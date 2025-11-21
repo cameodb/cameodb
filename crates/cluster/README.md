@@ -146,7 +146,7 @@ pub fn get_owner(&self, key: &str) -> Option<Uuid> {
 ### Basic Usage
 
 ```rust
-use cluster_core::{NodeIdentity, ConsistentRing};
+use cluster::{NodeIdentity, ConsistentRing};
 use std::path::PathBuf;
 
 // Create or load node identity
@@ -165,7 +165,7 @@ println!("Key 'user:123' belongs to: {:?}", owner);
 ### Multi-Node Cluster
 
 ```rust
-use cluster_core::{NodeIdentity, ConsistentRing};
+use cluster::{NodeIdentity, ConsistentRing};
 
 let mut ring = ConsistentRing::new();
 
@@ -189,7 +189,7 @@ for key in &keys {
 ### Dynamic Membership
 
 ```rust
-use cluster_core::{NodeIdentity, ConsistentRing};
+use cluster::{NodeIdentity, ConsistentRing};
 
 let mut ring = ConsistentRing::new();
 let node_a = NodeIdentity::new();
@@ -227,8 +227,8 @@ let final_owner = ring.get_owner(key);
 The cluster core integrates with the storage engine for request routing:
 
 ```rust
-use cluster_core::ConsistentRing;
-use storage_engine::HybridStore;
+use cluster::ConsistentRing;
+use storage::HybridStore;
 
 // Determine which shard should handle a key
 let ring = ConsistentRing::new();
@@ -256,7 +256,7 @@ The crate includes comprehensive tests covering:
 
 Run tests with:
 ```bash
-cargo test -p cluster_core
+cargo test -p cluster
 ```
 
 ## Future Enhancements

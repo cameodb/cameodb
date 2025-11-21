@@ -1,4 +1,4 @@
-use cluster_core::{ConsistentRing, NodeIdentity};
+use cluster::{ConsistentRing, NodeIdentity};
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -189,7 +189,7 @@ fn test_node_identity_new() {
     let identity2 = NodeIdentity {
         uuid,
         name: identity.name.clone(),
-        vnode_tokens: cluster_core::generate_tokens(uuid),
+        vnode_tokens: cluster::generate_tokens(uuid),
     };
 
     assert_eq!(identity.vnode_tokens, identity2.vnode_tokens);

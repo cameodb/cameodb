@@ -45,7 +45,7 @@
 //! **NEVER** call storage methods directly from async contexts. Always use `spawn_blocking`:
 //!
 //! ```rust,ignore
-//! use storage_engine::{HybridStore, StorageConfig, WalOp};
+//! use storage::{HybridStore, StorageConfig, WalOp};
 //! use tokio::task;
 //!
 //! async fn async_write_example(store: HybridStore, op: WalOp) -> Result<u64, Box<dyn std::error::Error>> {
@@ -74,7 +74,7 @@
 //! ## Example Usage
 //!
 //! ```rust,no_run
-//! use storage_engine::{HybridStore, StorageConfig, WalOp};
+//! use storage::{HybridStore, StorageConfig, WalOp};
 //! use serde_json::json;
 //! use std::path::PathBuf;
 //!
@@ -139,7 +139,7 @@ const TABLE_DATA: TableDefinition<&str, &[u8]> = TableDefinition::new("data");
 /// # Examples
 ///
 /// ```rust
-/// use storage_engine::StorageConfig;
+/// use storage::StorageConfig;
 /// use std::path::PathBuf;
 ///
 /// // Default configuration
@@ -235,7 +235,7 @@ pub enum StoreError {
 /// # Examples
 ///
 /// ```rust
-/// use storage_engine::WalOp;
+/// use storage::WalOp;
 /// use serde_json::json;
 ///
 /// // Create a document
@@ -303,7 +303,7 @@ struct SchemaFields {
 /// **NEVER** call methods directly from async contexts. Always wrap in `spawn_blocking`:
 ///
 /// ```rust,ignore
-/// # use storage_engine::{HybridStore, WalOp};
+/// # use storage::{HybridStore, WalOp};
 /// # use tokio::task;
 /// async fn safe_async_usage(store: HybridStore, op: WalOp) {
 ///     let result = task::spawn_blocking(move || {
@@ -328,7 +328,7 @@ struct SchemaFields {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use storage_engine::{HybridStore, StorageConfig, WalOp};
+/// use storage::{HybridStore, StorageConfig, WalOp};
 /// use std::path::PathBuf;
 ///
 /// let config = StorageConfig {
@@ -416,7 +416,7 @@ impl HybridStore {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use storage_engine::{HybridStore, StorageConfig};
+    /// use storage::{HybridStore, StorageConfig};
     /// use std::path::PathBuf;
     ///
     /// let config = StorageConfig {
@@ -516,7 +516,7 @@ impl HybridStore {
     /// # Examples
     ///
     /// ```rust
-    /// use storage_engine::{HybridStore, StorageConfig, WalOp};
+    /// use storage::{HybridStore, StorageConfig, WalOp};
     /// use serde_json::json;
     /// use std::path::PathBuf;
     ///
@@ -633,7 +633,7 @@ impl HybridStore {
     /// # Examples
     ///
     /// ```rust
-    /// use storage_engine::{HybridStore, StorageConfig, WalOp};
+    /// use storage::{HybridStore, StorageConfig, WalOp};
     /// use serde_json::json;
     ///
     /// let store = HybridStore::new(StorageConfig::default())?;
@@ -697,7 +697,7 @@ impl HybridStore {
     /// # Examples
     ///
     /// ```rust
-    /// use storage_engine::{HybridStore, StorageConfig};
+    /// use storage::{HybridStore, StorageConfig};
     ///
     /// let store = HybridStore::new(StorageConfig::default())?;
     ///

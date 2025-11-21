@@ -1,5 +1,5 @@
 [package]
-name = "storage_engine"
+name = "storage"
 version = "0.1.0"
 edition = "2021"
 

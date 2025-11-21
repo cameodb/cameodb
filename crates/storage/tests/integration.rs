@@ -1,5 +1,5 @@
 use serde_json::json;
-use storage_engine::{HybridStore, StorageConfig, WalOp};
+use storage::{HybridStore, StorageConfig, WalOp};
 
 mod common;
 use common::{cleanup_test_data_dir, create_test_data_dir};

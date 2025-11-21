@@ -22,7 +22,7 @@
 //! ## Example Usage
 //!
 //! ```rust,no_run
-//! use cluster_core::{NodeIdentity, ConsistentRing};
+//! use cluster::{NodeIdentity, ConsistentRing};
 //! use std::path::PathBuf;
 //!
 //! // Create or load node identity (use proper test data directory in tests)
@@ -70,7 +70,7 @@ const VNODE_COUNT: usize = 256;
 /// # Examples
 ///
 /// ```rust
-/// use cluster_core::NodeIdentity;
+/// use cluster::NodeIdentity;
 ///
 /// // Generate a new identity
 /// let identity = NodeIdentity::new();
@@ -116,7 +116,7 @@ impl NodeIdentity {
     /// # Examples
     ///
     /// ```rust
-    /// use cluster_core::NodeIdentity;
+    /// use cluster::NodeIdentity;
     ///
     /// let identity = NodeIdentity::new();
     /// println!("Node: {} ({})", identity.name, identity.uuid);
@@ -149,7 +149,7 @@ impl NodeIdentity {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use cluster_core::NodeIdentity;
+    /// use cluster::NodeIdentity;
     /// use std::path::PathBuf;
     ///
     /// // Use centralized test data directory structure
@@ -260,7 +260,7 @@ fn to_base36(mut value: u32) -> String {
 /// # Examples
 ///
 /// ```rust
-/// use cluster_core::generate_tokens;
+/// use cluster::generate_tokens;
 /// use uuid::Uuid;
 ///
 /// let uuid = Uuid::new_v4();
@@ -305,7 +305,7 @@ pub fn generate_tokens(uuid: Uuid) -> Vec<u64> {
 /// # Examples
 ///
 /// ```rust
-/// use cluster_core::{ConsistentRing, NodeIdentity};
+/// use cluster::{ConsistentRing, NodeIdentity};
 ///
 /// let mut ring = ConsistentRing::new();
 ///
@@ -335,7 +335,7 @@ impl ConsistentRing {
     /// # Examples
     ///
     /// ```rust
-    /// use cluster_core::ConsistentRing;
+    /// use cluster::ConsistentRing;
     ///
     /// let ring = ConsistentRing::new();
     /// assert_eq!(ring.get_owner("any_key"), None);
@@ -358,7 +358,7 @@ impl ConsistentRing {
     /// # Examples
     ///
     /// ```rust
-    /// use cluster_core::{ConsistentRing, NodeIdentity};
+    /// use cluster::{ConsistentRing, NodeIdentity};
     ///
     /// let mut ring = ConsistentRing::new();
     /// let identity = NodeIdentity::new();
@@ -388,7 +388,7 @@ impl ConsistentRing {
     /// # Examples
     ///
     /// ```rust
-    /// use cluster_core::{ConsistentRing, NodeIdentity};
+    /// use cluster::{ConsistentRing, NodeIdentity};
     ///
     /// let mut ring = ConsistentRing::new();
     /// let node_a = NodeIdentity::new();
@@ -429,7 +429,7 @@ impl ConsistentRing {
     /// # Examples
     ///
     /// ```rust
-    /// use cluster_core::{ConsistentRing, NodeIdentity};
+    /// use cluster::{ConsistentRing, NodeIdentity};
     ///
     /// let mut ring = ConsistentRing::new();
     /// let identity = NodeIdentity::new();

@@ -1,4 +1,4 @@
-use cluster_core::NodeIdentity;
+use cluster::NodeIdentity;
 
 mod common;
 use common::{cleanup_test_data_dir, create_test_identity_path};

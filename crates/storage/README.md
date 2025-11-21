@@ -164,7 +164,7 @@ The storage engine creates a well-organized directory structure:
 ### Basic Operations
 
 ```rust
-use storage_engine::{HybridStore, StorageConfig, WalOp};
+use storage::{HybridStore, StorageConfig, WalOp};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -226,7 +226,7 @@ async fn correct_usage(store: HybridStore, op: WalOp) -> Result<u64, StoreError>
 ### Batch Operations
 
 ```rust
-use storage_engine::{HybridStore, WalOp};
+use storage::{HybridStore, WalOp};
 
 async fn batch_insert(store: HybridStore, documents: Vec<(String, String)>) -> Result<Vec<u64>, StoreError> {
     let mut sequence_ids = Vec::new();
@@ -254,7 +254,7 @@ async fn batch_insert(store: HybridStore, documents: Vec<(String, String)>) -> R
 ### Configuration Tuning
 
 ```rust
-use storage_engine::StorageConfig;
+use storage::StorageConfig;
 use std::path::PathBuf;
 
 // High-performance configuration
