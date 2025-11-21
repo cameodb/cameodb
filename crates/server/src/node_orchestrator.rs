@@ -525,8 +525,18 @@ mod tests {
 
     impl TestDataGuard {
         fn new(test_name: &str) -> Self {
-            let project_root = std::env::current_dir().expect("Failed to get current directory");
-            let data_dir = project_root.join("data").join("server").join(test_name);
+            // Find workspace root by going up from current crate directory
+            let workspace_root =
+                std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+
+            let data_dir = PathBuf::from(workspace_root)
+                .parent() // Go up from crates/server to crates/
+                .unwrap()
+                .parent() // Go up from crates/ to workspace root
+                .unwrap()
+                .join("data")
+                .join("server")
+                .join(test_name);
 
             // Clean up any existing test data
             if data_dir.exists() {
