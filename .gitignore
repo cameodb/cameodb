@@ -1,0 +1,80 @@
+# Rust build artifacts
+# The entire target directory contains generated build artifacts
+# and should never be committed. This includes:
+# - Compiled binaries and libraries
+# - Generated documentation (target/doc/)
+# - Debug information and symbols
+# - Incremental compilation cache
+/target/
+**/target/
+
+# Cargo.lock for libraries (keep for applications)
+# For libraries: typically ignored (let consumers choose versions)
+# For applications: should be committed (ensure reproducible builds)
+# Since CameoDB is a database system (application), we keep Cargo.lock
+# Cargo.lock
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Rust-specific
+**/*.rs.bk
+*.pdb
+
+# Test artifacts and temporary files
+/test_data/
+*.tmp
+*.temp
+
+# Environment and configuration
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Runtime and cache directories
+.cache/
+.cargo/
+.rustup/
+
+# Backup files
+*.orig
+*.rej
+
+# Profiling and debugging
+*.prof
+perf.data*
+flamegraph.svg
+
+# Documentation build artifacts
+# Generated documentation should not be committed:
+# - target/doc/ (rustdoc output) - already covered by /target/
+# - book/ (mdbook output)
+# - docs/book/ (if using mdbook in docs/)
+# 
+# Source documentation SHOULD be committed:
+# - docs/*.md (our architecture and API docs)
+# - README.md files
+# - Inline /// documentation in source code
+book/
+docs/book/
+
+# Local development overrides
+local.toml
+dev.toml
