@@ -75,7 +75,9 @@ Thumbs.db
 *.pdb
 
 # Test artifacts and temporary files
-/test_data/
+/data/
+!/data/.gitignore
+!/data/README.md
 *.tmp
 *.temp
 

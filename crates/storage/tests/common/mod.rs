@@ -7,19 +7,19 @@ use std::path::PathBuf;
 /// easily cleaned up. The directory structure is:
 ///
 /// ```
-/// {workspace_root}/test_data/storage_engine/{test_name}/
+/// {workspace_root}/data/storage/{test_name}/
 /// ```
 pub fn create_test_data_dir(test_name: &str) -> PathBuf {
     let workspace_root =
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set during tests");
 
     let test_data_root = PathBuf::from(workspace_root)
-        .parent() // Go up from crates/storage_engine to crates/
+        .parent() // Go up from crates/storage to crates/
         .unwrap()
         .parent() // Go up from crates/ to workspace root
         .unwrap()
-        .join("test_data")
-        .join("storage_engine")
+        .join("data")
+        .join("storage")
         .join(test_name);
 
     // Clean up any existing test data
@@ -52,7 +52,7 @@ mod tests {
         assert!(test_dir.is_dir());
         assert!(test_dir
             .to_string_lossy()
-            .contains("test_data/storage_engine/test_utils_test"));
+            .contains("data/storage/test_utils_test"));
 
         // Cleanup
         cleanup_test_data_dir(&test_dir);

@@ -7,19 +7,19 @@ use std::path::PathBuf;
 /// easily cleaned up. The directory structure is:
 ///
 /// ```
-/// {workspace_root}/test_data/cluster_core/{test_name}/
+/// {workspace_root}/data/cluster/{test_name}/
 /// ```
 pub fn create_test_data_dir(test_name: &str) -> PathBuf {
     let workspace_root =
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set during tests");
 
     let test_data_root = PathBuf::from(workspace_root)
-        .parent() // Go up from crates/cluster_core to crates/
+        .parent() // Go up from crates/cluster to crates/
         .unwrap()
         .parent() // Go up from crates/ to workspace root
         .unwrap()
-        .join("test_data")
-        .join("cluster_core")
+        .join("data")
+        .join("cluster")
         .join(test_name);
 
     // Clean up any existing test data
@@ -57,7 +57,7 @@ mod tests {
         assert!(test_dir.is_dir());
         assert!(test_dir
             .to_string_lossy()
-            .contains("test_data/cluster_core/test_utils_test"));
+            .contains("data/cluster/test_utils_test"));
 
         // Cleanup
         cleanup_test_data_dir(&test_dir);
@@ -71,7 +71,7 @@ mod tests {
         assert!(identity_path.parent().unwrap().exists());
         assert!(identity_path
             .to_string_lossy()
-            .contains("test_data/cluster_core/identity_test"));
+            .contains("data/cluster/identity_test"));
         assert!(identity_path
             .to_string_lossy()
             .ends_with("node_a_identity.json"));
