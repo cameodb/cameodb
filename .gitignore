@@ -15,11 +15,51 @@
 # Cargo.lock
 
 # IDE and editor files
+# Visual Studio Code
 .vscode/
+.vscode-test/
+
+# JetBrains IDEs (IntelliJ, CLion, etc.)
 .idea/
+*.iml
+*.ipr
+*.iws
+
+# Vim/Neovim
 *.swp
 *.swo
 *~
+.netrwhist
+Session.vim
+Sessionx.vim
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# Atom
+.atom/
+
+# Rust Analyzer
+.rust-analyzer
+
+# Windsurf IDE
+.windsurfrules
+
+# Other editors
+.project
+.settings/
+.classpath
 
 # OS generated files
 .DS_Store
