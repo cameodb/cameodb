@@ -12,10 +12,14 @@
 //! │ - identity: NodeIdentity                │
 //! │ - shards: HashMap<Uuid, ActorRef>       │
 //! │ - config: NodeConfig                    │
+//! └─────────────────────────────────────────┘
+//! ```
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -24,7 +28,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use cluster::{IdentityError, NodeIdentity};
-use storage::StorageConfig;
+use serde_json::Value as JsonValue;
+use storage::{HybridStore, StorageConfig, StoreError, WalOp};
 
 /// Configuration for a CameoDB node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,36 +76,288 @@ pub struct ProposeShard {
     pub shard_id: Uuid,
 }
 
-/// Placeholder microshard actor for now.
-#[derive(Debug)]
+/// Search request message for MicroshardActor.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub struct SearchRequest {
+    pub query_string: String,
+    pub limit: usize,
+}
+
+/// Write request message for MicroshardActor.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct WriteRequest {
+    pub op: WalOp,
+}
+
+/// Client operation messages for RouterActor.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub enum ClientOp {
+    /// Search operation across shards of an index
+    Search {
+        index: String,
+        query: String,
+        limit: Option<usize>,
+    },
+}
+
+/// Microshard actor that manages a single shard's storage and search operations.
 pub struct MicroshardActor {
     shard_id: Uuid,
+    store: Option<Arc<HybridStore>>,
     storage_config: StorageConfig,
+}
+
+impl std::fmt::Debug for MicroshardActor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MicroshardActor")
+            .field("shard_id", &self.shard_id)
+            .field("store_initialized", &self.store.is_some())
+            .field("storage_config", &self.storage_config)
+            .finish()
+    }
 }
 
 impl MicroshardActor {
     pub fn new(shard_id: Uuid, storage_config: StorageConfig) -> Self {
         Self {
             shard_id,
+            store: None,
             storage_config,
         }
     }
 
-    pub async fn start(&self) -> Result<(), OrchestratorError> {
+    pub async fn start(&mut self) -> Result<(), OrchestratorError> {
         info!(
             shard_id = %self.shard_id,
             path = %self.storage_config.shard_path.display(),
             "MicroshardActor starting"
         );
-        // TODO: Initialize HybridStore with spawn_blocking when needed
+
+        // Initialize HybridStore with spawn_blocking to avoid blocking async runtime
+        let config = self.storage_config.clone();
+        let store = tokio::task::spawn_blocking(move || HybridStore::new(config))
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .map_err(|e: StoreError| match e {
+                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
+                _ => OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )),
+            })?;
+
+        self.store = Some(Arc::new(store));
+        info!(shard_id = %self.shard_id, "HybridStore initialized successfully");
         Ok(())
+    }
+
+    /// Handles search requests with spawn_blocking to avoid blocking the actor thread.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn handle_search(
+        &self,
+        request: SearchRequest,
+    ) -> Result<Vec<(f32, JsonValue)>, OrchestratorError> {
+        let store = self.store.as_ref().ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "HybridStore not initialized",
+            ))
+        })?;
+
+        let store = Arc::clone(store);
+        let query = request.query_string;
+        let limit = request.limit;
+
+        // Use spawn_blocking to execute search on blocking thread pool
+        let results = tokio::task::spawn_blocking(move || store.search_documents(&query, limit))
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .map_err(|e: StoreError| match e {
+                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
+                _ => OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )),
+            })?;
+
+        Ok(results)
+    }
+
+    /// Handles write requests with spawn_blocking to avoid blocking the actor thread.
+    #[allow(dead_code)]
+    pub async fn handle_write(&self, request: WriteRequest) -> Result<u64, OrchestratorError> {
+        let store = self.store.as_ref().ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "HybridStore not initialized",
+            ))
+        })?;
+
+        let store = Arc::clone(store);
+        let op = request.op;
+
+        // Use spawn_blocking to execute write on blocking thread pool
+        let seq_id = tokio::task::spawn_blocking(move || store.apply_write(op))
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .map_err(|e: StoreError| match e {
+                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
+                _ => OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )),
+            })?;
+
+        Ok(seq_id)
+    }
+}
+
+/// Router actor that handles client operations and distributes them across shards.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct RouterActor {
+    orchestrator: std::sync::Arc<tokio::sync::RwLock<NodeOrchestrator>>,
+}
+
+impl RouterActor {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new(orchestrator: std::sync::Arc<tokio::sync::RwLock<NodeOrchestrator>>) -> Self {
+        Self { orchestrator }
+    }
+
+    /// Handles client operations with scatter-gather pattern for search.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn handle_client_op(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
+        match op {
+            ClientOp::Search {
+                index,
+                query,
+                limit,
+            } => {
+                self.handle_search(&index, &query, limit.unwrap_or(10))
+                    .await
+            }
+        }
+    }
+
+    /// Implements scatter-gather search across all shards.
+    async fn handle_search(
+        &self,
+        _index: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let orchestrator = self.orchestrator.read().await;
+
+        // Get all shard actors (scatter-gather across all shards for now)
+        let shard_ids: Vec<Uuid> = orchestrator.shards.keys().copied().collect();
+        drop(orchestrator); // Release read lock early
+
+        if shard_ids.is_empty() {
+            return Ok(serde_json::json!({
+                "results": [],
+                "total_shards": 0,
+                "query": query
+            }));
+        }
+
+        // Scatter: Send search requests to all shards
+        let mut search_tasks = Vec::new();
+
+        for shard_id in &shard_ids {
+            let orchestrator = self.orchestrator.clone();
+            let shard_id = *shard_id;
+            let search_request = SearchRequest {
+                query_string: query.to_string(),
+                limit,
+            };
+
+            let task = tokio::spawn(async move {
+                let orchestrator = orchestrator.read().await;
+                if let Some(shard) = orchestrator.shards.get(&shard_id) {
+                    let result = shard.handle_search(search_request).await;
+                    (shard_id, result)
+                } else {
+                    (
+                        shard_id,
+                        Err(OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "Shard not found",
+                        ))),
+                    )
+                }
+            });
+
+            search_tasks.push(task);
+        }
+
+        // Gather: Collect results from all shards
+        let mut all_results = Vec::new();
+        let mut successful_shards = 0;
+        let mut failed_shards = 0;
+
+        for task in search_tasks {
+            match task.await {
+                Ok((shard_id, Ok(shard_results))) => {
+                    successful_shards += 1;
+                    for (score, doc) in shard_results {
+                        all_results.push((score, doc, shard_id));
+                    }
+                }
+                Ok((shard_id, Err(e))) => {
+                    failed_shards += 1;
+                    warn!("Shard {} search failed: {}", shard_id, e);
+                }
+                Err(e) => {
+                    failed_shards += 1;
+                    warn!("Shard search task failed: {}", e);
+                }
+            }
+        }
+
+        // Aggregation: Sort by score (descending) and take top N
+        all_results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        all_results.truncate(limit);
+
+        // Format results
+        let formatted_results: Vec<JsonValue> = all_results
+            .into_iter()
+            .map(|(score, mut doc, shard_id)| {
+                // Add metadata to each result
+                if let JsonValue::Object(ref mut obj) = doc {
+                    obj.insert(
+                        "_score".to_string(),
+                        JsonValue::Number(
+                            serde_json::Number::from_f64(score as f64)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        ),
+                    );
+                    obj.insert(
+                        "_shard_id".to_string(),
+                        JsonValue::String(shard_id.to_string()),
+                    );
+                }
+                doc
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "results": formatted_results,
+            "total_results": formatted_results.len(),
+            "total_shards": shard_ids.len(),
+            "successful_shards": successful_shards,
+            "failed_shards": failed_shards,
+            "query": query
+        }))
     }
 }
 
 #[derive(Debug)]
 pub struct NodeOrchestrator {
     /// Map of shard UUIDs to their microshard actors
-    shards: HashMap<Uuid, MicroshardActor>,
+    pub(crate) shards: HashMap<Uuid, MicroshardActor>,
     /// This node's identity (UUID, name, virtual tokens)
     identity: NodeIdentity,
     /// Node configuration  
@@ -143,7 +400,7 @@ impl NodeOrchestrator {
             }
 
             let storage_config = self.create_shard_storage_config(shard_id);
-            let microshard = MicroshardActor::new(shard_id, storage_config);
+            let mut microshard = MicroshardActor::new(shard_id, storage_config);
 
             match microshard.start().await {
                 Ok(()) => {
@@ -231,7 +488,7 @@ impl NodeOrchestrator {
 
         // Create and start microshard actor
         let storage_config = self.create_shard_storage_config(shard_id);
-        let microshard = MicroshardActor::new(shard_id, storage_config);
+        let mut microshard = MicroshardActor::new(shard_id, storage_config);
         microshard.start().await?;
 
         // Add to shards map
@@ -260,63 +517,72 @@ impl NodeOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::Path;
 
-    fn create_test_data_dir(test_name: &str) -> PathBuf {
-        let workspace_root = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR should be set during tests");
-
-        let test_data_root = PathBuf::from(workspace_root)
-            .parent() // Go up from crates/server to crates/
-            .unwrap()
-            .parent() // Go up from crates/ to workspace root
-            .unwrap()
-            .join("data")
-            .join("server")
-            .join(test_name);
-
-        if test_data_root.exists() {
-            fs::remove_dir_all(&test_data_root).expect("Failed to clean up existing test data");
-        }
-
-        fs::create_dir_all(&test_data_root).expect("Failed to create test data directory");
-
-        test_data_root
+    /// RAII guard that ensures test data cleanup even if test panics
+    struct TestDataGuard {
+        data_dir: PathBuf,
     }
 
-    fn cleanup_test_data_dir(path: &Path) {
-        if path.exists() {
-            let _ = fs::remove_dir_all(path);
+    impl TestDataGuard {
+        fn new(test_name: &str) -> Self {
+            let project_root = std::env::current_dir().expect("Failed to get current directory");
+            let data_dir = project_root.join("data").join("server").join(test_name);
+
+            // Clean up any existing test data
+            if data_dir.exists() {
+                std::fs::remove_dir_all(&data_dir).expect("Failed to remove existing test data");
+            }
+
+            // Create the test directory
+            std::fs::create_dir_all(&data_dir).expect("Failed to create test data directory");
+
+            Self { data_dir }
+        }
+
+        fn path(&self) -> &PathBuf {
+            &self.data_dir
         }
     }
+
+    impl Drop for TestDataGuard {
+        fn drop(&mut self) {
+            if self.data_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&self.data_dir) {
+                    eprintln!(
+                        "Warning: Failed to clean up test data at {:?}: {}",
+                        self.data_dir, e
+                    );
+                }
+            }
+        }
+    }
+
+    // Legacy functions removed - now using TestDataGuard RAII pattern
 
     #[tokio::test]
     async fn test_node_orchestrator_initialization() {
-        let data_dir = create_test_data_dir("orchestrator_initialization");
+        let _guard = TestDataGuard::new("node_orchestrator_initialization");
         let config = NodeConfig {
-            storage_path: data_dir.clone(),
+            storage_path: _guard.path().clone(),
             max_shards: 5,
-            shard_memory_budget: 10 * 1024 * 1024, // 10MB for testing
+            shard_memory_budget: 20 * 1024 * 1024, // 20MB - above Tantivy's 15MB minimum
         };
 
         let orchestrator = NodeOrchestrator::new(config).await.unwrap();
-
-        // Verify initialization
         assert_eq!(orchestrator.shard_count(), 0);
         assert!(!orchestrator.identity().uuid.is_nil());
-        assert!(orchestrator.identity().name.len() >= 3);
 
-        cleanup_test_data_dir(&data_dir);
+        // Note: Identity file creation/verification removed since it's handled by cluster crate
+        // Cleanup happens automatically when _guard is dropped
     }
 
     #[tokio::test]
     async fn test_propose_shard() {
-        let data_dir = create_test_data_dir("propose_shard");
+        let _guard = TestDataGuard::new("propose_shard");
         let config = NodeConfig {
-            storage_path: data_dir.clone(),
-            max_shards: 2,
-            shard_memory_budget: 10 * 1024 * 1024,
+            storage_path: _guard.path().clone(),
+            max_shards: 5,
+            shard_memory_budget: 20 * 1024 * 1024, // 20MB - above Tantivy's 15MB minimum
         };
 
         let mut orchestrator = NodeOrchestrator::new(config).await.unwrap();
@@ -326,12 +592,22 @@ mod tests {
         let result = orchestrator
             .handle_propose_shard(ProposeShard { shard_id })
             .await;
-        assert!(result.is_ok());
+
+        // Debug the error if it fails
+        if let Err(ref e) = result {
+            eprintln!("Shard proposal failed: {}", e);
+            eprintln!("Error details: {:?}", e);
+        }
+        assert!(
+            result.is_ok(),
+            "Shard proposal should succeed but got: {:?}",
+            result
+        );
         assert_eq!(result.unwrap(), shard_id);
         assert_eq!(orchestrator.shard_count(), 1);
 
         // Verify directory was created
-        let shard_dir = data_dir.join(format!("shard-{}", shard_id));
+        let shard_dir = _guard.path().join(format!("shard-{}", shard_id));
         assert!(shard_dir.exists());
 
         // Try to propose the same shard again (should fail)
@@ -342,17 +618,16 @@ mod tests {
             duplicate_result,
             Err(OrchestratorError::ShardAlreadyExists { .. })
         ));
-
-        cleanup_test_data_dir(&data_dir);
+        // Cleanup happens automatically when _guard is dropped
     }
 
     #[tokio::test]
     async fn test_shard_limit() {
-        let data_dir = create_test_data_dir("shard_limit");
+        let _guard = TestDataGuard::new("shard_limit");
         let config = NodeConfig {
-            storage_path: data_dir.clone(),
-            max_shards: 1, // Very small limit for testing
-            shard_memory_budget: 10 * 1024 * 1024,
+            storage_path: _guard.path().clone(),
+            max_shards: 1,                         // Very small limit for testing
+            shard_memory_budget: 20 * 1024 * 1024, // 20MB - above Tantivy's 15MB minimum
         };
 
         let mut orchestrator = NodeOrchestrator::new(config).await.unwrap();
@@ -362,7 +637,17 @@ mod tests {
         let result1 = orchestrator
             .handle_propose_shard(ProposeShard { shard_id: shard1 })
             .await;
-        assert!(result1.is_ok());
+
+        // Debug the error if it fails
+        if let Err(ref e) = result1 {
+            eprintln!("First shard proposal failed: {}", e);
+            eprintln!("Error details: {:?}", e);
+        }
+        assert!(
+            result1.is_ok(),
+            "First shard should succeed but got: {:?}",
+            result1
+        );
 
         // Second shard should fail due to limit
         let shard2 = uuid::Uuid::new_v4();
@@ -373,7 +658,36 @@ mod tests {
             result2,
             Err(OrchestratorError::ShardLimitExceeded { .. })
         ));
+        // Cleanup happens automatically when _guard is dropped
+    }
 
-        cleanup_test_data_dir(&data_dir);
+    #[tokio::test]
+    async fn test_router_actor_search() {
+        let _guard = TestDataGuard::new("router_actor_search");
+        let config = NodeConfig {
+            storage_path: _guard.path().clone(),
+            max_shards: 2,
+            shard_memory_budget: 20 * 1024 * 1024, // 20MB - above Tantivy's 15MB minimum
+        };
+
+        let orchestrator = NodeOrchestrator::new(config).await.unwrap();
+        let orchestrator = std::sync::Arc::new(tokio::sync::RwLock::new(orchestrator));
+
+        let router = RouterActor::new(orchestrator.clone());
+
+        // Test empty search (no shards)
+        let search_op = ClientOp::Search {
+            index: "test_index".to_string(),
+            query: "test query".to_string(),
+            limit: Some(10),
+        };
+
+        let result = router.handle_client_op(search_op).await.unwrap();
+
+        // Verify empty result structure
+        assert!(result.is_object());
+        assert_eq!(result["total_shards"], 0);
+        assert_eq!(result["results"].as_array().unwrap().len(), 0);
+        // Cleanup happens automatically when _guard is dropped
     }
 }
