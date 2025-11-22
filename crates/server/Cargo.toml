@@ -4,22 +4,25 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow.workspace = true
-axum.workspace = true
-futures.workspace = true
-kameo.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
+anyhow = { workspace = true }
+axum = { workspace = true }
+futures = { workspace = true }
+kameo = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
 tokio-stream = "0.1"
-tower.workspace = true
-tower-http.workspace = true
+tower = { workspace = true }
+tower-http = { workspace = true }
 cluster = { path = "../cluster" }
 storage = { path = "../storage" }
-uuid.workspace = true
-thiserror.workspace = true
-tracing = "0.1"
-tracing-subscriber = "0.3"
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+toml = { workspace = true }
+serde_yaml = { workspace = true }
+num_cpus = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.8"

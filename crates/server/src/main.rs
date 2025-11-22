@@ -4,27 +4,41 @@ use std::sync::Arc;
 
 use tracing_subscriber;
 
+mod config;
 mod http_server;
 mod node_orchestrator;
 
+use config::CameoDbConfig;
 use http_server::{create_router, AppState};
 use node_orchestrator::{NodeConfig, NodeOrchestrator, RouterActor};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing for logging
+    // Handle CLI arguments for configuration utilities
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "generate-config" {
+        println!("{}", CameoDbConfig::generate_sample_config()?);
+        return Ok(());
+    }
+
+    // Load configuration from multiple sources
+    let cameodb_config = CameoDbConfig::load()?;
+
+    // Initialize tracing with configuration
     tracing_subscriber::fmt::init();
 
-    // Create node configuration
-    // Use ./cameodb-data for production data (will be created if needed)
-    let config = NodeConfig {
-        storage_path: PathBuf::from("./cameodb-data"),
-        max_shards: 10,
-        shard_memory_budget: 50 * 1024 * 1024, // 50MB per shard
+    // Create node configuration from loaded config
+    let node_config = NodeConfig {
+        storage_path: cameodb_config.storage.data_paths[0].clone(),
+        max_shards: cameodb_config.server.node.max_shards,
+        writer_memory_min_mb: cameodb_config.search.writer_memory_min_mb,
+        writer_memory_max_mb: cameodb_config.search.writer_memory_max_mb,
+        writer_memory_default_mb: cameodb_config.server.node.writer_memory_default_mb,
+        wal_sync: cameodb_config.storage.wal_sync,
     };
 
     // Create the NodeOrchestrator
-    let orchestrator = NodeOrchestrator::new(config).await?;
+    let orchestrator = NodeOrchestrator::new(node_config).await?;
 
     println!("NodeOrchestrator started successfully");
     println!(
@@ -43,18 +57,38 @@ async fn main() -> Result<()> {
         orchestrator: orchestrator_arc,
     };
 
-    // Create HTTP server
+    // Create the HTTP router with shared state
     let app = create_router(app_state);
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:9480").await?;
 
-    println!("🚀 CameoDB HTTP Server starting on http://0.0.0.0:9480");
+    // Extract HTTP configuration
+    let http_config = &cameodb_config.server.http;
+    let bind_address = format!("{}:{}", http_config.host, http_config.port);
+
+    // Print startup information
+    println!("🚀 CameoDB HTTP Server starting on http://{}", bind_address);
     println!("📡 API endpoints:");
     println!("  POST /api/:index/search - Standard search");
     println!("  POST /api/:index/stream - Streaming search");
     println!("  PUT  /api/:index/document - Write document");
     println!("  GET  /_cluster/health - Health check");
     println!();
+    println!("⚙️  Configuration:");
+    println!("  Data Paths: {:?}", cameodb_config.storage.data_paths);
+    println!("  Max Shards: {}", cameodb_config.server.node.max_shards);
+    println!(
+        "  Writer Memory: {}-{}MB",
+        cameodb_config.search.writer_memory_min_mb, cameodb_config.search.writer_memory_max_mb
+    );
+    println!(
+        "  Total Memory Limit: {}MB",
+        cameodb_config.search.total_memory_limit_mb
+    );
+    println!();
     println!("Press Ctrl+C to shutdown...");
+    println!();
+
+    // Start the HTTP server with configured address
+    let listener = tokio::net::TcpListener::bind(&bind_address).await?;
 
     // Start the HTTP server
     let server_handle = tokio::spawn(async move {

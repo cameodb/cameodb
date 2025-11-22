@@ -164,6 +164,7 @@ pub struct StorageConfig {
     pub shard_path: PathBuf,
 
     /// Memory budget for tantivy's IndexWriter in bytes.
+    /// Range: 16MB - 256MB (configurable via CameoDB config)
     ///
     /// Higher values allow more documents to be buffered in memory
     /// before flushing to disk, improving write performance but

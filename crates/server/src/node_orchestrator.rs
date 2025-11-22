@@ -37,12 +37,17 @@ use storage::{HybridStore, StorageConfig, StoreError, WalOp};
 /// Configuration for a CameoDB node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
-    /// Root directory for all node data
+    /// Base path for all node data storage
     pub storage_path: PathBuf,
     /// Maximum number of shards this node can host
     pub max_shards: usize,
-    /// Memory budget per shard in bytes
-    pub shard_memory_budget: usize,
+    /// Tantivy writer memory configuration (per shard)
+    pub writer_memory_min_mb: usize,
+    pub writer_memory_max_mb: usize,
+    /// Default writer memory per shard in MB (will be clamped to min/max range)
+    pub writer_memory_default_mb: usize,
+    /// Enable WAL fsync for durability
+    pub wal_sync: bool,
 }
 
 impl Default for NodeConfig {
@@ -50,7 +55,10 @@ impl Default for NodeConfig {
         Self {
             storage_path: PathBuf::from("./cameodb-data"),
             max_shards: 10,
-            shard_memory_budget: 50 * 1024 * 1024, // 50MB
+            writer_memory_min_mb: 16,
+            writer_memory_max_mb: 256,
+            writer_memory_default_mb: 50,
+            wal_sync: true,
         }
     }
 }
@@ -638,10 +646,19 @@ impl NodeOrchestrator {
     fn create_shard_storage_config(&self, shard_id: Uuid) -> StorageConfig {
         let shard_path = self.config.storage_path.join(format!("shard-{}", shard_id));
 
+        // Use default writer memory, clamped to configured min/max range
+        let writer_memory_mb = std::cmp::min(
+            std::cmp::max(
+                self.config.writer_memory_min_mb,
+                self.config.writer_memory_default_mb,
+            ),
+            self.config.writer_memory_max_mb,
+        );
+
         StorageConfig {
             shard_path,
-            writer_memory_budget: self.config.shard_memory_budget,
-            wal_sync: true, // Ensure durability
+            writer_memory_budget: writer_memory_mb * 1024 * 1024, // Convert to bytes
+            wal_sync: self.config.wal_sync,
         }
     }
 
@@ -736,6 +753,18 @@ mod tests {
         }
     }
 
+    /// Creates a test NodeConfig with all required fields
+    fn create_test_config(guard: &TestDataGuard, max_shards: usize) -> NodeConfig {
+        NodeConfig {
+            storage_path: guard.path().clone(),
+            max_shards,
+            writer_memory_min_mb: 16,
+            writer_memory_max_mb: 64,
+            writer_memory_default_mb: 20, // 20MB - above Tantivy's 15MB minimum
+            wal_sync: true,
+        }
+    }
+
     impl Drop for TestDataGuard {
         fn drop(&mut self) {
             if self.data_dir.exists() {
@@ -758,6 +787,9 @@ mod tests {
             storage_path: _guard.path().clone(),
             max_shards: 5,
             shard_memory_budget: 20 * 1024 * 1024, // 20MB - above Tantivy's 15MB minimum
+            writer_memory_min_mb: 16,
+            writer_memory_max_mb: 64,
+            wal_sync: true,
         };
 
         let orchestrator = NodeOrchestrator::new(config).await.unwrap();
@@ -775,6 +807,9 @@ mod tests {
             storage_path: _guard.path().clone(),
             max_shards: 5,
             shard_memory_budget: 20 * 1024 * 1024, // 20MB - above Tantivy's 15MB minimum
+            writer_memory_min_mb: 16,
+            writer_memory_max_mb: 64,
+            wal_sync: true,
         };
 
         let mut orchestrator = NodeOrchestrator::new(config).await.unwrap();

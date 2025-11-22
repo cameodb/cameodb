@@ -25,11 +25,10 @@ For a quick overview of all available scripts and project status:
 - **Audience**: New developers, CI/CD systems
 
 #### `init-cluster.sh [port]`
-**Purpose**: Initialize and start a development cluster with sample data
+**Purpose**: Initialize development cluster with sample data and shards
 - **Features**:
-  - Starts CameoDB server on specified port (default: 9480)
-  - Adds 5 sample documents for testing
-  - Validates all API endpoints (search, write, stream, health)
+  - Creates sample shards with realistic data
+  - Validates server startup and data ingestion
   - Interactive mode - keeps server running until Ctrl+C
 - **Usage**: 
   ```bash
@@ -37,6 +36,23 @@ For a quick overview of all available scripts and project status:
   ./scripts/setup/init-cluster.sh 8080   # Custom port
   ```
 - **Audience**: Developers, demo environments
+
+#### `config-manager.sh <command> [options]`
+**Purpose**: Configuration management and template generation
+- **Commands**:
+  - `generate [file]` - Generate sample configuration
+  - `validate [file]` - Validate configuration syntax
+  - `env-template` - Show environment variables
+  - `multi-disk` - Multi-disk configuration template
+  - `performance` - High-performance configuration
+  - `minimal` - Minimal/development configuration
+- **Usage**:
+  ```bash
+  ./scripts/setup/config-manager.sh generate          # Basic config
+  ./scripts/setup/config-manager.sh performance       # High-perf config
+  ./scripts/setup/config-manager.sh validate cameodb.toml
+  ```
+- **Audience**: DevOps, system administrators, developers
 
 ### 🧪 `testing/` - Testing and Validation
 
