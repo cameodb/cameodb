@@ -74,10 +74,10 @@ Thumbs.db
 **/*.rs.bk
 *.pdb
 
+# Production data directory (created at runtime)
+/cameodb-data/
+
 # Test artifacts and temporary files
-/data/
-!/data/.gitignore
-!/data/README.md
 *.tmp
 *.temp
 

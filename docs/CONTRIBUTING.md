@@ -114,9 +114,9 @@ Generated documentation should be deployed via CI/CD:
 
 ### Test Data Management
 
-- All test data goes in `test_data/` directory
-- Use test utilities in `tests/common/mod.rs`
-- Tests automatically clean up after themselves
+- All test data uses system temporary directories (`/tmp/cameodb_tests/`)
+- Use test utilities in `tests/common/mod.rs` for data directory creation
+- Tests automatically clean up after themselves with UUID isolation
 - Never commit test artifacts to git
 
 ### Code Quality
@@ -132,7 +132,7 @@ Generated documentation should be deployed via CI/CD:
 
 The `.gitignore` file excludes:
 - `target/` - All build artifacts and generated docs
-- `test_data/` - Test-generated files
+- `cameodb-data/` - Production runtime data directory
 - IDE files (`.vscode/`, `.idea/`)
 - OS files (`.DS_Store`, `Thumbs.db`)
 - Temporary and backup files

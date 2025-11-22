@@ -80,7 +80,7 @@
 //!
 //! // Configure storage
 //! let config = StorageConfig {
-//!     shard_path: PathBuf::from("./test_data/storage_engine/example/shard1"),
+//!     shard_path: PathBuf::from("./cameodb-data/shard1"),
 //!     writer_memory_budget: 50 * 1024 * 1024, // 50MB
 //!     wal_sync: true,
 //! };
@@ -103,8 +103,8 @@
 //!     println!("Found: {}", doc["body"]);
 //! }
 //!
-//! // Search (when implemented)
-//! let results = store.search("software engineer")?;
+//! // Search documents
+//! let results = store.search_documents("software engineer", 10)?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -149,7 +149,7 @@ const TABLE_DATA: TableDefinition<&str, &[u8]> = TableDefinition::new("data");
 ///
 /// // Custom configuration
 /// let config = StorageConfig {
-///     shard_path: PathBuf::from("./test_data/storage_engine/example/shard1"),
+///     shard_path: PathBuf::from("./cameodb-data/shard1"),
 ///     writer_memory_budget: 100 * 1024 * 1024, // 100MB
 ///     wal_sync: false, // Higher performance, less durability
 /// };
@@ -333,7 +333,7 @@ struct SchemaFields {
 /// use std::path::PathBuf;
 ///
 /// let config = StorageConfig {
-///     shard_path: PathBuf::from("./test_data/storage_engine/example/test_shard"),
+///     shard_path: PathBuf::from("./cameodb-data/test_shard"),
 ///     writer_memory_budget: 50 * 1024 * 1024,
 ///     wal_sync: true,
 /// };
@@ -421,7 +421,7 @@ impl HybridStore {
     /// use std::path::PathBuf;
     ///
     /// let config = StorageConfig {
-    ///     shard_path: PathBuf::from("./test_data/storage_engine/example/my_shard"),
+    ///     shard_path: PathBuf::from("./cameodb-data/my_shard"),
     ///     writer_memory_budget: 100 * 1024 * 1024, // 100MB
     ///     wal_sync: true,
     /// };

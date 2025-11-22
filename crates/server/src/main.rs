@@ -16,9 +16,9 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     // Create node configuration
-    // Use data/server when running from workspace root, or ./data/server when running locally
+    // Use ./cameodb-data for production data (will be created if needed)
     let config = NodeConfig {
-        storage_path: PathBuf::from("./data/server"),
+        storage_path: PathBuf::from("./cameodb-data"),
         max_shards: 10,
         shard_memory_budget: 50 * 1024 * 1024, // 50MB per shard
     };

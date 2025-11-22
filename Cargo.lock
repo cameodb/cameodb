@@ -2002,6 +2002,7 @@ dependencies = [
  "serde_json",
  "tantivy",
  "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

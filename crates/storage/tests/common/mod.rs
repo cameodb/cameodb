@@ -1,26 +1,22 @@
 use std::fs;
 use std::path::PathBuf;
 
-/// Creates a test data directory structure under the workspace root.
+/// Creates a test data directory structure in system temporary directory.
 ///
-/// This ensures all test data is contained within the project and can be
-/// easily cleaned up. The directory structure is:
+/// This ensures all test data is isolated and automatically cleaned up.
+/// Uses UUID for unique test runs. The directory structure is:
 ///
 /// ```
-/// {workspace_root}/data/storage/{test_name}/
+/// /tmp/cameodb_tests/storage/{test_name}/{uuid}/
 /// ```
 pub fn create_test_data_dir(test_name: &str) -> PathBuf {
-    let workspace_root =
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set during tests");
+    use uuid::Uuid;
 
-    let test_data_root = PathBuf::from(workspace_root)
-        .parent() // Go up from crates/storage to crates/
-        .unwrap()
-        .parent() // Go up from crates/ to workspace root
-        .unwrap()
-        .join("data")
+    let test_data_root = std::env::temp_dir()
+        .join("cameodb_tests")
         .join("storage")
-        .join(test_name);
+        .join(test_name)
+        .join(Uuid::new_v4().to_string());
 
     // Clean up any existing test data
     if test_data_root.exists() {
@@ -52,7 +48,7 @@ mod tests {
         assert!(test_dir.is_dir());
         assert!(test_dir
             .to_string_lossy()
-            .contains("data/storage/test_utils_test"));
+            .contains("cameodb_tests/storage/test_utils_test"));
 
         // Cleanup
         cleanup_test_data_dir(&test_dir);

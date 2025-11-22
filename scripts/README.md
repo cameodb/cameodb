@@ -165,8 +165,8 @@ Scripts respect these environment variables when available:
 - `CAMEODB_HOST`: Default server host (default: localhost)
 
 ### Data Directories
-- **Production Data**: `./data/server/` (git-ignored)
-- **Test Data**: `/tmp/cameodb_tests/` (temporary, auto-cleanup)
+- **Production Data**: `./cameodb-data/` (git-ignored, created at runtime)
+- **Test Data**: `/tmp/cameodb_tests/` (temporary, auto-cleanup with UUID isolation)
 
 ## Contributing
 

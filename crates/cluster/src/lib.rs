@@ -25,8 +25,8 @@
 //! use cluster::{NodeIdentity, ConsistentRing};
 //! use std::path::PathBuf;
 //!
-//! // Create or load node identity (use proper test data directory in tests)
-//! let identity = NodeIdentity::load_or_create(PathBuf::from("./test_data/cluster_core/example/meta.json"))?
+//! // Create or load node identity (use appropriate data directory for your use case)
+//! let identity = NodeIdentity::load_or_create(PathBuf::from("./cameodb-data/meta.json"))?;
 //! println!("Node: {} ({})", identity.name, identity.uuid);
 //!
 //! // Set up consistent hash ring
@@ -152,8 +152,8 @@ impl NodeIdentity {
     /// use cluster::NodeIdentity;
     /// use std::path::PathBuf;
     ///
-    /// // Use centralized test data directory structure
-    /// let identity_path = PathBuf::from("./test_data/cluster_core/my_test/meta.json");
+    /// // Use appropriate data directory for your use case
+    /// let identity_path = PathBuf::from("./cameodb-data/meta.json");
     ///
     /// // First call creates new identity
     /// let identity1 = NodeIdentity::load_or_create(identity_path.clone())?;
