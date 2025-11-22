@@ -783,14 +783,7 @@ mod tests {
     #[tokio::test]
     async fn test_node_orchestrator_initialization() {
         let _guard = TestDataGuard::new("node_orchestrator_initialization");
-        let config = NodeConfig {
-            storage_path: _guard.path().clone(),
-            max_shards: 5,
-            shard_memory_budget: 20 * 1024 * 1024, // 20MB - above Tantivy's 15MB minimum
-            writer_memory_min_mb: 16,
-            writer_memory_max_mb: 64,
-            wal_sync: true,
-        };
+        let config = create_test_config(&_guard, 5);
 
         let orchestrator = NodeOrchestrator::new(config).await.unwrap();
         assert_eq!(orchestrator.shard_count(), 0);
@@ -803,14 +796,7 @@ mod tests {
     #[tokio::test]
     async fn test_propose_shard() {
         let _guard = TestDataGuard::new("propose_shard");
-        let config = NodeConfig {
-            storage_path: _guard.path().clone(),
-            max_shards: 5,
-            shard_memory_budget: 20 * 1024 * 1024, // 20MB - above Tantivy's 15MB minimum
-            writer_memory_min_mb: 16,
-            writer_memory_max_mb: 64,
-            wal_sync: true,
-        };
+        let config = create_test_config(&_guard, 5);
 
         let mut orchestrator = NodeOrchestrator::new(config).await.unwrap();
         let shard_id = uuid::Uuid::new_v4();
@@ -851,11 +837,7 @@ mod tests {
     #[tokio::test]
     async fn test_shard_limit() {
         let _guard = TestDataGuard::new("shard_limit");
-        let config = NodeConfig {
-            storage_path: _guard.path().clone(),
-            max_shards: 1,                         // Very small limit for testing
-            shard_memory_budget: 20 * 1024 * 1024, // 20MB - above Tantivy's 15MB minimum
-        };
+        let config = create_test_config(&_guard, 1); // Very small limit for testing
 
         let mut orchestrator = NodeOrchestrator::new(config).await.unwrap();
 
@@ -891,11 +873,7 @@ mod tests {
     #[tokio::test]
     async fn test_router_actor_search() {
         let _guard = TestDataGuard::new("router_actor_search");
-        let config = NodeConfig {
-            storage_path: _guard.path().clone(),
-            max_shards: 2,
-            shard_memory_budget: 20 * 1024 * 1024, // 20MB - above Tantivy's 15MB minimum
-        };
+        let config = create_test_config(&_guard, 2);
 
         let orchestrator = NodeOrchestrator::new(config).await.unwrap();
         let orchestrator = std::sync::Arc::new(tokio::sync::RwLock::new(orchestrator));
@@ -921,11 +899,7 @@ mod tests {
     #[tokio::test]
     async fn test_microshard_write_and_search() {
         let _guard = TestDataGuard::new("microshard_write_search");
-        let config = NodeConfig {
-            storage_path: _guard.path().clone(),
-            max_shards: 1,
-            shard_memory_budget: 20 * 1024 * 1024, // 20MB - above Tantivy's 15MB minimum
-        };
+        let config = create_test_config(&_guard, 1);
 
         let mut orchestrator = NodeOrchestrator::new(config).await.unwrap();
         let shard_id = uuid::Uuid::new_v4();
@@ -978,11 +952,7 @@ mod tests {
     #[tokio::test]
     async fn test_microshard_streaming_search() {
         let _guard = TestDataGuard::new("microshard_streaming");
-        let config = NodeConfig {
-            storage_path: _guard.path().clone(),
-            max_shards: 1,
-            shard_memory_budget: 20 * 1024 * 1024, // 20MB - above Tantivy's 15MB minimum
-        };
+        let config = create_test_config(&_guard, 1);
 
         let mut orchestrator = NodeOrchestrator::new(config).await.unwrap();
         let shard_id = uuid::Uuid::new_v4();
@@ -1050,11 +1020,7 @@ mod tests {
     #[tokio::test]
     async fn test_router_actor_streaming() {
         let _guard = TestDataGuard::new("router_streaming");
-        let config = NodeConfig {
-            storage_path: _guard.path().clone(),
-            max_shards: 2,
-            shard_memory_budget: 20 * 1024 * 1024, // 20MB - above Tantivy's 15MB minimum
-        };
+        let config = create_test_config(&_guard, 2);
 
         let mut orchestrator = NodeOrchestrator::new(config).await.unwrap();
 

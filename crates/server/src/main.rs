@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tracing_subscriber;

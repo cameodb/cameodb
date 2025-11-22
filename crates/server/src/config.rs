@@ -34,9 +34,6 @@ pub enum ConfigError {
     #[error("Configuration file not found: {path}")]
     FileNotFound { path: String },
 
-    #[error("Invalid configuration: {message}")]
-    Invalid { message: String },
-
     #[error("Memory configuration error: {message}")]
     MemoryConfig { message: String },
 
