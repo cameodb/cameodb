@@ -1,8 +1,8 @@
 # Distributed Hybrid-Search Database: Architecture Design Document
 
-**Version:** 1.1.0 (Tantivy-Native)
-**Status:** Approved for Implementation
+**Version:** 1.2.0
 **Stack:** Rust, Kameo (Actors), Tokio, Redb, Tantivy, Axum
+**Crates:** `server`, `storage`, `cluster`, `client`
 
 ---
 
@@ -16,7 +16,9 @@ The system is designed without a central master ("Leaderless" / "Decentralized")
 1.  **State is Emergent:** The cluster state is the aggregate of local states announced by nodes.
 2.  **Hybrid Storage:** Every shard is an atomic unit containing both KV storage and Search Indices.
 3.  **Smart Routing:** Clients participate in topology awareness; Nodes act as mesh routers.
-4.  **Unified Replication:** Migration and Rebalancing are treated as standard replication events.
+4.  **Async/Sync Isolation:** Blocking storage operations are properly isolated from async actor runtime.
+5.  **Unified Replication:** Migration and Rebalancing are treated as standard replication events.
+6.  **Serializable Search:** Search results use JSON serialization for distributed actor communication.
 
 ---
 
@@ -26,7 +28,7 @@ The system is designed without a central master ("Leaderless" / "Decentralized")
 Nodes are "Self-Sovereign." They do not request an ID from a master.
 * **UUID (v4):** The immutable, cryptographic identity of the node.
 * **Friendly Name:** A Base36 string derived from the first 2 bytes of the UUID (e.g., `7FX`).
-* **Storage:** Identity is generated on Cold Boot and persisted to `./data/node_meta.json`.
+* **Storage:** Identity is generated on Cold Boot and persisted to `./data/meta.json`.
 
 ### 2.2. The Ring (Consistent Hashing)
 To ensure uniform data distribution without coordination:
@@ -35,10 +37,11 @@ To ensure uniform data distribution without coordination:
 * **Ownership:** A key belongs to the first VNode found clockwise on the ring.
 
 ### 2.3. Cluster Discovery
-* **Mechanism:** Kameo DHT (Kademlia / Libp2p).
-* **Bootstrap:** Nodes connect to a seed list.
+* **Mechanism:** Kameo DHT (Kademlia / Libp2p) for distributed node discovery.
+* **Bootstrap:** Nodes connect to a seed list for initial cluster join.
 * **Announcement:** Nodes publish their UUID and Address to the DHT group `"cluster_nodes"`.
 * **Registry:** Each node maintains a local, eventually consistent map of the Cluster Ring based on DHT gossip.
+* **Ring Management:** Local consistent hashing with deterministic token generation.
 
 ---
 
@@ -50,10 +53,19 @@ The internal structure of a node is hierarchical, managed by the Kameo Actor Fra
 graph TD
     Entry[main.rs] -->|Spawns| Orchestrator[NodeOrchestrator Actor]
     Orchestrator -->|Spawns| API[Axum HTTP Server]
-    Orchestrator -->|Manages| Shard1[Microshard Actor <br/> UUID-A]
-    Orchestrator -->|Manages| Shard2[Microshard Actor <br/> UUID-B]
+    Orchestrator -->|Spawns| Router[RouterActor <br/> Request Distribution]
+    Orchestrator -->|Manages| Shard1[MicroshardActor <br/> UUID-A]
+    Orchestrator -->|Manages| Shard2[MicroshardActor <br/> UUID-B]
     
-    Shard1 -->|Wraps| HybridStore[HybridStorage <br/> Redb + Tantivy]
+    Router -->|Unicast/Scatter-Gather| Shard1
+    Router -->|Unicast/Scatter-Gather| Shard2
+    Shard1 -->|spawn_blocking| HybridStore1[HybridStore <br/> Redb + Tantivy]
+    Shard2 -->|spawn_blocking| HybridStore2[HybridStore <br/> Redb + Tantivy]
+    
+    subgraph "Async/Sync Boundary"
+        HybridStore1
+        HybridStore2
+    end
 ```
 
 ### 3.1. The Node Orchestrator
@@ -62,8 +74,16 @@ graph TD
 * **Lifecycle:** Handles `ProposeNewShard`, `GetStatus`, and `Shutdown` signals.
 * **Resource Guard:** Enforces `max_shards` and disk usage limits before accepting new work.
 
-### 3.2. The Microshard Actor
-* **Role:** The atomic unit of data processing.
+### 3.2. The RouterActor
+* **Role:** Request distribution and result aggregation across the cluster.
+* **Routing Logic:**
+    - **Unicast:** When `routing_key` is present, uses consistent hashing for targeted delivery to specific shard.
+    - **Scatter-Gather:** When no `routing_key`, broadcasts to all shards and aggregates results for global queries.
+* **Async Patterns:** Handles concurrent requests with proper async coordination and result serialization.
+
+### 3.3. The MicroshardActor
+* **Role:** The atomic unit of data processing with strict async/sync isolation.
+* **Threading Model:** All blocking storage operations use `tokio::task::spawn_blocking` to prevent async runtime blocking.
 * **State Machine:**
     1.  **`Hosting`:** Active Leader. Writes to local disk, streams to replicas.
     2.  **`Follower`:** Passive Replica. Applies incoming WAL streams.
@@ -91,13 +111,33 @@ Writes are durable only if committed to Redb. Tantivy is treated as a "View."
 4.  **Commit Redb.** (Data is safe).
 5.  **Update Tantivy:** Parse JSON, extract indexed fields, add to Inverted Index.
 
+**Threading Isolation:** All redb and tantivy operations are executed via `tokio::task::spawn_blocking` when called from async actors to maintain runtime performance.
+
 ### 4.2. Schema Strategy
-* **Schemaless Storage:** Redb stores the full original JSON.
-* **Dynamic Indexing:** The Ingest logic detects fields.
-    * `id` -> Primary Key (Redb).
-    * `routing_key` -> Sharding Key.
-    * `text_fields` -> Tantivy Text (Standard Tokenizer + Ngram).
-    * `numeric_fields` -> Tantivy FastField.
+* **Schemaless Storage:** Redb stores the full original JSON document for maximum flexibility.
+* **Dynamic Indexing:** The ingest pipeline automatically detects and processes field types:
+    * `id` -> Primary Key (Redb)
+    * `routing_key` -> Sharding Key for consistent hashing
+    * `text_fields` -> Tantivy Text fields with standard tokenization
+    * `numeric_fields` -> Tantivy FastField for range queries and aggregations
+
+### 4.3. Search Result Serialization
+**Design Challenge:** Tantivy documents must be serializable for distributed actor communication.
+
+**Solution:** JSON-based serialization pipeline using tantivy's native conversion:
+```rust
+// Convert tantivy documents to JSON for network transmission
+let doc: TantivyDocument = searcher.doc(doc_address)?;
+let json_string = doc.to_json(&schema);  // Native tantivy serialization
+let json_doc: JsonValue = serde_json::from_str(&json_string)?;
+// Returns Vec<(f32, JsonValue)> - fully serializable for actor messages
+```
+
+**Architecture Benefits:**
+- **Network Compatibility:** JSON format enables cross-language client support
+- **Type Safety:** Maintains Rust's type system throughout the conversion pipeline
+- **Performance:** Leverages tantivy's optimized JSON serialization
+- **Actor Integration:** `Vec<(f32, JsonValue)>` seamlessly integrates with Kameo message passing
 
 ---
 
@@ -121,15 +161,28 @@ The system exposes a RESTful API built on **Axum**. It rejects the complexity of
 
 ### 6.1. Search Endpoint
 * **Method:** `POST /api/:index/search`
-* **Body:**
+* **Request Body:**
   ```json
   {
     "query": "description:\"distributed database\" AND stars: >500",
-    "limit": 20
+    "limit": 20,
+    "routing_key": "optional_key_for_unicast"
   }
   ```
-* **Logic:** The `query` string is passed directly to the `Microshard`'s `QueryParser`.
-* **Capabilities:** Supports Boolean operators (`AND`, `OR`, `-`), Phrase queries (`"foo bar"`), Ranges (`[10 TO 20]`), and Fuzzy matching (`word~1`).
+* **Routing Architecture:**
+  - **Unicast Mode:** With `routing_key`, routes to specific shard via consistent hashing
+  - **Scatter-Gather Mode:** Without `routing_key`, broadcasts across all shards and aggregates results
+* **Response Format:**
+  ```json
+  {
+    "results": [{"_score": 0.95, "title": "...", "body": "..."}],
+    "total_results": 42,
+    "successful_shards": 3,
+    "failed_shards": 0,
+    "query": "search terms"
+  }
+  ```
+* **Query Capabilities:** Full Tantivy query language including Boolean operators (`AND`, `OR`, `-`), Phrase queries (`"foo bar"`), Range queries (`[10 TO 20]`), and Fuzzy matching (`word~1`).
 
 ### 6.2. Ingestion Endpoint
 * **Method:** `PUT /api/:index/document`
@@ -144,9 +197,96 @@ The system exposes a RESTful API built on **Axum**. It rejects the complexity of
 
 ---
 
-## 7. Resilience & Recovery
+## 7. Async/Sync Integration Architecture
 
-### 7.1. Cold Boot / Crash Recovery
+### 7.1. Threading Model: Async/Sync Isolation
+**Architectural Constraint:** `redb` and `tantivy` are blocking/synchronous libraries, while Kameo actors and Axum operate in async context.
+
+**Design Solution:** Strict isolation boundary using `tokio::task::spawn_blocking`:
+
+```rust
+// ✅ CORRECT: Actor method properly isolates blocking calls
+async fn handle_search(&self, request: SearchRequest) -> Result<Vec<(f32, JsonValue)>, Error> {
+    let store = Arc::clone(&self.store);
+    
+    // Offload blocking tantivy operations to thread pool
+    let results = tokio::task::spawn_blocking(move || {
+        store.search_documents(&request.query, request.limit)
+    }).await??;
+    
+    Ok(results) // Can be serialized and sent to other actors
+}
+
+// ❌ WRONG: This would block the entire async runtime
+async fn bad_example(&self, request: SearchRequest) -> Result<Vec<(f32, JsonValue)>, Error> {
+    self.store.search_documents(&request.query, request.limit) // BLOCKS ASYNC RUNTIME!
+}
+```
+
+### 7.2. HybridStore Thread Safety
+* **Design:** `HybridStore` implements `Arc<T> + Send + Sync` for safe sharing
+* **IndexWriter:** Protected by `Arc<Mutex<IndexWriter>>` for concurrent access
+* **Sequence Counter:** Lock-free `AtomicU64` for WAL sequence generation
+* **Pattern:** Clone `Arc<HybridStore>` into blocking tasks
+
+### 7.3. Actor Communication Patterns
+```rust
+// Scatter-gather search across multiple shards
+let mut search_tasks = Vec::new();
+for shard_id in &shard_ids {
+    let task = tokio::spawn(async move {
+        let results = shard.handle_search(search_request).await;
+        (shard_id, results)
+    });
+    search_tasks.push(task);
+}
+
+// Aggregate results from all shards
+let mut all_results = Vec::new();
+for task in search_tasks {
+    match task.await {
+        Ok((shard_id, Ok(shard_results))) => {
+            for (score, doc) in shard_results {
+                all_results.push((score, doc, shard_id));
+            }
+        }
+        Ok((shard_id, Err(e))) => warn!("Shard {} failed: {}", shard_id, e),
+        Err(e) => warn!("Task failed: {}", e),
+    }
+}
+
+// Sort by relevance score and return top results
+all_results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+all_results.truncate(limit);
+```
+
+## 8. Modular Crate Architecture
+
+### 8.1. Modular Design
+```text
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│   server    │    │   storage   │    │   client    │
+│  (actors)   │    │ (hybrid db) │    │    (sdk)    │
+└──────┬──────┘    └──────┬──────┘    └──────┬──────┘
+       │                  │                  │
+       └─────────┬────────┴──────────────────┘
+                 │
+         ┌───────▼────────┐
+         │    cluster     │
+         │ (topology &    │
+         │  routing)      │
+         └────────────────┘
+```
+
+### 8.2. Crate Responsibilities
+- **`server`:** Actor system, HTTP API, request routing, orchestration
+- **`storage`:** Hybrid storage engine (redb + tantivy), WAL, search functionality
+- **`cluster`:** Consistent hashing, node identity, topology management
+- **`client`:** SDK for application integration (planned)
+
+## 9. Resilience & Recovery
+
+### 9.1. Cold Boot / Crash Recovery
 1.  **Orchestrator** starts.
 2.  **Local Hydration:** Reads `redb` for the last committed WAL Sequence ID.
 3.  **Network Join:** Connects to DHT.
@@ -155,7 +295,7 @@ The system exposes a RESTful API built on **Axum**. It rejects the complexity of
     * If yes, opens gates for writes.
     * If no (Cluster rebalanced while dead), enters `Forwarding` mode or deletes data (based on policy).
 
-### 7.2. Zero-Downtime Migration (Soft Handoff)
+### 9.2. Zero-Downtime Migration (Soft Handoff)
 1.  **Candidate** joins as Follower.
 2.  **Sync** completes.
 3.  **Orchestrator** issues `Promote`.

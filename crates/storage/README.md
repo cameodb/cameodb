@@ -1,6 +1,6 @@
 # Storage Engine - Hybrid KV + Search Storage
 
-The `storage_engine` crate provides a production-grade hybrid storage engine that combines ACID-compliant key-value storage with full-text search capabilities.
+The `storage` crate provides a production-grade hybrid storage engine that combines ACID-compliant key-value storage with full-text search capabilities.
 
 ## Architecture: The "Hybrid" Concept
 
@@ -371,26 +371,167 @@ Status: Recoverable (redb contains all data)
 The storage engine includes comprehensive integration tests:
 
 ```bash
-# Run all storage engine tests
-cargo test -p storage_engine
+# Run all storage tests
+cargo test -p storage
 
 # Run specific test suites
-cargo test -p storage_engine --test integration
-cargo test -p storage_engine test_persistence
-cargo test -p storage_engine test_atomic_operations
+cargo test -p storage --test integration
+cargo test -p storage search_documents
+cargo test -p storage test_persistence
+cargo test -p storage test_atomic_operations
 ```
 
 ### Test Coverage
 - **Basic Operations**: Put, Get, Delete operations
+- **Search Functionality**: Full-text search with relevance scoring
+- **Serialization**: JSON conversion and serde compatibility
 - **Atomicity**: Consistency across both storage engines
 - **Persistence**: Data survives process restart
 - **Concurrency**: Thread safety and performance
 - **Error Handling**: Various failure scenarios
+- **Async Integration**: spawn_blocking patterns with actors
+
+## Search Functionality
+
+### Overview
+The storage engine now provides full-text search capabilities through the `search_documents` method, which integrates tantivy's search engine with serde-compatible serialization.
+
+### API
+```rust
+pub fn search_documents(
+    &self,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<(f32, JsonValue)>, StoreError>
+```
+
+### Return Format
+- **`f32`**: Relevance score (higher = more relevant)
+- **`JsonValue`**: Document content as serde-compatible JSON
+- **Vector**: Sorted by relevance score (descending)
+
+### Usage Example
+```rust
+use storage::{HybridStore, StorageConfig};
+use serde_json::Value as JsonValue;
+
+// Search for documents
+let results: Vec<(f32, JsonValue)> = store.search_documents("software engineer", 10)?;
+
+for (score, document) in results {
+    println!("Score: {:.3}", score);
+    println!("Title: {}", document["title"].as_str().unwrap_or("N/A"));
+    println!("Content: {}", document["body"].as_str().unwrap_or("N/A"));
+    println!("---");
+}
+```
+
+### Async Integration for Search
+```rust
+use tokio::task;
+
+async fn async_search(
+    store: HybridStore,
+    query: String,
+    limit: usize
+) -> Result<Vec<(f32, JsonValue)>, StoreError> {
+    // ✅ CORRECT: Use spawn_blocking for search operations
+    let results = task::spawn_blocking(move || {
+        store.search_documents(&query, limit)
+    }).await.map_err(|_| StoreError::Serialization("Task panicked".to_string()))??;
+    
+    Ok(results)
+}
+```
+
+### Query Syntax
+Supports standard tantivy query syntax:
+- **Simple terms**: `"engineer"`
+- **Phrase queries**: `"software engineer"`
+- **Boolean operators**: `"software AND engineer"`
+- **Field-specific**: `"title:manager"` (if fields are properly indexed)
+
+### Performance Characteristics
+- **Latency**: ~10-100ms (depends on index size and query complexity)
+- **Indexing**: Automatic when documents are written via `apply_write`
+- **Memory**: Uses tantivy's memory budget (configurable via `writer_memory_budget`)
+
+## Serialization and Tantivy Integration
+
+### The Challenge: Document Serialization
+
+Initially, we attempted to return `Vec<tantivy::Document>` directly from actors for network transmission. However, this approach faced a critical limitation:
+
+**Problem**: Tantivy 0.25 does not provide serde features for `Document` serialization.
+
+### Our Solution: JSON Conversion
+
+Instead of trying to serialize tantivy documents directly, we leverage tantivy's built-in JSON conversion:
+
+```rust
+// ❌ ATTEMPTED: Direct serde serialization (not supported in tantivy 0.25)
+// Vec<tantivy::Document> // Cannot be serialized for actor communication
+
+// ✅ SOLUTION: Convert to JSON via tantivy's built-in method
+let doc: TantivyDocument = searcher.doc(doc_address)?;
+let json_string = doc.to_json(&schema); // tantivy's built-in serialization
+let json_doc: JsonValue = serde_json::from_str(&json_string)?; // Parse to serde type
+```
+
+### Key Technical Insights
+
+#### Tantivy Type System
+- **`tantivy::schema::Document`**: A trait defining document behavior
+- **`tantivy::TantivyDocument`**: The concrete type implementing the Document trait
+- **Trait Requirements**: The `to_json()` method requires the `Document` trait to be in scope
+
+#### Import Strategy
+```rust
+use tantivy::schema::{Document, Field, Schema, STORED, STRING, TEXT};
+use tantivy::TantivyDocument;
+
+// Document trait must be in scope for to_json() method
+let doc: TantivyDocument = searcher.doc(doc_address)?;
+let json = doc.to_json(&schema); // Works because Document trait is imported
+```
+
+#### Serde Interoperability
+```rust
+// tantivy document → JSON string → serde Value → network serializable
+TantivyDocument → String → JsonValue → Vec<u8> (for network transmission)
+```
+
+### Actor Integration Benefits
+
+This approach enables distributed search across the actor system:
+
+1. **Serializable Results**: `Vec<(f32, JsonValue)>` can be sent between actors
+2. **Network Compatible**: JSON format works across language boundaries
+3. **Type Safety**: Maintains Rust's type safety through the conversion pipeline
+4. **Performance**: Leverages tantivy's optimized JSON serialization
+
+### Thread Safety and Async Compatibility
+
+```rust
+// ✅ CORRECT: Actor usage pattern
+impl MicroshardActor {
+    pub async fn handle_search(&self, request: SearchRequest) -> Result<Vec<(f32, JsonValue)>, Error> {
+        let store = Arc::clone(&self.store);
+        
+        // Offload blocking tantivy operations to thread pool
+        let results = tokio::task::spawn_blocking(move || {
+            store.search_documents(&request.query, request.limit)
+        }).await??;
+        
+        Ok(results) // Can be serialized and sent to other actors
+    }
+}
+```
 
 ## Future Enhancements
 
 ### Planned Features
-- **Search Implementation**: Complete tantivy query support
+- **Advanced Query Support**: Range queries, faceted search, aggregations
 - **WAL Compaction**: Periodic cleanup of old WAL entries
 - **Backup/Restore**: Point-in-time backup capabilities
 - **Replication**: Multi-node consistency

@@ -117,7 +117,8 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tantivy::query::QueryParserError;
-use tantivy::schema::{Field, Schema, STORED, STRING, TEXT};
+use tantivy::schema::{Document, Field, Schema, STORED, STRING, TEXT};
+use tantivy::TantivyDocument;
 use tantivy::{doc, Index, IndexWriter};
 use thiserror::Error;
 
@@ -673,10 +674,43 @@ impl HybridStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(f32, JsonValue)>, StoreError> {
-        // TODO: Fix tantivy Document type annotation issue
-        // Implementation is correct per Context7 validation, just needs type resolution
-        let _ = (query, limit);
-        Ok(vec![])
+        use tantivy::collector::TopDocs;
+        use tantivy::query::QueryParser;
+
+        let reader = self.index.reader()?;
+        let searcher = reader.searcher();
+
+        // Create query parser for all text fields
+        let text_fields: Vec<Field> = self
+            .index
+            .schema()
+            .fields()
+            .filter(|(_, field_entry)| {
+                matches!(field_entry.field_type(), tantivy::schema::FieldType::Str(_))
+            })
+            .map(|(field, _)| field)
+            .collect();
+
+        if text_fields.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let query_parser = QueryParser::for_index(&self.index, text_fields);
+        let parsed_query = query_parser.parse_query(query)?;
+
+        // Execute search with limit
+        let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(limit))?;
+
+        // Convert results to (score, JsonValue) format
+        let mut results = Vec::new();
+        for (score, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher.doc(doc_address)?;
+            let json_doc: JsonValue = serde_json::from_str(&doc.to_json(&self.index.schema()))
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            results.push((score, json_doc));
+        }
+
+        Ok(results)
     }
 
     /// Provides the underlying Tantivy schema for document serialization.

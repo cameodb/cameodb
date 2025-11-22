@@ -26,7 +26,7 @@
 //! use std::path::PathBuf;
 //!
 //! // Create or load node identity (use proper test data directory in tests)
-//! let identity = NodeIdentity::load_or_create(PathBuf::from("./test_data/cluster_core/example/node.json"))?;
+//! let identity = NodeIdentity::load_or_create(PathBuf::from("./test_data/cluster_core/example/meta.json"))?
 //! println!("Node: {} ({})", identity.name, identity.uuid);
 //!
 //! // Set up consistent hash ring
@@ -144,7 +144,7 @@ impl NodeIdentity {
     ///
     /// # Arguments
     ///
-    /// * `path` - Path to the identity file (typically `node_meta.json`)
+    /// * `path` - Path to the identity file (typically `meta.json`)
     ///
     /// # Examples
     ///
@@ -153,7 +153,7 @@ impl NodeIdentity {
     /// use std::path::PathBuf;
     ///
     /// // Use centralized test data directory structure
-    /// let identity_path = PathBuf::from("./test_data/cluster_core/my_test/node.json");
+    /// let identity_path = PathBuf::from("./test_data/cluster_core/my_test/meta.json");
     ///
     /// // First call creates new identity
     /// let identity1 = NodeIdentity::load_or_create(identity_path.clone())?;

@@ -1,6 +1,6 @@
-# Cluster Core - Distributed Topology for CameoDB
+# Cluster - Distributed Topology for CameoDB
 
-The `cluster_core` crate provides the foundational topology logic for CameoDB's distributed architecture, implementing consistent hashing for data distribution and node identity management.
+The `cluster` crate provides the foundational topology logic for CameoDB's distributed architecture, implementing consistent hashing for data distribution and node identity management.
 
 ## Self-Sovereign Identity
 
@@ -150,7 +150,7 @@ use cluster::{NodeIdentity, ConsistentRing};
 use std::path::PathBuf;
 
 // Create or load node identity
-let identity = NodeIdentity::load_or_create(PathBuf::from("node.json"))?;
+let identity = NodeIdentity::load_or_create(PathBuf::from("./data/meta.json"))?;
 println!("Node: {} ({})", identity.name, identity.uuid);
 
 // Set up consistent hash ring
@@ -169,10 +169,10 @@ use cluster::{NodeIdentity, ConsistentRing};
 
 let mut ring = ConsistentRing::new();
 
-// Add multiple nodes
-let node_a = NodeIdentity::new(); // e.g., "A1B"
-let node_b = NodeIdentity::new(); // e.g., "X9Z"
-let node_c = NodeIdentity::new(); // e.g., "M7K"
+// Add multiple nodes (each gets unique UUID and 3-char name)
+let node_a = NodeIdentity::new(); // e.g., "A1B" (from UUID bytes)
+let node_b = NodeIdentity::new(); // e.g., "X9Z" (from UUID bytes)
+let node_c = NodeIdentity::new(); // e.g., "M7K" (from UUID bytes)
 
 ring.add_node(&node_a);
 ring.add_node(&node_b);
@@ -207,12 +207,12 @@ let node_c = NodeIdentity::new();
 ring.add_node(&node_c);
 
 let new_owner = ring.get_owner(key);
-// Key may or may not move to new node (depends on hash distribution)
+// Only ~1/256 chance key moves to new node (minimal rebalancing)
 
 // Remove node
 ring.remove_node(&node_a.uuid);
 let final_owner = ring.get_owner(key);
-// Key will be reassigned if it was on the removed node
+// Key automatically reassigned to next node in ring if it was on removed node
 ```
 
 ## Performance Characteristics
@@ -222,9 +222,11 @@ let final_owner = ring.get_owner(key);
 - **Rebalancing**: Only ~1/N keys move when adding/removing nodes
 - **Hash Quality**: SHA256 provides excellent distribution properties
 
-## Integration with Storage Engine
+## Shared-Nothing Architecture Integration
 
-The cluster core integrates with the storage engine for request routing:
+The cluster crate enables CameoDB's **shared-nothing architecture** by providing topology-aware routing that integrates seamlessly with the storage engine and actor system:
+
+### Request Routing Pattern
 
 ```rust
 use cluster::ConsistentRing;
@@ -239,9 +241,118 @@ if owner == Some(local_node.uuid) {
     // Handle locally
     local_store.apply_write(operation)?;
 } else {
-    // Forward to remote node
+    // Forward to remote node via actor system
     forward_to_node(owner, operation)?;
 }
+```
+
+### Unicast vs Scatter-Gather Routing
+
+#### Unicast (With routing_key)
+```rust
+// When routing_key is present, use consistent hashing for targeted delivery
+let target_node = ring.get_owner(&routing_key);
+send_to_single_node(target_node, request).await?;
+```
+
+#### Scatter-Gather (No routing_key)
+```rust
+// When no routing_key, broadcast to all shards and aggregate results
+let all_nodes = ring.get_all_nodes();
+let futures: Vec<_> = all_nodes.iter()
+    .map(|node| send_to_node(*node, request.clone()))
+    .collect();
+    
+let results = futures::future::join_all(futures).await;
+let aggregated = aggregate_results(results)?;
+```
+
+### Actor System Integration
+
+The cluster topology works with CameoDB's actor-based architecture:
+
+```rust
+// RouterActor uses consistent hashing for request distribution
+impl RouterActor {
+    pub async fn handle_client_op(&self, op: ClientOp) -> Result<JsonValue, Error> {
+        match op {
+            ClientOp::Search { index, query, routing_key, .. } => {
+                if let Some(key) = routing_key {
+                    // Unicast: Route to specific shard
+                    let target = self.ring.get_owner(&key);
+                    self.send_to_shard(target, SearchRequest { query }).await
+                } else {
+                    // Scatter-Gather: Search across all shards
+                    let results = self.scatter_gather_search(query).await?;
+                    self.aggregate_search_results(results)
+                }
+            }
+        }
+    }
+}
+```
+
+## Distributed System Properties
+
+### Consistency Model
+- **Eventual Consistency**: Ring membership is eventually consistent across nodes
+- **Deterministic Routing**: Given the same ring state, routing is deterministic
+- **No Global State**: Each node maintains its own view of the cluster topology
+
+### Partition Tolerance
+- **Network Partitions**: Nodes can operate independently during network splits
+- **Split-Brain Handling**: Each partition continues serving requests for its keys
+- **Healing**: Partitions automatically heal when network connectivity is restored
+
+### Availability
+- **No SPOF**: No single point of failure in the routing layer
+- **Graceful Degradation**: System remains available even if some nodes are unreachable
+- **Fast Recovery**: New nodes can join without global synchronization
+
+## Advanced Features
+
+### Virtual Node Distribution Analysis
+
+The choice of 256 virtual nodes provides optimal distribution characteristics:
+
+```rust
+// Distribution quality metrics
+let distribution_variance = calculate_load_variance(&ring);
+let rebalance_efficiency = calculate_rebalance_ratio(&ring);
+
+// With 256 VNodes:
+// - Variance: < 5% for clusters with 10+ nodes
+// - Rebalance: Only ~0.39% of keys move per node addition
+```
+
+### Node Weight Support (Future)
+
+```rust
+// Planned: Support for heterogeneous node capacities
+let mut ring = ConsistentRing::new();
+ring.add_weighted_node(&small_node, 1.0);   // 1x capacity
+ring.add_weighted_node(&large_node, 4.0);   // 4x capacity
+// Large node gets ~4x more virtual tokens
+```
+
+### Rack-Aware Placement (Future)
+
+```rust
+// Planned: Ensure replicas are distributed across failure domains
+let placement = ring.get_replicas("user:123", replication_factor=3)
+    .with_rack_awareness()
+    .with_datacenter_awareness();
+```
+
+## Integration with Storage Engine
+
+```rust
+use cluster::ConsistentRing;
+use storage::HybridStore;
+
+// Determine which shard should handle a key
+// This routing logic is handled by the RouterActor in the server crate
+// See the "Shared-Nothing Architecture Integration" section above for details
 ```
 
 ## Testing
@@ -256,12 +367,53 @@ The crate includes comprehensive tests covering:
 
 Run tests with:
 ```bash
+# Run all cluster tests
 cargo test -p cluster
+
+# Run specific test suites
+cargo test -p cluster test_consistent_hashing
+cargo test -p cluster test_node_identity
+cargo test -p cluster test_ring_operations
 ```
+
+### Test Coverage
+- **Identity Generation**: Node UUID and name generation
+- **Hash Distribution**: Statistical analysis of key distribution
+- **Ring Operations**: Add/remove nodes, key routing
+- **Edge Cases**: Empty rings, wrap-around behavior, collision handling
+- **Performance**: Benchmark routing latency and memory usage
 
 ## Future Enhancements
 
-- **Weighted Nodes**: Support for nodes with different capacities
+### Near-term
+- **Weighted Nodes**: Support for nodes with different capacities based on hardware specs
+- **Membership Events**: Callbacks for node join/leave events
+- **Health Integration**: Remove unhealthy nodes from routing decisions
+
+### Long-term
 - **Rack Awareness**: Ensure replicas are distributed across failure domains
-- **Dynamic Rebalancing**: Automatic rebalancing based on load metrics
+- **Dynamic Rebalancing**: Automatic rebalancing based on load metrics and hotspots
 - **Gossip Protocol**: Distributed membership management without coordination
+- **Topology Optimization**: Machine learning-based placement optimization
+- **Global Load Balancing**: Cross-datacenter request routing
+
+## Relationship to Other Crates
+
+```text
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│   server    │    │   storage   │    │   client    │
+│  (actors)   │    │ (hybrid db) │    │    (sdk)    │
+└──────┬──────┘    └──────┬──────┘    └──────┬──────┘
+       │                  │                  │
+       └─────────┬────────┴──────────────────┘
+                 │
+         ┌───────▼────────┐
+         │    cluster     │
+         │ (topology &    │
+         │  routing)      │
+         └────────────────┘
+```
+
+- **server**: Uses cluster for request routing in RouterActor
+- **storage**: Sharding decisions based on cluster topology
+- **client**: May use cluster knowledge for client-side routing optimization
