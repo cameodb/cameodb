@@ -95,11 +95,11 @@ cors_enabled = true
 
 ```toml
 [server.node]
-# Maximum number of shards this node can host (default: 10)
-max_shards = 10
+# Maximum number of shards this node can host (default: 8)
+max_shards = 8
 
-# Memory budget per shard in MB (default: 50)
-writer_memory_default_mb = 50
+# Default writer memory per shard in MB (default: 32)
+writer_memory_default_mb = 32
 ```
 
 ### Storage Configuration

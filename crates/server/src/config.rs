@@ -423,10 +423,10 @@ fn default_cors_enabled() -> bool {
 }
 
 fn default_max_shards() -> usize {
-    10
+    8
 }
 fn default_writer_memory_default_mb() -> usize {
-    50
+    32
 }
 
 fn default_disk_usage_threshold() -> f64 {

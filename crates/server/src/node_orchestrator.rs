@@ -54,10 +54,10 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             storage_path: PathBuf::from("./cameodb-data"),
-            max_shards: 10,
+            max_shards: 8,
             writer_memory_min_mb: 16,
             writer_memory_max_mb: 256,
-            writer_memory_default_mb: 50,
+            writer_memory_default_mb: 32,
             wal_sync: true,
         }
     }

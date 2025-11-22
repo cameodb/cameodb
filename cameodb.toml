@@ -6,8 +6,8 @@ max_body_size_mb = 20
 cors_enabled = true
 
 [server.node]
-max_shards = 10
-writer_memory_default_mb = 50
+max_shards = 8
+writer_memory_default_mb = 32
 
 [storage]
 data_paths = ["./cameodb-data"]
