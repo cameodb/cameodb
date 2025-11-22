@@ -112,6 +112,12 @@ pub enum ClientOp {
     },
     /// Streaming search operation across shards of an index
     Stream { index: String, query: String },
+    /// Write operation to store a document
+    Write {
+        index: String,
+        id: String,
+        doc: JsonValue,
+    },
 }
 
 /// Microshard actor that manages a single shard's storage and search operations.
@@ -302,6 +308,7 @@ impl MicroshardActor {
 
 /// Router actor that handles client operations and distributes them across shards.
 #[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone)]
 pub struct RouterActor {
     orchestrator: std::sync::Arc<tokio::sync::RwLock<NodeOrchestrator>>,
 }
@@ -333,6 +340,41 @@ impl RouterActor {
                     "query": query
                 }))
             }
+            ClientOp::Write { index, id, doc } => self.handle_write(&index, id, doc).await,
+        }
+    }
+
+    /// Handles write operations by routing to an appropriate shard.
+    async fn handle_write(
+        &self,
+        _index: &str,
+        id: String,
+        doc: JsonValue,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let orchestrator = self.orchestrator.read().await;
+
+        // For simplicity, write to the first available shard
+        // In a full implementation, this would use consistent hashing
+        if let Some((shard_id, shard)) = orchestrator.shards.iter().next() {
+            let write_request = WriteRequest {
+                id: id.clone(),
+                doc,
+            };
+
+            match shard.handle_write(write_request).await {
+                Ok(seq_id) => Ok(serde_json::json!({
+                    "id": id,
+                    "result": "created",
+                    "version": seq_id,
+                    "shard_id": shard_id.to_string()
+                })),
+                Err(e) => Err(e),
+            }
+        } else {
+            Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards available for write operation",
+            )))
         }
     }
 
@@ -670,28 +712,23 @@ mod tests {
 
     impl TestDataGuard {
         fn new(test_name: &str) -> Self {
-            // Find workspace root by going up from current crate directory
-            let workspace_root =
-                std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-
-            let data_dir = PathBuf::from(workspace_root)
-                .parent() // Go up from crates/server to crates/
-                .unwrap()
-                .parent() // Go up from crates/ to workspace root
-                .unwrap()
-                .join("data")
-                .join("server")
-                .join(test_name);
+            // Use system temp directory for test data instead of production data directory
+            let temp_base = std::env::temp_dir()
+                .join("cameodb_tests")
+                .join(test_name)
+                .join(uuid::Uuid::new_v4().to_string()); // Add UUID for unique test runs
 
             // Clean up any existing test data
-            if data_dir.exists() {
-                std::fs::remove_dir_all(&data_dir).expect("Failed to remove existing test data");
+            if temp_base.exists() {
+                std::fs::remove_dir_all(&temp_base).expect("Failed to remove existing test data");
             }
 
             // Create the test directory
-            std::fs::create_dir_all(&data_dir).expect("Failed to create test data directory");
+            std::fs::create_dir_all(&temp_base).expect("Failed to create test data directory");
 
-            Self { data_dir }
+            Self {
+                data_dir: temp_base,
+            }
         }
 
         fn path(&self) -> &PathBuf {
