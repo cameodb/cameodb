@@ -81,6 +81,11 @@ Thumbs.db
 *.tmp
 *.temp
 
+# Scripts are committed but their logs/outputs are ignored
+!/scripts/
+scripts/**/*.log
+scripts/**/*.tmp
+
 # Environment and configuration
 .env
 .env.local
