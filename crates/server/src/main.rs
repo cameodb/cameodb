@@ -9,7 +9,7 @@ mod node_orchestrator;
 
 use config::CameoDbConfig;
 use http_server::{create_router, AppState};
-use node_orchestrator::{NodeConfig, NodeOrchestrator, RouterActor};
+use node_orchestrator::{NodeConfig, NodeOrchestrator, ProposeShard, RouterActor};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -37,7 +37,22 @@ async fn main() -> Result<()> {
     };
 
     // Create the NodeOrchestrator
-    let orchestrator = NodeOrchestrator::new(node_config).await?;
+    let mut orchestrator = NodeOrchestrator::new(node_config).await?;
+
+    // Initialize default shards on first boot if none exist
+    let init_shards = cameodb_config.server.node.init_shards;
+    if orchestrator.shard_count() == 0 && init_shards > 0 {
+        for _ in 0..init_shards {
+            let shard_id = uuid::Uuid::new_v4();
+            if let Err(err) = orchestrator
+                .handle_propose_shard(ProposeShard { shard_id })
+                .await
+            {
+                tracing::warn!(%shard_id, %err, "Failed to create initial shard");
+            }
+        }
+        println!("Initialized {} shards", init_shards);
+    }
 
     println!("NodeOrchestrator started successfully");
     println!(

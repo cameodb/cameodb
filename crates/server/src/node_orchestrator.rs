@@ -19,7 +19,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    Arc,
+};
 
 use anyhow::Result;
 use futures::stream::StreamExt;
@@ -30,7 +33,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use cluster::{IdentityError, NodeIdentity};
+use cluster::{generate_tokens, ConsistentRing, IdentityError, NodeIdentity};
 use serde_json::Value as JsonValue;
 use storage::{HybridStore, StorageConfig, StoreError, WalOp};
 
@@ -120,10 +123,11 @@ pub enum ClientOp {
     },
     /// Streaming search operation across shards of an index
     Stream { index: String, query: String },
-    /// Write operation to store a document
+    /// Write operation to insert/update a document
     Write {
         index: String,
         id: String,
+        routing_key: Option<String>,
         doc: JsonValue,
     },
 }
@@ -348,7 +352,12 @@ impl RouterActor {
                     "query": query
                 }))
             }
-            ClientOp::Write { index, id, doc } => self.handle_write(&index, id, doc).await,
+            ClientOp::Write {
+                index,
+                id,
+                routing_key,
+                doc,
+            } => self.handle_write(&index, id, routing_key, doc).await,
         }
     }
 
@@ -357,32 +366,54 @@ impl RouterActor {
         &self,
         _index: &str,
         id: String,
+        routing_key: Option<String>,
         doc: JsonValue,
     ) -> Result<JsonValue, OrchestratorError> {
         let orchestrator = self.orchestrator.read().await;
 
-        // For simplicity, write to the first available shard
-        // In a full implementation, this would use consistent hashing
-        if let Some((shard_id, shard)) = orchestrator.shards.iter().next() {
-            let write_request = WriteRequest {
-                id: id.clone(),
-                doc,
-            };
-
-            match shard.handle_write(write_request).await {
-                Ok(seq_id) => Ok(serde_json::json!({
-                    "id": id,
-                    "result": "created",
-                    "version": seq_id,
-                    "shard_id": shard_id.to_string()
-                })),
-                Err(e) => Err(e),
-            }
-        } else {
-            Err(OrchestratorError::Io(std::io::Error::new(
+        if orchestrator.shards.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "No shards available for write operation",
-            )))
+            )));
+        }
+
+        let target_shard_id = if let Some(ref routing_key) = routing_key {
+            // Use consistent hashing when routing_key is provided
+            orchestrator
+                .select_shard_for_key(routing_key)
+                .or_else(|| orchestrator.first_shard_id())
+        } else {
+            // Use round-robin distribution when no routing_key
+            (*orchestrator).select_shard_round_robin()
+        }
+        .ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Unable to select shard for write operation",
+            ))
+        })?;
+
+        let shard = orchestrator.shards.get(&target_shard_id).ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Selected shard not found for write operation",
+            ))
+        })?;
+
+        let write_request = WriteRequest {
+            id: id.clone(),
+            doc,
+        };
+
+        match shard.handle_write(write_request).await {
+            Ok(seq_id) => Ok(serde_json::json!({
+                "id": id,
+                "result": "created",
+                "version": seq_id,
+                "shard_id": target_shard_id.to_string()
+            })),
+            Err(e) => Err(e),
         }
     }
 
@@ -557,6 +588,10 @@ pub struct NodeOrchestrator {
     identity: NodeIdentity,
     /// Node configuration  
     config: NodeConfig,
+    /// Consistent hash ring for routing writes based on routing keys
+    routing_ring: ConsistentRing,
+    /// Round-robin counter for writes without routing key
+    round_robin_counter: AtomicUsize,
 }
 
 impl NodeOrchestrator {
@@ -575,6 +610,8 @@ impl NodeOrchestrator {
             shards: HashMap::new(),
             identity,
             config,
+            routing_ring: ConsistentRing::new(),
+            round_robin_counter: AtomicUsize::new(0),
         };
 
         // Discover and hydrate existing shards
@@ -600,6 +637,7 @@ impl NodeOrchestrator {
             match microshard.start().await {
                 Ok(()) => {
                     self.shards.insert(shard_id, microshard);
+                    self.register_shard_for_routing(shard_id);
                     info!("Hydrated shard {}", shard_id);
                 }
                 Err(e) => {
@@ -697,6 +735,7 @@ impl NodeOrchestrator {
 
         // Add to shards map
         self.shards.insert(shard_id, microshard);
+        self.register_shard_for_routing(shard_id);
 
         info!(
             "Successfully created shard {} ({}/{})",
@@ -710,6 +749,42 @@ impl NodeOrchestrator {
     /// Gets the node identity.
     pub fn identity(&self) -> &NodeIdentity {
         &self.identity
+    }
+
+    /// Registers a shard with the routing ring for consistent hashing.
+    fn register_shard_for_routing(&mut self, shard_id: Uuid) {
+        let simple = shard_id.simple().to_string();
+        let name: String = simple.chars().take(3).collect();
+        let identity = NodeIdentity {
+            uuid: shard_id,
+            name,
+            vnode_tokens: generate_tokens(shard_id),
+        };
+        self.routing_ring.add_node(&identity);
+    }
+
+    /// Determines the shard that should handle a routing key.
+    fn select_shard_for_key(&self, key: &str) -> Option<Uuid> {
+        self.routing_ring.get_owner(key)
+    }
+
+    /// Returns the first shard id if any exist (fallback for empty ring).
+    fn first_shard_id(&self) -> Option<Uuid> {
+        self.shards.keys().copied().next()
+    }
+
+    /// Selects a shard using round-robin distribution.
+    fn select_shard_round_robin(&self) -> Option<Uuid> {
+        if self.shards.is_empty() {
+            return None;
+        }
+
+        let shard_ids: Vec<Uuid> = self.shards.keys().copied().collect();
+        let index = self
+            .round_robin_counter
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            % shard_ids.len();
+        Some(shard_ids[index])
     }
 
     /// Gets the number of active shards.

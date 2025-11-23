@@ -71,6 +71,8 @@ pub struct SearchPayload {
 #[derive(Debug, Deserialize)]
 pub struct DocPayload {
     pub id: String,
+    #[serde(default)]
+    pub routing_key: Option<String>,
     pub doc: JsonValue,
 }
 
@@ -187,10 +189,17 @@ async fn write_handler(
 ) -> Result<Json<JsonValue>, ApiError> {
     info!("Write request - index: {}, doc_id: {}", index, payload.id);
 
+    let DocPayload {
+        id,
+        routing_key,
+        doc,
+    } = payload;
+
     let client_op = ClientOp::Write {
         index,
-        id: payload.id,
-        doc: payload.doc,
+        id,
+        routing_key,
+        doc,
     };
 
     let result = state.router.handle_client_op(client_op).await?;

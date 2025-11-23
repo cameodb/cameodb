@@ -101,6 +101,11 @@ pub struct NodeConfig {
     /// Default writer memory per shard in MB (default: 50)
     #[serde(default = "default_writer_memory_default_mb")]
     pub writer_memory_default_mb: usize,
+
+    /// If no shards exist on first startup, create this many shards (default: 4)
+    /// Set to 0 to disable automatic initialization.
+    #[serde(default = "default_init_shards")]
+    pub init_shards: usize,
 }
 
 /// Storage configuration for data persistence
@@ -377,6 +382,7 @@ impl Default for NodeConfig {
         Self {
             max_shards: default_max_shards(),
             writer_memory_default_mb: default_writer_memory_default_mb(),
+            init_shards: default_init_shards(),
         }
     }
 }
@@ -427,6 +433,9 @@ fn default_max_shards() -> usize {
 }
 fn default_writer_memory_default_mb() -> usize {
     32
+}
+fn default_init_shards() -> usize {
+    4
 }
 
 fn default_disk_usage_threshold() -> f64 {
