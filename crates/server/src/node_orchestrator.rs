@@ -104,11 +104,26 @@ pub struct SearchStream {
     pub query_string: String,
 }
 
+/// Document payload for write operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocPayload {
+    pub id: String,
+    #[serde(default)]
+    pub routing_key: Option<String>,
+    pub doc: JsonValue,
+}
+
 /// Write request message for MicroshardActor.
 #[derive(Debug, Clone)]
 pub struct WriteRequest {
     pub id: String,
     pub doc: JsonValue,
+}
+
+/// Batch write request message for MicroshardActor.
+#[derive(Debug, Clone)]
+pub struct BatchWriteRequest {
+    pub ops: Vec<ClientOp>,
 }
 
 /// Client operation messages for RouterActor.
@@ -130,9 +145,15 @@ pub enum ClientOp {
         routing_key: Option<String>,
         doc: JsonValue,
     },
+    /// Bulk write operation to insert/update multiple documents
+    BulkWrite {
+        index: String,
+        docs: Vec<DocPayload>,
+    },
 }
 
 /// Microshard actor that manages a single shard's storage and search operations.
+#[derive(Clone)]
 pub struct MicroshardActor {
     shard_id: Uuid,
     store: Option<Arc<HybridStore>>,
@@ -316,6 +337,80 @@ impl MicroshardActor {
 
         Ok(seq_id)
     }
+
+    /// Handles batch write requests with spawn_blocking to avoid blocking the actor thread.
+    pub async fn handle_batch_write(
+        &self,
+        request: BatchWriteRequest,
+    ) -> Result<Vec<u64>, OrchestratorError> {
+        let store = self.store.as_ref().ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "HybridStore not initialized",
+            ))
+        })?;
+
+        let store = Arc::clone(store);
+        let ops = request.ops;
+
+        // Convert ClientOp to WalOp for each operation
+        let mut wal_ops = Vec::new();
+        for op in ops {
+            match op {
+                ClientOp::Write { id, doc, .. } => {
+                    // Map document to WalOp::Put with proper body and json_blob mapping
+                    let (body, json_blob) = match &doc {
+                        JsonValue::Object(obj) => {
+                            // Extract body field if present, otherwise use entire doc as body
+                            let body = obj
+                                .get("body")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&doc.to_string())
+                                .to_string();
+
+                            // Store entire doc as json_blob for structured queries
+                            (body, Some(doc.clone()))
+                        }
+                        JsonValue::String(s) => {
+                            // If doc is just a string, use it as body
+                            (s.clone(), None)
+                        }
+                        _ => {
+                            // For other types, convert to string for body and store as json_blob
+                            (doc.to_string(), Some(doc.clone()))
+                        }
+                    };
+
+                    wal_ops.push(WalOp::Put {
+                        id,
+                        body,
+                        json_blob,
+                    });
+                }
+                _ => {
+                    // For now, only support Write operations in batch
+                    return Err(OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Only Write operations are supported in batch requests",
+                    )));
+                }
+            }
+        }
+
+        // Use spawn_blocking to execute batch write on blocking thread pool
+        let seq_ids = tokio::task::spawn_blocking(move || store.apply_batch(wal_ops))
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .map_err(|e: StoreError| match e {
+                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
+                _ => OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )),
+            })?;
+
+        Ok(seq_ids)
+    }
 }
 
 /// Router actor that handles client operations and distributes them across shards.
@@ -358,6 +453,7 @@ impl RouterActor {
                 routing_key,
                 doc,
             } => self.handle_write(&index, id, routing_key, doc).await,
+            ClientOp::BulkWrite { index, docs } => self.handle_bulk_write(&index, docs).await,
         }
     }
 
@@ -415,6 +511,126 @@ impl RouterActor {
             })),
             Err(e) => Err(e),
         }
+    }
+
+    /// Handles bulk write operations using binning strategy for optimal distribution.
+    async fn handle_bulk_write(
+        &self,
+        _index: &str,
+        docs: Vec<DocPayload>,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let orchestrator = self.orchestrator.read().await;
+
+        if orchestrator.shards.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards available for bulk write operation",
+            )));
+        }
+
+        // Binning Strategy: Group documents by target shard
+        let mut batches: std::collections::HashMap<Uuid, Vec<ClientOp>> =
+            std::collections::HashMap::new();
+
+        for doc_payload in docs {
+            let routing_key = doc_payload.routing_key.as_ref().unwrap_or(&doc_payload.id);
+
+            // Determine target shard using consistent hashing or round-robin
+            let target_shard_id = orchestrator
+                .select_shard_for_key(routing_key)
+                .or_else(|| orchestrator.first_shard_id())
+                .ok_or_else(|| {
+                    OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Unable to select shard for bulk write operation",
+                    ))
+                })?;
+
+            // Convert DocPayload to ClientOp::Write
+            let client_op = ClientOp::Write {
+                index: _index.to_string(),
+                id: doc_payload.id,
+                routing_key: doc_payload.routing_key,
+                doc: doc_payload.doc,
+            };
+
+            // Add to the batch for this shard
+            batches
+                .entry(target_shard_id)
+                .or_insert_with(Vec::new)
+                .push(client_op);
+        }
+
+        // Collect shard references before spawning tasks
+        let mut shard_batches = Vec::new();
+        for (shard_id, ops) in batches {
+            if let Some(shard) = orchestrator.shards.get(&shard_id) {
+                shard_batches.push((shard_id, shard.clone(), ops));
+            } else {
+                return Err(OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Shard {} not found for bulk write operation", shard_id),
+                )));
+            }
+        }
+
+        drop(orchestrator); // Release read lock early
+
+        // Parallel Dispatch: Send BatchWriteRequest to each shard
+        let mut batch_tasks = Vec::new();
+
+        for (shard_id, shard, ops) in shard_batches {
+            let batch_request = BatchWriteRequest { ops };
+
+            let task = tokio::spawn(async move { shard.handle_batch_write(batch_request).await });
+
+            batch_tasks.push((shard_id, task));
+        }
+
+        // Gather results from all shards
+        let mut total_indexed = 0;
+        let mut successful_shards = 0;
+        let mut failed_shards = 0;
+        let mut shard_results = Vec::new();
+
+        for (shard_id, task) in batch_tasks {
+            match task.await {
+                Ok(Ok(seq_ids)) => {
+                    successful_shards += 1;
+                    total_indexed += seq_ids.len();
+                    shard_results.push(serde_json::json!({
+                        "shard_id": shard_id.to_string(),
+                        "items_indexed": seq_ids.len(),
+                        "status": "success"
+                    }));
+                }
+                Ok(Err(e)) => {
+                    failed_shards += 1;
+                    warn!("Shard {} bulk write failed: {}", shard_id, e);
+                    shard_results.push(serde_json::json!({
+                        "shard_id": shard_id.to_string(),
+                        "status": "failed",
+                        "error": e.to_string()
+                    }));
+                }
+                Err(e) => {
+                    failed_shards += 1;
+                    warn!("Shard {} bulk write task failed: {}", shard_id, e);
+                    shard_results.push(serde_json::json!({
+                        "shard_id": shard_id.to_string(),
+                        "status": "failed",
+                        "error": format!("Task execution failed: {}", e)
+                    }));
+                }
+            }
+        }
+
+        Ok(serde_json::json!({
+            "items_indexed": total_indexed,
+            "successful_shards": successful_shards,
+            "failed_shards": failed_shards,
+            "shard_results": shard_results
+        }))
     }
 
     /// Handles streaming client operations and returns a combined stream.

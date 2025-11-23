@@ -20,7 +20,7 @@ use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{error, info};
 
-use crate::node_orchestrator::{ClientOp, NodeOrchestrator, RouterActor};
+use crate::node_orchestrator::{ClientOp, DocPayload, NodeOrchestrator, RouterActor};
 
 /// API Error wrapper for consistent error handling
 #[derive(Debug)]
@@ -67,15 +67,6 @@ pub struct SearchPayload {
     pub limit: Option<usize>,
 }
 
-/// Document write payload
-#[derive(Debug, Deserialize)]
-pub struct DocPayload {
-    pub id: String,
-    #[serde(default)]
-    pub routing_key: Option<String>,
-    pub doc: JsonValue,
-}
-
 /// Health check response
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -98,6 +89,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/:index/search", post(search_handler))
         .route("/api/:index/stream", post(stream_handler))
         .route("/api/:index/document", put(write_handler))
+        .route("/api/:index/_bulk", post(bulk_write_handler))
         // Health check
         .route("/_cluster/health", get(health_handler))
         .with_state(state)
@@ -201,6 +193,24 @@ async fn write_handler(
         routing_key,
         doc,
     };
+
+    let result = state.router.handle_client_op(client_op).await?;
+    Ok(Json(result))
+}
+
+/// Handler for bulk write operations
+async fn bulk_write_handler(
+    Path(index): Path<String>,
+    State(state): State<AppState>,
+    Json(docs): Json<Vec<DocPayload>>,
+) -> Result<Json<JsonValue>, ApiError> {
+    info!(
+        "Bulk write request - index: {}, docs: {}",
+        index,
+        docs.len()
+    );
+
+    let client_op = ClientOp::BulkWrite { index, docs };
 
     let result = state.router.handle_client_op(client_op).await?;
     Ok(Json(result))
