@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use cluster::{generate_tokens, ConsistentRing, IdentityError, NodeIdentity};
 use serde_json::Value as JsonValue;
-use storage::{HybridStore, StorageConfig, StoreError, WalOp};
+use storage::{FieldDef, HybridStore, IndexSchema, StorageConfig, StoreError, WalOp};
 
 /// Configuration for a CameoDB node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +94,7 @@ pub struct ProposeShard {
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
+    pub index: String,
     pub query_string: String,
     pub limit: usize,
 }
@@ -101,6 +102,7 @@ pub struct SearchRequest {
 /// Search stream request message for MicroshardActor.
 #[derive(Debug, Clone)]
 pub struct SearchStream {
+    pub index: String,
     pub query_string: String,
 }
 
@@ -116,6 +118,7 @@ pub struct DocPayload {
 /// Write request message for MicroshardActor.
 #[derive(Debug, Clone)]
 pub struct WriteRequest {
+    pub index: String,
     pub id: String,
     pub doc: JsonValue,
 }
@@ -150,6 +153,10 @@ pub enum ClientOp {
         index: String,
         docs: Vec<DocPayload>,
     },
+    /// Create or update index configuration/schema
+    CreateConfig { index: String, schema: IndexSchema },
+    /// Get index configuration/schema
+    GetConfig { index: String },
 }
 
 /// Microshard actor that manages a single shard's storage and search operations.
@@ -222,16 +229,20 @@ impl MicroshardActor {
         let limit = request.limit;
 
         // Use spawn_blocking to execute search on blocking thread pool
-        let results = tokio::task::spawn_blocking(move || store.search_documents(&query, limit))
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
-            .map_err(|e: StoreError| match e {
-                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
-                _ => OrchestratorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )),
-            })?;
+        let index = request.index.clone();
+        let results =
+            tokio::task::spawn_blocking(move || store.search_documents(&index, &query, limit))
+                .await
+                .map_err(|e| {
+                    OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                })?
+                .map_err(|e: StoreError| match e {
+                    StoreError::Io(io_err) => OrchestratorError::Io(io_err),
+                    _ => OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    )),
+                })?;
 
         Ok(results)
     }
@@ -250,6 +261,7 @@ impl MicroshardActor {
 
         let store = Arc::clone(store);
         let query = request.query_string;
+        let index = request.index;
 
         // Create channel for streaming results
         let (tx, rx) = mpsc::channel::<Vec<(f32, JsonValue)>>(100);
@@ -258,7 +270,7 @@ impl MicroshardActor {
         tokio::task::spawn_blocking(move || {
             // For now, we'll simulate streaming by chunking a large search result
             // In a real implementation, this would use tantivy's streaming search capabilities
-            match store.search_documents(&query, 1000) {
+            match store.search_documents(&index, &query, 1000) {
                 // Get more results for chunking
                 Ok(results) => {
                     // Send results in chunks of 50
@@ -324,7 +336,8 @@ impl MicroshardActor {
         };
 
         // Use spawn_blocking to execute write on blocking thread pool
-        let seq_id = tokio::task::spawn_blocking(move || store.apply_write(op))
+        let index = request.index.clone();
+        let seq_id = tokio::task::spawn_blocking(move || store.apply_write(&index, op))
             .await
             .map_err(|e| OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
             .map_err(|e: StoreError| match e {
@@ -353,11 +366,13 @@ impl MicroshardActor {
         let store = Arc::clone(store);
         let ops = request.ops;
 
-        // Convert ClientOp to WalOp for each operation
-        let mut wal_ops = Vec::new();
+        // Group operations by index
+        let mut ops_by_index: std::collections::HashMap<String, Vec<WalOp>> =
+            std::collections::HashMap::new();
+
         for op in ops {
             match op {
-                ClientOp::Write { id, doc, .. } => {
+                ClientOp::Write { index, id, doc, .. } => {
                     // Map document to WalOp::Put with proper body and json_blob mapping
                     let (body, json_blob) = match &doc {
                         JsonValue::Object(obj) => {
@@ -381,11 +396,16 @@ impl MicroshardActor {
                         }
                     };
 
-                    wal_ops.push(WalOp::Put {
+                    let wal_op = WalOp::Put {
                         id,
                         body,
                         json_blob,
-                    });
+                    };
+
+                    ops_by_index
+                        .entry(index)
+                        .or_insert_with(Vec::new)
+                        .push(wal_op);
                 }
                 _ => {
                     // For now, only support Write operations in batch
@@ -398,19 +418,124 @@ impl MicroshardActor {
         }
 
         // Use spawn_blocking to execute batch write on blocking thread pool
-        let seq_ids = tokio::task::spawn_blocking(move || store.apply_batch(wal_ops))
+        let all_seq_ids = tokio::task::spawn_blocking(move || {
+            let mut all_results = Vec::new();
+            for (index, wal_ops) in ops_by_index {
+                let seq_ids = store.apply_batch(&index, wal_ops)?;
+                all_results.extend(seq_ids);
+            }
+            Ok::<Vec<u64>, StoreError>(all_results)
+        })
+        .await
+        .map_err(|e| OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+        .map_err(|e: StoreError| match e {
+            StoreError::Io(io_err) => OrchestratorError::Io(io_err),
+            _ => OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            )),
+        })?;
+
+        Ok(all_seq_ids)
+    }
+}
+
+/// Validates and evolves schema for a document.
+///
+/// This function implements schema validation and evolution logic:
+/// 1. Ensures the document has an "id" field (mandatory)
+/// 2. Checks type compatibility for existing fields
+/// 3. Adds new fields to the schema (append-only evolution)
+/// 4. Persists schema updates to storage
+///
+/// # Arguments
+///
+/// * `index` - The index name
+/// * `doc` - The document to validate
+/// * `schema_cache` - Mutable reference to the cached schema
+/// * `store` - Reference to the storage engine for persistence
+///
+/// # Returns
+///
+/// `Ok(())` if validation passes, `Err` if validation fails
+async fn validate_and_evolve_schema(
+    index: &str,
+    doc: &JsonValue,
+    schema_cache: &mut IndexSchema,
+    store: &Arc<HybridStore>,
+) -> Result<(), OrchestratorError> {
+    // Check 1 (Mandatory): Ensure doc["id"] exists
+    if !doc.is_object() || !doc.as_object().unwrap().contains_key("id") {
+        return Err(OrchestratorError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Document must contain an 'id' field",
+        )));
+    }
+
+    let mut schema_updated = false;
+
+    // Check 2 (Evolution): Iterate keys in doc
+    if let Some(obj) = doc.as_object() {
+        for (key, value) in obj {
+            let inferred_type = match value {
+                JsonValue::String(_) => "text",
+                JsonValue::Number(_) => "number",
+                JsonValue::Bool(_) => "boolean",
+                JsonValue::Array(_) => "array",
+                JsonValue::Object(_) => "object",
+                JsonValue::Null => "null",
+            };
+
+            if let Some(existing_field) = schema_cache.fields.get(key) {
+                // Check type compatibility
+                if existing_field.field_type != inferred_type {
+                    return Err(OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Type mismatch for field '{}': expected '{}', got '{}'",
+                            key, existing_field.field_type, inferred_type
+                        ),
+                    )));
+                }
+            } else {
+                // New field: Update schema_cache (Append-Only)
+                let new_field = FieldDef {
+                    name: key.clone(),
+                    field_type: inferred_type.to_string(),
+                    indexed: matches!(inferred_type, "text" | "string"),
+                };
+                schema_cache.fields.insert(key.clone(), new_field);
+                schema_updated = true;
+            }
+        }
+    }
+
+    // Persist updated schema to storage if changed
+    if schema_updated {
+        let store_clone = Arc::clone(store);
+        let schema_clone = schema_cache.clone();
+        let index_name = index.to_string();
+
+        tokio::task::spawn_blocking(move || store_clone.store_schema(&index_name, &schema_clone))
             .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
-            .map_err(|e: StoreError| match e {
-                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
-                _ => OrchestratorError::Io(std::io::Error::new(
+            .map_err(|e| {
+                OrchestratorError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    e.to_string(),
-                )),
+                    format!("Failed to spawn schema update task: {}", e),
+                ))
+            })?
+            .map_err(|e| {
+                OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to store schema: {}", e),
+                ))
             })?;
 
-        Ok(seq_ids)
+        // TODO: Broadcast SchemaUpdate to cluster
+        info!("Schema updated for index '{}' with new fields", index);
     }
+
+    Ok(())
 }
 
 /// Router actor that handles client operations and distributes them across shards.
@@ -454,13 +579,17 @@ impl RouterActor {
                 doc,
             } => self.handle_write(&index, id, routing_key, doc).await,
             ClientOp::BulkWrite { index, docs } => self.handle_bulk_write(&index, docs).await,
+            ClientOp::CreateConfig { index, schema } => {
+                self.handle_create_config(&index, schema).await
+            }
+            ClientOp::GetConfig { index } => self.handle_get_config(&index).await,
         }
     }
 
     /// Handles write operations by routing to an appropriate shard.
     async fn handle_write(
         &self,
-        _index: &str,
+        index: &str,
         id: String,
         routing_key: Option<String>,
         doc: JsonValue,
@@ -472,6 +601,41 @@ impl RouterActor {
                 std::io::ErrorKind::NotFound,
                 "No shards available for write operation",
             )));
+        }
+
+        // Load IndexSchema from local state (using any shard's storage)
+        let mut schema_cache = if let Some(shard) = orchestrator.shards.values().next() {
+            if let Some(store) = &shard.store {
+                let store_clone = Arc::clone(store);
+                let index_name = index.to_string();
+
+                tokio::task::spawn_blocking(move || store_clone.get_schema(&index_name))
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to spawn schema load task: {}", e),
+                        ))
+                    })?
+                    .map_err(|e| {
+                        OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to load schema: {}", e),
+                        ))
+                    })?
+                    .unwrap_or_else(IndexSchema::default)
+            } else {
+                IndexSchema::default()
+            }
+        } else {
+            IndexSchema::default()
+        };
+
+        // Run validate_and_evolve_schema for the document
+        if let Some(shard) = orchestrator.shards.values().next() {
+            if let Some(store) = &shard.store {
+                validate_and_evolve_schema(index, &doc, &mut schema_cache, store).await?;
+            }
         }
 
         let target_shard_id = if let Some(ref routing_key) = routing_key {
@@ -498,6 +662,7 @@ impl RouterActor {
         })?;
 
         let write_request = WriteRequest {
+            index: index.to_string(),
             id: id.clone(),
             doc,
         };
@@ -516,7 +681,7 @@ impl RouterActor {
     /// Handles bulk write operations using binning strategy for optimal distribution.
     async fn handle_bulk_write(
         &self,
-        _index: &str,
+        index: &str,
         docs: Vec<DocPayload>,
     ) -> Result<JsonValue, OrchestratorError> {
         let orchestrator = self.orchestrator.read().await;
@@ -526,6 +691,44 @@ impl RouterActor {
                 std::io::ErrorKind::NotFound,
                 "No shards available for bulk write operation",
             )));
+        }
+
+        // Load IndexSchema from local state (using any shard's storage)
+        let mut schema_cache = if let Some(shard) = orchestrator.shards.values().next() {
+            if let Some(store) = &shard.store {
+                let store_clone = Arc::clone(store);
+                let index_name = index.to_string();
+
+                tokio::task::spawn_blocking(move || store_clone.get_schema(&index_name))
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to spawn schema load task: {}", e),
+                        ))
+                    })?
+                    .map_err(|e| {
+                        OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to load schema: {}", e),
+                        ))
+                    })?
+                    .unwrap_or_else(IndexSchema::default)
+            } else {
+                IndexSchema::default()
+            }
+        } else {
+            IndexSchema::default()
+        };
+
+        // Validate all documents before processing
+        if let Some(shard) = orchestrator.shards.values().next() {
+            if let Some(store) = &shard.store {
+                for doc_payload in &docs {
+                    validate_and_evolve_schema(index, &doc_payload.doc, &mut schema_cache, store)
+                        .await?;
+                }
+            }
         }
 
         // Binning Strategy: Group documents by target shard
@@ -548,7 +751,7 @@ impl RouterActor {
 
             // Convert DocPayload to ClientOp::Write
             let client_op = ClientOp::Write {
-                index: _index.to_string(),
+                index: index.to_string(),
                 id: doc_payload.id,
                 routing_key: doc_payload.routing_key,
                 doc: doc_payload.doc,
@@ -636,7 +839,7 @@ impl RouterActor {
     /// Handles streaming client operations and returns a combined stream.
     pub async fn handle_client_stream(
         &self,
-        _index: String,
+        index: String,
         query: String,
     ) -> Result<ReceiverStream<Vec<(f32, JsonValue)>>, OrchestratorError> {
         let orchestrator = self.orchestrator.read().await;
@@ -659,6 +862,7 @@ impl RouterActor {
 
             for shard_id in shard_ids {
                 let search_stream = SearchStream {
+                    index: index.clone(),
                     query_string: query.clone(),
                 };
 
@@ -687,7 +891,7 @@ impl RouterActor {
     /// Implements scatter-gather search across all shards.
     async fn handle_search(
         &self,
-        _index: &str,
+        index: &str,
         query: &str,
         limit: usize,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -712,6 +916,7 @@ impl RouterActor {
             let orchestrator = self.orchestrator.clone();
             let shard_id = *shard_id;
             let search_request = SearchRequest {
+                index: index.to_string(),
                 query_string: query.to_string(),
                 limit,
             };
@@ -793,6 +998,113 @@ impl RouterActor {
             "failed_shards": failed_shards,
             "query": query
         }))
+    }
+
+    /// Handles schema creation/update operations.
+    async fn handle_create_config(
+        &self,
+        index: &str,
+        schema: IndexSchema,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let orchestrator = self.orchestrator.read().await;
+
+        // Get any shard to store the schema (schema is replicated across all shards)
+        if let Some(shard) = orchestrator.shards.values().next() {
+            if let Some(store) = &shard.store {
+                let store_clone = Arc::clone(store);
+                let schema_clone = schema.clone();
+                let index_name = index.to_string();
+
+                tokio::task::spawn_blocking(move || {
+                    store_clone.store_schema(&index_name, &schema_clone)
+                })
+                .await
+                .map_err(|e| {
+                    OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to spawn schema creation task: {}", e),
+                    ))
+                })?
+                .map_err(|e| {
+                    OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to store schema: {}", e),
+                    ))
+                })?;
+
+                info!("Schema created for index '{}'", index);
+
+                Ok(serde_json::json!({
+                    "index": index,
+                    "shard_count": schema.shard_count,
+                    "fields": schema.fields,
+                    "status": "created"
+                }))
+            } else {
+                Err(OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No initialized shards available for schema storage",
+                )))
+            }
+        } else {
+            Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards available for schema storage",
+            )))
+        }
+    }
+
+    /// Handles schema retrieval operations.
+    async fn handle_get_config(&self, index: &str) -> Result<JsonValue, OrchestratorError> {
+        let orchestrator = self.orchestrator.read().await;
+
+        // Get any shard to retrieve the schema
+        if let Some(shard) = orchestrator.shards.values().next() {
+            if let Some(store) = &shard.store {
+                let store_clone = Arc::clone(store);
+                let index_name = index.to_string();
+
+                let schema_opt =
+                    tokio::task::spawn_blocking(move || store_clone.get_schema(&index_name))
+                        .await
+                        .map_err(|e| {
+                            OrchestratorError::Io(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("Failed to spawn schema retrieval task: {}", e),
+                            ))
+                        })?
+                        .map_err(|e| {
+                            OrchestratorError::Io(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("Failed to retrieve schema: {}", e),
+                            ))
+                        })?;
+
+                match schema_opt {
+                    Some(schema) => Ok(serde_json::json!({
+                        "index": index,
+                        "shard_count": schema.shard_count,
+                        "fields": schema.fields,
+                        "status": "found"
+                    })),
+                    None => Ok(serde_json::json!({
+                        "index": index,
+                        "status": "not_found",
+                        "message": "No schema found for this index"
+                    })),
+                }
+            } else {
+                Err(OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No initialized shards available for schema retrieval",
+                )))
+            }
+        } else {
+            Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards available for schema retrieval",
+            )))
+        }
     }
 }
 
@@ -1206,6 +1518,7 @@ mod tests {
 
         // Test write operation using new WriteRequest format
         let write_request = WriteRequest {
+            index: "test_index".to_string(),
             id: "doc1".to_string(),
             doc: serde_json::json!({
                 "title": "Test Document",
@@ -1223,6 +1536,7 @@ mod tests {
 
         // Test search operation
         let search_request = SearchRequest {
+            index: "test_index".to_string(),
             query_string: "test".to_string(),
             limit: 10,
         };
@@ -1260,6 +1574,7 @@ mod tests {
         // Write some test documents
         for i in 0..5 {
             let write_request = WriteRequest {
+                index: "test_index".to_string(),
                 id: format!("doc{}", i),
                 doc: serde_json::json!({
                     "title": format!("Document {}", i),
@@ -1272,6 +1587,7 @@ mod tests {
 
         // Test streaming search
         let stream_request = SearchStream {
+            index: "test_index".to_string(),
             query_string: "document".to_string(),
         };
 

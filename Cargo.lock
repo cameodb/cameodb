@@ -2051,6 +2051,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tantivy",
+ "tempfile",
  "thiserror 1.0.69",
  "uuid",
 ]

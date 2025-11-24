@@ -14,3 +14,4 @@ tantivy = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true }
+tempfile = "3.8"

@@ -21,6 +21,7 @@ use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLaye
 use tracing::{error, info};
 
 use crate::node_orchestrator::{ClientOp, DocPayload, NodeOrchestrator, RouterActor};
+use storage::IndexSchema;
 
 /// API Error wrapper for consistent error handling
 #[derive(Debug)]
@@ -90,6 +91,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/:index/stream", post(stream_handler))
         .route("/api/:index/document", put(write_handler))
         .route("/api/:index/_bulk", post(bulk_write_handler))
+        .route("/api/:index/_config", put(create_config_handler))
+        .route("/api/:index/_config", get(get_config_handler))
         // Health check
         .route("/_cluster/health", get(health_handler))
         .with_state(state)
@@ -211,6 +214,36 @@ async fn bulk_write_handler(
     );
 
     let client_op = ClientOp::BulkWrite { index, docs };
+
+    let result = state.router.handle_client_op(client_op).await?;
+    Ok(Json(result))
+}
+
+/// Handler for creating/updating index configuration/schema
+async fn create_config_handler(
+    Path(index): Path<String>,
+    State(state): State<AppState>,
+    Json(schema): Json<IndexSchema>,
+) -> Result<Json<JsonValue>, ApiError> {
+    info!(
+        "Create config request - index: {}, shard_count: {}",
+        index, schema.shard_count
+    );
+
+    let client_op = ClientOp::CreateConfig { index, schema };
+
+    let result = state.router.handle_client_op(client_op).await?;
+    Ok(Json(result))
+}
+
+/// Handler for retrieving index configuration/schema
+async fn get_config_handler(
+    Path(index): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<JsonValue>, ApiError> {
+    info!("Get config request - index: {}", index);
+
+    let client_op = ClientOp::GetConfig { index };
 
     let result = state.router.handle_client_op(client_op).await?;
     Ok(Json(result))
