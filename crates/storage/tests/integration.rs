@@ -11,6 +11,9 @@ fn test_multi_tenant_storage_integration() {
     let config = StorageConfig {
         shard_path: temp_dir.path().to_path_buf(),
         writer_memory_budget: 32 * 1024 * 1024, // 32MB per index
+        writer_memory_min_mb: 16,               // 16MB minimum
+        writer_memory_max_mb: 256,              // 256MB maximum
+        default_batch_size: 1000,               // 1000 operations default
         wal_sync: true,
     };
 
@@ -141,6 +144,9 @@ fn test_multi_tenant_persistence_and_sequence() {
     let config = StorageConfig {
         shard_path: temp_dir.path().to_path_buf(),
         writer_memory_budget: 32 * 1024 * 1024, // 32MB per index
+        writer_memory_min_mb: 16,               // 16MB minimum
+        writer_memory_max_mb: 256,              // 256MB maximum
+        default_batch_size: 1000,               // 1000 operations default
         wal_sync: true,
     };
 

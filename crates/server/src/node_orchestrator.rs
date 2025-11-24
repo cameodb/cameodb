@@ -1224,6 +1224,9 @@ impl NodeOrchestrator {
         StorageConfig {
             shard_path,
             writer_memory_budget: writer_memory_mb * 1024 * 1024, // Convert to bytes
+            writer_memory_min_mb: self.config.writer_memory_min_mb,
+            writer_memory_max_mb: self.config.writer_memory_max_mb,
+            default_batch_size: 1000, // Use default from config or hard-coded for now
             wal_sync: self.config.wal_sync,
         }
     }

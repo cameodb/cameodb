@@ -85,6 +85,8 @@ async fn main() -> Result<()> {
     println!("  POST /api/:index/stream - Streaming search");
     println!("  PUT  /api/:index/document - Write document");
     println!("  POST /api/:index/_bulk - Bulk write documents");
+    println!("  PUT  /api/:index/_config - Create/update index schema");
+    println!("  GET  /api/:index/_config - Retrieve index schema");
     println!("  GET  /_cluster/health - Health check");
     println!();
     println!("⚙️  Configuration:");

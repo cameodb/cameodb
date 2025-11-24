@@ -2,7 +2,7 @@
 port = 9480
 host = "0.0.0.0"
 request_timeout_secs = 30
-max_body_size_mb = 20
+max_body_size_mb = 200
 cors_enabled = true
 
 [server.node]
@@ -19,7 +19,8 @@ wal_segment_size_mb = 64
 [search]
 writer_memory_min_mb = 16
 writer_memory_max_mb = 256
-total_memory_limit_mb = 1024
+default_batch_size = 1000
+total_memory_limit_mb = 2048
 memory_pressure_threshold = 0.8
 search_threads = 8
 index_refresh_interval_secs = 5

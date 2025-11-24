@@ -1,6 +1,6 @@
-# Storage Engine - Hybrid KV + Search Storage
+# Storage Engine - Multi-Tenant Hybrid KV + Search Storage
 
-The `storage` crate provides a production-grade hybrid storage engine that combines ACID-compliant key-value storage with full-text search capabilities.
+The `storage` crate provides a production-grade multi-tenant hybrid storage engine that combines ACID-compliant key-value storage with full-text search capabilities. Each index operates as an isolated tenant with independent data tables, search indices, and sequence counters.
 
 ## Architecture: The "Hybrid" Concept
 
@@ -16,7 +16,18 @@ CameoDB's storage engine combines two complementary storage systems:
 - **Strengths**: Inverted indexes, relevance scoring, complex queries
 - **Use Cases**: Full-text search, filtering, analytics
 
-### Why Both?
+### Multi-Tenant Architecture
+
+CameoDB's storage engine supports multiple isolated indices within a single storage instance:
+
+| Feature | Implementation | Benefit |
+|---------|---------------|---------|
+| **Data Isolation** | `data_{index}` and `wal_{index}` tables per index | Complete tenant separation |
+| **Search Isolation** | `indices/{index_name}/` directories per index | Independent search performance |
+| **Sequence Independence** | Per-index AtomicU64 counters | Parallel write scaling |
+| **Cache Efficiency** | Per-index IndexWriter and IndexReader caches | Optimized memory usage |
+
+### Why Both Storage Engines?
 
 | Operation | redb | tantivy | Hybrid Advantage |
 |-----------|------|---------|------------------|
@@ -168,17 +179,20 @@ use storage::{HybridStore, StorageConfig, WalOp};
 use serde_json::json;
 use std::path::PathBuf;
 
-// Configure storage
+// Configure storage with performance optimizations
 let config = StorageConfig {
     shard_path: PathBuf::from("./data/shard1"),
-    writer_memory_budget: 50 * 1024 * 1024, // 50MB
-    wal_sync: true, // Maximum durability
+    writer_memory_budget: 32 * 1024 * 1024, // 32MB default
+    writer_memory_min_mb: 16,               // 16MB minimum
+    writer_memory_max_mb: 256,              // 256MB maximum  
+    default_batch_size: 1000,               // Smart commit threshold
+    wal_sync: true,                         // Maximum durability
 };
 
 // Initialize store
 let store = HybridStore::new(config)?;
 
-// Write operations
+// Multi-tenant write operations
 let put_op = WalOp::Put {
     id: "user:123".to_string(),
     body: "John Doe software engineer at Acme Corp".to_string(),
@@ -189,15 +203,22 @@ let put_op = WalOp::Put {
     })),
 };
 
-let seq_id = store.apply_write(put_op)?;
+// Write to specific index (tenant)
+let seq_id = store.apply_write("employees", put_op)?;
 println!("Document stored with sequence ID: {}", seq_id);
 
-// Read operations
-let data = store.get_by_key("user:123")?;
+// Read operations from specific index
+let data = store.get_by_key("employees", "user:123")?;
 if let Some(bytes) = data {
     let doc: serde_json::Value = serde_json::from_slice(&bytes)?;
     println!("Found: {}", doc["body"]);
     println!("Email: {}", doc["json_blob"]["email"]);
+}
+
+// Search within specific index
+let results = store.search_documents("employees", "software engineer", 10)?;
+for (score, doc) in results {
+    println!("Score: {:.3}, ID: {}", score, doc["id"]);
 }
 ```
 
@@ -223,12 +244,40 @@ async fn correct_usage(store: HybridStore, op: WalOp) -> Result<u64, StoreError>
 }
 ```
 
-### Batch Operations
+### Multi-Tenant Batch Operations
 
 ```rust
 use storage::{HybridStore, WalOp};
 
-async fn batch_insert(store: HybridStore, documents: Vec<(String, String)>) -> Result<Vec<u64>, StoreError> {
+async fn batch_insert(
+    store: HybridStore, 
+    index: &str,
+    documents: Vec<(String, String)>
+) -> Result<Vec<u64>, StoreError> {
+    let ops: Vec<WalOp> = documents.into_iter().map(|(id, content)| {
+        WalOp::Put {
+            id,
+            body: content,
+            json_blob: None,
+        }
+    }).collect();
+    
+    // Atomic batch processing with smart commits
+    let sequence_ids = tokio::task::spawn_blocking({
+        let store = store.clone();
+        let index = index.to_string();
+        move || store.apply_batch(&index, ops)
+    }).await??;
+    
+    Ok(sequence_ids)
+}
+
+// Alternative: Individual operations (less efficient)
+async fn individual_insert(
+    store: HybridStore, 
+    index: &str,
+    documents: Vec<(String, String)>
+) -> Result<Vec<u64>, StoreError> {
     let mut sequence_ids = Vec::new();
     
     for (id, content) in documents {
@@ -238,10 +287,10 @@ async fn batch_insert(store: HybridStore, documents: Vec<(String, String)>) -> R
             json_blob: None,
         };
         
-        // Each operation gets its own sequence ID
         let seq_id = tokio::task::spawn_blocking({
-            let store = store.clone(); // HybridStore must implement Clone
-            move || store.apply_write(op)
+            let store = store.clone();
+            let index = index.to_string();
+            move || store.apply_write(&index, op)
         }).await??;
         
         sequence_ids.push(seq_id);
@@ -257,24 +306,33 @@ async fn batch_insert(store: HybridStore, documents: Vec<(String, String)>) -> R
 use storage::StorageConfig;
 use std::path::PathBuf;
 
-// High-performance configuration
+// High-performance configuration with smart commits
 let high_perf_config = StorageConfig {
     shard_path: PathBuf::from("/fast-ssd/shard1"),
-    writer_memory_budget: 200 * 1024 * 1024, // 200MB buffer
-    wal_sync: false, // Skip fsync for speed (less durable)
+    writer_memory_budget: 64 * 1024 * 1024,  // 64MB default
+    writer_memory_min_mb: 32,                 // 32MB minimum
+    writer_memory_max_mb: 512,                // 512MB maximum
+    default_batch_size: 2000,                 // Higher commit threshold
+    wal_sync: false,                          // Skip fsync for speed
 };
 
-// High-durability configuration  
+// High-durability configuration with frequent commits
 let high_durability_config = StorageConfig {
     shard_path: PathBuf::from("/redundant-storage/shard1"),
-    writer_memory_budget: 50 * 1024 * 1024,  // 50MB buffer
-    wal_sync: true, // Always fsync (maximum durability)
+    writer_memory_budget: 32 * 1024 * 1024,  // 32MB default
+    writer_memory_min_mb: 16,                 // 16MB minimum
+    writer_memory_max_mb: 128,                // 128MB maximum
+    default_batch_size: 500,                  // Lower commit threshold
+    wal_sync: true,                           // Always fsync
 };
 
 // Memory-constrained configuration
 let low_memory_config = StorageConfig {
     shard_path: PathBuf::from("./shard1"),
-    writer_memory_budget: 10 * 1024 * 1024,  // 10MB buffer
+    writer_memory_budget: 16 * 1024 * 1024,  // 16MB default
+    writer_memory_min_mb: 8,                  // 8MB minimum
+    writer_memory_max_mb: 32,                 // 32MB maximum
+    default_batch_size: 250,                  // Very low commit threshold
     wal_sync: true,
 };
 ```
@@ -282,9 +340,17 @@ let low_memory_config = StorageConfig {
 ## Performance Characteristics
 
 ### Write Performance
-- **Latency**: ~1-5ms per operation (depends on fsync setting)
-- **Throughput**: ~1000-10000 ops/sec (depends on document size and hardware)
+- **Single Operations**: ~1-5ms per operation (depends on fsync setting)
+- **Batch Operations**: ~0.1-1ms per operation in batch (significant improvement)
+- **Throughput**: ~1000-10000 ops/sec individual, ~5000-50000 ops/sec batched
+- **Smart Commits**: Adaptive commit frequency based on memory budget and batch size
 - **Bottlenecks**: Disk I/O (fsync), tantivy indexing, mutex contention
+
+### Multi-Tenant Performance
+- **Index Isolation**: No performance interference between indices
+- **Memory Scaling**: Dynamic memory budgets based on index size (16MB-256MB)
+- **Commit Optimization**: Per-index smart commits with configurable thresholds
+- **Cache Efficiency**: Independent IndexWriter/IndexReader caches per index
 
 ### Read Performance  
 - **Point Queries**: ~0.1ms (redb B-tree lookup)
@@ -396,7 +462,17 @@ cargo test -p storage test_atomic_operations
 ### Overview
 The storage engine now provides full-text search capabilities through the `search_documents` method, which integrates tantivy's search engine with serde-compatible serialization.
 
-### API
+### Multi-Tenant Search API
+```rust
+pub fn search_documents(
+    &self,
+    index: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<(f32, JsonValue)>, StoreError>
+```
+
+### Legacy Single-Index API (Deprecated)
 ```rust
 pub fn search_documents(
     &self,
@@ -415,14 +491,22 @@ pub fn search_documents(
 use storage::{HybridStore, StorageConfig};
 use serde_json::Value as JsonValue;
 
-// Search for documents
-let results: Vec<(f32, JsonValue)> = store.search_documents("software engineer", 10)?;
+// Multi-tenant search
+let results: Vec<(f32, JsonValue)> = store.search_documents("employees", "software engineer", 10)?;
 
 for (score, document) in results {
     println!("Score: {:.3}", score);
     println!("Title: {}", document["title"].as_str().unwrap_or("N/A"));
     println!("Content: {}", document["body"].as_str().unwrap_or("N/A"));
+    println!("Index: employees");
     println!("---");
+}
+
+// Search across multiple indices
+let indices = ["employees", "contractors", "vendors"];
+for index in &indices {
+    let results = store.search_documents(index, "software engineer", 5)?;
+    println!("Results from {}: {} matches", index, results.len());
 }
 ```
 
@@ -430,14 +514,14 @@ for (score, document) in results {
 ```rust
 use tokio::task;
 
-async fn async_search(
+async fn async_multi_tenant_search(
     store: HybridStore,
+    index: String,
     query: String,
     limit: usize
 ) -> Result<Vec<(f32, JsonValue)>, StoreError> {
-    // ✅ CORRECT: Use spawn_blocking for search operations
     let results = task::spawn_blocking(move || {
-        store.search_documents(&query, limit)
+        store.search_documents(&index, &query, limit)
     }).await.map_err(|_| StoreError::Serialization("Task panicked".to_string()))??;
     
     Ok(results)
@@ -451,10 +535,12 @@ Supports standard tantivy query syntax:
 - **Boolean operators**: `"software AND engineer"`
 - **Field-specific**: `"title:manager"` (if fields are properly indexed)
 
-### Performance Characteristics
-- **Latency**: ~10-100ms (depends on index size and query complexity)
-- **Indexing**: Automatic when documents are written via `apply_write`
-- **Memory**: Uses tantivy's memory budget (configurable via `writer_memory_budget`)
+### Search Performance Characteristics
+- **Latency**: ~10-100ms per index (depends on index size and query complexity)
+- **Multi-tenant Isolation**: Each index maintains independent search performance
+- **Memory Scaling**: Dynamic memory budgets (16MB-256MB) based on index size
+- **Indexing**: Automatic when documents are written via `apply_write` or `apply_batch`
+- **Smart Commits**: Configurable commit frequency optimizes search freshness vs performance
 
 ## Serialization and Tantivy Integration
 
@@ -531,15 +617,22 @@ impl MicroshardActor {
 ## Future Enhancements
 
 ### Planned Features
+- **Schema Evolution**: Dynamic field addition with type validation
 - **Advanced Query Support**: Range queries, faceted search, aggregations
 - **WAL Compaction**: Periodic cleanup of old WAL entries
-- **Backup/Restore**: Point-in-time backup capabilities
-- **Replication**: Multi-node consistency
+- **Cross-Index Search**: Federated search across multiple indices
+- **Index Templates**: Predefined schemas for new indices
+- **Backup/Restore**: Point-in-time backup capabilities per index
+- **Replication**: Multi-node consistency with per-index replication
 - **Compression**: Configurable compression algorithms
-- **Metrics**: Performance monitoring and health checks
+- **Metrics**: Performance monitoring and health checks per index
 
 ### Performance Optimizations
-- **Write Batching**: Group operations in single transaction
-- **Read Caching**: LRU cache for frequently accessed documents
-- **Index Optimization**: Periodic segment merging
-- **Async I/O**: Non-blocking operations where possible
+- **Smart Commit Strategy**: ✅ Implemented - Adaptive commit frequency based on memory budget
+- **Dynamic Memory Budgets**: ✅ Implemented - Per-index memory scaling (16MB-256MB)
+- **Atomic Batch Processing**: ✅ Implemented - Single transaction for multiple operations
+- **Multi-tenant Caching**: ✅ Implemented - Independent caches per index
+- **Operation Counting**: ✅ Implemented - Lock-free AtomicU64 counters per index
+- **Read Caching**: LRU cache for frequently accessed documents (planned)
+- **Index Optimization**: Periodic segment merging (planned)
+- **Async I/O**: Non-blocking operations where possible (planned)

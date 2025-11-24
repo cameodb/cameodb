@@ -45,8 +45,14 @@ const TABLE_SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("schema"
 pub struct StorageConfig {
     /// The root folder for this shard's data files.
     pub shard_path: PathBuf,
-    /// Memory budget for each tantivy IndexWriter in bytes.
+    /// Default memory budget for each tantivy IndexWriter in bytes.
     pub writer_memory_budget: usize,
+    /// Minimum memory budget for IndexWriter in bytes.
+    pub writer_memory_min_mb: usize,
+    /// Maximum memory budget for IndexWriter in bytes.
+    pub writer_memory_max_mb: usize,
+    /// Default batch size for smart commit calculations.
+    pub default_batch_size: usize,
     /// Whether to call fsync() on every redb commit.
     pub wal_sync: bool,
 }
@@ -55,8 +61,40 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             shard_path: PathBuf::from("/tmp/cameodb_default_shard"),
-            writer_memory_budget: 32 * 1024 * 1024, // 32MB
+            writer_memory_budget: 32 * 1024 * 1024, // 32MB default
+            writer_memory_min_mb: 16,               // 16MB minimum
+            writer_memory_max_mb: 256,              // 256MB maximum
+            default_batch_size: 1000,               // 1000 operations default
             wal_sync: true,
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Calculate optimal memory budget based on index size and configurable range
+    pub fn get_optimal_memory_budget(&self, index_path: &PathBuf) -> usize {
+        let min_budget_bytes = self.writer_memory_min_mb * 1024 * 1024;
+        let max_budget_bytes = self.writer_memory_max_mb * 1024 * 1024;
+        let default_budget_bytes = self.writer_memory_budget;
+
+        // Check index size and adjust budget dynamically within configurable range
+        if let Ok(metadata) = std::fs::metadata(index_path) {
+            let size_mb = metadata.len() / (1024 * 1024);
+            let optimal_budget = match size_mb {
+                0..=50 => min_budget_bytes,       // Very small indices: min budget (16MB)
+                51..=200 => default_budget_bytes, // Small indices: default budget (32MB)
+                201..=1000 => (min_budget_bytes + max_budget_bytes) / 2, // Medium indices: mid-range (136MB)
+                1001..=5000 => (max_budget_bytes * 3) / 4, // Large indices: 75% of max (192MB)
+                _ => max_budget_bytes,                     // Very large indices: max budget (256MB)
+            };
+
+            // Ensure result is within configured bounds
+            optimal_budget.max(min_budget_bytes).min(max_budget_bytes)
+        } else {
+            // New index, use default budget
+            default_budget_bytes
+                .max(min_budget_bytes)
+                .min(max_budget_bytes)
         }
     }
 }
@@ -156,6 +194,8 @@ pub struct HybridStore {
     readers: Arc<RwLock<HashMap<String, IndexReader>>>,
     /// Atomic counters for WAL sequence IDs per index
     current_seq: Arc<RwLock<HashMap<String, AtomicU64>>>,
+    /// Operation counters for smart commits per index
+    operations_counter: Arc<RwLock<HashMap<String, AtomicU64>>>,
     /// Storage configuration
     config: StorageConfig,
 }
@@ -177,6 +217,7 @@ impl HybridStore {
             writers: Arc::new(RwLock::new(HashMap::new())),
             readers: Arc::new(RwLock::new(HashMap::new())),
             current_seq: Arc::new(RwLock::new(HashMap::new())),
+            operations_counter: Arc::new(RwLock::new(HashMap::new())),
             config,
         })
     }
@@ -225,8 +266,9 @@ impl HybridStore {
             Index::create_in_dir(&index_path, schema)?
         };
 
-        // Create writer
-        let writer = tantivy_index.writer(self.config.writer_memory_budget)?;
+        // Create writer with dynamic memory budget based on index size
+        let optimal_budget = self.config.get_optimal_memory_budget(&index_path);
+        let writer = tantivy_index.writer(optimal_budget)?;
         let writer_arc = Arc::new(Mutex::new(writer));
 
         // Store in cache
@@ -245,6 +287,83 @@ impl HybridStore {
         }
 
         Ok((writer_arc, fields))
+    }
+
+    /// Track document count and perform smart commits based on operation thresholds
+    fn should_commit_writer(&self, index: &str, operations_since_commit: u64) -> bool {
+        // Get dynamic memory budget for this specific index
+        let index_path = self.config.shard_path.join("indices").join(index);
+        let budget = self.config.get_optimal_memory_budget(&index_path);
+
+        // Commit strategy based on document count and configurable memory budget range
+        // Scale commit frequency with memory budget: more memory = fewer commits
+        let min_budget = self.config.writer_memory_min_mb * 1024 * 1024;
+        let max_budget = self.config.writer_memory_max_mb * 1024 * 1024;
+
+        // Calculate adaptive threshold based on default_batch_size and memory budget ratio
+        let budget_ratio = (budget - min_budget) as f64 / (max_budget - min_budget) as f64;
+        let default_batch = self.config.default_batch_size as f64;
+
+        // Scale from 50% of default (min memory) to 800% of default (max memory)
+        // e.g., default=1000: 500 ops (16MB) -> 8000 ops (256MB)
+        let base_ops = (default_batch * (0.5 + budget_ratio * 7.5)) as u64;
+
+        operations_since_commit >= base_ops
+    }
+
+    /// Get operation count for an index since last commit
+    fn get_operations_count(&self, index: &str) -> u64 {
+        if let Ok(counter_map) = self.operations_counter.read() {
+            if let Some(counter) = counter_map.get(index) {
+                return counter.load(Ordering::SeqCst);
+            }
+        }
+        0
+    }
+
+    /// Increment operation count and return new count
+    fn increment_operations(&self, index: &str) -> u64 {
+        // Ensure counter exists for this index
+        {
+            let mut counter_map = self.operations_counter.write().unwrap();
+            if !counter_map.contains_key(index) {
+                counter_map.insert(index.to_string(), AtomicU64::new(0));
+            }
+        }
+
+        // Increment and return new count
+        if let Ok(counter_map) = self.operations_counter.read() {
+            if let Some(counter) = counter_map.get(index) {
+                return counter.fetch_add(1, Ordering::SeqCst) + 1;
+            }
+        }
+        0
+    }
+
+    /// Reset operation counter after commit
+    fn reset_operations_counter(&self, index: &str) {
+        if let Ok(counter_map) = self.operations_counter.read() {
+            if let Some(counter) = counter_map.get(index) {
+                counter.store(0, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Perform smart commit based on operation count
+    fn maybe_commit_writer(&self, index: &str) -> Result<bool, StoreError> {
+        let ops_count = self.get_operations_count(index);
+
+        if self.should_commit_writer(index, ops_count) {
+            if let Ok(writers) = self.writers.read() {
+                if let Some(writer_arc) = writers.get(index) {
+                    let mut writer = writer_arc.lock().unwrap();
+                    writer.commit()?;
+                    self.reset_operations_counter(index);
+                    return Ok(true); // Commit performed
+                }
+            }
+        }
+        Ok(false) // No commit needed
     }
 
     /// Multi-tenant apply_write method
@@ -322,11 +441,9 @@ impl HybridStore {
 
         write_txn.commit()?;
 
-        // Commit tantivy changes
-        {
-            let mut writer = writer_arc.lock().unwrap();
-            writer.commit()?;
-        }
+        // Increment operation counter and perform smart commit if needed
+        self.increment_operations(index);
+        self.maybe_commit_writer(index)?;
 
         Ok(seq_id)
     }
@@ -572,6 +689,17 @@ impl HybridStore {
 
         write_txn.commit()?;
 
+        // Check for pre-emptive commit before batch processing
+        let initial_ops_count = self.get_operations_count(index);
+        let should_pre_commit = self.should_commit_writer(index, initial_ops_count);
+
+        if should_pre_commit {
+            // Pre-emptive commit to free up memory before large batch
+            let mut writer = writer_arc.lock().unwrap();
+            writer.commit()?;
+            self.reset_operations_counter(index);
+        }
+
         // Apply all tantivy operations
         {
             let mut writer = writer_arc.lock().unwrap();
@@ -587,7 +715,24 @@ impl HybridStore {
                     _ => unreachable!(),
                 }
             }
-            writer.commit()?;
+
+            // Increment operations counter by batch size
+            let batch_size = ops.len() as u64;
+            for _ in 0..batch_size {
+                self.increment_operations(index);
+            }
+
+            // Perform smart commit if needed, or force commit for very large batches
+            if batch_size >= 1000 {
+                // Force commit for very large batches
+                writer.commit()?;
+                self.reset_operations_counter(index);
+            }
+        }
+
+        // Use smart commit logic for normal batches (when writer lock is released)
+        if ops.len() < 1000 {
+            self.maybe_commit_writer(index)?;
         }
 
         Ok(seq_ids)
@@ -609,6 +754,9 @@ mod tests {
         let config = StorageConfig {
             shard_path: temp_dir.path().to_path_buf(),
             writer_memory_budget: 32 * 1024 * 1024,
+            writer_memory_min_mb: 16,
+            writer_memory_max_mb: 256,
+            default_batch_size: 1000,
             wal_sync: true,
         };
 

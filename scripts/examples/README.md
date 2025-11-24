@@ -18,7 +18,7 @@ the HTTP API.
 ### Usage
 
 ```bash
-# Dry run: inspect JSON payloads without writing
+# Dry run: inspect JSON payloads (shows target index + payload)
 python scripts/examples/ingest_ted.py --dry-run | head
 
 # Ingest into default index "ted"
@@ -29,6 +29,9 @@ python scripts/examples/ingest_ted.py --index talks --csv path/to/file.csv
 
 # Target a remote CameoDB node
 python scripts/examples/ingest_ted.py --base-url http://node1:9480
+
+# Inspect recognized schema for an index
+curl -s http://localhost:9480/api/ted/_config | jq
 ```
 
 ### Document Schema
