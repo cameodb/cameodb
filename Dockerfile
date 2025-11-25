@@ -6,7 +6,7 @@
 # Multi-stage build for CameoDB with cross-platform support (amd64/arm64).
 # Uses Rust musl targets for static compilation and minimal runtime dependencies.
 ################################################################################
-ARG RUST_VERSION=1.75
+ARG RUST_VERSION=1.90
 FROM rust:${RUST_VERSION}-slim AS builder
 
 # Force rustup to use the specific Rust version

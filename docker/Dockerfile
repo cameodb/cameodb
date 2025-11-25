@@ -6,7 +6,7 @@
 ################################################################################
 # Builder Stage - Same as main Dockerfile but with distributed optimizations
 ################################################################################
-ARG RUST_VERSION=1.75
+ARG RUST_VERSION=1.90
 FROM rust:${RUST_VERSION}-slim AS builder
 
 RUN rustup default ${RUST_VERSION}
