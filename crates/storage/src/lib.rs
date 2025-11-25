@@ -353,11 +353,10 @@ impl HybridStore {
 
     /// Get operation count for an index since last commit
     fn get_operations_count(&self, index: &str) -> u64 {
-        if let Ok(counter_map) = self.operations_counter.read() {
-            if let Some(counter) = counter_map.get(index) {
+        if let Ok(counter_map) = self.operations_counter.read()
+            && let Some(counter) = counter_map.get(index) {
                 return counter.load(Ordering::SeqCst);
             }
-        }
         0
     }
 
@@ -372,37 +371,33 @@ impl HybridStore {
         }
 
         // Increment and return new count
-        if let Ok(counter_map) = self.operations_counter.read() {
-            if let Some(counter) = counter_map.get(index) {
+        if let Ok(counter_map) = self.operations_counter.read()
+            && let Some(counter) = counter_map.get(index) {
                 return counter.fetch_add(1, Ordering::SeqCst) + 1;
             }
-        }
         0
     }
 
     /// Reset operation counter after commit
     fn reset_operations_counter(&self, index: &str) {
-        if let Ok(counter_map) = self.operations_counter.read() {
-            if let Some(counter) = counter_map.get(index) {
+        if let Ok(counter_map) = self.operations_counter.read()
+            && let Some(counter) = counter_map.get(index) {
                 counter.store(0, Ordering::SeqCst);
             }
-        }
     }
 
     /// Perform smart commit based on operation count
     fn maybe_commit_writer(&self, index: &str) -> Result<bool, StoreError> {
         let ops_count = self.get_operations_count(index);
 
-        if self.should_commit_writer(index, ops_count) {
-            if let Ok(writers) = self.writers.read() {
-                if let Some(writer_arc) = writers.get(index) {
+        if self.should_commit_writer(index, ops_count)
+            && let Ok(writers) = self.writers.read()
+                && let Some(writer_arc) = writers.get(index) {
                     let mut writer = writer_arc.lock().unwrap();
                     writer.commit()?;
                     self.reset_operations_counter(index);
                     return Ok(true); // Commit performed
                 }
-            }
-        }
         Ok(false) // No commit needed
     }
 
@@ -868,11 +863,10 @@ impl HybridStore {
         let tantivy_index_exists = index_path.exists() && index_path.is_dir();
 
         // Add Tantivy index size if it exists
-        if tantivy_index_exists {
-            if let Ok(tantivy_size) = get_directory_size(&index_path) {
+        if tantivy_index_exists
+            && let Ok(tantivy_size) = get_directory_size(&index_path) {
                 total_size_bytes += tantivy_size;
             }
-        }
 
         Ok(IndexStats {
             document_count,
@@ -937,13 +931,12 @@ impl HybridStore {
 
                     // Parse the document JSON to extract field names
                     if let Ok(doc_data) = serde_json::from_slice::<JsonValue>(value.value()) {
-                        if let Some(json_blob) = doc_data.get("json_blob") {
-                            if let Some(json_obj) = json_blob.as_object() {
+                        if let Some(json_blob) = doc_data.get("json_blob")
+                            && let Some(json_obj) = json_blob.as_object() {
                                 for field_name in json_obj.keys() {
                                     field_names.insert(field_name.clone());
                                 }
                             }
-                        }
 
                         // Also check top-level fields in the document
                         if let Some(doc_obj) = doc_data.as_object() {

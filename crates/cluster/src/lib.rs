@@ -105,6 +105,12 @@ pub enum IdentityError {
     Serde(#[from] serde_json::Error),
 }
 
+impl Default for NodeIdentity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NodeIdentity {
     /// Creates a new NodeIdentity with a random UUID.
     ///
@@ -276,7 +282,7 @@ pub fn generate_tokens(uuid: Uuid) -> Vec<u64> {
         .map(|index| {
             let mut hasher = Sha256::new();
             hasher.update(uuid.as_bytes());
-            hasher.update(&index.to_be_bytes());
+            hasher.update(index.to_be_bytes());
             let digest = hasher.finalize();
             u64::from_be_bytes(digest[0..8].try_into().expect("digest slice is 8 bytes"))
         })
@@ -327,6 +333,12 @@ pub fn generate_tokens(uuid: Uuid) -> Vec<u64> {
 pub struct ConsistentRing {
     /// Maps hash tokens to node UUIDs. BTreeMap provides ordered iteration.
     ring: BTreeMap<u64, Uuid>,
+}
+
+impl Default for ConsistentRing {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConsistentRing {

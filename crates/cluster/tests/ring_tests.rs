@@ -97,7 +97,7 @@ fn test_remove_node() {
     }
 
     // Should have both nodes as owners for different keys
-    assert!(owners_before.len() > 0, "Should have at least one owner");
+    assert!(!owners_before.is_empty(), "Should have at least one owner");
 
     // Remove node A
     ring.remove_node(&node_a_uuid);
