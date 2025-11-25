@@ -20,8 +20,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering as AtomicOrdering},
     Arc,
+    atomic::{AtomicUsize, Ordering as AtomicOrdering},
 };
 
 use anyhow::Result;
@@ -34,7 +34,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use cluster::{generate_tokens, ConsistentRing, IdentityError, NodeIdentity};
+use cluster::{ConsistentRing, IdentityError, NodeIdentity, generate_tokens};
 use serde_json::Value as JsonValue;
 use storage::{FieldDef, HybridStore, IndexSchema, StorageConfig, StoreError, WalOp};
 
@@ -1417,15 +1417,13 @@ impl NodeOrchestrator {
             let entry = entry?;
             let path = entry.path();
 
-            if path.is_dir() {
-                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if let Some(uuid_str) = dir_name.strip_prefix("shard-") {
-                        if let Ok(shard_id) = Uuid::parse_str(uuid_str) {
-                            shard_ids.push(shard_id);
-                            info!("Discovered existing shard: {}", shard_id);
-                        }
-                    }
-                }
+            if path.is_dir()
+                && let Some(dir_name) = path.file_name().and_then(|n| n.to_str())
+                && let Some(uuid_str) = dir_name.strip_prefix("shard-")
+                && let Ok(shard_id) = Uuid::parse_str(uuid_str)
+            {
+                shard_ids.push(shard_id);
+                info!("Discovered existing shard: {}", shard_id);
             }
         }
 
@@ -1597,13 +1595,13 @@ mod tests {
 
     impl Drop for TestDataGuard {
         fn drop(&mut self) {
-            if self.data_dir.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&self.data_dir) {
-                    eprintln!(
-                        "Warning: Failed to clean up test data at {:?}: {}",
-                        self.data_dir, e
-                    );
-                }
+            if self.data_dir.exists()
+                && let Err(e) = std::fs::remove_dir_all(&self.data_dir)
+            {
+                eprintln!(
+                    "Warning: Failed to clean up test data at {:?}: {}",
+                    self.data_dir, e
+                );
             }
         }
     }

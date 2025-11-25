@@ -10,7 +10,7 @@ mod node_orchestrator;
 
 use config::CameoDbConfig;
 use distributed::DistributedCluster;
-use http_server::{create_router, AppState};
+use http_server::{AppState, create_router};
 use node_orchestrator::{NodeConfig, NodeOrchestrator, ProposeShard, RouterActor};
 
 #[tokio::main]
@@ -68,25 +68,28 @@ async fn main() -> Result<()> {
     let mut distributed_cluster =
         DistributedCluster::new(cameodb_config.cluster.clone(), orchestrator.identity().uuid);
 
-    match distributed_cluster.bootstrap().await { Err(err) => {
-        tracing::warn!(%err, "Failed to bootstrap distributed cluster");
-        println!("⚠️  Distributed cluster bootstrap failed, continuing in single-node mode");
-    } _ => {
-        let cluster_status = distributed_cluster.get_cluster_status();
-        if cluster_status.distributed_enabled {
-            println!("🌐 Distributed cluster initialized:");
-            println!("  📡 Cluster: {}", cluster_status.cluster_name);
-            println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
-            println!("  ✅ Connected: {}", cluster_status.connected_nodes);
+    match distributed_cluster.bootstrap().await {
+        Err(err) => {
+            tracing::warn!(%err, "Failed to bootstrap distributed cluster");
+            println!("⚠️  Distributed cluster bootstrap failed, continuing in single-node mode");
+        }
+        _ => {
+            let cluster_status = distributed_cluster.get_cluster_status();
+            if cluster_status.distributed_enabled {
+                println!("🌐 Distributed cluster initialized:");
+                println!("  📡 Cluster: {}", cluster_status.cluster_name);
+                println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
+                println!("  ✅ Connected: {}", cluster_status.connected_nodes);
 
-            // Discover peers
-            if let Ok(peers) = distributed_cluster.discover_peers().await {
-                if !peers.is_empty() {
+                // Discover peers
+                if let Ok(peers) = distributed_cluster.discover_peers().await
+                    && !peers.is_empty()
+                {
                     println!("  👥 Discovered {} peer nodes", peers.len());
                 }
             }
         }
-    }}
+    }
 
     // Create shared state for HTTP server
     let orchestrator_arc = Arc::new(tokio::sync::RwLock::new(orchestrator));

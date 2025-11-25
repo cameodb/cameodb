@@ -33,8 +33,8 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tantivy::query::QueryParserError;
-use tantivy::schema::{Document, Field, Schema, STORED, STRING, TEXT};
-use tantivy::{doc, Index, IndexReader, IndexWriter};
+use tantivy::schema::{Document, Field, STORED, STRING, Schema, TEXT};
+use tantivy::{Index, IndexReader, IndexWriter, doc};
 use thiserror::Error;
 
 /// Schema metadata table: maps index names to their schema definitions.
@@ -354,9 +354,10 @@ impl HybridStore {
     /// Get operation count for an index since last commit
     fn get_operations_count(&self, index: &str) -> u64 {
         if let Ok(counter_map) = self.operations_counter.read()
-            && let Some(counter) = counter_map.get(index) {
-                return counter.load(Ordering::SeqCst);
-            }
+            && let Some(counter) = counter_map.get(index)
+        {
+            return counter.load(Ordering::SeqCst);
+        }
         0
     }
 
@@ -372,18 +373,20 @@ impl HybridStore {
 
         // Increment and return new count
         if let Ok(counter_map) = self.operations_counter.read()
-            && let Some(counter) = counter_map.get(index) {
-                return counter.fetch_add(1, Ordering::SeqCst) + 1;
-            }
+            && let Some(counter) = counter_map.get(index)
+        {
+            return counter.fetch_add(1, Ordering::SeqCst) + 1;
+        }
         0
     }
 
     /// Reset operation counter after commit
     fn reset_operations_counter(&self, index: &str) {
         if let Ok(counter_map) = self.operations_counter.read()
-            && let Some(counter) = counter_map.get(index) {
-                counter.store(0, Ordering::SeqCst);
-            }
+            && let Some(counter) = counter_map.get(index)
+        {
+            counter.store(0, Ordering::SeqCst);
+        }
     }
 
     /// Perform smart commit based on operation count
@@ -392,12 +395,13 @@ impl HybridStore {
 
         if self.should_commit_writer(index, ops_count)
             && let Ok(writers) = self.writers.read()
-                && let Some(writer_arc) = writers.get(index) {
-                    let mut writer = writer_arc.lock().unwrap();
-                    writer.commit()?;
-                    self.reset_operations_counter(index);
-                    return Ok(true); // Commit performed
-                }
+            && let Some(writer_arc) = writers.get(index)
+        {
+            let mut writer = writer_arc.lock().unwrap();
+            writer.commit()?;
+            self.reset_operations_counter(index);
+            return Ok(true); // Commit performed
+        }
         Ok(false) // No commit needed
     }
 
@@ -863,10 +867,9 @@ impl HybridStore {
         let tantivy_index_exists = index_path.exists() && index_path.is_dir();
 
         // Add Tantivy index size if it exists
-        if tantivy_index_exists
-            && let Ok(tantivy_size) = get_directory_size(&index_path) {
-                total_size_bytes += tantivy_size;
-            }
+        if tantivy_index_exists && let Ok(tantivy_size) = get_directory_size(&index_path) {
+            total_size_bytes += tantivy_size;
+        }
 
         Ok(IndexStats {
             document_count,
@@ -919,10 +922,9 @@ impl HybridStore {
 
         match read_txn.open_table(data_table_def) {
             Ok(data_table) => {
-                let mut sample_count = 0;
                 const MAX_SAMPLES: usize = 100; // Sample up to 100 documents
 
-                for result in data_table.iter()? {
+                for (sample_count, result) in data_table.iter()?.enumerate() {
                     if sample_count >= MAX_SAMPLES {
                         break;
                     }
@@ -932,11 +934,12 @@ impl HybridStore {
                     // Parse the document JSON to extract field names
                     if let Ok(doc_data) = serde_json::from_slice::<JsonValue>(value.value()) {
                         if let Some(json_blob) = doc_data.get("json_blob")
-                            && let Some(json_obj) = json_blob.as_object() {
-                                for field_name in json_obj.keys() {
-                                    field_names.insert(field_name.clone());
-                                }
+                            && let Some(json_obj) = json_blob.as_object()
+                        {
+                            for field_name in json_obj.keys() {
+                                field_names.insert(field_name.clone());
                             }
+                        }
 
                         // Also check top-level fields in the document
                         if let Some(doc_obj) = doc_data.as_object() {
@@ -947,8 +950,6 @@ impl HybridStore {
                             }
                         }
                     }
-
-                    sample_count += 1;
                 }
             }
             Err(_) => {
