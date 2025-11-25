@@ -157,6 +157,8 @@ pub enum ClientOp {
     CreateConfig { index: String, schema: IndexSchema },
     /// Get index configuration/schema
     GetConfig { index: String },
+    /// List all available indexes with statistics
+    ListIndexes,
 }
 
 /// Microshard actor that manages a single shard's storage and search operations.
@@ -583,6 +585,7 @@ impl RouterActor {
                 self.handle_create_config(&index, schema).await
             }
             ClientOp::GetConfig { index } => self.handle_get_config(&index).await,
+            ClientOp::ListIndexes => self.handle_list_indexes().await,
         }
     }
 
@@ -1103,6 +1106,67 @@ impl RouterActor {
             Err(OrchestratorError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "No shards available for schema retrieval",
+            )))
+        }
+    }
+
+    /// Handles listing all available indexes with their statistics.
+    async fn handle_list_indexes(&self) -> Result<JsonValue, OrchestratorError> {
+        let orchestrator = self.orchestrator.read().await;
+
+        // Get any shard to list indexes (they should all have the same indexes)
+        if let Some(shard) = orchestrator.shards.values().next() {
+            if let Some(store) = &shard.store {
+                let store_clone = Arc::clone(store);
+
+                let indexes = tokio::task::spawn_blocking(move || store_clone.list_indexes())
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to spawn list indexes task: {}", e),
+                        ))
+                    })?
+                    .map_err(|e| {
+                        OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to list indexes: {}", e),
+                        ))
+                    })?;
+
+                // Convert IndexInfo to JSON format
+                let indexes_json: Vec<JsonValue> = indexes
+                    .into_iter()
+                    .map(|info| {
+                        serde_json::json!({
+                            "name": info.name,
+                            "document_count": info.document_count,
+                            "total_size_bytes": info.total_size_bytes,
+                            "size_mb": (info.total_size_bytes as f64 / (1024.0 * 1024.0)),
+                            "tantivy_index_exists": info.tantivy_index_exists,
+                            "schema": {
+                                "shard_count": info.schema.shard_count,
+                                "fields": info.schema.fields
+                            }
+                        })
+                    })
+                    .collect();
+
+                Ok(serde_json::json!({
+                    "indexes": indexes_json,
+                    "total_indexes": indexes_json.len(),
+                    "node_id": orchestrator.identity.uuid.to_string()
+                }))
+            } else {
+                Err(OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No initialized shards available for listing indexes",
+                )))
+            }
+        } else {
+            Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards available for listing indexes",
             )))
         }
     }

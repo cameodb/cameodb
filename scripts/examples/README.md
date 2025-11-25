@@ -1,8 +1,34 @@
 # CameoDB Examples
 
-This directory contains runnable examples for ingesting data into CameoDB.
+This directory contains runnable examples for ingesting data into CameoDB using optimized batch processing.
 
-## TED Talks CSV Ingestion
+## 📊 Available Datasets
+
+| Dataset | Script | Records | Format | Batch Size | Description |
+|---------|--------|---------|--------|------------|-------------|
+| **TED Talks** | `ingest_ted.py` | ~4,600 | CSV (semicolon) | 400 docs / 2MB | YouTube TED talks metadata with descriptions |
+| **Book Summaries** | `ingest_books.py` | 16,559 | TSV (tab) | 200 docs / 4MB | CMU Book Summaries with plot synopses |
+
+## 🚀 Quick Start
+
+```bash
+# Prerequisites: CameoDB server running on localhost:9480
+# Install dependencies: pip install requests
+
+# Ingest TED talks
+python3 scripts/examples/ingest_ted.py
+
+# Ingest book summaries  
+python3 scripts/examples/ingest_books.py
+
+# Test with dry run first
+python3 scripts/examples/ingest_ted.py --dry-run
+python3 scripts/examples/ingest_books.py --dry-run
+```
+
+---
+
+## 🎤 TED Talks CSV Ingestion
 
 The `ingest_ted.py` script loads TED Talks metadata from the CSV file shipped under
 `scripts/data/youtube_ted_2024_03_17.csv` and writes documents into a CameoDB index via
@@ -63,3 +89,107 @@ Each CSV row is transformed into a JSON document with the following fields:
 - Use `--dry-run` to verify parsed output before ingestion.
 - You can rerun the script safely; documents with the same `id` will be overwritten by
   the current `PUT` semantics.
+
+---
+
+## 📚 Book Summaries Ingestion
+
+The `ingest_books.py` script loads the CMU Book Summaries dataset into CameoDB using the bulk API for optimal performance.
+
+### Dataset
+
+The script processes the CMU Book Summaries dataset (`booksummaries.txt`), which contains:
+- **16,559 books** with plot summaries
+- Tab-separated format with fields: book_id, freebase_id, title, author, publication_date, genres_json, summary
+- Genres stored as JSON objects with Freebase mappings
+- Summaries ranging from short descriptions to detailed plot synopses
+
+### Usage
+
+#### Basic Usage
+```bash
+# Ingest all books into the 'books' index
+python3 scripts/examples/ingest_books.py
+
+# Use custom index name
+python3 scripts/examples/ingest_books.py --index literature
+
+# Use custom CameoDB server
+python3 scripts/examples/ingest_books.py --base-url http://localhost:8080
+```
+
+#### Dry Run (Testing)
+```bash
+# Test parsing without sending data
+python3 scripts/examples/ingest_books.py --dry-run
+
+# Test with smaller batches
+python3 scripts/examples/ingest_books.py --dry-run --batch-size 50
+```
+
+#### Performance Tuning
+```bash
+# Large batches for faster ingestion
+python3 scripts/examples/ingest_books.py --batch-size 100 --max-batch-mb 4
+
+# Round-robin distribution instead of consistent hashing
+python3 scripts/examples/ingest_books.py --round-robin
+```
+
+### Document Structure
+
+Each book is indexed with the following fields:
+
+```json
+{
+  "id": "620",
+  "doc": {
+    "book_id": "620",
+    "freebase_id": "/m/0hhy",
+    "title": "Animal Farm",
+    "author": "George Orwell",
+    "publication_date": "1945-08-17",
+    "genres": ["Roman à clef", "Satire", "Children's literature", "Speculative fiction", "Fiction"],
+    "summary": "Old Major, the old boar on the Manor Farm, calls the animals...",
+    "body": "Animal Farm | Author: George Orwell | Old Major, the old boar... | Genres: Roman à clef, Satire, Children's literature, Speculative fiction, Fiction"
+  }
+}
+```
+
+### Performance
+
+- **Batch Processing**: Uses configurable batch sizes (default: 400 documents)
+- **Memory Management**: Respects byte limits (default: 4MB per batch)
+- **Atomic Operations**: Each batch is processed atomically across shards
+- **Expected Throughput**: ~100-200 docs/sec depending on system and network
+
+### Command Line Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--base-url` | `http://localhost:9480` | CameoDB HTTP base URL |
+| `--index` | `books` | Target index name |
+| `--data` | `scripts/data/booksummaries.txt` | Path to book summaries data file |
+| `--dry-run` | `false` | Print sample documents instead of sending |
+| `--round-robin` | `false` | Use round-robin instead of consistent hashing |
+| `--batch-size` | `400` | Maximum documents per batch |
+| `--max-batch-mb` | `4` | Maximum batch size in MB |
+
+### Example Output
+
+```
+Starting batch ingestion with max batch size: 200, max bytes: 4MB
+Batch 1: 200/200 docs indexed (4 shards success, 0 failed) in 0.23s
+Batch 2: 200/200 docs indexed (4 shards success, 0 failed) in 0.07s
+...
+Batch 82: 200/200 docs indexed (4 shards success, 0 failed) in 0.05s
+Batch 83: 159/159 docs indexed (4 shards success, 0 failed) in 0.10s
+
+Ingestion completed:
+  Total processed: 16559 documents
+  Total indexed: 16559 documents
+  Batches sent: 83
+  Total time: 6.69s
+  Throughput: 2473.8 docs/sec
+  Index: 'books'
+```

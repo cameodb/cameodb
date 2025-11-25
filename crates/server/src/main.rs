@@ -80,13 +80,14 @@ async fn main() -> Result<()> {
 
     // Print startup information
     println!("🚀 CameoDB HTTP Server starting on http://{}", bind_address);
-    println!("📡 API endpoints:");
+    println!("🎯 API endpoints:");
     println!("  POST /api/:index/search - Standard search");
     println!("  POST /api/:index/stream - Streaming search");
     println!("  PUT  /api/:index/document - Write document");
     println!("  POST /api/:index/_bulk - Bulk write documents");
     println!("  PUT  /api/:index/_config - Create/update index schema");
     println!("  GET  /api/:index/_config - Retrieve index schema");
+    println!("  GET  /_indexes - List all indexes with statistics");
     println!("  GET  /_cluster/health - Health check");
     println!();
     println!("⚙️  Configuration:");

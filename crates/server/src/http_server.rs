@@ -93,6 +93,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/:index/_bulk", post(bulk_write_handler))
         .route("/api/:index/_config", put(create_config_handler))
         .route("/api/:index/_config", get(get_config_handler))
+        // Index management
+        .route("/_indexes", get(list_indexes_handler))
         // Health check
         .route("/_cluster/health", get(health_handler))
         .with_state(state)
@@ -244,6 +246,16 @@ async fn get_config_handler(
     info!("Get config request - index: {}", index);
 
     let client_op = ClientOp::GetConfig { index };
+
+    let result = state.router.handle_client_op(client_op).await?;
+    Ok(Json(result))
+}
+
+/// Handler for listing all available indexes
+async fn list_indexes_handler(State(state): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
+    info!("List indexes request");
+
+    let client_op = ClientOp::ListIndexes;
 
     let result = state.router.handle_client_op(client_op).await?;
     Ok(Json(result))

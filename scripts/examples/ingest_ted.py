@@ -17,7 +17,7 @@ DEFAULT_BASE_URL = "http://localhost:9480"
 DEFAULT_INDEX = "ted"
 DEFAULT_CSV_PATH = Path("scripts/data/youtube_ted_2024_03_17.csv")
 DEFAULT_BATCH_SIZE = 400
-DEFAULT_MAX_BATCH_BYTES = 30 * 1024 * 1024  # 30MB
+DEFAULT_MAX_BATCH_BYTES = 2 * 1024 * 1024  # 2MB
 
 
 @dataclass

@@ -123,6 +123,24 @@ impl Default for IndexSchema {
     }
 }
 
+/// Statistics for an index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexStats {
+    pub document_count: u64,
+    pub total_size_bytes: u64,
+    pub tantivy_index_exists: bool,
+}
+
+/// Information about an index including schema and statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexInfo {
+    pub name: String,
+    pub schema: IndexSchema,
+    pub document_count: u64,
+    pub total_size_bytes: u64,
+    pub tantivy_index_exists: bool,
+}
+
 /// Comprehensive error types for storage engine operations.
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -182,6 +200,28 @@ struct SchemaFields {
     id: Field,
     body: Field,
     json_blob: Field,
+}
+
+/// Helper function to calculate directory size recursively
+fn get_directory_size(path: &PathBuf) -> Result<u64, std::io::Error> {
+    let mut total_size = 0u64;
+
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+
+            if entry_path.is_dir() {
+                total_size += get_directory_size(&entry_path)?;
+            } else {
+                total_size += entry.metadata()?.len();
+            }
+        }
+    } else {
+        total_size = path.metadata()?.len();
+    }
+
+    Ok(total_size)
 }
 
 /// Multi-tenant hybrid storage engine combining redb and tantivy.
@@ -736,6 +776,109 @@ impl HybridStore {
         }
 
         Ok(seq_ids)
+    }
+
+    /// List all available indexes with their statistics
+    pub fn list_indexes(&self) -> Result<Vec<IndexInfo>, StoreError> {
+        let mut indexes = Vec::new();
+
+        // Get all schemas from the schema table
+        let read_txn = self.kv.begin_read()?;
+
+        match read_txn.open_table(TABLE_SCHEMA) {
+            Ok(schema_table) => {
+                for result in schema_table.iter()? {
+                    let (index_name, schema_bytes) = result?;
+                    let index_name = index_name.value().to_string();
+
+                    // Parse schema
+                    let schema: IndexSchema = serde_json::from_slice(schema_bytes.value())
+                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+                    // Get statistics for this index
+                    let stats = self.get_index_statistics(&index_name)?;
+
+                    indexes.push(IndexInfo {
+                        name: index_name,
+                        schema,
+                        document_count: stats.document_count,
+                        total_size_bytes: stats.total_size_bytes,
+                        tantivy_index_exists: stats.tantivy_index_exists,
+                    });
+                }
+            }
+            Err(_) => {
+                // Schema table doesn't exist yet, check for any existing Tantivy indices
+                let indices_dir = self.config.shard_path.join("indices");
+                if indices_dir.exists() {
+                    for entry in fs::read_dir(&indices_dir)? {
+                        let entry = entry?;
+                        if entry.file_type()?.is_dir() {
+                            let index_name = entry.file_name().to_string_lossy().to_string();
+                            let stats = self.get_index_statistics(&index_name)?;
+
+                            // Create default schema for legacy indices
+                            let default_schema = IndexSchema {
+                                shard_count: 256,
+                                fields: HashMap::new(),
+                            };
+
+                            indexes.push(IndexInfo {
+                                name: index_name,
+                                schema: default_schema,
+                                document_count: stats.document_count,
+                                total_size_bytes: stats.total_size_bytes,
+                                tantivy_index_exists: stats.tantivy_index_exists,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(indexes)
+    }
+
+    /// Get statistics for a specific index
+    pub fn get_index_statistics(&self, index: &str) -> Result<IndexStats, StoreError> {
+        let data_table_name = format!("data_{}", index);
+        let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
+
+        let read_txn = self.kv.begin_read()?;
+
+        let mut document_count = 0u64;
+        let mut total_size_bytes = 0u64;
+
+        // Count documents and calculate size from redb data table
+        match read_txn.open_table(data_table_def) {
+            Ok(data_table) => {
+                for result in data_table.iter()? {
+                    let (_, value) = result?;
+                    document_count += 1;
+                    total_size_bytes += value.value().len() as u64;
+                }
+            }
+            Err(_) => {
+                // Table doesn't exist, keep counts at 0
+            }
+        }
+
+        // Check if Tantivy index exists
+        let index_path = self.config.shard_path.join("indices").join(index);
+        let tantivy_index_exists = index_path.exists() && index_path.is_dir();
+
+        // Add Tantivy index size if it exists
+        if tantivy_index_exists {
+            if let Ok(tantivy_size) = get_directory_size(&index_path) {
+                total_size_bytes += tantivy_size;
+            }
+        }
+
+        Ok(IndexStats {
+            document_count,
+            total_size_bytes,
+            tantivy_index_exists,
+        })
     }
 }
 
