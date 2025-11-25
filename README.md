@@ -1,6 +1,17 @@
 # CameoDB
 
-A high-performance, distributed, shared-nothing hybrid-search database built in Rust. CameoDB combines the reliability of ACID-compliant key-value storage (redb) with the power of full-text search (Tantivy) in a multi-tenant, horizontally scalable architecture.
+A high-performance, distributed, shared-nothing hybrid-search database built in **Rust 2024 Edition**. CameoDB combines the reliability of ACID-compliant key-value storage (redb) with the power of full-text search (Tantivy) in a multi-tenant, horizontally scalable architecture.
+
+## 🌟 **Key Features**
+
+- 🦀 **Modern Rust 2024** - Built with latest Rust standards and performance optimizations  
+- 🔄 **Multi-Tenant Architecture** - Complete index isolation with dynamic scaling
+- ⚡ **Atomic Batch Operations** - High-throughput bulk processing with ACID guarantees
+- 🔍 **Hybrid Storage** - Combined KV store (redb) + full-text search (Tantivy)  
+- 📊 **Schema Management** - Dynamic schema evolution with type validation
+- 🌐 **Distributed Ready** - Actor-based architecture with consistent hashing
+- 🐳 **Docker Deployment** - Production-ready containerized setup
+- 📈 **Performance Optimized** - Smart commits, memory budgets, and adaptive batching
 
 ## 🚀 Quick Start
 
@@ -352,7 +363,7 @@ docker build --platform linux/amd64 -t cameodb:latest .
 docker build --platform linux/arm64 -t cameodb:latest .
 
 # Build with different Rust version
-docker build --build-arg RUST_VERSION=1.75 -t cameodb:latest .
+docker build --build-arg RUST_VERSION=1.90 -t cameodb:latest .
 
 # Multi-platform build
 docker buildx build --platform linux/amd64,linux/arm64 -t cameodb:latest .
@@ -501,12 +512,39 @@ data_paths = ["./cameodb-data"]
 wal_sync = true
 ```
 
+## � System Requirements
+
+### **Development**
+- **Rust**: 1.90.0+ with Rust 2024 Edition support
+- **OS**: macOS 11+, Ubuntu 20.04+, or Windows 10+ with WSL2
+- **Memory**: 4GB RAM minimum (8GB+ recommended)
+- **Storage**: 10GB+ available space
+- **Network**: Ports 9480 (HTTP API), 9580 (cluster communication)
+
+### **Dependencies**
+- **System**: `curl`, `jq` (for scripts and testing)
+- **Python**: 3.9+ with `requests` (for data ingestion examples)
+- **Docker**: Docker Desktop (for distributed deployment)
+
+### **Quick Environment Setup**
+```bash
+# Automated dependency installation
+./scripts/setup/install-deps.sh
+
+# Initialize development cluster with sample data
+./scripts/setup/init-cluster.sh
+
+# Verify installation  
+./scripts/testing/test-api.sh
+```
+
 ## 📚 Documentation
 
-- [Architecture Overview](ARCHITECTURE.md)
-- [Configuration Guide](docs/CONFIGURATION.md)
-- [Contributing Guidelines](docs/CONTRIBUTING.md)
-- [Ingestion Examples](scripts/examples/README.md)
+- [Storage Engine Details](crates/storage/README.md) - Multi-tenant hybrid storage architecture
+- [Cluster Management](crates/cluster/README.md) - Distributed topology and consistent hashing  
+- [Development Scripts](scripts/README.md) - Testing, data generation, and operations
+- [Ingestion Examples](scripts/examples/README.md) - TED talks and book summaries datasets
+- [Docker Deployment](docker/README.md) - Container deployment and cluster setup
 
 ## 🚀 Getting Started
 
@@ -536,7 +574,31 @@ wal_sync = true
 
 ## 📄 License
 
-[Add your license information here]
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 🤝 Contributing
+
+We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details on:
+
+- 🐛 **Bug Reports** - Help us improve by reporting issues
+- 💡 **Feature Requests** - Suggest new capabilities  
+- 🔧 **Pull Requests** - Submit code improvements
+- 📝 **Documentation** - Help improve our docs
+- 🧪 **Testing** - Add test cases and benchmarks
+
+### **Development Quick Start**
+```bash
+# Setup development environment
+./scripts/setup/install-deps.sh
+
+# Run full test suite
+cargo test --all
+cargo clippy --all-targets -- -D warnings
+
+# Test with sample data
+./scripts/data/sample-data.sh
+./scripts/testing/load-test.sh
+```
 
 ---
 

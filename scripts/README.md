@@ -224,7 +224,7 @@ Scripts respect these environment variables when available:
 - **timeout**: Command execution limits (GNU coreutils)
 
 ### CameoDB Dependencies
-- **Rust Toolchain**: 1.70+ with Cargo
+- **Rust Toolchain**: 1.90.0+ with Cargo (Rust 2024 Edition)
 - **CameoDB Project**: Must be built (`cargo build --release`)
 
 ### Development Tools (Optional)

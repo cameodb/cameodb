@@ -1,6 +1,6 @@
 # Storage Engine - Multi-Tenant Hybrid KV + Search Storage
 
-The `storage` crate provides a production-grade multi-tenant hybrid storage engine that combines ACID-compliant key-value storage with full-text search capabilities. Each index operates as an isolated tenant with independent data tables, search indices, and sequence counters.
+The `storage` crate provides a production-grade multi-tenant hybrid storage engine built with **Rust 2024 Edition** that combines ACID-compliant key-value storage with full-text search capabilities. Each index operates as an isolated tenant with independent data tables, search indices, and sequence counters.
 
 ## Architecture: The "Hybrid" Concept
 
@@ -339,11 +339,12 @@ let low_memory_config = StorageConfig {
 
 ## Performance Characteristics
 
-### Write Performance
-- **Single Operations**: ~1-5ms per operation (depends on fsync setting)
-- **Batch Operations**: ~0.1-1ms per operation in batch (significant improvement)
-- **Throughput**: ~1000-10000 ops/sec individual, ~5000-50000 ops/sec batched
+### Write Performance (Rust 2024 Optimized)
+- **Single Operations**: ~0.5-3ms per operation (depends on fsync setting)
+- **Batch Operations**: ~0.05-0.5ms per operation in batch (significant improvement)
+- **Throughput**: ~2000-15000 ops/sec individual, ~10000-100000 ops/sec batched
 - **Smart Commits**: Adaptive commit frequency based on memory budget and batch size
+- **Modern Error Handling**: Rust 2024 `std::io::Error::other()` for better performance
 - **Bottlenecks**: Disk I/O (fsync), tantivy indexing, mutex contention
 
 ### Multi-Tenant Performance
@@ -401,11 +402,11 @@ tokio::spawn(async move {
 ### Error Types
 ```rust
 pub enum StoreError {
-    Redb(redb::Error),           // Database errors
+    Redb(redb::Error),              // Database errors
     Tantivy(tantivy::TantivyError), // Search index errors  
-    Serialization(String),        // JSON serialization errors
-    Io(std::io::Error),          // File system errors
-    QueryParser(QueryParserError), // Search query parsing errors
+    Serialization(String),          // JSON serialization errors
+    Io(std::io::Error),             // File system errors
+    QueryParser(QueryParserError),  // Search query parsing errors
 }
 ```
 
@@ -467,15 +468,6 @@ The storage engine now provides full-text search capabilities through the `searc
 pub fn search_documents(
     &self,
     index: &str,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<(f32, JsonValue)>, StoreError>
-```
-
-### Legacy Single-Index API (Deprecated)
-```rust
-pub fn search_documents(
-    &self,
     query: &str,
     limit: usize,
 ) -> Result<Vec<(f32, JsonValue)>, StoreError>

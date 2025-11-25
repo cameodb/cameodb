@@ -6,8 +6,8 @@ This directory contains runnable examples for ingesting data into CameoDB using 
 
 | Dataset | Script | Records | Format | Batch Size | Description |
 |---------|--------|---------|--------|------------|-------------|
-| **TED Talks** | `ingest_ted.py` | ~4,600 | CSV (semicolon) | 400 docs / 2MB | YouTube TED talks metadata with descriptions |
-| **Book Summaries** | `ingest_books.py` | 16,559 | TSV (tab) | 200 docs / 4MB | CMU Book Summaries with plot synopses |
+| **TED Talks** | `ingest_ted.py` | ~4,600 | CSV (semicolon) | 500 docs / 5MB | YouTube TED talks metadata with descriptions |
+| **Book Summaries** | `ingest_books.py` | 16,559 | TSV (tab) | 400 docs / 4MB | CMU Book Summaries with plot synopses |
 
 ## 🚀 Quick Start
 
@@ -159,9 +159,11 @@ Each book is indexed with the following fields:
 ### Performance
 
 - **Batch Processing**: Uses configurable batch sizes (default: 400 documents)
-- **Memory Management**: Respects byte limits (default: 4MB per batch)
+- **Memory Management**: Respects byte limits (default: 4MB per batch)  
 - **Atomic Operations**: Each batch is processed atomically across shards
-- **Expected Throughput**: ~100-200 docs/sec depending on system and network
+- **Expected Throughput**: ~1,000-3,000 docs/sec with optimized batching (Rust 2024 performance improvements)
+- **Smart Commits**: Dynamic commit thresholds based on memory budgets (16MB-256MB)
+- **Parallel Sharding**: Automatic document distribution across multiple shards
 
 ### Command Line Options
 
