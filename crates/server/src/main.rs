@@ -68,10 +68,10 @@ async fn main() -> Result<()> {
     let mut distributed_cluster =
         DistributedCluster::new(cameodb_config.cluster.clone(), orchestrator.identity().uuid);
 
-    if let Err(err) = distributed_cluster.bootstrap().await {
+    match distributed_cluster.bootstrap().await { Err(err) => {
         tracing::warn!(%err, "Failed to bootstrap distributed cluster");
         println!("⚠️  Distributed cluster bootstrap failed, continuing in single-node mode");
-    } else {
+    } _ => {
         let cluster_status = distributed_cluster.get_cluster_status();
         if cluster_status.distributed_enabled {
             println!("🌐 Distributed cluster initialized:");
@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-    }
+    }}
 
     // Create shared state for HTTP server
     let orchestrator_arc = Arc::new(tokio::sync::RwLock::new(orchestrator));
