@@ -687,6 +687,8 @@ impl RouterActor {
         index: &str,
         docs: Vec<DocPayload>,
     ) -> Result<JsonValue, OrchestratorError> {
+        let start_time = std::time::Instant::now();
+        let total_docs = docs.len();
         let orchestrator = self.orchestrator.read().await;
 
         if orchestrator.shards.is_empty() {
@@ -831,11 +833,18 @@ impl RouterActor {
             }
         }
 
+        let operation_time_ms = start_time.elapsed().as_millis() as u64;
+
         Ok(serde_json::json!({
             "items_indexed": total_indexed,
             "successful_shards": successful_shards,
             "failed_shards": failed_shards,
-            "shard_results": shard_results
+            "shard_results": shard_results,
+            "QTime": operation_time_ms,
+            "timing": {
+                "total_ms": operation_time_ms,
+                "documents_processed": total_docs
+            }
         }))
     }
 
@@ -898,6 +907,7 @@ impl RouterActor {
         query: &str,
         limit: usize,
     ) -> Result<JsonValue, OrchestratorError> {
+        let start_time = std::time::Instant::now();
         let orchestrator = self.orchestrator.read().await;
 
         // Get all shard actors (scatter-gather across all shards for now)
@@ -905,10 +915,16 @@ impl RouterActor {
         drop(orchestrator); // Release read lock early
 
         if shard_ids.is_empty() {
+            let query_time_ms = start_time.elapsed().as_millis() as u64;
             return Ok(serde_json::json!({
                 "results": [],
                 "total_shards": 0,
-                "query": query
+                "query": query,
+                "QTime": query_time_ms,
+                "timing": {
+                    "total_ms": query_time_ms,
+                    "query": query.to_string()
+                }
             }));
         }
 
@@ -993,13 +1009,20 @@ impl RouterActor {
             })
             .collect();
 
+        let query_time_ms = start_time.elapsed().as_millis() as u64;
+
         Ok(serde_json::json!({
             "results": formatted_results,
             "total_results": formatted_results.len(),
             "total_shards": shard_ids.len(),
             "successful_shards": successful_shards,
             "failed_shards": failed_shards,
-            "query": query
+            "query": query,
+            "QTime": query_time_ms,
+            "timing": {
+                "total_ms": query_time_ms,
+                "query": query.to_string()
+            }
         }))
     }
 
@@ -1110,65 +1133,125 @@ impl RouterActor {
         }
     }
 
-    /// Handles listing all available indexes with their statistics.
+    /// Handles listing all available indexes with their statistics aggregated across all shards.
     async fn handle_list_indexes(&self) -> Result<JsonValue, OrchestratorError> {
         let orchestrator = self.orchestrator.read().await;
 
-        // Get any shard to list indexes (they should all have the same indexes)
-        if let Some(shard) = orchestrator.shards.values().next() {
+        if orchestrator.shards.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards available for listing indexes",
+            )));
+        }
+
+        // Get index names from the first available shard
+        let index_names = if let Some(shard) = orchestrator.shards.values().next() {
             if let Some(store) = &shard.store {
                 let store_clone = Arc::clone(store);
-
-                let indexes = tokio::task::spawn_blocking(move || store_clone.list_indexes())
+                tokio::task::spawn_blocking(move || store_clone.get_index_names())
                     .await
                     .map_err(|e| {
                         OrchestratorError::Io(std::io::Error::new(
                             std::io::ErrorKind::Other,
-                            format!("Failed to spawn list indexes task: {}", e),
+                            format!("Failed to spawn get index names task: {}", e),
                         ))
                     })?
                     .map_err(|e| {
                         OrchestratorError::Io(std::io::Error::new(
                             std::io::ErrorKind::Other,
-                            format!("Failed to list indexes: {}", e),
+                            format!("Failed to get index names: {}", e),
+                        ))
+                    })?
+            } else {
+                return Err(OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No initialized shards available",
+                )));
+            }
+        } else {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards available",
+            )));
+        };
+
+        let mut indexes_json = Vec::new();
+        let actual_shard_count = orchestrator.shards.len();
+
+        // For each index, aggregate statistics across all shards
+        for index_name in index_names {
+            let mut total_document_count = 0u64;
+            let mut total_size_bytes = 0u64;
+            let mut tantivy_exists_count = 0;
+            let mut field_names = std::collections::HashSet::new();
+
+            // Collect statistics from all shards for this index
+            for shard in orchestrator.shards.values() {
+                if let Some(store) = &shard.store {
+                    let store_clone = Arc::clone(store);
+                    let index_name_clone = index_name.clone();
+
+                    let shard_stats = tokio::task::spawn_blocking(move || {
+                        let stats = store_clone.get_index_statistics(&index_name_clone)?;
+                        let fields = store_clone.get_index_field_names(&index_name_clone)?;
+                        Ok::<_, storage::StoreError>((stats, fields))
+                    })
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to spawn shard stats task: {}", e),
+                        ))
+                    })?
+                    .map_err(|e| {
+                        OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to get shard stats: {}", e),
                         ))
                     })?;
 
-                // Convert IndexInfo to JSON format
-                let indexes_json: Vec<JsonValue> = indexes
-                    .into_iter()
-                    .map(|info| {
-                        serde_json::json!({
-                            "name": info.name,
-                            "document_count": info.document_count,
-                            "total_size_bytes": info.total_size_bytes,
-                            "size_mb": (info.total_size_bytes as f64 / (1024.0 * 1024.0)),
-                            "tantivy_index_exists": info.tantivy_index_exists,
-                            "schema": {
-                                "shard_count": info.schema.shard_count,
-                                "fields": info.schema.fields
-                            }
-                        })
-                    })
-                    .collect();
+                    total_document_count += shard_stats.0.document_count;
+                    total_size_bytes += shard_stats.0.total_size_bytes;
+                    if shard_stats.0.tantivy_index_exists {
+                        tantivy_exists_count += 1;
+                    }
 
-                Ok(serde_json::json!({
-                    "indexes": indexes_json,
-                    "total_indexes": indexes_json.len(),
-                    "node_id": orchestrator.identity.uuid.to_string()
-                }))
-            } else {
-                Err(OrchestratorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "No initialized shards available for listing indexes",
-                )))
+                    // Collect unique field names
+                    for field in shard_stats.1 {
+                        field_names.insert(field);
+                    }
+                }
             }
-        } else {
-            Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No shards available for listing indexes",
-            )))
+
+            let mut field_names_vec: Vec<String> = field_names.into_iter().collect();
+
+            // Sort fields with "id" first, then alphabetically
+            field_names_vec.sort_by(|a, b| {
+                match (a.as_str(), b.as_str()) {
+                    ("id", "id") => std::cmp::Ordering::Equal,
+                    ("id", _) => std::cmp::Ordering::Less, // "id" comes first
+                    (_, "id") => std::cmp::Ordering::Greater, // "id" comes first
+                    (a, b) => a.cmp(b),                    // alphabetical for others
+                }
+            });
+
+            indexes_json.push(serde_json::json!({
+                "name": index_name,
+                "document_count": total_document_count,
+                "total_size_bytes": total_size_bytes,
+                "size_mb": (total_size_bytes / (1024 * 1024)) as u64,
+                "shard_count": actual_shard_count,
+                "tantivy_shards": tantivy_exists_count,
+                "field_names": field_names_vec
+            }));
         }
+
+        Ok(serde_json::json!({
+            "indexes": indexes_json,
+            "total_indexes": indexes_json.len(),
+            "node_id": orchestrator.identity.uuid.to_string(),
+            "total_shards": actual_shard_count
+        }))
     }
 }
 

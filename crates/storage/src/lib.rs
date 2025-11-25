@@ -880,6 +880,103 @@ impl HybridStore {
             tantivy_index_exists,
         })
     }
+
+    /// Get list of index names from schema table and filesystem
+    pub fn get_index_names(&self) -> Result<Vec<String>, StoreError> {
+        let mut index_names = std::collections::HashSet::new();
+
+        let read_txn = self.kv.begin_read()?;
+
+        // Get index names from schema table
+        match read_txn.open_table(TABLE_SCHEMA) {
+            Ok(schema_table) => {
+                for result in schema_table.iter()? {
+                    let (index_name, _) = result?;
+                    index_names.insert(index_name.value().to_string());
+                }
+            }
+            Err(_) => {
+                // Schema table doesn't exist yet
+            }
+        }
+
+        // Also check for indices in filesystem (legacy support)
+        let indices_dir = self.config.shard_path.join("indices");
+        if indices_dir.exists() {
+            for entry in fs::read_dir(&indices_dir)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    let index_name = entry.file_name().to_string_lossy().to_string();
+                    index_names.insert(index_name);
+                }
+            }
+        }
+
+        Ok(index_names.into_iter().collect())
+    }
+
+    /// Get field names from actual documents in an index by sampling
+    pub fn get_index_field_names(&self, index: &str) -> Result<Vec<String>, StoreError> {
+        let data_table_name = format!("data_{}", index);
+        let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
+
+        let read_txn = self.kv.begin_read()?;
+        let mut field_names = std::collections::HashSet::new();
+
+        match read_txn.open_table(data_table_def) {
+            Ok(data_table) => {
+                let mut sample_count = 0;
+                const MAX_SAMPLES: usize = 100; // Sample up to 100 documents
+
+                for result in data_table.iter()? {
+                    if sample_count >= MAX_SAMPLES {
+                        break;
+                    }
+
+                    let (_, value) = result?;
+
+                    // Parse the document JSON to extract field names
+                    if let Ok(doc_data) = serde_json::from_slice::<JsonValue>(value.value()) {
+                        if let Some(json_blob) = doc_data.get("json_blob") {
+                            if let Some(json_obj) = json_blob.as_object() {
+                                for field_name in json_obj.keys() {
+                                    field_names.insert(field_name.clone());
+                                }
+                            }
+                        }
+
+                        // Also check top-level fields in the document
+                        if let Some(doc_obj) = doc_data.as_object() {
+                            for field_name in doc_obj.keys() {
+                                if field_name != "body" && field_name != "json_blob" {
+                                    field_names.insert(field_name.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    sample_count += 1;
+                }
+            }
+            Err(_) => {
+                // Table doesn't exist, return empty list
+            }
+        }
+
+        let mut field_names_vec: Vec<String> = field_names.into_iter().collect();
+
+        // Sort fields with "id" first, then alphabetically
+        field_names_vec.sort_by(|a, b| {
+            match (a.as_str(), b.as_str()) {
+                ("id", "id") => std::cmp::Ordering::Equal,
+                ("id", _) => std::cmp::Ordering::Less, // "id" comes first
+                (_, "id") => std::cmp::Ordering::Greater, // "id" comes first
+                (a, b) => a.cmp(b),                    // alphabetical for others
+            }
+        });
+
+        Ok(field_names_vec)
+    }
 }
 
 // Safe because all components are Send+Sync

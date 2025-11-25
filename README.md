@@ -48,8 +48,16 @@ curl -X POST http://localhost:9480/api/books/search \
       }
     }
   ],
-  "total": 42,
-  "took_ms": 12
+  "total_results": 42,
+  "total_shards": 4,
+  "successful_shards": 4,
+  "failed_shards": 0,
+  "query": "science fiction space",
+  "QTime": 12,
+  "timing": {
+    "total_ms": 12,
+    "query": "science fiction space"
+  }
 }
 ```
 
@@ -146,8 +154,15 @@ curl -X POST http://localhost:9480/api/books/_bulk \
   "items_indexed": 2,
   "successful_shards": 4,
   "failed_shards": 0,
-  "sequence_ids": [1002, 1003],
-  "took_ms": 45
+  "shard_results": [
+    {"shard_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "items_indexed": 1, "status": "success"},
+    {"shard_id": "b2c3d4e5-f6g7-8901-bcde-f12345678901", "items_indexed": 1, "status": "success"}
+  ],
+  "QTime": 45,
+  "timing": {
+    "total_ms": 45,
+    "documents_processed": 2
+  }
 }
 ```
 
@@ -231,29 +246,23 @@ curl http://localhost:9480/_indexes
       "name": "books",
       "document_count": 16559,
       "total_size_bytes": 45231680,
-      "size_mb": 43.1,
-      "tantivy_index_exists": true,
-      "schema": {
-        "shard_count": 256,
-        "fields": {
-          "title": {"name": "title", "field_type": "text", "indexed": true},
-          "author": {"name": "author", "field_type": "text", "indexed": true}
-        }
-      }
+      "size_mb": 43,
+      "shard_count": 4,
+      "tantivy_shards": 4,
+      "field_names": ["id", "author", "genres", "publication_date", "summary", "title"]
     },
     {
       "name": "ted",
       "document_count": 4641,
       "total_size_bytes": 12458752,
-      "size_mb": 11.9,
-      "tantivy_index_exists": true,
-      "schema": {
-        "shard_count": 256,
-        "fields": {}
-      }
+      "size_mb": 12,
+      "shard_count": 4,
+      "tantivy_shards": 4,
+      "field_names": ["id", "description", "like_count", "speaker", "tags", "title", "view_count"]
     }
   ],
   "total_indexes": 2,
+  "total_shards": 4,
   "node_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
@@ -318,6 +327,7 @@ python3 scripts/examples/ingest_books.py --dry-run
 - **Consistent Hashing**: Optimal data distribution
 - **Streaming Search**: Real-time result streaming for large queries
 - **Schema Evolution**: Dynamic field addition and validation
+- **Query Timing**: Detailed performance metrics like Lucene/Solr (QTime, component timing)
 
 ## 🔧 Configuration
 
