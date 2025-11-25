@@ -201,13 +201,10 @@ impl MicroshardActor {
         let config = self.storage_config.clone();
         let store = tokio::task::spawn_blocking(move || HybridStore::new(config))
             .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
             .map_err(|e: StoreError| match e {
                 StoreError::Io(io_err) => OrchestratorError::Io(io_err),
-                _ => OrchestratorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )),
+                _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
             })?;
 
         self.store = Some(Arc::new(store));
@@ -237,15 +234,10 @@ impl MicroshardActor {
         let results =
             tokio::task::spawn_blocking(move || store.search_documents(&index, &query, limit))
                 .await
-                .map_err(|e| {
-                    OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
-                })?
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
                 .map_err(|e: StoreError| match e {
                     StoreError::Io(io_err) => OrchestratorError::Io(io_err),
-                    _ => OrchestratorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    )),
+                    _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
                 })?;
 
         Ok(results)
@@ -354,13 +346,10 @@ impl MicroshardActor {
         let index = request.index.clone();
         let seq_id = tokio::task::spawn_blocking(move || store.apply_write(&index, op))
             .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
             .map_err(|e: StoreError| match e {
                 StoreError::Io(io_err) => OrchestratorError::Io(io_err),
-                _ => OrchestratorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )),
+                _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
             })?;
 
         Ok(seq_id)
@@ -417,10 +406,7 @@ impl MicroshardActor {
                         json_blob,
                     };
 
-                    ops_by_index
-                        .entry(index)
-                        .or_insert_with(Vec::new)
-                        .push(wal_op);
+                    ops_by_index.entry(index).or_default().push(wal_op);
                 }
                 _ => {
                     // For now, only support Write operations in batch
@@ -442,13 +428,10 @@ impl MicroshardActor {
             Ok::<Vec<u64>, StoreError>(all_results)
         })
         .await
-        .map_err(|e| OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
         .map_err(|e: StoreError| match e {
             StoreError::Io(io_err) => OrchestratorError::Io(io_err),
-            _ => OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            )),
+            _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
         })?;
 
         Ok(all_seq_ids)
@@ -534,16 +517,16 @@ async fn validate_and_evolve_schema(
         tokio::task::spawn_blocking(move || store_clone.store_schema(&index_name, &schema_clone))
             .await
             .map_err(|e| {
-                OrchestratorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to spawn schema update task: {}", e),
-                ))
+                OrchestratorError::Io(std::io::Error::other(format!(
+                    "Failed to spawn schema update task: {}",
+                    e
+                )))
             })?
             .map_err(|e| {
-                OrchestratorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to store schema: {}", e),
-                ))
+                OrchestratorError::Io(std::io::Error::other(format!(
+                    "Failed to store schema: {}",
+                    e
+                )))
             })?;
 
         // TODO: Broadcast SchemaUpdate to cluster
@@ -691,16 +674,16 @@ impl RouterActor {
                 tokio::task::spawn_blocking(move || store_clone.get_schema(&index_name))
                     .await
                     .map_err(|e| {
-                        OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to spawn schema load task: {}", e),
-                        ))
+                        OrchestratorError::Io(std::io::Error::other(format!(
+                            "Failed to spawn schema load task: {}",
+                            e
+                        )))
                     })?
                     .map_err(|e| {
-                        OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to load schema: {}", e),
-                        ))
+                        OrchestratorError::Io(std::io::Error::other(format!(
+                            "Failed to load schema: {}",
+                            e
+                        )))
                     })?
                     .unwrap_or_else(IndexSchema::default)
             } else {
@@ -711,10 +694,10 @@ impl RouterActor {
         };
 
         // Run validate_and_evolve_schema for the document
-        if let Some(shard) = orchestrator.shards.values().next() {
-            if let Some(store) = &shard.store {
-                validate_and_evolve_schema(index, &doc, &mut schema_cache, store).await?;
-            }
+        if let Some(shard) = orchestrator.shards.values().next()
+            && let Some(store) = &shard.store
+        {
+            validate_and_evolve_schema(index, &doc, &mut schema_cache, store).await?;
         }
 
         let target_shard_id = if let Some(ref routing_key) = routing_key {
@@ -783,16 +766,16 @@ impl RouterActor {
                 tokio::task::spawn_blocking(move || store_clone.get_schema(&index_name))
                     .await
                     .map_err(|e| {
-                        OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to spawn schema load task: {}", e),
-                        ))
+                        OrchestratorError::Io(std::io::Error::other(format!(
+                            "Failed to spawn schema load task: {}",
+                            e
+                        )))
                     })?
                     .map_err(|e| {
-                        OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to load schema: {}", e),
-                        ))
+                        OrchestratorError::Io(std::io::Error::other(format!(
+                            "Failed to load schema: {}",
+                            e
+                        )))
                     })?
                     .unwrap_or_else(IndexSchema::default)
             } else {
@@ -803,12 +786,12 @@ impl RouterActor {
         };
 
         // Validate all documents before processing
-        if let Some(shard) = orchestrator.shards.values().next() {
-            if let Some(store) = &shard.store {
-                for doc_payload in &docs {
-                    validate_and_evolve_schema(index, &doc_payload.doc, &mut schema_cache, store)
-                        .await?;
-                }
+        if let Some(shard) = orchestrator.shards.values().next()
+            && let Some(store) = &shard.store
+        {
+            for doc_payload in &docs {
+                validate_and_evolve_schema(index, &doc_payload.doc, &mut schema_cache, store)
+                    .await?;
             }
         }
 
@@ -839,10 +822,7 @@ impl RouterActor {
             };
 
             // Add to the batch for this shard
-            batches
-                .entry(target_shard_id)
-                .or_insert_with(Vec::new)
-                .push(client_op);
+            batches.entry(target_shard_id).or_default().push(client_op);
         }
 
         // Collect shard references before spawning tasks
@@ -1123,16 +1103,16 @@ impl RouterActor {
                 })
                 .await
                 .map_err(|e| {
-                    OrchestratorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to spawn schema creation task: {}", e),
-                    ))
+                    OrchestratorError::Io(std::io::Error::other(format!(
+                        "Failed to spawn schema creation task: {}",
+                        e
+                    )))
                 })?
                 .map_err(|e| {
-                    OrchestratorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to store schema: {}", e),
-                    ))
+                    OrchestratorError::Io(std::io::Error::other(format!(
+                        "Failed to store schema: {}",
+                        e
+                    )))
                 })?;
 
                 info!("Schema created for index '{}'", index);
@@ -1171,16 +1151,16 @@ impl RouterActor {
                     tokio::task::spawn_blocking(move || store_clone.get_schema(&index_name))
                         .await
                         .map_err(|e| {
-                            OrchestratorError::Io(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Failed to spawn schema retrieval task: {}", e),
-                            ))
+                            OrchestratorError::Io(std::io::Error::other(format!(
+                                "Failed to spawn schema retrieval task: {}",
+                                e
+                            )))
                         })?
                         .map_err(|e| {
-                            OrchestratorError::Io(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Failed to retrieve schema: {}", e),
-                            ))
+                            OrchestratorError::Io(std::io::Error::other(format!(
+                                "Failed to retrieve schema: {}",
+                                e
+                            )))
                         })?;
 
                 match schema_opt {
@@ -1228,16 +1208,16 @@ impl RouterActor {
                 tokio::task::spawn_blocking(move || store_clone.get_index_names())
                     .await
                     .map_err(|e| {
-                        OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to spawn get index names task: {}", e),
-                        ))
+                        OrchestratorError::Io(std::io::Error::other(format!(
+                            "Failed to spawn get index names task: {}",
+                            e
+                        )))
                     })?
                     .map_err(|e| {
-                        OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to get index names: {}", e),
-                        ))
+                        OrchestratorError::Io(std::io::Error::other(format!(
+                            "Failed to get index names: {}",
+                            e
+                        )))
                     })?
             } else {
                 return Err(OrchestratorError::Io(std::io::Error::new(
@@ -1275,16 +1255,16 @@ impl RouterActor {
                     })
                     .await
                     .map_err(|e| {
-                        OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to spawn shard stats task: {}", e),
-                        ))
+                        OrchestratorError::Io(std::io::Error::other(format!(
+                            "Failed to spawn shard stats task: {}",
+                            e
+                        )))
                     })?
                     .map_err(|e| {
-                        OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to get shard stats: {}", e),
-                        ))
+                        OrchestratorError::Io(std::io::Error::other(format!(
+                            "Failed to get shard stats: {}",
+                            e
+                        )))
                     })?;
 
                     total_document_count += shard_stats.0.document_count;
@@ -1316,7 +1296,7 @@ impl RouterActor {
                 "name": index_name,
                 "document_count": total_document_count,
                 "total_size_bytes": total_size_bytes,
-                "size_mb": (total_size_bytes / (1024 * 1024)) as u64,
+                "size_mb": total_size_bytes / (1024 * 1024),
                 "shard_count": actual_shard_count,
                 "tantivy_shards": tantivy_exists_count,
                 "field_names": field_names_vec

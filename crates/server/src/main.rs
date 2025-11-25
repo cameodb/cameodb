@@ -1,8 +1,6 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use tracing_subscriber;
-
 mod config;
 mod distributed;
 mod http_server;
