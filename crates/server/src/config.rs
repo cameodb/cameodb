@@ -55,6 +55,10 @@ pub struct CameoDbConfig {
 
     /// Search engine configuration (Tantivy settings)
     pub search: SearchConfig,
+
+    /// Cluster configuration for distributed deployment
+    #[serde(default)]
+    pub cluster: ClusterConfig,
 }
 
 /// HTTP server and networking configuration
@@ -126,6 +130,30 @@ pub struct StorageConfig {
     /// WAL segment size in MB (default: 64)
     #[serde(default = "default_wal_segment_size_mb")]
     pub wal_segment_size_mb: usize,
+}
+
+/// Cluster configuration for distributed actor system
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterConfig {
+    /// Enable distributed actor system (default: false)
+    #[serde(default = "default_distributed_actors")]
+    pub distributed_actors: bool,
+
+    /// Cluster communication port for libp2p (default: 8080)
+    #[serde(default = "default_cluster_port")]
+    pub cluster_port: u16,
+
+    /// Bootstrap nodes for cluster discovery
+    #[serde(default)]
+    pub bootstrap_nodes: Vec<String>,
+
+    /// Enable automatic peer discovery via mDNS (default: true)
+    #[serde(default = "default_mdns_discovery")]
+    pub mdns_discovery: bool,
+
+    /// Cluster name for isolation (default: "cameodb-cluster")
+    #[serde(default = "default_cluster_name")]
+    pub cluster_name: String,
 }
 
 /// Tantivy search engine configuration
@@ -361,6 +389,7 @@ impl Default for CameoDbConfig {
             },
             storage: StorageConfig::default(),
             search: SearchConfig::default(),
+            cluster: ClusterConfig::default(),
         }
     }
 }
@@ -407,6 +436,18 @@ impl Default for SearchConfig {
             memory_pressure_threshold: default_pressure_threshold(),
             search_threads: default_search_threads(),
             index_refresh_interval_secs: default_index_refresh_secs(),
+        }
+    }
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            distributed_actors: default_distributed_actors(),
+            cluster_port: default_cluster_port(),
+            bootstrap_nodes: Vec::new(),
+            mdns_discovery: default_mdns_discovery(),
+            cluster_name: default_cluster_name(),
         }
     }
 }
@@ -465,6 +506,19 @@ fn default_search_threads() -> usize {
 }
 fn default_index_refresh_secs() -> u64 {
     5
+}
+
+fn default_distributed_actors() -> bool {
+    false
+}
+fn default_cluster_port() -> u16 {
+    9580
+}
+fn default_mdns_discovery() -> bool {
+    true
+}
+fn default_cluster_name() -> String {
+    "cameodb-cluster".to_string()
 }
 
 #[cfg(test)]

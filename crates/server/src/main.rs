@@ -4,10 +4,12 @@ use std::sync::Arc;
 use tracing_subscriber;
 
 mod config;
+mod distributed;
 mod http_server;
 mod node_orchestrator;
 
 use config::CameoDbConfig;
+use distributed::DistributedCluster;
 use http_server::{create_router, AppState};
 use node_orchestrator::{NodeConfig, NodeOrchestrator, ProposeShard, RouterActor};
 
@@ -61,6 +63,30 @@ async fn main() -> Result<()> {
         orchestrator.identity().uuid
     );
     println!("Active shards: {}", orchestrator.shard_count());
+
+    // Initialize distributed cluster if enabled
+    let mut distributed_cluster =
+        DistributedCluster::new(cameodb_config.cluster.clone(), orchestrator.identity().uuid);
+
+    if let Err(err) = distributed_cluster.bootstrap().await {
+        tracing::warn!(%err, "Failed to bootstrap distributed cluster");
+        println!("⚠️  Distributed cluster bootstrap failed, continuing in single-node mode");
+    } else {
+        let cluster_status = distributed_cluster.get_cluster_status();
+        if cluster_status.distributed_enabled {
+            println!("🌐 Distributed cluster initialized:");
+            println!("  📡 Cluster: {}", cluster_status.cluster_name);
+            println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
+            println!("  ✅ Connected: {}", cluster_status.connected_nodes);
+
+            // Discover peers
+            if let Ok(peers) = distributed_cluster.discover_peers().await {
+                if !peers.is_empty() {
+                    println!("  👥 Discovered {} peer nodes", peers.len());
+                }
+            }
+        }
+    }
 
     // Create shared state for HTTP server
     let orchestrator_arc = Arc::new(tokio::sync::RwLock::new(orchestrator));

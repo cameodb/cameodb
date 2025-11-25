@@ -314,11 +314,12 @@ python3 scripts/examples/ingest_books.py --dry-run
 
 ## 🏗️ Architecture
 
-- **Distributed**: Shared-nothing architecture with consistent hashing
-- **Multi-tenant**: Complete isolation between indexes
+- **Distributed**: Shared-nothing architecture with consistent hashing and Kameo actor system
+- **Multi-tenant**: Complete isolation between indexes  
 - **Hybrid Storage**: ACID-compliant KV store + full-text search
 - **High Performance**: Optimized batch operations and memory management
 - **Rust-native**: Built for safety, performance, and concurrency
+- **Actor-based**: Transparent distributed actors with automatic service discovery
 
 ## 📈 Performance Features
 
@@ -328,6 +329,158 @@ python3 scripts/examples/ingest_books.py --dry-run
 - **Streaming Search**: Real-time result streaming for large queries
 - **Schema Evolution**: Dynamic field addition and validation
 - **Query Timing**: Detailed performance metrics like Lucene/Solr (QTime, component timing)
+
+## 🌐 Distributed Deployment
+
+CameoDB supports true distributed deployment using Kameo's remote actor system:
+
+### Quick Start - 3-Node Cluster (Docker Desktop)
+
+#### **Deploy the Cluster**
+```bash
+# Deploy distributed CameoDB cluster
+cd docker && docker-compose up -d --build
+
+# Check all containers are running
+docker-compose ps
+```
+
+#### **Docker Build Options**
+```bash
+# Build for specific architecture
+docker build --platform linux/amd64 -t cameodb:latest .
+docker build --platform linux/arm64 -t cameodb:latest .
+
+# Build with different Rust version
+docker build --build-arg RUST_VERSION=1.75 -t cameodb:latest .
+
+# Multi-platform build
+docker buildx build --platform linux/amd64,linux/arm64 -t cameodb:latest .
+```
+
+#### **Port Mapping Strategy**
+```
+External Access    Internal Service    Purpose
+──────────────────────────────────────────────────
+localhost:9481  → Node 1:9480       Direct node access
+localhost:9482  → Node 2:9480       Direct node access  
+localhost:9483  → Node 3:9480       Direct node access
+localhost:80    → Load Balancer     Production access
+─────────────────────────────────────────────  
+9581            → 9580           Node 1 Cluster
+9582            → 9580           Node 2 Cluster  
+9583            → 9580           Node 3 Cluster
+```
+
+#### **Simple Load Balancer**
+Uses nginx with inline configuration for external ports:
+```nginx
+upstream cameodb_cluster {
+    server host.docker.internal:9481;  # External port to Node 1
+    server host.docker.internal:9482;  # External port to Node 2
+    server host.docker.internal:9483;  # External port to Node 3
+}
+```
+
+#### **Access Patterns**
+```bash
+# Direct node access
+curl http://localhost:9481/api/books/search -d '{"query": "distributed systems"}'  # Node 1
+curl http://localhost:9482/api/books/search -d '{"query": "rust programming"}'     # Node 2
+curl http://localhost:9483/api/books/search -d '{"query": "database design"}'     # Node 3
+
+# Load-balanced access (automatically distributed across all 3 nodes)
+curl http://localhost/api/books/search -d '{"query": "microservices"}'
+curl http://localhost/_health
+curl http://localhost/api/books/_bulk -d '[{"id":"1","title":"Test"}]'
+```
+
+### Configuration Example
+```toml
+[cluster]
+# Enable distributed actor system
+distributed_actors = true
+# Cluster communication port (aligned with gRPC best practices)
+cluster_port = 9580
+# Bootstrap nodes for discovery
+bootstrap_nodes = ["node1.cameodb.com:9580", "node2.cameodb.com:9580"]
+# Enable local network discovery
+mdns_discovery = true
+# Cluster isolation name
+cluster_name = "cameodb-production"
+```
+
+### Key Benefits
+- **🎯 Zero-Configuration Networking**: Actors automatically discover each other
+- **🔄 Transparent Routing**: Same API works for local and remote shards
+- **⚡ Automatic Failover**: Failed nodes are automatically excluded
+- **📈 Dynamic Scaling**: Add/remove nodes without downtime
+- **🏷️  Service Discovery**: DHT + mDNS for automatic peer discovery
+
+### Development Workflow
+
+#### **Testing Individual Nodes**
+```bash
+# Test each node individually
+for port in 9481 9482 9483; do
+  echo "Testing Node on port $port:"
+  curl -s http://localhost:$port/_health | jq
+done
+```
+
+#### **Load Testing**
+```bash
+# Test load balancing across all nodes
+for i in {1..10}; do
+  curl -s http://localhost/api/books/search -d '{"query": "test", "limit": 1}' | jq '.results | length'
+done
+```
+
+#### **Container Management**
+```bash
+# Follow logs for debugging (from docker folder)
+cd docker && docker-compose logs -f
+
+# Restart specific node
+docker-compose restart cameodb-node2
+
+# Stop all containers
+docker-compose down
+
+# Full cleanup (removes volumes)
+docker-compose down -v
+```
+
+### Resource Requirements (Docker Desktop)
+
+- **CPU**: 4+ cores recommended (each node gets 1/3 allocation)
+- **Memory**: 4GB+ recommended (512MB per node minimum)
+- **Storage**: 10GB+ available space
+- **Network**: Uses `172.20.0.0/16` subnet with mDNS discovery
+
+### Troubleshooting
+
+#### **Port Conflicts**
+```bash
+# Check if ports are in use
+lsof -i :9481 -i :9482 -i :9483 -i :80
+
+# Kill conflicting processes
+sudo lsof -ti:9481 | xargs kill -9
+```
+
+#### **Container Health Checks**
+```bash
+# Check container status (from docker folder)
+cd docker && docker-compose ps
+
+# Individual health endpoints
+curl http://localhost:9481/_health  # Node 1
+curl http://localhost:9482/_health  # Node 2  
+curl http://localhost:9483/_health  # Node 3
+```
+
+This configuration provides a seamless distributed CameoDB experience optimized for Docker Desktop development on macOS!
 
 ## 🔧 Configuration
 

@@ -26,6 +26,7 @@ use std::sync::{
 
 use anyhow::Result;
 use futures::stream::StreamExt;
+use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -92,7 +93,7 @@ pub struct ProposeShard {
 
 /// Search request message for MicroshardActor.
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
     pub index: String,
     pub query_string: String,
@@ -100,10 +101,11 @@ pub struct SearchRequest {
 }
 
 /// Search stream request message for MicroshardActor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchStream {
     pub index: String,
-    pub query_string: String,
+    pub query: String,
+    pub limit: usize,
 }
 
 /// Document payload for write operations.
@@ -116,22 +118,22 @@ pub struct DocPayload {
 }
 
 /// Write request message for MicroshardActor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteRequest {
     pub index: String,
-    pub id: String,
+    pub routing_key: Option<String>,
     pub doc: JsonValue,
 }
 
 /// Batch write request message for MicroshardActor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchWriteRequest {
     pub ops: Vec<ClientOp>,
 }
 
 /// Client operation messages for RouterActor.
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientOp {
     /// Search operation across shards of an index
     Search {
@@ -162,7 +164,7 @@ pub enum ClientOp {
 }
 
 /// Microshard actor that manages a single shard's storage and search operations.
-#[derive(Clone)]
+#[derive(Clone, Actor)]
 pub struct MicroshardActor {
     shard_id: Uuid,
     store: Option<Arc<HybridStore>>,
@@ -262,7 +264,7 @@ impl MicroshardActor {
         })?;
 
         let store = Arc::clone(store);
-        let query = request.query_string;
+        let query = request.query;
         let index = request.index;
 
         // Create channel for streaming results
@@ -305,8 +307,19 @@ impl MicroshardActor {
         })?;
 
         let store = Arc::clone(store);
-        let id = request.id;
-        let doc = request.doc;
+        let doc = request.doc.clone();
+
+        // Extract ID from document
+        let id = doc
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Document must contain an 'id' field",
+                ))
+            })?
+            .to_string();
 
         // Map document to WalOp::Put with proper body and json_blob mapping
         let (body, json_blob) = match &doc {
@@ -540,9 +553,72 @@ async fn validate_and_evolve_schema(
     Ok(())
 }
 
+// ============================================================================
+// Remote Message Implementations for Distributed Actors
+// ============================================================================
+
+/// Message implementation for MicroshardActor search operations
+impl Message<SearchRequest> for MicroshardActor {
+    type Reply = Result<Vec<(f32, JsonValue)>, OrchestratorError>;
+
+    async fn handle(
+        &mut self,
+        msg: SearchRequest,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_search(msg).await
+    }
+}
+
+/// Message implementation for MicroshardActor write operations
+impl Message<WriteRequest> for MicroshardActor {
+    type Reply = Result<u64, OrchestratorError>;
+
+    async fn handle(
+        &mut self,
+        msg: WriteRequest,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_write(msg).await
+    }
+}
+
+/// Message implementation for MicroshardActor batch write operations
+impl Message<BatchWriteRequest> for MicroshardActor {
+    type Reply = Result<JsonValue, OrchestratorError>;
+
+    async fn handle(
+        &mut self,
+        msg: BatchWriteRequest,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // Convert Vec<u64> to JsonValue to match expected return type
+        match self.handle_batch_write(msg).await {
+            Ok(sequence_ids) => Ok(serde_json::json!({
+                "sequence_ids": sequence_ids,
+                "items_processed": sequence_ids.len()
+            })),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Message implementation for RouterActor client operations
+impl Message<ClientOp> for RouterActor {
+    type Reply = Result<JsonValue, OrchestratorError>;
+
+    async fn handle(
+        &mut self,
+        msg: ClientOp,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_client_op(msg).await
+    }
+}
+
 /// Router actor that handles client operations and distributes them across shards.
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone)]
+#[derive(Clone, Actor)]
 pub struct RouterActor {
     orchestrator: std::sync::Arc<tokio::sync::RwLock<NodeOrchestrator>>,
 }
@@ -666,7 +742,7 @@ impl RouterActor {
 
         let write_request = WriteRequest {
             index: index.to_string(),
-            id: id.clone(),
+            routing_key: routing_key.clone(),
             doc,
         };
 
@@ -875,7 +951,8 @@ impl RouterActor {
             for shard_id in shard_ids {
                 let search_stream = SearchStream {
                     index: index.clone(),
-                    query_string: query.clone(),
+                    query: query.clone(),
+                    limit: 1000, // Default streaming limit
                 };
 
                 // Get stream from each shard
@@ -1669,8 +1746,9 @@ mod tests {
         // Test write operation using new WriteRequest format
         let write_request = WriteRequest {
             index: "test_index".to_string(),
-            id: "doc1".to_string(),
+            routing_key: Some("doc1".to_string()),
             doc: serde_json::json!({
+                "id": "doc1",
                 "title": "Test Document",
                 "body": "This is a test document for search functionality",
                 "category": "test"
@@ -1725,8 +1803,9 @@ mod tests {
         for i in 0..5 {
             let write_request = WriteRequest {
                 index: "test_index".to_string(),
-                id: format!("doc{}", i),
+                routing_key: Some(format!("doc{}", i)),
                 doc: serde_json::json!({
+                    "id": format!("doc{}", i),
                     "title": format!("Document {}", i),
                     "body": format!("Content for document {}", i),
                     "number": i
@@ -1738,7 +1817,8 @@ mod tests {
         // Test streaming search
         let stream_request = SearchStream {
             index: "test_index".to_string(),
-            query_string: "document".to_string(),
+            query: "document".to_string(),
+            limit: 100,
         };
 
         let stream_result = shard.handle_search_stream(stream_request).await;

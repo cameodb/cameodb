@@ -7,7 +7,7 @@ anyhow = "1.0"
 axum = "0.7"
 bincode = "1.3"
 futures = "0.3.30"
-kameo = "0.19"
+kameo = { version = "0.19", features = ["remote"] }
 libp2p = "0.53"
 num_cpus = "1.16"
 redb = "3.1"

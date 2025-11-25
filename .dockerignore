@@ -1,0 +1,44 @@
+# Build artifacts
+target/
+.vscode/
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+
+# Development files
+.env
+.env.local
+*.log
+
+# IDE files
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test data
+data/
+!data/.gitkeep
+
+# Docker files (avoid recursion)
+docker-compose*.yml
+Dockerfile*
+
+# Scripts
+scripts/
+examples/
+
+# Backup files
+*.bak
+*.backup
+
+# Temporary files
+tmp/
+temp/
