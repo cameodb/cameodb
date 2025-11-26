@@ -25,23 +25,31 @@ Based on the BlazeDBS Dockerfile, the following patterns were adopted for CameoD
 ### **File Structure**
 ```
 cameodb/
-├── Dockerfile                    # Main single-node Dockerfile
-├── .dockerignore                 # Build optimization
+├── Dockerfile                   # Main single-node Dockerfile
+├── .dockerignore                # Build optimization
 └── docker/
     ├── Dockerfile               # Distributed cluster Dockerfile
     ├── docker-compose.yml       # 3-node cluster orchestration
-    └── README.md               # Docker-specific documentation
+    └── README.md                # Docker-specific documentation
 ```
 
 ### **Multi-Stage Build Process**
 
 #### **Builder Stage Features**
 ```dockerfile
-# Rust 1.75 with musl static linking
-FROM rust:1.75-slim AS builder
+# Rust 1.90 with musl static linking
+ARG RUST_VERSION=1.90
+FROM rust:${RUST_VERSION}-slim AS builder
+
+RUN rustup default ${RUST_VERSION}
 
 # Cross-compilation support
-RUN apt-get install musl-tools gcc-aarch64-linux-gnu
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    musl-tools \
+    gcc-aarch64-linux-gnu \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Architecture-aware builds
 case "${TARGETARCH}" in
@@ -50,9 +58,13 @@ case "${TARGETARCH}" in
 esac
 
 # Optimized caching with mount cache
+WORKDIR /src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --target "${TARGET_TRIPLE}"
+    cargo build --release --target "${TARGET_TRIPLE}" --bin server
+
+# Stage binary for runtime image
+RUN cp "/src/target/${TARGET_TRIPLE}/release/server" /src/cameodb
 ```
 
 #### **Runtime Stage Features**
@@ -64,6 +76,7 @@ FROM gcr.io/distroless/static:latest AS runtime
 USER nonroot:nonroot
 
 # Essential configuration only
+COPY --from=builder --chown=nonroot:nonroot /src/cameodb /usr/local/bin/cameodb
 COPY --chown=nonroot:nonroot cameodb.toml /etc/cameodb/
 EXPOSE 9480 9580
 
@@ -93,7 +106,7 @@ services:
     depends_on: [cameodb-node1]
     
   nginx-lb: # Simple load balancer
-    ports: ["80:80"]
+    ports: ["9480:80"]
     # Proxies to external ports 9481, 9482, 9483
 ```
 
@@ -104,7 +117,7 @@ Docker Host (macOS)
 │   ├── :9481 → Node 1 HTTP
 │   ├── :9482 → Node 2 HTTP  
 │   ├── :9483 → Node 3 HTTP
-│   └── :80   → Load Balancer
+│   └── :9480 → Load Balancer
 ├── Cluster Network (172.20.0.0/16)
 │   ├── node1.cameodb.local (172.20.0.10)
 │   ├── node2.cameodb.local (172.20.0.11)
@@ -136,14 +149,17 @@ Docker Host (macOS)
 ### **Single Node Deployment**
 ```bash
 # Build and run single node
+mkdir -p cameodb-data
 docker build -t cameodb:latest .
-docker run -p 9480:9480 -v $(pwd)/data:/data cameodb:latest
+docker run -p 9480:9480 -v $(pwd)/cameodb-data:/data/cameodb-data cameodb:latest
 ```
 
 ### **Multi-Node Cluster**
 ```bash
 # Deploy distributed cluster
-cd docker && docker-compose up -d --build
+cd docker
+mkdir -p ../cameodb-data/node{1,2,3}
+docker-compose up -d --build
 
 # Scale individual services
 docker-compose up -d --scale cameodb-node2=2

@@ -7,14 +7,14 @@
 # Port Mapping Strategy:
 # - HTTP API (external): 9481, 9482, 9483 -> 9480 (internal)
 # - Cluster Communication: 9581, 9582, 9583 -> 9580 (internal)
-# - Load Balancer: 80 -> simple proxy to external ports 9481, 9482, 9483
+# - Load Balancer: 9480 -> simple proxy to external ports 9481, 9482, 9483
 #
 # Usage:
 #   cd docker && docker-compose up -d
 #   curl http://localhost:9481/api/books/search  # Direct Node 1
 #   curl http://localhost:9482/api/books/search  # Direct Node 2  
 #   curl http://localhost:9483/api/books/search  # Direct Node 3
-#   curl http://localhost/api/books/search       # Load balanced (simple proxy)
+#   curl http://localhost:9480/api/books/search  # Load balanced (simple proxy)
 
 networks:
   cameodb-cluster:
@@ -43,7 +43,7 @@ services:
       - "9481:9480"  # HTTP API (external:internal)
       - "9581:9580"  # Cluster communication (libp2p)
     volumes:
-      - ./data/node1:/data/cameodb-data
+      - ../cameodb-data/node1:/data/cameodb-data
       - ./config/node1.toml:/etc/cameodb/config.toml:ro
     networks:
       cameodb-cluster:
@@ -74,7 +74,7 @@ services:
       - "9482:9480"  # HTTP API (external:internal)
       - "9582:9580"  # Cluster communication (libp2p)
     volumes:
-      - ./data/node2:/data/cameodb-data
+      - ../cameodb-data/node2:/data/cameodb-data
       - ./config/node2.toml:/etc/cameodb/config.toml:ro
     networks:
       cameodb-cluster:
@@ -108,7 +108,7 @@ services:
       - "9483:9480"  # HTTP API (external:internal)
       - "9583:9580"  # Cluster communication (libp2p)
     volumes:
-      - ./data/node3:/data/cameodb-data
+      - ../cameodb-data/node3:/data/cameodb-data
       - ./config/node3.toml:/etc/cameodb/config.toml:ro
     networks:
       cameodb-cluster:
@@ -128,7 +128,7 @@ services:
     image: nginx:alpine
     container_name: cameodb-lb
     ports:
-      - "80:80"     # Main load-balanced endpoint
+      - "9480:80"   # Main load-balanced endpoint
     command: |
       /bin/sh -c "
       echo 'upstream cameodb_cluster {
