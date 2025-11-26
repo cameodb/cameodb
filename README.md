@@ -372,12 +372,12 @@ docker buildx build --platform linux/amd64,linux/arm64 -t cameodb:latest .
 #### **Port Mapping Strategy**
 ```
 External Access    Internal Service    Purpose
-──────────────────────────────────────────────────
+──────────────────────────────────────────────────────
 localhost:9481  → Node 1:9480       Direct node access
 localhost:9482  → Node 2:9480       Direct node access  
 localhost:9483  → Node 3:9480       Direct node access
 localhost:80    → Load Balancer     Production access
-─────────────────────────────────────────────  
+──────────────────────────────────────────────────────
 9581            → 9580           Node 1 Cluster
 9582            → 9580           Node 2 Cluster  
 9583            → 9580           Node 3 Cluster
@@ -398,7 +398,7 @@ upstream cameodb_cluster {
 # Direct node access
 curl http://localhost:9481/api/books/search -d '{"query": "distributed systems"}'  # Node 1
 curl http://localhost:9482/api/books/search -d '{"query": "rust programming"}'     # Node 2
-curl http://localhost:9483/api/books/search -d '{"query": "database design"}'     # Node 3
+curl http://localhost:9483/api/books/search -d '{"query": "database design"}'      # Node 3
 
 # Load-balanced access (automatically distributed across all 3 nodes)
 curl http://localhost/api/books/search -d '{"query": "microservices"}'
@@ -574,7 +574,21 @@ wal_sync = true
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+CameoDB uses a multi-license policy inspired by Sentry:
+
+| Component / Path | License | Notes |
+|------------------|---------|-------|
+| Core crates (e.g. `crates/cluster`, `crates/storage`, supporting libraries) | Apache-2.0 | Fully open source core with patent protection |
+| SDKs and client tooling (e.g. `crates/client`) | MIT | Maximizes compatibility (incl. GPL) |
+| Product / server application (`crates/server`) | FSL-1.1-Apache-2.0 | Restricts competitive hosting for 2 years, then reverts to Apache-2.0 |
+
+License texts are available under [`licenses/`](licenses/):
+
+- `licenses/LICENSE-APACHE-2.0`
+- `licenses/LICENSE-MIT`
+- `licenses/LICENSE-FSL-1.1-APACHE-2.0`
+
+See the top-level [LICENSE](LICENSE) file for details.
 
 ## 🤝 Contributing
 
