@@ -28,7 +28,7 @@ The system is designed without a central master ("Leaderless" / "Decentralized")
 Nodes are "Self-Sovereign." They do not request an ID from a master.
 * **UUID (v4):** The immutable, cryptographic identity of the node.
 * **Friendly Name:** A Base36 string derived from the first 2 bytes of the UUID (e.g., `7FX`).
-* **Storage:** Identity is generated on Cold Boot and persisted to `./data/meta.json`.
+* **Storage:** Identity is generated on Cold Boot and persisted to `./data/cameodb/node_identity.json`.
 
 ### 2.2. The Ring (Consistent Hashing)
 To ensure uniform data distribution without coordination:
@@ -70,7 +70,7 @@ graph TD
 
 ### 3.1. The Node Orchestrator
 * **Role:** Local Resource Manager and Parent.
-* **Startup:** Scans `./data/storage/`. Detects existing shard directories (named by UUID). Spawns `MicroshardActors` for them.
+* **Startup:** Scans `./data/cameodb/`. Detects existing shard directories (e.g., `shard-<uuid>`). Spawns `MicroshardActors` for them.
 * **Lifecycle:** Handles `ProposeNewShard`, `GetStatus`, and `Shutdown` signals.
 * **Resource Guard:** Enforces `max_shards` and disk usage limits before accepting new work.
 
@@ -97,10 +97,11 @@ To solve the trade-off between Search (Tantivy) and Retrieval (Redb), both engin
 
 **Directory Structure:**
 ```text
-/data/storage/shard-{uuid}/
-├── wal_meta.redb      # The Write-Ahead Log + Raw Data
-├── tantivy_idx/       # The Inverted Index files
-└── state.json         # Shard-specific config (e.g., replication targets)
+/data/cameodb/shard-{uuid}/
+├── store.redb         # Redb database for KV data and WAL
+└── indices/           # Root for multi-tenant Tantivy indices
+    ├── {index_name_1}/  # Separate directory for each index
+    └── {index_name_2}/  # ...
 ```
 
 ### 4.1. The Atomic Write Transaction
