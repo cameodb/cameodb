@@ -1,53 +1,66 @@
 # 🐳 CameoDB Docker Configuration
 
-This folder contains Docker configuration files for running CameoDB in a distributed setup.
-
-## Quick Start
-
-```bash
-# From the docker directory (project root contains data/cameodb/)
-mkdir -p ../data/cameodb/node{1,2,3}
-docker-compose up -d
-
-# Check status
-docker-compose ps
-
-# View logs
-docker-compose logs -f
-
-# Stop all containers
-docker-compose down
-```
+This directory contains configurations for running CameoDB using Docker for both single-node and multi-node cluster deployments.
 
 ## What's Included
 
-- **docker-compose.yml**: 3-node distributed CameoDB cluster with nginx load balancer
-- **Port Configuration**: External ports 9481-9483 for direct node access, port 80 for load-balanced access
-- **Data Persistence**: Volumes for each node's data storage
-- **Health Checks**: Container health monitoring enabled
+- **`Dockerfile`**: A multi-stage `Dockerfile` that builds a minimal, secure production image using a non-root user. It uses Docker secrets to handle build-time CA certificates without leaking them into the final image.
+- **`docker-compose.yml`**: A simple configuration for running a single, standalone CameoDB node. Ideal for local development and testing.
+- **`docker-compose-cluster.yml`**: A 3-node distributed cluster configuration with an NGINX load balancer. Demonstrates a production-like setup.
 
-## Data Directories
+## Deployment Scenarios
 
-The compose file binds host volumes under the project-level `data/cameodb/` directory to
-`/data/cameodb` inside each CameoDB node. Ensure subdirectories exist before starting the cluster:
+### 1. Single-Node Deployment
 
+This is the simplest way to run CameoDB. It uses the `docker-compose.yml` file.
+
+**Setup & Run:**
 ```bash
-mkdir -p ../data/cameodb/node{1,2,3}
+# Ensure the data directory exists in the project root
+mkdir -p ../data/cameodb
+
+# From the /docker directory, start the container
+docker-compose up -d
 ```
 
-All indexed data, WAL files, and shard metadata will persist inside these host directories.
+- **Access Point**: `http://localhost:9480`
+- **Data Persistence**: Data is stored in the project's `data/cameodb` directory.
 
-## Access Points
+### 2. Multi-Node Cluster Deployment
 
-- **Node 1 (Direct)**: http://localhost:9481
-- **Node 2 (Direct)**: http://localhost:9482  
-- **Node 3 (Direct)**: http://localhost:9483
-- **Load Balanced**: http://localhost:9480
+This setup runs a 3-node cluster and is defined in `docker-compose-cluster.yml`.
 
-## Requirements
+**Setup & Run:**
+```bash
+# Create data directories for each node
+mkdir -p ../data/cameodb/node{1,2,3}
 
-- Docker Desktop for macOS
-- 4GB+ RAM recommended
-- Ports 80, 9481, 9482, 9483, 9581, 9582, 9583 available
+# From the /docker directory, start the cluster
+docker-compose -f docker-compose-cluster.yml up -d
+```
 
-For detailed documentation, see the main [README.md](../README.md) file.
+- **Access Points**:
+  - **Load Balanced**: `http://localhost:9480` (via NGINX)
+  - **Node 1 (Direct)**: `http://localhost:9481`
+  - **Node 2 (Direct)**: `http://localhost:9482`
+  - **Node 3 (Direct)**: `http://localhost:9483`
+- **Data Persistence**: Each node's data is stored in a separate subdirectory within `data/cameodb/`.
+
+## Common Commands
+
+```bash
+# Check status of containers (use -f for cluster file)
+docker-compose [-f docker-compose-cluster.yml] ps
+
+# View logs
+docker-compose [-f docker-compose-cluster.yml] logs -f
+
+# Stop and remove containers
+docker-compose [-f docker-compose-cluster.yml] down
+```
+
+## Security & Best Practices
+
+- **Non-Root User**: The container runs as a `nonroot` user (`65532:65532`) for enhanced security.
+- **Multi-Stage Build**: The `Dockerfile` uses a builder stage for compilation and a minimal `distroless` image for runtime, reducing the attack surface.
+- **Secret Management**: Build-time secrets (like CA certificates) are mounted using `--mount=type=secret` and are not persisted in the final image layers.

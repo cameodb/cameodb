@@ -25,12 +25,12 @@ Based on the BlazeDBS Dockerfile, the following patterns were adopted for CameoD
 ### **File Structure**
 ```
 cameodb/
-├── Dockerfile                   # Main single-node Dockerfile
-├── .dockerignore                # Build optimization
+├── Dockerfile                     # Multi-stage Dockerfile for production builds
+├── .dockerignore                  # Files to exclude from the build context
 └── docker/
-    ├── Dockerfile               # Distributed cluster Dockerfile
-    ├── docker-compose.yml       # 3-node cluster orchestration
-    └── README.md                # Docker-specific documentation
+    ├── docker-compose.yml         # Single-node deployment configuration
+    ├── docker-compose-cluster.yml # 3-node cluster deployment configuration
+    └── README.md                  # Docker-specific documentation
 ```
 
 ### **Multi-Stage Build Process**
@@ -146,23 +146,18 @@ Docker Host (macOS)
 
 ## 🚀 Usage Examples
 
-### **Single Node Deployment**
+### **Single-Node Deployment**
 ```bash
-# Build and run single node
+# From the project root
 mkdir -p data/cameodb
-docker build -t cameodb:latest .
-docker run -p 9480:9480 -v $(pwd)/data/cameodb:/data/cameodb cameodb:latest
+docker-compose -f docker/docker-compose.yml up -d --build
 ```
 
 ### **Multi-Node Cluster**
 ```bash
-# Deploy distributed cluster
-cd docker
-mkdir -p ../data/cameodb/node{1,2,3}
-docker-compose up -d --build
-
-# Scale individual services
-docker-compose up -d --scale cameodb-node2=2
+# From the project root
+mkdir -p data/cameodb/node{1,2,3}
+docker-compose -f docker/docker-compose-cluster.yml up -d --build
 ```
 
 ### **Cross-Platform Builds**
