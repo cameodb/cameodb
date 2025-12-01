@@ -57,7 +57,7 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            storage_path: PathBuf::from("./cameodb-data"),
+            storage_path: PathBuf::from("./data/cameodb"),
             max_shards: 8,
             writer_memory_min_mb: 16,
             writer_memory_max_mb: 256,

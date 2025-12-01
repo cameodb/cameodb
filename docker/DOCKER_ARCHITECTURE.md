@@ -149,16 +149,16 @@ Docker Host (macOS)
 ### **Single Node Deployment**
 ```bash
 # Build and run single node
-mkdir -p cameodb-data
+mkdir -p data/cameodb
 docker build -t cameodb:latest .
-docker run -p 9480:9480 -v $(pwd)/cameodb-data:/data/cameodb-data cameodb:latest
+docker run -p 9480:9480 -v $(pwd)/data/cameodb:/data/cameodb cameodb:latest
 ```
 
 ### **Multi-Node Cluster**
 ```bash
 # Deploy distributed cluster
 cd docker
-mkdir -p ../cameodb-data/node{1,2,3}
+mkdir -p ../data/cameodb/node{1,2,3}
 docker-compose up -d --build
 
 # Scale individual services

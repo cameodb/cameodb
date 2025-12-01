@@ -80,7 +80,7 @@
 //!
 //! // Configure storage
 //! let config = StorageConfig {
-//!     shard_path: PathBuf::from("./cameodb-data/shard1"),
+//!     shard_path: PathBuf::from("./data/cameodb/shard1"),
 //!     writer_memory_budget: 50 * 1024 * 1024, // 50MB
 //!     wal_sync: true,
 //! };
@@ -118,8 +118,8 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tantivy::query::QueryParserError;
-use tantivy::schema::{Document, Field, Schema, STORED, STRING, TEXT};
-use tantivy::{doc, Index, IndexReader, IndexWriter, TantivyDocument};
+use tantivy::schema::{Document, Field, STORED, STRING, Schema, TEXT};
+use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, doc};
 use thiserror::Error;
 
 // Dynamic table definitions for multi-tenant storage
@@ -162,7 +162,7 @@ macro_rules! wal_table_name {
 ///
 /// // Custom configuration
 /// let config = StorageConfig {
-///     shard_path: PathBuf::from("./cameodb-data/shard1"),
+///     shard_path: PathBuf::from("./data/cameodb/shard1"),
 ///     writer_memory_budget: 64 * 1024 * 1024, // 64MB
 ///     wal_sync: false, // Higher performance, less durability
 /// };
@@ -414,7 +414,7 @@ struct SchemaFields {
 /// use std::path::PathBuf;
 ///
 /// let config = StorageConfig {
-///     shard_path: PathBuf::from("./cameodb-data/test_shard"),
+///     shard_path: PathBuf::from("./data/cameodb/test_shard"),
 ///     writer_memory_budget: 32 * 1024 * 1024,
 ///     wal_sync: true,
 /// };
@@ -494,7 +494,7 @@ impl HybridStore {
     /// use std::path::PathBuf;
     ///
     /// let config = StorageConfig {
-    ///     shard_path: PathBuf::from("./cameodb-data/my_shard"),
+    ///     shard_path: PathBuf::from("./data/cameodb/my_shard"),
     ///     writer_memory_budget: 32 * 1024 * 1024, // 32MB per index
     ///     wal_sync: true,
     /// };

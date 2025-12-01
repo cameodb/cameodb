@@ -100,7 +100,7 @@ export CAMEODB_HTTP_PORT=9480
 export CAMEODB_HTTP_HOST="0.0.0.0"
 
 # Storage Configuration (colon-separated paths for multi-disk)
-export CAMEODB_DATA_PATHS="./cameodb-data:/mnt/disk1/cameodb:/mnt/disk2/cameodb"
+export CAMEODB_DATA_PATHS="./data/cameodb:/mnt/disk1/cameodb:/mnt/disk2/cameodb"
 
 # Tantivy Memory Configuration (MB)
 export CAMEODB_WRITER_MEMORY_MIN_MB=16
@@ -181,7 +181,7 @@ max_shards = 100             # Many shards for parallelism
 writer_memory_default_mb = 200 # More memory per shard
 
 [storage]
-data_paths = ["./cameodb-data"]
+data_paths = ["./data/cameodb"]
 disk_usage_threshold = 0.95  # Use more disk space
 wal_sync = false             # Disable fsync for speed (less durable)
 wal_segment_size_mb = 256    # Large WAL segments
@@ -217,7 +217,7 @@ max_shards = 5
 writer_memory_default_mb = 25
 
 [storage]
-data_paths = ["./cameodb-data"]
+data_paths = ["./data/cameodb"]
 
 [search]
 writer_memory_min_mb = 16

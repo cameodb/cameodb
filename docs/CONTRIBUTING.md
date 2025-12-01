@@ -132,7 +132,7 @@ Generated documentation should be deployed via CI/CD:
 
 The `.gitignore` file excludes:
 - `target/` - All build artifacts and generated docs
-- `cameodb-data/` - Production runtime data directory
+- `data/cameodb/` - Production runtime data directory
 - IDE files (`.vscode/`, `.idea/`)
 - OS files (`.DS_Store`, `Thumbs.db`)
 - Temporary and backup files

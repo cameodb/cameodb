@@ -75,7 +75,7 @@ Thumbs.db
 *.pdb
 
 # Production data directory (created at runtime)
-/cameodb-data/
+/data/cameodb/
 
 # Test artifacts and temporary files
 *.tmp

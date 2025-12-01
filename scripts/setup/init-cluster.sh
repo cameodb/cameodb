@@ -10,7 +10,7 @@ echo "🚀 Initializing CameoDB development cluster..."
 # Configuration
 DEFAULT_PORT=9480
 PORT=${1:-$DEFAULT_PORT}
-DATA_DIR="cameodb-data"
+DATA_DIR="data/cameodb"
 
 # Check if server is already running
 if curl -s "http://localhost:$PORT/_cluster/health" &> /dev/null; then

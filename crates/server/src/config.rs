@@ -419,7 +419,7 @@ impl Default for NodeConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            data_paths: vec![PathBuf::from("./cameodb-data")],
+            data_paths: vec![PathBuf::from("./data/cameodb")],
             disk_usage_threshold: default_disk_usage_threshold(),
             wal_sync: default_wal_sync(),
             wal_segment_size_mb: default_wal_segment_size_mb(),

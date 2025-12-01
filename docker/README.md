@@ -5,8 +5,8 @@ This folder contains Docker configuration files for running CameoDB in a distrib
 ## Quick Start
 
 ```bash
-# From the docker directory (project root contains cameodb-data/)
-mkdir -p ../cameodb-data/node{1,2,3}
+# From the docker directory (project root contains data/cameodb/)
+mkdir -p ../data/cameodb/node{1,2,3}
 docker-compose up -d
 
 # Check status
@@ -28,11 +28,11 @@ docker-compose down
 
 ## Data Directories
 
-The compose file binds host volumes under the project-level `cameodb-data/` directory to
-`/data/cameodb-data` inside each CameoDB node. Ensure subdirectories exist before starting the cluster:
+The compose file binds host volumes under the project-level `data/cameodb/` directory to
+`/data/cameodb` inside each CameoDB node. Ensure subdirectories exist before starting the cluster:
 
 ```bash
-mkdir -p ../cameodb-data/node{1,2,3}
+mkdir -p ../data/cameodb/node{1,2,3}
 ```
 
 All indexed data, WAL files, and shard metadata will persist inside these host directories.

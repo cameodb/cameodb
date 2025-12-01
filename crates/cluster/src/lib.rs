@@ -26,7 +26,7 @@
 //! use std::path::PathBuf;
 //!
 //! // Create or load node identity (use appropriate data directory for your use case)
-//! let identity = NodeIdentity::load_or_create(PathBuf::from("./cameodb-data/meta.json"))?;
+//! let identity = NodeIdentity::load_or_create(PathBuf::from("./data/cameodb/meta.json"))?;
 //! println!("Node: {} ({})", identity.name, identity.uuid);
 //!
 //! // Set up consistent hash ring
@@ -159,7 +159,7 @@ impl NodeIdentity {
     /// use std::path::PathBuf;
     ///
     /// // Use appropriate data directory for your use case
-    /// let identity_path = PathBuf::from("./cameodb-data/meta.json");
+    /// let identity_path = PathBuf::from("./data/cameodb/meta.json");
     ///
     /// // First call creates new identity
     /// let identity1 = NodeIdentity::load_or_create(identity_path.clone())?;

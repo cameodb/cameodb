@@ -11,7 +11,7 @@ init_shards = 4
 writer_memory_default_mb = 32
 
 [storage]
-data_paths = ["./data/cameodb"]
+data_paths = ["/data/cameodb"]
 disk_usage_threshold = 0.9
 wal_sync = true
 wal_segment_size_mb = 64
