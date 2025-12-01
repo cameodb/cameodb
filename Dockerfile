@@ -43,7 +43,6 @@ RUN mkdir -p /build-data/cameodb
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
-COPY cameodb.toml ./
 
 # 6. Build (Uses the cert implicitly via cargo)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -59,8 +58,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         *) echo "Unsupported architecture: ${TARGETARCH}"; exit 1;; \
     esac; \
     rustup target add "${TARGET_TRIPLE}"; \
-    cargo build --release --target "${TARGET_TRIPLE}" --bin server; \
-    cp "/src/target/${TARGET_TRIPLE}/release/server" /src/cameodb;
+    cargo build --release --target "${TARGET_TRIPLE}" --bin cameodb; \
+    cp "/src/target/${TARGET_TRIPLE}/release/cameodb" /src/cameodb;
 
 ################################################################################
 # STAGE 2: Runtime (Offline / Clean)
@@ -70,7 +69,7 @@ FROM gcr.io/distroless/static:latest AS runtime
 # We COPY the binary and the config.
 # We DO NOT copy the certificates.
 COPY --from=builder --chown=nonroot:nonroot /src/cameodb /usr/local/bin/cameodb
-COPY --chown=nonroot:nonroot cameodb.toml /etc/cameodb/cameodb.toml
+COPY --chown=nonroot:nonroot docker/cameodb-docker.toml /etc/cameodb/cameodb.toml
 COPY --from=builder --chown=nonroot:nonroot /build-data/cameodb /data/cameodb
 
 ENV CAMEODB_CONFIG=/etc/cameodb/cameodb.toml

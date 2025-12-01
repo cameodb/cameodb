@@ -1,147 +1,152 @@
-# Docker Compose for Distributed CameoDB Deployment
-# 
-# This configuration demonstrates how to deploy a 3-node CameoDB cluster
-# with distributed actors using Kameo's remote actor system.
-# Optimized for Docker Desktop on macOS
-#
-# Port Mapping Strategy:
-# - HTTP API (external): 9481, 9482, 9483 -> 9480 (internal)
-# - Cluster Communication: 9581, 9582, 9583 -> 9580 (internal)
-# - Load Balancer: 9480 -> simple proxy to external ports 9481, 9482, 9483
-#
-# Usage:
-#   cd docker && docker-compose up -d
-#   curl http://localhost:9481/api/books/search  # Direct Node 1
-#   curl http://localhost:9482/api/books/search  # Direct Node 2  
-#   curl http://localhost:9483/api/books/search  # Direct Node 3
-#   curl http://localhost:9480/api/books/search  # Load balanced (simple proxy)
-
-networks:
-  cameodb-cluster:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
-
 services:
+  # ==========================================
+  # NODE 1 (Seed Node)
+  # ==========================================
   cameodb-node1:
     build: 
       context: ..
       dockerfile: Dockerfile
+      secrets:
+        - zscaler
     image: cameodb:latest
     container_name: cameodb-node1
-    hostname: node1.cameodb.local
+    user: "65532:65532"
+    
     environment:
       - NODE_ID=node1
       - CLUSTER_NAME=cameodb-production
-      - CLUSTER_PORT=9580
       - DISTRIBUTED_ACTORS=true
-      - BOOTSTRAP_NODES=node2.cameodb.local:9580,node3.cameodb.local:9580
+      - BOOTSTRAP_NODES=cameodb-node2:9580,cameodb-node3:9580
       - MDNS_DISCOVERY=true
       - HTTP_PORT=9480
-      - INIT_SHARDS=2
-    user: "${CURRENT_UID}:${CURRENT_GID}"
+      - CLUSTER_PORT=9580
+    
     ports:
-      - "9481:9480"  # HTTP API (external:internal)
-      - "9581:9580"  # Cluster communication (libp2p)
+      - "9481:9480"
+      - "9581:9580"
+    
     volumes:
       - ../data/cameodb/node1:/data/cameodb
-      - ./config/node1.toml:/etc/cameodb/config.toml:ro
+      # Optional Config override
+      # - ./config/node1.toml:/etc/cameodb/cameodb.toml:ro
+    
     networks:
       cameodb-cluster:
         ipv4_address: 172.20.0.10
+    
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9480/_cluster/health"]
+      test: ["CMD", "/usr/local/bin/cameodb", "--version"]
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 10s
 
+  # ==========================================
+  # NODE 2
+  # ==========================================
   cameodb-node2:
     build: 
       context: ..
       dockerfile: Dockerfile
+      secrets:
+        - zscaler
     image: cameodb:latest
     container_name: cameodb-node2
-    hostname: node2.cameodb.local
+    user: "65532:65532"
+    
     environment:
       - NODE_ID=node2
       - CLUSTER_NAME=cameodb-production
-      - CLUSTER_PORT=9580
       - DISTRIBUTED_ACTORS=true
-      - BOOTSTRAP_NODES=node1.cameodb.local:9580,node3.cameodb.local:9580
+      - BOOTSTRAP_NODES=cameodb-node1:9580,cameodb-node3:9580
       - MDNS_DISCOVERY=true
       - HTTP_PORT=9480
-      - INIT_SHARDS=2
-    user: "${CURRENT_UID}:${CURRENT_GID}"
+      - CLUSTER_PORT=9580
+    
     ports:
-      - "9482:9480"  # HTTP API (external:internal)
-      - "9582:9580"  # Cluster communication (libp2p)
+      - "9482:9480"
+      - "9582:9580"
+    
     volumes:
       - ../data/cameodb/node2:/data/cameodb
-      - ./config/node2.toml:/etc/cameodb/config.toml:ro
+    
     networks:
       cameodb-cluster:
         ipv4_address: 172.20.0.11
+    
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9480/_cluster/health"]
+      test: ["CMD", "/usr/local/bin/cameodb", "--version"]
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 30s
+    
     depends_on:
       cameodb-node1:
         condition: service_healthy
 
+  # ==========================================
+  # NODE 3
+  # ==========================================
   cameodb-node3:
     build: 
       context: ..
       dockerfile: Dockerfile
+      secrets:
+        - zscaler
     image: cameodb:latest
     container_name: cameodb-node3
-    hostname: node3.cameodb.local
+    user: "65532:65532"
+    
     environment:
       - NODE_ID=node3
       - CLUSTER_NAME=cameodb-production
-      - CLUSTER_PORT=9580
       - DISTRIBUTED_ACTORS=true
-      - BOOTSTRAP_NODES=node1.cameodb.local:9580,node2.cameodb.local:9580
+      - BOOTSTRAP_NODES=cameodb-node1:9580,cameodb-node2:9580
       - MDNS_DISCOVERY=true
       - HTTP_PORT=9480
-      - INIT_SHARDS=2
-    user: "${CURRENT_UID}:${CURRENT_GID}"
+      - CLUSTER_PORT=9580
+    
     ports:
-      - "9483:9480"  # HTTP API (external:internal)
-      - "9583:9580"  # Cluster communication (libp2p)
+      - "9483:9480"
+      - "9583:9580"
+    
     volumes:
       - ../data/cameodb/node3:/data/cameodb
-      - ./config/node3.toml:/etc/cameodb/config.toml:ro
+    
     networks:
       cameodb-cluster:
         ipv4_address: 172.20.0.12
+    
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9480/_cluster/health"]
+      test: ["CMD", "/usr/local/bin/cameodb", "--version"]
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 30s
+    
     depends_on:
       cameodb-node1:
         condition: service_healthy
 
-  # Simple load balancer using external ports
+  # ==========================================
+  # LOAD BALANCER
+  # ==========================================
   nginx-lb:
     image: nginx:alpine
     container_name: cameodb-lb
-    user: "${CURRENT_UID}:${CURRENT_GID}"
     ports:
-      - "9480:80"   # Main load-balanced endpoint
+      - "9480:80"
+    networks:
+      - cameodb-cluster
+    depends_on:
+      - cameodb-node1
+      - cameodb-node2
+      - cameodb-node3
     command: |
       /bin/sh -c "
       echo 'upstream cameodb_cluster {
-          server host.docker.internal:9481;
-          server host.docker.internal:9482;
-          server host.docker.internal:9483;
+          server cameodb-node1:9480;
+          server cameodb-node2:9480;
+          server cameodb-node3:9480;
       }
       server {
           listen 80;
@@ -154,18 +159,13 @@ services:
       nginx -g 'daemon off;'
       "
 
-volumes:
-  node1-data:
-    driver: local
-  node2-data:
-    driver: local
-  node3-data:
-    driver: local
+networks:
+  cameodb-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
 
-
-
-
-
-
-
-
+secrets:
+  zscaler:
+    file: /usr/local/share/ca-certificates/Zscaler.crt

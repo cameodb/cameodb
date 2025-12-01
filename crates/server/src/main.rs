@@ -15,9 +15,18 @@ use node_orchestrator::{NodeConfig, NodeOrchestrator, ProposeShard, RouterActor}
 async fn main() -> Result<()> {
     // Handle CLI arguments for configuration utilities
     let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 && args[1] == "generate-config" {
-        println!("{}", CameoDbConfig::generate_sample_config()?);
-        return Ok(());
+    if let Some(flag) = args.get(1).map(String::as_str) {
+        match flag {
+            "--version" | "-V" => {
+                println!("cameodb {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "generate-config" => {
+                println!("{}", CameoDbConfig::generate_sample_config()?);
+                return Ok(());
+            }
+            _ => {}
+        }
     }
 
     // Load configuration from multiple sources

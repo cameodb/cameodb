@@ -21,7 +21,7 @@ services:
     # Note: No certificates here. Only Config and Data.
     volumes:
       # 1. Config: Project Root -> Container (Read Only)
-      - ../cameodb-docker.toml:/etc/cameodb/cameodb.toml:ro
+      - ../docker/cameodb-docker.toml:/etc/cameodb/cameodb.toml:ro
 
       # 2. Data: Project Root/data/cameodb -> Container
       - ../data/cameodb:/data/cameodb
