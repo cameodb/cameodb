@@ -5,7 +5,7 @@ This document captures the key architectural decisions made during CameoDB's dev
 ## ADR 001: Topology - SHA256 and 256 Virtual Nodes
 
 ### Status
-**Accepted** - Implemented in `cluster_core`
+**Accepted** - Implemented in `crates/cluster`
 
 ### Context
 CameoDB requires a distributed topology system that can:
@@ -100,7 +100,7 @@ fn generate_tokens(uuid: Uuid) -> Vec<u64> {
 ## ADR 002: Storage - redb + tantivy Hybrid Architecture
 
 ### Status
-**Accepted** - Implemented in `storage_engine`
+**Accepted** - Implemented in `crates/storage`
 
 ### Context
 CameoDB requires a storage engine that provides:
@@ -173,21 +173,67 @@ We chose a **hybrid architecture** combining:
 #### Atomic Dual-Write Protocol
 
 ```rust
-pub fn apply_write(&self, op: WalOp) -> Result<u64, StoreError> {
-    // 1. Generate sequence ID
-    let seq_id = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
-    
-    // 2. Write to redb (authoritative)
+pub fn apply_write(&self, index: &str, op: WalOp) -> Result<u64, StoreError> {
+    // 1. Ensure per-index assets exist and grab writer
+    let (writer_arc, fields) = self.get_or_create_index(index)?;
+
+    // 2. Allocate next WAL sequence for this index (independent counters)
+    let seq_id = {
+        let seq_map = self.current_seq.read().unwrap();
+        let counter = seq_map.get(index).ok_or_else(|| {
+            StoreError::IndexNotFound(format!(
+                "Sequence counter not found for index: {}",
+                index
+            ))
+        })?;
+        counter.fetch_add(1, Ordering::SeqCst) + 1
+    };
+
+    // 3. Persist WAL + primary data inside a single redb write transaction
+    let wal_table = TableDefinition::<u64, &[u8]>::new(&format!("wal_{}", index));
+    let data_table = TableDefinition::<&str, &[u8]>::new(&format!("data_{}", index));
+    let wal_bytes = serde_json::to_vec(&op)
+        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
     let write_txn = self.kv.begin_write()?;
-    write_txn.insert_wal(seq_id, &op)?;
-    write_txn.insert_data(&op.id, &op.data)?;
-    write_txn.commit()?; // ← Durability checkpoint
-    
-    // 3. Update tantivy (best-effort)
-    let mut writer = self.index_writer.lock().unwrap();
-    writer.add_document(create_doc(&op))?;
-    writer.commit()?;
-    
+    {
+        let mut wal = write_txn.open_table(wal_table)?;
+        wal.insert(seq_id, wal_bytes.as_slice())?;
+
+        let mut data = write_txn.open_table(data_table)?;
+        match &op {
+            WalOp::Put { id, body, json_blob } => {
+                let doc_payload = serde_json::json!({
+                    "body": body,
+                    "json_blob": json_blob
+                });
+                let doc_bytes = serde_json::to_vec(&doc_payload)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                data.insert(id.as_str(), doc_bytes.as_slice())?;
+
+                let mut writer = writer_arc.lock().unwrap();
+                let mut tantivy_doc = doc!(fields.id => id.as_str(), fields.body => body.as_str());
+                if let Some(json_data) = json_blob {
+                    let json_str = serde_json::to_string(json_data)
+                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                    tantivy_doc.add_text(fields.json_blob, &json_str);
+                }
+                writer.add_document(tantivy_doc)?;
+            }
+            WalOp::Delete { id } => {
+                data.remove(id.as_str())?;
+                let mut writer = writer_arc.lock().unwrap();
+                let term = tantivy::Term::from_field_text(fields.id, id);
+                writer.delete_term(term);
+            }
+        }
+    }
+    write_txn.commit()?; // ← Durability checkpoint (wal + data)
+
+    // 4. Adaptive commit heuristics per index (operations counter + memory budget)
+    self.increment_operations(index);
+    self.maybe_commit_writer(index)?;
+
     Ok(seq_id)
 }
 ```
@@ -195,7 +241,8 @@ pub fn apply_write(&self, op: WalOp) -> Result<u64, StoreError> {
 **Consistency Model:**
 - **redb is authoritative**: All data must exist in redb
 - **tantivy is derived**: Search index derived from redb data
-- **WAL for recovery**: Can rebuild tantivy from redb + WAL
+- **Per-index WAL**: Each index maintains an independent WAL table and sequence counter
+- **WAL for recovery**: Can rebuild tantivy from redb + per-index WAL snapshots
 
 ### Alternatives Considered
 
@@ -256,13 +303,17 @@ TiKV + separate search service
 
 ### Mitigation Strategies
 
-#### Consistency Risk Mitigation
+#### Consistency & Async Boundary Mitigation
 ```rust
-// WAL-first approach ensures recoverability
+// Storage calls always run inside spawn_blocking from async actors/services
+let store = self.store.clone();
+let index = request.index.clone();
+tokio::task::spawn_blocking(move || store.apply_write(&index, op)).await??;
+
+// WAL-first approach ensures recoverability if Tantivy fails
 if redb_commit_succeeds && tantivy_commit_fails {
-    // WAL entry exists, can replay tantivy update
-    log::warn!("Tantivy update failed, marked for replay");
-    schedule_index_repair(seq_id);
+    tracing::warn!(index, seq_id, "tantivy update failed, scheduling repair");
+    schedule_index_repair(index, seq_id);
 }
 ```
 

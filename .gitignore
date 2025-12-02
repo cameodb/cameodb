@@ -123,6 +123,7 @@ flamegraph.svg
 book/
 docs/book/
 docs/web/
+docs/webpage
 
 # Local development overrides
 local.toml
