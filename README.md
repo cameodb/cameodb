@@ -448,6 +448,7 @@ wal_sync = true
 - [Development Scripts](scripts/README.md) - Testing, data generation, and operations
 - [Ingestion Examples](scripts/examples/README.md) - TED talks and book summaries datasets
 - [Docker Deployment](docker/README.md) - Container deployment and cluster setup
+- [Website](docs/web/README.md) - Live documentation and feature showcase
 
 ## 🚀 Getting Started
 
@@ -459,7 +460,7 @@ wal_sync = true
 
 2. **Build and run**
    ```bash
-   cargo run --bin server
+   cargo run --bin cameodb
    ```
 
 3. **Ingest sample data**
