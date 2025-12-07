@@ -32,8 +32,7 @@ distributed_actors = true
 cluster_port = 9580
 # Bootstrap nodes for cluster discovery (comma-separated)
 bootstrap_nodes = []
-# Enable automatic peer discovery via mDNS (for local networks)
-mdns_discovery = true
+# Peer discovery via Kademlia DHT for enterprise environments
 # Cluster name for isolation
 cluster_name = "cameodb-cluster"
 

@@ -27,6 +27,8 @@ tracing-subscriber = { workspace = true }
 toml = { workspace = true }
 serde_yaml = { workspace = true }
 num_cpus = { workspace = true }
+# Note: if-addrs and if-watch removed with mDNS cleanup - no longer needed for Kademlia-only mode
+libp2p = { workspace = true, features = ["tokio", "tcp", "noise", "yamux", "quic", "macros"] }
 
 [dev-dependencies]
 tempfile = "3.8"

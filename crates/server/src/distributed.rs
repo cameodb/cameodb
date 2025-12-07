@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::config::ClusterConfig;
 use crate::node_orchestrator::MicroshardActor;
+use crate::swarm;
 
 /// Distributed cluster manager for CameoDB nodes
 #[derive(Debug)]
@@ -21,6 +22,7 @@ pub struct DistributedCluster {
     pub peer_nodes: HashMap<Uuid, NodeInfo>,
     /// Local node identity
     pub local_node_id: Uuid,
+    // event_loop: Option<EventLoop>, // Temporarily disabled until swarm integration
 }
 
 /// Information about a peer node in the cluster
@@ -54,43 +56,35 @@ impl DistributedCluster {
             cluster_config,
             peer_nodes: HashMap::new(),
             local_node_id,
+            // event_loop: None, // Temporarily disabled until swarm integration
         }
     }
 
-    /// Bootstrap the distributed actor system for this node
-    pub async fn bootstrap(&mut self) -> Result<()> {
+    /// Initialize the distributed swarm using kameo's ActorSwarm
+    pub async fn init_swarm(&mut self) -> Result<String> {
         info!(
             node_id = %self.local_node_id,
             cluster_name = %self.cluster_config.cluster_name,
             port = %self.cluster_config.cluster_port,
-            "Bootstrapping distributed cluster"
+            "Initializing kameo distributed swarm"
         );
 
-        if !self.cluster_config.distributed_actors {
-            info!("Distributed actors disabled, running in single-node mode");
-            return Ok(());
-        }
+        // Initialize distributed swarm for peer communication
+        let peer_id = swarm::init_distributed_swarm(&self.cluster_config).await?;
 
-        // TODO: When Kameo remote features are available, bootstrap here:
-        // let peer_id = kameo::remote::bootstrap()?;
-
-        // For now, we'll prepare the framework and log what would happen
-        info!("🌐 Distributed Framework Ready:");
+        info!("🌐 Kameo Distributed Framework Ready:");
         info!("  📡 Cluster Port: {}", self.cluster_config.cluster_port);
-        info!(
-            "  🔍 mDNS Discovery: {}",
-            self.cluster_config.mdns_discovery
-        );
+        info!("  🔍 Discovery: Kademlia DHT");
         info!("  🏷️  Cluster Name: {}", self.cluster_config.cluster_name);
 
-        if !self.cluster_config.bootstrap_nodes.is_empty() {
+        if !self.cluster_config.bootstrap_peers.is_empty() {
             info!(
-                "  🚀 Bootstrap Nodes: {:?}",
-                self.cluster_config.bootstrap_nodes
+                "  🚀 Bootstrap Peers: {}",
+                self.cluster_config.bootstrap_peers.len()
             );
         }
 
-        Ok(())
+        Ok(peer_id.to_string())
     }
 
     /// Register a local shard actor with the distributed registry
@@ -142,8 +136,8 @@ impl DistributedCluster {
             self.peer_nodes.insert(node_info.node_id, node_info);
         }
 
-        if discovered_peers.is_empty() && self.cluster_config.mdns_discovery {
-            info!("🏠 mDNS discovery enabled - would scan local network for peers");
+        if discovered_peers.is_empty() {
+            info!("🔍 No bootstrap peers configured - operating as single node");
         }
 
         info!("✅ Discovered {} peer nodes", discovered_peers.len());

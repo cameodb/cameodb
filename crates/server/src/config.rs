@@ -139,7 +139,7 @@ pub struct ClusterConfig {
     #[serde(default = "default_distributed_actors")]
     pub distributed_actors: bool,
 
-    /// Cluster communication port for libp2p (default: 8080)
+    /// Cluster communication port for libp2p (default: 9580)
     #[serde(default = "default_cluster_port")]
     pub cluster_port: u16,
 
@@ -147,13 +147,58 @@ pub struct ClusterConfig {
     #[serde(default)]
     pub bootstrap_nodes: Vec<String>,
 
-    /// Enable automatic peer discovery via mDNS (default: true)
-    #[serde(default = "default_mdns_discovery")]
-    pub mdns_discovery: bool,
-
+    // Peer discovery handled by Kademlia DHT
     /// Cluster name for isolation (default: "cameodb-cluster")
     #[serde(default = "default_cluster_name")]
     pub cluster_name: String,
+
+    /// Listen addresses for swarm (default: auto)
+    #[serde(default)]
+    pub listen_addrs: Vec<String>,
+
+    /// Bootstrap peers with peer IDs (format: "/ip4/1.2.3.4/tcp/9580/p2p/12D3KooW...")
+    #[serde(default)]
+    pub bootstrap_peers: Vec<String>,
+
+    /// Messaging configuration
+    #[serde(default)]
+    pub messaging: MessagingConfig,
+
+    /// mDNS interface filtering options
+    #[serde(default)]
+    pub mdns_filter: MdnsFilterConfig,
+}
+
+/// Messaging configuration for Kameo remote actors
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagingConfig {
+    /// Request timeout in seconds (default: 30)
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+
+    /// Maximum concurrent requests per peer (default: 100)
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+
+    /// Connection pool size (default: 10)
+    #[serde(default = "default_connection_pool_size")]
+    pub connection_pool_size: usize,
+}
+
+/// mDNS interface filtering configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MdnsFilterConfig {
+    /// Additional interface patterns to allow (besides defaults)
+    #[serde(default)]
+    pub allow_patterns: Vec<String>,
+
+    /// Additional interface patterns to deny
+    #[serde(default)]
+    pub deny_patterns: Vec<String>,
+
+    /// Enable IPv6 mDNS discovery (default: false)
+    #[serde(default = "default_ipv6_enabled")]
+    pub ipv6_enabled: bool,
 }
 
 /// Tantivy search engine configuration
@@ -440,14 +485,37 @@ impl Default for SearchConfig {
     }
 }
 
+impl Default for MessagingConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: default_request_timeout_secs(),
+            max_concurrent_requests: default_max_concurrent_requests(),
+            connection_pool_size: default_connection_pool_size(),
+        }
+    }
+}
+
+impl Default for MdnsFilterConfig {
+    fn default() -> Self {
+        Self {
+            allow_patterns: Vec::new(),
+            deny_patterns: Vec::new(),
+            ipv6_enabled: default_ipv6_enabled(),
+        }
+    }
+}
+
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             distributed_actors: default_distributed_actors(),
             cluster_port: default_cluster_port(),
             bootstrap_nodes: Vec::new(),
-            mdns_discovery: default_mdns_discovery(),
             cluster_name: default_cluster_name(),
+            listen_addrs: Vec::new(),
+            bootstrap_peers: Vec::new(),
+            messaging: MessagingConfig::default(),
+            mdns_filter: MdnsFilterConfig::default(),
         }
     }
 }
@@ -514,11 +582,24 @@ fn default_distributed_actors() -> bool {
 fn default_cluster_port() -> u16 {
     9580
 }
-fn default_mdns_discovery() -> bool {
-    true
-}
 fn default_cluster_name() -> String {
     "cameodb-cluster".to_string()
+}
+
+fn default_request_timeout_secs() -> u64 {
+    30
+}
+
+fn default_max_concurrent_requests() -> usize {
+    100
+}
+
+fn default_connection_pool_size() -> usize {
+    10
+}
+
+fn default_ipv6_enabled() -> bool {
+    false
 }
 
 #[cfg(test)]

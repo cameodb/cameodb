@@ -30,10 +30,11 @@ index_refresh_interval_secs = 5
 distributed_actors = true
 # Cluster communication port (libp2p) - aligned with gRPC best practices
 cluster_port = 9580
-# Bootstrap nodes for cluster discovery (comma-separated)
+# Bootstrap nodes for cluster discovery (IP:port format)
+# For single-node: use empty list []
+# For cluster: add peers like ["192.168.1.100:9580", "192.168.1.101:9580"]
 bootstrap_nodes = []
-# Enable automatic peer discovery via mDNS (for local networks)
-mdns_discovery = true
+# Peer discovery via Kademlia DHT for enterprise environments
 # Cluster name for isolation
 cluster_name = "cameodb-cluster"
 

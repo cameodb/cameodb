@@ -5,6 +5,7 @@ mod config;
 mod distributed;
 mod http_server;
 mod node_orchestrator;
+mod swarm;
 
 use config::CameoDbConfig;
 use distributed::DistributedCluster;
@@ -75,16 +76,17 @@ async fn main() -> Result<()> {
     let mut distributed_cluster =
         DistributedCluster::new(cameodb_config.cluster.clone(), orchestrator.identity().uuid);
 
-    match distributed_cluster.bootstrap().await {
+    match distributed_cluster.init_swarm().await {
         Err(err) => {
-            tracing::warn!(%err, "Failed to bootstrap distributed cluster");
-            println!("⚠️  Distributed cluster bootstrap failed, continuing in single-node mode");
+            tracing::warn!(%err, "Failed to initialize distributed swarm");
+            println!("⚠️  Distributed swarm initialization failed, continuing in single-node mode");
         }
-        _ => {
+        Ok(peer_id) => {
             let cluster_status = distributed_cluster.get_cluster_status();
             if cluster_status.distributed_enabled {
-                println!("🌐 Distributed cluster initialized:");
+                println!("🌐 Distributed swarm initialized:");
                 println!("  📡 Cluster: {}", cluster_status.cluster_name);
+                println!("  🆔 Peer ID: {}", peer_id);
                 println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
                 println!("  ✅ Connected: {}", cluster_status.connected_nodes);
 
