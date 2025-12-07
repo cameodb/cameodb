@@ -28,7 +28,7 @@ docker-compose up -d
 
 ### 2. Multi-Node Cluster Deployment
 
-This setup runs a 3-node cluster and is defined in `docker-compose-cluster.yml`.
+This setup runs a 3-node cluster and is defined in `docker-compose-cluster.yml`. Swarm discovery relies on Kademlia with static bootstrap peers.
 
 **Setup & Run:**
 ```bash
@@ -45,6 +45,7 @@ docker-compose -f docker-compose-cluster.yml up -d
   - **Node 2 (Direct)**: `http://localhost:9482`
   - **Node 3 (Direct)**: `http://localhost:9483`
 - **Data Persistence**: Each node's data is stored in a separate subdirectory within `data/cameodb/`.
+- **Swarm Configuration**: Update the `CAMEODB_CLUSTER_NAME`, `CAMEODB_CLUSTER_PORT`, `CAMEODB_BOOTSTRAP_NODES`, and `CAMEODB_DISTRIBUTED_ACTORS` environment variables to reflect your deployment topology.
 
 ## Common Commands
 

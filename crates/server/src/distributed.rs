@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::config::ClusterConfig;
 use crate::node_orchestrator::MicroshardActor;
-use crate::swarm;
+use crate::swarm::{self, SwarmRuntimeHandle, SwarmStartup};
 
 /// Distributed cluster manager for CameoDB nodes
 #[derive(Debug)]
@@ -22,7 +22,8 @@ pub struct DistributedCluster {
     pub peer_nodes: HashMap<Uuid, NodeInfo>,
     /// Local node identity
     pub local_node_id: Uuid,
-    // event_loop: Option<EventLoop>, // Temporarily disabled until swarm integration
+    /// Handle to the running swarm runtime (if started)
+    swarm_handle: Option<SwarmRuntimeHandle>,
 }
 
 /// Information about a peer node in the cluster
@@ -56,11 +57,11 @@ impl DistributedCluster {
             cluster_config,
             peer_nodes: HashMap::new(),
             local_node_id,
-            // event_loop: None, // Temporarily disabled until swarm integration
+            swarm_handle: None,
         }
     }
 
-    /// Initialize the distributed swarm using kameo's ActorSwarm
+    /// Initialize the distributed swarm runtime and return the peer identity
     pub async fn init_swarm(&mut self) -> Result<String> {
         info!(
             node_id = %self.local_node_id,
@@ -70,19 +71,21 @@ impl DistributedCluster {
         );
 
         // Initialize distributed swarm for peer communication
-        let peer_id = swarm::init_distributed_swarm(&self.cluster_config).await?;
+        let SwarmStartup {
+            peer_id,
+            listen_addr,
+            bootstrap_peer_count,
+            runtime,
+        } = swarm::init_distributed_swarm(&self.cluster_config).await?;
+
+        self.swarm_handle = Some(runtime);
 
         info!("🌐 Kameo Distributed Framework Ready:");
         info!("  📡 Cluster Port: {}", self.cluster_config.cluster_port);
         info!("  🔍 Discovery: Kademlia DHT");
         info!("  🏷️  Cluster Name: {}", self.cluster_config.cluster_name);
-
-        if !self.cluster_config.bootstrap_peers.is_empty() {
-            info!(
-                "  🚀 Bootstrap Peers: {}",
-                self.cluster_config.bootstrap_peers.len()
-            );
-        }
+        info!("  🎧 Listen Address: {}", listen_addr);
+        info!("  🚀 Bootstrap Peers Connected: {}", bootstrap_peer_count);
 
         Ok(peer_id.to_string())
     }

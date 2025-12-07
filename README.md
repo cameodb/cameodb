@@ -347,7 +347,7 @@ CameoDB provides configurations for both single-node and multi-node cluster depl
 
 ### 1. Single-Node Deployment
 
-Ideal for local development and testing. This uses the `docker/docker-compose.yml` file.
+Ideal for local development and testing. This uses the `docker/docker-compose.yml` file with the default `cameodb-docker.toml` configuration (with Kademlia discovery).
 
 **Setup & Run:**
 ```bash
@@ -363,7 +363,7 @@ docker-compose -f docker/docker-compose.yml up -d
 
 ### 2. Multi-Node Cluster Deployment
 
-Runs a 3-node cluster with a load balancer. This uses the `docker/docker-compose-cluster.yml` file.
+Runs a 3-node cluster with a load balancer. This uses the `docker/docker-compose-cluster.yml` file. The cluster relies on static bootstrap peers and the new swarm runtime (Kademlia discovery).
 
 **Setup & Run:**
 ```bash
@@ -380,6 +380,7 @@ docker-compose -f docker/docker-compose-cluster.yml up -d
   - **Node 2 (Direct)**: `http://localhost:9482`
   - **Node 3 (Direct)**: `http://localhost:9483`
 - **Data Persistence**: Each node's data is stored in a separate subdirectory within `data/cameodb/`.
+- **Swarm Configuration**: `CAMEODB_CLUSTER_NAME`, `CAMEODB_CLUSTER_PORT`, `CAMEODB_BOOTSTRAP_NODES`, and `CAMEODB_DISTRIBUTED_ACTORS` environment variables drive the Kademlia swarm. Update them per deployment needs.
 
 ### Common Docker Commands
 
@@ -394,7 +395,7 @@ docker-compose -f docker/docker-compose.yml logs -f
 docker-compose -f docker/docker-compose-cluster.yml down
 ```
 
-For more details, see the [Docker README](docker/README.md).
+For more details, see the [Docker README](docker/README.md), which includes the latest swarm environment variables and configuration guidance.
 
 ## 🔧 Configuration
 

@@ -11,14 +11,14 @@ pub mod utils;
 use anyhow::Result;
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, SwarmBuilder, identity::Keypair, noise, swarm::SwarmEvent, tcp, yamux,
+    Multiaddr, PeerId, SwarmBuilder, identity::Keypair, kad, noise, swarm::SwarmEvent, tcp, yamux,
 };
 use std::time::Duration;
-use tokio::select;
+use tokio::{select, sync::watch};
 use tracing::{debug, info, warn};
 
 use crate::config::ClusterConfig;
-use behaviour::DhtBehaviour;
+use behaviour::{DhtBehaviour, DhtBehaviourEvent};
 // TODO: Add cluster state actor integration for peer management
 // use cluster_actor::{ClusterStateActor, PeerDiscovered, PeerLost};
 // use kameo::prelude::{ActorRef, spawn};
@@ -28,46 +28,114 @@ use behaviour::DhtBehaviour;
 // pub use cluster_actor::{GetActivePeers, PeerInfo};
 pub use utils::get_preferred_listen_address;
 
+/// Result returned after the swarm runtime has been launched
+#[derive(Debug)]
+pub struct SwarmStartup {
+    pub peer_id: PeerId,
+    pub listen_addr: Multiaddr,
+    pub bootstrap_peer_count: usize,
+    pub runtime: SwarmRuntimeHandle,
+}
+
+/// Handle used to manage the background swarm runtime task
+#[derive(Debug, Clone)]
+pub struct SwarmRuntimeHandle {
+    shutdown_tx: Option<watch::Sender<SwarmControl>>,
+}
+
+impl SwarmRuntimeHandle {
+    fn new(shutdown_tx: watch::Sender<SwarmControl>) -> Self {
+        Self {
+            shutdown_tx: Some(shutdown_tx),
+        }
+    }
+
+    fn inert() -> Self {
+        Self { shutdown_tx: None }
+    }
+
+    /// Request a graceful shutdown of the swarm runtime task
+    pub fn shutdown(&self) -> Result<()> {
+        if let Some(tx) = &self.shutdown_tx {
+            tx.send(SwarmControl::Shutdown)
+                .map_err(|err| anyhow::anyhow!("failed to signal swarm shutdown: {}", err))?
+        }
+        Ok(())
+    }
+
+    /// Returns true if the runtime task is still active
+    pub fn is_running(&self) -> bool {
+        self.shutdown_tx
+            .as_ref()
+            .map(|tx| !matches!(*tx.borrow(), SwarmControl::Shutdown))
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwarmControl {
+    Run,
+    Shutdown,
+}
+
+#[derive(Debug, Default)]
+struct SwarmRuntimeMetrics {
+    total_events: u64,
+    behaviour_events: u64,
+    kademlia_updates: u64,
+    connections_established: u64,
+    connections_closed: u64,
+}
+
+impl SwarmRuntimeMetrics {
+    fn log_summary(&self) {
+        info!(
+            total_events = self.total_events,
+            behaviour_events = self.behaviour_events,
+            kademlia_updates = self.kademlia_updates,
+            connections_established = self.connections_established,
+            connections_closed = self.connections_closed,
+            "📊 Swarm runtime summary"
+        );
+    }
+}
+
 /// Initialize the distributed swarm for peer-to-peer communication
-pub async fn init_distributed_swarm(config: &ClusterConfig) -> Result<String> {
+pub async fn init_distributed_swarm(config: &ClusterConfig) -> Result<SwarmStartup> {
     if !config.distributed_actors {
         info!("Distributed actors disabled, running in single-node mode");
-        return Ok("single-node-mode".to_string());
+        return Ok(SwarmStartup {
+            peer_id: PeerId::random(),
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            bootstrap_peer_count: 0,
+            runtime: SwarmRuntimeHandle::inert(),
+        });
     }
 
     info!("🚀 Initializing distributed libp2p swarm");
 
     // Create production-ready swarm with Kademlia DHT
-    let swarm_result = create_production_swarm(config).await?;
+    let startup = create_production_swarm(config).await?;
 
     info!("✅ Production swarm initialized successfully");
-    info!("   📡 Peer ID: {}", swarm_result.peer_id);
-    info!("   🎧 Listen Address: {}", swarm_result.listen_addr);
+    info!("   📡 Peer ID: {}", startup.peer_id);
+    info!("   🎧 Listen Address: {}", startup.listen_addr);
     info!("   🚀 Cluster Port: {} (from config)", config.cluster_port);
     info!("   🌐 Discovery: Kademlia DHT");
     info!(
         "   📊 Bootstrap Peers: {}",
-        swarm_result.bootstrap_peer_count
+        startup.bootstrap_peer_count
     );
 
     // TODO: Future enhancements:
     // - Cluster state actor integration for peer management
     // - Enhanced event loop with distributed state synchronization
 
-    Ok(swarm_result.peer_id.to_string())
-}
-
-/// Production swarm creation result
-struct SwarmInitResult {
-    peer_id: PeerId,
-    listen_addr: Multiaddr,
-    bootstrap_peer_count: usize,
-    // TODO: Add cluster state actor reference
-    // cluster_actor: ActorRef<ClusterStateActor>,
+    Ok(startup)
 }
 
 /// Create a production-ready libp2p swarm with custom behaviour
-async fn create_production_swarm(config: &ClusterConfig) -> Result<SwarmInitResult> {
+async fn create_production_swarm(config: &ClusterConfig) -> Result<SwarmStartup> {
     // Generate cryptographic identity for this node
     let keypair = Keypair::generate_ed25519();
     let peer_id = PeerId::from(keypair.public());
@@ -135,13 +203,14 @@ async fn create_production_swarm(config: &ClusterConfig) -> Result<SwarmInitResu
         info!("📋 No bootstrap peers available - running in standalone mode");
     }
 
-    // Spawn a basic event monitoring task (Phase 6 will expand this)
-    spawn_basic_event_monitor(swarm).await;
+    // Start the swarm runtime task to process events
+    let runtime = launch_swarm_runtime(swarm);
 
-    Ok(SwarmInitResult {
+    Ok(SwarmStartup {
         peer_id,
         listen_addr,
         bootstrap_peer_count: connected_peers,
+        runtime,
     })
 }
 
@@ -183,41 +252,103 @@ fn convert_bootstrap_nodes_to_multiaddrs(bootstrap_nodes: &[String]) -> Vec<Mult
     multiaddrs
 }
 
-/// Spawn a basic swarm event monitor for network activity
-async fn spawn_basic_event_monitor(mut swarm: libp2p::Swarm<DhtBehaviour>) {
-    tokio::spawn(async move {
-        info!("🔄 Starting basic swarm event monitor");
+fn launch_swarm_runtime(mut swarm: libp2p::Swarm<DhtBehaviour>) -> SwarmRuntimeHandle {
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(SwarmControl::Run);
 
-        let mut event_count = 0;
-        let mut peer_discovery_count = 0;
+    tokio::spawn(async move {
+        info!("🔄 Swarm runtime task started");
+        let mut metrics = SwarmRuntimeMetrics::default();
 
         loop {
             select! {
-                event = swarm.select_next_some() => {
-                    event_count += 1;
-
-                    match event {
-                        SwarmEvent::Behaviour(event) => {
-                            debug!("📨 Behaviour event #{}: {:?}", event_count, event);
-                            // TODO: Phase 5 will add ClusterStateActor integration here
-                        }
-                        SwarmEvent::NewListenAddr { address, .. } => {
-                            info!("🎧 Now listening on: {}", address);
-                        }
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            peer_discovery_count += 1;
-                            info!("🔗 Connected to peer #{}: {}", peer_discovery_count, peer_id);
-                        }
-                        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                            info!("🔌 Disconnected from peer: {} ({:?})", peer_id, cause);
-                        }
-                        _ => {
-                            debug!("📡 Swarm event #{}: {:?}", event_count, event);
-                        }
+                _ = shutdown_rx.changed() => {
+                    if matches!(*shutdown_rx.borrow(), SwarmControl::Shutdown) {
+                        info!("🛑 Swarm shutdown signal received");
+                        break;
                     }
                 }
-                // TODO: Phase 6 will add shutdown signal handling
+                event = swarm.select_next_some() => {
+                    metrics.total_events += 1;
+                    handle_swarm_event(event, &mut metrics);
+                }
             }
         }
+
+        metrics.log_summary();
+        info!("✅ Swarm runtime task completed");
     });
+
+    SwarmRuntimeHandle::new(shutdown_tx)
+}
+
+fn handle_swarm_event(event: SwarmEvent<DhtBehaviourEvent>, metrics: &mut SwarmRuntimeMetrics) {
+    match event {
+        SwarmEvent::Behaviour(behaviour_event) => {
+            metrics.behaviour_events += 1;
+            handle_behaviour_event(behaviour_event, metrics);
+        }
+        SwarmEvent::NewListenAddr { address, .. } => {
+            info!("🎧 Swarm listening on: {}", address);
+        }
+        SwarmEvent::ExpiredListenAddr { address, .. } => {
+            warn!("⚠️ Listen address expired: {}", address);
+        }
+        SwarmEvent::ConnectionEstablished { peer_id, established_in, .. } => {
+            metrics.connections_established += 1;
+            info!("🔗 Connection established with {} ({} ms)", peer_id, established_in.as_millis());
+        }
+        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            metrics.connections_closed += 1;
+            info!("� Connection closed with {} ({:?})", peer_id, cause);
+        }
+        SwarmEvent::Dialing { peer_id, connection_id } => {
+            match peer_id {
+                Some(peer) => debug!("📞 Dialing peer: {} (conn {:?})", peer, connection_id),
+                None => debug!("📞 Dialing new peer address (conn {:?})", connection_id),
+            }
+        }
+        SwarmEvent::IncomingConnection { local_addr, send_back_addr, connection_id } => {
+            info!("📥 Incoming connection on {} from {} (conn {:?})", local_addr, send_back_addr, connection_id);
+        }
+        SwarmEvent::IncomingConnectionError { local_addr, send_back_addr, connection_id, error } => {
+            warn!("⚠️ Incoming connection error on {} from {:?} (conn {:?}): {}", local_addr, send_back_addr, connection_id, error);
+        }
+        SwarmEvent::OutgoingConnectionError { peer_id, connection_id, error } => {
+            warn!("⚠️ Outgoing connection error to {:?} (conn {:?}): {}", peer_id, connection_id, error);
+        }
+        SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {
+            warn!("⚠️ Listener {:?} closed: {:?} (addresses: {:?})", listener_id, reason, addresses);
+        }
+        SwarmEvent::ListenerError { listener_id, error } => {
+            warn!("⚠️ Listener {:?} error: {}", listener_id, error);
+        }
+        other => {
+            debug!("📡 Swarm event: {:?}", other);
+        }
+    }
+}
+
+fn handle_behaviour_event(event: DhtBehaviourEvent, metrics: &mut SwarmRuntimeMetrics) {
+    match event {
+        DhtBehaviourEvent::Kademlia(kad_event) => handle_kademlia_event(kad_event, metrics),
+    }
+}
+
+fn handle_kademlia_event(event: kad::Event, metrics: &mut SwarmRuntimeMetrics) {
+    match event {
+        kad::Event::RoutingUpdated { peer, addresses, .. } => {
+            metrics.kademlia_updates += 1;
+            let addr_count = addresses.len();
+            info!("🛰️  Routing table updated for {} ({} addresses)", peer, addr_count);
+        }
+        kad::Event::OutboundQueryProgressed { id, result, stats, .. } => {
+            debug!("📊 Kademlia query {:?} progressed: result={:?}, stats={:?}", id, result, stats);
+        }
+        kad::Event::InboundRequest { request } => {
+            debug!("📨 Kademlia inbound request: {:?}", request);
+        }
+        other => {
+            debug!("📡 Kademlia event: {:?}", other);
+        }
+    }
 }

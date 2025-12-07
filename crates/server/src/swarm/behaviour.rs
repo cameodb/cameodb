@@ -50,11 +50,13 @@ impl DhtBehaviour {
         }
     }
 
+    #[allow(dead_code)]
     /// Add a peer address to Kademlia routing table
     pub fn add_peer_address(&mut self, peer_id: &PeerId, addr: Multiaddr) {
         self.kademlia.add_address(peer_id, addr);
     }
 
+    #[allow(dead_code)]
     /// Get basic Kademlia statistics
     pub fn kademlia_stats(&mut self) -> KademliaStats {
         KademliaStats {
@@ -66,6 +68,7 @@ impl DhtBehaviour {
 
 /// Basic Kademlia statistics
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct KademliaStats {
     pub bucket_count: usize,
     pub peer_count: usize,

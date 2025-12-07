@@ -26,13 +26,8 @@ search_threads = 8
 index_refresh_interval_secs = 5
 
 [cluster]
-# Enable distributed actor system
-distributed_actors = true
-# Cluster communication port (libp2p) - aligned with gRPC best practices
-cluster_port = 9580
-# Bootstrap nodes for cluster discovery (comma-separated)
-bootstrap_nodes = []
-# Peer discovery via Kademlia DHT for enterprise environments
-# Cluster name for isolation
 cluster_name = "cameodb-cluster"
+distributed_actors = true
+cluster_port = 9580
+bootstrap_nodes = []
 

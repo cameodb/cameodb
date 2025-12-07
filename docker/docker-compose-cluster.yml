@@ -14,12 +14,11 @@ services:
     
     environment:
       - NODE_ID=node1
-      - CLUSTER_NAME=cameodb-production
-      - DISTRIBUTED_ACTORS=true
-      - BOOTSTRAP_NODES=cameodb-node2:9580,cameodb-node3:9580
-      - MDNS_DISCOVERY=true
-      - HTTP_PORT=9480
-      - CLUSTER_PORT=9580
+      - CAMEODB_CLUSTER_NAME=cameodb-production
+      - CAMEODB_DISTRIBUTED_ACTORS=true
+      - CAMEODB_HTTP_PORT=9480
+      - CAMEODB_CLUSTER_PORT=9580
+      - CAMEODB_BOOTSTRAP_NODES=cameodb-node2:9580,cameodb-node3:9580
     
     ports:
       - "9481:9480"
@@ -56,12 +55,11 @@ services:
     
     environment:
       - NODE_ID=node2
-      - CLUSTER_NAME=cameodb-production
-      - DISTRIBUTED_ACTORS=true
-      - BOOTSTRAP_NODES=cameodb-node1:9580,cameodb-node3:9580
-      - MDNS_DISCOVERY=true
-      - HTTP_PORT=9480
-      - CLUSTER_PORT=9580
+      - CAMEODB_CLUSTER_NAME=cameodb-production
+      - CAMEODB_DISTRIBUTED_ACTORS=true
+      - CAMEODB_HTTP_PORT=9480
+      - CAMEODB_CLUSTER_PORT=9580
+      - CAMEODB_BOOTSTRAP_NODES=cameodb-node1:9580,cameodb-node3:9580
     
     ports:
       - "9482:9480"
@@ -99,12 +97,11 @@ services:
     
     environment:
       - NODE_ID=node3
-      - CLUSTER_NAME=cameodb-production
-      - DISTRIBUTED_ACTORS=true
-      - BOOTSTRAP_NODES=cameodb-node1:9580,cameodb-node2:9580
-      - MDNS_DISCOVERY=true
-      - HTTP_PORT=9480
-      - CLUSTER_PORT=9580
+      - CAMEODB_CLUSTER_NAME=cameodb-production
+      - CAMEODB_DISTRIBUTED_ACTORS=true
+      - CAMEODB_HTTP_PORT=9480
+      - CAMEODB_CLUSTER_PORT=9580
+      - CAMEODB_BOOTSTRAP_NODES=cameodb-node1:9580,cameodb-node2:9580
     
     ports:
       - "9483:9480"
