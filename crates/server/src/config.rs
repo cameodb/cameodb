@@ -333,6 +333,42 @@ impl CameoDbConfig {
                 .with_context(|| "Invalid CAMEODB_MEMORY_PRESSURE_THRESHOLD")?;
         }
 
+        // Cluster configuration
+        if let Ok(distributed) = std::env::var("CAMEODB_DISTRIBUTED_ACTORS") {
+            let normalized = distributed.trim().to_ascii_lowercase();
+            config.cluster.distributed_actors = matches!(normalized.as_str(), "true" | "1" | "yes");
+        }
+
+        if let Ok(port) = std::env::var("CAMEODB_CLUSTER_PORT") {
+            config.cluster.cluster_port = port
+                .parse()
+                .with_context(|| "Invalid CAMEODB_CLUSTER_PORT")?;
+        }
+
+        if let Ok(name) = std::env::var("CAMEODB_CLUSTER_NAME") {
+            if !name.trim().is_empty() {
+                config.cluster.cluster_name = name;
+            }
+        }
+
+        if let Ok(nodes) = std::env::var("CAMEODB_BOOTSTRAP_NODES") {
+            let parsed: Vec<String> = nodes
+                .split(|c| c == ',' || c == ';')
+                .filter_map(|entry| {
+                    let trimmed = entry.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                })
+                .collect();
+
+            if !parsed.is_empty() {
+                config.cluster.bootstrap_nodes = parsed;
+            }
+        }
+
         Ok(config)
     }
 

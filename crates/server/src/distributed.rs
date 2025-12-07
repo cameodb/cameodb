@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::ClusterConfig;
@@ -197,6 +197,18 @@ impl DistributedCluster {
             connected_nodes: connected_nodes + 1,   // +1 for local node
             total_shards,
             distributed_enabled: self.cluster_config.distributed_actors,
+        }
+    }
+}
+
+impl Drop for DistributedCluster {
+    fn drop(&mut self) {
+        if let Some(handle) = self.swarm_handle.as_ref() {
+            if handle.is_running() {
+                if let Err(error) = handle.shutdown() {
+                    warn!(%error, "failed to signal swarm shutdown during drop");
+                }
+            }
         }
     }
 }

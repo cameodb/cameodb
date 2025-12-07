@@ -3,6 +3,8 @@
 //! This actor maintains the distributed cluster state, tracking discovered
 //! peers, connection status, and providing queries for cluster information.
 
+#![allow(dead_code)]
+
 use kameo::Actor;
 use libp2p::{Multiaddr, PeerId};
 use std::collections::{HashMap, HashSet};
