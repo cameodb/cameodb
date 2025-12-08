@@ -1548,6 +1548,289 @@ impl NodeOrchestrator {
     pub fn shard_count(&self) -> usize {
         self.shards.len()
     }
+
+    // ========================================================================
+    // Client Operation Handling (for actor-based access - no locks needed)
+    // ========================================================================
+
+    /// Handles client operations. Called from Message<ClientOp> handler.
+    pub async fn handle_client_op(&mut self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
+        match op {
+            ClientOp::Search {
+                index,
+                query,
+                limit,
+            } => self.orch_search(&index, &query, limit.unwrap_or(10)).await,
+            ClientOp::Stream { index, query } => Ok(
+                serde_json::json!({"message": "Stream initiated", "index": index, "query": query}),
+            ),
+            ClientOp::Write {
+                index,
+                id,
+                routing_key,
+                doc,
+            } => self.orch_write(&index, id, routing_key, doc).await,
+            ClientOp::BulkWrite { index, docs } => self.orch_bulk_write(&index, docs).await,
+            ClientOp::CreateConfig { index, schema } => {
+                self.orch_create_config(&index, schema).await
+            }
+            ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
+            ClientOp::ListIndexes => self.orch_list_indexes().await,
+        }
+    }
+
+    async fn orch_write(
+        &self,
+        index: &str,
+        id: String,
+        routing_key: Option<String>,
+        doc: JsonValue,
+    ) -> Result<JsonValue, OrchestratorError> {
+        if self.shards.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards",
+            )));
+        }
+        let mut schema_cache = self.load_schema(index).await?;
+        if let Some(shard) = self.shards.values().next() {
+            if let Some(store) = &shard.store {
+                validate_and_evolve_schema(index, &doc, &mut schema_cache, store).await?;
+            }
+        }
+        let target = self.route_write(&routing_key)?;
+        let shard = self.shards.get(&target).ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Shard not found",
+            ))
+        })?;
+        let req = WriteRequest {
+            index: index.to_string(),
+            routing_key,
+            doc,
+        };
+        match shard.handle_write(req).await {
+            Ok(seq) => Ok(
+                serde_json::json!({"id": id, "result": "created", "version": seq, "shard_id": target.to_string()}),
+            ),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn orch_bulk_write(
+        &self,
+        index: &str,
+        docs: Vec<DocPayload>,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let start = std::time::Instant::now();
+        if self.shards.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards",
+            )));
+        }
+        let mut batches: HashMap<Uuid, Vec<&DocPayload>> = HashMap::new();
+        for doc in &docs {
+            let target = self
+                .route_write(&doc.routing_key)
+                .unwrap_or_else(|_| self.shards.keys().next().copied().unwrap());
+            batches.entry(target).or_default().push(doc);
+        }
+        let mut written = 0usize;
+        let mut errors = Vec::new();
+        for (shard_id, batch) in batches {
+            if let Some(shard) = self.shards.get(&shard_id) {
+                let ops: Vec<ClientOp> = batch
+                    .iter()
+                    .map(|d| ClientOp::Write {
+                        index: index.to_string(),
+                        id: d.id.clone(),
+                        routing_key: d.routing_key.clone(),
+                        doc: d.doc.clone(),
+                    })
+                    .collect();
+                match shard.handle_batch_write(BatchWriteRequest { ops }).await {
+                    Ok(seq_ids) => written += seq_ids.len(),
+                    Err(e) => errors.push(format!("Shard {}: {}", shard_id, e)),
+                }
+            }
+        }
+        Ok(
+            serde_json::json!({"took_ms": start.elapsed().as_millis(), "items_received": docs.len(), "items_written": written, "errors": errors}),
+        )
+    }
+
+    async fn orch_search(
+        &self,
+        index: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let start = std::time::Instant::now();
+        if self.shards.is_empty() {
+            return Ok(serde_json::json!({"hits": [], "total": 0, "took_ms": 0}));
+        }
+        let mut handles = Vec::new();
+        for (&shard_id, shard) in &self.shards {
+            let req = SearchRequest {
+                index: index.to_string(),
+                query_string: query.to_string(),
+                limit,
+            };
+            let s = shard.clone();
+            handles.push(tokio::spawn(async move {
+                (shard_id, s.handle_search(req).await)
+            }));
+        }
+        let mut results: Vec<(f32, JsonValue)> = Vec::new();
+        for h in handles {
+            if let Ok((_, Ok(r))) = h.await {
+                results.extend(r);
+            }
+        }
+        results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+        let hits: Vec<JsonValue> = results
+            .into_iter()
+            .map(|(score, mut doc)| {
+                if let JsonValue::Object(ref mut o) = doc {
+                    o.insert(
+                        "_score".to_string(),
+                        serde_json::Number::from_f64(score as f64)
+                            .map(JsonValue::Number)
+                            .unwrap_or(JsonValue::Null),
+                    );
+                }
+                doc
+            })
+            .collect();
+        Ok(
+            serde_json::json!({"hits": hits, "total": hits.len(), "took_ms": start.elapsed().as_millis()}),
+        )
+    }
+
+    async fn orch_create_config(
+        &self,
+        index: &str,
+        schema: IndexSchema,
+    ) -> Result<JsonValue, OrchestratorError> {
+        if let Some(shard) = self.shards.values().next() {
+            if let Some(store) = &shard.store {
+                let sc = Arc::clone(store);
+                let idx = index.to_string();
+                let sch = schema.clone();
+                tokio::task::spawn_blocking(move || sc.store_schema(&idx, &sch))
+                    .await
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+                return Ok(
+                    serde_json::json!({"acknowledged": true, "index": index, "shard_count": schema.shard_count}),
+                );
+            }
+        }
+        Err(OrchestratorError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No shards",
+        )))
+    }
+
+    async fn orch_get_config(&self, index: &str) -> Result<JsonValue, OrchestratorError> {
+        if let Some(shard) = self.shards.values().next() {
+            if let Some(store) = &shard.store {
+                let sc = Arc::clone(store);
+                let idx = index.to_string();
+                let schema = tokio::task::spawn_blocking(move || sc.get_schema(&idx))
+                    .await
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+                return match schema {
+                    Some(s) => Ok(serde_json::to_value(s).unwrap_or(serde_json::json!({}))),
+                    None => Err(OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Index '{}' not found", index),
+                    ))),
+                };
+            }
+        }
+        Err(OrchestratorError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No shards",
+        )))
+    }
+
+    async fn orch_list_indexes(&self) -> Result<JsonValue, OrchestratorError> {
+        if self.shards.is_empty() {
+            return Ok(
+                serde_json::json!({"indexes": [], "total_indexes": 0, "node_id": self.identity.uuid.to_string(), "total_shards": 0}),
+            );
+        }
+        let mut all: HashMap<String, (u64, u64, Vec<String>, usize)> = HashMap::new();
+        for shard in self.shards.values() {
+            if let Some(store) = &shard.store {
+                let sc = Arc::clone(store);
+                let stats = tokio::task::spawn_blocking(move || sc.list_indexes())
+                    .await
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+                for stat in stats {
+                    let e = all
+                        .entry(stat.name.clone())
+                        .or_insert((0, 0, Vec::new(), 0));
+                    e.0 += stat.document_count;
+                    e.1 += stat.total_size_bytes;
+                    for (f, _) in &stat.schema.fields {
+                        if !e.2.contains(f) {
+                            e.2.push(f.clone());
+                        }
+                    }
+                    e.3 += 1;
+                }
+            }
+        }
+        let indexes: Vec<JsonValue> = all.into_iter().map(|(n, (d, s, f, c))| serde_json::json!({"name": n, "document_count": d, "total_size_bytes": s, "size_mb": s/(1024*1024), "shard_count": c, "field_names": f})).collect();
+        Ok(
+            serde_json::json!({"indexes": indexes, "total_indexes": indexes.len(), "node_id": self.identity.uuid.to_string(), "total_shards": self.shards.len()}),
+        )
+    }
+
+    /// Helper: Load schema from first shard
+    async fn load_schema(&self, index: &str) -> Result<IndexSchema, OrchestratorError> {
+        if let Some(shard) = self.shards.values().next() {
+            if let Some(store) = &shard.store {
+                let sc = Arc::clone(store);
+                let idx = index.to_string();
+                return tokio::task::spawn_blocking(move || sc.get_schema(&idx))
+                    .await
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                    .ok_or_else(|| {
+                        OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "Schema not found",
+                        ))
+                    })
+                    .or_else(|_| Ok(IndexSchema::default()));
+            }
+        }
+        Ok(IndexSchema::default())
+    }
+
+    /// Helper: Route write to shard
+    fn route_write(&self, routing_key: &Option<String>) -> Result<Uuid, OrchestratorError> {
+        let target = if let Some(key) = routing_key {
+            self.select_shard_for_key(key)
+                .or_else(|| self.first_shard_id())
+        } else {
+            self.select_shard_round_robin()
+        };
+        target.ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shard selected",
+            ))
+        })
+    }
 }
 
 // ============================================================================
@@ -1602,6 +1885,18 @@ impl Message<ProposeShard> for NodeOrchestrator {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.handle_propose_shard(msg).await
+    }
+}
+
+impl Message<ClientOp> for NodeOrchestrator {
+    type Reply = Result<JsonValue, OrchestratorError>;
+
+    async fn handle(
+        &mut self,
+        msg: ClientOp,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_client_op(msg).await
     }
 }
 
