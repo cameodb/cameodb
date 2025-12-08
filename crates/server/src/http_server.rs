@@ -3,26 +3,21 @@
 //! Provides REST API endpoints for distributed hybrid-search operations
 //! using Axum web framework with streaming support.
 
-use std::sync::Arc;
-
 use axum::{
     Json, Router,
-    body::Body,
     extract::{Path, State},
-    http::{StatusCode, header},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use futures::stream::{StreamExt, TryStreamExt};
 use kameo::actor::ActorRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{error, info};
 
 use crate::cluster_coordinator::{ClusterCoordinator, GetStatus};
-use crate::node_orchestrator::{ClientOp, DocPayload, NodeOrchestrator, RouterActor};
+use crate::node_orchestrator::{ClientOp, DocPayload, RouterActor};
 use storage::IndexSchema;
 
 /// API Error wrapper for consistent error handling
@@ -91,7 +86,6 @@ pub struct HealthResponse {
 #[derive(Clone)]
 pub struct AppState {
     pub router: RouterActor,
-    pub orchestrator: Arc<RwLock<NodeOrchestrator>>,
     pub coordinator: ActorRef<ClusterCoordinator>,
 }
 
@@ -147,47 +141,14 @@ async fn stream_handler(
         index, payload.query
     );
 
-    // Create the stream using the router
-    let stream = state
-        .router
-        .handle_client_stream(index.clone(), payload.query.clone())
-        .await?;
+    // Streaming support temporarily stubbed during actor refactoring
+    let client_op = ClientOp::Stream {
+        index,
+        query: payload.query,
+    };
 
-    // Convert the stream to NDJSON format
-    let ndjson_stream = stream
-        .map(|chunk| {
-            // Convert each chunk to newline-delimited JSON
-            let json_lines: Vec<String> = chunk
-                .into_iter()
-                .map(|(score, mut doc)| {
-                    // Add score to document
-                    if let JsonValue::Object(ref mut obj) = doc {
-                        obj.insert(
-                            "_score".to_string(),
-                            JsonValue::Number(
-                                serde_json::Number::from_f64(score as f64)
-                                    .unwrap_or_else(|| serde_json::Number::from(0)),
-                            ),
-                        );
-                    }
-                    serde_json::to_string(&doc).unwrap_or_else(|_| "{}".to_string())
-                })
-                .collect();
-
-            Ok::<_, std::convert::Infallible>(json_lines.join("\n") + "\n")
-        })
-        .map_ok(|data| data.into_bytes());
-
-    let body = Body::from_stream(ndjson_stream);
-
-    let response = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-ndjson")
-        .header(header::TRANSFER_ENCODING, "chunked")
-        .body(body)
-        .map_err(|e| ApiError(anyhow::anyhow!("Failed to create response: {}", e)))?;
-
-    Ok(response)
+    let result = state.router.handle_client_op(client_op).await?;
+    Ok(Json(result).into_response())
 }
 
 /// Handler for document write operations
@@ -275,7 +236,16 @@ async fn list_indexes_handler(State(state): State<AppState>) -> Result<Json<Json
 
 /// Handler for cluster health check
 async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
-    let orchestrator = state.orchestrator.read().await;
+    let identity = state
+        .router
+        .get_identity()
+        .await
+        .map_err(|e| ApiError(anyhow::anyhow!(e)))?;
+    let shard_count = state
+        .router
+        .get_shard_count()
+        .await
+        .map_err(|e| ApiError(anyhow::anyhow!(e)))?;
 
     // Query cluster status from coordinator
     let (cluster_name, distributed_enabled, total_nodes, connected_nodes) =
@@ -294,8 +264,8 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
 
     let response = HealthResponse {
         status: "green".to_string(),
-        node_id: orchestrator.identity().uuid.to_string(),
-        active_shards: orchestrator.shard_count(),
+        node_id: identity.uuid.to_string(),
+        active_shards: shard_count,
         cluster_name,
         distributed_enabled,
         total_nodes,

@@ -1,6 +1,5 @@
 use anyhow::Result;
 use kameo::actor::Spawn;
-use std::sync::Arc;
 
 mod cluster_coordinator;
 mod config;
@@ -49,7 +48,7 @@ async fn main() -> Result<()> {
         wal_sync: cameodb_config.storage.wal_sync,
     };
 
-    // Create the NodeOrchestrator
+    // Create the NodeOrchestrator actor
     let mut orchestrator = NodeOrchestrator::new(node_config).await?;
 
     // Initialize default shards on first boot if none exist
@@ -80,6 +79,9 @@ async fn main() -> Result<()> {
         DistributedCluster::new(cameodb_config.cluster.clone(), orchestrator.identity().uuid);
     let coordinator_actor = ClusterCoordinator::spawn(ClusterCoordinator::new(distributed_cluster));
 
+    // Spawn NodeOrchestrator as an actor
+    let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
+
     // Initialize swarm via actor message
     match coordinator_actor.ask(InitSwarm).await {
         Err(err) => {
@@ -107,13 +109,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Create shared state for HTTP server
-    let orchestrator_arc = Arc::new(tokio::sync::RwLock::new(orchestrator));
-    let router_actor = RouterActor::new(orchestrator_arc.clone());
+    // Create RouterActor with ActorRef
+    let router_actor = RouterActor::new(orchestrator_ref.clone());
 
     let app_state = AppState {
         router: router_actor,
-        orchestrator: orchestrator_arc,
         coordinator: coordinator_actor.clone(),
     };
 
