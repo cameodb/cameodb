@@ -14,12 +14,14 @@ use axum::{
     routing::{get, post, put},
 };
 use futures::stream::{StreamExt, TryStreamExt};
+use kameo::actor::ActorRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{error, info};
 
+use crate::cluster_coordinator::{ClusterCoordinator, GetStatus};
 use crate::node_orchestrator::{ClientOp, DocPayload, NodeOrchestrator, RouterActor};
 use storage::IndexSchema;
 
@@ -74,6 +76,15 @@ pub struct HealthResponse {
     pub status: String,
     pub node_id: String,
     pub active_shards: usize,
+    // Cluster status fields (from ClusterCoordinator)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distributed_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_nodes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connected_nodes: Option<usize>,
 }
 
 /// Application state shared across handlers
@@ -81,6 +92,7 @@ pub struct HealthResponse {
 pub struct AppState {
     pub router: RouterActor,
     pub orchestrator: Arc<RwLock<NodeOrchestrator>>,
+    pub coordinator: ActorRef<ClusterCoordinator>,
 }
 
 /// Creates the main HTTP router with all endpoints and middleware
@@ -265,10 +277,29 @@ async fn list_indexes_handler(State(state): State<AppState>) -> Result<Json<Json
 async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
     let orchestrator = state.orchestrator.read().await;
 
+    // Query cluster status from coordinator
+    let (cluster_name, distributed_enabled, total_nodes, connected_nodes) =
+        match state.coordinator.ask(GetStatus).await {
+            Ok(status) => (
+                Some(status.cluster_name),
+                Some(status.distributed_enabled),
+                Some(status.total_nodes),
+                Some(status.connected_nodes),
+            ),
+            Err(err) => {
+                error!(error = ?err, "Failed to get cluster status from coordinator");
+                (None, None, None, None)
+            }
+        };
+
     let response = HealthResponse {
         status: "green".to_string(),
         node_id: orchestrator.identity().uuid.to_string(),
         active_shards: orchestrator.shard_count(),
+        cluster_name,
+        distributed_enabled,
+        total_nodes,
+        connected_nodes,
     };
 
     Ok(Json(response))

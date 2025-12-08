@@ -1,12 +1,15 @@
 use anyhow::Result;
+use kameo::actor::Spawn;
 use std::sync::Arc;
 
+mod cluster_coordinator;
 mod config;
 mod distributed;
 mod http_server;
 mod node_orchestrator;
 mod swarm;
 
+use cluster_coordinator::{ClusterCoordinator, DiscoverPeers, GetStatus, InitSwarm, ShutdownSwarm};
 use config::CameoDbConfig;
 use distributed::DistributedCluster;
 use http_server::{AppState, create_router};
@@ -72,29 +75,33 @@ async fn main() -> Result<()> {
     );
     println!("Active shards: {}", orchestrator.shard_count());
 
-    // Initialize distributed cluster if enabled
-    let mut distributed_cluster =
+    // Initialize distributed cluster via ClusterCoordinator actor
+    let distributed_cluster =
         DistributedCluster::new(cameodb_config.cluster.clone(), orchestrator.identity().uuid);
+    let coordinator_actor = ClusterCoordinator::spawn(ClusterCoordinator::new(distributed_cluster));
 
-    match distributed_cluster.init_swarm().await {
+    // Initialize swarm via actor message
+    match coordinator_actor.ask(InitSwarm).await {
         Err(err) => {
-            tracing::warn!(%err, "Failed to initialize distributed swarm");
+            tracing::warn!(error = ?err, "Failed to initialize distributed swarm");
             println!("⚠️  Distributed swarm initialization failed, continuing in single-node mode");
         }
         Ok(peer_id) => {
-            let cluster_status = distributed_cluster.get_cluster_status();
-            if cluster_status.distributed_enabled {
-                println!("🌐 Distributed swarm initialized:");
-                println!("  📡 Cluster: {}", cluster_status.cluster_name);
-                println!("  🆔 Peer ID: {}", peer_id);
-                println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
-                println!("  ✅ Connected: {}", cluster_status.connected_nodes);
+            // Get cluster status via actor
+            if let Ok(cluster_status) = coordinator_actor.ask(GetStatus).await {
+                if cluster_status.distributed_enabled {
+                    println!("🌐 Distributed swarm initialized:");
+                    println!("  📡 Cluster: {}", cluster_status.cluster_name);
+                    println!("  🆔 Peer ID: {}", peer_id);
+                    println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
+                    println!("  ✅ Connected: {}", cluster_status.connected_nodes);
 
-                // Discover peers
-                if let Ok(peers) = distributed_cluster.discover_peers().await
-                    && !peers.is_empty()
-                {
-                    println!("  👥 Discovered {} peer nodes", peers.len());
+                    // Discover peers via actor
+                    if let Ok(peers) = coordinator_actor.ask(DiscoverPeers).await {
+                        if !peers.is_empty() {
+                            println!("  👥 Discovered {} peer nodes", peers.len());
+                        }
+                    }
                 }
             }
         }
@@ -107,6 +114,7 @@ async fn main() -> Result<()> {
     let app_state = AppState {
         router: router_actor,
         orchestrator: orchestrator_arc,
+        coordinator: coordinator_actor.clone(),
     };
 
     // Create the HTTP router with shared state
@@ -156,6 +164,9 @@ async fn main() -> Result<()> {
     // Wait for shutdown signal
     tokio::signal::ctrl_c().await?;
     println!("Shutting down...");
+
+    // Signal coordinator to shutdown swarm gracefully
+    let _ = coordinator_actor.ask(ShutdownSwarm).await;
 
     server_handle.abort();
     Ok(())

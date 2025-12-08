@@ -163,6 +163,30 @@ pub enum ClientOp {
     ListIndexes,
 }
 
+// ============================================================================
+// NodeOrchestrator Messages (for future actor-based communication)
+// ============================================================================
+
+/// Message to get the current shard count.
+#[derive(Debug, Clone)]
+pub struct GetShardCount;
+
+/// Message to get the node identity.
+#[derive(Debug, Clone)]
+pub struct GetIdentity;
+
+/// Message to get all shard IDs.
+#[derive(Debug, Clone)]
+pub struct GetShardIds;
+
+/// Response containing node identity info for actor replies.
+#[derive(Debug, Clone, kameo::Reply)]
+#[allow(dead_code)] // Fields will be used when RouterActor migrates to ActorRef
+pub struct NodeIdentityInfo {
+    pub uuid: Uuid,
+    pub name: String,
+}
+
 /// Microshard actor that manages a single shard's storage and search operations.
 #[derive(Clone, Actor)]
 pub struct MicroshardActor {
@@ -1312,7 +1336,7 @@ impl RouterActor {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Actor)]
 pub struct NodeOrchestrator {
     /// Map of shard UUIDs to their microshard actors
     pub(crate) shards: HashMap<Uuid, MicroshardActor>,
@@ -1523,6 +1547,61 @@ impl NodeOrchestrator {
     /// Gets the number of active shards.
     pub fn shard_count(&self) -> usize {
         self.shards.len()
+    }
+}
+
+// ============================================================================
+// NodeOrchestrator Message Handlers (for future actor-based communication)
+// ============================================================================
+
+impl Message<GetShardCount> for NodeOrchestrator {
+    type Reply = usize;
+
+    async fn handle(
+        &mut self,
+        _msg: GetShardCount,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.shards.len()
+    }
+}
+
+impl Message<GetIdentity> for NodeOrchestrator {
+    type Reply = NodeIdentityInfo;
+
+    async fn handle(
+        &mut self,
+        _msg: GetIdentity,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        NodeIdentityInfo {
+            uuid: self.identity.uuid,
+            name: self.identity.name.clone(),
+        }
+    }
+}
+
+impl Message<GetShardIds> for NodeOrchestrator {
+    type Reply = Vec<Uuid>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetShardIds,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.shards.keys().copied().collect()
+    }
+}
+
+impl Message<ProposeShard> for NodeOrchestrator {
+    type Reply = Result<Uuid, OrchestratorError>;
+
+    async fn handle(
+        &mut self,
+        msg: ProposeShard,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_propose_shard(msg).await
     }
 }
 

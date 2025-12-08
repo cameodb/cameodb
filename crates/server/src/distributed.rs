@@ -5,6 +5,7 @@
 //! actor registration, and distributed routing functionality.
 
 use anyhow::Result;
+use kameo::Reply;
 use std::collections::HashMap;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -59,6 +60,11 @@ impl DistributedCluster {
             local_node_id,
             swarm_handle: None,
         }
+    }
+
+    /// Expose swarm handle for coordinator shutdown hooks
+    pub fn swarm_handle(&self) -> Option<SwarmRuntimeHandle> {
+        self.swarm_handle.clone()
     }
 
     /// Initialize the distributed swarm runtime and return the peer identity
@@ -214,7 +220,7 @@ impl Drop for DistributedCluster {
 }
 
 /// Cluster health and status information
-#[derive(Debug)]
+#[derive(Debug, Clone, Reply)]
 #[allow(dead_code)] // Framework structure, used when distributed features are enabled
 pub struct ClusterStatus {
     pub local_node_id: Uuid,
