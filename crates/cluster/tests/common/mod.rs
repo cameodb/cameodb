@@ -51,9 +51,11 @@ mod tests {
 
         assert!(test_dir.exists());
         assert!(test_dir.is_dir());
-        assert!(test_dir
-            .to_string_lossy()
-            .contains("cameodb_tests/cluster/test_utils_test"));
+        assert!(
+            test_dir
+                .to_string_lossy()
+                .contains("cameodb_tests/cluster/test_utils_test")
+        );
 
         // Cleanup
         cleanup_test_data_dir(&test_dir);
@@ -65,12 +67,16 @@ mod tests {
         let identity_path = create_test_identity_path("identity_test", "node_a");
 
         assert!(identity_path.parent().unwrap().exists());
-        assert!(identity_path
-            .to_string_lossy()
-            .contains("cameodb_tests/cluster/identity_test"));
-        assert!(identity_path
-            .to_string_lossy()
-            .ends_with("node_a_identity.json"));
+        assert!(
+            identity_path
+                .to_string_lossy()
+                .contains("cameodb_tests/cluster/identity_test")
+        );
+        assert!(
+            identity_path
+                .to_string_lossy()
+                .ends_with("node_a_identity.json")
+        );
 
         // Cleanup
         cleanup_test_data_dir(&identity_path.parent().unwrap().to_path_buf());

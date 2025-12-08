@@ -122,10 +122,7 @@ pub async fn init_distributed_swarm(config: &ClusterConfig) -> Result<SwarmStart
     info!("   🎧 Listen Address: {}", startup.listen_addr);
     info!("   🚀 Cluster Port: {} (from config)", config.cluster_port);
     info!("   🌐 Discovery: Kademlia DHT");
-    info!(
-        "   📊 Bootstrap Peers: {}",
-        startup.bootstrap_peer_count
-    );
+    info!("   📊 Bootstrap Peers: {}", startup.bootstrap_peer_count);
 
     // TODO: Future enhancements:
     // - Cluster state actor integration for peer management
@@ -293,31 +290,69 @@ fn handle_swarm_event(event: SwarmEvent<DhtBehaviourEvent>, metrics: &mut SwarmR
         SwarmEvent::ExpiredListenAddr { address, .. } => {
             warn!("⚠️ Listen address expired: {}", address);
         }
-        SwarmEvent::ConnectionEstablished { peer_id, established_in, .. } => {
+        SwarmEvent::ConnectionEstablished {
+            peer_id,
+            established_in,
+            ..
+        } => {
             metrics.connections_established += 1;
-            info!("🔗 Connection established with {} ({} ms)", peer_id, established_in.as_millis());
+            info!(
+                "🔗 Connection established with {} ({} ms)",
+                peer_id,
+                established_in.as_millis()
+            );
         }
         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
             metrics.connections_closed += 1;
             info!("� Connection closed with {} ({:?})", peer_id, cause);
         }
-        SwarmEvent::Dialing { peer_id, connection_id } => {
-            match peer_id {
-                Some(peer) => debug!("📞 Dialing peer: {} (conn {:?})", peer, connection_id),
-                None => debug!("📞 Dialing new peer address (conn {:?})", connection_id),
-            }
+        SwarmEvent::Dialing {
+            peer_id,
+            connection_id,
+        } => match peer_id {
+            Some(peer) => debug!("📞 Dialing peer: {} (conn {:?})", peer, connection_id),
+            None => debug!("📞 Dialing new peer address (conn {:?})", connection_id),
+        },
+        SwarmEvent::IncomingConnection {
+            local_addr,
+            send_back_addr,
+            connection_id,
+        } => {
+            info!(
+                "📥 Incoming connection on {} from {} (conn {:?})",
+                local_addr, send_back_addr, connection_id
+            );
         }
-        SwarmEvent::IncomingConnection { local_addr, send_back_addr, connection_id } => {
-            info!("📥 Incoming connection on {} from {} (conn {:?})", local_addr, send_back_addr, connection_id);
+        SwarmEvent::IncomingConnectionError {
+            local_addr,
+            send_back_addr,
+            connection_id,
+            error,
+        } => {
+            warn!(
+                "⚠️ Incoming connection error on {} from {:?} (conn {:?}): {}",
+                local_addr, send_back_addr, connection_id, error
+            );
         }
-        SwarmEvent::IncomingConnectionError { local_addr, send_back_addr, connection_id, error } => {
-            warn!("⚠️ Incoming connection error on {} from {:?} (conn {:?}): {}", local_addr, send_back_addr, connection_id, error);
+        SwarmEvent::OutgoingConnectionError {
+            peer_id,
+            connection_id,
+            error,
+        } => {
+            warn!(
+                "⚠️ Outgoing connection error to {:?} (conn {:?}): {}",
+                peer_id, connection_id, error
+            );
         }
-        SwarmEvent::OutgoingConnectionError { peer_id, connection_id, error } => {
-            warn!("⚠️ Outgoing connection error to {:?} (conn {:?}): {}", peer_id, connection_id, error);
-        }
-        SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {
-            warn!("⚠️ Listener {:?} closed: {:?} (addresses: {:?})", listener_id, reason, addresses);
+        SwarmEvent::ListenerClosed {
+            listener_id,
+            addresses,
+            reason,
+        } => {
+            warn!(
+                "⚠️ Listener {:?} closed: {:?} (addresses: {:?})",
+                listener_id, reason, addresses
+            );
         }
         SwarmEvent::ListenerError { listener_id, error } => {
             warn!("⚠️ Listener {:?} error: {}", listener_id, error);
@@ -336,13 +371,23 @@ fn handle_behaviour_event(event: DhtBehaviourEvent, metrics: &mut SwarmRuntimeMe
 
 fn handle_kademlia_event(event: kad::Event, metrics: &mut SwarmRuntimeMetrics) {
     match event {
-        kad::Event::RoutingUpdated { peer, addresses, .. } => {
+        kad::Event::RoutingUpdated {
+            peer, addresses, ..
+        } => {
             metrics.kademlia_updates += 1;
             let addr_count = addresses.len();
-            info!("🛰️  Routing table updated for {} ({} addresses)", peer, addr_count);
+            info!(
+                "🛰️  Routing table updated for {} ({} addresses)",
+                peer, addr_count
+            );
         }
-        kad::Event::OutboundQueryProgressed { id, result, stats, .. } => {
-            debug!("📊 Kademlia query {:?} progressed: result={:?}, stats={:?}", id, result, stats);
+        kad::Event::OutboundQueryProgressed {
+            id, result, stats, ..
+        } => {
+            debug!(
+                "📊 Kademlia query {:?} progressed: result={:?}, stats={:?}",
+                id, result, stats
+            );
         }
         kad::Event::InboundRequest { request } => {
             debug!("📨 Kademlia inbound request: {:?}", request);
