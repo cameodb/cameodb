@@ -16,7 +16,7 @@ use serde_json::Value as JsonValue;
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{error, info};
 
-use crate::cluster_coordinator::{ClusterCoordinator, GetStatus};
+use crate::cluster_coordinator::{ClusterCoordinator, GetStatus, OperationType};
 use crate::node_orchestrator::{ClientOp, DocPayload, RouterActor};
 use storage::IndexSchema;
 
@@ -126,7 +126,10 @@ async fn search_handler(
         limit: payload.limit,
     };
 
-    let result = state.router.handle_client_op(client_op).await?;
+    let result = state
+        .router
+        .route_and_handle(client_op, None, OperationType::Read)
+        .await?;
     Ok(Json(result))
 }
 
@@ -147,7 +150,10 @@ async fn stream_handler(
         query: payload.query,
     };
 
-    let result = state.router.handle_client_op(client_op).await?;
+    let result = state
+        .router
+        .route_and_handle(client_op, None, OperationType::Read)
+        .await?;
     Ok(Json(result).into_response())
 }
 
@@ -168,11 +174,14 @@ async fn write_handler(
     let client_op = ClientOp::Write {
         index,
         id,
-        routing_key,
+        routing_key: routing_key.clone(),
         doc,
     };
 
-    let result = state.router.handle_client_op(client_op).await?;
+    let result = state
+        .router
+        .route_and_handle(client_op, routing_key, OperationType::Write)
+        .await?;
     Ok(Json(result))
 }
 
@@ -190,7 +199,10 @@ async fn bulk_write_handler(
 
     let client_op = ClientOp::BulkWrite { index, docs };
 
-    let result = state.router.handle_client_op(client_op).await?;
+    let result = state
+        .router
+        .route_and_handle(client_op, None, OperationType::Write)
+        .await?;
     Ok(Json(result))
 }
 
@@ -207,7 +219,10 @@ async fn create_config_handler(
 
     let client_op = ClientOp::CreateConfig { index, schema };
 
-    let result = state.router.handle_client_op(client_op).await?;
+    let result = state
+        .router
+        .route_and_handle(client_op, None, OperationType::Write)
+        .await?;
     Ok(Json(result))
 }
 
@@ -220,7 +235,10 @@ async fn get_config_handler(
 
     let client_op = ClientOp::GetConfig { index };
 
-    let result = state.router.handle_client_op(client_op).await?;
+    let result = state
+        .router
+        .route_and_handle(client_op, None, OperationType::Read)
+        .await?;
     Ok(Json(result))
 }
 
@@ -230,7 +248,10 @@ async fn list_indexes_handler(State(state): State<AppState>) -> Result<Json<Json
 
     let client_op = ClientOp::ListIndexes;
 
-    let result = state.router.handle_client_op(client_op).await?;
+    let result = state
+        .router
+        .route_and_handle(client_op, None, OperationType::Read)
+        .await?;
     Ok(Json(result))
 }
 

@@ -24,7 +24,9 @@ use std::sync::{
 };
 
 use anyhow::Result;
-use kameo::prelude::*;
+use kameo::Actor;
+use kameo::actor::ActorRef;
+use kameo::message::{Context, Message};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -32,6 +34,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::cluster_coordinator::{
+    ClusterCoordinator, OperationType, RequestBootstrapRedial, RouteOperation, RoutingDecision,
+};
 use cluster::{ConsistentRing, IdentityError, NodeIdentity, generate_tokens};
 use serde_json::Value as JsonValue;
 use storage::{FieldDef, HybridStore, IndexSchema, StorageConfig, StoreError, WalOp};
@@ -616,12 +621,19 @@ impl Message<BatchWriteRequest> for MicroshardActor {
 #[derive(Clone, Actor)]
 pub struct RouterActor {
     orchestrator: ActorRef<NodeOrchestrator>,
+    coordinator: ActorRef<ClusterCoordinator>,
 }
 
 impl RouterActor {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn new(orchestrator: ActorRef<NodeOrchestrator>) -> Self {
-        Self { orchestrator }
+    pub fn new(
+        orchestrator: ActorRef<NodeOrchestrator>,
+        coordinator: ActorRef<ClusterCoordinator>,
+    ) -> Self {
+        Self {
+            orchestrator,
+            coordinator,
+        }
     }
 
     /// Handles client operations by forwarding to NodeOrchestrator actor.
@@ -633,6 +645,47 @@ impl RouterActor {
                 "Actor error: {}",
                 e
             )))),
+        }
+    }
+
+    /// Route via ClusterCoordinator then handle locally (remote/broadcast stubbed).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn route_and_handle(
+        &self,
+        op: ClientOp,
+        routing_key: Option<String>,
+        operation_type: OperationType,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let decision = self
+            .coordinator
+            .ask(RouteOperation {
+                routing_key,
+                operation_type,
+            })
+            .await;
+
+        match decision {
+            Ok(RoutingDecision::Local) => self.handle_client_op(op).await,
+            Ok(RoutingDecision::Broadcast) => {
+                // TODO: scatter-gather across peers when remote actors land.
+                self.handle_client_op(op).await
+            }
+            Ok(RoutingDecision::Remote { node_id, peer_addr }) => {
+                Err(OrchestratorError::Io(std::io::Error::other(format!(
+                    "Remote routing not implemented (node_id={}, addr={})",
+                    node_id, peer_addr
+                ))))
+            }
+            Err(err) => {
+                let reason = format!("routing failed: {}", err);
+                let _ = self
+                    .coordinator
+                    .ask(RequestBootstrapRedial {
+                        reason: reason.clone(),
+                    })
+                    .await;
+                Err(OrchestratorError::Io(std::io::Error::other(reason)))
+            }
         }
     }
 

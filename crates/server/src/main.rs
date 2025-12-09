@@ -109,8 +109,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Create RouterActor with ActorRef
-    let router_actor = RouterActor::new(orchestrator_ref.clone());
+    // Create RouterActor with ActorRefs
+    let router_actor = RouterActor::new(orchestrator_ref.clone(), coordinator_actor.clone());
 
     let app_state = AppState {
         router: router_actor,
