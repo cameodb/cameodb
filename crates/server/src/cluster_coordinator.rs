@@ -635,6 +635,8 @@ mod tests {
 
     #[test]
     fn ring_distribution_splits_across_multiple_nodes() {
+        use cluster::generate_tokens;
+
         let mut cluster = make_cluster();
         let n1 = Uuid::new_v4();
         let n2 = Uuid::new_v4();
@@ -660,12 +662,13 @@ mod tests {
 
         let s1 = Uuid::new_v4();
         let s2 = Uuid::new_v4();
+        // Use realistic token distribution across the u64 hash space
         cc.shard_assignments.insert(
             s1,
             ShardMetadata {
                 shard_id: s1,
                 node_id: n1,
-                vnode_tokens: vec![1, 3, 5],
+                vnode_tokens: generate_tokens(s1),
                 storage_bytes: 0,
                 document_count: 0,
             },
@@ -675,7 +678,7 @@ mod tests {
             ShardMetadata {
                 shard_id: s2,
                 node_id: n2,
-                vnode_tokens: vec![2, 4, 6],
+                vnode_tokens: generate_tokens(s2),
                 storage_bytes: 0,
                 document_count: 0,
             },
