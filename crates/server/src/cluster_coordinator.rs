@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::distributed::{ClusterStatus, DistributedCluster, NodeInfo};
 use crate::swarm::CoordinatorEvent;
+use cluster::{ConsistentRing, NodeIdentity};
 
 // ============================================================================
 // Message Definitions
@@ -128,6 +129,7 @@ pub struct RequestBootstrapRedial {
 pub struct ClusterCoordinator {
     cluster: DistributedCluster,
     shard_assignments: std::collections::HashMap<Uuid, ShardMetadata>,
+    ring: ConsistentRing,
 }
 
 impl ClusterCoordinator {
@@ -136,6 +138,7 @@ impl ClusterCoordinator {
         Self {
             cluster,
             shard_assignments: std::collections::HashMap::new(),
+            ring: ConsistentRing::new(),
         }
     }
 }
@@ -151,6 +154,7 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
         for shard in msg.shards {
             self.shard_assignments.insert(shard.shard_id, shard);
         }
+        self.rebuild_ring();
         info!(
             node = %msg.node_id,
             total_assignments = self.shard_assignments.len(),
@@ -168,6 +172,36 @@ impl Message<GetShardAssignments> for ClusterCoordinator {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.shard_assignments.clone()
+    }
+}
+
+impl ClusterCoordinator {
+    fn rebuild_ring(&mut self) {
+        self.ring = ConsistentRing::new();
+        for (shard_id, meta) in &self.shard_assignments {
+            let name: String = shard_id.simple().to_string().chars().take(3).collect();
+            let identity = NodeIdentity {
+                uuid: *shard_id,
+                name,
+                vnode_tokens: meta.vnode_tokens.clone(),
+            };
+            self.ring.add_node(&identity);
+        }
+    }
+
+    fn route_for_key(&self, key: &str) -> Option<Uuid> {
+        self.ring.get_owner(key)
+    }
+
+    fn shard_owner(&self, shard_id: &Uuid) -> Option<Uuid> {
+        self.shard_assignments.get(shard_id).map(|m| m.node_id)
+    }
+
+    fn node_address(&self, node_id: &Uuid) -> Option<String> {
+        self.cluster
+            .peer_nodes
+            .get(node_id)
+            .map(|n| n.address.clone())
     }
 }
 // ============================================================================
@@ -389,32 +423,34 @@ impl Message<RouteOperation> for ClusterCoordinator {
         msg: RouteOperation,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // Phase 4 stub: Currently all operations are handled locally.
-        // Future phases will implement proper routing based on:
-        // - Hash ring lookup for routing_key
-        // - Cluster topology from peer tracking
-        // - Shard-to-node assignments
-        match msg.routing_key {
-            Some(_key) => {
-                // TODO: Look up routing_key in hash ring to determine target node
-                // For now, handle locally
-                info!("RouteOperation: routing_key present, handling locally (stub)");
-                RoutingDecision::Local
-            }
-            None => {
-                // No routing key = scatter-gather for reads, round-robin for writes
-                match msg.operation_type {
-                    OperationType::Read => {
-                        info!("RouteOperation: no routing_key, broadcast for read");
-                        RoutingDecision::Broadcast
+        if let Some(key) = msg.routing_key {
+            if let Some(shard_id) = self.route_for_key(&key) {
+                if let Some(owner_node) = self.shard_owner(&shard_id) {
+                    if owner_node == self.cluster.local_node_id {
+                        info!(%shard_id, "RouteOperation: routing locally by key");
+                        return RoutingDecision::Local;
+                    } else if let Some(addr) = self.node_address(&owner_node) {
+                        info!(%shard_id, node = %owner_node, addr = %addr, "RouteOperation: routing remote by key");
+                        return RoutingDecision::Remote {
+                            node_id: owner_node,
+                            peer_addr: addr,
+                        };
+                    } else {
+                        warn!(%shard_id, node = %owner_node, "RouteOperation: owner address unknown, broadcasting");
+                        return RoutingDecision::Broadcast;
                     }
-                    OperationType::Write => {
-                        info!("RouteOperation: no routing_key, local round-robin for write");
-                        RoutingDecision::Local
-                    }
+                } else {
+                    warn!(%shard_id, "RouteOperation: shard owner unknown, broadcasting");
+                    return RoutingDecision::Broadcast;
                 }
+            } else {
+                warn!("RouteOperation: ring empty, broadcasting");
+                return RoutingDecision::Broadcast;
             }
         }
+
+        info!("RouteOperation: no routing_key provided, broadcasting");
+        RoutingDecision::Broadcast
     }
 }
 

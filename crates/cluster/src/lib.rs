@@ -93,6 +93,31 @@ pub struct NodeIdentity {
     pub vnode_tokens: Vec<u64>,
 }
 
+#[cfg(test)]
+mod ring_distribution_tests {
+    use super::*;
+
+    #[test]
+    fn ring_distributes_keys_across_nodes() {
+        let mut ring = ConsistentRing::new();
+        let n1 = NodeIdentity::new();
+        let n2 = NodeIdentity::new();
+        ring.add_node(&n1);
+        ring.add_node(&n2);
+
+        let mut counts = std::collections::HashMap::new();
+        for i in 0..200 {
+            let key = format!("key-{i}");
+            let owner = ring.get_owner(&key).expect("owner");
+            *counts.entry(owner).or_insert(0usize) += 1;
+        }
+
+        let c1 = *counts.get(&n1.uuid).unwrap_or(&0);
+        let c2 = *counts.get(&n2.uuid).unwrap_or(&0);
+        assert!(c1 > 0 && c2 > 0, "both nodes should receive keys");
+    }
+}
+
 /// Errors that can occur during node identity operations.
 #[derive(Debug, Error)]
 pub enum IdentityError {
