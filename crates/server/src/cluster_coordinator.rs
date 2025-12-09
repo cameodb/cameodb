@@ -122,6 +122,17 @@ pub struct RequestBootstrapRedial {
     pub reason: String,
 }
 
+/// Message to get known peers for broadcast scatter-gather.
+#[derive(Debug, Clone)]
+pub struct GetKnownPeers;
+
+/// Response containing known peer information for broadcast.
+#[derive(Debug, Clone)]
+pub struct KnownPeer {
+    pub node_id: Uuid,
+    pub address: String,
+}
+
 // ============================================================================
 // Actor Definition
 // ============================================================================
@@ -487,6 +498,25 @@ impl Message<RequestBootstrapRedial> for ClusterCoordinator {
         // 2. Re-dial bootstrap peers via swarm handle
         // 3. Update cluster state after successful connections
         Ok(())
+    }
+}
+
+impl Message<GetKnownPeers> for ClusterCoordinator {
+    type Reply = Vec<KnownPeer>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetKnownPeers,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.cluster
+            .peer_nodes
+            .values()
+            .map(|info| KnownPeer {
+                node_id: info.node_id,
+                address: info.address.clone(),
+            })
+            .collect()
     }
 }
 

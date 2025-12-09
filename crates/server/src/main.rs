@@ -12,7 +12,9 @@ use cluster_coordinator::{ClusterCoordinator, DiscoverPeers, GetStatus, InitSwar
 use config::CameoDbConfig;
 use distributed::DistributedCluster;
 use http_server::{AppState, create_router};
-use node_orchestrator::{NodeConfig, NodeOrchestrator, ProposeShard, RouterActor};
+use node_orchestrator::{
+    NodeConfig, NodeOrchestrator, ProposeShard, RouterActor, orchestrator_remote_name,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -87,8 +89,15 @@ async fn main() -> Result<()> {
         .await
         .ok();
 
-    // Spawn NodeOrchestrator as an actor
+    // Spawn NodeOrchestrator as an actor and register with remote registry
+    let node_id = orchestrator.identity().uuid;
     let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
+    let remote_name = orchestrator_remote_name(&node_id);
+    if let Err(e) = orchestrator_ref.register(remote_name.clone()).await {
+        tracing::warn!(name = %remote_name, error = %e, "Failed to register orchestrator for remote access");
+    } else {
+        tracing::info!(name = %remote_name, "Registered orchestrator for remote access");
+    }
 
     // Initialize swarm via actor message
     match coordinator_actor.ask(InitSwarm).await {

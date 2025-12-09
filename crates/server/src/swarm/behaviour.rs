@@ -4,6 +4,7 @@
 //! for peer discovery and distributed routing in enterprise environments.
 
 use anyhow;
+use kameo::remote;
 use libp2p::{
     Multiaddr, PeerId,
     kad::{self, Mode as KadMode, store::MemoryStore},
@@ -19,6 +20,8 @@ use tracing::{info, warn};
 /// - **Enterprise ready**: Designed for corporate and production environments
 #[derive(NetworkBehaviour)]
 pub struct DhtBehaviour {
+    /// Kameo remote messaging behaviour for actor remoting
+    pub kameo: remote::Behaviour,
     /// Global discovery & distributed hash table
     pub kademlia: kad::Behaviour<MemoryStore>,
 }
@@ -35,7 +38,9 @@ impl DhtBehaviour {
             info!("⚙️  Kademlia mode set to: {:?}", mode);
         }
 
-        Ok(Self { kademlia })
+        let kameo = remote::Behaviour::new(local_peer_id, remote::messaging::Config::default());
+
+        Ok(Self { kameo, kademlia })
     }
 
     /// Bootstrap the Kademlia DHT

@@ -179,7 +179,7 @@ async fn create_production_swarm(config: &ClusterConfig) -> Result<SwarmStartup>
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
-            tcp::Config::default().port_reuse(true).nodelay(true),
+            tcp::Config::default().nodelay(true),
             noise::Config::new,
             yamux::Config::default,
         )?
@@ -190,6 +190,10 @@ async fn create_production_swarm(config: &ClusterConfig) -> Result<SwarmStartup>
                 .with_max_negotiating_inbound_streams(2048)
         })
         .build();
+
+    // Initialize Kameo remote registry so remote actors can be registered/looked up.
+    swarm.behaviour_mut().kameo.init_global();
+    info!("🎭 Kameo remote actor registry initialized");
 
     // Start listening on the optimized address
     swarm.listen_on(listen_addr.clone())?;
@@ -371,10 +375,11 @@ fn handle_swarm_event(
             send_back_addr,
             connection_id,
             error,
+            peer_id,
         } => {
             warn!(
-                "⚠️ Incoming connection error on {} from {:?} (conn {:?}): {}",
-                local_addr, send_back_addr, connection_id, error
+                "⚠️ Incoming connection error on {} from {:?} (conn {:?}, peer {:?}): {}",
+                local_addr, send_back_addr, connection_id, peer_id, error
             );
         }
         SwarmEvent::OutgoingConnectionError {
@@ -418,6 +423,9 @@ fn handle_behaviour_event(
     match event {
         DhtBehaviourEvent::Kademlia(kad_event) => {
             handle_kademlia_event(kad_event, metrics, event_tx)
+        }
+        DhtBehaviourEvent::Kameo(kameo_event) => {
+            debug!("📡 Kameo remote event: {:?}", kameo_event);
         }
     }
 }

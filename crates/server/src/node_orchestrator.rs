@@ -31,6 +31,7 @@ use kameo::{Actor, RemoteActor, remote_message};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -41,8 +42,24 @@ use crate::cluster_coordinator::{
 };
 use crate::config::MessagingConfig;
 use cluster::{ConsistentRing, IdentityError, NodeIdentity, generate_tokens};
+use kameo::actor::RemoteActorRef;
 use serde_json::Value as JsonValue;
 use storage::{FieldDef, HybridStore, IndexSchema, StorageConfig, StoreError, WalOp};
+
+// ============================================================================
+// Remote Actor Naming Constants
+// ============================================================================
+
+/// Generate the remote actor name for a NodeOrchestrator.
+pub fn orchestrator_remote_name(node_id: &Uuid) -> String {
+    format!("orchestrator-{}", node_id)
+}
+
+/// Generate the remote actor name for a MicroshardActor.
+#[allow(dead_code)] // Will be used for direct shard-to-shard remote calls
+pub fn shard_remote_name(shard_id: &Uuid) -> String {
+    format!("shard-{}", shard_id)
+}
 
 /// Configuration for a CameoDB node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +174,73 @@ pub struct WriteRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchWriteRequest {
     pub ops: Vec<ClientOp>,
+}
+
+/// Remote-friendly error type for cross-node microshard calls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RemoteError {
+    Io(String),
+    Identity(String),
+    NotFound(String),
+    InvalidInput(String),
+    Other(String),
+}
+
+impl From<OrchestratorError> for RemoteError {
+    fn from(err: OrchestratorError) -> Self {
+        match err {
+            OrchestratorError::Identity(e) => RemoteError::Identity(e.to_string()),
+            OrchestratorError::Io(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    RemoteError::NotFound(e.to_string())
+                } else if e.kind() == std::io::ErrorKind::InvalidInput {
+                    RemoteError::InvalidInput(e.to_string())
+                } else {
+                    RemoteError::Io(e.to_string())
+                }
+            }
+            OrchestratorError::ShardLimitExceeded { current, max } => {
+                RemoteError::InvalidInput(format!("shard limit exceeded {current}/{max}"))
+            }
+            OrchestratorError::ShardAlreadyExists { shard_id } => {
+                RemoteError::InvalidInput(format!("shard already exists: {shard_id}"))
+            }
+        }
+    }
+}
+
+impl From<RemoteError> for OrchestratorError {
+    fn from(err: RemoteError) -> Self {
+        match err {
+            RemoteError::Io(s)
+            | RemoteError::Identity(s)
+            | RemoteError::NotFound(s)
+            | RemoteError::InvalidInput(s)
+            | RemoteError::Other(s) => OrchestratorError::Io(std::io::Error::other(s)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub score: f32,
+    pub doc: JsonValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchReply {
+    pub hits: Vec<SearchHit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteReply {
+    pub sequence_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchWriteReply {
+    pub sequence_ids: Vec<u64>,
+    pub items_processed: usize,
 }
 
 /// Client operation messages for RouterActor.
@@ -596,49 +680,59 @@ async fn validate_and_evolve_schema(
 /// Message implementation for MicroshardActor search operations
 #[remote_message("cameo.microshard.search")]
 impl Message<SearchRequest> for MicroshardActor {
-    type Reply = Result<Vec<(f32, JsonValue)>, OrchestratorError>;
+    type Reply = Result<SearchReply, RemoteError>;
 
     async fn handle(
         &mut self,
         msg: SearchRequest,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.handle_search(msg).await
+        self.handle_search(msg)
+            .await
+            .map(|hits| SearchReply {
+                hits: hits
+                    .into_iter()
+                    .map(|(score, doc)| SearchHit { score, doc })
+                    .collect(),
+            })
+            .map_err(RemoteError::from)
     }
 }
 
 /// Message implementation for MicroshardActor write operations
 #[remote_message("cameo.microshard.write")]
 impl Message<WriteRequest> for MicroshardActor {
-    type Reply = Result<u64, OrchestratorError>;
+    type Reply = Result<WriteReply, RemoteError>;
 
     async fn handle(
         &mut self,
         msg: WriteRequest,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.handle_write(msg).await
+        self.handle_write(msg)
+            .await
+            .map(|sequence_id| WriteReply { sequence_id })
+            .map_err(RemoteError::from)
     }
 }
 
 /// Message implementation for MicroshardActor batch write operations
 #[remote_message("cameo.microshard.batch_write")]
 impl Message<BatchWriteRequest> for MicroshardActor {
-    type Reply = Result<JsonValue, OrchestratorError>;
+    type Reply = Result<BatchWriteReply, RemoteError>;
 
     async fn handle(
         &mut self,
         msg: BatchWriteRequest,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // Convert Vec<u64> to JsonValue to match expected return type
-        match self.handle_batch_write(msg).await {
-            Ok(sequence_ids) => Ok(serde_json::json!({
-                "sequence_ids": sequence_ids,
-                "items_processed": sequence_ids.len()
-            })),
-            Err(e) => Err(e),
-        }
+        self.handle_batch_write(msg)
+            .await
+            .map(|sequence_ids| BatchWriteReply {
+                items_processed: sequence_ids.len(),
+                sequence_ids,
+            })
+            .map_err(RemoteError::from)
     }
 }
 
@@ -747,18 +841,132 @@ impl RouterActor {
     }
 
     async fn handle_broadcast(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
+        use crate::cluster_coordinator::{GetKnownPeers, KnownPeer};
+        use futures::future::join_all;
+
         self.broadcasts_total.fetch_add(1, AtomicOrdering::Relaxed);
+
+        // Get known peers for remote fan-out
+        let peers: Vec<KnownPeer> = self
+            .coordinator
+            .ask(GetKnownPeers)
+            .await
+            .unwrap_or_default();
+
+        let peer_count = peers.len().min(self.broadcast_fanout_limit);
         info!(
             timeout_ms = self.broadcast_timeout.as_millis(),
             fanout_limit = self.broadcast_fanout_limit,
-            "RouterActor: broadcast routing falling back to local handling"
+            known_peers = peers.len(),
+            target_peers = peer_count,
+            "RouterActor: broadcast routing with remote fan-out"
         );
-        let res = self.handle_client_op(op).await;
-        if res.is_err() {
-            self.broadcast_failures
-                .fetch_add(1, AtomicOrdering::Relaxed);
+
+        // Start local operation
+        let local_op = op.clone();
+        let local_future = self.handle_client_op(local_op);
+
+        // Fan out to remote peers (up to fanout_limit)
+        let remote_futures: Vec<_> = peers
+            .into_iter()
+            .take(self.broadcast_fanout_limit)
+            .map(|peer| {
+                let op_clone = op.clone();
+                let node_id = peer.node_id;
+                let peer_addr = peer.address;
+                async move {
+                    timeout(
+                        self.broadcast_timeout,
+                        self.try_remote(op_clone, node_id, &peer_addr),
+                    )
+                    .await
+                }
+            })
+            .collect();
+
+        // Execute local + remote concurrently
+        let (local_result, remote_results) = tokio::join!(local_future, join_all(remote_futures));
+
+        // Aggregate results: for search, merge hits; for writes, report success/failure counts
+        let mut all_results: Vec<JsonValue> = Vec::new();
+        let mut error_count = 0u64;
+
+        // Process local result
+        match local_result {
+            Ok(val) => all_results.push(val),
+            Err(e) => {
+                error_count += 1;
+                warn!(error = %e, "Broadcast: local operation failed");
+            }
         }
-        res
+
+        // Process remote results
+        for result in remote_results {
+            match result {
+                Ok(Ok(val)) => all_results.push(val),
+                Ok(Err(e)) => {
+                    error_count += 1;
+                    warn!(error = %e, "Broadcast: remote operation failed");
+                }
+                Err(elapsed) => {
+                    error_count += 1;
+                    warn!(error = %elapsed, "Broadcast: remote operation timed out");
+                }
+            }
+        }
+
+        if error_count > 0 {
+            self.broadcast_failures
+                .fetch_add(error_count, AtomicOrdering::Relaxed);
+        }
+
+        // Merge results based on operation type
+        let total_shards = all_results.len();
+        match &op {
+            ClientOp::Search { .. } => {
+                // Merge search results: combine all hits arrays
+                let mut merged_hits: Vec<JsonValue> = Vec::new();
+                for result in &all_results {
+                    if let Some(hits) = result.get("hits").and_then(|h| h.as_array()) {
+                        merged_hits.extend(hits.iter().cloned());
+                    }
+                }
+                // Sort by score descending and deduplicate by _id if present
+                merged_hits.sort_by(|a, b| {
+                    let score_a = a.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                    let score_b = b.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                    score_b
+                        .partial_cmp(&score_a)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                Ok(serde_json::json!({
+                    "hits": merged_hits,
+                    "total_shards": total_shards,
+                    "failed_shards": error_count
+                }))
+            }
+            ClientOp::Write { .. } | ClientOp::BulkWrite { .. } => {
+                // For writes, return aggregate success info
+                Ok(serde_json::json!({
+                    "success": error_count == 0,
+                    "nodes_contacted": total_shards + error_count as usize,
+                    "nodes_succeeded": total_shards,
+                    "nodes_failed": error_count
+                }))
+            }
+            _ => {
+                // For other operations, return first successful result or error
+                if let Some(first) = all_results.first() {
+                    Ok(first.clone())
+                } else {
+                    self.broadcast_failures
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    Err(OrchestratorError::Io(std::io::Error::other(
+                        "broadcast failed: no successful responses",
+                    )))
+                }
+            }
+        }
     }
 
     async fn handle_remote(
@@ -767,21 +975,97 @@ impl RouterActor {
         node_id: Uuid,
         peer_addr: String,
     ) -> Result<JsonValue, OrchestratorError> {
-        let reason = format!(
-            "Remote routing not implemented (node_id={}, addr={}, timeout={:?}, retries={})",
-            node_id, peer_addr, self.remote_timeout, self.remote_retry_attempts
-        );
-        warn!(%node_id, %peer_addr, timeout_ms = self.remote_timeout.as_millis(), "RouterActor: remote routing stubbed");
+        let max_attempts = std::cmp::max(1, self.remote_retry_attempts as usize);
+        let mut last_err = None;
+
+        for attempt in 1..=max_attempts {
+            let op_clone = op.clone();
+            match timeout(
+                self.remote_timeout,
+                self.try_remote(op_clone, node_id, &peer_addr),
+            )
+            .await
+            {
+                Ok(Ok(value)) => return Ok(value),
+                Ok(Err(err)) => {
+                    warn!(
+                        %node_id,
+                        %peer_addr,
+                        attempt,
+                        max_attempts,
+                        error = %err,
+                        "RouterActor: remote attempt failed"
+                    );
+                    last_err = Some(err);
+                }
+                Err(elapsed) => {
+                    warn!(
+                        %node_id,
+                        %peer_addr,
+                        attempt,
+                        max_attempts,
+                        timeout_ms = self.remote_timeout.as_millis(),
+                        error = %elapsed,
+                        "RouterActor: remote attempt timed out"
+                    );
+                    last_err = Some(OrchestratorError::Io(std::io::Error::other(
+                        elapsed.to_string(),
+                    )));
+                }
+            }
+        }
+
+        let reason = last_err
+            .map(|e| {
+                format!(
+                    "remote routing failed after {} attempts: {}",
+                    max_attempts, e
+                )
+            })
+            .unwrap_or_else(|| "remote routing failed".to_string());
+
         let _ = self
             .coordinator
             .ask(RequestBootstrapRedial {
                 reason: reason.clone(),
             })
             .await;
-        // Preserve op to avoid unused warning for now
-        // TODO: implement remote ask using Kameo remoting
-        drop(op);
+
         Err(OrchestratorError::Io(std::io::Error::other(reason)))
+    }
+}
+
+impl RouterActor {
+    /// Attempt a remote call to a microshard on another node.
+    /// Looks up the remote NodeOrchestrator by name and forwards the ClientOp.
+    async fn try_remote(
+        &self,
+        op: ClientOp,
+        node_id: Uuid,
+        _peer_addr: &str,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let orchestrator_name = orchestrator_remote_name(&node_id);
+        let remote_ref: Option<RemoteActorRef<NodeOrchestrator>> =
+            RemoteActorRef::lookup(orchestrator_name.clone())
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+
+        match remote_ref {
+            Some(remote) => {
+                let result = remote
+                    .ask(&op)
+                    .await
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+                Ok(result)
+            }
+            None => {
+                warn!(%node_id, name = %orchestrator_name, "Remote orchestrator not found");
+                Err(OrchestratorError::Io(std::io::Error::other(format!(
+                    "remote orchestrator {} not found",
+                    orchestrator_name
+                ))))
+            }
+        }
     }
 }
 
@@ -1431,6 +1715,7 @@ impl Message<ProposeShard> for NodeOrchestrator {
     }
 }
 
+#[remote_message("cameo.orchestrator.client_op")]
 impl Message<ClientOp> for NodeOrchestrator {
     type Reply = Result<JsonValue, OrchestratorError>;
 
