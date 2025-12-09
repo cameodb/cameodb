@@ -35,7 +35,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::cluster_coordinator::{
-    ClusterCoordinator, OperationType, RequestBootstrapRedial, RouteOperation, RoutingDecision,
+    ClusterCoordinator, OperationType, RegisterLocalShards, RequestBootstrapRedial, RouteOperation,
+    RoutingDecision, ShardMetadata,
 };
 use cluster::{ConsistentRing, IdentityError, NodeIdentity, generate_tokens};
 use serde_json::Value as JsonValue;
@@ -718,6 +719,8 @@ pub struct NodeOrchestrator {
     routing_ring: ConsistentRing,
     /// Round-robin counter for writes without routing key
     round_robin_counter: AtomicUsize,
+    /// Optional coordinator reference for shard registration
+    coordinator: Option<ActorRef<ClusterCoordinator>>,
 }
 
 impl NodeOrchestrator {
@@ -738,12 +741,18 @@ impl NodeOrchestrator {
             config,
             routing_ring: ConsistentRing::new(),
             round_robin_counter: AtomicUsize::new(0),
+            coordinator: None,
         };
 
         // Discover and hydrate existing shards
         orchestrator.hydrate_existing_shards().await?;
 
         Ok(orchestrator)
+    }
+
+    /// Set the coordinator ActorRef after it is spawned (used for shard registration).
+    pub fn set_coordinator(&mut self, coordinator: ActorRef<ClusterCoordinator>) {
+        self.coordinator = Some(coordinator);
     }
 
     /// Scans the storage directory for existing shard folders and hydrates them.
@@ -764,6 +773,9 @@ impl NodeOrchestrator {
                 Ok(()) => {
                     self.shards.insert(shard_id, microshard);
                     self.register_shard_for_routing(shard_id);
+                    if let Err(err) = self.register_shard_with_coordinator(shard_id).await {
+                        warn!(%shard_id, error = %err, "Failed to register hydrated shard");
+                    }
                     info!("Hydrated shard {}", shard_id);
                 }
                 Err(e) => {
@@ -863,11 +875,14 @@ impl NodeOrchestrator {
         // Add to shards map
         self.shards.insert(shard_id, microshard);
         self.register_shard_for_routing(shard_id);
+        if let Err(err) = self.register_shard_with_coordinator(shard_id).await {
+            warn!(%shard_id, error = %err, "Failed to register new shard with coordinator");
+        }
 
         info!(
             "Successfully created shard {} ({}/{})",
             shard_id,
-            self.shards.len(),
+            self.shard_count(),
             self.config.max_shards
         );
         Ok(shard_id)
@@ -876,6 +891,61 @@ impl NodeOrchestrator {
     /// Gets the node identity.
     pub fn identity(&self) -> &NodeIdentity {
         &self.identity
+    }
+
+    /// Builds ShardMetadata for a given shard id (storage stats currently stubbed).
+    fn shard_metadata(&self, shard_id: Uuid) -> ShardMetadata {
+        ShardMetadata {
+            shard_id,
+            node_id: self.identity.uuid,
+            vnode_tokens: generate_tokens(shard_id),
+            storage_bytes: 0,
+            document_count: 0,
+        }
+    }
+
+    /// Registers a single shard with the coordinator if available.
+    async fn register_shard_with_coordinator(
+        &self,
+        shard_id: Uuid,
+    ) -> Result<(), OrchestratorError> {
+        if let Some(coordinator) = &self.coordinator {
+            let metadata = self.shard_metadata(shard_id);
+            coordinator
+                .ask(RegisterLocalShards {
+                    node_id: self.identity.uuid,
+                    shards: vec![metadata],
+                })
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?;
+        } else {
+            warn!(%shard_id, "Coordinator not set; skipping shard registration");
+        }
+        Ok(())
+    }
+
+    /// Registers all known shards with the coordinator (called on startup after coordinator set).
+    pub async fn register_all_shards_with_coordinator(&self) -> Result<(), OrchestratorError> {
+        if let Some(coordinator) = &self.coordinator {
+            let shards: Vec<ShardMetadata> = self
+                .shards
+                .keys()
+                .copied()
+                .map(|shard_id| self.shard_metadata(shard_id))
+                .collect();
+            if !shards.is_empty() {
+                coordinator
+                    .ask(RegisterLocalShards {
+                        node_id: self.identity.uuid,
+                        shards,
+                    })
+                    .await
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?;
+            }
+        } else {
+            warn!("Coordinator not set; skipping bulk shard registration");
+        }
+        Ok(())
     }
 
     /// Registers a shard with the routing ring for consistent hashing.

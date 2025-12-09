@@ -6,10 +6,12 @@
 use anyhow::Result;
 use kameo::message::{Context, Message};
 use kameo::{Actor, Reply};
+use tokio::task;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::distributed::{ClusterStatus, DistributedCluster, NodeInfo};
+use crate::swarm::CoordinatorEvent;
 
 // ============================================================================
 // Message Definitions
@@ -31,12 +33,57 @@ pub struct DiscoverPeers;
 #[derive(Debug, Clone)]
 pub struct GetStatus;
 
+/// Routing table update event from swarm.
+#[derive(Debug, Clone)]
+pub struct RoutingUpdated;
+
+/// Dial/connect failure event from swarm.
+#[derive(Debug, Clone)]
+pub struct DialFailed {
+    pub peer_id: Option<String>,
+    pub error: String,
+}
+
+/// Peer discovered/updated event.
+#[derive(Debug, Clone)]
+pub struct PeerDiscovered {
+    pub node_id: Uuid,
+    pub address: String,
+}
+
+/// Peer lost/disconnected event.
+#[derive(Debug, Clone)]
+pub struct PeerLost {
+    pub node_id: Uuid,
+}
+
 /// Message to route a shard operation (stub for future remote actor support).
 #[derive(Debug, Clone)]
 pub struct RouteShard {
     pub shard_id: Uuid,
     pub operation: String,
 }
+
+/// Metadata describing a shard and its owning node.
+#[derive(Debug, Clone)]
+pub struct ShardMetadata {
+    pub shard_id: Uuid,
+    pub node_id: Uuid,
+    pub vnode_tokens: Vec<u64>,
+    pub storage_bytes: u64,
+    pub document_count: u64,
+}
+
+/// Register or refresh local shards with the coordinator so assignments can be shared.
+#[derive(Debug, Clone)]
+pub struct RegisterLocalShards {
+    pub node_id: Uuid,
+    pub shards: Vec<ShardMetadata>,
+}
+
+/// Get the current shard-to-node assignments.
+#[derive(Debug, Clone)]
+pub struct GetShardAssignments;
 
 /// Response indicating where an operation should be routed.
 #[derive(Debug, Clone, Reply)]
@@ -80,15 +127,49 @@ pub struct RequestBootstrapRedial {
 #[derive(Actor)]
 pub struct ClusterCoordinator {
     cluster: DistributedCluster,
+    shard_assignments: std::collections::HashMap<Uuid, ShardMetadata>,
 }
 
 impl ClusterCoordinator {
     /// Create a new ClusterCoordinator wrapping the given DistributedCluster.
     pub fn new(cluster: DistributedCluster) -> Self {
-        Self { cluster }
+        Self {
+            cluster,
+            shard_assignments: std::collections::HashMap::new(),
+        }
     }
 }
 
+impl Message<RegisterLocalShards> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: RegisterLocalShards,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        for shard in msg.shards {
+            self.shard_assignments.insert(shard.shard_id, shard);
+        }
+        info!(
+            node = %msg.node_id,
+            total_assignments = self.shard_assignments.len(),
+            "ClusterCoordinator: registered local shards"
+        );
+    }
+}
+
+impl Message<GetShardAssignments> for ClusterCoordinator {
+    type Reply = std::collections::HashMap<Uuid, ShardMetadata>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetShardAssignments,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.shard_assignments.clone()
+    }
+}
 // ============================================================================
 // Message Handlers
 // ============================================================================
@@ -99,11 +180,57 @@ impl Message<InitSwarm> for ClusterCoordinator {
     async fn handle(
         &mut self,
         _msg: InitSwarm,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        let self_ref = ctx.actor_ref();
         match self.cluster.init_swarm().await {
-            Ok(peer_id) => {
+            Ok((peer_id, events)) => {
                 info!(peer_id = %peer_id, "ClusterCoordinator: swarm initialized");
+
+                if let Some(mut rx) = events {
+                    let coordinator = self_ref.clone();
+                    task::spawn(async move {
+                        while let Some(event) = rx.recv().await {
+                            match event {
+                                CoordinatorEvent::RoutingUpdated { .. } => {
+                                    if let Err(err) = coordinator.ask(RoutingUpdated).await {
+                                        warn!(error = %err, "ClusterCoordinator: failed to forward routing update");
+                                    }
+                                }
+                                CoordinatorEvent::PeerDiscovered { peer_id, address } => {
+                                    let parsed = Uuid::parse_str(&peer_id)
+                                        .unwrap_or_else(|_| Uuid::new_v4());
+                                    if let Err(err) = coordinator
+                                        .ask(PeerDiscovered {
+                                            node_id: parsed,
+                                            address: address.unwrap_or_default(),
+                                        })
+                                        .await
+                                    {
+                                        warn!(error = %err, "ClusterCoordinator: failed to forward peer discovered");
+                                    }
+                                }
+                                CoordinatorEvent::PeerLost { peer_id } => {
+                                    let parsed = Uuid::parse_str(&peer_id)
+                                        .unwrap_or_else(|_| Uuid::new_v4());
+                                    if let Err(err) =
+                                        coordinator.ask(PeerLost { node_id: parsed }).await
+                                    {
+                                        warn!(error = %err, "ClusterCoordinator: failed to forward peer lost");
+                                    }
+                                }
+                                CoordinatorEvent::DialFailed { peer_id, error } => {
+                                    if let Err(err) =
+                                        coordinator.ask(DialFailed { peer_id, error }).await
+                                    {
+                                        warn!(error = %err, "ClusterCoordinator: failed to forward dial failed");
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
                 Ok(peer_id)
             }
             Err(err) => {
@@ -172,6 +299,63 @@ impl Message<GetStatus> for ClusterCoordinator {
             "ClusterCoordinator: status snapshot"
         );
         status
+    }
+}
+
+impl Message<RoutingUpdated> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _msg: RoutingUpdated,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.cluster.routing_updated();
+        info!("ClusterCoordinator: routing table updated");
+    }
+}
+
+impl Message<DialFailed> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: DialFailed,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.cluster.dial_failed();
+        warn!(
+            peer = ?msg.peer_id,
+            error = %msg.error,
+            "ClusterCoordinator: dial failed"
+        );
+    }
+}
+
+impl Message<PeerDiscovered> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: PeerDiscovered,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.cluster
+            .peer_discovered(msg.node_id, msg.address.clone());
+        info!(node = %msg.node_id, addr = %msg.address, "ClusterCoordinator: peer discovered");
+    }
+}
+
+impl Message<PeerLost> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: PeerLost,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.cluster.peer_lost(msg.node_id);
+        warn!(node = %msg.node_id, "ClusterCoordinator: peer lost");
     }
 }
 

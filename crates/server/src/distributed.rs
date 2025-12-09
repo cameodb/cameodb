@@ -7,12 +7,13 @@
 use anyhow::Result;
 use kameo::Reply;
 use std::collections::HashMap;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::ClusterConfig;
 use crate::node_orchestrator::MicroshardActor;
-use crate::swarm::{self, SwarmRuntimeHandle, SwarmStartup};
+use crate::swarm::{self, CoordinatorEvent, SwarmRuntimeHandle, SwarmStartup};
 
 /// Distributed cluster manager for CameoDB nodes
 #[derive(Debug)]
@@ -25,6 +26,12 @@ pub struct DistributedCluster {
     pub local_node_id: Uuid,
     /// Handle to the running swarm runtime (if started)
     swarm_handle: Option<SwarmRuntimeHandle>,
+    /// Count of successful bootstrap peer connections
+    bootstrap_successes: u64,
+    /// Count of dial/connect failures
+    dial_failures: u64,
+    /// Count of routing table update events
+    routing_updates: u64,
 }
 
 /// Information about a peer node in the cluster
@@ -59,6 +66,9 @@ impl DistributedCluster {
             peer_nodes: HashMap::new(),
             local_node_id,
             swarm_handle: None,
+            bootstrap_successes: 0,
+            dial_failures: 0,
+            routing_updates: 0,
         }
     }
 
@@ -68,7 +78,9 @@ impl DistributedCluster {
     }
 
     /// Initialize the distributed swarm runtime and return the peer identity
-    pub async fn init_swarm(&mut self) -> Result<String> {
+    pub async fn init_swarm(
+        &mut self,
+    ) -> Result<(String, Option<UnboundedReceiver<CoordinatorEvent>>)> {
         info!(
             node_id = %self.local_node_id,
             cluster_name = %self.cluster_config.cluster_name,
@@ -82,9 +94,11 @@ impl DistributedCluster {
             listen_addr,
             bootstrap_peer_count,
             runtime,
+            events,
         } = swarm::init_distributed_swarm(&self.cluster_config).await?;
 
         self.swarm_handle = Some(runtime);
+        self.bootstrap_successes += bootstrap_peer_count as u64;
 
         info!("🌐 Kameo Distributed Framework Ready:");
         info!("  📡 Cluster Port: {}", self.cluster_config.cluster_port);
@@ -93,7 +107,7 @@ impl DistributedCluster {
         info!("  🎧 Listen Address: {}", listen_addr);
         info!("  🚀 Bootstrap Peers Connected: {}", bootstrap_peer_count);
 
-        Ok(peer_id.to_string())
+        Ok((peer_id.to_string(), events))
     }
 
     /// Register a local shard actor with the distributed registry
@@ -153,6 +167,35 @@ impl DistributedCluster {
         Ok(discovered_peers)
     }
 
+    /// Record a routing table update event from the swarm.
+    pub fn routing_updated(&mut self) {
+        self.routing_updates = self.routing_updates.saturating_add(1);
+    }
+
+    /// Record a peer discovery/update event.
+    pub fn peer_discovered(&mut self, node_id: Uuid, address: String) {
+        let entry = self.peer_nodes.entry(node_id).or_insert(NodeInfo {
+            node_id,
+            address: address.clone(),
+            status: NodeStatus::Connected,
+            shard_count: 0,
+        });
+        entry.address = address;
+        entry.status = NodeStatus::Connected;
+    }
+
+    /// Record a peer lost/disconnected event.
+    pub fn peer_lost(&mut self, node_id: Uuid) {
+        if let Some(node) = self.peer_nodes.get_mut(&node_id) {
+            node.status = NodeStatus::Disconnected;
+        }
+    }
+
+    /// Increment dial failure counter (to be called by swarm hooks).
+    pub fn dial_failed(&mut self) {
+        self.dial_failures = self.dial_failures.saturating_add(1);
+    }
+
     /// Route a request to the appropriate shard, potentially on a remote node
     #[allow(dead_code)] // Framework method, used when Kameo remote features are enabled
     pub async fn route_to_shard(&self, shard_id: Uuid, operation: &str) -> Result<String> {
@@ -203,6 +246,11 @@ impl DistributedCluster {
             connected_nodes: connected_nodes + 1,   // +1 for local node
             total_shards,
             distributed_enabled: self.cluster_config.distributed_actors,
+            known_peers: self.peer_nodes.len(),
+            active_peers: connected_nodes,
+            dial_failures: self.dial_failures,
+            bootstrap_successes: self.bootstrap_successes,
+            routing_updates: self.routing_updates,
         }
     }
 }
@@ -229,4 +277,9 @@ pub struct ClusterStatus {
     pub connected_nodes: usize,
     pub total_shards: usize,
     pub distributed_enabled: bool,
+    pub known_peers: usize,
+    pub active_peers: usize,
+    pub dial_failures: u64,
+    pub bootstrap_successes: u64,
+    pub routing_updates: u64,
 }

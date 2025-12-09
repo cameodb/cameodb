@@ -8,17 +8,17 @@ pub mod behaviour;
 pub mod cluster_actor;
 pub mod utils;
 
+use crate::config::ClusterConfig;
 use anyhow::Result;
+use behaviour::{DhtBehaviour, DhtBehaviourEvent};
 use futures::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, SwarmBuilder, identity::Keypair, kad, noise, swarm::SwarmEvent, tcp, yamux,
 };
 use std::time::Duration;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::{select, sync::watch};
 use tracing::{debug, info, warn};
-
-use crate::config::ClusterConfig;
-use behaviour::{DhtBehaviour, DhtBehaviourEvent};
 // TODO: Add cluster state actor integration for peer management
 // use cluster_actor::{ClusterStateActor, PeerDiscovered, PeerLost};
 // use kameo::prelude::{ActorRef, spawn};
@@ -35,6 +35,27 @@ pub struct SwarmStartup {
     pub listen_addr: Multiaddr,
     pub bootstrap_peer_count: usize,
     pub runtime: SwarmRuntimeHandle,
+    pub events: Option<UnboundedReceiver<CoordinatorEvent>>,
+}
+
+/// Events emitted from the swarm runtime to be forwarded to the coordinator actor.
+#[derive(Debug)]
+pub enum CoordinatorEvent {
+    RoutingUpdated {
+        peer_id: String,
+        address_count: usize,
+    },
+    PeerDiscovered {
+        peer_id: String,
+        address: Option<String>,
+    },
+    PeerLost {
+        peer_id: String,
+    },
+    DialFailed {
+        peer_id: Option<String>,
+        error: String,
+    },
 }
 
 /// Handle used to manage the background swarm runtime task
@@ -109,6 +130,7 @@ pub async fn init_distributed_swarm(config: &ClusterConfig) -> Result<SwarmStart
             listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
             bootstrap_peer_count: 0,
             runtime: SwarmRuntimeHandle::inert(),
+            events: None,
         });
     }
 
@@ -201,13 +223,15 @@ async fn create_production_swarm(config: &ClusterConfig) -> Result<SwarmStartup>
     }
 
     // Start the swarm runtime task to process events
-    let runtime = launch_swarm_runtime(swarm);
+    let (event_tx, event_rx) = unbounded_channel();
+    let runtime = launch_swarm_runtime(swarm, event_tx);
 
     Ok(SwarmStartup {
         peer_id,
         listen_addr,
         bootstrap_peer_count: connected_peers,
         runtime,
+        events: Some(event_rx),
     })
 }
 
@@ -249,7 +273,10 @@ fn convert_bootstrap_nodes_to_multiaddrs(bootstrap_nodes: &[String]) -> Vec<Mult
     multiaddrs
 }
 
-fn launch_swarm_runtime(mut swarm: libp2p::Swarm<DhtBehaviour>) -> SwarmRuntimeHandle {
+fn launch_swarm_runtime(
+    mut swarm: libp2p::Swarm<DhtBehaviour>,
+    event_tx: UnboundedSender<CoordinatorEvent>,
+) -> SwarmRuntimeHandle {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(SwarmControl::Run);
 
     tokio::spawn(async move {
@@ -266,7 +293,7 @@ fn launch_swarm_runtime(mut swarm: libp2p::Swarm<DhtBehaviour>) -> SwarmRuntimeH
                 }
                 event = swarm.select_next_some() => {
                     metrics.total_events += 1;
-                    handle_swarm_event(event, &mut metrics);
+                    handle_swarm_event(event, &mut metrics, &event_tx);
                 }
             }
         }
@@ -278,11 +305,15 @@ fn launch_swarm_runtime(mut swarm: libp2p::Swarm<DhtBehaviour>) -> SwarmRuntimeH
     SwarmRuntimeHandle::new(shutdown_tx)
 }
 
-fn handle_swarm_event(event: SwarmEvent<DhtBehaviourEvent>, metrics: &mut SwarmRuntimeMetrics) {
+fn handle_swarm_event(
+    event: SwarmEvent<DhtBehaviourEvent>,
+    metrics: &mut SwarmRuntimeMetrics,
+    event_tx: &UnboundedSender<CoordinatorEvent>,
+) {
     match event {
         SwarmEvent::Behaviour(behaviour_event) => {
             metrics.behaviour_events += 1;
-            handle_behaviour_event(behaviour_event, metrics);
+            handle_behaviour_event(behaviour_event, metrics, event_tx);
         }
         SwarmEvent::NewListenAddr { address, .. } => {
             info!("🎧 Swarm listening on: {}", address);
@@ -293,9 +324,15 @@ fn handle_swarm_event(event: SwarmEvent<DhtBehaviourEvent>, metrics: &mut SwarmR
         SwarmEvent::ConnectionEstablished {
             peer_id,
             established_in,
+            endpoint,
             ..
         } => {
             metrics.connections_established += 1;
+            let addr = Some(endpoint.get_remote_address().to_string());
+            let _ = event_tx.send(CoordinatorEvent::PeerDiscovered {
+                peer_id: peer_id.to_string(),
+                address: addr,
+            });
             info!(
                 "🔗 Connection established with {} ({} ms)",
                 peer_id,
@@ -304,7 +341,10 @@ fn handle_swarm_event(event: SwarmEvent<DhtBehaviourEvent>, metrics: &mut SwarmR
         }
         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
             metrics.connections_closed += 1;
-            info!("� Connection closed with {} ({:?})", peer_id, cause);
+            info!("🔒 Connection closed with {} ({:?})", peer_id, cause);
+            let _ = event_tx.send(CoordinatorEvent::PeerLost {
+                peer_id: peer_id.to_string(),
+            });
         }
         SwarmEvent::Dialing {
             peer_id,
@@ -343,6 +383,10 @@ fn handle_swarm_event(event: SwarmEvent<DhtBehaviourEvent>, metrics: &mut SwarmR
                 "⚠️ Outgoing connection error to {:?} (conn {:?}): {}",
                 peer_id, connection_id, error
             );
+            let _ = event_tx.send(CoordinatorEvent::DialFailed {
+                peer_id: peer_id.map(|p| p.to_string()),
+                error: error.to_string(),
+            });
         }
         SwarmEvent::ListenerClosed {
             listener_id,
@@ -363,13 +407,23 @@ fn handle_swarm_event(event: SwarmEvent<DhtBehaviourEvent>, metrics: &mut SwarmR
     }
 }
 
-fn handle_behaviour_event(event: DhtBehaviourEvent, metrics: &mut SwarmRuntimeMetrics) {
+fn handle_behaviour_event(
+    event: DhtBehaviourEvent,
+    metrics: &mut SwarmRuntimeMetrics,
+    event_tx: &UnboundedSender<CoordinatorEvent>,
+) {
     match event {
-        DhtBehaviourEvent::Kademlia(kad_event) => handle_kademlia_event(kad_event, metrics),
+        DhtBehaviourEvent::Kademlia(kad_event) => {
+            handle_kademlia_event(kad_event, metrics, event_tx)
+        }
     }
 }
 
-fn handle_kademlia_event(event: kad::Event, metrics: &mut SwarmRuntimeMetrics) {
+fn handle_kademlia_event(
+    event: kad::Event,
+    metrics: &mut SwarmRuntimeMetrics,
+    event_tx: &UnboundedSender<CoordinatorEvent>,
+) {
     match event {
         kad::Event::RoutingUpdated {
             peer, addresses, ..
@@ -380,6 +434,10 @@ fn handle_kademlia_event(event: kad::Event, metrics: &mut SwarmRuntimeMetrics) {
                 "🛰️  Routing table updated for {} ({} addresses)",
                 peer, addr_count
             );
+            let _ = event_tx.send(CoordinatorEvent::RoutingUpdated {
+                peer_id: peer.to_string(),
+                address_count: addr_count,
+            });
         }
         kad::Event::OutboundQueryProgressed {
             id, result, stats, ..

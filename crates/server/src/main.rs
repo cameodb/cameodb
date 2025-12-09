@@ -79,6 +79,14 @@ async fn main() -> Result<()> {
         DistributedCluster::new(cameodb_config.cluster.clone(), orchestrator.identity().uuid);
     let coordinator_actor = ClusterCoordinator::spawn(ClusterCoordinator::new(distributed_cluster));
 
+    // Give orchestrator a handle to the coordinator for shard registration before spawning it.
+    orchestrator.set_coordinator(coordinator_actor.clone());
+    // Register any hydrated shards with the coordinator (no-op if none).
+    orchestrator
+        .register_all_shards_with_coordinator()
+        .await
+        .ok();
+
     // Spawn NodeOrchestrator as an actor
     let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
 
