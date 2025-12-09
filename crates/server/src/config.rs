@@ -183,6 +183,18 @@ pub struct MessagingConfig {
     /// Connection pool size (default: 10)
     #[serde(default = "default_connection_pool_size")]
     pub connection_pool_size: usize,
+
+    /// How many remote retry attempts to perform before surfacing an error
+    #[serde(default = "default_remote_retry_attempts")]
+    pub remote_retry_attempts: u8,
+
+    /// Timeout for broadcast scatter-gather operations in seconds
+    #[serde(default = "default_broadcast_timeout_secs")]
+    pub broadcast_timeout_secs: u64,
+
+    /// Maximum number of local shards to fan out to when broadcasting
+    #[serde(default = "default_broadcast_fanout_limit")]
+    pub broadcast_fanout_limit: usize,
 }
 
 /// mDNS interface filtering configuration
@@ -527,6 +539,9 @@ impl Default for MessagingConfig {
             request_timeout_secs: default_request_timeout_secs(),
             max_concurrent_requests: default_max_concurrent_requests(),
             connection_pool_size: default_connection_pool_size(),
+            remote_retry_attempts: default_remote_retry_attempts(),
+            broadcast_timeout_secs: default_broadcast_timeout_secs(),
+            broadcast_fanout_limit: default_broadcast_fanout_limit(),
         }
     }
 }
@@ -632,6 +647,18 @@ fn default_max_concurrent_requests() -> usize {
 
 fn default_connection_pool_size() -> usize {
     10
+}
+
+fn default_remote_retry_attempts() -> u8 {
+    2
+}
+
+fn default_broadcast_timeout_secs() -> u64 {
+    5
+}
+
+fn default_broadcast_fanout_limit() -> usize {
+    16
 }
 
 fn default_ipv6_enabled() -> bool {

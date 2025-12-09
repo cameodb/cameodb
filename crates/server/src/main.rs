@@ -117,8 +117,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Create RouterActor with ActorRefs
-    let router_actor = RouterActor::new(orchestrator_ref.clone(), coordinator_actor.clone());
+    // Create RouterActor with ActorRefs and messaging config
+    let router_actor = RouterActor::with_config(
+        orchestrator_ref.clone(),
+        coordinator_actor.clone(),
+        &cameodb_config.cluster.messaging,
+    );
 
     let app_state = AppState {
         router: router_actor,

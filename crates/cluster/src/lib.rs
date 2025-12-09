@@ -475,16 +475,35 @@ impl ConsistentRing {
     /// let owner = ring.get_owner("user:123");
     /// assert_eq!(owner, Some(identity.uuid));
     ///
-    /// // Same key always routes to same node
-    /// let owner2 = ring.get_owner("user:123");
-    /// assert_eq!(owner, owner2);
-    /// ```
     pub fn get_owner(&self, key: &str) -> Option<Uuid> {
+        self.get_owner_with_hash(hash_key(key.as_bytes()))
+    }
+
+    /// Number of vnode tokens currently in the ring.
+    pub fn len(&self) -> usize {
+        self.ring.len()
+    }
+
+    /// Determines which node should own the given hash value.
+    ///
+    /// Uses consistent hashing to route the key to a node:
+    /// 1. Find the first token >= hash value
+    /// 2. If no such token exists, wrap around to the first token
+    /// 3. Return the UUID of the node owning that token
+    ///
+    /// Returns `None` if the ring is empty.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The hash value to route
+    ///
+    /// # Returns
+    ///
+    /// The UUID of the node that should own this key, or `None` if no nodes exist.
+    fn get_owner_with_hash(&self, hash: u64) -> Option<Uuid> {
         if self.ring.is_empty() {
             return None;
         }
-
-        let hash = hash_key(key.as_bytes());
 
         self.ring
             .range(hash..)

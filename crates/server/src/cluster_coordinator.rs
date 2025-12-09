@@ -6,6 +6,7 @@
 use anyhow::Result;
 use kameo::message::{Context, Message};
 use kameo::{Actor, Reply};
+use std::collections::HashMap;
 use tokio::task;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -67,6 +68,7 @@ pub struct RouteShard {
 
 /// Metadata describing a shard and its owning node.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ShardMetadata {
     pub shard_id: Uuid,
     pub node_id: Uuid,
@@ -128,7 +130,7 @@ pub struct RequestBootstrapRedial {
 #[derive(Actor)]
 pub struct ClusterCoordinator {
     cluster: DistributedCluster,
-    shard_assignments: std::collections::HashMap<Uuid, ShardMetadata>,
+    shard_assignments: HashMap<Uuid, ShardMetadata>,
     ring: ConsistentRing,
 }
 
@@ -137,9 +139,47 @@ impl ClusterCoordinator {
     pub fn new(cluster: DistributedCluster) -> Self {
         Self {
             cluster,
-            shard_assignments: std::collections::HashMap::new(),
+            shard_assignments: HashMap::new(),
             ring: ConsistentRing::new(),
         }
+    }
+
+    fn decide_route(
+        &self,
+        routing_key: Option<String>,
+        operation_type: OperationType,
+    ) -> RoutingDecision {
+        // operation_type reserved for future policy; currently unused
+        let _ = operation_type;
+
+        if let Some(key) = routing_key {
+            if let Some(shard_id) = self.route_for_key(&key) {
+                if let Some(owner_node) = self.shard_owner(&shard_id) {
+                    if owner_node == self.cluster.local_node_id {
+                        info!(%shard_id, "RouteOperation: routing locally by key");
+                        return RoutingDecision::Local;
+                    } else if let Some(addr) = self.node_address(&owner_node) {
+                        info!(%shard_id, node = %owner_node, addr = %addr, "RouteOperation: routing remote by key");
+                        return RoutingDecision::Remote {
+                            node_id: owner_node,
+                            peer_addr: addr,
+                        };
+                    } else {
+                        warn!(%shard_id, node = %owner_node, "RouteOperation: owner address unknown, broadcasting");
+                        return RoutingDecision::Broadcast;
+                    }
+                } else {
+                    warn!(%shard_id, "RouteOperation: shard owner unknown, broadcasting");
+                    return RoutingDecision::Broadcast;
+                }
+            } else {
+                warn!("RouteOperation: ring empty, broadcasting");
+                return RoutingDecision::Broadcast;
+            }
+        }
+
+        info!("RouteOperation: no routing_key provided, broadcasting");
+        RoutingDecision::Broadcast
     }
 }
 
@@ -204,6 +244,7 @@ impl ClusterCoordinator {
             .map(|n| n.address.clone())
     }
 }
+
 // ============================================================================
 // Message Handlers
 // ============================================================================
@@ -423,34 +464,7 @@ impl Message<RouteOperation> for ClusterCoordinator {
         msg: RouteOperation,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Some(key) = msg.routing_key {
-            if let Some(shard_id) = self.route_for_key(&key) {
-                if let Some(owner_node) = self.shard_owner(&shard_id) {
-                    if owner_node == self.cluster.local_node_id {
-                        info!(%shard_id, "RouteOperation: routing locally by key");
-                        return RoutingDecision::Local;
-                    } else if let Some(addr) = self.node_address(&owner_node) {
-                        info!(%shard_id, node = %owner_node, addr = %addr, "RouteOperation: routing remote by key");
-                        return RoutingDecision::Remote {
-                            node_id: owner_node,
-                            peer_addr: addr,
-                        };
-                    } else {
-                        warn!(%shard_id, node = %owner_node, "RouteOperation: owner address unknown, broadcasting");
-                        return RoutingDecision::Broadcast;
-                    }
-                } else {
-                    warn!(%shard_id, "RouteOperation: shard owner unknown, broadcasting");
-                    return RoutingDecision::Broadcast;
-                }
-            } else {
-                warn!("RouteOperation: ring empty, broadcasting");
-                return RoutingDecision::Broadcast;
-            }
-        }
-
-        info!("RouteOperation: no routing_key provided, broadcasting");
-        RoutingDecision::Broadcast
+        self.decide_route(msg.routing_key, msg.operation_type)
     }
 }
 
@@ -489,5 +503,172 @@ impl Drop for ClusterCoordinator {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ClusterConfig;
+    use crate::distributed::NodeStatus;
+
+    fn make_cluster() -> DistributedCluster {
+        let cfg = ClusterConfig::default();
+        DistributedCluster::new(cfg, Uuid::new_v4())
+    }
+
+    #[test]
+    fn decide_route_defaults_to_broadcast_when_no_key() {
+        let cc = ClusterCoordinator::new(make_cluster());
+        let decision = cc.decide_route(None, OperationType::Read);
+        assert!(matches!(decision, RoutingDecision::Broadcast));
+    }
+
+    #[test]
+    fn decide_route_returns_local_when_owner_is_self() {
+        let cluster = make_cluster();
+        let local = cluster.local_node_id;
+        let mut cc = ClusterCoordinator::new(cluster);
+
+        let shard_id = Uuid::new_v4();
+        cc.shard_assignments.insert(
+            shard_id,
+            ShardMetadata {
+                shard_id,
+                node_id: local,
+                vnode_tokens: vec![1, 2, 3],
+                storage_bytes: 0,
+                document_count: 0,
+            },
+        );
+        cc.rebuild_ring();
+
+        let decision = cc.decide_route(Some("key-1".into()), OperationType::Read);
+        assert!(matches!(decision, RoutingDecision::Local));
+    }
+
+    #[test]
+    fn decide_route_returns_remote_when_owner_known_with_addr() {
+        let mut cluster = make_cluster();
+        let owner = Uuid::new_v4();
+        cluster.peer_nodes.insert(
+            owner,
+            NodeInfo {
+                node_id: owner,
+                address: "127.0.0.1:9000".into(),
+                status: NodeStatus::Connected,
+                shard_count: 0,
+            },
+        );
+        let mut cc = ClusterCoordinator::new(cluster);
+
+        let shard_id = Uuid::new_v4();
+        cc.shard_assignments.insert(
+            shard_id,
+            ShardMetadata {
+                shard_id,
+                node_id: owner,
+                vnode_tokens: vec![1, 2, 3],
+                storage_bytes: 0,
+                document_count: 0,
+            },
+        );
+        cc.rebuild_ring();
+
+        let decision = cc.decide_route(Some("key-remote".into()), OperationType::Write);
+        match decision {
+            RoutingDecision::Remote { node_id, .. } => assert_eq!(node_id, owner),
+            other => panic!("expected Remote, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decide_route_broadcasts_when_owner_address_missing() {
+        let mut cc = ClusterCoordinator::new(make_cluster());
+        let shard_id = Uuid::new_v4();
+        let owner = Uuid::new_v4(); // not present in peer_nodes
+        cc.shard_assignments.insert(
+            shard_id,
+            ShardMetadata {
+                shard_id,
+                node_id: owner,
+                vnode_tokens: vec![1, 2, 3],
+                storage_bytes: 0,
+                document_count: 0,
+            },
+        );
+        cc.rebuild_ring();
+
+        let decision = cc.decide_route(Some("key-no-addr".into()), OperationType::Read);
+        assert!(matches!(decision, RoutingDecision::Broadcast));
+    }
+
+    #[test]
+    fn ring_distribution_splits_across_multiple_nodes() {
+        let mut cluster = make_cluster();
+        let n1 = Uuid::new_v4();
+        let n2 = Uuid::new_v4();
+        cluster.peer_nodes.insert(
+            n1,
+            NodeInfo {
+                node_id: n1,
+                address: "127.0.0.1:9101".into(),
+                status: NodeStatus::Connected,
+                shard_count: 0,
+            },
+        );
+        cluster.peer_nodes.insert(
+            n2,
+            NodeInfo {
+                node_id: n2,
+                address: "127.0.0.1:9102".into(),
+                status: NodeStatus::Connected,
+                shard_count: 0,
+            },
+        );
+        let mut cc = ClusterCoordinator::new(cluster);
+
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        cc.shard_assignments.insert(
+            s1,
+            ShardMetadata {
+                shard_id: s1,
+                node_id: n1,
+                vnode_tokens: vec![1, 3, 5],
+                storage_bytes: 0,
+                document_count: 0,
+            },
+        );
+        cc.shard_assignments.insert(
+            s2,
+            ShardMetadata {
+                shard_id: s2,
+                node_id: n2,
+                vnode_tokens: vec![2, 4, 6],
+                storage_bytes: 0,
+                document_count: 0,
+            },
+        );
+        cc.rebuild_ring();
+
+        let mut counts = std::collections::HashMap::new();
+        for i in 0..200 {
+            let key = format!("key-{i}");
+            match cc.decide_route(Some(key), OperationType::Read) {
+                RoutingDecision::Remote { node_id, .. } => {
+                    *counts.entry(node_id).or_insert(0usize) += 1;
+                }
+                RoutingDecision::Local => {
+                    *counts.entry(cc.cluster.local_node_id).or_insert(0usize) += 1;
+                }
+                RoutingDecision::Broadcast => {
+                    *counts.entry(Uuid::nil()).or_insert(0usize) += 1;
+                }
+            }
+        }
+
+        assert!(counts.get(&n1).copied().unwrap_or(0) > 0);
+        assert!(counts.get(&n2).copied().unwrap_or(0) > 0);
     }
 }
