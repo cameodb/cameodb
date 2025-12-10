@@ -22,6 +22,19 @@ cargo run --bin cameodb
 # Server starts on http://localhost:9480 by default
 ```
 
+## 🧠 Distributed Architecture Overview
+
+CameoDB is designed as a **distributed, shared-nothing cluster**:
+
+- **Per-node storage** is handled by the `server` crate with actors (`NodeOrchestrator`, `MicroshardActor`) on top of redb + Tantivy.
+- **Routing & clustering** use a `ClusterCoordinator` actor with a consistent hash ring and libp2p Kademlia DHT.
+- **Remote execution** is powered by Kameo remote actors over a custom libp2p swarm (TCP/QUIC/Noise/Yamux, no mDNS).
+- **Scatter–gather** search and multi-node writes are implemented via a `RouterActor` that fans out to peers and aggregates results.
+
+For a detailed walkthrough of the server-side actors, routing decisions, and remote flows, see:
+
+- [`crates/server/README.md`](crates/server/README.md)
+
 ## 📡 HTTP API Reference
 
 CameoDB provides a comprehensive REST API for document management, search, and system administration.
