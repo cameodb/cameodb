@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
 };
 use std::time::Duration;
@@ -43,7 +43,7 @@ use crate::cluster_coordinator::{
 use crate::config::MessagingConfig;
 use cluster::{ConsistentRing, IdentityError, NodeIdentity, generate_tokens};
 use kameo::actor::RemoteActorRef;
-use serde_json::Value as JsonValue;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use storage::{FieldDef, HybridStore, IndexSchema, StorageConfig, StoreError, WalOp};
 
 // ============================================================================
@@ -593,12 +593,13 @@ impl MicroshardActor {
 /// # Returns
 ///
 /// `Ok(())` if validation passes, `Err` if validation fails
+/// Returns true if schema was updated/persisted.
 async fn validate_and_evolve_schema(
     index: &str,
     doc: &JsonValue,
     schema_cache: &mut IndexSchema,
     store: &Arc<HybridStore>,
-) -> Result<(), OrchestratorError> {
+) -> Result<bool, OrchestratorError> {
     // Check 1 (Mandatory): Ensure doc["id"] exists
     if !doc.is_object() || !doc.as_object().unwrap().contains_key("id") {
         return Err(OrchestratorError::Io(std::io::Error::new(
@@ -670,7 +671,7 @@ async fn validate_and_evolve_schema(
         info!("Schema updated for index '{}' with new fields", index);
     }
 
-    Ok(())
+    Ok(schema_updated)
 }
 
 // ============================================================================
@@ -797,6 +798,14 @@ impl RouterActor {
         routing_key: Option<String>,
         operation_type: OperationType,
     ) -> Result<JsonValue, OrchestratorError> {
+        // Metadata operations (schema/config) always execute locally - no need to broadcast
+        if matches!(
+            op,
+            ClientOp::GetConfig { .. } | ClientOp::CreateConfig { .. } | ClientOp::ListIndexes
+        ) {
+            return self.handle_client_op(op).await;
+        }
+
         let decision = self
             .coordinator
             .ask(RouteOperation {
@@ -1083,9 +1092,78 @@ pub struct NodeOrchestrator {
     round_robin_counter: AtomicUsize,
     /// Optional coordinator reference for shard registration
     coordinator: Option<ActorRef<ClusterCoordinator>>,
+    /// Per-index schema cache to avoid repeated metadata reads
+    schema_cache: RwLock<HashMap<String, IndexSchema>>,
 }
 
 impl NodeOrchestrator {
+    /// Fetch a schema from cache if present.
+    fn get_cached_schema(&self, index: &str) -> Option<IndexSchema> {
+        self.schema_cache
+            .read()
+            .ok()
+            .and_then(|map| map.get(index).cloned())
+    }
+
+    /// Insert or replace a schema in the cache.
+    fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
+        if let Ok(mut map) = self.schema_cache.write() {
+            map.insert(index.to_string(), schema.clone());
+        }
+    }
+
+    fn default_shard_count(&self) -> u32 {
+        std::cmp::max(1, self.shards.len() as u32)
+    }
+
+    /// Produce sorted field names with "id" first (if present), others alphabetical.
+    fn sorted_field_names(schema: &IndexSchema) -> Vec<String> {
+        let mut names: Vec<String> = schema.fields.keys().cloned().collect();
+        names.sort_by(|a, b| match (a.as_str(), b.as_str()) {
+            ("id", "id") => std::cmp::Ordering::Equal,
+            ("id", _) => std::cmp::Ordering::Less,
+            (_, "id") => std::cmp::Ordering::Greater,
+            _ => a.cmp(b),
+        });
+        names
+    }
+
+    /// Produce a JSON object of fields, ordered with "id" first (if present).
+    fn sorted_fields_map(schema: &IndexSchema) -> JsonMap<String, JsonValue> {
+        let mut entries: Vec<_> = schema.fields.iter().collect();
+        entries.sort_by(|(a, _), (b, _)| match (a.as_str(), b.as_str()) {
+            ("id", "id") => std::cmp::Ordering::Equal,
+            ("id", _) => std::cmp::Ordering::Less,
+            (_, "id") => std::cmp::Ordering::Greater,
+            _ => a.cmp(b),
+        });
+
+        let mut map = JsonMap::new();
+        for (k, v) in entries {
+            let value = serde_json::to_value(v).unwrap_or(JsonValue::Null);
+            map.insert(k.clone(), value);
+        }
+        map
+    }
+
+    fn schema_response(
+        field_names: Vec<String>,
+        fields: JsonMap<String, JsonValue>,
+        shard_count: u32,
+    ) -> JsonValue {
+        let mut map = JsonMap::new();
+        map.insert(
+            "field_names".to_string(),
+            JsonValue::Array(field_names.into_iter().map(JsonValue::String).collect()),
+        );
+        map.insert("fields".to_string(), JsonValue::Object(fields));
+        map.insert(
+            "shard_count".to_string(),
+            JsonValue::Number(serde_json::Number::from(shard_count)),
+        );
+        JsonValue::Object(map)
+    }
+
     /// Creates a new NodeOrchestrator with the given configuration.
     pub async fn new(config: NodeConfig) -> Result<Self, OrchestratorError> {
         // Ensure storage directory exists
@@ -1104,6 +1182,7 @@ impl NodeOrchestrator {
             routing_ring: ConsistentRing::new(),
             round_robin_counter: AtomicUsize::new(0),
             coordinator: None,
+            schema_cache: RwLock::new(HashMap::new()),
         };
 
         // Discover and hydrate existing shards
@@ -1397,7 +1476,11 @@ impl NodeOrchestrator {
         let mut schema_cache = self.load_schema(index).await?;
         if let Some(shard) = self.shards.values().next() {
             if let Some(store) = &shard.store {
-                validate_and_evolve_schema(index, &doc, &mut schema_cache, store).await?;
+                let updated =
+                    validate_and_evolve_schema(index, &doc, &mut schema_cache, store).await?;
+                if updated {
+                    self.put_cached_schema(index, &schema_cache);
+                }
             }
         }
 
@@ -1573,8 +1656,10 @@ impl NodeOrchestrator {
                     .await
                     .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
                     .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+                let shard_count = schema.shard_count;
+                self.put_cached_schema(index, &schema);
                 return Ok(
-                    serde_json::json!({"acknowledged": true, "index": index, "shard_count": schema.shard_count}),
+                    serde_json::json!({"acknowledged": true, "index": index, "shard_count": shard_count, "field_names": Self::sorted_field_names(&schema)}),
                 );
             }
         }
@@ -1585,7 +1670,16 @@ impl NodeOrchestrator {
     }
 
     async fn orch_get_config(&self, index: &str) -> Result<JsonValue, OrchestratorError> {
-        if let Some(shard) = self.shards.values().next() {
+        if let Some(cached) = self.get_cached_schema(index) {
+            let field_names = Self::sorted_field_names(&cached);
+            let fields = Self::sorted_fields_map(&cached);
+            let shard_count = self.default_shard_count();
+            return Ok(Self::schema_response(field_names, fields, shard_count));
+        }
+
+        // Try each shard until we find a schema; this tolerates cases where the first shard
+        // might not yet have the schema materialized locally.
+        for shard in self.shards.values() {
             if let Some(store) = &shard.store {
                 let sc = Arc::clone(store);
                 let idx = index.to_string();
@@ -1593,13 +1687,13 @@ impl NodeOrchestrator {
                     .await
                     .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
                     .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-                return match schema {
-                    Some(s) => Ok(serde_json::to_value(s).unwrap_or(serde_json::json!({}))),
-                    None => Err(OrchestratorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("Index '{}' not found", index),
-                    ))),
-                };
+                if let Some(s) = schema {
+                    let field_names = Self::sorted_field_names(&s);
+                    let fields = Self::sorted_fields_map(&s);
+                    self.put_cached_schema(index, &s);
+                    let shard_count = self.default_shard_count();
+                    return Ok(Self::schema_response(field_names, fields, shard_count));
+                }
             }
         }
         Err(OrchestratorError::Io(std::io::Error::new(
@@ -1665,24 +1759,28 @@ impl NodeOrchestrator {
 
     /// Helper: Load schema from first shard
     async fn load_schema(&self, index: &str) -> Result<IndexSchema, OrchestratorError> {
+        if let Some(cached) = self.get_cached_schema(index) {
+            return Ok(cached);
+        }
+
         if let Some(shard) = self.shards.values().next() {
             if let Some(store) = &shard.store {
                 let sc = Arc::clone(store);
                 let idx = index.to_string();
-                return tokio::task::spawn_blocking(move || sc.get_schema(&idx))
+                let schema = tokio::task::spawn_blocking(move || sc.get_schema(&idx))
                     .await
                     .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                    .ok_or_else(|| {
-                        OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "Schema not found",
-                        ))
-                    })
-                    .or_else(|_| Ok(IndexSchema::default()));
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+                if let Some(schema) = schema {
+                    self.put_cached_schema(index, &schema);
+                    return Ok(schema);
+                }
             }
         }
-        Ok(IndexSchema::default())
+        Ok(IndexSchema {
+            shard_count: self.default_shard_count(),
+            fields: HashMap::new(),
+        })
     }
 
     /// Helper: Route write to shard

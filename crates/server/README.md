@@ -172,6 +172,10 @@ This gives you single-owner semantics for keyed **writes** across the cluster wh
 providing a deterministic, evenly distributed fallback when clients do not specify a
 routing key explicitly.
 
+**Metadata operations** (`GetConfig`, `CreateConfig`, `ListIndexes`) always execute locally on the node handling the HTTP request. They do not broadcast or remote, since schema/config data is available via the local `HybridStore` and errors (e.g., missing index) should surface directly instead of being wrapped by broadcast aggregation.
+
+Schema metadata is cached per node inside `NodeOrchestrator` to avoid repeated redb reads on every request. The cache is populated on first read (`_config`), updated on schema evolution or `CreateConfig`, and returned on subsequent requests with fields sorted (`id` first, others alphabetical).
+
 ### 4.2 Broadcast / Scatter–Gather
 
 When there is **no routing_key**, or the coordinator chooses `Broadcast` because of missing metadata, the router performs a scatter–gather:
