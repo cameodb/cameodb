@@ -74,26 +74,26 @@ fn generate_tokens(uuid: Uuid) -> Vec<u64> {
 The following diagram shows how keys are routed to nodes:
 
 ```mermaid
-graph TD
-    A[Key: "user:123"] --> B[SHA256 Hash]
-    B --> C[Hash Value: 0x1A2B3C4D...]
-    C --> D[Ring Lookup]
-    D --> E{Find Token >= Hash}
-    E -->|Found| F[Return Node UUID]
-    E -->|Not Found| G[Wrap Around]
-    G --> H[Return First Node]
-    
-    subgraph "Consistent Hash Ring"
-        I[Token 42 → Node A1B]
-        J[Token 108 → Node X9Z]
-        K[Token 200 → Node A1B]
-        L[Token 255 → Node X9Z]
+flowchart TD
+    key["Key: user:123"] --> hash["SHA256 hash"]
+    hash --> value["Hash value 0x1A2B3C4D"]
+    value --> lookup["Ring lookup"]
+    lookup --> decision{Token ≥ hash?}
+    decision -->|yes| owner["Return node UUID"]
+    decision -->|no| wrap["Wrap around"]
+    wrap --> owner
+
+    subgraph Ring["Consistent hash ring"]
+        token1["Token 42 → node A1B"]
+        token2["Token 108 → node X9Z"]
+        token3["Token 200 → node A1B"]
+        token4["Token 255 → node X9Z"]
     end
-    
-    D --> I
-    D --> J
-    D --> K
-    D --> L
+
+    lookup --> token1
+    lookup --> token2
+    lookup --> token3
+    lookup --> token4
 ```
 
 ### Routing Algorithm
@@ -399,19 +399,30 @@ cargo test -p cluster test_ring_operations
 
 ## Relationship to Other Crates
 
-```text
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   server    │    │   storage   │    │   client    │
-│  (actors)   │    │ (hybrid db) │    │    (sdk)    │
-└──────┬──────┘    └──────┬──────┘    └──────┬──────┘
-       │                  │                  │
-       └─────────┬────────┴──────────────────┘
-                 │
-         ┌───────▼────────┐
-         │    cluster     │
-         │ (topology &    │
-         │  routing)      │
-         └────────────────┘
+```mermaid
+flowchart TD
+    subgraph Server["server crate"]
+        A["RouterActor\nNodeOrchestrator"]
+    end
+
+    subgraph Storage["storage crate"]
+        B["HybridStore\nMicroshardActor"]
+    end
+
+    subgraph Client["client SDKs"]
+        C["Client routing\n(future)"]
+    end
+
+    subgraph Cluster["cluster crate"]
+        R["ConsistentRing\nNodeIdentity"]
+    end
+
+    A -->|routing decisions| R
+    B -->|shard metadata| R
+    C -->|optional topology info| R
+
+    R -->|ownership + vnode tokens| A
+    R -->|shard assignments| B
 ```
 
 - **server**: Uses cluster for request routing in RouterActor
