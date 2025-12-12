@@ -1400,7 +1400,16 @@ impl NodeOrchestrator {
                 validate_and_evolve_schema(index, &doc, &mut schema_cache, store).await?;
             }
         }
-        let target = self.route_write(&routing_key)?;
+
+        // Derive effective routing key:
+        // 1) explicit routing_key from payload (if provided)
+        // 2) fallback to document id field (doc["id"])
+        // 3) fallback to deterministic key derived from document bytes
+        let effective_routing_key = routing_key
+            .clone()
+            .or_else(|| derive_routing_key_from_doc(&doc));
+
+        let target = self.route_write(&effective_routing_key)?;
         let shard = self.shards.get(&target).ok_or_else(|| {
             OrchestratorError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -1409,7 +1418,7 @@ impl NodeOrchestrator {
         })?;
         let req = WriteRequest {
             index: index.to_string(),
-            routing_key,
+            routing_key: effective_routing_key.clone(),
             doc,
         };
         match shard.handle_write(req).await {
@@ -1432,12 +1441,24 @@ impl NodeOrchestrator {
                 "No shards",
             )));
         }
-        let mut batches: HashMap<Uuid, Vec<&DocPayload>> = HashMap::new();
-        for doc in &docs {
+        // Group documents by target shard using the same routing key strategy
+        // as single-write: explicit routing_key → doc id → derived key.
+        let items_received = docs.len();
+        let mut batches: HashMap<Uuid, Vec<(DocPayload, Option<String>)>> = HashMap::new();
+        for doc in docs {
+            let effective_routing_key = doc
+                .routing_key
+                .clone()
+                .or_else(|| derive_routing_key_from_doc(&doc.doc));
+
             let target = self
-                .route_write(&doc.routing_key)
+                .route_write(&effective_routing_key)
                 .unwrap_or_else(|_| self.shards.keys().next().copied().unwrap());
-            batches.entry(target).or_default().push(doc);
+
+            batches
+                .entry(target)
+                .or_default()
+                .push((doc, effective_routing_key));
         }
         let mut written = 0usize;
         let mut errors = Vec::new();
@@ -1445,11 +1466,12 @@ impl NodeOrchestrator {
             if let Some(shard) = self.shards.get(&shard_id) {
                 let ops: Vec<ClientOp> = batch
                     .iter()
-                    .map(|d| ClientOp::Write {
+                    .cloned()
+                    .map(|(d, effective_routing_key)| ClientOp::Write {
                         index: index.to_string(),
-                        id: d.id.clone(),
-                        routing_key: d.routing_key.clone(),
-                        doc: d.doc.clone(),
+                        id: d.id,
+                        routing_key: effective_routing_key,
+                        doc: d.doc,
                     })
                     .collect();
                 match shard.handle_batch_write(BatchWriteRequest { ops }).await {
@@ -1459,7 +1481,7 @@ impl NodeOrchestrator {
             }
         }
         Ok(
-            serde_json::json!({"took_ms": start.elapsed().as_millis(), "items_received": docs.len(), "items_written": written, "errors": errors}),
+            serde_json::json!({"took_ms": start.elapsed().as_millis(), "items_received": items_received, "items_written": written, "errors": errors}),
         )
     }
 
@@ -1615,7 +1637,27 @@ impl NodeOrchestrator {
                 }
             }
         }
-        let indexes: Vec<JsonValue> = all.into_iter().map(|(n, (d, s, f, c))| serde_json::json!({"name": n, "document_count": d, "total_size_bytes": s, "size_mb": s/(1024*1024), "shard_count": c, "field_names": f})).collect();
+        let indexes: Vec<JsonValue> = all
+            .into_iter()
+            .map(|(n, (d, s, mut f, c))| {
+                // Sort fields by name, with "id" (if present) always first.
+                f.sort_by(|a, b| match (a.as_str(), b.as_str()) {
+                    ("id", "id") => std::cmp::Ordering::Equal,
+                    ("id", _) => std::cmp::Ordering::Less,
+                    (_, "id") => std::cmp::Ordering::Greater,
+                    _ => a.cmp(b),
+                });
+
+                serde_json::json!({
+                    "name": n,
+                    "document_count": d,
+                    "total_size_bytes": s,
+                    "size_mb": s/(1024*1024),
+                    "shard_count": c,
+                    "field_names": f,
+                })
+            })
+            .collect();
         Ok(
             serde_json::json!({"indexes": indexes, "total_indexes": indexes.len(), "node_id": self.identity.uuid.to_string(), "total_shards": self.shards.len()}),
         )
@@ -1658,6 +1700,41 @@ impl NodeOrchestrator {
             ))
         })
     }
+}
+
+/// Derive a deterministic routing key from document content.
+///
+/// Preference order:
+/// 1. If the document has an "id" field (string), use that directly.
+/// 2. Otherwise, serialize the document to JSON bytes, take a prefix,
+///    and hex-encode it to produce a stable routing key string.
+fn derive_routing_key_from_doc(doc: &JsonValue) -> Option<String> {
+    // Prefer explicit id field in the document body
+    if let Some(id_value) = doc.get("id").and_then(|v| v.as_str()) {
+        if !id_value.is_empty() {
+            return Some(id_value.to_string());
+        }
+    }
+
+    // Fallback: derive from JSON bytes (deterministic for same document)
+    let mut bytes = serde_json::to_vec(doc).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+
+    // Limit the number of bytes used to keep the key reasonably sized
+    const MAX_PREFIX_LEN: usize = 64;
+    if bytes.len() > MAX_PREFIX_LEN {
+        bytes.truncate(MAX_PREFIX_LEN);
+    }
+
+    // Hex-encode the prefix to a string key; ConsistentRing will hash it again
+    let mut key = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut key, "{:02x}", b);
+    }
+    Some(key)
 }
 
 // ============================================================================

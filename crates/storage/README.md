@@ -92,19 +92,80 @@ All write operations follow a strict sequence to ensure atomicity across both st
 ### Error Handling
 
 ```rust
-pub fn apply_write(&self, op: WalOp) -> Result<u64, StoreError> {
-    let seq_id = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
-    
-    // WAL write (durability)
+pub fn apply_write(&self, index: &str, op: WalOp) -> Result<u64, StoreError> {
+    // Get or create the index and its Tantivy writer
+    let (writer_arc, fields) = self.get_or_create_index(index)?;
+
+    // Per-index sequence ID
+    let seq_id = {
+        let seq_map = self.current_seq.read().unwrap();
+        let counter = seq_map.get(index).ok_or_else(|| {
+            StoreError::IndexNotFound(format!(
+                "Sequence counter not found for index: {}",
+                index
+            ))
+        })?;
+        counter.fetch_add(1, Ordering::SeqCst) + 1
+    };
+
+    // WAL + data tables are per-index
+    let data_table_name = format!("data_{}", index);
+    let wal_table_name = format!("wal_{}", index);
+    let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
+    let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
+
+    // WAL write (durability) + data update in a single redb transaction
+    let wal_data = serde_json::to_vec(&op)
+        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
     let write_txn = self.kv.begin_write()?;
-    // ... write to WAL and data tables ...
-    write_txn.commit()?; // ← If this fails, tantivy not updated
-    
-    // Index update (consistency)
-    let mut writer = self.index_writer.lock().unwrap();
-    writer.add_document(doc)?; // ← If this fails, redb already committed
-    writer.commit()?;
-    
+    {
+        let mut wal_table = write_txn.open_table(wal_table_def)?;
+        wal_table.insert(seq_id, wal_data.as_slice())?;
+
+        match &op {
+            WalOp::Put { id, body, json_blob } => {
+                let doc_data = serde_json::json!({
+                    "body": body,
+                    "json_blob": json_blob
+                });
+                let doc_bytes = serde_json::to_vec(&doc_data)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+                let mut data_table = write_txn.open_table(data_table_def)?;
+                data_table.insert(id.as_str(), doc_bytes.as_slice())?;
+
+                // Prepare Tantivy document
+                let mut tantivy_doc =
+                    doc!(fields.id => id.as_str(), fields.body => body.as_str());
+                if let Some(json_data) = json_blob {
+                    let json_str = serde_json::to_string(json_data)
+                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                    tantivy_doc.add_text(fields.json_blob, &json_str);
+                }
+
+                let writer = writer_arc.lock().unwrap();
+                writer.add_document(tantivy_doc)?;
+            }
+            WalOp::Delete { id } => {
+                let mut data_table = write_txn.open_table(data_table_def)?;
+                data_table.remove(id.as_str())?;
+
+                // Delete from Tantivy index
+                let term = tantivy::Term::from_field_text(fields.id, id);
+                let writer = writer_arc.lock().unwrap();
+                writer.delete_term(term);
+            }
+        }
+    }
+
+    // Commit redb transaction (WAL + data)
+    write_txn.commit()?;
+
+    // Smart commit: may or may not commit Tantivy immediately
+    self.increment_operations(index);
+    self.maybe_commit_writer(index)?;
+
     Ok(seq_id)
 }
 ```
@@ -117,48 +178,42 @@ The storage engine creates a well-organized directory structure:
 
 ```
 {shard_path}/
-├── kv_store.redb                 # redb database file (ACID KV store)
-│   ├── [Internal Structure]
-│   │   ├── TABLE_WAL             # Write-ahead log (u64 → bytes)
-│   │   │   ├── 1 → {"Put": {"id": "user:1", ...}}
-│   │   │   ├── 2 → {"Put": {"id": "user:2", ...}}
-│   │   │   └── 3 → {"Delete": {"id": "user:1"}}
-│   │   └── TABLE_DATA            # Main data storage (string → bytes)
-│   │       ├── "user:1" → {"body": "...", "json_blob": {...}}
-│   │       └── "user:2" → {"body": "...", "json_blob": {...}}
-│   └── [B-tree pages, metadata, etc.]
-└── search_index/                 # tantivy index directory
-    ├── meta.json                 # Index metadata and schema
-    │   └── {"index_settings": {...}, "schema": [...]}
-    ├── .managed.json             # Managed files list
-    │   └── {"files": ["seg_0", "seg_1", ...]}
-    ├── seg_0                     # Index segment 0
-    │   ├── .fieldnorm            # Field normalization data
-    │   ├── .idx                  # Inverted index
-    │   ├── .pos                  # Term positions
-    │   ├── .store                # Stored field values
-    │   └── .term                 # Term dictionary
-    ├── seg_1                     # Index segment 1 (after merge)
-    └── [Additional segments...]
+├── store.redb                      # redb database file (shared across all indices)
+│   ├── data_index_1                # Data table for index_1 (string → bytes)
+│   ├── wal_index_1                 # WAL table for index_1 (u64 → bytes)
+│   ├── data_index_2                # Data table for index_2
+│   ├── wal_index_2                 # WAL table for index_2
+│   └── schema                      # Schema metadata table (index name → bytes)
+└── indices/                        # tantivy index directories (per index)
+    ├── index_1/
+    │   ├── meta.json               # Index metadata and schema
+    │   ├── .managed.json           # Managed files list
+    │   ├── seg_0*                  # Index segments (fieldnorm, idx, pos, store, term, ...)
+    │   └── ...
+    └── index_2/
+        └── ...
 ```
 
 ### File Descriptions
 
 #### redb Files
-- **`kv_store.redb`**: Single-file database containing all KV data
+- **`store.redb`**: Single-file database containing all KV data and metadata
+  - Per-index tables: `data_{index}`, `wal_{index}`
+  - Shared `schema` table for index schemas
   - Uses B+ trees for efficient range queries
   - Includes transaction log for ACID compliance
   - Supports concurrent readers with MVCC
 
-#### tantivy Files
-- **`meta.json`**: Index configuration and schema definition
-- **`.managed.json`**: Tracks active index segments
-- **`seg_*`**: Index segments containing inverted indexes
-  - **`.idx`**: Inverted index (term → document list)
-  - **`.pos`**: Term positions for phrase queries
-  - **`.store`**: Stored field values for retrieval
-  - **`.term`**: Term dictionary for efficient lookups
-  - **`.fieldnorm`**: Field normalization factors for scoring
+#### tantivy Directories
+- **`indices/{index_name}/`**: Tantivy index for a specific tenant
+  - **`meta.json`**: Index configuration and schema definition
+  - **`.managed.json`**: Tracks active index segments
+  - **`seg_*`**: Index segments containing inverted indexes
+    - **`.idx`**: Inverted index (term → document list)
+    - **`.pos`**: Term positions for phrase queries
+    - **`.store`**: Stored field values for retrieval
+    - **`.term`**: Term dictionary for efficient lookups
+    - **`.fieldnorm`**: Field normalization factors for scoring
 
 ### Storage Characteristics
 
@@ -166,9 +221,36 @@ The storage engine creates a well-organized directory structure:
 |--------|------|---------|
 | **File Format** | Single file | Multiple segments |
 | **Concurrency** | MVCC readers | Immutable segments |
-| **Durability** | WAL + fsync | Atomic segment creation |
+| **Durability** | Per-index WAL tables + fsync | Atomic segment creation |
 | **Compression** | Built-in | Per-segment compression |
 | **Size Growth** | Append-only pages | Segment merging |
+
+### Index Metadata and Statistics
+
+Beyond raw storage, the engine tracks per-index metadata and stats:
+
+- **Schema metadata**
+  - Stored in a shared `schema` table inside `store.redb`
+  - API:
+    - `store.store_schema(index_name, &IndexSchema)`
+    - `store.get_schema(index_name) -> Option<IndexSchema>`
+
+- **Index listing**
+  - Discover all known indices, their schemas, and basic stats:
+    - `store.list_indexes() -> Vec<IndexInfo>`
+  - Each `IndexInfo` includes:
+    - `name`
+    - `schema` (`IndexSchema`)
+    - `document_count`
+    - `total_size_bytes`
+    - `tantivy_index_exists`
+
+- **Statistics**
+  - `store.get_index_statistics(index) -> IndexStats`
+  - Uses redb table scan + filesystem size to report:
+    - `document_count`
+    - `total_size_bytes`
+    - `tantivy_index_exists`
 
 ## Usage Examples
 
@@ -375,38 +457,114 @@ let low_memory_config = StorageConfig {
 // HybridStore implements Send + Sync
 let store = Arc::new(HybridStore::new(config)?);
 
-// Safe to share across threads
+// Safe to share across threads and actors
 let store1 = Arc::clone(&store);
 let store2 = Arc::clone(&store);
 
 tokio::spawn(async move {
-    // Each thread can safely use the store
+    // Each task offloads blocking work to a dedicated thread pool
     let result = tokio::task::spawn_blocking(move || {
-        store1.get_by_key("user:123")
+        store1.get_by_key("employees", "user:123")
     }).await;
 });
 ```
 
-### Locking Strategy
-- **IndexWriter**: Protected by `Arc<Mutex<IndexWriter>>`
-- **Sequence Counter**: Lock-free `AtomicU64`
-- **redb**: Internal concurrency control (MVCC)
+### Locking & Caching Strategy
 
-### Deadlock Prevention
-- **Lock Ordering**: Always acquire IndexWriter mutex last
-- **Short Critical Sections**: Minimize time holding locks
-- **No Nested Locks**: Never acquire multiple locks simultaneously
+- **IndexWriter cache**
+  - `IndexWriter` is cached per index in an `Arc<Mutex<IndexWriter>>`
+  - Writers are created on first access and reused across writes
+  - Smart commit logic uses per-index operation counters to decide when to call `commit()`
+
+- **IndexReader cache (internal)**
+  - `HybridStore` maintains an internal reader cache, but `search_documents` currently:
+    - Ensures the index exists via `get_or_create_index`
+    - Opens a fresh Tantivy `Index` and `IndexReader` for each call
+  - This leaves room to hook in reader reuse later without changing the external API.
+
+- **Sequence counters**
+  - Per-index `AtomicU64` counters stored in a `HashMap` under `Arc<RwLock<...>>`
+  - Ensure per-tenant monotonic WAL IDs
+
+- **redb concurrency**
+  - Relies on redb’s internal MVCC and transaction model for safe concurrent reads/writes
+
+### Read Behavior and Caching
+
+- **Per-index read cache**
+  - `get_by_key(index, key)` first checks an in-memory cache keyed by `(index, id)`
+  - On cache hit: returns the cached `Vec<u8>` without touching redb
+  - On cache miss: performs a redb lookup, then inserts the bytes into the cache
+  - Bounded to a fixed number of entries per index (simple eviction when full)
+
+- **Planned enhancements**
+  - A more advanced LRU policy and negative caching are planned, but the current design
+    already provides good locality for hot keys while keeping the implementation simple.
 
 ## Error Handling and Recovery
 
 ### Error Types
+
+At a high level, storage operations can fail with the following **error categories**:
+
+- **redb errors**
+  - Low-level issues from the embedded KV store (I/O, storage, transaction, commit)
+  - Typically indicate disk, filesystem, or data corruption problems
+
+- **Indexing errors (tantivy)**
+  - Failures while writing to or reading from the search index
+  - Examples: index directory missing, schema mismatch, segment corruption
+
+- **Serialization errors**
+  - JSON or bincode encoding/decoding issues for WAL entries, documents, or schemas
+
+- **Query errors**
+  - Problems parsing or executing search queries (invalid syntax, unknown fields)
+
+- **Not-found / logical errors**
+  - Index or field does not exist (`IndexNotFound`, `FieldNotFound`)
+  - Usually indicate a bug in higher layers or an incorrect API call
+
+The `StoreError` enum captures these categories in a strongly typed way:
+
 ```rust
+#[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    Redb(redb::Error),              // Database errors
-    Tantivy(tantivy::TantivyError), // Search index errors  
-    Serialization(String),          // JSON serialization errors
-    Io(std::io::Error),             // File system errors
-    QueryParser(QueryParserError),  // Search query parsing errors
+    #[error("redb error: {0}")]
+    Redb(#[from] redb::Error),
+
+    #[error("redb database error: {0}")]
+    Database(#[from] redb::DatabaseError),
+
+    #[error("redb transaction error: {0}")]
+    Transaction(#[from] redb::TransactionError),
+
+    #[error("redb table error: {0}")]
+    Table(#[from] redb::TableError),
+
+    #[error("redb storage error: {0}")]
+    Storage(#[from] redb::StorageError),
+
+    #[error("redb commit error: {0}")]
+    Commit(#[from] redb::CommitError),
+
+    #[error("tantivy error: {0}")]
+    Tantivy(#[from] tantivy::TantivyError),
+
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
+    #[error("field not found: {0}")]
+    FieldNotFound(String),
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("query parser error: {0}")]
+    QueryParser(#[from] QueryParserError),
+
+    #[error("index not found: {0}")]
+    IndexNotFound(String),
 }
 ```
 

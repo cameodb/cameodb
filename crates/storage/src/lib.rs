@@ -236,6 +236,8 @@ pub struct HybridStore {
     current_seq: Arc<RwLock<HashMap<String, AtomicU64>>>,
     /// Operation counters for smart commits per index
     operations_counter: Arc<RwLock<HashMap<String, AtomicU64>>>,
+    /// Simple per-index read cache for frequently accessed documents
+    read_cache: Arc<RwLock<HashMap<String, HashMap<String, Vec<u8>>>>>,
     /// Storage configuration
     config: StorageConfig,
 }
@@ -258,8 +260,40 @@ impl HybridStore {
             readers: Arc::new(RwLock::new(HashMap::new())),
             current_seq: Arc::new(RwLock::new(HashMap::new())),
             operations_counter: Arc::new(RwLock::new(HashMap::new())),
+            read_cache: Arc::new(RwLock::new(HashMap::new())),
             config,
         })
+    }
+
+    /// Get a value from the read cache if present.
+    fn get_from_cache(&self, index: &str, key: &str) -> Option<Vec<u8>> {
+        if let Ok(cache_map) = self.read_cache.read() {
+            if let Some(index_cache) = cache_map.get(index) {
+                if let Some(value) = index_cache.get(key) {
+                    return Some(value.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Insert a value into the read cache with a simple per-index size bound.
+    fn insert_into_cache(&self, index: &str, key: &str, value: Vec<u8>) {
+        const MAX_CACHE_ENTRIES_PER_INDEX: usize = 1024;
+
+        if let Ok(mut cache_map) = self.read_cache.write() {
+            let index_cache = cache_map
+                .entry(index.to_string())
+                .or_insert_with(HashMap::new);
+
+            if index_cache.len() >= MAX_CACHE_ENTRIES_PER_INDEX {
+                if let Some(first_key) = index_cache.keys().next().cloned() {
+                    index_cache.remove(&first_key);
+                }
+            }
+
+            index_cache.insert(key.to_string(), value);
+        }
     }
 
     /// Creates the default Tantivy schema.
@@ -529,6 +563,10 @@ impl HybridStore {
 
     /// Get document by key from specific index
     pub fn get_by_key(&self, index: &str, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        if let Some(cached) = self.get_from_cache(index, key) {
+            return Ok(Some(cached));
+        }
+
         let data_table_name = format!("data_{}", index);
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
 
@@ -536,7 +574,11 @@ impl HybridStore {
 
         match read_txn.open_table(data_table_def) {
             Ok(data_table) => match data_table.get(key)? {
-                Some(value) => Ok(Some(value.value().to_vec())),
+                Some(value) => {
+                    let bytes = value.value().to_vec();
+                    self.insert_into_cache(index, key, bytes.clone());
+                    Ok(Some(bytes))
+                }
                 None => Ok(None),
             },
             Err(_) => Ok(None), // Table doesn't exist (index was deleted)

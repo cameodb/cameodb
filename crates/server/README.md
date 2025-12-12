@@ -145,11 +145,18 @@ This path reuses the same `ClientOp` semantics on remote nodes as on the local n
 
 ### 4.1 Single-Key Read/Write Routing
 
-When a request has a `routing_key` (typically a document or tenant key):
+For **writes**, the system derives an effective `routing_key` using the following priority:
+
+1. **Explicit routing_key from the client payload** (if provided).
+2. **Document id field**: if the JSON document has an `"id"` field, that value is used.
+3. **Derived key from document bytes**: if neither of the above is present, the document is
+   serialized to JSON, a prefix of the bytes is taken, and hex-encoded into a stable key.
+
+This effective key is then used consistently across the cluster:
 
 1. `RouterActor` sends `RouteOperation { routing_key, operation_type }` to `ClusterCoordinator`.
 2. `ClusterCoordinator::decide_route`:
-   - Uses `ConsistentRing::get_owner(key)` to map key → `shard_id`.
+   - Uses `ConsistentRing::get_owner(key)` (SHA-256 based) to map key → `shard_id`.
    - Uses `shard_owner(shard_id)` to map `shard_id` → `node_id`.
    - Looks up node address in `peer_nodes`.
    - Returns:
@@ -161,7 +168,9 @@ When a request has a `routing_key` (typically a document or tenant key):
    - Remote: uses Kameo remote actors as described above.
    - Broadcast: falls through to scatter–gather.
 
-This gives you single-owner semantics for keyed reads/writes across the cluster.
+This gives you single-owner semantics for keyed **writes** across the cluster while still
+providing a deterministic, evenly distributed fallback when clients do not specify a
+routing key explicitly.
 
 ### 4.2 Broadcast / Scatter–Gather
 
