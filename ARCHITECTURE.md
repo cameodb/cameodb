@@ -264,19 +264,29 @@ all_results.truncate(limit);
 ## 8. Modular Crate Architecture
 
 ### 8.1. Modular Design
-```text
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   server    │    │   storage   │    │   client    │
-│  (actors)   │    │ (hybrid db) │    │    (sdk)    │
-└──────┬──────┘    └──────┬──────┘    └──────┬──────┘
-       │                  │                  │
-       └─────────┬────────┴──────────────────┘
-                 │
-         ┌───────▼────────┐
-         │    cluster     │
-         │ (topology &    │
-         │  routing)      │
-         └────────────────┘
+
+```mermaid
+flowchart TB
+    subgraph Application["🎯 Application Layer"]
+        Server["🚀 server<br/>━━━━━━━━<br/>Actor System<br/>HTTP API<br/>Request Routing<br/>Orchestration"]
+        Client["📦 client<br/>━━━━━━━━<br/>SDK<br/>Client Libraries<br/>API Bindings<br/>(planned)"]
+    end
+
+    subgraph Core["⚙️ Core Infrastructure"]
+        Storage["💾 storage<br/>━━━━━━━━<br/>Hybrid Engine<br/>redb + Tantivy<br/>WAL<br/>Search"]
+        Cluster["🌐 cluster<br/>━━━━━━━━<br/>Consistent Hashing<br/>Node Identity<br/>Topology<br/>Routing"]
+    end
+
+    Server -->|uses| Storage
+    Server -->|routing decisions| Cluster
+    Client -->|optional topology| Cluster
+    Storage -->|shard metadata| Cluster
+
+    classDef appStyle fill:#4A90E2,stroke:#2E5C8A,stroke-width:2px,color:#fff
+    classDef coreStyle fill:#50C878,stroke:#2E7D4E,stroke-width:2px,color:#fff
+    
+    class Server,Client appStyle
+    class Storage,Cluster coreStyle
 ```
 
 ### 8.2. Crate Responsibilities

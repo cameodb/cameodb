@@ -81,16 +81,28 @@ Each `MicroshardActor` manages a single shard’s data and index.
 
 `ClusterCoordinator` owns a `DistributedCluster` and exposes cluster operations via actor messages.
 
-- Tracks:
-  - `peer_nodes: HashMap<Uuid, NodeInfo>` (remote node id, address, status, shard_count).
-  - `shard_assignments: HashMap<Uuid, ShardMetadata>` (which shards live on which nodes).
-  - `ring: ConsistentRing` used for consistent hashing.
-- Key messages:
-  - `InitSwarm` / `ShutdownSwarm` for swarm lifecycle.
-  - `DiscoverPeers`, `GetStatus` for cluster observability.
-  - `RegisterLocalShards` + `rebuild_ring()` to maintain shard metadata.
-  - `RouteOperation` → `RoutingDecision` for read/write routing.
-  - `GetKnownPeers` → `Vec<KnownPeer>` for broadcast fan-out.
+- **Core State**:
+  - `peer_nodes: HashMap<Uuid, NodeInfo>` - Remote node id, address, status, shard_count.
+  - `shard_assignments: HashMap<Uuid, ShardMetadata>` - Which shards live on which nodes.
+  - `ring: ConsistentRing` - Used for consistent hashing.
+  - `state: ClusterState` - Current cluster health (`Active`, `Degraded`, `Failed`).
+  - `expected_nodes: HashSet<Uuid>` - Nodes expected from persisted snapshot.
+  - `expected_shards: HashMap<Uuid, ShardMetadata>` - Shards expected from snapshot for reconciliation.
+
+- **Key Messages**:
+  - `InitSwarm` / `ShutdownSwarm` - Swarm lifecycle.
+  - `DiscoverPeers`, `GetStatus` - Cluster observability.
+  - `RegisterLocalShards` + `rebuild_ring()` - Maintain shard metadata.
+  - `RouteOperation` → `RoutingDecision` - Read/write routing.
+  - `GetKnownPeers` → `Vec<KnownPeer>` - Broadcast fan-out.
+  - `PeerDiscovered` / `PeerLost` - Membership events trigger state transitions.
+  - `MergeRemoteShards` - Reconcile remote node shard reports with local expectations.
+
+- **Event-Driven State Management**:
+  - No background polling or timeouts.
+  - State transitions occur only on membership events (`PeerDiscovered`, `PeerLost`).
+  - Cluster metadata persisted inline with state changes to `metadata.redb`.
+  - Pure Kameo actor message-driven lifecycle.
 
 ---
 
@@ -217,7 +229,84 @@ This implements a distributed search/read path suitable for fan-out queries acro
 
 ---
 
-## 6. Current Distributed Feature Coverage
+## 6. Cluster Metadata Persistence & State Reconciliation
+
+### 6.1 Event-Driven Persistence
+
+Cluster metadata is persisted to `metadata.redb` using a **zero-polling, event-driven** approach:
+
+- **No background tasks** - All persistence triggered inline with state-changing actor messages.
+- **No timeouts** - State transitions occur only on actual membership events.
+- **Message-driven lifecycle** - Fully aligned with Kameo actor model.
+
+**Persistence Triggers:**
+- `PeerDiscovered` → Update node registry, evaluate cluster state, persist snapshot.
+- `PeerLost` → Mark node inactive, transition state (e.g., Active → Degraded), persist.
+- `MergeRemoteShards` → Reconcile shard metadata, update assignments, persist.
+
+**Persisted Data (`metadata.redb` tables):**
+- `cluster_config` - Generation number, expected node count, last stable timestamp.
+- `shard_assignments` - Per-shard metadata (node owner, vnode tokens, document count, storage bytes).
+- `node_registry` - Node info (UUID, address, shard count, first/last seen timestamps).
+- `ring_snapshot` - (Reserved for future ring serialization optimization).
+
+### 6.2 State Reconciliation on Boot
+
+When a node restarts with persisted metadata, it performs **snapshot-vs-reality reconciliation**:
+
+**Boot Sequence:**
+1. Load `metadata.redb` → `PersistedClusterTopology`.
+2. Extract `expected_nodes` (nodes from last run) → mark as Inactive.
+3. Extract `expected_shards` (shard assignments from snapshot) → store for comparison.
+4. Set initial state to `Degraded` (only local node active, others expected).
+5. Wait for peer discovery via libp2p Kademlia.
+
+**Reconciliation on Peer Join:**
+When a remote node sends `PeerDiscovered` and reports its shards via `MergeRemoteShards`:
+
+1. **Compare** actual reported shards vs expected shards from snapshot.
+2. **Categorize**:
+   - **Matched**: Shard exists, metadata unchanged (document count, storage bytes match).
+   - **Changed**: Shard exists but metadata differs (e.g., +200 docs since last shutdown).
+   - **Added**: Shard not in snapshot (new shard created on remote node).
+   - **Missing**: Expected from snapshot but not reported (possible data loss or migration).
+3. **Log** detailed reconciliation results for operational visibility.
+4. **Accept** remote node's reported state as source of truth.
+5. **Persist** reconciled cluster topology to `metadata.redb`.
+
+**Example Reconciliation Log:**
+```
+INFO ClusterCoordinator: reconciling node state with snapshot
+  node=b2c3d4e5-... matched=1 added=1 changed=1 missing=1
+
+INFO New shards not in snapshot
+  node=b2c3d4e5-... shards=[shard-uuid-4]
+
+INFO Shard state changed since snapshot
+  node=b2c3d4e5-... shard=shard-uuid-1
+  expected_docs=1000 actual_docs=1200
+  expected_bytes=5242880 actual_bytes=6291456
+
+WARN Expected shards from snapshot not reported by node
+  node=b2c3d4e5-... shards=[shard-uuid-3]
+```
+
+### 6.3 Cluster State Machine
+
+Simplified reactive state machine with three states:
+
+- **Active** - All expected nodes present and healthy.
+- **Degraded** - Some expected nodes inactive or missing.
+- **Failed** - Too few nodes to operate reliably (< 50% quorum).
+
+**State Transitions:**
+- `PeerDiscovered` → May transition Degraded → Active if all nodes rejoined.
+- `PeerLost` → May transition Active → Degraded or Degraded → Failed.
+- No waiting states, no timeouts - purely reactive to membership events.
+
+---
+
+## 7. Current Distributed Feature Coverage
 
 The `server` crate currently supports:
 
@@ -225,22 +314,27 @@ The `server` crate currently supports:
 - Clustered routing using consistent hashing and shard assignments.
 - Remote execution of logical `ClientOp` operations on other nodes via Kameo + libp2p.
 - Scatter–gather broadcast for unkeyed search and multi-node writes.
-- Basic resilience hooks (retries, timeouts, bootstrap redial stub) and telemetry.
+- **Event-driven cluster metadata persistence** with zero-polling architecture.
+- **Snapshot-based state reconciliation** on boot with discrepancy logging.
+- **Simplified cluster state machine** (Active/Degraded/Failed) triggered by membership events.
+- Basic resilience hooks (retries, timeouts) and telemetry.
 
 Planned future work includes:
 
-- A dedicated remote registry/connector module to cache `RemoteActorRef`s.
-- Remote registration and direct addressing of individual `MicroshardActor`s.
+- Ring snapshot persistence optimization for faster boot (10-40x) on large clusters.
+- Cluster state history tracking for SLA monitoring and failure forensics.
+- Health metrics persistence for capacity planning.
+- `GetClusterSnapshot` query API for operational visibility.
+- Dedicated remote registry/connector module to cache `RemoteActorRef`s.
 - Configurable fallback modes (e.g. local-only when remoting is disabled).
-- Operational endpoints for cluster introspection and admin workflows.
 
 ---
 
-## 7. Distributed Flows (Sequence Diagrams)
+## 8. Distributed Flows (Sequence Diagrams)
 
 This section illustrates the main distributed workflows implemented by the `server` crate.
 
-### 7.1 Local Read/Write
+### 8.1 Local Read/Write
 
 ```mermaid
 sequenceDiagram
@@ -266,7 +360,7 @@ sequenceDiagram
     HTTP-->>Client: HTTP response
 ```
 
-### 7.2 Remote Read/Write
+### 8.2 Remote Read/Write
 
 ```mermaid
 sequenceDiagram
@@ -296,7 +390,7 @@ sequenceDiagram
     HTTP-->>Client: HTTP response
 ```
 
-### 7.3 Broadcast Search (Scatter–Gather)
+### 8.3 Broadcast Search (Scatter–Gather)
 
 ```mermaid
 sequenceDiagram

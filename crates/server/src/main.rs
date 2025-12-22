@@ -2,6 +2,8 @@ use anyhow::Result;
 use kameo::actor::Spawn;
 
 mod cluster_coordinator;
+mod cluster_state;
+mod cluster_state_machine;
 mod config;
 mod distributed;
 mod http_server;
@@ -9,12 +11,14 @@ mod node_orchestrator;
 mod swarm;
 
 use cluster_coordinator::{ClusterCoordinator, DiscoverPeers, GetStatus, InitSwarm, ShutdownSwarm};
+use cluster_state::ClusterStateStore;
 use config::CameoDbConfig;
 use distributed::DistributedCluster;
 use http_server::{AppState, create_router};
 use node_orchestrator::{
     NodeConfig, NodeOrchestrator, ProposeShard, RouterActor, orchestrator_remote_name,
 };
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -76,10 +80,51 @@ async fn main() -> Result<()> {
     );
     println!("Active shards: {}", orchestrator.shard_count());
 
+    // Capture node_id early for remote registration
+    let node_id = orchestrator.identity().uuid;
+
+    // Initialize cluster state store for persistent metadata
+    let state_store = Arc::new(
+        ClusterStateStore::new(cameodb_config.storage.data_paths[0].clone())
+            .expect("Failed to initialize cluster state store"),
+    );
+
+    // Load persisted cluster topology (if exists)
+    let persisted_cluster = state_store
+        .load_persisted_cluster()
+        .expect("Failed to load persisted cluster state");
+
     // Initialize distributed cluster via ClusterCoordinator actor
-    let distributed_cluster =
-        DistributedCluster::new(cameodb_config.cluster.clone(), orchestrator.identity().uuid);
-    let coordinator_actor = ClusterCoordinator::spawn(ClusterCoordinator::new(distributed_cluster));
+    let distributed_cluster = DistributedCluster::new(cameodb_config.cluster.clone(), node_id);
+
+    let coordinator_actor = if let Some(persisted) = persisted_cluster {
+        tracing::info!(
+            "Restoring cluster from persisted state: {} nodes, {} shards expected",
+            persisted.nodes.len(),
+            persisted.shards.len()
+        );
+        ClusterCoordinator::spawn(ClusterCoordinator::new_with_persisted_state(
+            distributed_cluster,
+            persisted,
+            state_store.clone(),
+        ))
+    } else {
+        tracing::info!("Fresh cluster boot, no persisted state");
+        let mut coordinator = ClusterCoordinator::new(distributed_cluster);
+        coordinator.set_state_store(state_store.clone());
+        ClusterCoordinator::spawn(coordinator)
+    };
+
+    // Register coordinator for remote access so peers can query shard metadata
+    let coordinator_remote_name = format!("coordinator-{}", node_id);
+    if let Err(e) = coordinator_actor
+        .register(coordinator_remote_name.clone())
+        .await
+    {
+        tracing::warn!(name = %coordinator_remote_name, error = %e, "Failed to register coordinator for remote access");
+    } else {
+        tracing::info!(name = %coordinator_remote_name, "Registered coordinator for remote access");
+    }
 
     // Give orchestrator a handle to the coordinator for shard registration before spawning it.
     orchestrator.set_coordinator(coordinator_actor.clone());
@@ -90,7 +135,6 @@ async fn main() -> Result<()> {
         .ok();
 
     // Spawn NodeOrchestrator as an actor and register with remote registry
-    let node_id = orchestrator.identity().uuid;
     let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
     let remote_name = orchestrator_remote_name(&node_id);
     if let Err(e) = orchestrator_ref.register(remote_name.clone()).await {

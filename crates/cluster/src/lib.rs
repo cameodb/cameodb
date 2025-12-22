@@ -354,7 +354,7 @@ pub fn generate_tokens(uuid: Uuid) -> Vec<u64> {
 /// let owner2 = ring.get_owner("user:123");
 /// assert_eq!(owner, owner2);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConsistentRing {
     /// Maps hash tokens to node UUIDs. BTreeMap provides ordered iteration.
     ring: BTreeMap<u64, Uuid>,

@@ -9,6 +9,7 @@ A high-performance, distributed, shared-nothing hybrid-search database built in 
 - 🔍 **Hybrid Storage** - Combined KV store (redb) + full-text search (Tantivy)  
 - 📊 **Schema Management** - Dynamic schema evolution with type validation
 - 🌐 **Distributed Ready** - Actor-based architecture with consistent hashing
+- 🔁 **Event-Driven Persistence** - Zero-polling cluster metadata with state reconciliation
 - 🐳 **Docker Deployment** - Production-ready containerized setup
 - 📈 **Performance Optimized** - Smart commits, memory budgets, and adaptive batching
 - 🦀 **Modern Rust 2024** - Built with latest Rust standards and performance optimizations
@@ -30,8 +31,10 @@ CameoDB is designed as a **distributed, shared-nothing cluster**:
 - **Routing & clustering** use a `ClusterCoordinator` actor with a consistent hash ring and libp2p Kademlia DHT.
 - **Remote execution** is powered by Kameo remote actors over a custom libp2p swarm (TCP/QUIC/Noise/Yamux, no mDNS).
 - **Scatter–gather** search and multi-node writes are implemented via a `RouterActor` that fans out to peers and aggregates results.
+- **Event-driven metadata** - Cluster state transitions and persistence triggered purely by actor messages (`PeerDiscovered`, `PeerLost`, `MergeRemoteShards`) with no background polling or timeouts.
+- **State reconciliation** - On boot, nodes compare expected cluster topology from snapshots vs actual peer reports, logging discrepancies and converging to distributed reality.
 
-For a detailed walkthrough of the server-side actors, routing decisions, and remote flows, see:
+For a detailed walkthrough of the server-side actors, routing decisions, remote flows, and metadata persistence, see:
 
 - [`crates/server/README.md`](crates/server/README.md)
 
