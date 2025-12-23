@@ -181,16 +181,20 @@ async fn write_handler(
         doc,
     } = payload;
 
+    // Optimization: Default routing_key to doc_id if not present to ensure
+    // Unicast routing instead of Broadcast (Scatter-Gather).
+    let effective_routing_key = routing_key.or_else(|| Some(id.clone()));
+
     let client_op = ClientOp::Write {
         index,
         id,
-        routing_key: routing_key.clone(),
+        routing_key: effective_routing_key.clone(),
         doc,
     };
 
     let result = state
         .router
-        .route_and_handle(client_op, routing_key, OperationType::Write)
+        .route_and_handle(client_op, effective_routing_key, OperationType::Write)
         .await?;
     Ok(Json(result))
 }

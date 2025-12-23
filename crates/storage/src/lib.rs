@@ -194,6 +194,13 @@ pub enum WalOp {
     },
 }
 
+/// Helper struct for zero-copy serialization of stored documents
+#[derive(Serialize)]
+struct StoredDoc<'a> {
+    body: &'a str,
+    json_blob: Option<&'a JsonValue>,
+}
+
 /// Internal schema field mappings for Tantivy.
 #[derive(Debug, Clone)]
 struct SchemaFields {
@@ -238,6 +245,8 @@ pub struct HybridStore {
     operations_counter: Arc<RwLock<HashMap<String, AtomicU64>>>,
     /// Simple per-index read cache for frequently accessed documents
     read_cache: Arc<RwLock<HashMap<String, HashMap<String, Vec<u8>>>>>,
+    /// Cache of optimal memory budgets per index to avoid frequent syscalls
+    budget_cache: Arc<RwLock<HashMap<String, usize>>>,
     /// Storage configuration
     config: StorageConfig,
 }
@@ -261,6 +270,7 @@ impl HybridStore {
             current_seq: Arc::new(RwLock::new(HashMap::new())),
             operations_counter: Arc::new(RwLock::new(HashMap::new())),
             read_cache: Arc::new(RwLock::new(HashMap::new())),
+            budget_cache: Arc::new(RwLock::new(HashMap::new())),
             config,
         })
     }
@@ -342,6 +352,12 @@ impl HybridStore {
 
         // Create writer with dynamic memory budget based on index size
         let optimal_budget = self.config.get_optimal_memory_budget(&index_path);
+
+        // Cache the budget
+        if let Ok(mut cache) = self.budget_cache.write() {
+            cache.insert(index.to_string(), optimal_budget);
+        }
+
         let writer = tantivy_index.writer(optimal_budget)?;
         let writer_arc = Arc::new(Mutex::new(writer));
 
@@ -366,8 +382,26 @@ impl HybridStore {
     /// Track document count and perform smart commits based on operation thresholds
     fn should_commit_writer(&self, index: &str, operations_since_commit: u64) -> bool {
         // Get dynamic memory budget for this specific index
-        let index_path = self.config.shard_path.join("indices").join(index);
-        let budget = self.config.get_optimal_memory_budget(&index_path);
+        // Use cached budget if available to avoid syscalls on every write
+        let budget = {
+            let cache_hit = if let Ok(cache) = self.budget_cache.read() {
+                cache.get(index).cloned()
+            } else {
+                None
+            };
+
+            if let Some(b) = cache_hit {
+                b
+            } else {
+                // Fallback: calculate and cache
+                let index_path = self.config.shard_path.join("indices").join(index);
+                let b = self.config.get_optimal_memory_budget(&index_path);
+                if let Ok(mut cache) = self.budget_cache.write() {
+                    cache.insert(index.to_string(), b);
+                }
+                b
+            }
+        };
 
         // Commit strategy based on document count and configurable memory budget range
         // Scale commit frequency with memory budget: more memory = fewer commits
@@ -434,6 +468,14 @@ impl HybridStore {
             let mut writer = writer_arc.lock().unwrap();
             writer.commit()?;
             self.reset_operations_counter(index);
+
+            // Refresh budget cache after commit since index size likely changed
+            let index_path = self.config.shard_path.join("indices").join(index);
+            let new_budget = self.config.get_optimal_memory_budget(&index_path);
+            if let Ok(mut cache) = self.budget_cache.write() {
+                cache.insert(index.to_string(), new_budget);
+            }
+
             return Ok(true); // Commit performed
         }
         Ok(false) // No commit needed
@@ -472,16 +514,17 @@ impl HybridStore {
             wal_table.insert(seq_id, wal_data.as_slice())?;
 
             // Apply to data table
-            match &op {
+            match op {
                 WalOp::Put {
                     id,
                     body,
                     json_blob,
                 } => {
-                    let doc_data = serde_json::json!({
-                        "body": body,
-                        "json_blob": json_blob
-                    });
+                    // Optimization: Zero-copy serialization
+                    let doc_data = StoredDoc {
+                        body: &body,
+                        json_blob: json_blob.as_ref(),
+                    };
                     let doc_bytes = serde_json::to_vec(&doc_data)
                         .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
@@ -492,7 +535,7 @@ impl HybridStore {
                     let mut tantivy_doc =
                         doc!(fields.id => id.as_str(), fields.body => body.as_str());
                     if let Some(json_data) = json_blob {
-                        let json_str = serde_json::to_string(json_data)
+                        let json_str = serde_json::to_string(&json_data)
                             .map_err(|e| StoreError::Serialization(e.to_string()))?;
                         tantivy_doc.add_text(fields.json_blob, &json_str);
                     }
@@ -505,7 +548,7 @@ impl HybridStore {
                     data_table.remove(id.as_str())?;
 
                     // Delete from tantivy index
-                    let term = tantivy::Term::from_field_text(fields.id, id);
+                    let term = tantivy::Term::from_field_text(fields.id, &id);
                     let writer = writer_arc.lock().unwrap();
                     writer.delete_term(term);
                 }
@@ -749,15 +792,16 @@ impl HybridStore {
         // Single transaction for all operations
         let write_txn = self.kv.begin_write()?;
         let mut tantivy_ops = Vec::new();
+        let batch_size = ops.len() as u64;
 
         {
             let mut wal_table = write_txn.open_table(wal_table_def)?;
             let mut data_table = write_txn.open_table(data_table_def)?;
 
-            for (op, seq_id) in ops.iter().zip(seq_ids.iter()) {
+            for (op, seq_id) in ops.into_iter().zip(seq_ids.iter()) {
                 // Write to WAL
-                let wal_data =
-                    serde_json::to_vec(op).map_err(|e| StoreError::Serialization(e.to_string()))?;
+                let wal_data = serde_json::to_vec(&op)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
                 wal_table.insert(*seq_id, wal_data.as_slice())?;
 
                 // Apply to data table and prepare tantivy operations
@@ -767,10 +811,11 @@ impl HybridStore {
                         body,
                         json_blob,
                     } => {
-                        let doc_data = serde_json::json!({
-                            "body": body,
-                            "json_blob": json_blob
-                        });
+                        // Optimization: Zero-copy serialization
+                        let doc_data = StoredDoc {
+                            body: &body,
+                            json_blob: json_blob.as_ref(),
+                        };
                         let doc_bytes = serde_json::to_vec(&doc_data)
                             .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
@@ -780,15 +825,15 @@ impl HybridStore {
                         let mut tantivy_doc =
                             doc!(fields.id => id.as_str(), fields.body => body.as_str());
                         if let Some(json_data) = json_blob {
-                            let json_str = serde_json::to_string(json_data)
+                            let json_str = serde_json::to_string(&json_data)
                                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
                             tantivy_doc.add_text(fields.json_blob, &json_str);
                         }
-                        tantivy_ops.push(("add", tantivy_doc, id.clone()));
+                        tantivy_ops.push(("add", tantivy_doc, id));
                     }
                     WalOp::Delete { id } => {
                         data_table.remove(id.as_str())?;
-                        tantivy_ops.push(("delete", doc!(), id.clone()));
+                        tantivy_ops.push(("delete", doc!(), id));
                     }
                 }
             }
@@ -824,7 +869,6 @@ impl HybridStore {
             }
 
             // Increment operations counter by batch size
-            let batch_size = ops.len() as u64;
             for _ in 0..batch_size {
                 self.increment_operations(index);
             }
@@ -838,7 +882,7 @@ impl HybridStore {
         }
 
         // Use smart commit logic for normal batches (when writer lock is released)
-        if ops.len() < 1000 {
+        if batch_size < 1000 {
             self.maybe_commit_writer(index)?;
         }
 
