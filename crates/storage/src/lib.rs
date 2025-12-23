@@ -247,6 +247,8 @@ pub struct HybridStore {
     read_cache: Arc<RwLock<HashMap<String, HashMap<String, Vec<u8>>>>>,
     /// Cache of optimal memory budgets per index to avoid frequent syscalls
     budget_cache: Arc<RwLock<HashMap<String, usize>>>,
+    /// Cache of schemas per index to avoid repeated redb reads
+    schema_cache: Arc<RwLock<HashMap<String, Arc<IndexSchema>>>>,
     /// Storage configuration
     config: StorageConfig,
 }
@@ -271,6 +273,7 @@ impl HybridStore {
             operations_counter: Arc::new(RwLock::new(HashMap::new())),
             read_cache: Arc::new(RwLock::new(HashMap::new())),
             budget_cache: Arc::new(RwLock::new(HashMap::new())),
+            schema_cache: Arc::new(RwLock::new(HashMap::new())),
             config,
         })
     }
@@ -520,7 +523,12 @@ impl HybridStore {
                     body,
                     json_blob,
                 } => {
-                    // Optimization: Zero-copy serialization
+                    // Step 1: Get cached schema for field filtering
+                    let schema = self
+                        .get_schema_cached(index)?
+                        .unwrap_or_else(|| Arc::new(IndexSchema::default()));
+
+                    // Step 2: Serialize complete document for redb (all fields)
                     let doc_data = StoredDoc {
                         body: &body,
                         json_blob: json_blob.as_ref(),
@@ -531,13 +539,30 @@ impl HybridStore {
                     let mut data_table = write_txn.open_table(data_table_def)?;
                     data_table.insert(id.as_str(), doc_bytes.as_slice())?;
 
-                    // Add to tantivy index
-                    let mut tantivy_doc =
-                        doc!(fields.id => id.as_str(), fields.body => body.as_str());
-                    if let Some(json_data) = json_blob {
-                        let json_str = serde_json::to_string(&json_data)
-                            .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                        tantivy_doc.add_text(fields.json_blob, &json_str);
+                    // Step 3: Build tantivy document with ONLY indexed fields
+                    let mut tantivy_doc = doc!(fields.id => id.as_str());
+
+                    // Check if 'body' field should be indexed
+                    let body_indexed = schema.fields.get("body").map_or(true, |f| f.indexed);
+
+                    if body_indexed {
+                        tantivy_doc.add_text(fields.body, &body);
+                    }
+
+                    // Step 4: Process json_blob fields selectively
+                    if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
+                        for (field_name, field_value) in json_obj {
+                            // Check if field should be indexed
+                            let should_index =
+                                schema.fields.get(field_name).map_or(false, |f| f.indexed);
+
+                            if should_index {
+                                // Only serialize and index if marked as indexed
+                                let field_str = serde_json::to_string(field_value)
+                                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                                tantivy_doc.add_text(fields.json_blob, &field_str);
+                            }
+                        }
                     }
 
                     let writer = writer_arc.lock().unwrap();
@@ -658,6 +683,55 @@ impl HybridStore {
             },
             Err(_) => Ok(None), // Table doesn't exist yet
         }
+    }
+
+    /// Get schema from cache, or load from redb and cache it
+    pub fn get_schema_cached(&self, index: &str) -> Result<Option<Arc<IndexSchema>>, StoreError> {
+        // Fast path: check cache
+        if let Ok(cache) = self.schema_cache.read() {
+            if let Some(schema) = cache.get(index) {
+                return Ok(Some(Arc::clone(schema)));
+            }
+        }
+
+        // Slow path: load from redb
+        if let Some(schema) = self.get_schema(index)? {
+            let schema_arc = Arc::new(schema);
+
+            // Update cache
+            if let Ok(mut cache) = self.schema_cache.write() {
+                cache.insert(index.to_string(), Arc::clone(&schema_arc));
+            }
+
+            Ok(Some(schema_arc))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Invalidate cache entry when schema is updated
+    pub fn invalidate_schema_cache(&self, index: &str) {
+        if let Ok(mut cache) = self.schema_cache.write() {
+            cache.remove(index);
+        }
+    }
+
+    /// Update both redb and cache atomically
+    pub fn store_schema_and_cache(
+        &self,
+        index: &str,
+        schema: &IndexSchema,
+    ) -> Result<(), StoreError> {
+        // Persist to redb first
+        self.store_schema(index, schema)?;
+
+        // Update cache
+        let schema_arc = Arc::new(schema.clone());
+        if let Ok(mut cache) = self.schema_cache.write() {
+            cache.insert(index.to_string(), schema_arc);
+        }
+
+        Ok(())
     }
 
     /// Get max WAL ID for a specific index
@@ -811,7 +885,12 @@ impl HybridStore {
                         body,
                         json_blob,
                     } => {
-                        // Optimization: Zero-copy serialization
+                        // Step 1: Get cached schema for field filtering
+                        let schema = self
+                            .get_schema_cached(index)?
+                            .unwrap_or_else(|| Arc::new(IndexSchema::default()));
+
+                        // Step 2: Serialize complete document for redb (all fields)
                         let doc_data = StoredDoc {
                             body: &body,
                             json_blob: json_blob.as_ref(),
@@ -821,14 +900,32 @@ impl HybridStore {
 
                         data_table.insert(id.as_str(), doc_bytes.as_slice())?;
 
-                        // Prepare tantivy document
-                        let mut tantivy_doc =
-                            doc!(fields.id => id.as_str(), fields.body => body.as_str());
-                        if let Some(json_data) = json_blob {
-                            let json_str = serde_json::to_string(&json_data)
-                                .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                            tantivy_doc.add_text(fields.json_blob, &json_str);
+                        // Step 3: Build tantivy document with ONLY indexed fields
+                        let mut tantivy_doc = doc!(fields.id => id.as_str());
+
+                        // Check if 'body' field should be indexed
+                        let body_indexed = schema.fields.get("body").map_or(true, |f| f.indexed);
+
+                        if body_indexed {
+                            tantivy_doc.add_text(fields.body, &body);
                         }
+
+                        // Step 4: Process json_blob fields selectively
+                        if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
+                            for (field_name, field_value) in json_obj {
+                                // Check if field should be indexed
+                                let should_index =
+                                    schema.fields.get(field_name).map_or(false, |f| f.indexed);
+
+                                if should_index {
+                                    // Only serialize and index if marked as indexed
+                                    let field_str = serde_json::to_string(field_value)
+                                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                                    tantivy_doc.add_text(fields.json_blob, &field_str);
+                                }
+                            }
+                        }
+
                         tantivy_ops.push(("add", tantivy_doc, id));
                     }
                     WalOp::Delete { id } => {

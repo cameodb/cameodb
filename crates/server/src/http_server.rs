@@ -8,7 +8,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, patch, post, put},
 };
 use kameo::actor::ActorRef;
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,13 @@ pub struct SearchPayload {
     pub limit: Option<usize>,
 }
 
+/// Schema update request payload for maintenance API
+#[derive(Debug, Deserialize)]
+pub struct SchemaUpdatePayload {
+    /// Map of field_name -> indexed (true/false)
+    pub field_updates: std::collections::HashMap<String, bool>,
+}
+
 /// Health check response
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -109,6 +116,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/:index/_bulk", post(bulk_write_handler))
         .route("/api/:index/_config", put(create_config_handler))
         .route("/api/:index/_config", get(get_config_handler))
+        // Schema maintenance
+        .route("/api/:index/_schema", patch(update_schema_handler))
         // Index management
         .route("/_indexes", get(list_indexes_handler))
         // Health check
@@ -306,6 +315,80 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
     };
 
     Ok(Json(response))
+}
+
+/// Handler for schema updates (maintenance API)
+async fn update_schema_handler(
+    Path(index): Path<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<SchemaUpdatePayload>,
+) -> Result<Json<JsonValue>, ApiError> {
+    info!(
+        index = %index,
+        field_count = payload.field_updates.len(),
+        "Schema update request"
+    );
+
+    // Get current schema
+    let current_schema_result = state
+        .router
+        .route_and_handle(
+            ClientOp::GetConfig {
+                index: index.clone(),
+            },
+            None,
+            OperationType::Read,
+        )
+        .await?;
+
+    let mut schema: IndexSchema = serde_json::from_value(current_schema_result)
+        .map_err(|e| ApiError(anyhow::anyhow!("Failed to parse schema: {}", e)))?;
+
+    // Update indexed flags for specified fields
+    let mut updated_fields = Vec::new();
+    let mut missing_fields = Vec::new();
+
+    for (field_name, indexed) in payload.field_updates {
+        if let Some(field_def) = schema.fields.get_mut(&field_name) {
+            field_def.indexed = indexed;
+            updated_fields.push(field_name);
+        } else {
+            missing_fields.push(field_name);
+        }
+    }
+
+    if !missing_fields.is_empty() {
+        return Err(ApiError(anyhow::anyhow!(
+            "Fields not found in schema: {}",
+            missing_fields.join(", ")
+        )));
+    }
+
+    // Store updated schema
+    state
+        .router
+        .route_and_handle(
+            ClientOp::CreateConfig {
+                index: index.clone(),
+                schema: schema.clone(),
+            },
+            None,
+            OperationType::Write,
+        )
+        .await?;
+
+    info!(
+        index = %index,
+        updated_fields = ?updated_fields,
+        "Schema updated successfully"
+    );
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "index": index,
+        "updated_fields": updated_fields,
+        "message": "Schema updated successfully. New writes will respect updated indexed flags."
+    })))
 }
 
 // TODO: Add HTTP endpoint tests

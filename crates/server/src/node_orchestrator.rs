@@ -635,10 +635,11 @@ async fn validate_and_evolve_schema(
                 }
             } else {
                 // New field: Update schema_cache (Append-Only)
+                // Default indexed=false for safety - explicit opt-in via maintenance API
                 let new_field = FieldDef {
                     name: key.clone(),
                     field_type: inferred_type.to_string(),
-                    indexed: matches!(inferred_type, "text" | "string"),
+                    indexed: false,
                 };
                 schema_cache.fields.insert(key.clone(), new_field);
                 schema_updated = true;
@@ -652,23 +653,28 @@ async fn validate_and_evolve_schema(
         let schema_clone = schema_cache.clone();
         let index_name = index.to_string();
 
-        tokio::task::spawn_blocking(move || store_clone.store_schema(&index_name, &schema_clone))
-            .await
-            .map_err(|e| {
-                OrchestratorError::Io(std::io::Error::other(format!(
-                    "Failed to spawn schema update task: {}",
-                    e
-                )))
-            })?
-            .map_err(|e| {
-                OrchestratorError::Io(std::io::Error::other(format!(
-                    "Failed to store schema: {}",
-                    e
-                )))
-            })?;
+        tokio::task::spawn_blocking(move || {
+            store_clone.store_schema_and_cache(&index_name, &schema_clone)
+        })
+        .await
+        .map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to spawn schema update task: {}",
+                e
+            )))
+        })?
+        .map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to store schema: {}",
+                e
+            )))
+        })?;
 
-        // TODO: Broadcast SchemaUpdate to cluster
-        info!("Schema updated for index '{}' with new fields", index);
+        info!(
+            index = %index,
+            new_fields = schema_cache.fields.len(),
+            "Schema updated with new fields (indexed=false by default)"
+        );
     }
 
     Ok(schema_updated)
