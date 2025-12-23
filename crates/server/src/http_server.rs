@@ -68,6 +68,7 @@ pub struct SearchPayload {
 /// Health check response
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
+    // Local node info
     pub status: String,
     pub node_id: String,
     pub active_shards: usize,
@@ -80,12 +81,7 @@ pub struct HealthResponse {
     pub total_nodes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connected_nodes: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub known_peers: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_peers: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cluster_local_node_id: Option<String>,
+    // Counters
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_total_shards: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -299,9 +295,6 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
         distributed_enabled: cluster_status.as_ref().map(|s| s.distributed_enabled),
         total_nodes: cluster_status.as_ref().map(|s| s.total_nodes),
         connected_nodes: cluster_status.as_ref().map(|s| s.connected_nodes),
-        known_peers: cluster_status.as_ref().map(|s| s.known_peers),
-        active_peers: cluster_status.as_ref().map(|s| s.active_peers),
-        cluster_local_node_id: cluster_status.as_ref().map(|s| s.local_node_id.to_string()),
         cluster_total_shards: cluster_status.as_ref().map(|s| s.total_shards),
         dial_failures: cluster_status.as_ref().map(|s| s.dial_failures),
         bootstrap_successes: cluster_status.as_ref().map(|s| s.bootstrap_successes),

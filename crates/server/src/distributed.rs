@@ -236,14 +236,11 @@ impl DistributedCluster {
         let total_shards = self.peer_nodes.values().map(|node| node.shard_count).sum();
 
         ClusterStatus {
-            local_node_id: self.local_node_id,
             cluster_name: self.cluster_config.cluster_name.clone(),
             total_nodes: self.peer_nodes.len() + 1, // +1 for local node
             connected_nodes: connected_nodes + 1,   // +1 for local node
             total_shards,
             distributed_enabled: self.cluster_config.distributed_actors,
-            known_peers: self.peer_nodes.len(),
-            active_peers: connected_nodes,
             dial_failures: self.dial_failures,
             bootstrap_successes: self.bootstrap_successes,
             routing_updates: self.routing_updates,
@@ -266,14 +263,11 @@ impl Drop for DistributedCluster {
 /// Cluster health and status information
 #[derive(Debug, Clone, Reply)]
 pub struct ClusterStatus {
-    pub local_node_id: Uuid,
     pub cluster_name: String,
     pub total_nodes: usize,
     pub connected_nodes: usize,
     pub total_shards: usize,
     pub distributed_enabled: bool,
-    pub known_peers: usize,
-    pub active_peers: usize,
     pub dial_failures: u64,
     pub bootstrap_successes: u64,
     pub routing_updates: u64,
