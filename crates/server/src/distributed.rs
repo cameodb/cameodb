@@ -36,7 +36,6 @@ pub struct DistributedCluster {
 
 /// Information about a peer node in the cluster
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Framework code, used when distributed features are enabled
 pub struct NodeInfo {
     /// Unique node identifier
     pub node_id: Uuid,
@@ -50,12 +49,9 @@ pub struct NodeInfo {
 
 /// Status of a node in the cluster
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Framework code, used when distributed features are enabled
 pub enum NodeStatus {
     Connected,
     Disconnected,
-    Joining,
-    Leaving,
 }
 
 impl DistributedCluster {
@@ -269,7 +265,6 @@ impl Drop for DistributedCluster {
 
 /// Cluster health and status information
 #[derive(Debug, Clone, Reply)]
-#[allow(dead_code)] // Framework structure, used when distributed features are enabled
 pub struct ClusterStatus {
     pub local_node_id: Uuid,
     pub cluster_name: String,

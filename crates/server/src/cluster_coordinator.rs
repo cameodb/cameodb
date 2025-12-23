@@ -75,7 +75,6 @@ pub struct RouteShard {
 
 /// Metadata describing a shard and its owning node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct ShardMetadata {
     pub shard_id: Uuid,
     pub node_id: Uuid,
@@ -97,7 +96,6 @@ pub struct GetShardAssignments;
 
 /// Response indicating where an operation should be routed.
 #[derive(Debug, Clone, Reply)]
-#[allow(dead_code)] // Variants used in future phases
 pub enum RoutingDecision {
     /// Handle locally on this node.
     Local,
@@ -154,13 +152,13 @@ pub struct GetClusterSnapshot;
 /// Snapshot of cluster topology for persistence
 #[derive(Debug, Clone, Reply)]
 pub struct ClusterSnapshot {
-    #[allow(dead_code)] // Used in GetClusterSnapshot query responses
+    #[allow(dead_code)] // Used by GetClusterSnapshot responses and future HTTP exposure
     pub config: PersistedClusterConfig,
-    #[allow(dead_code)] // Used in GetClusterSnapshot query responses
+    #[allow(dead_code)] // Used by GetClusterSnapshot responses and future HTTP exposure
     pub shards: HashMap<Uuid, ShardMetadata>,
-    #[allow(dead_code)] // Used in GetClusterSnapshot query responses
+    #[allow(dead_code)] // Used by GetClusterSnapshot responses and future HTTP exposure
     pub nodes: HashMap<Uuid, NodeInfo>,
-    #[allow(dead_code)] // Used in GetClusterSnapshot query responses
+    #[allow(dead_code)] // Used by GetClusterSnapshot responses and future HTTP exposure
     pub ring: ConsistentRing,
 }
 

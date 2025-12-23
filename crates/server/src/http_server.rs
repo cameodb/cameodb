@@ -80,6 +80,20 @@ pub struct HealthResponse {
     pub total_nodes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connected_nodes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known_peers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_peers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster_local_node_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster_total_shards: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dial_failures: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_successes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_updates: Option<u64>,
 }
 
 /// Application state shared across handlers
@@ -269,32 +283,32 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
         .map_err(|e| ApiError(anyhow::anyhow!(e)))?;
 
     // Query cluster status from coordinator
-    let (cluster_name, distributed_enabled, total_nodes, connected_nodes) =
-        match state.coordinator.ask(GetStatus).await {
-            Ok(status) => (
-                Some(status.cluster_name),
-                Some(status.distributed_enabled),
-                Some(status.total_nodes),
-                Some(status.connected_nodes),
-            ),
-            Err(err) => {
-                error!(error = ?err, "Failed to get cluster status from coordinator");
-                (None, None, None, None)
-            }
-        };
+    let cluster_status = match state.coordinator.ask(GetStatus).await {
+        Ok(status) => Some(status),
+        Err(err) => {
+            error!(error = ?err, "Failed to get cluster status from coordinator");
+            None
+        }
+    };
 
     let response = HealthResponse {
         status: "green".to_string(),
         node_id: identity.uuid.to_string(),
         active_shards: shard_count,
-        cluster_name,
-        distributed_enabled,
-        total_nodes,
-        connected_nodes,
+        cluster_name: cluster_status.as_ref().map(|s| s.cluster_name.clone()),
+        distributed_enabled: cluster_status.as_ref().map(|s| s.distributed_enabled),
+        total_nodes: cluster_status.as_ref().map(|s| s.total_nodes),
+        connected_nodes: cluster_status.as_ref().map(|s| s.connected_nodes),
+        known_peers: cluster_status.as_ref().map(|s| s.known_peers),
+        active_peers: cluster_status.as_ref().map(|s| s.active_peers),
+        cluster_local_node_id: cluster_status.as_ref().map(|s| s.local_node_id.to_string()),
+        cluster_total_shards: cluster_status.as_ref().map(|s| s.total_shards),
+        dial_failures: cluster_status.as_ref().map(|s| s.dial_failures),
+        bootstrap_successes: cluster_status.as_ref().map(|s| s.bootstrap_successes),
+        routing_updates: cluster_status.as_ref().map(|s| s.routing_updates),
     };
 
     Ok(Json(response))
 }
 
 // TODO: Add HTTP endpoint tests
-// Tests removed temporarily due to dependency issues

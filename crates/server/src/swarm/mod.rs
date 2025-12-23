@@ -40,21 +40,20 @@ pub struct SwarmStartup {
 
 /// Events emitted from the swarm runtime to be forwarded to the coordinator actor.
 #[derive(Debug)]
-#[allow(dead_code)] // Event fields may be unused in certain builds/tests
 pub enum CoordinatorEvent {
-    #[allow(dead_code)]
     RoutingUpdated {
+        #[allow(dead_code)]
         peer_id: String,
+        #[allow(dead_code)]
         address_count: usize,
     },
-    #[allow(dead_code)]
     PeerDiscovered {
         peer_id: String,
         address: Option<String>,
     },
-    #[allow(dead_code)]
-    PeerLost { peer_id: String },
-    #[allow(dead_code)]
+    PeerLost {
+        peer_id: String,
+    },
     DialFailed {
         peer_id: Option<String>,
         error: String,

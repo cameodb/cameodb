@@ -640,6 +640,36 @@ impl HybridStore {
         }
     }
 
+    /// Get or create a cached IndexReader for the given index
+    fn get_reader(&self, index: &str) -> Result<Option<IndexReader>, StoreError> {
+        // Check cache first
+        {
+            let readers = self.readers.read().unwrap();
+            if let Some(reader) = readers.get(index) {
+                reader.reload()?;
+                return Ok(Some(reader.clone()));
+            }
+        }
+
+        // Check if index directory exists
+        let index_path = self.config.shard_path.join("indices").join(index);
+        if !index_path.exists() || !index_path.join("meta.json").exists() {
+            return Ok(None);
+        }
+
+        // Open index and create reader
+        let tantivy_index = Index::open_in_dir(&index_path)?;
+        let reader = tantivy_index.reader()?;
+
+        // Cache the reader
+        {
+            let mut readers = self.readers.write().unwrap();
+            readers.insert(index.to_string(), reader.clone());
+        }
+
+        Ok(Some(reader))
+    }
+
     /// Search documents in a specific index
     pub fn search_documents(
         &self,
@@ -647,24 +677,20 @@ impl HybridStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(f32, JsonValue)>, StoreError> {
-        // Get or create the index to ensure it exists
-        let (_, fields) = self.get_or_create_index(index)?;
+        // Get schema fields (lightweight, no IO)
+        let (_, fields) = Self::create_default_schema();
 
-        // Get the Tantivy index path
-        let index_path = self.config.shard_path.join("indices").join(index);
+        // Get reader from cache or disk
+        let reader = match self.get_reader(index)? {
+            Some(r) => r,
+            None => return Ok(Vec::new()),
+        };
 
-        if !index_path.exists() {
-            return Ok(Vec::new()); // No results if index doesn't exist
-        }
-
-        // Open the Tantivy index
-        let tantivy_index = Index::open_in_dir(&index_path)?;
-        let reader = tantivy_index.reader()?;
         let searcher = reader.searcher();
+        let tantivy_index = searcher.index();
 
         // Create query parser for the body field
-        let query_parser =
-            tantivy::query::QueryParser::for_index(&tantivy_index, vec![fields.body]);
+        let query_parser = tantivy::query::QueryParser::for_index(tantivy_index, vec![fields.body]);
         let parsed_query = query_parser.parse_query(query)?;
 
         // Execute search

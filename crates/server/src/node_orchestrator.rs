@@ -1579,11 +1579,7 @@ impl NodeOrchestrator {
             return Ok(serde_json::json!({"hits": [], "total": 0, "took_ms": 0}));
         }
         let mut handles = Vec::new();
-        for (&shard_id, shard) in self
-            .shards
-            .iter()
-            .take(self.shards.len().min(self.routing_ring.len().max(1)))
-        {
+        for (&shard_id, shard) in self.shards.iter() {
             let req = SearchRequest {
                 index: index.to_string(),
                 query_string: query.to_string(),
