@@ -176,9 +176,10 @@ def ingest(
             try:
                 if not dry_run:
                     result = send_batch(base_url, index, docs_to_send)
-                    batch_indexed = result.get("items_indexed", 0)
-                    successful_shards = result.get("successful_shards", 0)
-                    failed_shards = result.get("failed_shards", 0)
+                    batch_indexed = result.get("items_written", 0)
+                    errors = result.get("errors", [])
+                    successful_shards = 4 - len(errors)  # Calculate from errors
+                    failed_shards = len(errors)
                 else:
                     batch_indexed = len(docs_to_send)
                     successful_shards = 4  # Assume 4 shards for dry run

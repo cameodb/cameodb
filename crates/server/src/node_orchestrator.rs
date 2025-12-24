@@ -586,6 +586,10 @@ impl MicroshardActor {
 /// 3. Adds new fields to the schema (append-only evolution)
 /// 4. Persists schema updates to storage
 ///
+/// Schema Creation vs Evolution:
+/// - **Initial Creation** (empty schema): All fields set to `indexed = true`
+/// - **Evolution** (existing schema): New fields set to `indexed = false`
+///
 /// # Arguments
 ///
 /// * `index` - The index name
@@ -595,8 +599,7 @@ impl MicroshardActor {
 ///
 /// # Returns
 ///
-/// `Ok(())` if validation passes, `Err` if validation fails
-/// Returns true if schema was updated/persisted.
+/// `Ok(bool)` - true if schema was updated/persisted, false otherwise
 async fn validate_and_evolve_schema(
     index: &str,
     doc: &JsonValue,
@@ -612,6 +615,9 @@ async fn validate_and_evolve_schema(
     }
 
     let mut schema_updated = false;
+
+    // Determine if this is initial schema creation (no fields defined yet)
+    let is_initial_creation = schema_cache.fields.is_empty();
 
     // Check 2 (Evolution): Iterate keys in doc
     if let Some(obj) = doc.as_object() {
@@ -638,11 +644,12 @@ async fn validate_and_evolve_schema(
                 }
             } else {
                 // New field: Update schema_cache (Append-Only)
-                // Default indexed=false for safety - explicit opt-in via maintenance API
+                // Initial creation: indexed=true (all fields indexed by default)
+                // Evolution: indexed=false (new fields not indexed, explicit opt-in required)
                 let new_field = FieldDef {
                     name: key.clone(),
                     field_type: inferred_type.to_string(),
-                    indexed: false,
+                    indexed: is_initial_creation,
                 };
                 schema_cache.fields.insert(key.clone(), new_field);
                 schema_updated = true;
@@ -673,11 +680,19 @@ async fn validate_and_evolve_schema(
             )))
         })?;
 
-        info!(
-            index = %index,
-            new_fields = schema_cache.fields.len(),
-            "Schema updated with new fields (indexed=false by default)"
-        );
+        if is_initial_creation {
+            info!(
+                index = %index,
+                field_count = schema_cache.fields.len(),
+                "Initial schema created with all fields indexed=true"
+            );
+        } else {
+            info!(
+                index = %index,
+                total_fields = schema_cache.fields.len(),
+                "Schema evolved with new fields (indexed=false by default)"
+            );
+        }
     }
 
     Ok(schema_updated)
@@ -939,16 +954,28 @@ impl RouterActor {
         }
 
         // Merge results based on operation type
-        let total_shards = all_results.len();
         match &op {
             ClientOp::Search { .. } => {
-                // Merge search results: combine all hits arrays
+                // For search operations, if we only have local results (no remote peers),
+                // return the local response directly to preserve shard-level details
+                if all_results.len() == 1 && peer_count == 0 {
+                    return Ok(all_results[0].clone());
+                }
+
+                // Merge search results from multiple nodes: combine all hits arrays
                 let mut merged_hits: Vec<JsonValue> = Vec::new();
+                let mut total_shards_queried = 0usize;
+
                 for result in &all_results {
                     if let Some(hits) = result.get("hits").and_then(|h| h.as_array()) {
                         merged_hits.extend(hits.iter().cloned());
                     }
+                    // Sum up shards_responded from each node
+                    if let Some(shards) = result.get("shards_responded").and_then(|s| s.as_u64()) {
+                        total_shards_queried += shards as usize;
+                    }
                 }
+
                 // Sort by score descending and deduplicate by _id if present
                 merged_hits.sort_by(|a, b| {
                     let score_a = a.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
@@ -957,18 +984,21 @@ impl RouterActor {
                         .partial_cmp(&score_a)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
+
                 Ok(serde_json::json!({
                     "hits": merged_hits,
-                    "total_shards": total_shards,
+                    "total_shards": total_shards_queried,
+                    "nodes_contacted": all_results.len(),
                     "failed_shards": error_count
                 }))
             }
             ClientOp::Write { .. } | ClientOp::BulkWrite { .. } => {
                 // For writes, return aggregate success info
+                let total_nodes = all_results.len();
                 Ok(serde_json::json!({
                     "success": error_count == 0,
-                    "nodes_contacted": total_shards + error_count as usize,
-                    "nodes_succeeded": total_shards,
+                    "nodes_contacted": total_nodes + error_count as usize,
+                    "nodes_succeeded": total_nodes,
                     "nodes_failed": error_count
                 }))
             }

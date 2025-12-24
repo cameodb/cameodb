@@ -193,9 +193,10 @@ def ingest(
 
             try:
                 result = send_batch(base_url, index, docs_to_send)
-                batch_indexed = result.get("items_indexed", 0)
-                successful_shards = result.get("successful_shards", 0)
-                failed_shards = result.get("failed_shards", 0)
+                batch_indexed = result.get("items_written", 0)
+                errors = result.get("errors", [])
+                successful_shards = 4 - len(errors)  # Calculate from errors
+                failed_shards = len(errors)
 
                 batch_time = time.time() - batch_start
                 total_indexed += batch_indexed

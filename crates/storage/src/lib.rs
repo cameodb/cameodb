@@ -844,13 +844,18 @@ impl HybridStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(f32, JsonValue)>, StoreError> {
+        use tracing::{debug, warn};
+
         // Get schema fields (lightweight, no IO)
         let (_, fields) = Self::create_default_schema();
 
         // Get reader from cache or disk
         let reader = match self.get_reader(index)? {
             Some(r) => r,
-            None => return Ok(Vec::new()),
+            None => {
+                warn!(index = %index, "No tantivy reader found for index");
+                return Ok(Vec::new());
+            }
         };
 
         let searcher = reader.searcher();
@@ -861,12 +866,19 @@ impl HybridStore {
             .get_schema_cached(index)?
             .unwrap_or_else(|| Arc::new(IndexSchema::default()));
 
+        debug!(
+            index = %index,
+            schema_fields = schema.fields.len(),
+            "Retrieved schema for search"
+        );
+
         // Build query parser with only indexed fields
         let mut query_fields = vec![];
 
         // Check if body field is indexed
         if schema.fields.get("body").map_or(true, |f| f.indexed) {
             query_fields.push(fields.body);
+            debug!("Added 'body' field to search");
         }
 
         // Check if any json_blob fields are indexed
@@ -876,12 +888,20 @@ impl HybridStore {
             .any(|f| f.name != "body" && f.indexed);
         if has_indexed_json {
             query_fields.push(fields.json_blob);
+            debug!("Added 'json_blob' field to search");
         }
 
         if query_fields.is_empty() {
-            // No indexed fields - cannot search
+            warn!(index = %index, "No indexed fields available for search");
             return Ok(Vec::new());
         }
+
+        debug!(
+            index = %index,
+            query = %query,
+            query_fields_count = query_fields.len(),
+            "Executing tantivy search"
+        );
 
         // Create query parser and execute search
         let query_parser = tantivy::query::QueryParser::for_index(tantivy_index, query_fields);
@@ -892,6 +912,12 @@ impl HybridStore {
             &parsed_query,
             &tantivy::collector::TopDocs::with_limit(limit),
         )?;
+
+        debug!(
+            index = %index,
+            hits_found = top_docs.len(),
+            "Tantivy search completed"
+        );
 
         if top_docs.is_empty() {
             return Ok(Vec::new());
@@ -905,11 +931,40 @@ impl HybridStore {
             // Extract ID field - use to_json to get the document and parse ID
             let json_str = doc.to_json(&tantivy_index.schema());
             if let Ok(json_val) = serde_json::from_str::<JsonValue>(&json_str) {
-                if let Some(id_str) = json_val.get("id").and_then(|v| v.as_str()) {
+                // Tantivy stores text fields as arrays, so we need to handle both cases
+                let id_opt = json_val.get("id").and_then(|v| {
+                    // Try as array first (Tantivy's default for text fields)
+                    if let Some(arr) = v.as_array() {
+                        arr.first().and_then(|item| item.as_str())
+                    } else {
+                        // Fallback to direct string
+                        v.as_str()
+                    }
+                });
+
+                if let Some(id_str) = id_opt {
                     doc_ids_with_scores.push((score, id_str.to_string()));
+                } else {
+                    warn!(
+                        index = %index,
+                        tantivy_doc = %json_str,
+                        "Tantivy document missing or invalid 'id' field"
+                    );
                 }
+            } else {
+                warn!(
+                    index = %index,
+                    json_str = %json_str,
+                    "Failed to parse tantivy document JSON"
+                );
             }
         }
+
+        debug!(
+            index = %index,
+            ids_extracted = doc_ids_with_scores.len(),
+            "Extracted document IDs from tantivy results"
+        );
 
         // Step 2: Batch retrieve complete documents from redb (single transaction)
         let doc_ids: Vec<String> = doc_ids_with_scores
@@ -918,6 +973,13 @@ impl HybridStore {
             .collect();
 
         let redb_docs = self.get_batch_by_keys(index, &doc_ids)?;
+
+        debug!(
+            index = %index,
+            requested_ids = doc_ids.len(),
+            retrieved_docs = redb_docs.len(),
+            "Retrieved documents from redb"
+        );
 
         // Create lookup map for O(1) access
         let doc_map: std::collections::HashMap<String, Vec<u8>> = redb_docs.into_iter().collect();
