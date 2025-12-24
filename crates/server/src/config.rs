@@ -130,6 +130,10 @@ pub struct StorageConfig {
     /// WAL segment size in MB (default: 64)
     #[serde(default = "default_wal_segment_size_mb")]
     pub wal_segment_size_mb: usize,
+
+    /// Default batch size for smart commit calculations (default: 1000)
+    #[serde(default = "default_default_batch_size")]
+    pub default_batch_size: usize,
 }
 
 /// Cluster configuration for distributed actor system
@@ -235,10 +239,6 @@ pub struct SearchConfig {
     /// Number of search threads (default: num_cpus)
     #[serde(default = "default_search_threads")]
     pub search_threads: usize,
-
-    /// Index refresh interval in seconds (default: 5)
-    #[serde(default = "default_index_refresh_secs")]
-    pub index_refresh_interval_secs: u64,
 }
 
 impl CameoDbConfig {
@@ -516,6 +516,7 @@ impl Default for StorageConfig {
             disk_usage_threshold: default_disk_usage_threshold(),
             wal_sync: default_wal_sync(),
             wal_segment_size_mb: default_wal_segment_size_mb(),
+            default_batch_size: default_default_batch_size(),
         }
     }
 }
@@ -528,7 +529,6 @@ impl Default for SearchConfig {
             total_memory_limit_mb: default_total_memory_limit_mb(),
             memory_pressure_threshold: default_pressure_threshold(),
             search_threads: default_search_threads(),
-            index_refresh_interval_secs: default_index_refresh_secs(),
         }
     }
 }
@@ -607,6 +607,9 @@ fn default_wal_sync() -> bool {
 fn default_wal_segment_size_mb() -> usize {
     64
 }
+fn default_default_batch_size() -> usize {
+    1000
+}
 
 fn default_writer_memory_min_mb() -> usize {
     16
@@ -622,9 +625,6 @@ fn default_pressure_threshold() -> f64 {
 }
 fn default_search_threads() -> usize {
     num_cpus::get()
-}
-fn default_index_refresh_secs() -> u64 {
-    5
 }
 
 fn default_distributed_actors() -> bool {

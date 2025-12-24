@@ -126,34 +126,6 @@ wal_segment_size_mb = 64
 ### Tantivy Search Configuration
 
 ```toml
-[search]
-# Minimum writer memory per shard in MB (range: 16-256, default: 16)
-writer_memory_min_mb = 16
-
-# Maximum writer memory per shard in MB (range: 16-256, default: 256)  
-writer_memory_max_mb = 256
-
-# Total memory limit for all search operations in MB (default: 1024)
-total_memory_limit_mb = 1024
-
-# Memory pressure threshold (0.0-1.0) to trigger cleanup (default: 0.8)
-memory_pressure_threshold = 0.8
-
-# Number of search threads (default: auto-detect CPU cores)
-search_threads = 4
-
-# Index refresh interval in seconds (default: 5)
-index_refresh_interval_secs = 5
-```
-
-## Environment Variables
-
-Override configuration with environment variables:
-
-```bash
-# HTTP Configuration
-export CAMEODB_HTTP_PORT=9480
-export CAMEODB_HTTP_HOST="0.0.0.0"
 
 # Storage Configuration (colon-separated paths)
 export CAMEODB_DATA_PATHS="./data/cameodb:/mnt/disk1/cameodb"
@@ -259,9 +231,6 @@ disk_usage_threshold = 0.95
 [search]
 # Maximize CPU utilization
 search_threads = 32
-
-# Frequent index refresh for low latency
-index_refresh_interval_secs = 1
 ```
 
 ### Performance vs Durability Trade-offs
@@ -293,14 +262,17 @@ data_paths = ["/data/cameodb"]  # Dedicated data volume
 disk_usage_threshold = 0.85
 wal_sync = true  # Enable for durability
 wal_segment_size_mb = 128
+default_batch_size = 1000
 
 [search]
-writer_memory_min_mb = 32
+writer_memory_min_mb = 16
 writer_memory_max_mb = 256
 total_memory_limit_mb = 2048
 memory_pressure_threshold = 0.8
 search_threads = 8
-index_refresh_interval_secs = 5
+
+[cluster]
+# Cluster configuration
 ```
 
 ### System Requirements
@@ -367,7 +339,6 @@ cargo run --release --bin server  # Should start without errors
 
 **Slow Searches**:
 - Increase `search_threads`
-- Reduce `index_refresh_interval_secs`
 - Add more RAM for caching
 
 ### Debug Configuration Loading

@@ -152,7 +152,6 @@ writer_memory_max_mb = 512   # More memory per shard
 total_memory_limit_mb = 4096 # 4GB total limit
 memory_pressure_threshold = 0.75
 search_threads = 16          # More threads for parallel search
-index_refresh_interval_secs = 3
 EOF
     
     echo "✅ Multi-disk configuration generated: $output_file"
@@ -192,7 +191,6 @@ writer_memory_max_mb = 1024  # Maximum memory allocation
 total_memory_limit_mb = 8192 # 8GB total limit
 memory_pressure_threshold = 0.9  # High memory usage
 search_threads = 32          # Maximum parallelism
-index_refresh_interval_secs = 1   # Frequent refresh
 EOF
     
     echo "✅ High-performance configuration generated: $output_file"

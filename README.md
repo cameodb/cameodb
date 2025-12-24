@@ -425,11 +425,11 @@ port = 9480
 [search]
 writer_memory_min_mb = 16
 writer_memory_max_mb = 256
-default_batch_size = 1000
 
 [storage]
 data_paths = ["./data/cameodb"]
 wal_sync = true
+default_batch_size = 1000
 ```
 
 ## � System Requirements

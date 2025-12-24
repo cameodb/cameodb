@@ -75,6 +75,8 @@ pub struct NodeConfig {
     pub writer_memory_default_mb: usize,
     /// Enable WAL fsync for durability
     pub wal_sync: bool,
+    /// Default batch size for smart commit calculations
+    pub default_batch_size: usize,
 }
 
 impl Default for NodeConfig {
@@ -86,6 +88,7 @@ impl Default for NodeConfig {
             writer_memory_max_mb: 256,
             writer_memory_default_mb: 32,
             wal_sync: true,
+            default_batch_size: 1000,
         }
     }
 }
@@ -1281,7 +1284,7 @@ impl NodeOrchestrator {
             writer_memory_budget: writer_memory_mb * 1024 * 1024, // Convert to bytes
             writer_memory_min_mb: self.config.writer_memory_min_mb,
             writer_memory_max_mb: self.config.writer_memory_max_mb,
-            default_batch_size: 1000, // Use default from config or hard-coded for now
+            default_batch_size: self.config.default_batch_size,
             wal_sync: self.config.wal_sync,
         }
     }
