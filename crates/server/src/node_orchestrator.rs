@@ -1533,6 +1533,32 @@ impl NodeOrchestrator {
                 "No shards",
             )));
         }
+
+        // Load schema and validate/evolve for all documents before writing
+        let mut schema_cache = self.load_schema(index).await?;
+        let mut schema_updated = false;
+
+        if let Some(shard) = self.shards.values().next() {
+            if let Some(store) = &shard.store {
+                for doc_payload in &docs {
+                    let updated = validate_and_evolve_schema(
+                        index,
+                        &doc_payload.doc,
+                        &mut schema_cache,
+                        store,
+                    )
+                    .await?;
+                    if updated {
+                        schema_updated = true;
+                    }
+                }
+                // Update cache once after processing all docs
+                if schema_updated {
+                    self.put_cached_schema(index, &schema_cache);
+                }
+            }
+        }
+
         // Group documents by target shard using the same routing key strategy
         // as single-write: explicit routing_key → doc id → derived key.
         let items_received = docs.len();
