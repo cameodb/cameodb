@@ -201,6 +201,13 @@ struct StoredDoc<'a> {
     json_blob: Option<&'a JsonValue>,
 }
 
+/// Owned version for deserialization from redb
+#[derive(Deserialize)]
+struct StoredDocOwned {
+    body: String,
+    json_blob: Option<JsonValue>,
+}
+
 /// Internal schema field mappings for Tantivy.
 #[derive(Debug, Clone)]
 struct SchemaFields {
@@ -653,6 +660,48 @@ impl HybridStore {
         }
     }
 
+    /// Batch retrieve documents by keys from specific index
+    /// More efficient than multiple get_by_key calls - uses single transaction
+    pub fn get_batch_by_keys(
+        &self,
+        index: &str,
+        keys: &[String],
+    ) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let data_table_name = format!("data_{}", index);
+        let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
+
+        // Single read transaction for all keys
+        let read_txn = self.kv.begin_read()?;
+        let data_table = match read_txn.open_table(data_table_def) {
+            Ok(table) => table,
+            Err(_) => return Ok(Vec::new()), // Table doesn't exist
+        };
+
+        let mut results = Vec::with_capacity(keys.len());
+
+        for key in keys {
+            // Check cache first
+            if let Some(cached) = self.get_from_cache(index, key) {
+                results.push((key.clone(), cached));
+                continue;
+            }
+
+            // Fetch from redb
+            if let Some(value) = data_table.get(key.as_str())? {
+                let bytes = value.value().to_vec();
+                self.insert_into_cache(index, key, bytes.clone());
+                results.push((key.clone(), bytes));
+            }
+            // Skip keys that don't exist (document may have been deleted)
+        }
+
+        Ok(results)
+    }
+
     /// Store schema for an index
     pub fn store_schema(&self, index_name: &str, schema: &IndexSchema) -> Result<(), StoreError> {
         let schema_bytes =
@@ -788,6 +837,7 @@ impl HybridStore {
     }
 
     /// Search documents in a specific index
+    /// Uses tantivy for search, then batch-retrieves complete documents from redb
     pub fn search_documents(
         &self,
         index: &str,
@@ -806,27 +856,99 @@ impl HybridStore {
         let searcher = reader.searcher();
         let tantivy_index = searcher.index();
 
-        // Create query parser for the body field
-        let query_parser = tantivy::query::QueryParser::for_index(tantivy_index, vec![fields.body]);
+        // Get cached schema to determine which fields are indexed
+        let schema = self
+            .get_schema_cached(index)?
+            .unwrap_or_else(|| Arc::new(IndexSchema::default()));
+
+        // Build query parser with only indexed fields
+        let mut query_fields = vec![];
+
+        // Check if body field is indexed
+        if schema.fields.get("body").map_or(true, |f| f.indexed) {
+            query_fields.push(fields.body);
+        }
+
+        // Check if any json_blob fields are indexed
+        let has_indexed_json = schema
+            .fields
+            .values()
+            .any(|f| f.name != "body" && f.indexed);
+        if has_indexed_json {
+            query_fields.push(fields.json_blob);
+        }
+
+        if query_fields.is_empty() {
+            // No indexed fields - cannot search
+            return Ok(Vec::new());
+        }
+
+        // Create query parser and execute search
+        let query_parser = tantivy::query::QueryParser::for_index(tantivy_index, query_fields);
         let parsed_query = query_parser.parse_query(query)?;
 
-        // Execute search
+        // Execute search on tantivy index
         let top_docs = searcher.search(
             &parsed_query,
             &tantivy::collector::TopDocs::with_limit(limit),
         )?;
 
-        // Convert results to (score, JsonValue) format
-        let mut results = Vec::new();
+        if top_docs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Step 1: Extract document IDs from tantivy results
+        let mut doc_ids_with_scores = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let doc: tantivy::TantivyDocument = searcher.doc(doc_address)?;
 
-            // Convert tantivy document to JSON
+            // Extract ID field - use to_json to get the document and parse ID
             let json_str = doc.to_json(&tantivy_index.schema());
-            let json_value: JsonValue = serde_json::from_str(&json_str)
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            if let Ok(json_val) = serde_json::from_str::<JsonValue>(&json_str) {
+                if let Some(id_str) = json_val.get("id").and_then(|v| v.as_str()) {
+                    doc_ids_with_scores.push((score, id_str.to_string()));
+                }
+            }
+        }
 
-            results.push((score, json_value));
+        // Step 2: Batch retrieve complete documents from redb (single transaction)
+        let doc_ids: Vec<String> = doc_ids_with_scores
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect();
+
+        let redb_docs = self.get_batch_by_keys(index, &doc_ids)?;
+
+        // Create lookup map for O(1) access
+        let doc_map: std::collections::HashMap<String, Vec<u8>> = redb_docs.into_iter().collect();
+
+        // Step 3: Combine scores with complete documents
+        let mut results = Vec::new();
+        for (score, doc_id) in doc_ids_with_scores {
+            if let Some(doc_bytes) = doc_map.get(&doc_id) {
+                // Deserialize complete document from redb
+                let stored_doc: StoredDocOwned = serde_json::from_slice(doc_bytes)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+                // Build complete JSON document with all fields
+                let mut complete_doc = serde_json::json!({
+                    "id": doc_id,
+                    "body": stored_doc.body,
+                });
+
+                // Merge json_blob fields into root document
+                if let Some(json_blob) = stored_doc.json_blob {
+                    if let Some(obj) = complete_doc.as_object_mut() {
+                        if let Some(blob_obj) = json_blob.as_object() {
+                            for (k, v) in blob_obj {
+                                obj.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+
+                results.push((score, complete_doc));
+            }
         }
 
         Ok(results)
