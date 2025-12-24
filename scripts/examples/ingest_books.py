@@ -68,10 +68,7 @@ def parse_publication_date(date_str: str) -> Optional[str]:
     return date_str
 
 
-def build_document(
-    line: str,
-    round_robin: bool = False,
-) -> Optional[Dict[str, Any]]:
+def build_document(line: str) -> Optional[Dict[str, Any]]:
     """Build a document payload for batch insertion from a tab-separated line."""
     # Split by tabs - the format is:
     # book_id \t freebase_id \t title \t author \t publication_date \t genres_json \t summary
@@ -122,9 +119,8 @@ def build_document(
         "doc": {k: v for k, v in doc_content.items() if v is not None}
     }
 
-    # Add routing_key for consistent hashing, or omit for round-robin
-    if not round_robin:
-        payload["routing_key"] = book_id
+    # Always include routing_key to leverage consistent hashing by default
+    payload["routing_key"] = book_id
         
     return payload
 
@@ -146,7 +142,6 @@ def ingest(
     index: str,
     data_path: Path,
     dry_run: bool = False,
-    round_robin: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
 ) -> None:
@@ -212,7 +207,7 @@ def ingest(
             if not line:
                 continue
                 
-            doc = build_document(line, round_robin)
+            doc = build_document(line)
             if not doc:
                 continue
 
@@ -274,11 +269,6 @@ def main() -> None:
         help="Print sample documents instead of sending to CameoDB",
     )
     parser.add_argument(
-        "--round-robin",
-        action="store_true",
-        help="Use round-robin distribution instead of consistent hashing",
-    )
-    parser.add_argument(
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
@@ -299,7 +289,6 @@ def main() -> None:
         index=args.index,
         data_path=args.data,
         dry_run=args.dry_run,
-        round_robin=args.round_robin,
         batch_size=args.batch_size,
         max_batch_bytes=max_batch_bytes,
     )

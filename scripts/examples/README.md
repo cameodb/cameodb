@@ -129,11 +129,8 @@ python3 scripts/examples/ingest_books.py --dry-run --batch-size 50
 
 #### Performance Tuning
 ```bash
-# Large batches for faster ingestion
+# Larger batches for faster ingestion (still routed via consistent hashing)
 python3 scripts/examples/ingest_books.py --batch-size 100 --max-batch-mb 4
-
-# Round-robin distribution instead of consistent hashing
-python3 scripts/examples/ingest_books.py --round-robin
 ```
 
 ### Document Structure
@@ -173,7 +170,6 @@ Each book is indexed with the following fields:
 | `--index` | `books` | Target index name |
 | `--data` | `scripts/data/booksummaries.txt` | Path to book summaries data file |
 | `--dry-run` | `false` | Print sample documents instead of sending |
-| `--round-robin` | `false` | Use round-robin instead of consistent hashing |
 | `--batch-size` | `400` | Maximum documents per batch |
 | `--max-batch-mb` | `4` | Maximum batch size in MB |
 
