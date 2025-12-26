@@ -51,7 +51,7 @@ pub struct NodeInfo {
 }
 
 /// Status of a node in the cluster
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
     Connected,
     Disconnected,

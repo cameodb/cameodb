@@ -23,7 +23,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::cluster_coordinator::ShardMetadata;
-use crate::distributed::NodeInfo;
+use crate::distributed::{NodeInfo, NodeStatus};
 use cluster::ConsistentRing;
 
 // ============================================================================
@@ -221,9 +221,11 @@ impl ClusterStateStore {
             table.insert("current", config_bytes.as_slice())?;
         }
 
-        // Write shard assignments
+        // Write shard assignments and prune stale ones
         {
             let mut table = txn.open_table(TABLE_SHARD_ASSIGNMENTS)?;
+
+            // 1. Insert/Update current shards
             for (shard_id, meta) in shards {
                 let key_bytes = shard_id.as_bytes();
                 let persisted = PersistedShardAssignment {
@@ -238,23 +240,65 @@ impl ClusterStateStore {
                 let value_bytes = bincode::serialize(&persisted)?;
                 table.insert(key_bytes.as_slice(), value_bytes.as_slice())?;
             }
+
+            // 2. Prune shards not in the current map
+            // We collect keys to delete first to avoid holding iterator while mutating
+            let mut keys_to_delete = Vec::new();
+            for result in table.iter()? {
+                let (key, _) = result?;
+                let key_slice = key.value();
+                if key_slice.len() == 16 {
+                    let uuid = Uuid::from_bytes(key_slice.try_into().unwrap());
+                    if !shards.contains_key(&uuid) {
+                        keys_to_delete.push(uuid);
+                    }
+                }
+            }
+
+            for shard_id in keys_to_delete {
+                table.remove(shard_id.as_bytes().as_slice())?;
+                // info!(%shard_id, "Pruned stale shard assignment from persistence");
+            }
         }
 
-        // Write node registry
+        // Write node registry and prune stale nodes
         {
             let mut table = txn.open_table(TABLE_NODE_REGISTRY)?;
+
+            // 1. Insert/Update current nodes
             for (node_id, info) in nodes {
                 let key_bytes = node_id.as_bytes();
                 let persisted = PersistedNodeInfo {
                     node_id: *node_id,
                     address: info.address.clone(),
                     shard_count: info.shard_count,
-                    first_seen: current_timestamp(),
+                    first_seen: current_timestamp(), // Ideally we'd preserve the original first_seen
                     last_seen: current_timestamp(),
-                    state: NodeState::Active,
+                    state: match info.status {
+                        NodeStatus::Connected => NodeState::Active,
+                        NodeStatus::Disconnected => NodeState::Lost,
+                    },
                 };
                 let value_bytes = bincode::serialize(&persisted)?;
                 table.insert(key_bytes.as_slice(), value_bytes.as_slice())?;
+            }
+
+            // 2. Prune nodes not in the current map
+            let mut keys_to_delete = Vec::new();
+            for result in table.iter()? {
+                let (key, _) = result?;
+                let key_slice = key.value();
+                if key_slice.len() == 16 {
+                    let uuid = Uuid::from_bytes(key_slice.try_into().unwrap());
+                    if !nodes.contains_key(&uuid) {
+                        keys_to_delete.push(uuid);
+                    }
+                }
+            }
+
+            for node_id in keys_to_delete {
+                table.remove(node_id.as_bytes().as_slice())?;
+                // info!(%node_id, "Pruned stale node from registry");
             }
         }
 

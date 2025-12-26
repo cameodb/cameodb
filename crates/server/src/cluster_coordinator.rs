@@ -209,7 +209,10 @@ impl ClusterCoordinator {
         persisted: PersistedClusterTopology,
         state_store: Arc<ClusterStateStore>,
     ) -> Self {
-        let expected_nodes: HashSet<Uuid> = persisted.nodes.keys().cloned().collect();
+        let mut expected_nodes: HashSet<Uuid> = persisted.nodes.keys().cloned().collect();
+        // Ensure local node is always expected
+        expected_nodes.insert(cluster.local_node_id);
+
         let generation = persisted.config.generation;
         let total_expected = expected_nodes.len();
 
@@ -276,7 +279,7 @@ impl ClusterCoordinator {
     }
 
     /// Persist current cluster state snapshot to disk (event-driven)
-    fn persist_snapshot(&self) {
+    fn persist_snapshot(&mut self) {
         if let Some(state_store) = &self.state_store {
             let config = PersistedClusterConfig {
                 expected_nodes: self.expected_nodes.len(),
@@ -297,6 +300,21 @@ impl ClusterCoordinator {
             ) {
                 warn!(error = %e, "Failed to persist cluster snapshot");
             } else {
+                // Sync expected_nodes with the source of truth (peer_nodes + local)
+                // This ensures that any stale nodes pruned from persistence are also removed from memory
+                let mut new_expected: HashSet<Uuid> =
+                    self.cluster.peer_nodes.keys().cloned().collect();
+                new_expected.insert(self.cluster.local_node_id);
+
+                if new_expected != self.expected_nodes {
+                    info!(
+                        old_count = self.expected_nodes.len(),
+                        new_count = new_expected.len(),
+                        "ClusterCoordinator: synced expected_nodes with current registry"
+                    );
+                    self.expected_nodes = new_expected;
+                }
+
                 info!(
                     generation = self.generation,
                     shards = self.shard_assignments.len(),
@@ -309,7 +327,15 @@ impl ClusterCoordinator {
     /// Evaluate cluster state and transition if needed (reactive, message-driven)
     /// Called after PeerDiscovered/PeerLost to update cluster state
     fn evaluate_and_transition_state(&mut self) {
-        let active_nodes = self.cluster.peer_nodes.len() + 1; // +1 for local node
+        // Count currently connected peers + local node
+        let connected_peers = self
+            .cluster
+            .peer_nodes
+            .values()
+            .filter(|n| n.status == crate::distributed::NodeStatus::Connected)
+            .count();
+        let active_nodes = connected_peers + 1; // +1 for local node
+
         let total_expected = if self.expected_nodes.is_empty() {
             active_nodes // No expectations, treat current as expected
         } else {
