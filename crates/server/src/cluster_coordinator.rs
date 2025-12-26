@@ -675,11 +675,16 @@ impl Message<GetStatus> for ClusterCoordinator {
         _msg: GetStatus,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let status = self.cluster.get_cluster_status();
+        let mut status = self.cluster.get_cluster_status();
+        // Override total_shards with the authoritative count from coordinator's assignment map
+        // This includes local shards + known remote shards
+        status.total_shards = self.shard_assignments.len();
+
         info!(
             cluster = %status.cluster_name,
             total = status.total_nodes,
             connected = status.connected_nodes,
+            shards = status.total_shards,
             "ClusterCoordinator: status snapshot"
         );
         status
@@ -811,6 +816,11 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
     ) -> Self::Reply {
         let node_id = msg.node_id;
         let actual_shards = msg.shards;
+
+        // Update peer shard count in DistributedCluster for visibility
+        if let Some(peer) = self.cluster.peer_nodes.get_mut(&node_id) {
+            peer.shard_count = actual_shards.len();
+        }
 
         // Extract expected shards for this node from snapshot
         let expected_for_node: HashMap<Uuid, &ShardMetadata> = self
