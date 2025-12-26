@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::task;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::cluster_state::{
@@ -480,6 +480,7 @@ impl ClusterCoordinator {
                 uuid: *shard_id,
                 name,
                 vnode_tokens: meta.vnode_tokens.clone(),
+                keypair: None,
             };
             self.ring.add_node(&identity);
         }
@@ -521,6 +522,9 @@ impl Message<InitSwarm> for ClusterCoordinator {
                 if let Some(mut rx) = events {
                     let coordinator = self_ref.clone();
                     task::spawn(async move {
+                        // Track connected peer addresses to correlate with UUIDs later
+                        let mut peer_addresses: HashMap<String, String> = HashMap::new();
+
                         while let Some(event) = rx.recv().await {
                             match event {
                                 CoordinatorEvent::RoutingUpdated { .. } => {
@@ -529,26 +533,49 @@ impl Message<InitSwarm> for ClusterCoordinator {
                                     }
                                 }
                                 CoordinatorEvent::PeerDiscovered { peer_id, address } => {
-                                    let parsed = Uuid::parse_str(&peer_id)
-                                        .unwrap_or_else(|_| Uuid::new_v4());
-                                    if let Err(err) = coordinator
-                                        .ask(PeerDiscovered {
-                                            node_id: parsed,
-                                            address: address.unwrap_or_default(),
-                                        })
-                                        .await
-                                    {
-                                        warn!(error = %err, "ClusterCoordinator: failed to forward peer discovered");
+                                    // Store address for when we discover the UUID
+                                    if let Some(addr) = address {
+                                        peer_addresses.insert(peer_id.clone(), addr);
+                                    }
+                                    // We DO NOT register the peer yet. We wait for PeerUuidDiscovered.
+                                    // This prevents "ghost" nodes with random UUIDs from polluting the cluster state.
+                                    info!(peer_id = %peer_id, "ClusterCoordinator: connected to raw peer, waiting for identity exchange");
+                                }
+                                CoordinatorEvent::PeerUuidDiscovered {
+                                    peer_id,
+                                    node_uuid,
+                                    address,
+                                } => {
+                                    // This event contains the actual node UUID from DHT
+                                    if let Ok(uuid) = Uuid::parse_str(&node_uuid) {
+                                        // Resolve address: explicit in event > cached from connection > unknown
+                                        let resolved_addr = address
+                                            .or_else(|| peer_addresses.get(&peer_id).cloned())
+                                            .unwrap_or_else(|| "unknown".to_string());
+
+                                        if let Err(err) = coordinator
+                                            .ask(PeerDiscovered {
+                                                node_id: uuid,
+                                                address: resolved_addr,
+                                            })
+                                            .await
+                                        {
+                                            warn!(error = %err, "ClusterCoordinator: failed to forward peer UUID discovered");
+                                        }
+                                    } else {
+                                        warn!(node_uuid = %node_uuid, "Failed to parse node UUID from DHT");
                                     }
                                 }
                                 CoordinatorEvent::PeerLost { peer_id } => {
-                                    let parsed = Uuid::parse_str(&peer_id)
-                                        .unwrap_or_else(|_| Uuid::new_v4());
-                                    if let Err(err) =
-                                        coordinator.ask(PeerLost { node_id: parsed }).await
-                                    {
-                                        warn!(error = %err, "ClusterCoordinator: failed to forward peer lost");
-                                    }
+                                    peer_addresses.remove(&peer_id);
+                                    // Note: We can't map PeerID -> NodeUUID easily here without reverse lookup.
+                                    // Ideally, Swarm should send NodeUUID in PeerLost if known, or we map it here.
+                                    // For now, we rely on Kademlia/HealthChecks to eventually cleanup lost nodes
+                                    // or improve PeerLost to carry UUID if we want immediate cleanup.
+                                    // But since we don't have the UUID, we can't notify ClusterCoordinator accurately
+                                    // if we only have peer_id.
+                                    // FUTURE TODO: Maintain PeerID <-> UUID mapping here or in Swarm.
+                                    debug!(peer_id = %peer_id, "ClusterCoordinator: raw peer lost");
                                 }
                                 CoordinatorEvent::DialFailed { peer_id, error } => {
                                     if let Err(err) =
@@ -988,7 +1015,8 @@ mod tests {
 
     fn make_cluster() -> DistributedCluster {
         let cfg = ClusterConfig::default();
-        DistributedCluster::new(cfg, Uuid::new_v4())
+        let path = std::env::temp_dir();
+        DistributedCluster::new(cfg, Uuid::new_v4(), path)
     }
 
     #[test]

@@ -7,6 +7,7 @@ use anyhow;
 use kameo::remote;
 use libp2p::{
     Multiaddr, PeerId,
+    identify,
     kad::{self, Mode as KadMode, store::MemoryStore},
     swarm::NetworkBehaviour,
 };
@@ -16,6 +17,7 @@ use tracing::{info, warn};
 ///
 /// This behaviour provides:
 /// - **Kademlia DHT**: Distributed hash table for peer discovery and content routing
+/// - **Identify**: Automatic peer identification and protocol negotiation
 /// - **Bootstrap support**: Connects to configured bootstrap peers for network entry
 /// - **Enterprise ready**: Designed for corporate and production environments
 #[derive(NetworkBehaviour)]
@@ -24,11 +26,17 @@ pub struct DhtBehaviour {
     pub kameo: remote::Behaviour,
     /// Global discovery & distributed hash table
     pub kademlia: kad::Behaviour<MemoryStore>,
+    /// Identify protocol for peer recognition
+    pub identify: identify::Behaviour,
 }
 
 impl DhtBehaviour {
     /// Create a new Kademlia DHT behaviour
-    pub fn new(local_peer_id: PeerId, kad_mode: Option<KadMode>) -> Result<Self, anyhow::Error> {
+    pub fn new(
+        local_peer_id: PeerId,
+        kad_mode: Option<KadMode>,
+        local_public_key: libp2p::identity::PublicKey,
+    ) -> Result<Self, anyhow::Error> {
         info!("🌐 Initializing Kademlia DHT for distributed peer discovery");
         let store = MemoryStore::new(local_peer_id);
         let mut kademlia = kad::Behaviour::new(local_peer_id, store);
@@ -40,7 +48,63 @@ impl DhtBehaviour {
 
         let kameo = remote::Behaviour::new(local_peer_id, remote::messaging::Config::default());
 
-        Ok(Self { kameo, kademlia })
+        let identify = identify::Behaviour::new(identify::Config::new(
+            "cameodb/1.0.0".to_string(),
+            local_public_key,
+        ));
+
+        Ok(Self {
+            kameo,
+            kademlia,
+            identify,
+        })
+    }
+
+    /// Publish node UUID to DHT so peers can discover it
+    /// Uses local peer ID as the key to ensure uniqueness
+    pub fn publish_node_uuid(
+        &mut self,
+        local_peer_id: &PeerId,
+        node_uuid: uuid::Uuid,
+    ) -> Result<(), anyhow::Error> {
+        use libp2p::kad::{Record, RecordKey};
+
+        // Use peer ID as part of the key to ensure uniqueness per node
+        let key_str = format!("cameodb-uuid-{}", local_peer_id);
+        let key = RecordKey::new(&key_str);
+        let value = node_uuid.to_string().into_bytes();
+
+        let record = Record {
+            key,
+            value,
+            publisher: None,
+            expires: None,
+        };
+
+        match self.kademlia.put_record(record, kad::Quorum::One) {
+            Ok(_) => {
+                info!(
+                    "📝 Published node UUID {} to DHT with key {}",
+                    node_uuid, key_str
+                );
+                Ok(())
+            }
+            Err(e) => {
+                warn!("⚠️  Failed to publish node UUID to DHT: {:?}", e);
+                Err(anyhow::anyhow!("Failed to publish node UUID: {:?}", e))
+            }
+        }
+    }
+
+    /// Query DHT for a peer's node UUID
+    pub fn query_peer_uuid(&mut self, peer_id: &PeerId) -> kad::QueryId {
+        let key_str = format!("cameodb-uuid-{}", peer_id);
+        let key = kad::RecordKey::new(&key_str);
+        info!(
+            "🔍 Querying DHT for peer {} node UUID with key {}",
+            peer_id, key_str
+        );
+        self.kademlia.get_record(key)
     }
 
     /// Bootstrap the Kademlia DHT

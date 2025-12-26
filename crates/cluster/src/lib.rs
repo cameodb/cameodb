@@ -91,6 +91,10 @@ pub struct NodeIdentity {
     pub name: String,
     /// 256 deterministic hash tokens for consistent hashing ring
     pub vnode_tokens: Vec<u64>,
+    /// Optional libp2p keypair (protobuf encoded bytes).
+    /// Stored as bytes to avoid direct dependency on libp2p in this crate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keypair: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -162,7 +166,18 @@ impl NodeIdentity {
             uuid,
             name,
             vnode_tokens,
+            keypair: None,
         }
+    }
+
+    /// Save the identity to disk.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), IdentityError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = File::create(path)?;
+        serde_json::to_writer_pretty(file, self)?;
+        Ok(())
     }
 
     /// Loads an existing identity from disk or creates a new one.
@@ -560,6 +575,7 @@ mod tests {
             uuid: Uuid::nil(),
             name: "000".to_string(),
             vnode_tokens: vec![10, 20, 30],
+            keypair: None,
         };
         ring.add_node(&first_identity);
 
@@ -569,6 +585,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: "001".to_string(),
             vnode_tokens: vec![u64::MAX - 5],
+            keypair: None,
         };
         ring.add_node(&second_identity);
 

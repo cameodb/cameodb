@@ -36,6 +36,7 @@ fn test_wrap_around_behavior() {
         uuid: Uuid::new_v4(),
         name: "AAA".to_string(),
         vnode_tokens: vec![100, 200, 300], // Low values
+        keypair: None,
     };
     let node_a_uuid = node_a.uuid;
 
@@ -57,6 +58,7 @@ fn test_wrap_around_behavior() {
         uuid: Uuid::new_v4(),
         name: "BBB".to_string(),
         vnode_tokens: vec![u64::MAX - 1], // Very high value
+        keypair: None,
     };
     let _node_b_uuid = node_b.uuid;
 
@@ -190,6 +192,7 @@ fn test_node_identity_new() {
         uuid,
         name: identity.name.clone(),
         vnode_tokens: cluster::generate_tokens(uuid),
+        keypair: None,
     };
 
     assert_eq!(identity.vnode_tokens, identity2.vnode_tokens);

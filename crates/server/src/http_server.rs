@@ -120,6 +120,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/:index/_schema", patch(update_schema_handler))
         // Index management
         .route("/_indexes", get(list_indexes_handler))
+        .route("/_cluster/_indexes", get(list_cluster_indexes_handler))
         // Health check
         .route("/_cluster/health", get(health_handler))
         .with_state(state)
@@ -144,6 +145,21 @@ async fn search_handler(
         query: payload.query,
         limit: payload.limit,
     };
+
+    let result = state
+        .router
+        .route_and_handle(client_op, None, OperationType::Read)
+        .await?;
+    Ok(Json(result))
+}
+
+/// Handler for listing all indexes across the cluster
+async fn list_cluster_indexes_handler(
+    State(state): State<AppState>,
+) -> Result<Json<JsonValue>, ApiError> {
+    info!("List cluster indexes request");
+
+    let client_op = ClientOp::ListClusterIndexes;
 
     let result = state
         .router

@@ -96,7 +96,11 @@ async fn main() -> Result<()> {
         .expect("Failed to load persisted cluster state");
 
     // Initialize distributed cluster via ClusterCoordinator actor
-    let distributed_cluster = DistributedCluster::new(cameodb_config.cluster.clone(), node_id);
+    let distributed_cluster = DistributedCluster::new(
+        cameodb_config.cluster.clone(),
+        node_id,
+        cameodb_config.storage.data_paths[0].clone(),
+    );
 
     let coordinator_actor = if let Some(persisted) = persisted_cluster {
         tracing::info!(
@@ -115,6 +119,33 @@ async fn main() -> Result<()> {
         coordinator.set_state_store(state_store.clone());
         ClusterCoordinator::spawn(coordinator)
     };
+
+    // Initialize swarm via actor message (MUST be done before actor registration)
+    match coordinator_actor.ask(InitSwarm).await {
+        Err(err) => {
+            tracing::warn!(error = ?err, "Failed to initialize distributed swarm");
+            println!("⚠️  Distributed swarm initialization failed, continuing in single-node mode");
+        }
+        Ok(peer_id) => {
+            // Get cluster status via actor
+            if let Ok(cluster_status) = coordinator_actor.ask(GetStatus).await {
+                if cluster_status.distributed_enabled {
+                    println!("🌐 Distributed swarm initialized:");
+                    println!("  📡 Cluster: {}", cluster_status.cluster_name);
+                    println!("  🆔 Peer ID: {}", peer_id);
+                    println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
+                    println!("  ✅ Connected: {}", cluster_status.connected_nodes);
+
+                    // Discover peers via actor
+                    if let Ok(peers) = coordinator_actor.ask(DiscoverPeers).await {
+                        if !peers.is_empty() {
+                            println!("  👥 Discovered {} peer nodes", peers.len());
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Register coordinator for remote access so peers can query shard metadata
     let coordinator_remote_name = format!("coordinator-{}", node_id);
@@ -142,33 +173,6 @@ async fn main() -> Result<()> {
         tracing::warn!(name = %remote_name, error = %e, "Failed to register orchestrator for remote access");
     } else {
         tracing::info!(name = %remote_name, "Registered orchestrator for remote access");
-    }
-
-    // Initialize swarm via actor message
-    match coordinator_actor.ask(InitSwarm).await {
-        Err(err) => {
-            tracing::warn!(error = ?err, "Failed to initialize distributed swarm");
-            println!("⚠️  Distributed swarm initialization failed, continuing in single-node mode");
-        }
-        Ok(peer_id) => {
-            // Get cluster status via actor
-            if let Ok(cluster_status) = coordinator_actor.ask(GetStatus).await {
-                if cluster_status.distributed_enabled {
-                    println!("🌐 Distributed swarm initialized:");
-                    println!("  📡 Cluster: {}", cluster_status.cluster_name);
-                    println!("  🆔 Peer ID: {}", peer_id);
-                    println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
-                    println!("  ✅ Connected: {}", cluster_status.connected_nodes);
-
-                    // Discover peers via actor
-                    if let Ok(peers) = coordinator_actor.ask(DiscoverPeers).await {
-                        if !peers.is_empty() {
-                            println!("  👥 Discovered {} peer nodes", peers.len());
-                        }
-                    }
-                }
-            }
-        }
     }
 
     // Create RouterActor with ActorRefs and messaging config

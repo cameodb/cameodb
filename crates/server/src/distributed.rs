@@ -7,6 +7,7 @@
 use anyhow::Result;
 use kameo::Reply;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -20,6 +21,8 @@ use crate::swarm::{self, CoordinatorEvent, SwarmRuntimeHandle, SwarmStartup};
 pub struct DistributedCluster {
     /// Local node configuration
     pub cluster_config: ClusterConfig,
+    /// Path for persistent storage (keys, etc.)
+    pub storage_path: PathBuf,
     /// Map of known remote nodes
     pub peer_nodes: HashMap<Uuid, NodeInfo>,
     /// Local node identity
@@ -56,9 +59,10 @@ pub enum NodeStatus {
 
 impl DistributedCluster {
     /// Create a new distributed cluster manager
-    pub fn new(cluster_config: ClusterConfig, local_node_id: Uuid) -> Self {
+    pub fn new(cluster_config: ClusterConfig, local_node_id: Uuid, storage_path: PathBuf) -> Self {
         Self {
             cluster_config,
+            storage_path,
             peer_nodes: HashMap::new(),
             local_node_id,
             swarm_handle: None,
@@ -91,7 +95,12 @@ impl DistributedCluster {
             bootstrap_peer_count,
             runtime,
             events,
-        } = swarm::init_distributed_swarm(&self.cluster_config).await?;
+        } = swarm::init_distributed_swarm(
+            &self.cluster_config,
+            self.local_node_id,
+            &self.storage_path,
+        )
+        .await?;
 
         self.swarm_handle = Some(runtime);
         self.bootstrap_successes += bootstrap_peer_count as u64;
@@ -114,14 +123,12 @@ impl DistributedCluster {
         info!(
             shard_id = %shard_id,
             shard_name = %shard_name,
-            "Registering shard for distributed access"
+            "Registering shard for distributed access (stub)"
         );
 
-        // TODO: When Kameo remote features are available:
-        // actor.register(&shard_name).await?;
-
-        // For now, simulate registration
-        info!("✅ Shard {} registered in distributed registry", shard_name);
+        // Note: Actual shard registration happens via NodeOrchestrator -> ClusterCoordinator
+        // and implicit Kameo registration if MicroshardActor is marked RemoteActor.
+        // This method is kept for future direct-shard-registration if needed.
 
         Ok(())
     }
@@ -133,34 +140,17 @@ impl DistributedCluster {
             self.cluster_config.cluster_name
         );
 
-        // TODO: When Kameo remote features are available:
-        // let mut peer_orchestrators = RemoteActorRef::<NodeOrchestrator>::lookup_all("orchestrator-*");
-        // while let Some(peer) = peer_orchestrators.try_next().await? {
-        //     self.add_peer_node(peer).await?;
-        // }
+        // Discovery is now event-driven via Kademlia DHT.
+        // The swarm runtime automatically handles:
+        // 1. Bootstrapping via Identify protocol (adds peers to DHT)
+        // 2. DHT RoutingUpdated events (triggers dialing)
+        // 3. PeerUuidDiscovered events (updates peer_nodes map)
 
-        // For now, simulate discovery based on bootstrap nodes
-        let mut discovered_peers = Vec::new();
+        // Return currently known connected peers
+        let known_peers: Vec<NodeInfo> = self.peer_nodes.values().cloned().collect();
 
-        for bootstrap_addr in &self.cluster_config.bootstrap_nodes {
-            let node_info = NodeInfo {
-                node_id: Uuid::new_v4(), // Would be discovered from actual peer
-                address: bootstrap_addr.clone(),
-                status: NodeStatus::Connected,
-                shard_count: 0, // Would be queried from peer
-            };
-
-            info!("📡 Discovered peer node: {}", bootstrap_addr);
-            discovered_peers.push(node_info.clone());
-            self.peer_nodes.insert(node_info.node_id, node_info);
-        }
-
-        if discovered_peers.is_empty() {
-            info!("🔍 No bootstrap peers configured - operating as single node");
-        }
-
-        info!("✅ Discovered {} peer nodes", discovered_peers.len());
-        Ok(discovered_peers)
+        info!("✅ Known connected peer nodes: {}", known_peers.len());
+        Ok(known_peers)
     }
 
     /// Record a routing table update event from the swarm.
@@ -195,34 +185,27 @@ impl DistributedCluster {
     /// Route a request to the appropriate shard, potentially on a remote node
     #[allow(dead_code)] // Framework method, used when Kameo remote features are enabled
     pub async fn route_to_shard(&self, shard_id: Uuid, operation: &str) -> Result<String> {
-        let shard_name = format!("shard-{}", shard_id);
+        let _shard_name = format!("shard-{}", shard_id);
 
         info!(
             shard_id = %shard_id,
             operation = %operation,
-            "Routing operation to distributed shard"
+            "Routing operation to distributed shard (stub)"
         );
 
-        // TODO: When Kameo remote features are available:
+        // Note: Actual routing happens via RouterActor -> ClusterCoordinator -> NodeOrchestrator.
+        // This method is legacy/simulated logic and should not be used in the new architecture.
+        // We return an error to ensure callers migrate to the proper flow.
+
+        // TODO: When Kameo remote features are available and if direct shard routing is needed:
         // if let Some(remote_shard) = RemoteActorRef::<MicroshardActor>::lookup(&shard_name).await? {
         //     let result = remote_shard.ask(&operation_message).await?;
         //     return Ok(result);
         // }
 
-        // For now, simulate routing decision
-        if let Some(peer) = self.peer_nodes.values().next() {
-            info!("📤 Routing {} to peer node {}", operation, peer.address);
-            Ok(format!(
-                "Routed {} to shard {} on node {}",
-                operation, shard_name, peer.address
-            ))
-        } else {
-            info!("🏠 Handling {} locally", operation);
-            Ok(format!(
-                "Handled {} locally for shard {}",
-                operation, shard_name
-            ))
-        }
+        Err(anyhow::anyhow!(
+            "Direct DistributedCluster routing is deprecated. Use RouterActor."
+        ))
     }
 
     /// Get cluster status and health information

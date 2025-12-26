@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
+use tracing::info;
 
 /// Configuration errors that can occur during loading or validation
 #[derive(Debug, Error)]
@@ -267,18 +268,26 @@ impl CameoDbConfig {
 
     /// Load configuration from YAML or TOML file
     pub fn load_from_file() -> Result<Self> {
-        // Try different config file locations
-        let config_paths = [
+        let mut config_paths = vec![
             "cameodb.toml",
             "cameodb.yaml",
             "cameodb.yml",
             "config/cameodb.toml",
             "config/cameodb.yaml",
+            "/etc/cameodb/cameodb.toml",
             "/etc/cameodb/config.toml",
         ];
 
+        // If CAMEODB_CONFIG env var is set, prepend it to the search list
+        let env_config = std::env::var("CAMEODB_CONFIG").ok();
+        if let Some(path) = env_config.as_deref() {
+            // Insert at the beginning to give it highest priority
+            config_paths.insert(0, path);
+        }
+
         for path in &config_paths {
             if let Ok(content) = fs::read_to_string(path) {
+                info!("📄 Loading configuration from: {}", path);
                 return Self::parse_config_content(&content, path)
                     .with_context(|| format!("Failed to parse config file: {}", path));
             }

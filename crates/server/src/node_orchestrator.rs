@@ -276,6 +276,8 @@ pub enum ClientOp {
     GetConfig { index: String },
     /// List all available indexes with statistics
     ListIndexes,
+    /// List all indexes across the cluster (broadcast)
+    ListClusterIndexes,
 }
 
 // ============================================================================
@@ -300,6 +302,16 @@ pub struct GetShardIds;
 pub struct NodeIdentityInfo {
     pub uuid: Uuid,
     pub name: String,
+}
+
+/// Helper struct for aggregating index statistics across cluster nodes.
+#[derive(Debug, Clone)]
+struct IndexStats {
+    name: String,
+    document_count: u64,
+    total_size_bytes: u64,
+    shard_count: usize,
+    field_names: Vec<String>,
 }
 
 /// Microshard actor that manages a single shard's storage and search operations.
@@ -886,6 +898,14 @@ impl RouterActor {
             .await
             .unwrap_or_default();
 
+        info!(
+            "🔍 Broadcast operation: got {} known peers from coordinator",
+            peers.len()
+        );
+        for peer in &peers {
+            info!("  📍 Peer: {} at {}", peer.node_id, peer.address);
+        }
+
         let peer_count = peers.len().min(self.broadcast_fanout_limit);
         info!(
             timeout_ms = self.broadcast_timeout.as_millis(),
@@ -1002,6 +1022,109 @@ impl RouterActor {
                     "nodes_failed": error_count
                 }))
             }
+            ClientOp::ListClusterIndexes => {
+                // Merge index statistics from all nodes
+                let mut index_map: HashMap<String, IndexStats> = HashMap::new();
+                let mut node_details: Vec<JsonValue> = Vec::new();
+
+                for result in &all_results {
+                    // Extract node_id from each response
+                    let node_id = result
+                        .get("node_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+
+                    // Collect per-node details
+                    node_details.push(serde_json::json!({
+                        "node_id": node_id,
+                        "indexes": result.get("indexes").cloned().unwrap_or(serde_json::json!([])),
+                        "total_indexes": result.get("total_indexes").and_then(|v| v.as_u64()).unwrap_or(0),
+                        "total_shards": result.get("total_shards").and_then(|v| v.as_u64()).unwrap_or(0),
+                    }));
+
+                    // Aggregate index stats across nodes
+                    if let Some(indexes) = result.get("indexes").and_then(|v| v.as_array()) {
+                        for idx in indexes {
+                            let name = idx
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if name.is_empty() {
+                                continue;
+                            }
+
+                            let entry = index_map.entry(name.clone()).or_insert(IndexStats {
+                                name: name.clone(),
+                                document_count: 0,
+                                total_size_bytes: 0,
+                                shard_count: 0,
+                                field_names: Vec::new(),
+                            });
+
+                            entry.document_count += idx
+                                .get("document_count")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            entry.total_size_bytes += idx
+                                .get("total_size_bytes")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            entry.shard_count +=
+                                idx.get("shard_count").and_then(|v| v.as_u64()).unwrap_or(0)
+                                    as usize;
+
+                            // Merge field names (union)
+                            if let Some(fields) = idx.get("field_names").and_then(|v| v.as_array())
+                            {
+                                for field in fields {
+                                    if let Some(field_str) = field.as_str() {
+                                        if !entry.field_names.contains(&field_str.to_string()) {
+                                            entry.field_names.push(field_str.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Sort field names for each index
+                for stats in index_map.values_mut() {
+                    stats
+                        .field_names
+                        .sort_by(|a, b| match (a.as_str(), b.as_str()) {
+                            ("id", "id") => std::cmp::Ordering::Equal,
+                            ("id", _) => std::cmp::Ordering::Less,
+                            (_, "id") => std::cmp::Ordering::Greater,
+                            _ => a.cmp(b),
+                        });
+                }
+
+                // Convert to JSON array
+                let cluster_indexes: Vec<JsonValue> = index_map
+                    .into_iter()
+                    .map(|(_, stats)| {
+                        serde_json::json!({
+                            "name": stats.name,
+                            "document_count": stats.document_count,
+                            "total_size_bytes": stats.total_size_bytes,
+                            "size_mb": stats.total_size_bytes / (1024 * 1024),
+                            "shard_count": stats.shard_count,
+                            "field_names": stats.field_names,
+                        })
+                    })
+                    .collect();
+
+                Ok(serde_json::json!({
+                    "indexes": cluster_indexes,
+                    "total_indexes": cluster_indexes.len(),
+                    "nodes_contacted": all_results.len(),
+                    "nodes_failed": error_count,
+                    "nodes": node_details,
+                }))
+            }
             _ => {
                 // For other operations, return first successful result or error
                 if let Some(first) = all_results.first() {
@@ -1090,24 +1213,37 @@ impl RouterActor {
         &self,
         op: ClientOp,
         node_id: Uuid,
-        _peer_addr: &str,
+        peer_addr: &str,
     ) -> Result<JsonValue, OrchestratorError> {
         let orchestrator_name = orchestrator_remote_name(&node_id);
+        info!(
+            "🔎 Attempting remote actor lookup: name='{}', node_id={}, addr={}",
+            orchestrator_name, node_id, peer_addr
+        );
+
         let remote_ref: Option<RemoteActorRef<NodeOrchestrator>> =
             RemoteActorRef::lookup(orchestrator_name.clone())
                 .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+                .map_err(|e| {
+                    warn!("❌ Remote actor lookup error: {}", e);
+                    OrchestratorError::Io(std::io::Error::other(e.to_string()))
+                })?;
 
         match remote_ref {
             Some(remote) => {
-                let result = remote
-                    .ask(&op)
-                    .await
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+                info!("✅ Remote actor found: {}", orchestrator_name);
+                let result = remote.ask(&op).await.map_err(|e| {
+                    warn!("❌ Remote actor ask failed: {}", e);
+                    OrchestratorError::Io(std::io::Error::other(e.to_string()))
+                })?;
+                info!("✅ Remote actor responded successfully");
                 Ok(result)
             }
             None => {
-                warn!(%node_id, name = %orchestrator_name, "Remote orchestrator not found");
+                warn!(
+                    "❌ Remote orchestrator not found: name='{}', node_id={}",
+                    orchestrator_name, node_id
+                );
                 Err(OrchestratorError::Io(std::io::Error::other(format!(
                     "remote orchestrator {} not found",
                     orchestrator_name
@@ -1436,6 +1572,7 @@ impl NodeOrchestrator {
             uuid: shard_id,
             name,
             vnode_tokens: generate_tokens(shard_id),
+            keypair: None,
         };
         self.routing_ring.add_node(&identity);
     }
@@ -1495,7 +1632,7 @@ impl NodeOrchestrator {
                 self.orch_create_config(&index, schema).await
             }
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
-            ClientOp::ListIndexes => self.orch_list_indexes().await,
+            ClientOp::ListIndexes | ClientOp::ListClusterIndexes => self.orch_list_indexes().await,
         }
     }
 
