@@ -37,8 +37,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::cluster_coordinator::{
-    ClusterCoordinator, OperationType, RegisterLocalShards, RequestBootstrapRedial, RouteOperation,
-    RoutingDecision, ShardMetadata,
+    ClusterCoordinator, GetKnownPeers, GetShardAssignments, OperationType, RegisterLocalShards,
+    RequestBootstrapRedial, RouteOperation, RoutingDecision, ShardMetadata,
 };
 use crate::config::MessagingConfig;
 use cluster::{ConsistentRing, IdentityError, NodeIdentity, generate_tokens};
@@ -1294,6 +1294,52 @@ pub struct NodeOrchestrator {
 }
 
 impl NodeOrchestrator {
+    /// Forward a bulk batch to a remote node's orchestrator.
+    async fn forward_bulk_to_remote(
+        &self,
+        node_id: Uuid,
+        peer_addr: &str,
+        index: &str,
+        docs: Vec<DocPayload>,
+    ) -> Result<usize, OrchestratorError> {
+        let orchestrator_name = orchestrator_remote_name(&node_id);
+        info!(
+            "🔎 Forwarding bulk batch to remote orchestrator: name='{}', node_id={}, addr={}",
+            orchestrator_name, node_id, peer_addr
+        );
+
+        let remote_ref: Option<RemoteActorRef<NodeOrchestrator>> =
+            RemoteActorRef::lookup(orchestrator_name.clone())
+                .await
+                .map_err(|e| {
+                    warn!("❌ Remote actor lookup error: {}", e);
+                    OrchestratorError::Io(std::io::Error::other(e.to_string()))
+                })?;
+
+        let remote = remote_ref.ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "remote orchestrator {} not found",
+                orchestrator_name
+            )))
+        })?;
+
+        let op = ClientOp::BulkWrite {
+            index: index.to_string(),
+            docs,
+        };
+
+        let result = remote.ask(&op).await.map_err(|e| {
+            warn!("❌ Remote actor ask failed: {}", e);
+            OrchestratorError::Io(std::io::Error::other(e.to_string()))
+        })?;
+
+        let items_written = result
+            .get("items_written")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        Ok(items_written)
+    }
+
     /// Fetch a schema from cache if present.
     fn get_cached_schema(&self, index: &str) -> Option<IndexSchema> {
         self.schema_cache
@@ -1752,20 +1798,24 @@ impl NodeOrchestrator {
         // as single-write: explicit routing_key → doc id → derived key.
         let items_received = docs.len();
         let mut batches: HashMap<Uuid, Vec<(DocPayload, Option<String>)>> = HashMap::new();
+        let mut routing_errors = Vec::new();
         for doc in docs {
             let effective_routing_key = doc
                 .routing_key
                 .clone()
                 .or_else(|| derive_routing_key_from_doc(&doc.doc));
 
-            let target = self
-                .route_write(&effective_routing_key)
-                .unwrap_or_else(|_| self.shards.keys().next().copied().unwrap());
-
-            batches
-                .entry(target)
-                .or_default()
-                .push((doc, effective_routing_key));
+            match self.route_write(&effective_routing_key) {
+                Ok(target) => {
+                    batches
+                        .entry(target)
+                        .or_default()
+                        .push((doc, effective_routing_key));
+                }
+                Err(err) => {
+                    routing_errors.push(format!("routing failed for doc {}: {}", doc.id, err));
+                }
+            }
         }
 
         tracing::debug!(
@@ -1774,35 +1824,92 @@ impl NodeOrchestrator {
             "BulkWrite grouped items by shard"
         );
 
+        // Fetch shard ownership and peer addresses to forward remote batches.
+        let mut shard_assignments = HashMap::new();
+        let mut peer_addrs = HashMap::new();
+        if let Some(coord) = &self.coordinator {
+            shard_assignments = coord.ask(GetShardAssignments).await.unwrap_or_default();
+            peer_addrs = coord
+                .ask(GetKnownPeers)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| (p.node_id, p.address))
+                .collect();
+        }
+
         let mut written = 0usize;
-        let mut errors = Vec::new();
+        let mut errors = routing_errors;
         for (shard_id, batch) in batches {
-            if let Some(shard) = self.shards.get(&shard_id) {
-                tracing::debug!(
-                    shard_id = %shard_id,
-                    count = batch.len(),
-                    "Processing bulk write batch for local shard"
-                );
-                let ops: Vec<ClientOp> = batch
-                    .iter()
-                    .cloned()
-                    .map(|(d, effective_routing_key)| ClientOp::Write {
-                        index: index.to_string(),
-                        id: d.id,
-                        routing_key: effective_routing_key,
-                        doc: d.doc,
-                    })
-                    .collect();
-                match shard.handle_batch_write(BatchWriteRequest { ops }).await {
-                    Ok(seq_ids) => written += seq_ids.len(),
-                    Err(e) => errors.push(format!("Shard {}: {}", shard_id, e)),
+            let owner_node = shard_assignments.get(&shard_id).map(|m| m.node_id);
+
+            match owner_node {
+                Some(node_id) if node_id == self.identity.uuid => {
+                    if let Some(shard) = self.shards.get(&shard_id) {
+                        tracing::debug!(
+                            shard_id = %shard_id,
+                            count = batch.len(),
+                            "Processing bulk write batch for local shard"
+                        );
+                        let ops: Vec<ClientOp> = batch
+                            .into_iter()
+                            .map(|(d, effective_routing_key)| ClientOp::Write {
+                                index: index.to_string(),
+                                id: d.id,
+                                routing_key: effective_routing_key,
+                                doc: d.doc,
+                            })
+                            .collect();
+                        match shard.handle_batch_write(BatchWriteRequest { ops }).await {
+                            Ok(seq_ids) => written += seq_ids.len(),
+                            Err(e) => errors.push(format!("Shard {}: {}", shard_id, e)),
+                        }
+                    } else {
+                        errors.push(format!("Local shard {} not found", shard_id));
+                    }
                 }
-            } else {
-                tracing::debug!(
-                    shard_id = %shard_id,
-                    count = batch.len(),
-                    "Skipping bulk write batch for remote shard"
-                );
+                Some(node_id) => {
+                    let peer_addr = peer_addrs.get(&node_id).cloned();
+                    if let Some(addr) = peer_addr {
+                        tracing::debug!(
+                            shard_id = %shard_id,
+                            owner = %node_id,
+                            count = batch.len(),
+                            "Forwarding bulk write batch to remote owner"
+                        );
+                        let docs_for_remote: Vec<DocPayload> = batch
+                            .into_iter()
+                            .map(|(d, effective_routing_key)| DocPayload {
+                                id: d.id,
+                                routing_key: effective_routing_key,
+                                doc: d.doc,
+                            })
+                            .collect();
+                        match self
+                            .forward_bulk_to_remote(node_id, &addr, index, docs_for_remote)
+                            .await
+                        {
+                            Ok(items) => {
+                                written += items;
+                            }
+                            Err(e) => errors.push(format!(
+                                "Remote shard {} (node {}) forwarding failed: {}",
+                                shard_id, node_id, e
+                            )),
+                        }
+                    } else {
+                        errors.push(format!(
+                            "No peer address for owner {} of shard {}",
+                            node_id, shard_id
+                        ));
+                    }
+                }
+                None => {
+                    errors.push(format!(
+                        "No shard assignment for shard {}; dropping batch",
+                        shard_id
+                    ));
+                }
             }
         }
         Ok(

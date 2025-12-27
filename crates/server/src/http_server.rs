@@ -236,11 +236,26 @@ async fn bulk_write_handler(
         docs.len()
     );
 
+    // Derive a routing hint from the first document to avoid cluster-wide broadcast:
+    // prefer explicit routing_key, then id, then a deterministic hash of the document.
+    let routing_hint = docs.first().and_then(|doc| {
+        doc.routing_key.clone().or_else(|| {
+            if !doc.id.is_empty() {
+                Some(doc.id.clone())
+            } else {
+                // Fallback: hash the document bytes to keep routing stable
+                serde_json::to_vec(&doc.doc)
+                    .ok()
+                    .and_then(|bytes| Some(format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes))))
+            }
+        })
+    });
+
     let client_op = ClientOp::BulkWrite { index, docs };
 
     let result = state
         .router
-        .route_and_handle(client_op, None, OperationType::Write)
+        .route_and_handle(client_op, routing_hint, OperationType::Write)
         .await?;
     Ok(Json(result))
 }
