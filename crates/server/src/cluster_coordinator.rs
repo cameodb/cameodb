@@ -10,6 +10,7 @@ use kameo::{Actor, RemoteActor, Reply, remote_message};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::task;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -25,6 +26,12 @@ use cluster::{ConsistentRing, NodeIdentity};
 // ============================================================================
 // Message Definitions
 // ============================================================================
+
+/// Message to subscribe to topology (ring) updates.
+#[derive(Debug, Clone)]
+pub struct SubscribeTopology {
+    pub subscriber: mpsc::Sender<ConsistentRing>,
+}
 
 /// Message to initialize the distributed swarm.
 #[derive(Debug, Clone)]
@@ -181,6 +188,9 @@ pub struct ClusterCoordinator {
 
     // Track expected shards from snapshot for reconciliation
     expected_shards: HashMap<Uuid, ShardMetadata>,
+
+    // Subscribers for topology updates
+    topology_subscribers: Vec<mpsc::Sender<ConsistentRing>>,
 }
 
 impl ClusterCoordinator {
@@ -199,6 +209,7 @@ impl ClusterCoordinator {
             generation: 1,
             state_store: None,
             expected_shards: HashMap::new(),
+            topology_subscribers: Vec::new(),
         }
     }
 
@@ -264,6 +275,7 @@ impl ClusterCoordinator {
             generation,
             state_store: Some(state_store),
             expected_shards,
+            topology_subscribers: Vec::new(),
         }
     }
 
@@ -510,6 +522,26 @@ impl ClusterCoordinator {
             };
             self.ring.add_node(&identity);
         }
+
+        // Notify subscribers of the new topology
+        if !self.topology_subscribers.is_empty() {
+            info!(
+                subscriber_count = self.topology_subscribers.len(),
+                "ClusterCoordinator: broadcasting topology update"
+            );
+
+            let ring_clone = self.ring.clone();
+            self.topology_subscribers.retain(|tx| {
+                match tx.try_send(ring_clone.clone()) {
+                    Ok(_) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false, // Prune closed channels
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!("ClusterCoordinator: subscriber channel full, skipping update");
+                        true
+                    }
+                }
+            });
+        }
     }
 
     fn route_for_key(&self, key: &str) -> Option<Uuid> {
@@ -531,6 +563,21 @@ impl ClusterCoordinator {
 // ============================================================================
 // Message Handlers
 // ============================================================================
+
+impl Message<SubscribeTopology> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SubscribeTopology,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        info!("ClusterCoordinator: new topology subscriber registered");
+        // Send current ring immediately
+        let _ = msg.subscriber.try_send(self.ring.clone());
+        self.topology_subscribers.push(msg.subscriber);
+    }
+}
 
 impl Message<InitSwarm> for ClusterCoordinator {
     type Reply = Result<String>; // Returns peer_id on success

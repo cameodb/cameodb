@@ -10,15 +10,19 @@ mod http_server;
 mod node_orchestrator;
 mod swarm;
 
-use cluster_coordinator::{ClusterCoordinator, DiscoverPeers, GetStatus, InitSwarm, ShutdownSwarm};
+use cluster_coordinator::{
+    ClusterCoordinator, DiscoverPeers, GetStatus, InitSwarm, ShutdownSwarm, SubscribeTopology,
+};
 use cluster_state::ClusterStateStore;
 use config::CameoDbConfig;
 use distributed::DistributedCluster;
 use http_server::{AppState, create_router};
 use node_orchestrator::{
-    NodeConfig, NodeOrchestrator, ProposeShard, RouterActor, orchestrator_remote_name,
+    NodeConfig, NodeOrchestrator, ProposeShard, RouterActor, UpdateTopology,
+    orchestrator_remote_name,
 };
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -174,6 +178,27 @@ async fn main() -> Result<()> {
     } else {
         tracing::info!(name = %remote_name, "Registered orchestrator for remote access");
     }
+
+    // Subscribe orchestrator to cluster topology updates to maintain global routing awareness
+    let (ring_tx, mut ring_rx) = mpsc::channel(16);
+    if let Err(e) = coordinator_actor
+        .tell(SubscribeTopology {
+            subscriber: ring_tx,
+        })
+        .await
+    {
+        tracing::warn!(error = %e, "Failed to subscribe orchestrator to topology updates");
+    }
+
+    // Spawn task to forward topology updates from coordinator to orchestrator
+    let orchestrator_for_updates = orchestrator_ref.clone();
+    tokio::spawn(async move {
+        while let Some(ring) = ring_rx.recv().await {
+            if let Err(e) = orchestrator_for_updates.tell(UpdateTopology { ring }).await {
+                tracing::warn!(error = %e, "Failed to forward topology update to orchestrator");
+            }
+        }
+    });
 
     // Create RouterActor with ActorRefs and messaging config
     let router_actor = RouterActor::with_config(

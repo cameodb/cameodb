@@ -296,6 +296,12 @@ pub struct GetIdentity;
 #[derive(Debug, Clone)]
 pub struct GetShardIds;
 
+/// Message to update the global routing topology (consistent ring).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateTopology {
+    pub ring: ConsistentRing,
+}
+
 /// Response containing node identity info for actor replies.
 #[derive(Debug, Clone, kameo::Reply)]
 #[allow(dead_code)] // Fields will be used when RouterActor migrates to ActorRef
@@ -1015,11 +1021,27 @@ impl RouterActor {
             ClientOp::Write { .. } | ClientOp::BulkWrite { .. } => {
                 // For writes, return aggregate success info
                 let total_nodes = all_results.len();
+
+                // Aggregate items_written and errors from all node responses
+                let mut items_written = 0u64;
+                let mut errors = Vec::new();
+
+                for result in &all_results {
+                    if let Some(n) = result.get("items_written").and_then(|v| v.as_u64()) {
+                        items_written += n;
+                    }
+                    if let Some(errs) = result.get("errors").and_then(|v| v.as_array()) {
+                        errors.extend(errs.clone());
+                    }
+                }
+
                 Ok(serde_json::json!({
-                    "success": error_count == 0,
+                    "success": error_count == 0 && errors.is_empty(),
                     "nodes_contacted": total_nodes + error_count as usize,
                     "nodes_succeeded": total_nodes,
-                    "nodes_failed": error_count
+                    "nodes_failed": error_count,
+                    "items_written": items_written,
+                    "errors": errors
                 }))
             }
             ClientOp::ListClusterIndexes => {
@@ -1745,10 +1767,22 @@ impl NodeOrchestrator {
                 .or_default()
                 .push((doc, effective_routing_key));
         }
+
+        tracing::debug!(
+            items_received = items_received,
+            unique_shards = batches.len(),
+            "BulkWrite grouped items by shard"
+        );
+
         let mut written = 0usize;
         let mut errors = Vec::new();
         for (shard_id, batch) in batches {
             if let Some(shard) = self.shards.get(&shard_id) {
+                tracing::debug!(
+                    shard_id = %shard_id,
+                    count = batch.len(),
+                    "Processing bulk write batch for local shard"
+                );
                 let ops: Vec<ClientOp> = batch
                     .iter()
                     .cloned()
@@ -1763,6 +1797,12 @@ impl NodeOrchestrator {
                     Ok(seq_ids) => written += seq_ids.len(),
                     Err(e) => errors.push(format!("Shard {}: {}", shard_id, e)),
                 }
+            } else {
+                tracing::debug!(
+                    shard_id = %shard_id,
+                    count = batch.len(),
+                    "Skipping bulk write batch for remote shard"
+                );
             }
         }
         Ok(
@@ -2098,6 +2138,22 @@ impl Message<ClientOp> for NodeOrchestrator {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.handle_client_op(msg).await
+    }
+}
+
+impl Message<UpdateTopology> for NodeOrchestrator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: UpdateTopology,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        info!(
+            ring_nodes = msg.ring.len(),
+            "NodeOrchestrator: received global topology update"
+        );
+        self.routing_ring = msg.ring;
     }
 }
 
