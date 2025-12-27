@@ -238,6 +238,10 @@ fn get_directory_size(path: &PathBuf) -> Result<u64, std::io::Error> {
     Ok(total_size)
 }
 
+/// Type alias for the read cache to satisfy clippy::type-complexity
+/// Maps: Index Name -> Document ID -> Document Bytes
+type ReadCache = HashMap<String, HashMap<String, Vec<u8>>>;
+
 /// Multi-tenant hybrid storage engine combining redb and tantivy.
 pub struct HybridStore {
     /// Shared redb database across all indices
@@ -251,7 +255,7 @@ pub struct HybridStore {
     /// Operation counters for smart commits per index
     operations_counter: Arc<RwLock<HashMap<String, AtomicU64>>>,
     /// Simple per-index read cache for frequently accessed documents
-    read_cache: Arc<RwLock<HashMap<String, HashMap<String, Vec<u8>>>>>,
+    read_cache: Arc<RwLock<ReadCache>>,
     /// Cache of optimal memory budgets per index to avoid frequent syscalls
     budget_cache: Arc<RwLock<HashMap<String, usize>>>,
     /// Cache of schemas per index to avoid repeated redb reads
@@ -287,33 +291,26 @@ impl HybridStore {
 
     /// Get a value from the read cache if present.
     fn get_from_cache(&self, index: &str, key: &str) -> Option<Vec<u8>> {
-        if let Ok(cache_map) = self.read_cache.read() {
-            if let Some(index_cache) = cache_map.get(index) {
-                if let Some(value) = index_cache.get(key) {
-                    return Some(value.clone());
-                }
-            }
-        }
-        None
+        let cache_map = self.read_cache.read().unwrap();
+        cache_map.get(index)?.get(key).cloned()
     }
 
     /// Insert a value into the read cache with a simple per-index size bound.
     fn insert_into_cache(&self, index: &str, key: &str, value: Vec<u8>) {
         const MAX_CACHE_ENTRIES_PER_INDEX: usize = 1024;
 
-        if let Ok(mut cache_map) = self.read_cache.write() {
-            let index_cache = cache_map
-                .entry(index.to_string())
-                .or_insert_with(HashMap::new);
+        let mut cache_map = self.read_cache.write().unwrap();
+        let index_cache = cache_map
+            .entry(index.to_string())
+            .or_insert_with(HashMap::new);
 
-            if index_cache.len() >= MAX_CACHE_ENTRIES_PER_INDEX {
-                if let Some(first_key) = index_cache.keys().next().cloned() {
-                    index_cache.remove(&first_key);
-                }
-            }
-
-            index_cache.insert(key.to_string(), value);
+        if index_cache.len() >= MAX_CACHE_ENTRIES_PER_INDEX
+            && let Some(first_key) = index_cache.keys().next().cloned()
+        {
+            index_cache.remove(&first_key);
         }
+
+        index_cache.insert(key.to_string(), value);
     }
 
     /// Creates the default Tantivy schema.
@@ -364,9 +361,8 @@ impl HybridStore {
         let optimal_budget = self.config.get_optimal_memory_budget(&index_path);
 
         // Cache the budget
-        if let Ok(mut cache) = self.budget_cache.write() {
-            cache.insert(index.to_string(), optimal_budget);
-        }
+        let mut cache = self.budget_cache.write().unwrap();
+        cache.insert(index.to_string(), optimal_budget);
 
         let writer = tantivy_index.writer(optimal_budget)?;
         let writer_arc = Arc::new(Mutex::new(writer));
@@ -406,9 +402,8 @@ impl HybridStore {
                 // Fallback: calculate and cache
                 let index_path = self.config.shard_path.join("indices").join(index);
                 let b = self.config.get_optimal_memory_budget(&index_path);
-                if let Ok(mut cache) = self.budget_cache.write() {
-                    cache.insert(index.to_string(), b);
-                }
+                let mut cache = self.budget_cache.write().unwrap();
+                cache.insert(index.to_string(), b);
                 b
             }
         };
@@ -431,9 +426,8 @@ impl HybridStore {
 
     /// Get operation count for an index since last commit
     fn get_operations_count(&self, index: &str) -> u64 {
-        if let Ok(counter_map) = self.operations_counter.read()
-            && let Some(counter) = counter_map.get(index)
-        {
+        let counter_map = self.operations_counter.read().unwrap();
+        if let Some(counter) = counter_map.get(index) {
             return counter.load(Ordering::SeqCst);
         }
         0
@@ -450,9 +444,8 @@ impl HybridStore {
         }
 
         // Increment and return new count
-        if let Ok(counter_map) = self.operations_counter.read()
-            && let Some(counter) = counter_map.get(index)
-        {
+        let counter_map = self.operations_counter.read().unwrap();
+        if let Some(counter) = counter_map.get(index) {
             return counter.fetch_add(1, Ordering::SeqCst) + 1;
         }
         0
@@ -460,9 +453,8 @@ impl HybridStore {
 
     /// Reset operation counter after commit
     fn reset_operations_counter(&self, index: &str) {
-        if let Ok(counter_map) = self.operations_counter.read()
-            && let Some(counter) = counter_map.get(index)
-        {
+        let counter_map = self.operations_counter.read().unwrap();
+        if let Some(counter) = counter_map.get(index) {
             counter.store(0, Ordering::SeqCst);
         }
     }
@@ -471,22 +463,21 @@ impl HybridStore {
     fn maybe_commit_writer(&self, index: &str) -> Result<bool, StoreError> {
         let ops_count = self.get_operations_count(index);
 
-        if self.should_commit_writer(index, ops_count)
-            && let Ok(writers) = self.writers.read()
-            && let Some(writer_arc) = writers.get(index)
-        {
-            let mut writer = writer_arc.lock().unwrap();
-            writer.commit()?;
-            self.reset_operations_counter(index);
+        if self.should_commit_writer(index, ops_count) {
+            let writers = self.writers.read().unwrap();
+            if let Some(writer_arc) = writers.get(index) {
+                let mut writer = writer_arc.lock().unwrap();
+                writer.commit()?;
+                self.reset_operations_counter(index);
 
-            // Refresh budget cache after commit since index size likely changed
-            let index_path = self.config.shard_path.join("indices").join(index);
-            let new_budget = self.config.get_optimal_memory_budget(&index_path);
-            if let Ok(mut cache) = self.budget_cache.write() {
+                // Refresh budget cache after commit since index size likely changed
+                let index_path = self.config.shard_path.join("indices").join(index);
+                let new_budget = self.config.get_optimal_memory_budget(&index_path);
+                let mut cache = self.budget_cache.write().unwrap();
                 cache.insert(index.to_string(), new_budget);
-            }
 
-            return Ok(true); // Commit performed
+                return Ok(true); // Commit performed
+            }
         }
         Ok(false) // No commit needed
     }
@@ -550,7 +541,7 @@ impl HybridStore {
                     let mut tantivy_doc = doc!(fields.id => id.as_str());
 
                     // Check if 'body' field should be indexed
-                    let body_indexed = schema.fields.get("body").map_or(true, |f| f.indexed);
+                    let body_indexed = schema.fields.get("body").is_none_or(|f| f.indexed);
 
                     if body_indexed {
                         tantivy_doc.add_text(fields.body, &body);
@@ -561,7 +552,7 @@ impl HybridStore {
                         for (field_name, field_value) in json_obj {
                             // Check if field should be indexed
                             let should_index =
-                                schema.fields.get(field_name).map_or(false, |f| f.indexed);
+                                schema.fields.get(field_name).is_some_and(|f| f.indexed);
 
                             if should_index {
                                 // Only serialize and index if marked as indexed
@@ -610,6 +601,18 @@ impl HybridStore {
         {
             let mut seq_map = self.current_seq.write().unwrap();
             seq_map.remove(index);
+        }
+        {
+            let mut read_cache = self.read_cache.write().unwrap();
+            read_cache.remove(index);
+        }
+        {
+            let mut schema_cache = self.schema_cache.write().unwrap();
+            schema_cache.remove(index);
+        }
+        {
+            let mut budget_cache = self.budget_cache.write().unwrap();
+            budget_cache.remove(index);
         }
 
         // Delete redb tables completely using delete_table() for efficiency
@@ -737,7 +740,8 @@ impl HybridStore {
     /// Get schema from cache, or load from redb and cache it
     pub fn get_schema_cached(&self, index: &str) -> Result<Option<Arc<IndexSchema>>, StoreError> {
         // Fast path: check cache
-        if let Ok(cache) = self.schema_cache.read() {
+        {
+            let cache = self.schema_cache.read().unwrap();
             if let Some(schema) = cache.get(index) {
                 return Ok(Some(Arc::clone(schema)));
             }
@@ -760,9 +764,8 @@ impl HybridStore {
 
     /// Invalidate cache entry when schema is updated
     pub fn invalidate_schema_cache(&self, index: &str) {
-        if let Ok(mut cache) = self.schema_cache.write() {
-            cache.remove(index);
-        }
+        let mut cache = self.schema_cache.write().unwrap();
+        cache.remove(index);
     }
 
     /// Update both redb and cache atomically
@@ -776,9 +779,8 @@ impl HybridStore {
 
         // Update cache
         let schema_arc = Arc::new(schema.clone());
-        if let Ok(mut cache) = self.schema_cache.write() {
-            cache.insert(index.to_string(), schema_arc);
-        }
+        let mut cache = self.schema_cache.write().unwrap();
+        cache.insert(index.to_string(), schema_arc);
 
         Ok(())
     }
@@ -876,7 +878,7 @@ impl HybridStore {
         let mut query_fields = vec![];
 
         // Check if body field is indexed
-        if schema.fields.get("body").map_or(true, |f| f.indexed) {
+        if schema.fields.get("body").is_none_or(|f| f.indexed) {
             query_fields.push(fields.body);
             debug!("Added 'body' field to search");
         }
@@ -999,13 +1001,12 @@ impl HybridStore {
                 });
 
                 // Merge json_blob fields into root document
-                if let Some(json_blob) = stored_doc.json_blob {
-                    if let Some(obj) = complete_doc.as_object_mut() {
-                        if let Some(blob_obj) = json_blob.as_object() {
-                            for (k, v) in blob_obj {
-                                obj.insert(k.clone(), v.clone());
-                            }
-                        }
+                if let Some(json_blob) = stored_doc.json_blob
+                    && let (Some(obj), Some(blob_obj)) =
+                        (complete_doc.as_object_mut(), json_blob.as_object())
+                {
+                    for (k, v) in blob_obj {
+                        obj.insert(k.clone(), v.clone());
                     }
                 }
 
@@ -1088,7 +1089,7 @@ impl HybridStore {
                         let mut tantivy_doc = doc!(fields.id => id.as_str());
 
                         // Check if 'body' field should be indexed
-                        let body_indexed = schema.fields.get("body").map_or(true, |f| f.indexed);
+                        let body_indexed = schema.fields.get("body").is_none_or(|f| f.indexed);
 
                         if body_indexed {
                             tantivy_doc.add_text(fields.body, &body);
@@ -1099,7 +1100,7 @@ impl HybridStore {
                             for (field_name, field_value) in json_obj {
                                 // Check if field should be indexed
                                 let should_index =
-                                    schema.fields.get(field_name).map_or(false, |f| f.indexed);
+                                    schema.fields.get(field_name).is_some_and(|f| f.indexed);
 
                                 if should_index {
                                     // Only serialize and index if marked as indexed

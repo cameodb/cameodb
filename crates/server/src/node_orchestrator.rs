@@ -2046,10 +2046,10 @@ impl NodeOrchestrator {
 ///    and hex-encode it to produce a stable routing key string.
 fn derive_routing_key_from_doc(doc: &JsonValue) -> Option<String> {
     // Prefer explicit id field in the document body
-    if let Some(id_value) = doc.get("id").and_then(|v| v.as_str()) {
-        if !id_value.is_empty() {
-            return Some(id_value.to_string());
-        }
+    if let Some(id_value) = doc.get("id").and_then(|v| v.as_str())
+        && !id_value.is_empty()
+    {
+        return Some(id_value.to_string());
     }
 
     // Fallback: derive from JSON bytes (deterministic for same document)

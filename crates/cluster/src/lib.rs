@@ -13,10 +13,10 @@
 //! ## Architecture
 //!
 //! ```text
-//! Key "user:123" -> SHA256 -> Hash Value -> Ring Lookup -> Node UUID
-//!                     |            |            |           |
-//!                     v            v            v           v
-//!                "user:123"   0x1A2B3C4D   Token 42   Node A1B
+//! Key "user:123" -> XXH3 -> Hash Value -> Ring Lookup -> Node UUID
+//!                     |          |            |           |
+//!                     v          v            v           v
+//!                "user:123" 0x1A2B3C4D    Token 42    Node A1B
 //! ```
 //!
 //! ## Example Usage
@@ -44,9 +44,9 @@ use std::fs::{self, File};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+use xxhash_rust::xxh3;
 
 /// Number of virtual nodes (tokens) per physical node.
 ///
@@ -146,7 +146,7 @@ impl NodeIdentity {
     /// This generates:
     /// - A new UUID v4
     /// - A 3-character Base36 name derived from the first 2 bytes of the UUID
-    /// - 256 deterministic virtual node tokens using SHA256(uuid + index)
+    /// - 256 deterministic virtual node tokens using XXH3(uuid + index)
     ///
     /// # Examples
     ///
@@ -289,11 +289,11 @@ fn to_base36(mut value: u32) -> String {
 
 /// Generates deterministic virtual node tokens for a given UUID.
 ///
-/// Creates 256 tokens by hashing the UUID with an index using SHA256.
+/// Creates 256 tokens by hashing the UUID with an index using XXH3.
 /// This ensures:
 /// - Deterministic: Same UUID always produces same tokens
-/// - Well-distributed: SHA256 provides good hash distribution
-/// - Collision-resistant: Cryptographic hash minimizes collisions
+/// - Well-distributed: XXH3 provides excellent distribution
+/// - Fast: Optimized for modern CPUs
 ///
 /// # Arguments
 ///
@@ -320,11 +320,10 @@ fn to_base36(mut value: u32) -> String {
 pub fn generate_tokens(uuid: Uuid) -> Vec<u64> {
     (0..VNODE_COUNT as u32)
         .map(|index| {
-            let mut hasher = Sha256::new();
+            let mut hasher = xxh3::Xxh3::new();
             hasher.update(uuid.as_bytes());
-            hasher.update(index.to_be_bytes());
-            let digest = hasher.finalize();
-            u64::from_be_bytes(digest[0..8].try_into().expect("digest slice is 8 bytes"))
+            hasher.update(&index.to_be_bytes());
+            hasher.digest()
         })
         .collect()
 }
@@ -337,7 +336,7 @@ pub fn generate_tokens(uuid: Uuid) -> Vec<u64> {
 ///
 /// ## Algorithm
 ///
-/// 1. Hash the key using SHA256
+/// 1. Hash the key using XXH3
 /// 2. Find the first token >= hash value using BTreeMap::range
 /// 3. If no token found, wrap around to the first token
 /// 4. Return the UUID associated with that token
@@ -463,7 +462,7 @@ impl ConsistentRing {
     /// Determines which node should own the given key.
     ///
     /// Uses consistent hashing to route the key to a node:
-    /// 1. Hash the key using SHA256
+    /// 1. Hash the key using XXH3
     /// 2. Find the first token >= hash value
     /// 3. If no such token exists, wrap around to the first token
     /// 4. Return the UUID of the node owning that token
@@ -499,6 +498,11 @@ impl ConsistentRing {
         self.ring.len()
     }
 
+    /// Returns true if the ring is empty.
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
+
     /// Determines which node should own the given hash value.
     ///
     /// Uses consistent hashing to route the key to a node:
@@ -528,10 +532,10 @@ impl ConsistentRing {
     }
 }
 
-/// Hashes a byte slice to a u64 using SHA256.
+/// Hashes a byte slice to a u64 using XXH3.
 ///
-/// Takes the first 8 bytes of the SHA256 digest and converts
-/// them to a u64 in big-endian format.
+/// Uses the high-performance XXH3 algorithm which is optimized for
+/// modern CPUs and provides excellent distribution.
 ///
 /// # Arguments
 ///
@@ -541,8 +545,7 @@ impl ConsistentRing {
 ///
 /// A u64 hash value suitable for consistent hashing
 fn hash_key(bytes: &[u8]) -> u64 {
-    let digest = Sha256::digest(bytes);
-    u64::from_be_bytes(digest[0..8].try_into().expect("digest slice is 8 bytes"))
+    xxh3::xxh3_64(bytes)
 }
 
 #[cfg(test)]

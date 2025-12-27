@@ -2,10 +2,10 @@
 
 This document captures the key architectural decisions made during CameoDB's development, including the rationale, alternatives considered, and trade-offs.
 
-## ADR 001: Topology - SHA256 and 256 Virtual Nodes
+## ADR 001: Topology - XXH3 and 256 Virtual Nodes
 
 ### Status
-**Accepted** - Implemented in `crates/cluster`
+**Accepted** - Implemented in `crates/cluster` (Updated: Replaced SHA256 with XXH3 for performance)
 
 ### Context
 CameoDB requires a distributed topology system that can:
@@ -13,33 +13,33 @@ CameoDB requires a distributed topology system that can:
 - Minimize data movement during cluster changes
 - Provide deterministic routing without coordination
 - Scale to hundreds of nodes
+- **Maximize routing performance** (critical path)
 
 ### Decision
 We chose **consistent hashing** with:
-- **SHA256** for hash function
+- **XXH3** for hash function (via `xxhash-rust`)
 - **256 virtual nodes** per physical node
 
 ### Rationale
 
-#### Why SHA256?
+#### Why XXH3?
 
 | Hash Function | Pros | Cons | Decision |
 |---------------|------|------|----------|
-| **SHA256** | Cryptographically secure, excellent distribution, collision-resistant | Slower than non-crypto hashes | ✅ **Chosen** |
+| **XXH3** | **Extremely fast**, excellent distribution, SIMD optimized | Not cryptographically secure | ✅ **Chosen** |
+| SHA256 | Cryptographically secure | High CPU overhead (~50x slower) | ❌ Rejected (Too slow) |
 | CRC32 | Very fast | Poor distribution, high collision rate | ❌ Rejected |
-| xxHash | Fast, good distribution | Not cryptographically secure | ❌ Rejected |
-| SipHash | Fast, DoS-resistant | Weaker distribution than SHA256 | ❌ Rejected |
+| SipHash | Fast, DoS-resistant | Slower than XXH3 | ❌ Rejected |
 
-**SHA256 Benefits:**
-- **Excellent Distribution**: Cryptographic properties ensure uniform distribution
-- **Collision Resistance**: Virtually eliminates hash collisions
-- **Deterministic**: Same input always produces same output
-- **Future-Proof**: Widely supported and battle-tested
+**XXH3 Benefits:**
+- **Extreme Performance**: ~30GB/s throughput, inlined for small keys
+- **Excellent Distribution**: Passes SMHasher test suite perfectly
+- **Deterministic**: Consistent results across platforms
+- **Low Overhead**: Frees up CPU for business logic
 
 **Performance Impact:**
-- SHA256 adds ~1-2μs per key lookup
-- Acceptable overhead for the distribution quality gained
-- Can be optimized with hardware acceleration if needed
+- Routing key calculation is effectively instant
+- Removes hashing as a potential bottleneck in the hot path
 
 #### Why 256 Virtual Nodes?
 
@@ -66,11 +66,10 @@ const VNODE_COUNT: usize = 256;
 fn generate_tokens(uuid: Uuid) -> Vec<u64> {
     (0..VNODE_COUNT as u32)
         .map(|index| {
-            let mut hasher = Sha256::new();
+            let mut hasher = xxh3::Xxh3::new();
             hasher.update(uuid.as_bytes());      // Node identity
             hasher.update(&index.to_be_bytes()); // VNode index
-            let digest = hasher.finalize();
-            u64::from_be_bytes(digest[0..8].try_into().unwrap())
+            hasher.digest()
         })
         .collect()
 }
@@ -89,10 +88,10 @@ fn generate_tokens(uuid: Uuid) -> Vec<u64> {
 - Minimal data movement during topology changes
 - No coordination required for routing decisions
 - Scales to large cluster sizes
+- **Zero latency overhead** for routing calculations
 
 **Negative:**
 - 2KB memory overhead per node
-- SHA256 computation adds minor latency
 - Fixed VNode count (not dynamically adjustable)
 
 ---

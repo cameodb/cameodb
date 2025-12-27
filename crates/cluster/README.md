@@ -50,24 +50,23 @@ CameoDB uses **256 virtual nodes per physical node** to ensure even data distrib
 
 ### Token Generation Algorithm
 
-Each virtual node token is generated deterministically using SHA256:
+Each virtual node token is generated deterministically using XXH3:
 
 ```rust
 fn generate_tokens(uuid: Uuid) -> Vec<u64> {
     (0..256).map(|index| {
-        let mut hasher = Sha256::new();
+        let mut hasher = xxh3::Xxh3::new();
         hasher.update(uuid.as_bytes());      // Node identity
         hasher.update(&index.to_be_bytes()); // VNode index
-        let digest = hasher.finalize();
-        u64::from_be_bytes(digest[0..8].try_into().unwrap())
+        hasher.digest()
     }).collect()
 }
 ```
 
 **Properties:**
 - **Deterministic**: Same UUID always produces same tokens
-- **Well-Distributed**: SHA256 provides excellent hash distribution
-- **Collision-Resistant**: Cryptographic hash minimizes token collisions
+- **Well-Distributed**: XXH3 provides excellent hash distribution
+- **Fast**: Optimized for modern CPUs
 
 ## Consistent Hashing Flow
 
@@ -75,7 +74,7 @@ The following diagram shows how keys are routed to nodes:
 
 ```mermaid
 flowchart TD
-    key["Key: user:123"] --> hash["SHA256 hash"]
+    key["Key: user:123"] --> hash["XXH3 hash"]
     hash --> value["Hash value 0x1A2B3C4D"]
     value --> lookup["Ring lookup"]
     lookup --> decision{Token ≥ hash?}
@@ -98,7 +97,7 @@ flowchart TD
 
 ### Routing Algorithm
 
-1. **Hash the Key**: `SHA256(key) → u64`
+1. **Hash the Key**: `XXH3(key) → u64`
 2. **Ring Lookup**: Find first token ≥ hash value using `BTreeMap::range(hash..)`
 3. **Wrap-Around**: If no token found, use first token in ring
 4. **Return Owner**: Return UUID associated with the token
@@ -220,7 +219,7 @@ let final_owner = ring.get_owner(key);
 - **Lookup Time**: O(log N) where N = number of virtual tokens (256 × nodes)
 - **Memory Usage**: O(N) for token storage (~2KB per node)
 - **Rebalancing**: Only ~1/N keys move when adding/removing nodes
-- **Hash Quality**: SHA256 provides excellent distribution properties
+- **Hash Quality**: XXH3 provides excellent distribution properties
 
 ## Shared-Nothing Architecture Integration
 
