@@ -6,8 +6,7 @@
 use anyhow;
 use kameo::remote;
 use libp2p::{
-    Multiaddr, PeerId,
-    identify,
+    Multiaddr, PeerId, identify,
     kad::{self, Mode as KadMode, store::MemoryStore},
     swarm::NetworkBehaviour,
 };
@@ -103,6 +102,55 @@ impl DhtBehaviour {
         info!(
             "🔍 Querying DHT for peer {} node UUID with key {}",
             peer_id, key_str
+        );
+        self.kademlia.get_record(key)
+    }
+
+    /// Publish local shards to DHT so peers can build the consistent hash ring
+    pub fn publish_shards(
+        &mut self,
+        node_uuid: uuid::Uuid,
+        shards: &[crate::cluster_coordinator::ShardMetadata],
+    ) -> Result<(), anyhow::Error> {
+        use libp2p::kad::{Record, RecordKey};
+
+        let shards_bytes = serde_json::to_vec(shards)?;
+
+        // Key: cameodb-shards-{node_uuid}
+        // We use Node UUID instead of PeerID for stability across restarts if PeerID changes
+        let key_str = format!("cameodb-shards-{}", node_uuid);
+        let key = RecordKey::new(&key_str);
+
+        let record = Record {
+            key: key.clone(),
+            value: shards_bytes,
+            publisher: None,
+            expires: None, // TODO: Set expiration
+        };
+
+        match self.kademlia.put_record(record, kad::Quorum::One) {
+            Ok(_) => {
+                info!(
+                    "📝 Published {} shards to DHT with key {}",
+                    shards.len(),
+                    key_str
+                );
+                Ok(())
+            }
+            Err(e) => {
+                warn!("⚠️  Failed to publish shards to DHT: {:?}", e);
+                Err(anyhow::anyhow!("Failed to publish shards: {:?}", e))
+            }
+        }
+    }
+
+    /// Query DHT for a peer's shards
+    pub fn query_shards(&mut self, node_uuid: uuid::Uuid) -> kad::QueryId {
+        let key_str = format!("cameodb-shards-{}", node_uuid);
+        let key = kad::RecordKey::new(&key_str);
+        info!(
+            "🔍 Querying DHT for shards of node {} with key {}",
+            node_uuid, key_str
         );
         self.kademlia.get_record(key)
     }

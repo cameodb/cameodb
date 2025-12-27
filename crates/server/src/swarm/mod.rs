@@ -67,23 +67,35 @@ pub enum CoordinatorEvent {
         node_uuid: String,
         address: Option<String>,
     },
+    PeerShardsDiscovered {
+        peer_id: String,
+        shards: Vec<crate::cluster_coordinator::ShardMetadata>,
+    },
 }
 
 /// Handle used to manage the background swarm runtime task
 #[derive(Debug, Clone)]
 pub struct SwarmRuntimeHandle {
     shutdown_tx: Option<watch::Sender<SwarmControl>>,
+    cmd_tx: Option<UnboundedSender<SwarmCommand>>,
 }
 
 impl SwarmRuntimeHandle {
-    fn new(shutdown_tx: watch::Sender<SwarmControl>) -> Self {
+    fn new(
+        shutdown_tx: watch::Sender<SwarmControl>,
+        cmd_tx: UnboundedSender<SwarmCommand>,
+    ) -> Self {
         Self {
             shutdown_tx: Some(shutdown_tx),
+            cmd_tx: Some(cmd_tx),
         }
     }
 
     fn inert() -> Self {
-        Self { shutdown_tx: None }
+        Self {
+            shutdown_tx: None,
+            cmd_tx: None,
+        }
     }
 
     /// Request a graceful shutdown of the swarm runtime task
@@ -101,6 +113,28 @@ impl SwarmRuntimeHandle {
             .as_ref()
             .map(|tx| !matches!(*tx.borrow(), SwarmControl::Shutdown))
             .unwrap_or(false)
+    }
+
+    /// Publish local shards to the DHT
+    pub fn publish_shards(
+        &self,
+        node_uuid: Uuid,
+        shards: Vec<crate::cluster_coordinator::ShardMetadata>,
+    ) -> Result<()> {
+        if let Some(tx) = &self.cmd_tx {
+            tx.send(SwarmCommand::PublishShards { node_uuid, shards })
+                .map_err(|_| anyhow::anyhow!("Swarm runtime channel closed"))?;
+        }
+        Ok(())
+    }
+
+    /// Query shards for a remote node from the DHT
+    pub fn query_shards(&self, node_uuid: Uuid) -> Result<()> {
+        if let Some(tx) = &self.cmd_tx {
+            tx.send(SwarmCommand::QueryShards { node_uuid })
+                .map_err(|_| anyhow::anyhow!("Swarm runtime channel closed"))?;
+        }
+        Ok(())
     }
 }
 
@@ -175,7 +209,7 @@ async fn create_production_swarm(
     storage_path: &Path,
 ) -> Result<SwarmStartup> {
     // Load or generate cryptographic identity for this node
-    let keypair = load_or_generate_keypair(storage_path)?;
+    let (keypair, _identity) = load_or_generate_keypair(storage_path)?;
     let peer_id = PeerId::from(keypair.public());
 
     info!("🔐 Node identity: {}", peer_id);
@@ -268,7 +302,8 @@ async fn create_production_swarm(
 
     // Start the swarm runtime task to process events
     let (event_tx, event_rx) = unbounded_channel();
-    let runtime = launch_swarm_runtime(swarm, event_tx);
+    let (cmd_tx, cmd_rx) = unbounded_channel();
+    let runtime = launch_swarm_runtime(swarm, event_tx, cmd_rx, cmd_tx.clone());
 
     Ok(SwarmStartup {
         peer_id,
@@ -280,7 +315,7 @@ async fn create_production_swarm(
 }
 
 /// Load existing keypair from node_identity.json or generate a new one
-fn load_or_generate_keypair(storage_path: &Path) -> Result<Keypair> {
+fn load_or_generate_keypair(storage_path: &Path) -> Result<(Keypair, NodeIdentity)> {
     let identity_path = storage_path.join("node_identity.json");
 
     // Load the identity (creates if doesn't exist, though NodeOrchestrator should have created it)
@@ -291,7 +326,7 @@ fn load_or_generate_keypair(storage_path: &Path) -> Result<Keypair> {
     if let Some(key_bytes) = &identity.keypair {
         info!("🔑 Loading existing libp2p keypair from node_identity.json");
         match Keypair::from_protobuf_encoding(key_bytes) {
-            Ok(kp) => return Ok(kp),
+            Ok(kp) => return Ok((kp, identity)),
             Err(e) => {
                 warn!(
                     "⚠️  Failed to decode existing keypair from identity: {}. Generating new one.",
@@ -314,7 +349,7 @@ fn load_or_generate_keypair(storage_path: &Path) -> Result<Keypair> {
         }
     }
 
-    Ok(keypair)
+    Ok((keypair, identity))
 }
 
 /// Convert IP:port format bootstrap nodes to full multiaddr format
@@ -377,8 +412,10 @@ fn convert_bootstrap_nodes_to_multiaddrs(bootstrap_nodes: &[String]) -> Vec<Mult
 fn launch_swarm_runtime(
     mut swarm: libp2p::Swarm<DhtBehaviour>,
     event_tx: UnboundedSender<CoordinatorEvent>,
+    mut cmd_rx: UnboundedReceiver<SwarmCommand>,
+    cmd_tx: UnboundedSender<SwarmCommand>,
 ) -> SwarmRuntimeHandle {
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(SwarmControl::Run);
+    let (shutdown_signal_tx, mut shutdown_signal_rx) = watch::channel(SwarmControl::Run);
 
     tokio::spawn(async move {
         info!("🔄 Swarm runtime task started");
@@ -386,11 +423,14 @@ fn launch_swarm_runtime(
 
         loop {
             select! {
-                _ = shutdown_rx.changed() => {
-                    if matches!(*shutdown_rx.borrow(), SwarmControl::Shutdown) {
+                _ = shutdown_signal_rx.changed() => {
+                    if matches!(*shutdown_signal_rx.borrow(), SwarmControl::Shutdown) {
                         info!("🛑 Swarm shutdown signal received");
                         break;
                     }
+                }
+                Some(cmd) = cmd_rx.recv() => {
+                    handle_swarm_command(cmd, &mut swarm);
                 }
                 event = swarm.select_next_some() => {
                     metrics.total_events += 1;
@@ -403,7 +443,32 @@ fn launch_swarm_runtime(
         info!("✅ Swarm runtime task completed");
     });
 
-    SwarmRuntimeHandle::new(shutdown_tx)
+    SwarmRuntimeHandle::new(shutdown_signal_tx, cmd_tx)
+}
+
+/// Commands that can be sent to the swarm runtime
+#[derive(Debug)]
+pub enum SwarmCommand {
+    PublishShards {
+        node_uuid: Uuid,
+        shards: Vec<crate::cluster_coordinator::ShardMetadata>,
+    },
+    QueryShards {
+        node_uuid: Uuid,
+    },
+}
+
+fn handle_swarm_command(cmd: SwarmCommand, swarm: &mut libp2p::Swarm<DhtBehaviour>) {
+    match cmd {
+        SwarmCommand::PublishShards { node_uuid, shards } => {
+            if let Err(e) = swarm.behaviour_mut().publish_shards(node_uuid, &shards) {
+                warn!("⚠️  Failed to publish shards to DHT: {}", e);
+            }
+        }
+        SwarmCommand::QueryShards { node_uuid } => {
+            swarm.behaviour_mut().query_shards(node_uuid);
+        }
+    }
 }
 
 fn handle_swarm_event(
@@ -595,6 +660,31 @@ fn handle_kademlia_event(
                         node_uuid: uuid_str.to_string(),
                         address: None,
                     });
+                } else if key_str.starts_with("cameodb-shards-") {
+                    let peer_id_str = key_str.trim_start_matches("cameodb-shards-");
+
+                    match serde_json::from_slice::<Vec<crate::cluster_coordinator::ShardMetadata>>(
+                        &record.value,
+                    ) {
+                        Ok(shards) => {
+                            info!(
+                                "🎯 DHT Shards Found: Peer {} -> {} shards",
+                                peer_id_str,
+                                shards.len()
+                            );
+
+                            let _ = event_tx.send(CoordinatorEvent::PeerShardsDiscovered {
+                                peer_id: peer_id_str.to_string(),
+                                shards,
+                            });
+                        }
+                        Err(e) => {
+                            warn!(
+                                "⚠️  Failed to deserialize shards from DHT for peer {}: {}",
+                                peer_id_str, e
+                            );
+                        }
+                    }
                 }
             }
             _ => {

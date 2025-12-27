@@ -145,6 +145,13 @@ pub struct KnownPeer {
     pub address: String,
 }
 
+/// Message when shards are discovered for a peer via DHT.
+#[derive(Debug, Clone)]
+pub struct PeerShardsDiscovered {
+    pub peer_id: String,
+    pub shards: Vec<ShardMetadata>,
+}
+
 /// Message to merge remote shard assignments into local coordinator.
 #[derive(Debug, Clone)]
 pub struct MergeRemoteShards {
@@ -266,10 +273,28 @@ impl ClusterCoordinator {
             }
         };
 
+        // Rebuild ring from expected shards immediately
+        let mut ring = ConsistentRing::new();
+        for (shard_id, meta) in &expected_shards {
+            let name: String = shard_id.simple().to_string().chars().take(3).collect();
+            let identity = NodeIdentity {
+                uuid: *shard_id,
+                name,
+                vnode_tokens: meta.vnode_tokens.clone(),
+                keypair: None,
+            };
+            ring.add_node(&identity);
+        }
+
+        info!(
+            ring_nodes = ring.len(), // This is actually vnode count, but Close enough for log
+            "ClusterCoordinator: rebuilt ring from persisted state"
+        );
+
         Self {
             cluster,
-            shard_assignments: HashMap::new(),
-            ring: ConsistentRing::new(),
+            shard_assignments: expected_shards.clone(), // Restore assignments
+            ring,
             state,
             expected_nodes,
             generation,
@@ -476,7 +501,7 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
         msg: RegisterLocalShards,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        for shard in msg.shards {
+        for shard in msg.shards.clone() {
             self.shard_assignments.insert(shard.shard_id, shard);
         }
         self.rebuild_ring();
@@ -488,6 +513,15 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
 
         // Persist snapshot after shard registration
         self.persist_snapshot();
+
+        // Publish local shards to DHT via swarm handle
+        if let Some(handle) = self.cluster.swarm_handle() {
+            if let Err(e) = handle.publish_shards(msg.node_id, msg.shards) {
+                warn!(error = %e, "Failed to publish shards to DHT");
+            } else {
+                info!("ClusterCoordinator: published local shards to DHT");
+            }
+        }
     }
 }
 
@@ -639,6 +673,15 @@ impl Message<InitSwarm> for ClusterCoordinator {
                                         warn!(node_uuid = %node_uuid, "Failed to parse node UUID from DHT");
                                     }
                                 }
+                                CoordinatorEvent::PeerShardsDiscovered { peer_id, shards } => {
+                                    // peer_id here is actually the Node UUID string from the DHT key
+                                    if let Err(err) = coordinator
+                                        .ask(PeerShardsDiscovered { peer_id, shards })
+                                        .await
+                                    {
+                                        warn!(error = %err, "ClusterCoordinator: failed to forward peer shards discovered");
+                                    }
+                                }
                                 CoordinatorEvent::PeerLost { peer_id } => {
                                     peer_addresses.remove(&peer_id);
                                     // Note: We can't map PeerID -> NodeUUID easily here without reverse lookup.
@@ -786,7 +829,16 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
         // Evaluate state (e.g., WaitingForPeers -> Active if all nodes joined)
         self.evaluate_and_transition_state();
 
-        // Fetch shard metadata from remote coordinator in background task
+        // Trigger DHT lookup for peer shards
+        if let Some(handle) = self.cluster.swarm_handle() {
+            if let Err(e) = handle.query_shards(msg.node_id) {
+                warn!(node = %msg.node_id, error = %e, "Failed to query peer shards from DHT");
+            } else {
+                info!(node = %msg.node_id, "ClusterCoordinator: querying shards from DHT");
+            }
+        }
+
+        // Fetch shard metadata from remote coordinator in background task (Fallback/Redundancy)
         let remote_coord_name = format!("coordinator-{}", msg.node_id);
         let self_weak = ctx.actor_ref().downgrade();
         let node_id = msg.node_id;
@@ -831,6 +883,39 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
                 }
             }
         });
+    }
+}
+
+impl Message<PeerShardsDiscovered> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: PeerShardsDiscovered,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        info!(
+            peer = %msg.peer_id,
+            shard_count = msg.shards.len(),
+            "ClusterCoordinator: discovered shards from DHT"
+        );
+
+        let mut changes = 0;
+        for shard in msg.shards {
+            // Update or insert shard metadata
+            // We trust the DHT record as it's published by the owner
+            self.shard_assignments.insert(shard.shard_id, shard);
+            changes += 1;
+        }
+
+        if changes > 0 {
+            self.rebuild_ring();
+            self.persist_snapshot();
+            info!(
+                total_shards = self.shard_assignments.len(),
+                "ClusterCoordinator: updated ring from DHT discovery"
+            );
+        }
     }
 }
 
