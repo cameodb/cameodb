@@ -211,9 +211,10 @@ struct StoredDocOwned {
 /// Internal schema field mappings for Tantivy.
 #[derive(Debug, Clone)]
 struct SchemaFields {
+    /// Tantivy field for the document identifier
     id: Field,
-    body: Field,
-    json_blob: Field,
+    /// Map of schema field name -> Tantivy field (only indexed fields are present)
+    indexed_fields: HashMap<String, Field>,
 }
 
 /// Helper function to calculate directory size recursively
@@ -260,6 +261,8 @@ pub struct HybridStore {
     budget_cache: Arc<RwLock<HashMap<String, usize>>>,
     /// Cache of schemas per index to avoid repeated redb reads
     schema_cache: Arc<RwLock<HashMap<String, Arc<IndexSchema>>>>,
+    /// Cache of Tantivy field mappings per index
+    fields_cache: Arc<RwLock<HashMap<String, SchemaFields>>>,
     /// Storage configuration
     config: StorageConfig,
 }
@@ -285,6 +288,7 @@ impl HybridStore {
             read_cache: Arc::new(RwLock::new(HashMap::new())),
             budget_cache: Arc::new(RwLock::new(HashMap::new())),
             schema_cache: Arc::new(RwLock::new(HashMap::new())),
+            fields_cache: Arc::new(RwLock::new(HashMap::new())),
             config,
         })
     }
@@ -313,21 +317,59 @@ impl HybridStore {
         index_cache.insert(key.to_string(), value);
     }
 
-    /// Creates the default Tantivy schema.
-    fn create_default_schema() -> (Schema, SchemaFields) {
+    /// Build Tantivy schema and field map from index schema definition.
+    fn create_schema_from_definition(index_schema: &IndexSchema) -> (Schema, SchemaFields) {
         let mut schema_builder = Schema::builder();
-        let id_field = schema_builder.add_text_field("id", STRING | STORED);
-        let body_field = schema_builder.add_text_field("body", TEXT);
-        let json_blob_field = schema_builder.add_text_field("json_blob", TEXT | STORED);
-        let schema = schema_builder.build();
 
+        // ID field is always present
+        let id_field = schema_builder.add_text_field("id", STRING | STORED);
+
+        let mut indexed_fields = HashMap::new();
+
+        for (name, field_def) in &index_schema.fields {
+            if !field_def.indexed {
+                continue;
+            }
+
+            let field = match field_def.field_type.as_str() {
+                // Textual fields use the default TEXT options
+                "text" => schema_builder.add_text_field(name, TEXT),
+                // Array is treated as multi-valued text
+                "array" => schema_builder.add_text_field(name, TEXT),
+                // Fallback to text for unknown types
+                _ => schema_builder.add_text_field(name, TEXT),
+            };
+
+            indexed_fields.insert(name.clone(), field);
+        }
+
+        let schema = schema_builder.build();
         let fields = SchemaFields {
             id: id_field,
-            body: body_field,
-            json_blob: json_blob_field,
+            indexed_fields,
         };
 
         (schema, fields)
+    }
+
+    /// Derive Tantivy field mapping from an existing index schema on disk.
+    fn load_fields_from_existing_index(tantivy_index: &Index) -> Result<SchemaFields, StoreError> {
+        let schema = tantivy_index.schema();
+
+        let id = schema
+            .get_field("id")
+            .map_err(|_| StoreError::FieldNotFound("id".to_string()))?;
+
+        let mut indexed_fields = HashMap::new();
+        for (field, field_entry) in schema.fields() {
+            let name = field_entry.name();
+            if name == "id" {
+                continue;
+            }
+            indexed_fields.insert(name.to_string(), field);
+        }
+
+        Ok(SchemaFields { id, indexed_fields })
     }
 
     /// Helper method: get_or_create_index
@@ -339,15 +381,21 @@ impl HybridStore {
         {
             let readers = self.writers.read().unwrap();
             if let Some(writer) = readers.get(index) {
-                let (_, fields) = Self::create_default_schema();
-                return Ok((Arc::clone(writer), fields));
+                if let Some(fields) = self.fields_cache.read().unwrap().get(index).cloned() {
+                    return Ok((Arc::clone(writer), fields));
+                }
             }
         }
 
         // Create index directory and Tantivy index if it doesn't exist
         let index_path = self.config.shard_path.join("indices").join(index);
 
-        let (schema, fields) = Self::create_default_schema();
+        // Determine schema for this index
+        let index_schema = self
+            .get_schema_cached(index)?
+            .unwrap_or_else(|| Arc::new(IndexSchema::default()));
+
+        let (schema, fields) = Self::create_schema_from_definition(&index_schema);
 
         // Create or open tantivy index
         let tantivy_index = if index_path.join("meta.json").exists() {
@@ -355,6 +403,13 @@ impl HybridStore {
         } else {
             fs::create_dir_all(&index_path)?;
             Index::create_in_dir(&index_path, schema)?
+        };
+
+        // For existing indexes, reload fields from disk to match stored schema
+        let fields = if index_path.join("meta.json").exists() {
+            Self::load_fields_from_existing_index(&tantivy_index)?
+        } else {
+            fields
         };
 
         // Create writer with dynamic memory budget based on index size
@@ -371,6 +426,11 @@ impl HybridStore {
         {
             let mut writers = self.writers.write().unwrap();
             writers.insert(index.to_string(), Arc::clone(&writer_arc));
+        }
+
+        {
+            let mut fields_cache = self.fields_cache.write().unwrap();
+            fields_cache.insert(index.to_string(), fields.clone());
         }
 
         // Initialize sequence counter for this index if needed
@@ -540,25 +600,43 @@ impl HybridStore {
                     // Step 3: Build tantivy document with ONLY indexed fields
                     let mut tantivy_doc = doc!(fields.id => id.as_str());
 
-                    // Check if 'body' field should be indexed
-                    let body_indexed = schema.fields.get("body").is_none_or(|f| f.indexed);
+                    // Step 4: Index schema-defined fields individually
+                    for (field_name, field_def) in &schema.fields {
+                        if !field_def.indexed {
+                            continue;
+                        }
 
-                    if body_indexed {
-                        tantivy_doc.add_text(fields.body, &body);
-                    }
+                        if let Some(tantivy_field) = fields.indexed_fields.get(field_name) {
+                            // Pull value from body (special casing by name) or json_blob map
+                            if field_name == "body" {
+                                tantivy_doc.add_text(*tantivy_field, &body);
+                                continue;
+                            }
 
-                    // Step 4: Process json_blob fields selectively
-                    if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
-                        for (field_name, field_value) in json_obj {
-                            // Check if field should be indexed
-                            let should_index =
-                                schema.fields.get(field_name).is_some_and(|f| f.indexed);
-
-                            if should_index {
-                                // Only serialize and index if marked as indexed
-                                let field_str = serde_json::to_string(field_value)
-                                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                                tantivy_doc.add_text(fields.json_blob, &field_str);
+                            // For other fields, look into json_blob
+                            if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
+                                if let Some(field_value) = json_obj.get(field_name) {
+                                    match field_def.field_type.as_str() {
+                                        "array" => {
+                                            if let Some(arr) = field_value.as_array() {
+                                                for item in arr {
+                                                    let item_str = serde_json::to_string(item)
+                                                        .map_err(|e| {
+                                                            StoreError::Serialization(e.to_string())
+                                                        })?;
+                                                    tantivy_doc.add_text(*tantivy_field, &item_str);
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            let field_str = serde_json::to_string(field_value)
+                                                .map_err(|e| {
+                                                    StoreError::Serialization(e.to_string())
+                                                })?;
+                                            tantivy_doc.add_text(*tantivy_field, &field_str);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -609,6 +687,10 @@ impl HybridStore {
         {
             let mut schema_cache = self.schema_cache.write().unwrap();
             schema_cache.remove(index);
+        }
+        {
+            let mut fields_cache = self.fields_cache.write().unwrap();
+            fields_cache.remove(index);
         }
         {
             let mut budget_cache = self.budget_cache.write().unwrap();
@@ -766,6 +848,9 @@ impl HybridStore {
     pub fn invalidate_schema_cache(&self, index: &str) {
         let mut cache = self.schema_cache.write().unwrap();
         cache.remove(index);
+
+        let mut fields_cache = self.fields_cache.write().unwrap();
+        fields_cache.remove(index);
     }
 
     /// Update both redb and cache atomically
@@ -808,14 +893,38 @@ impl HybridStore {
         }
     }
 
+    /// Get SchemaFields from cache or derive from an existing Tantivy index.
+    fn get_fields_for_index(
+        &self,
+        index: &str,
+        tantivy_index: &Index,
+    ) -> Result<SchemaFields, StoreError> {
+        // Fast path: cache
+        if let Some(fields) = self.fields_cache.read().unwrap().get(index).cloned() {
+            return Ok(fields);
+        }
+
+        // Slow path: derive from index and cache
+        let fields = Self::load_fields_from_existing_index(tantivy_index)?;
+        {
+            let mut cache = self.fields_cache.write().unwrap();
+            cache.insert(index.to_string(), fields.clone());
+        }
+        Ok(fields)
+    }
+
     /// Get or create a cached IndexReader for the given index
-    fn get_reader(&self, index: &str) -> Result<Option<IndexReader>, StoreError> {
+    fn get_reader(&self, index: &str) -> Result<Option<(IndexReader, SchemaFields)>, StoreError> {
         // Check cache first
         {
             let readers = self.readers.read().unwrap();
             if let Some(reader) = readers.get(index) {
                 reader.reload()?;
-                return Ok(Some(reader.clone()));
+                // Ensure fields are cached; if not, rebuild from index schema
+                let searcher = reader.searcher();
+                let tantivy_index = searcher.index();
+                let fields = self.get_fields_for_index(index, tantivy_index)?;
+                return Ok(Some((reader.clone(), fields)));
             }
         }
 
@@ -827,6 +936,7 @@ impl HybridStore {
 
         // Open index and create reader
         let tantivy_index = Index::open_in_dir(&index_path)?;
+        let fields = self.get_fields_for_index(index, &tantivy_index)?;
         let reader = tantivy_index.reader()?;
 
         // Cache the reader
@@ -835,7 +945,7 @@ impl HybridStore {
             readers.insert(index.to_string(), reader.clone());
         }
 
-        Ok(Some(reader))
+        Ok(Some((reader, fields)))
     }
 
     /// Search documents in a specific index
@@ -848,11 +958,8 @@ impl HybridStore {
     ) -> Result<Vec<(f32, JsonValue)>, StoreError> {
         use tracing::{debug, warn};
 
-        // Get schema fields (lightweight, no IO)
-        let (_, fields) = Self::create_default_schema();
-
-        // Get reader from cache or disk
-        let reader = match self.get_reader(index)? {
+        // Get reader and field mapping from cache or disk
+        let (reader, fields) = match self.get_reader(index)? {
             Some(r) => r,
             None => {
                 warn!(index = %index, "No tantivy reader found for index");
@@ -875,23 +982,7 @@ impl HybridStore {
         );
 
         // Build query parser with only indexed fields
-        let mut query_fields = vec![];
-
-        // Check if body field is indexed
-        if schema.fields.get("body").is_none_or(|f| f.indexed) {
-            query_fields.push(fields.body);
-            debug!("Added 'body' field to search");
-        }
-
-        // Check if any json_blob fields are indexed
-        let has_indexed_json = schema
-            .fields
-            .values()
-            .any(|f| f.name != "body" && f.indexed);
-        if has_indexed_json {
-            query_fields.push(fields.json_blob);
-            debug!("Added 'json_blob' field to search");
-        }
+        let query_fields: Vec<Field> = fields.indexed_fields.values().cloned().collect();
 
         if query_fields.is_empty() {
             warn!(index = %index, "No indexed fields available for search");
@@ -1088,25 +1179,46 @@ impl HybridStore {
                         // Step 3: Build tantivy document with ONLY indexed fields
                         let mut tantivy_doc = doc!(fields.id => id.as_str());
 
-                        // Check if 'body' field should be indexed
-                        let body_indexed = schema.fields.get("body").is_none_or(|f| f.indexed);
+                        // Step 4: Index schema-defined fields individually
+                        for (field_name, field_def) in &schema.fields {
+                            if !field_def.indexed {
+                                continue;
+                            }
 
-                        if body_indexed {
-                            tantivy_doc.add_text(fields.body, &body);
-                        }
+                            if let Some(tantivy_field) = fields.indexed_fields.get(field_name) {
+                                if field_name == "body" {
+                                    tantivy_doc.add_text(*tantivy_field, &body);
+                                    continue;
+                                }
 
-                        // Step 4: Process json_blob fields selectively
-                        if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
-                            for (field_name, field_value) in json_obj {
-                                // Check if field should be indexed
-                                let should_index =
-                                    schema.fields.get(field_name).is_some_and(|f| f.indexed);
-
-                                if should_index {
-                                    // Only serialize and index if marked as indexed
-                                    let field_str = serde_json::to_string(field_value)
-                                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                                    tantivy_doc.add_text(fields.json_blob, &field_str);
+                                if let Some(json_obj) =
+                                    json_blob.as_ref().and_then(|v| v.as_object())
+                                {
+                                    if let Some(field_value) = json_obj.get(field_name) {
+                                        match field_def.field_type.as_str() {
+                                            "array" => {
+                                                if let Some(arr) = field_value.as_array() {
+                                                    for item in arr {
+                                                        let item_str = serde_json::to_string(item)
+                                                            .map_err(|e| {
+                                                                StoreError::Serialization(
+                                                                    e.to_string(),
+                                                                )
+                                                            })?;
+                                                        tantivy_doc
+                                                            .add_text(*tantivy_field, &item_str);
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                let field_str = serde_json::to_string(field_value)
+                                                    .map_err(|e| {
+                                                        StoreError::Serialization(e.to_string())
+                                                    })?;
+                                                tantivy_doc.add_text(*tantivy_field, &field_str);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
