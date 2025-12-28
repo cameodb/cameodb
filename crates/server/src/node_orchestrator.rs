@@ -946,6 +946,102 @@ impl RouterActor {
         // Execute local + remote concurrently
         let (local_result, remote_results) = tokio::join!(local_future, join_all(remote_futures));
 
+        // If this is a search, prefer fastest/local results and stop after hitting the limit.
+        if let ClientOp::Search { limit, .. } = &op {
+            let limit = limit.unwrap_or(10);
+            let mut merged_hits: Vec<JsonValue> = Vec::with_capacity(limit);
+            let mut total_shards_queried = 0usize;
+            let mut error_count = 0u64;
+            let mut nodes_contacted = 0usize;
+
+            // Helper to push hits from a result up to the remaining limit
+            fn push_hits(
+                value: &JsonValue,
+                merged_hits: &mut Vec<JsonValue>,
+                limit: usize,
+                total_shards_queried: &mut usize,
+                nodes_contacted: &mut usize,
+            ) {
+                if merged_hits.len() >= limit {
+                    return;
+                }
+                if let Some(hits) = value.get("hits").and_then(|h| h.as_array()) {
+                    for hit in hits {
+                        if merged_hits.len() >= limit {
+                            break;
+                        }
+                        merged_hits.push(hit.clone());
+                    }
+                }
+                if let Some(shards) = value.get("shards_responded").and_then(|s| s.as_u64()) {
+                    *total_shards_queried += shards as usize;
+                }
+                *nodes_contacted += 1;
+            }
+
+            // Process local result first
+            match &local_result {
+                Ok(val) => push_hits(
+                    val,
+                    &mut merged_hits,
+                    limit,
+                    &mut total_shards_queried,
+                    &mut nodes_contacted,
+                ),
+                Err(e) => {
+                    error_count += 1;
+                    warn!(error = %e, "Broadcast: local search failed");
+                }
+            }
+
+            // Then process remote results in completion order until limit is reached
+            for result in remote_results {
+                if merged_hits.len() >= limit {
+                    break;
+                }
+                match result {
+                    Ok(Ok(val)) => push_hits(
+                        &val,
+                        &mut merged_hits,
+                        limit,
+                        &mut total_shards_queried,
+                        &mut nodes_contacted,
+                    ),
+                    Ok(Err(e)) => {
+                        error_count += 1;
+                        warn!(error = %e, "Broadcast: remote search failed");
+                    }
+                    Err(elapsed) => {
+                        error_count += 1;
+                        warn!(error = %elapsed, "Broadcast: remote search timed out");
+                    }
+                }
+            }
+
+            // Track failures
+            if error_count > 0 {
+                self.broadcast_failures
+                    .fetch_add(error_count, AtomicOrdering::Relaxed);
+            }
+
+            // Keep local/fast-first ordering, but stabilize scores within the collected set
+            merged_hits.sort_by(|a, b| {
+                let score_a = a.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                let score_b = b.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                score_b
+                    .partial_cmp(&score_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            merged_hits.truncate(limit);
+
+            return Ok(serde_json::json!({
+                "hits": merged_hits,
+                "total_shards": total_shards_queried,
+                "nodes_contacted": nodes_contacted,
+                "failed_shards": error_count
+            }));
+        }
+
         // Aggregate results: for search, merge hits; for writes, report success/failure counts
         let mut all_results: Vec<JsonValue> = Vec::new();
         let mut error_count = 0u64;
@@ -981,7 +1077,11 @@ impl RouterActor {
 
         // Merge results based on operation type
         match &op {
-            ClientOp::Search { .. } => {
+            ClientOp::Search { limit, .. } => {
+                // Enforce a global limit across merged results to avoid returning
+                // (limit * nodes) hits when broadcasting.
+                let limit = limit.unwrap_or(10);
+
                 // For search operations, if we only have local results (no remote peers),
                 // return the local response directly to preserve shard-level details
                 if all_results.len() == 1 && peer_count == 0 {
@@ -1010,6 +1110,7 @@ impl RouterActor {
                         .partial_cmp(&score_a)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
+                merged_hits.truncate(limit);
 
                 Ok(serde_json::json!({
                     "hits": merged_hits,
