@@ -5,11 +5,14 @@
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, patch, post, put},
 };
+use bytes::Bytes;
+use futures::{StreamExt, stream};
 use kameo::actor::ActorRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -197,7 +200,37 @@ async fn stream_handler(
         .router
         .route_and_handle(client_op, None, OperationType::Read)
         .await?;
-    Ok(Json(result).into_response())
+
+    // Stream hits as NDJSON if present; otherwise stream the full JSON once.
+    if let Some(hits) = result.get("hits").and_then(|v| v.as_array()).cloned() {
+        let stream = stream::iter(hits.into_iter().map(|hit| match serde_json::to_vec(&hit) {
+            Ok(mut bytes) => {
+                bytes.push(b'\n');
+                Ok(Bytes::from(bytes))
+            }
+            Err(e) => Err(std::io::Error::other(e)),
+        }))
+        .map(|res| res.map_err(|e| std::io::Error::other(e)));
+
+        let body = Body::from_stream(stream);
+        let mut resp = Response::new(body);
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-ndjson"),
+        );
+        Ok(resp)
+    } else {
+        let bytes = serde_json::to_vec(&result)
+            .map_err(|e| AppError(anyhow::anyhow!("Failed to serialize stream result: {}", e)))?;
+        let stream = stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
+        let body = Body::from_stream(stream);
+        let mut resp = Response::new(body);
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        Ok(resp)
+    }
 }
 
 /// Handler for document write operations
