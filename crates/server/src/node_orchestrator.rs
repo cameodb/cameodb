@@ -22,7 +22,7 @@ use std::sync::{
     Arc, RwLock,
     atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use kameo::actor::ActorRef;
@@ -944,6 +944,7 @@ impl RouterActor {
             .collect();
 
         // Execute local + remote concurrently
+        let t_start = Instant::now();
         let (local_result, remote_results) = tokio::join!(local_future, join_all(remote_futures));
 
         // If this is a search, prefer fastest/local results and stop after hitting the limit.
@@ -953,6 +954,7 @@ impl RouterActor {
             let mut total_shards_queried = 0usize;
             let mut error_count = 0u64;
             let mut nodes_contacted = 0usize;
+            let mut max_took_ms: Option<u64> = None;
 
             // Helper to push hits from a result up to the remaining limit
             fn push_hits(
@@ -961,6 +963,7 @@ impl RouterActor {
                 limit: usize,
                 total_shards_queried: &mut usize,
                 nodes_contacted: &mut usize,
+                max_took_ms: &mut Option<u64>,
             ) {
                 if merged_hits.len() >= limit {
                     return;
@@ -977,6 +980,12 @@ impl RouterActor {
                     *total_shards_queried += shards as usize;
                 }
                 *nodes_contacted += 1;
+                if let Some(t) = value.get("took_ms").and_then(|v| v.as_u64()) {
+                    *max_took_ms = match *max_took_ms {
+                        Some(cur) => Some(cur.max(t)),
+                        None => Some(t),
+                    };
+                }
             }
 
             // Process local result first
@@ -987,6 +996,7 @@ impl RouterActor {
                     limit,
                     &mut total_shards_queried,
                     &mut nodes_contacted,
+                    &mut max_took_ms,
                 ),
                 Err(e) => {
                     error_count += 1;
@@ -1006,6 +1016,7 @@ impl RouterActor {
                         limit,
                         &mut total_shards_queried,
                         &mut nodes_contacted,
+                        &mut max_took_ms,
                     ),
                     Ok(Err(e)) => {
                         error_count += 1;
@@ -1038,7 +1049,8 @@ impl RouterActor {
                 "hits": merged_hits,
                 "total_shards": total_shards_queried,
                 "nodes_contacted": nodes_contacted,
-                "failed_shards": error_count
+                "failed_shards": error_count,
+                "took_ms": max_took_ms.unwrap_or_else(|| t_start.elapsed().as_millis() as u64)
             }));
         }
 
