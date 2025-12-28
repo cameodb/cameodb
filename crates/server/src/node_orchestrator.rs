@@ -613,7 +613,7 @@ impl MicroshardActor {
 /// * `index` - The index name
 /// * `doc` - The document to validate
 /// * `schema_cache` - Mutable reference to the cached schema
-/// * `store` - Reference to the storage engine for persistence
+/// * `shards` - Map of local shards to persist schema updates to
 ///
 /// # Returns
 ///
@@ -622,7 +622,7 @@ async fn validate_and_evolve_schema(
     index: &str,
     doc: &JsonValue,
     schema_cache: &mut IndexSchema,
-    store: &Arc<HybridStore>,
+    shards: &HashMap<Uuid, MicroshardActor>,
 ) -> Result<bool, OrchestratorError> {
     // Check 1 (Mandatory): Ensure doc["id"] exists
     if !doc.is_object() || !doc.as_object().unwrap().contains_key("id") {
@@ -640,9 +640,20 @@ async fn validate_and_evolve_schema(
     // Check 2 (Evolution): Iterate keys in doc
     if let Some(obj) = doc.as_object() {
         for (key, value) in obj {
+            if key == "id" {
+                continue;
+            }
+
             let inferred_type = match value {
-                JsonValue::String(_) => "text",
-                JsonValue::Number(_) => "number",
+                JsonValue::String(s) => {
+                    // Try to infer date from string
+                    if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+                        "date"
+                    } else {
+                        "text"
+                    }
+                }
+                JsonValue::Number(_) => "f64",
                 JsonValue::Bool(_) => "boolean",
                 JsonValue::Array(_) => "array",
                 JsonValue::Object(_) => "object",
@@ -676,26 +687,49 @@ async fn validate_and_evolve_schema(
 
     // Persist updated schema to storage if changed
     if schema_updated {
-        let store_clone = Arc::clone(store);
-        let schema_clone = schema_cache.clone();
         let index_name = index.to_string();
+        let schema_clone = schema_cache.clone();
 
-        tokio::task::spawn_blocking(move || {
-            store_clone.store_schema_and_cache(&index_name, &schema_clone)
-        })
-        .await
-        .map_err(|e| {
-            OrchestratorError::Io(std::io::Error::other(format!(
-                "Failed to spawn schema update task: {}",
-                e
-            )))
-        })?
-        .map_err(|e| {
-            OrchestratorError::Io(std::io::Error::other(format!(
-                "Failed to store schema: {}",
-                e
-            )))
-        })?;
+        // Collect all stores from local shards
+        let stores: Vec<Arc<HybridStore>> = shards
+            .values()
+            .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
+            .collect();
+
+        if stores.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No local stores available to persist schema",
+            )));
+        }
+
+        // Persist to all stores concurrently
+        let handles: Vec<_> = stores
+            .into_iter()
+            .map(|store| {
+                let idx = index_name.clone();
+                let sch = schema_clone.clone();
+                tokio::task::spawn_blocking(move || store.store_schema_and_cache(&idx, &sch))
+            })
+            .collect();
+
+        // Await all results
+        for handle in handles {
+            handle
+                .await
+                .map_err(|e| {
+                    OrchestratorError::Io(std::io::Error::other(format!(
+                        "Failed to spawn schema update task: {}",
+                        e
+                    )))
+                })?
+                .map_err(|e| {
+                    OrchestratorError::Io(std::io::Error::other(format!(
+                        "Failed to store schema: {}",
+                        e
+                    )))
+                })?;
+        }
 
         if is_initial_creation {
             info!(
@@ -1830,14 +1864,12 @@ impl NodeOrchestrator {
             )));
         }
         let mut schema_cache = self.load_schema(index).await?;
-        if let Some(shard) = self.shards.values().next() {
-            if let Some(store) = &shard.store {
-                let updated =
-                    validate_and_evolve_schema(index, &doc, &mut schema_cache, store).await?;
-                if updated {
-                    self.put_cached_schema(index, &schema_cache);
-                }
-            }
+
+        // Evolve schema and persist to ALL local shards
+        let updated =
+            validate_and_evolve_schema(index, &doc, &mut schema_cache, &self.shards).await?;
+        if updated {
+            self.put_cached_schema(index, &schema_cache);
         }
 
         // Derive effective routing key:
@@ -1885,25 +1917,22 @@ impl NodeOrchestrator {
         let mut schema_cache = self.load_schema(index).await?;
         let mut schema_updated = false;
 
-        if let Some(shard) = self.shards.values().next() {
-            if let Some(store) = &shard.store {
-                for doc_payload in &docs {
-                    let updated = validate_and_evolve_schema(
-                        index,
-                        &doc_payload.doc,
-                        &mut schema_cache,
-                        store,
-                    )
-                    .await?;
-                    if updated {
-                        schema_updated = true;
-                    }
-                }
-                // Update cache once after processing all docs
-                if schema_updated {
-                    self.put_cached_schema(index, &schema_cache);
-                }
+        for doc_payload in &docs {
+            let updated = validate_and_evolve_schema(
+                index,
+                &doc_payload.doc,
+                &mut schema_cache,
+                &self.shards,
+            )
+            .await?;
+            if updated {
+                schema_updated = true;
             }
+        }
+
+        // Update cache once after processing all docs
+        if schema_updated {
+            self.put_cached_schema(index, &schema_cache);
         }
 
         // Group documents by target shard using the same routing key strategy
@@ -2104,26 +2133,48 @@ impl NodeOrchestrator {
         index: &str,
         schema: IndexSchema,
     ) -> Result<JsonValue, OrchestratorError> {
-        if let Some(shard) = self.shards.values().next() {
-            if let Some(store) = &shard.store {
-                let sc = Arc::clone(store);
-                let idx = index.to_string();
-                let sch = schema.clone();
-                tokio::task::spawn_blocking(move || sc.store_schema(&idx, &sch))
-                    .await
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-                let shard_count = schema.shard_count;
-                self.put_cached_schema(index, &schema);
-                return Ok(
-                    serde_json::json!({"acknowledged": true, "index": index, "shard_count": shard_count, "field_names": Self::sorted_field_names(&schema)}),
-                );
-            }
+        let stores: Vec<Arc<HybridStore>> = self
+            .shards
+            .values()
+            .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
+            .collect();
+
+        if stores.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No local stores available to persist schema",
+            )));
         }
-        Err(OrchestratorError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "No shards",
-        )))
+
+        let index_name = index.to_string();
+        let schema_clone = schema.clone();
+
+        // Persist to all stores concurrently
+        let handles: Vec<_> = stores
+            .into_iter()
+            .map(|store| {
+                let idx = index_name.clone();
+                let sch = schema_clone.clone();
+                tokio::task::spawn_blocking(move || store.store_schema_and_cache(&idx, &sch))
+            })
+            .collect();
+
+        for handle in handles {
+            handle
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+        }
+
+        let shard_count = schema.shard_count;
+        self.put_cached_schema(index, &schema);
+
+        Ok(serde_json::json!({
+            "acknowledged": true,
+            "index": index,
+            "shard_count": shard_count,
+            "field_names": Self::sorted_field_names(&schema)
+        }))
     }
 
     async fn orch_get_config(&self, index: &str) -> Result<JsonValue, OrchestratorError> {

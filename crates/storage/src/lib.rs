@@ -33,8 +33,8 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tantivy::query::QueryParserError;
-use tantivy::schema::{Document, Field, STORED, STRING, Schema, TEXT};
-use tantivy::{Index, IndexReader, IndexWriter, doc};
+use tantivy::schema::{Document, FAST, Field, INDEXED, STORED, STRING, Schema, TEXT};
+use tantivy::{DateTime, Index, IndexReader, IndexWriter, doc};
 use thiserror::Error;
 
 /// Schema metadata table: maps index names to their schema definitions.
@@ -327,6 +327,10 @@ impl HybridStore {
         let mut indexed_fields = HashMap::new();
 
         for (name, field_def) in &index_schema.fields {
+            if name == "id" {
+                continue;
+            }
+
             if !field_def.indexed {
                 continue;
             }
@@ -336,6 +340,14 @@ impl HybridStore {
                 "text" => schema_builder.add_text_field(name, TEXT),
                 // Array is treated as multi-valued text
                 "array" => schema_builder.add_text_field(name, TEXT),
+                // Numeric types (FAST allows range queries and sorting)
+                "f64" | "number" => schema_builder.add_f64_field(name, FAST | INDEXED | STORED),
+                "i64" => schema_builder.add_i64_field(name, FAST | INDEXED | STORED),
+                "u64" => schema_builder.add_u64_field(name, FAST | INDEXED | STORED),
+                // Date type
+                "date" => schema_builder.add_date_field(name, FAST | INDEXED | STORED),
+                // Boolean (stored as untokenized string "true"/"false")
+                "boolean" => schema_builder.add_text_field(name, STRING | STORED),
                 // Fallback to text for unknown types
                 _ => schema_builder.add_text_field(name, TEXT),
             };
@@ -628,6 +640,42 @@ impl HybridStore {
                                                 }
                                             }
                                         }
+                                        "f64" | "number" => {
+                                            if let Some(n) = field_value.as_f64() {
+                                                tantivy_doc.add_f64(*tantivy_field, n);
+                                            }
+                                        }
+                                        "i64" => {
+                                            if let Some(n) = field_value.as_i64() {
+                                                tantivy_doc.add_i64(*tantivy_field, n);
+                                            }
+                                        }
+                                        "u64" => {
+                                            if let Some(n) = field_value.as_u64() {
+                                                tantivy_doc.add_u64(*tantivy_field, n);
+                                            }
+                                        }
+                                        "date" => {
+                                            if let Some(s) = field_value.as_str() {
+                                                if let Ok(dt) =
+                                                    chrono::DateTime::parse_from_rfc3339(s)
+                                                {
+                                                    let tantivy_dt = DateTime::from_timestamp_secs(
+                                                        dt.timestamp(),
+                                                    );
+                                                    tantivy_doc
+                                                        .add_date(*tantivy_field, tantivy_dt);
+                                                }
+                                            }
+                                        }
+                                        "boolean" => {
+                                            if let Some(b) = field_value.as_bool() {
+                                                tantivy_doc.add_text(
+                                                    *tantivy_field,
+                                                    if b { "true" } else { "false" },
+                                                );
+                                            }
+                                        }
                                         _ => {
                                             let field_str = serde_json::to_string(field_value)
                                                 .map_err(|e| {
@@ -864,8 +912,16 @@ impl HybridStore {
 
         // Update cache
         let schema_arc = Arc::new(schema.clone());
-        let mut cache = self.schema_cache.write().unwrap();
-        cache.insert(index.to_string(), schema_arc);
+        {
+            let mut cache = self.schema_cache.write().unwrap();
+            cache.insert(index.to_string(), schema_arc);
+        }
+
+        // Invalidate fields cache so it rebuilds on next access
+        {
+            let mut fields_cache = self.fields_cache.write().unwrap();
+            fields_cache.remove(index);
+        }
 
         Ok(())
     }
