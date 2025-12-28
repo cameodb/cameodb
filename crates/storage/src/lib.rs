@@ -348,6 +348,8 @@ impl HybridStore {
                 "date" => schema_builder.add_date_field(name, FAST | INDEXED | STORED),
                 // Boolean (stored as untokenized string "true"/"false")
                 "boolean" => schema_builder.add_text_field(name, STRING | STORED),
+                // Exact (stored as untokenized string, preserved punctuation)
+                "exact" => schema_builder.add_text_field(name, STRING | STORED),
                 // Fallback to text for unknown types
                 _ => schema_builder.add_text_field(name, TEXT),
             };
@@ -674,6 +676,17 @@ impl HybridStore {
                                                     *tantivy_field,
                                                     if b { "true" } else { "false" },
                                                 );
+                                            }
+                                        }
+                                        "exact" => {
+                                            if let Some(arr) = field_value.as_array() {
+                                                for item in arr {
+                                                    if let Some(s) = item.as_str() {
+                                                        tantivy_doc.add_text(*tantivy_field, s);
+                                                    }
+                                                }
+                                            } else if let Some(s) = field_value.as_str() {
+                                                tantivy_doc.add_text(*tantivy_field, s);
                                             }
                                         }
                                         _ => {

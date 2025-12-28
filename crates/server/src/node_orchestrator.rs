@@ -662,7 +662,25 @@ async fn validate_and_evolve_schema(
 
             if let Some(existing_field) = schema_cache.fields.get(key) {
                 // Check type compatibility
-                if existing_field.field_type != inferred_type {
+                // 1. Exact match is always allowed
+                let mut is_compatible = existing_field.field_type == inferred_type;
+
+                // 2. Allow "text" (inferred) to match "exact" (schema)
+                if !is_compatible && inferred_type == "text" {
+                    if existing_field.field_type == "exact" {
+                        is_compatible = true;
+                    }
+                }
+
+                // 3. Allow "array" (inferred) to match "text", "exact" (schema)
+                // Tantivy supports multi-valued fields for all text/string types
+                if !is_compatible && inferred_type == "array" {
+                    if existing_field.field_type == "text" || existing_field.field_type == "exact" {
+                        is_compatible = true;
+                    }
+                }
+
+                if !is_compatible {
                     return Err(OrchestratorError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
