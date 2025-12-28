@@ -249,9 +249,14 @@ async fn main() -> Result<()> {
     // Start the HTTP server with configured address
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
 
-    // Start the HTTP server
+    // Start the HTTP server (with connect info for client addr extraction)
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        if let Err(e) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        {
             eprintln!("Server error: {}", e);
         }
     });

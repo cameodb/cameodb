@@ -13,18 +13,21 @@ use axum::{
 use kameo::actor::ActorRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
+use tower_http::{
+    compression::CompressionLayer, cors::CorsLayer, decompression::DecompressionLayer,
+    limit::RequestBodyLimitLayer, trace::TraceLayer,
+};
 use tracing::{error, info};
 
 use crate::cluster_coordinator::{ClusterCoordinator, GetStatus, OperationType};
 use crate::node_orchestrator::{ClientOp, DocPayload, RouterActor};
 use storage::IndexSchema;
 
-/// API Error wrapper for consistent error handling
+/// Application error wrapper for consistent error handling
 #[derive(Debug)]
-pub struct ApiError(pub anyhow::Error);
+pub struct AppError(pub anyhow::Error);
 
-impl IntoResponse for ApiError {
+impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let error_msg = self.0.to_string();
 
@@ -49,7 +52,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-impl<E> From<E> for ApiError
+impl<E> From<E> for AppError
 where
     E: Into<anyhow::Error>,
 {
@@ -123,10 +126,15 @@ pub fn create_router(state: AppState) -> Router {
         .route("/_cluster/_indexes", get(list_cluster_indexes_handler))
         // Health check
         .route("/_cluster/health", get(health_handler))
+        .fallback(fallback_handler)
         .with_state(state)
+        // Response compression first (outermost)
+        .layer(CompressionLayer::new())
+        // Allow compressed requests
+        .layer(DecompressionLayer::new())
+        .layer(RequestBodyLimitLayer::new(20 * 1024 * 1024)) // 20MB limit
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
-        .layer(RequestBodyLimitLayer::new(20 * 1024 * 1024)) // 20MB limit
 }
 
 /// Handler for standard search operations
@@ -134,7 +142,7 @@ async fn search_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
     Json(payload): Json<SearchPayload>,
-) -> Result<Json<JsonValue>, ApiError> {
+) -> Result<Json<JsonValue>, AppError> {
     info!(
         "Search request - index: {}, query: {}, limit: {:?}",
         index, payload.query, payload.limit
@@ -156,7 +164,7 @@ async fn search_handler(
 /// Handler for listing all indexes across the cluster
 async fn list_cluster_indexes_handler(
     State(state): State<AppState>,
-) -> Result<Json<JsonValue>, ApiError> {
+) -> Result<Json<JsonValue>, AppError> {
     info!("List cluster indexes request");
 
     let client_op = ClientOp::ListClusterIndexes;
@@ -173,7 +181,7 @@ async fn stream_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
     Json(payload): Json<SearchPayload>,
-) -> Result<Response, ApiError> {
+) -> Result<Response, AppError> {
     info!(
         "Stream request - index: {}, query: {}",
         index, payload.query
@@ -197,7 +205,7 @@ async fn write_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
     Json(payload): Json<DocPayload>,
-) -> Result<Json<JsonValue>, ApiError> {
+) -> Result<Json<JsonValue>, AppError> {
     info!("Write request - index: {}, doc_id: {}", index, payload.id);
 
     let DocPayload {
@@ -229,7 +237,7 @@ async fn bulk_write_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
     Json(docs): Json<Vec<DocPayload>>,
-) -> Result<Json<JsonValue>, ApiError> {
+) -> Result<Json<JsonValue>, AppError> {
     info!(
         "Bulk write request - index: {}, docs: {}",
         index,
@@ -265,7 +273,7 @@ async fn create_config_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
     Json(schema): Json<IndexSchema>,
-) -> Result<Json<JsonValue>, ApiError> {
+) -> Result<Json<JsonValue>, AppError> {
     info!(
         "Create config request - index: {}, shard_count: {}",
         index, schema.shard_count
@@ -284,7 +292,7 @@ async fn create_config_handler(
 async fn get_config_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
-) -> Result<Json<JsonValue>, ApiError> {
+) -> Result<Json<JsonValue>, AppError> {
     info!("Get config request - index: {}", index);
 
     let client_op = ClientOp::GetConfig { index };
@@ -297,7 +305,7 @@ async fn get_config_handler(
 }
 
 /// Handler for listing all available indexes
-async fn list_indexes_handler(State(state): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
+async fn list_indexes_handler(State(state): State<AppState>) -> Result<Json<JsonValue>, AppError> {
     info!("List indexes request");
 
     let client_op = ClientOp::ListIndexes;
@@ -310,17 +318,17 @@ async fn list_indexes_handler(State(state): State<AppState>) -> Result<Json<Json
 }
 
 /// Handler for cluster health check
-async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
+async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResponse>, AppError> {
     let identity = state
         .router
         .get_identity()
         .await
-        .map_err(|e| ApiError(anyhow::anyhow!(e)))?;
+        .map_err(|e| AppError(anyhow::anyhow!(e)))?;
     let shard_count = state
         .router
         .get_shard_count()
         .await
-        .map_err(|e| ApiError(anyhow::anyhow!(e)))?;
+        .map_err(|e| AppError(anyhow::anyhow!(e)))?;
 
     // Query cluster status from coordinator
     let cluster_status = match state.coordinator.ask(GetStatus).await {
@@ -353,7 +361,7 @@ async fn update_schema_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
     Json(payload): Json<SchemaUpdatePayload>,
-) -> Result<Json<JsonValue>, ApiError> {
+) -> Result<Json<JsonValue>, AppError> {
     info!(
         index = %index,
         field_count = payload.field_updates.len(),
@@ -373,7 +381,7 @@ async fn update_schema_handler(
         .await?;
 
     let mut schema: IndexSchema = serde_json::from_value(current_schema_result)
-        .map_err(|e| ApiError(anyhow::anyhow!("Failed to parse schema: {}", e)))?;
+        .map_err(|e| AppError(anyhow::anyhow!("Failed to parse schema: {}", e)))?;
 
     // Update indexed flags for specified fields
     let mut updated_fields = Vec::new();
@@ -389,7 +397,7 @@ async fn update_schema_handler(
     }
 
     if !missing_fields.is_empty() {
-        return Err(ApiError(anyhow::anyhow!(
+        return Err(AppError(anyhow::anyhow!(
             "Fields not found in schema: {}",
             missing_fields.join(", ")
         )));
@@ -420,6 +428,17 @@ async fn update_schema_handler(
         "updated_fields": updated_fields,
         "message": "Schema updated successfully. New writes will respect updated indexed flags."
     })))
+}
+
+/// Fallback handler for 404/405 to return JSON error shape
+async fn fallback_handler(uri: axum::http::Uri) -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "Not Found",
+            "path": uri.to_string()
+        })),
+    )
 }
 
 // TODO: Add HTTP endpoint tests
