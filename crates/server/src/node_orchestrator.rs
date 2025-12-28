@@ -640,24 +640,24 @@ async fn validate_and_evolve_schema(
     // Check 2 (Evolution): Iterate keys in doc
     if let Some(obj) = doc.as_object() {
         for (key, value) in obj {
-            if key == "id" {
-                continue;
-            }
-
-            let inferred_type = match value {
-                JsonValue::String(s) => {
-                    // Try to infer date from string
-                    if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
-                        "date"
-                    } else {
-                        "text"
+            let inferred_type = if key == "id" {
+                "text"
+            } else {
+                match value {
+                    JsonValue::String(s) => {
+                        // Try to infer date from string
+                        if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+                            "date"
+                        } else {
+                            "text"
+                        }
                     }
+                    JsonValue::Number(_) => "f64",
+                    JsonValue::Bool(_) => "boolean",
+                    JsonValue::Array(_) => "array",
+                    JsonValue::Object(_) => "object",
+                    JsonValue::Null => "null",
                 }
-                JsonValue::Number(_) => "f64",
-                JsonValue::Bool(_) => "boolean",
-                JsonValue::Array(_) => "array",
-                JsonValue::Object(_) => "object",
-                JsonValue::Null => "null",
             };
 
             if let Some(existing_field) = schema_cache.fields.get(key) {
@@ -2131,8 +2131,20 @@ impl NodeOrchestrator {
     async fn orch_create_config(
         &self,
         index: &str,
-        schema: IndexSchema,
+        mut schema: IndexSchema,
     ) -> Result<JsonValue, OrchestratorError> {
+        // Ensure 'id' field is explicitly in the schema for visibility
+        if !schema.fields.contains_key("id") {
+            schema.fields.insert(
+                "id".to_string(),
+                FieldDef {
+                    name: "id".to_string(),
+                    field_type: "text".to_string(),
+                    indexed: true,
+                },
+            );
+        }
+
         let stores: Vec<Arc<HybridStore>> = self
             .shards
             .values()
