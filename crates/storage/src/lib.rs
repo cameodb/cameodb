@@ -304,9 +304,7 @@ impl HybridStore {
         const MAX_CACHE_ENTRIES_PER_INDEX: usize = 1024;
 
         let mut cache_map = self.read_cache.write().unwrap();
-        let index_cache = cache_map
-            .entry(index.to_string())
-            .or_insert_with(HashMap::new);
+        let index_cache = cache_map.entry(index.to_string()).or_default();
 
         if index_cache.len() >= MAX_CACHE_ENTRIES_PER_INDEX
             && let Some(first_key) = index_cache.keys().next().cloned()
@@ -394,10 +392,10 @@ impl HybridStore {
         // Check writers cache first
         {
             let readers = self.writers.read().unwrap();
-            if let Some(writer) = readers.get(index) {
-                if let Some(fields) = self.fields_cache.read().unwrap().get(index).cloned() {
-                    return Ok((Arc::clone(writer), fields));
-                }
+            if let Some(writer) = readers.get(index)
+                && let Some(fields) = self.fields_cache.read().unwrap().get(index).cloned()
+            {
+                return Ok((Arc::clone(writer), fields));
             }
         }
 
@@ -658,16 +656,13 @@ impl HybridStore {
                                             }
                                         }
                                         "date" => {
-                                            if let Some(s) = field_value.as_str() {
-                                                if let Ok(dt) =
+                                            if let Some(s) = field_value.as_str()
+                                                && let Ok(dt) =
                                                     chrono::DateTime::parse_from_rfc3339(s)
-                                                {
-                                                    let tantivy_dt = DateTime::from_timestamp_secs(
-                                                        dt.timestamp(),
-                                                    );
-                                                    tantivy_doc
-                                                        .add_date(*tantivy_field, tantivy_dt);
-                                                }
+                                            {
+                                                let tantivy_dt =
+                                                    DateTime::from_timestamp_secs(dt.timestamp());
+                                                tantivy_doc.add_date(*tantivy_field, tantivy_dt);
                                             }
                                         }
                                         "boolean" => {
@@ -1262,30 +1257,26 @@ impl HybridStore {
 
                                 if let Some(json_obj) =
                                     json_blob.as_ref().and_then(|v| v.as_object())
+                                    && let Some(field_value) = json_obj.get(field_name)
                                 {
-                                    if let Some(field_value) = json_obj.get(field_name) {
-                                        match field_def.field_type.as_str() {
-                                            "array" => {
-                                                if let Some(arr) = field_value.as_array() {
-                                                    for item in arr {
-                                                        let item_str = serde_json::to_string(item)
-                                                            .map_err(|e| {
-                                                                StoreError::Serialization(
-                                                                    e.to_string(),
-                                                                )
-                                                            })?;
-                                                        tantivy_doc
-                                                            .add_text(*tantivy_field, &item_str);
-                                                    }
+                                    match field_def.field_type.as_str() {
+                                        "array" => {
+                                            if let Some(arr) = field_value.as_array() {
+                                                for item in arr {
+                                                    let item_str = serde_json::to_string(item)
+                                                        .map_err(|e| {
+                                                            StoreError::Serialization(e.to_string())
+                                                        })?;
+                                                    tantivy_doc.add_text(*tantivy_field, &item_str);
                                                 }
                                             }
-                                            _ => {
-                                                let field_str = serde_json::to_string(field_value)
-                                                    .map_err(|e| {
-                                                        StoreError::Serialization(e.to_string())
-                                                    })?;
-                                                tantivy_doc.add_text(*tantivy_field, &field_str);
-                                            }
+                                        }
+                                        _ => {
+                                            let field_str = serde_json::to_string(field_value)
+                                                .map_err(|e| {
+                                                    StoreError::Serialization(e.to_string())
+                                                })?;
+                                            tantivy_doc.add_text(*tantivy_field, &field_str);
                                         }
                                     }
                                 }

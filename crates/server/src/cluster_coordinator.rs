@@ -986,7 +986,7 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
         }
 
         // Check for shards we expected but didn't receive
-        for (shard_id, _) in &expected_for_node {
+        for shard_id in expected_for_node.keys() {
             if !actual_shards.contains_key(shard_id) {
                 missing.push(*shard_id);
             }

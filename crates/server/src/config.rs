@@ -374,7 +374,7 @@ impl CameoDbConfig {
 
         if let Ok(nodes) = std::env::var("CAMEODB_BOOTSTRAP_NODES") {
             let parsed: Vec<String> = nodes
-                .split(|c| c == ',' || c == ';')
+                .split([',', ';'])
                 .filter_map(|entry| {
                     let trimmed = entry.trim();
                     if trimmed.is_empty() {

@@ -1290,8 +1290,8 @@ impl RouterActor {
 
                 // Convert to JSON array
                 let cluster_indexes: Vec<JsonValue> = index_map
-                    .into_iter()
-                    .map(|(_, stats)| {
+                    .into_values()
+                    .map(|stats| {
                         serde_json::json!({
                             "name": stats.name,
                             "document_count": stats.document_count,
@@ -2260,7 +2260,7 @@ impl NodeOrchestrator {
                         .or_insert((0, 0, Vec::new(), 0));
                     e.0 += stat.document_count;
                     e.1 += stat.total_size_bytes;
-                    for (f, _) in &stat.schema.fields {
+                    for f in stat.schema.fields.keys() {
                         if !e.2.contains(f) {
                             e.2.push(f.clone());
                         }

@@ -246,7 +246,7 @@ async fn bulk_write_handler(
                 // Fallback: hash the document bytes to keep routing stable
                 serde_json::to_vec(&doc.doc)
                     .ok()
-                    .and_then(|bytes| Some(format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes))))
+                    .map(|bytes| format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes)))
             }
         })
     });
