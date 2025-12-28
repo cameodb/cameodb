@@ -662,12 +662,11 @@ async fn validate_and_evolve_schema(
                 }
             } else {
                 // New field: Update schema_cache (Append-Only)
-                // Initial creation: indexed=true (all fields indexed by default)
-                // Evolution: indexed=false (new fields not indexed, explicit opt-in required)
+                // Mark new fields indexed by default so they become searchable on arrival
                 let new_field = FieldDef {
                     name: key.clone(),
                     field_type: inferred_type.to_string(),
-                    indexed: is_initial_creation,
+                    indexed: true,
                 };
                 schema_cache.fields.insert(key.clone(), new_field);
                 schema_updated = true;
