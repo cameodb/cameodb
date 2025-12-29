@@ -26,10 +26,13 @@ use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Handle CLI arguments for configuration utilities
+    // Handle CLI arguments for configuration utilities and client mode
     let args: Vec<String> = std::env::args().collect();
-    if let Some(flag) = args.get(1).map(String::as_str) {
-        match flag {
+    if let Some(arg) = args.get(1).map(String::as_str) {
+        match arg {
+            "client" => {
+                return client::run_cli().await;
+            }
             "--version" | "-V" => {
                 println!("cameodb {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
