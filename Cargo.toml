@@ -11,7 +11,7 @@ kameo = { version = "0.19", features = ["remote", "macros"] }
 libp2p = { version = "0.56", features = ["tcp", "dns", "quic", "noise", "yamux", "macros", "kad", "tokio", "serde", "request-response"] }
 num_cpus = "1.16"
 redb = "3.1"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_yaml = "0.9"

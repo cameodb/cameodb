@@ -12,7 +12,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     musl-tools \
     gcc-aarch64-linux-gnu \
     pkg-config \
-    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. MOUNT SECRET (Transient)
