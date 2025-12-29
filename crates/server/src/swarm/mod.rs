@@ -222,6 +222,7 @@ async fn create_production_swarm(
         peer_id,
         Some(libp2p::kad::Mode::Server), // Server mode for stable operation
         keypair.public(),
+        node_uuid,
     )?;
 
     info!("🏗️  Created Kademlia DHT behaviour for peer discovery");
@@ -560,6 +561,7 @@ fn handle_swarm_event(
             listener_id,
             addresses,
             reason,
+            ..
         } => {
             warn!(
                 "⚠️ Listener {:?} closed: {:?} (addresses: {:?})",
@@ -589,7 +591,7 @@ fn handle_behaviour_event(
             handle_kameo_event(kameo_event, swarm);
         }
         DhtBehaviourEvent::Identify(identify_event) => {
-            handle_identify_event(identify_event, metrics, swarm);
+            handle_identify_event(identify_event, metrics, event_tx, swarm);
         }
     }
 }
@@ -719,6 +721,7 @@ fn handle_kameo_event(event: kameo::remote::Event, _swarm: &mut libp2p::Swarm<Dh
 fn handle_identify_event(
     event: identify::Event,
     _metrics: &mut SwarmRuntimeMetrics,
+    event_tx: &UnboundedSender<CoordinatorEvent>,
     swarm: &mut libp2p::Swarm<DhtBehaviour>,
 ) {
     if let identify::Event::Received {
@@ -728,18 +731,41 @@ fn handle_identify_event(
     } = event
     {
         info!(
-            "🆔 Identify: Received info from peer {} ({} addrs)",
+            "🆔 Identify: Received info from peer {} ({} addrs, agent: {})",
             peer_id,
-            info.listen_addrs.len()
+            info.listen_addrs.len(),
+            info.agent_version
         );
 
         // Add discovered addresses to Kademlia routing table
-        for addr in info.listen_addrs {
+        for addr in &info.listen_addrs {
             info!("   - Address: {}", addr);
-            swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+            swarm
+                .behaviour_mut()
+                .kademlia
+                .add_address(&peer_id, addr.clone());
         }
 
-        // Query the peer's UUID from the DHT to verify identity and trigger cluster join
+        // Try to extract Node UUID from agent version string: "cameodb/1.0.0/{UUID}"
+        let parts: Vec<&str> = info.agent_version.split('/').collect();
+        if parts.len() >= 3 {
+            let uuid_str = parts[2];
+            if let Ok(uuid) = uuid::Uuid::parse_str(uuid_str) {
+                info!("✨ Discovered Node UUID from Identify protocol: {}", uuid);
+
+                // Trigger peer resolution immediately without waiting for DHT
+                let _ = event_tx.send(CoordinatorEvent::PeerUuidDiscovered {
+                    peer_id: peer_id.to_string(),
+                    node_uuid: uuid.to_string(),
+                    address: info.listen_addrs.first().map(|a| a.to_string()),
+                });
+            } else {
+                warn!("⚠️  Invalid UUID in agent version: {}", uuid_str);
+            }
+        }
+
+        // Fallback: Query the peer's UUID from the DHT (just in case Identify didn't have it or parsing failed)
+        // This is now redundant if Identify succeeds, but harmless as a backup.
         swarm.behaviour_mut().query_peer_uuid(&peer_id);
     }
 }

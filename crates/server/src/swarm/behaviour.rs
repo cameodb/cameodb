@@ -35,6 +35,7 @@ impl DhtBehaviour {
         local_peer_id: PeerId,
         kad_mode: Option<KadMode>,
         local_public_key: libp2p::identity::PublicKey,
+        local_node_uuid: uuid::Uuid,
     ) -> Result<Self, anyhow::Error> {
         info!("🌐 Initializing Kademlia DHT for distributed peer discovery");
         let store = MemoryStore::new(local_peer_id);
@@ -47,10 +48,10 @@ impl DhtBehaviour {
 
         let kameo = remote::Behaviour::new(local_peer_id, remote::messaging::Config::default());
 
-        let identify = identify::Behaviour::new(identify::Config::new(
-            "cameodb/1.0.0".to_string(),
-            local_public_key,
-        ));
+        // Embed Node UUID in agent version for immediate identification during handshake
+        let agent_version = format!("cameodb/1.0.0/{}", local_node_uuid);
+        let identify =
+            identify::Behaviour::new(identify::Config::new(agent_version, local_public_key));
 
         Ok(Self {
             kameo,
