@@ -116,14 +116,14 @@ pub struct AppState {
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         // API routes
-        .route("/api/:index/search", post(search_handler))
-        .route("/api/:index/stream", post(stream_handler))
-        .route("/api/:index/document", put(write_handler))
-        .route("/api/:index/_bulk", post(bulk_write_handler))
-        .route("/api/:index/_config", put(create_config_handler))
-        .route("/api/:index/_config", get(get_config_handler))
+        .route("/api/{index}/search", post(search_handler))
+        .route("/api/{index}/stream", post(stream_handler))
+        .route("/api/{index}/document", put(write_handler))
+        .route("/api/{index}/_bulk", post(bulk_write_handler))
+        .route("/api/{index}/_config", put(create_config_handler))
+        .route("/api/{index}/_config", get(get_config_handler))
         // Schema maintenance
-        .route("/api/:index/_schema", patch(update_schema_handler))
+        .route("/api/{index}/_schema", patch(update_schema_handler))
         // Index management
         .route("/_indexes", get(list_indexes_handler))
         .route("/_cluster/_indexes", get(list_cluster_indexes_handler))
