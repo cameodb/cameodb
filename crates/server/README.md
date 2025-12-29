@@ -9,7 +9,7 @@ This document focuses on the *server-side* architecture and the distributed work
 ## 1. Core Responsibilities
 
 - **HTTP API surface**
-  - Routes: `/api/:index/search` (JSON), `/api/:index/stream` (NDJSON, JSON fallback), `/api/:index/document` (PUT), `/api/:index/_bulk` (POST), `/api/:index/_config` (GET/PUT), `/api/:index/_schema` (PATCH), `/_indexes`, `/_cluster/_indexes`, `/_cluster/health`.
+  - Routes: `/api/{index}/search` (JSON), `/api/{index}/stream` (NDJSON, JSON fallback), `/api/{index}/document` (PUT), `/api/{index}/_bulk` (POST), `/api/{index}/_config` (GET/PUT), `/api/{index}/_schema` (PATCH), `/_indexes`, `/_cluster/_indexes`, `/_cluster/health`.
   - Translates requests into strongly-typed operations (`ClientOp`) and hands them to `RouterActor`.
   - Middleware: compression/decompression, trace, permissive CORS, request body limit; ConnectInfo enabled at serve for client addr extraction.
 - **Local orchestration**

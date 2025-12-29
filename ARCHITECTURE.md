@@ -161,7 +161,7 @@ We utilize a **Unified Replication Model**. There is no distinct "Migration" cod
 The system exposes a RESTful API built on **Axum**. It rejects the complexity of the Elasticsearch JSON DSL in favor of the direct **Tantivy Query Language**.
 
 ### 6.1. Search Endpoint
-* **Method:** `POST /api/:index/search`
+* **Method:** `POST /api/{index}/search`
 * **Request Body:**
   ```json
   {
@@ -186,7 +186,7 @@ The system exposes a RESTful API built on **Axum**. It rejects the complexity of
 * **Query Capabilities:** Full Tantivy query language including Boolean operators (`AND`, `OR`, `-`), Phrase queries (`"foo bar"`), Range queries (`[10 TO 20]`), and Fuzzy matching (`word~1`).
 
 ### 6.2. Ingestion Endpoint
-* **Method:** `PUT /api/:index/document`
+* **Method:** `PUT /api/{index}/document`
 * **Body:**
   ```json
   {

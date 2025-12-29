@@ -48,12 +48,12 @@ CameoDB provides a comprehensive REST API for document management, search, and s
 Search documents within an index with relevance scoring. Returns a single JSON payload (non-streaming).
 
 ```bash
-POST /api/:index/search
+POST /api/{index}/search
 ```
 
 **Example:**
 ```bash
-curl -X POST http://localhost:9480/api/books/search \
+curl -s -X POST http://localhost:9480/api/books/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "science fiction space",
@@ -85,12 +85,12 @@ curl -X POST http://localhost:9480/api/books/search \
 Get search results as a real-time stream for large result sets.
 
 ```bash
-POST /api/:index/stream
+POST /api/{index}/stream
 ```
 
 **Example:**
 ```bash
-curl -X POST http://localhost:9480/api/books/stream \
+curl -s -X POST http://localhost:9480/api/books/stream \
   -H "Content-Type: application/json" \
   -d '{"query": "fantasy adventure"}' \
   --no-buffer
@@ -110,12 +110,12 @@ curl -X POST http://localhost:9480/api/books/stream \
 Insert or update a single document.
 
 ```bash
-PUT /api/:index/document
+PUT /api/{index}/document
 ```
 
 **Example:**
 ```bash
-curl -X PUT http://localhost:9480/api/books/document \
+curl -s -X PUT http://localhost:9480/api/books/document \
   -H "Content-Type: application/json" \
   -d '{
     "id": "book_001",
@@ -144,12 +144,12 @@ curl -X PUT http://localhost:9480/api/books/document \
 Insert or update multiple documents in a single atomic operation.
 
 ```bash
-POST /api/:index/_bulk
+POST /api/{index}/_bulk
 ```
 
 **Example:**
 ```bash
-curl -X POST http://localhost:9480/api/books/_bulk \
+curl -s -X POST http://localhost:9480/api/books/_bulk \
   -H "Content-Type: application/json" \
   -d '[
     {
@@ -187,12 +187,12 @@ curl -X POST http://localhost:9480/api/books/_bulk \
 Define or modify the schema for an index.
 
 ```bash
-PUT /api/:index/_config
+PUT /api/{index}/_config
 ```
 
 **Example:**
 ```bash
-curl -X PUT http://localhost:9480/api/books/_config \
+curl -s -X PUT http://localhost:9480/api/books/_config \
   -H "Content-Type: application/json" \
   -d '{
     "shard_count": 256,
@@ -230,12 +230,12 @@ curl -X PUT http://localhost:9480/api/books/_config \
 Retrieve the current schema for an index.
 
 ```bash
-GET /api/:index/_config
+GET /api/{index}/_config
 ```
 
 **Example:**
 ```bash
-curl http://localhost:9480/api/books/_config
+curl -s http://localhost:9480/api/books/_config
 ```
 
 **Response:**
@@ -259,7 +259,7 @@ GET /_indexes
 
 **Example:**
 ```bash
-curl http://localhost:9480/_indexes
+curl -s http://localhost:9480/_indexes
 ```
 
 **Response:**
@@ -300,7 +300,7 @@ GET /_cluster/health
 
 **Example:**
 ```bash
-curl http://localhost:9480/_cluster/health
+curl -s http://localhost:9480/_cluster/health
 ```
 
 **Response:**
@@ -483,7 +483,7 @@ default_batch_size = 1000
 
 4. **Query your data**
    ```bash
-   curl -X POST http://localhost:9480/api/books/search \
+   curl -s -X POST http://localhost:9480/api/books/search \
      -H "Content-Type: application/json" \
      -d '{"query": "science fiction", "limit": 5}'
    ```

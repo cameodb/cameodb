@@ -27,7 +27,7 @@ sequenceDiagram
     participant B_Orch as NodeOrchestrator (Node B)
     participant B_Shards as MicroshardActors (Node B)
 
-    Client->>A_HTTP: POST /api/:index/search\n{ query, routing_key = "user-42" }
+    Client->>A_HTTP: POST /api/{index}/search\n{ query, routing_key = "user-42" }
     A_HTTP->>A_Router: ClientOp::Search
     A_Router->>A_Coord: RouteOperation{ routing_key = "user-42", Read }
     A_Coord-->>A_Router: RoutingDecision::Remote { node_id = B, peer_addr }
@@ -46,7 +46,7 @@ sequenceDiagram
 
 1. Client sends an HTTP search request to node A:
 
-   - `POST /api/:index/search`
+   - `POST /api/{index}/search`
    - Body includes `routing_key: "user-42"` and `query`.
 
 2. The HTTP handler constructs a `ClientOp` (simplified):
