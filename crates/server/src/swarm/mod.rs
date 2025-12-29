@@ -17,6 +17,7 @@ use libp2p::{
     Multiaddr, PeerId, SwarmBuilder, identify, identity::Keypair, kad, noise, swarm::SwarmEvent,
     tcp, yamux,
 };
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -57,6 +58,8 @@ pub enum CoordinatorEvent {
     },
     PeerLost {
         peer_id: String,
+        node_uuid: Option<String>,
+        address: Option<String>,
     },
     DialFailed {
         peer_id: Option<String>,
@@ -164,6 +167,31 @@ impl SwarmRuntimeMetrics {
             "📊 Swarm runtime summary"
         );
     }
+}
+
+#[derive(Default)]
+struct PeerBook {
+    uuid_by_peer: HashMap<String, String>,
+    addr_by_peer: HashMap<String, String>, // last known good address (from established conn or identify)
+}
+
+fn select_preferred_address(addrs: &[Multiaddr]) -> Option<Multiaddr> {
+    // Prefer IPv4, then IPv6, then anything else
+    if let Some(addr) = addrs
+        .iter()
+        .find(|a| a.to_string().starts_with("/ip4/"))
+        .cloned()
+    {
+        return Some(addr);
+    }
+    if let Some(addr) = addrs
+        .iter()
+        .find(|a| a.to_string().starts_with("/ip6/"))
+        .cloned()
+    {
+        return Some(addr);
+    }
+    addrs.first().cloned()
 }
 
 /// Initialize the distributed swarm for peer-to-peer communication
@@ -421,6 +449,7 @@ fn launch_swarm_runtime(
     tokio::spawn(async move {
         info!("🔄 Swarm runtime task started");
         let mut metrics = SwarmRuntimeMetrics::default();
+        let mut peer_book = PeerBook::default();
 
         loop {
             select! {
@@ -435,7 +464,7 @@ fn launch_swarm_runtime(
                 }
                 event = swarm.select_next_some() => {
                     metrics.total_events += 1;
-                    handle_swarm_event(event, &mut metrics, &event_tx, &mut swarm);
+                    handle_swarm_event(event, &mut metrics, &event_tx, &mut swarm, &mut peer_book);
                 }
             }
         }
@@ -477,11 +506,12 @@ fn handle_swarm_event(
     metrics: &mut SwarmRuntimeMetrics,
     event_tx: &UnboundedSender<CoordinatorEvent>,
     swarm: &mut libp2p::Swarm<DhtBehaviour>,
+    peer_book: &mut PeerBook,
 ) {
     match event {
         SwarmEvent::Behaviour(behaviour_event) => {
             metrics.behaviour_events += 1;
-            handle_behaviour_event(behaviour_event, metrics, event_tx, swarm);
+            handle_behaviour_event(behaviour_event, metrics, event_tx, swarm, peer_book);
         }
         SwarmEvent::NewListenAddr { address, .. } => {
             info!("🎧 Swarm listening on: {}", address);
@@ -497,6 +527,9 @@ fn handle_swarm_event(
         } => {
             metrics.connections_established += 1;
             let addr = Some(endpoint.get_remote_address().to_string());
+            peer_book
+                .addr_by_peer
+                .insert(peer_id.to_string(), addr.clone().unwrap_or_default());
             let _ = event_tx.send(CoordinatorEvent::PeerDiscovered {
                 peer_id: peer_id.to_string(),
                 address: addr,
@@ -510,8 +543,12 @@ fn handle_swarm_event(
         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
             metrics.connections_closed += 1;
             info!("🔒 Connection closed with {} ({:?})", peer_id, cause);
+            let node_uuid = peer_book.uuid_by_peer.remove(&peer_id.to_string());
+            let address = peer_book.addr_by_peer.remove(&peer_id.to_string());
             let _ = event_tx.send(CoordinatorEvent::PeerLost {
                 peer_id: peer_id.to_string(),
+                node_uuid,
+                address,
             });
         }
         SwarmEvent::Dialing {
@@ -582,16 +619,17 @@ fn handle_behaviour_event(
     metrics: &mut SwarmRuntimeMetrics,
     event_tx: &UnboundedSender<CoordinatorEvent>,
     swarm: &mut libp2p::Swarm<DhtBehaviour>,
+    peer_book: &mut PeerBook,
 ) {
     match event {
         DhtBehaviourEvent::Kademlia(kad_event) => {
-            handle_kademlia_event(kad_event, metrics, event_tx, swarm)
+            handle_kademlia_event(kad_event, metrics, event_tx, swarm, peer_book)
         }
         DhtBehaviourEvent::Kameo(kameo_event) => {
             handle_kameo_event(kameo_event, swarm);
         }
         DhtBehaviourEvent::Identify(identify_event) => {
-            handle_identify_event(identify_event, metrics, event_tx, swarm);
+            handle_identify_event(identify_event, metrics, event_tx, swarm, peer_book);
         }
     }
 }
@@ -601,6 +639,7 @@ fn handle_kademlia_event(
     metrics: &mut SwarmRuntimeMetrics,
     event_tx: &UnboundedSender<CoordinatorEvent>,
     swarm: &mut libp2p::Swarm<DhtBehaviour>,
+    peer_book: &mut PeerBook,
 ) {
     match event {
         kad::Event::RoutingUpdated {
@@ -623,10 +662,13 @@ fn handle_kademlia_event(
             }
 
             // Dial the peer to establish connection for Kameo actor communication
-            // Use the first address from the routing update
-            if let Some(addr) = addr_vec.first() {
+            // Use preferred address (IPv4 > IPv6 > first)
+            if let Some(addr) = select_preferred_address(&addr_vec) {
                 match swarm.dial(addr.clone()) {
                     Ok(_) => {
+                        peer_book
+                            .addr_by_peer
+                            .insert(peer.to_string(), addr.to_string());
                         info!("📞 Dialing Kademlia-discovered peer: {} at {}", peer, addr);
                     }
                     Err(e) => {
@@ -651,6 +693,10 @@ fn handle_kademlia_event(
                 if key_str.starts_with("cameodb-uuid-") {
                     let peer_id_str = key_str.trim_start_matches("cameodb-uuid-");
                     let uuid_str = String::from_utf8_lossy(&record.value);
+
+                    peer_book
+                        .uuid_by_peer
+                        .insert(peer_id_str.to_string(), uuid_str.to_string());
 
                     info!(
                         "🎯 DHT Record Found: Peer {} -> UUID {}",
@@ -723,6 +769,7 @@ fn handle_identify_event(
     _metrics: &mut SwarmRuntimeMetrics,
     event_tx: &UnboundedSender<CoordinatorEvent>,
     swarm: &mut libp2p::Swarm<DhtBehaviour>,
+    peer_book: &mut PeerBook,
 ) {
     if let identify::Event::Received {
         peer_id,
@@ -751,13 +798,22 @@ fn handle_identify_event(
         if parts.len() >= 3 {
             let uuid_str = parts[2];
             if let Ok(uuid) = uuid::Uuid::parse_str(uuid_str) {
+                peer_book
+                    .uuid_by_peer
+                    .insert(peer_id.to_string(), uuid.to_string());
+                if let Some(addr) = select_preferred_address(&info.listen_addrs) {
+                    peer_book
+                        .addr_by_peer
+                        .insert(peer_id.to_string(), addr.to_string());
+                }
+
                 info!("✨ Discovered Node UUID from Identify protocol: {}", uuid);
 
                 // Trigger peer resolution immediately without waiting for DHT
                 let _ = event_tx.send(CoordinatorEvent::PeerUuidDiscovered {
                     peer_id: peer_id.to_string(),
                     node_uuid: uuid.to_string(),
-                    address: info.listen_addrs.first().map(|a| a.to_string()),
+                    address: select_preferred_address(&info.listen_addrs).map(|a| a.to_string()),
                 });
             } else {
                 warn!("⚠️  Invalid UUID in agent version: {}", uuid_str);

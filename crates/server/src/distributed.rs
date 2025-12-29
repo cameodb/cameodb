@@ -166,7 +166,10 @@ impl DistributedCluster {
             status: NodeStatus::Connected,
             shard_count: 0,
         });
-        entry.address = address;
+        // Prefer the newer address only if it differs from the current one to track last-good
+        if entry.address != address {
+            entry.address = address;
+        }
         entry.status = NodeStatus::Connected;
     }
 

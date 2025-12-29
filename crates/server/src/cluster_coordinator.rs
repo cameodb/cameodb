@@ -8,7 +8,7 @@ use kameo::actor::RemoteActorRef;
 use kameo::message::{Context, Message};
 use kameo::{Actor, RemoteActor, Reply, remote_message};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task;
@@ -19,7 +19,7 @@ use crate::cluster_state::{
     ClusterStateStore, PersistedClusterConfig, PersistedClusterTopology, current_timestamp,
 };
 use crate::cluster_state_machine::ClusterState;
-use crate::distributed::{ClusterStatus, DistributedCluster, NodeInfo};
+use crate::distributed::{ClusterStatus, DistributedCluster, NodeInfo, NodeStatus};
 use crate::swarm::CoordinatorEvent;
 use cluster::{ConsistentRing, NodeIdentity};
 
@@ -189,7 +189,8 @@ pub struct ClusterCoordinator {
 
     // State management
     state: ClusterState,
-    expected_nodes: HashSet<Uuid>,
+    /// Authoritative registry of all known cluster nodes (active or disconnected)
+    expected_nodes: HashMap<Uuid, NodeInfo>,
     generation: u64,
     state_store: Option<Arc<ClusterStateStore>>,
 
@@ -203,6 +204,18 @@ pub struct ClusterCoordinator {
 impl ClusterCoordinator {
     /// Create a new ClusterCoordinator wrapping the given DistributedCluster.
     pub fn new(cluster: DistributedCluster) -> Self {
+        let mut expected_nodes = HashMap::new();
+        // Add local node to expected nodes
+        expected_nodes.insert(
+            cluster.local_node_id,
+            NodeInfo {
+                node_id: cluster.local_node_id,
+                address: format!("0.0.0.0:{}", cluster.cluster_config.cluster_port),
+                status: NodeStatus::Connected,
+                shard_count: 0,
+            },
+        );
+
         Self {
             cluster,
             shard_assignments: HashMap::new(),
@@ -212,7 +225,7 @@ impl ClusterCoordinator {
                 active_nodes: 1,
                 total_expected: 1,
             },
-            expected_nodes: HashSet::new(),
+            expected_nodes,
             generation: 1,
             state_store: None,
             expected_shards: HashMap::new(),
@@ -227,9 +240,33 @@ impl ClusterCoordinator {
         persisted: PersistedClusterTopology,
         state_store: Arc<ClusterStateStore>,
     ) -> Self {
-        let mut expected_nodes: HashSet<Uuid> = persisted.nodes.keys().cloned().collect();
-        // Ensure local node is always expected
-        expected_nodes.insert(cluster.local_node_id);
+        // Convert persisted nodes to expected_nodes map
+        let mut expected_nodes: HashMap<Uuid, NodeInfo> = persisted
+            .nodes
+            .values()
+            .map(|pn| {
+                (
+                    pn.node_id,
+                    NodeInfo {
+                        node_id: pn.node_id,
+                        address: pn.address.clone(),
+                        status: crate::distributed::NodeStatus::Disconnected, // Start as Disconnected, wait for discovery
+                        shard_count: pn.shard_count,
+                    },
+                )
+            })
+            .collect();
+
+        // Ensure local node is always expected and Connected
+        expected_nodes.insert(
+            cluster.local_node_id,
+            NodeInfo {
+                node_id: cluster.local_node_id,
+                address: format!("0.0.0.0:{}", cluster.cluster_config.cluster_port),
+                status: crate::distributed::NodeStatus::Connected,
+                shard_count: 0, // Will be updated by RegisterLocalShards
+            },
+        );
 
         let generation = persisted.config.generation;
         let total_expected = expected_nodes.len();
@@ -318,21 +355,57 @@ impl ClusterCoordinator {
     /// Persist current cluster state snapshot to disk (event-driven)
     fn persist_snapshot(&mut self) {
         if let Some(state_store) = &self.state_store {
-            // 1. Sync expected_nodes with the source of truth (peer_nodes + local)
-            // We update in-memory state immediately so it reflects reality regardless of persistence result
-            let mut new_expected: HashSet<Uuid> = self.cluster.peer_nodes.keys().cloned().collect();
-            new_expected.insert(self.cluster.local_node_id);
-
-            if new_expected != self.expected_nodes {
-                info!(
-                    old_count = self.expected_nodes.len(),
-                    new_count = new_expected.len(),
-                    "ClusterCoordinator: synced expected_nodes with current registry"
-                );
-                self.expected_nodes = new_expected;
+            // 1. Calculate authoritative shard counts from assignments
+            let mut shard_counts: HashMap<Uuid, usize> = HashMap::new();
+            for meta in self.shard_assignments.values() {
+                *shard_counts.entry(meta.node_id).or_default() += 1;
             }
 
-            // 2. Prepare data for persistence (clone for moving to blocking task)
+            // 2. Sync expected_nodes with the source of truth (peer_nodes + local)
+
+            // 2a. Update local node
+            let local_id = self.cluster.local_node_id;
+            let local_shard_count = shard_counts.get(&local_id).copied().unwrap_or(0);
+
+            self.expected_nodes
+                .entry(local_id)
+                .and_modify(|n| {
+                    n.status = crate::distributed::NodeStatus::Connected;
+                    n.shard_count = local_shard_count;
+                })
+                .or_insert_with(|| NodeInfo {
+                    node_id: local_id,
+                    address: format!("0.0.0.0:{}", self.cluster.cluster_config.cluster_port),
+                    status: crate::distributed::NodeStatus::Connected,
+                    shard_count: local_shard_count,
+                });
+
+            // 2b. Sync from peer_nodes (active connections)
+            for (node_id, peer_info) in &self.cluster.peer_nodes {
+                let count = shard_counts.get(node_id).copied().unwrap_or(0);
+                self.expected_nodes
+                    .entry(*node_id)
+                    .and_modify(|n| {
+                        n.status = peer_info.status;
+                        n.address = peer_info.address.clone();
+                        n.shard_count = count;
+                    })
+                    .or_insert_with(|| {
+                        let mut n = peer_info.clone();
+                        n.shard_count = count;
+                        n
+                    });
+            }
+
+            // 2c. Update shard counts for disconnected nodes (in expected_nodes but not in peer_nodes)
+            for (node_id, node_info) in self.expected_nodes.iter_mut() {
+                if *node_id != local_id && !self.cluster.peer_nodes.contains_key(node_id) {
+                    node_info.shard_count = shard_counts.get(node_id).copied().unwrap_or(0);
+                    node_info.status = crate::distributed::NodeStatus::Disconnected;
+                }
+            }
+
+            // 3. Prepare data for persistence (clone for moving to blocking task)
             let config = PersistedClusterConfig {
                 expected_nodes: self.expected_nodes.len(),
                 generation: self.generation,
@@ -345,17 +418,18 @@ impl ClusterCoordinator {
             };
 
             let shard_assignments = self.shard_assignments.clone();
-            let peer_nodes = self.cluster.peer_nodes.clone();
+            // Use expected_nodes (the full registry) instead of just peer_nodes
+            let nodes_to_persist = self.expected_nodes.clone();
             let ring = self.ring.clone();
             let state_store = state_store.clone();
             let generation = self.generation;
 
-            // 3. Offload blocking I/O to thread pool
+            // 4. Offload blocking I/O to thread pool
             task::spawn_blocking(move || {
                 if let Err(e) = state_store.persist_cluster_snapshot(
                     &config,
                     &shard_assignments,
-                    &peer_nodes,
+                    &nodes_to_persist,
                     &ring,
                 ) {
                     warn!(error = %e, "Failed to persist cluster snapshot");
@@ -363,6 +437,7 @@ impl ClusterCoordinator {
                     info!(
                         generation,
                         shards = shard_assignments.len(),
+                        nodes = nodes_to_persist.len(),
                         "Cluster snapshot persisted"
                     );
                 }
@@ -637,10 +712,14 @@ impl Message<InitSwarm> for ClusterCoordinator {
 
                 if let Some(mut rx) = events {
                     let coordinator = self_ref.clone();
-                    task::spawn(async move {
-                        // Track connected peer addresses to correlate with UUIDs later
-                        let mut peer_addresses: HashMap<String, String> = HashMap::new();
+                    #[derive(Default)]
+                    struct PeerMeta {
+                        uuid: Option<Uuid>,
+                        address: Option<String>,
+                    }
+                    let mut peer_meta: HashMap<String, PeerMeta> = HashMap::new();
 
+                    task::spawn(async move {
                         while let Some(event) = rx.recv().await {
                             match event {
                                 CoordinatorEvent::RoutingUpdated { .. } => {
@@ -649,12 +728,9 @@ impl Message<InitSwarm> for ClusterCoordinator {
                                     }
                                 }
                                 CoordinatorEvent::PeerDiscovered { peer_id, address } => {
-                                    // Store address for when we discover the UUID
-                                    if let Some(addr) = address {
-                                        peer_addresses.insert(peer_id.clone(), addr);
-                                    }
-                                    // We DO NOT register the peer yet. We wait for PeerUuidDiscovered.
-                                    // This prevents "ghost" nodes with random UUIDs from polluting the cluster state.
+                                    // Cache address for later UUID resolution
+                                    let entry = peer_meta.entry(peer_id.clone()).or_default();
+                                    entry.address = address;
                                     info!(peer_id = %peer_id, "ClusterCoordinator: connected to raw peer, waiting for identity exchange");
                                 }
                                 CoordinatorEvent::PeerUuidDiscovered {
@@ -662,21 +738,39 @@ impl Message<InitSwarm> for ClusterCoordinator {
                                     node_uuid,
                                     address,
                                 } => {
-                                    // This event contains the actual node UUID from DHT
+                                    // This event contains the actual node UUID from DHT or Identify
                                     if let Ok(uuid) = Uuid::parse_str(&node_uuid) {
-                                        // Resolve address: explicit in event > cached from connection > unknown
-                                        let resolved_addr = address
-                                            .or_else(|| peer_addresses.get(&peer_id).cloned())
+                                        let meta = peer_meta.entry(peer_id.clone()).or_default();
+                                        meta.uuid = Some(uuid);
+                                        if address.is_some() {
+                                            meta.address = address.clone();
+                                        }
+                                        let resolved_addr = meta
+                                            .address
+                                            .clone()
                                             .unwrap_or_else(|| "unknown".to_string());
 
                                         if let Err(err) = coordinator
                                             .ask(PeerDiscovered {
                                                 node_id: uuid,
-                                                address: resolved_addr,
+                                                address: resolved_addr.clone(),
                                             })
                                             .await
                                         {
                                             warn!(error = %err, "ClusterCoordinator: failed to forward peer UUID discovered");
+                                        } else {
+                                            // also persist preferred address for future losses
+                                            let meta_entry =
+                                                peer_meta.entry(peer_id.clone()).or_default();
+                                            if meta_entry.address.as_deref() != Some(&resolved_addr)
+                                            {
+                                                debug!(
+                                                    peer_id = %peer_id,
+                                                    addr = %resolved_addr,
+                                                    "ClusterCoordinator: updating preferred address from swarm event"
+                                                );
+                                            }
+                                            meta_entry.address = Some(resolved_addr);
                                         }
                                     } else {
                                         warn!(node_uuid = %node_uuid, "Failed to parse node UUID from DHT");
@@ -691,16 +785,57 @@ impl Message<InitSwarm> for ClusterCoordinator {
                                         warn!(error = %err, "ClusterCoordinator: failed to forward peer shards discovered");
                                     }
                                 }
-                                CoordinatorEvent::PeerLost { peer_id } => {
-                                    peer_addresses.remove(&peer_id);
-                                    // Note: We can't map PeerID -> NodeUUID easily here without reverse lookup.
-                                    // Ideally, Swarm should send NodeUUID in PeerLost if known, or we map it here.
-                                    // For now, we rely on Kademlia/HealthChecks to eventually cleanup lost nodes
-                                    // or improve PeerLost to carry UUID if we want immediate cleanup.
-                                    // But since we don't have the UUID, we can't notify ClusterCoordinator accurately
-                                    // if we only have peer_id.
-                                    // FUTURE TODO: Maintain PeerID <-> UUID mapping here or in Swarm.
-                                    debug!(peer_id = %peer_id, "ClusterCoordinator: raw peer lost");
+                                CoordinatorEvent::PeerLost {
+                                    peer_id,
+                                    node_uuid,
+                                    address,
+                                } => {
+                                    let event_addr = address.unwrap_or_default();
+                                    if let Some(mut meta) = peer_meta.remove(&peer_id) {
+                                        if meta.address.is_none() && !event_addr.is_empty() {
+                                            debug!(
+                                                peer_id = %peer_id,
+                                                addr = %event_addr,
+                                                "ClusterCoordinator: adopting swarm-supplied address on loss"
+                                            );
+                                            meta.address = Some(event_addr.clone());
+                                        }
+                                        if let Some(uuid) = meta.uuid {
+                                            if let Err(err) =
+                                                coordinator.ask(PeerLost { node_id: uuid }).await
+                                            {
+                                                warn!(error = %err, "ClusterCoordinator: failed to forward peer lost with uuid");
+                                            }
+                                        } else if let Some(uuid_str) = node_uuid {
+                                            if let Ok(uuid) = Uuid::parse_str(&uuid_str) {
+                                                if let Err(err) = coordinator
+                                                    .ask(PeerLost { node_id: uuid })
+                                                    .await
+                                                {
+                                                    warn!(error = %err, "ClusterCoordinator: failed to forward peer lost with uuid (from swarm)");
+                                                }
+                                            } else {
+                                                warn!(peer_id = %peer_id, uuid = %uuid_str, "ClusterCoordinator: invalid uuid supplied for peer lost");
+                                            }
+                                        } else {
+                                            debug!(peer_id = %peer_id, address = %meta.address.clone().unwrap_or_default(), "ClusterCoordinator: peer lost before UUID resolution");
+                                        }
+                                    } else {
+                                        if let Some(uuid_str) = node_uuid {
+                                            if let Ok(uuid) = Uuid::parse_str(&uuid_str) {
+                                                if let Err(err) = coordinator
+                                                    .ask(PeerLost { node_id: uuid })
+                                                    .await
+                                                {
+                                                    warn!(error = %err, address = %event_addr, "ClusterCoordinator: failed to forward peer lost with uuid (uncached)");
+                                                }
+                                            } else {
+                                                warn!(peer_id = %peer_id, uuid = %uuid_str, "ClusterCoordinator: invalid uuid supplied for uncached peer");
+                                            }
+                                        } else {
+                                            debug!(peer_id = %peer_id, address = %event_addr, "ClusterCoordinator: peer lost with no cached metadata");
+                                        }
+                                    }
                                 }
                                 CoordinatorEvent::DialFailed { peer_id, error } => {
                                     if let Err(err) =
