@@ -45,7 +45,7 @@ CameoDB provides a comprehensive REST API for document management, search, and s
 ### 🔍 Search Operations
 
 #### Standard Search
-Search documents within an index with relevance scoring.
+Search documents within an index with relevance scoring. Returns a single JSON payload (non-streaming).
 
 ```bash
 POST /api/:index/search
@@ -64,27 +64,20 @@ curl -X POST http://localhost:9480/api/books/search \
 **Response:**
 ```json
 {
-  "results": [
+  "hits": [
     {
-      "score": 2.45,
-      "document": {
-        "id": "2080",
-        "title": "A Fire Upon the Deep",
-        "author": "Vernor Vinge",
-        "genres": ["Hard science fiction", "Science Fiction"]
-      }
+      "_score": 2.45,
+      "shard_id": "a1b2c3d4-...",
+      "id": "2080",
+      "title": "A Fire Upon the Deep",
+      "author": "Vernor Vinge",
+      "genres": ["Hard science fiction", "Science Fiction"]
     }
   ],
-  "total_results": 42,
   "total_shards": 4,
-  "successful_shards": 4,
+  "nodes_contacted": 1,
   "failed_shards": 0,
-  "query": "science fiction space",
-  "QTime": 12,
-  "timing": {
-    "total_ms": 12,
-    "query": "science fiction space"
-  }
+  "took_ms": 12
 }
 ```
 
@@ -103,10 +96,12 @@ curl -X POST http://localhost:9480/api/books/stream \
   --no-buffer
 ```
 
-**Response:** NDJSON stream
+**Response:** NDJSON stream (one hit per line). If no `hits` array is present, falls back to a single JSON body.
+
+> **Note:** Currently, the streaming backend returns a confirmation message as the distributed streaming logic is being finalized.
+
 ```json
-{"_score": 3.2, "id": "123", "title": "The Hobbit", "author": "J.R.R. Tolkien"}
-{"_score": 2.8, "id": "456", "title": "Dune", "author": "Frank Herbert"}
+{"message": "Stream initiated", "index": "books", "query": "fantasy adventure"}
 ```
 
 ### 📝 Document Operations
@@ -138,8 +133,9 @@ curl -X PUT http://localhost:9480/api/books/document \
 **Response:**
 ```json
 {
-  "indexed": true,
-  "sequence_id": 1001,
+  "id": "book_001",
+  "result": "created",
+  "version": 1001,
   "shard_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 }
 ```
@@ -178,18 +174,10 @@ curl -X POST http://localhost:9480/api/books/_bulk \
 **Response:**
 ```json
 {
-  "items_indexed": 2,
-  "successful_shards": 4,
-  "failed_shards": 0,
-  "shard_results": [
-    {"shard_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "items_indexed": 1, "status": "success"},
-    {"shard_id": "b2c3d4e5-f6g7-8901-bcde-f12345678901", "items_indexed": 1, "status": "success"}
-  ],
-  "QTime": 45,
-  "timing": {
-    "total_ms": 45,
-    "documents_processed": 2
-  }
+  "items_received": 2,
+  "items_written": 2,
+  "errors": [],
+  "took_ms": 45
 }
 ```
 
@@ -228,6 +216,16 @@ curl -X PUT http://localhost:9480/api/books/_config \
   }'
 ```
 
+**Response:**
+```json
+{
+  "acknowledged": true,
+  "index": "books",
+  "shard_count": 256,
+  "field_names": ["id", "author", "title", "publication_year"]
+}
+```
+
 #### Get Index Schema
 Retrieve the current schema for an index.
 
@@ -243,13 +241,12 @@ curl http://localhost:9480/api/books/_config
 **Response:**
 ```json
 {
-  "index": "books",
-  "shard_count": 256,
+  "field_names": ["author", "title"],
   "fields": {
     "title": {"name": "title", "field_type": "text", "indexed": true},
     "author": {"name": "author", "field_type": "text", "indexed": true}
   },
-  "status": "found"
+  "shard_count": 256
 }
 ```
 
@@ -275,7 +272,6 @@ curl http://localhost:9480/_indexes
       "total_size_bytes": 45231680,
       "size_mb": 43,
       "shard_count": 4,
-      "tantivy_shards": 4,
       "field_names": ["id", "author", "genres", "publication_date", "summary", "title"]
     },
     {
@@ -284,7 +280,6 @@ curl http://localhost:9480/_indexes
       "total_size_bytes": 12458752,
       "size_mb": 12,
       "shard_count": 4,
-      "tantivy_shards": 4,
       "field_names": ["id", "description", "like_count", "speaker", "tags", "title", "view_count"]
     }
   ],

@@ -9,8 +9,9 @@ This document focuses on the *server-side* architecture and the distributed work
 ## 1. Core Responsibilities
 
 - **HTTP API surface**
-  - Accepts client requests (search, write, bulk write, admin).
-  - Translates them into strongly-typed operations (`ClientOp`).
+  - Routes: `/api/:index/search` (JSON), `/api/:index/stream` (NDJSON, JSON fallback), `/api/:index/document` (PUT), `/api/:index/_bulk` (POST), `/api/:index/_config` (GET/PUT), `/api/:index/_schema` (PATCH), `/_indexes`, `/_cluster/_indexes`, `/_cluster/health`.
+  - Translates requests into strongly-typed operations (`ClientOp`) and hands them to `RouterActor`.
+  - Middleware: compression/decompression, trace, permissive CORS, request body limit; ConnectInfo enabled at serve for client addr extraction.
 - **Local orchestration**
   - Manages microshards (`MicroshardActor`) and their storage configuration.
   - Ensures all redb/tantivy I/O is executed via `tokio::task::spawn_blocking`.
@@ -31,8 +32,11 @@ The `RouterActor` is the primary ingress for database operations on a node.
 
 - Input: `ClientOp`, representing logical client operations:
   - `Search { index, query, limit }`
+  - `Stream { index, query }`
   - `Write { index, id, routing_key, doc }`
   - `BulkWrite { index, docs }`
+  - `CreateConfig`, `GetConfig` (Schema management)
+  - `ListIndexes`, `ListClusterIndexes` (Metadata)
 - Responsibilities:
   - Ask the `ClusterCoordinator` for a routing decision:
     - `RoutingDecision::Local`
@@ -162,13 +166,13 @@ For **writes**, the system derives an effective `routing_key` using the followin
 1. **Explicit routing_key from the client payload** (if provided).
 2. **Document id field**: if the JSON document has an `"id"` field, that value is used.
 3. **Derived key from document bytes**: if neither of the above is present, the document is
-   serialized to JSON, a prefix of the bytes is taken, and hex-encoded into a stable key.
+   serialized to JSON, hashed using XXH3-64, and hex-encoded into a stable key.
 
 This effective key is then used consistently across the cluster:
 
 1. `RouterActor` sends `RouteOperation { routing_key, operation_type }` to `ClusterCoordinator`.
 2. `ClusterCoordinator::decide_route`:
-   - Uses `ConsistentRing::get_owner(key)` (SHA-256 based) to map key → `shard_id`.
+   - Uses `ConsistentRing::get_owner(key)` (XXH3 based) to map key → `shard_id`.
    - Uses `shard_owner(shard_id)` to map `shard_id` → `node_id`.
    - Looks up node address in `peer_nodes`.
    - Returns:
@@ -184,7 +188,9 @@ This gives you single-owner semantics for keyed **writes** across the cluster wh
 providing a deterministic, evenly distributed fallback when clients do not specify a
 routing key explicitly.
 
-**Metadata operations** (`GetConfig`, `CreateConfig`, `ListIndexes`) always execute locally on the node handling the HTTP request. They do not broadcast or remote, since schema/config data is available via the local `HybridStore` and errors (e.g., missing index) should surface directly instead of being wrapped by broadcast aggregation.
+**Metadata operations** (`GetConfig`, `CreateConfig`, `ListIndexes`) always execute locally on the node handling the HTTP request. They do not broadcast or remote, since schema/config data is available via the local `HybridStore`.
+
+**Cluster-wide Metadata** (`ListClusterIndexes`) is an exception: it broadcasts to all nodes to aggregate index statistics and shard counts across the cluster.
 
 Schema metadata is cached per node inside `NodeOrchestrator` to avoid repeated redb reads on every request. The cache is populated on first read (`_config`), updated on schema evolution or `CreateConfig`, and returned on subsequent requests with fields sorted (`id` first, others alphabetical).
 

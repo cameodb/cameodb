@@ -692,6 +692,23 @@ Supports standard tantivy query syntax:
 - **Indexing**: Automatic when documents are written via `apply_write` or `apply_batch`
 - **Smart Commits**: Configurable commit frequency optimizes search freshness vs performance
 
+## Supported Schema Field Types
+
+CameoDB supports a rich set of field types for indexing and storage. These types map directly to Tantivy schema definitions:
+
+| Type | Description | Tantivy Mapping |
+|------|-------------|-----------------|
+| **`text`** | Standard full-text search field. Tokenized and indexed. | `TEXT` |
+| **`exact`** | Exact match field. Not tokenized; punctuation preserved. Case-sensitive. | `STRING` |
+| **`boolean`** | Boolean value. Stored as "true"/"false" strings. | `STRING` |
+| **`i64`** | 64-bit signed integer. Supports range queries and sorting. | `i64` (FAST) |
+| **`u64`** | 64-bit unsigned integer. Supports range queries and sorting. | `u64` (FAST) |
+| **`f64`** / **`number`** | 64-bit floating point. Supports range queries and sorting. | `f64` (FAST) |
+| **`date`** | DateTime field (RFC3339). Supports range queries and sorting. | `date` (FAST) |
+| **`array`** | Multi-valued text field. Each element is tokenized. | `TEXT` (multi-valued) |
+
+> **Note:** All fields are `STORED` by default, meaning the original JSON value is retrievable.
+
 ## Serialization and Tantivy Integration
 
 ### The Challenge: Document Serialization
