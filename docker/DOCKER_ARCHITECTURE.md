@@ -2,8 +2,8 @@
 
 ## 📊 Docker Implementation Analysis
 
-### **BlazeDBS Pattern Analysis**
-Based on the BlazeDBS Dockerfile, the following patterns were adopted for CameoDB:
+### **Patterns used in CameoDB**
+The following patterns are adopted for CameoDB:
 
 #### **✅ Multi-Stage Build Strategy**
 - **Builder Stage**: Full Rust toolchain with cross-compilation support
@@ -28,6 +28,7 @@ cameodb/
 ├── Dockerfile                     # Multi-stage Dockerfile for production builds
 ├── .dockerignore                  # Files to exclude from the build context
 └── docker/
+    ├── cameodb-docker.toml        # Container-optimized configuration
     ├── docker-compose.yml         # Single-node deployment configuration
     ├── docker-compose-cluster.yml # 3-node cluster deployment configuration
     └── README.md                  # Docker-specific documentation
@@ -45,26 +46,29 @@ RUN rustup default ${RUST_VERSION}
 
 # Cross-compilation support
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     musl-tools \
     gcc-aarch64-linux-gnu \
     pkg-config \
-    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
-
-# Architecture-aware builds
-case "${TARGETARCH}" in
-    "amd64") TARGET_TRIPLE="x86_64-unknown-linux-musl";;
-    "arm64") TARGET_TRIPLE="aarch64-unknown-linux-musl";;
-esac
 
 # Optimized caching with mount cache
 WORKDIR /src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --target "${TARGET_TRIPLE}" --bin server
-
-# Stage binary for runtime image
-RUN cp "/src/target/${TARGET_TRIPLE}/release/server" /src/cameodb
+    set -e; \
+    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; \
+    export OPENSSL_STATIC=1; \
+    export PKG_CONFIG_ALLOW_CROSS=1; \
+    TARGET_TRIPLE=""; \
+    case "${TARGETARCH}" in \
+        "amd64") TARGET_TRIPLE="x86_64-unknown-linux-musl";; \
+        "arm64") TARGET_TRIPLE="aarch64-unknown-linux-musl";; \
+        *) echo "Unsupported architecture: ${TARGETARCH}"; exit 1;; \
+    esac; \
+    rustup target add "${TARGET_TRIPLE}"; \
+    cargo build --release --target "${TARGET_TRIPLE}" --bin cameodb; \
+    cp "/src/target/${TARGET_TRIPLE}/release/cameodb" /src/cameodb
 ```
 
 #### **Runtime Stage Features**
@@ -77,11 +81,13 @@ USER nonroot:nonroot
 
 # Essential configuration only
 COPY --from=builder --chown=nonroot:nonroot /src/cameodb /usr/local/bin/cameodb
-COPY --chown=nonroot:nonroot cameodb.toml /etc/cameodb/
+COPY --chown=nonroot:nonroot docker/cameodb-docker.toml /etc/cameodb/cameodb.toml
+COPY --from=builder --chown=nonroot:nonroot /build-data/cameodb /data/cameodb
+
 EXPOSE 9480 9580
 
 # Health check integration
-HEALTHCHECK --interval=30s --timeout=10s \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/cameodb", "--version"]
 ```
 
@@ -93,17 +99,34 @@ services:
   cameodb-node1: # Primary node
     ports: ["9481:9480", "9581:9580"]
     environment:
-      - DISTRIBUTED_ACTORS=true
-      - CLUSTER_PORT=9580
-      - BOOTSTRAP_NODES=node2,node3
+      - NODE_ID=node1
+      - CAMEODB_CLUSTER_NAME=cameodb-production
+      - CAMEODB_DISTRIBUTED_ACTORS=true
+      - CAMEODB_HTTP_PORT=9480
+      - CAMEODB_CLUSTER_PORT=9580
+      - CAMEODB_BOOTSTRAP_NODES=cameodb-node2:9580,cameodb-node3:9580
       
   cameodb-node2: # Secondary node
     ports: ["9482:9480", "9582:9580"]
     depends_on: [cameodb-node1]
+    environment:
+      - NODE_ID=node2
+      - CAMEODB_CLUSTER_NAME=cameodb-production
+      - CAMEODB_DISTRIBUTED_ACTORS=true
+      - CAMEODB_HTTP_PORT=9480
+      - CAMEODB_CLUSTER_PORT=9580
+      - CAMEODB_BOOTSTRAP_NODES=cameodb-node1:9580,cameodb-node3:9580
       
   cameodb-node3: # Secondary node  
     ports: ["9483:9480", "9583:9580"]
     depends_on: [cameodb-node1]
+    environment:
+      - NODE_ID=node3
+      - CAMEODB_CLUSTER_NAME=cameodb-production
+      - CAMEODB_DISTRIBUTED_ACTORS=true
+      - CAMEODB_HTTP_PORT=9480
+      - CAMEODB_CLUSTER_PORT=9580
+      - CAMEODB_BOOTSTRAP_NODES=cameodb-node1:9580,cameodb-node2:9580
     
   nginx-lb: # Simple load balancer
     ports: ["9480:80"]
@@ -119,9 +142,9 @@ Docker Host (macOS)
 │   ├── :9483 → Node 3 HTTP
 │   └── :9480 → Load Balancer
 ├── Cluster Network (172.20.0.0/16)
-│   ├── node1.cameodb.local (172.20.0.10)
-│   ├── node2.cameodb.local (172.20.0.11)
-│   └── node3.cameodb.local (172.20.0.12)
+│   ├── cameodb-node1 (172.20.0.10)
+│   ├── cameodb-node2 (172.20.0.11)
+│   └── cameodb-node3 (172.20.0.12)
 └── Internal Communication
     ├── :9480 → HTTP API (internal)
     └── :9580 → Cluster/Kameo (internal)
