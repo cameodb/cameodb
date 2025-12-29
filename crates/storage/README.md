@@ -67,15 +67,15 @@ All write operations follow a strict sequence to ensure atomicity across both st
    ├─ For Delete: TABLE_DATA.remove(id)
    └─ Apply the actual operation
 
-5. Commit redb Transaction
+5. Update tantivy Index (In-Memory)
+   ├─ For Put: IndexWriter.add_document(tantivy_doc)
+   ├─ For Delete: IndexWriter.delete_term(id_term)
+   └─ Update search index buffer
+
+6. Commit redb Transaction
    ├─ write_txn.commit()
    ├─ Optional fsync() based on wal_sync config
    └─ Durability checkpoint
-
-6. Update tantivy Index
-   ├─ For Put: IndexWriter.add_document(tantivy_doc)
-   ├─ For Delete: IndexWriter.delete_term(id_term)
-   └─ Maintain search index consistency
 
 7. Commit tantivy Changes
    ├─ IndexWriter.commit()
@@ -312,14 +312,14 @@ for (score, doc) in results {
 use tokio::task;
 
 // ❌ WRONG: Will block async runtime
-async fn wrong_usage(store: HybridStore, op: WalOp) {
-    let result = store.apply_write(op); // Blocks entire async runtime!
+async fn wrong_usage(store: HybridStore, index: String, op: WalOp) {
+    let result = store.apply_write(&index, op); // Blocks entire async runtime!
 }
 
 // ✅ CORRECT: Use spawn_blocking
-async fn correct_usage(store: HybridStore, op: WalOp) -> Result<u64, StoreError> {
+async fn correct_usage(store: HybridStore, index: String, op: WalOp) -> Result<u64, StoreError> {
     let result = task::spawn_blocking(move || {
-        store.apply_write(op) // Safe: runs on blocking thread pool
+        store.apply_write(&index, op) // Safe: runs on blocking thread pool
     }).await.map_err(|_| StoreError::Serialization("Task panicked".to_string()))??;
     
     Ok(result)
@@ -800,6 +800,6 @@ impl MicroshardActor {
 - **Atomic Batch Processing**: ✅ Implemented - Single transaction for multiple operations
 - **Multi-tenant Caching**: ✅ Implemented - Independent caches per index
 - **Operation Counting**: ✅ Implemented - Lock-free AtomicU64 counters per index
-- **Read Caching**: LRU cache for frequently accessed documents (planned)
+- **Read Caching**: ✅ Implemented - Simple bounded cache (LRU policy planned)
 - **Index Optimization**: Periodic segment merging (planned)
 - **Async I/O**: Non-blocking operations where possible (planned)

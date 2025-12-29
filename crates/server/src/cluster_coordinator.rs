@@ -318,6 +318,21 @@ impl ClusterCoordinator {
     /// Persist current cluster state snapshot to disk (event-driven)
     fn persist_snapshot(&mut self) {
         if let Some(state_store) = &self.state_store {
+            // 1. Sync expected_nodes with the source of truth (peer_nodes + local)
+            // We update in-memory state immediately so it reflects reality regardless of persistence result
+            let mut new_expected: HashSet<Uuid> = self.cluster.peer_nodes.keys().cloned().collect();
+            new_expected.insert(self.cluster.local_node_id);
+
+            if new_expected != self.expected_nodes {
+                info!(
+                    old_count = self.expected_nodes.len(),
+                    new_count = new_expected.len(),
+                    "ClusterCoordinator: synced expected_nodes with current registry"
+                );
+                self.expected_nodes = new_expected;
+            }
+
+            // 2. Prepare data for persistence (clone for moving to blocking task)
             let config = PersistedClusterConfig {
                 expected_nodes: self.expected_nodes.len(),
                 generation: self.generation,
@@ -329,35 +344,29 @@ impl ClusterCoordinator {
                 cluster_name: self.cluster.cluster_config.cluster_name.clone(),
             };
 
-            if let Err(e) = state_store.persist_cluster_snapshot(
-                &config,
-                &self.shard_assignments,
-                &self.cluster.peer_nodes,
-                &self.ring,
-            ) {
-                warn!(error = %e, "Failed to persist cluster snapshot");
-            } else {
-                // Sync expected_nodes with the source of truth (peer_nodes + local)
-                // This ensures that any stale nodes pruned from persistence are also removed from memory
-                let mut new_expected: HashSet<Uuid> =
-                    self.cluster.peer_nodes.keys().cloned().collect();
-                new_expected.insert(self.cluster.local_node_id);
+            let shard_assignments = self.shard_assignments.clone();
+            let peer_nodes = self.cluster.peer_nodes.clone();
+            let ring = self.ring.clone();
+            let state_store = state_store.clone();
+            let generation = self.generation;
 
-                if new_expected != self.expected_nodes {
+            // 3. Offload blocking I/O to thread pool
+            task::spawn_blocking(move || {
+                if let Err(e) = state_store.persist_cluster_snapshot(
+                    &config,
+                    &shard_assignments,
+                    &peer_nodes,
+                    &ring,
+                ) {
+                    warn!(error = %e, "Failed to persist cluster snapshot");
+                } else {
                     info!(
-                        old_count = self.expected_nodes.len(),
-                        new_count = new_expected.len(),
-                        "ClusterCoordinator: synced expected_nodes with current registry"
+                        generation,
+                        shards = shard_assignments.len(),
+                        "Cluster snapshot persisted"
                     );
-                    self.expected_nodes = new_expected;
                 }
-
-                info!(
-                    generation = self.generation,
-                    shards = self.shard_assignments.len(),
-                    "Cluster snapshot persisted"
-                );
-            }
+            });
         }
     }
 
