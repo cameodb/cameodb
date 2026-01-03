@@ -57,7 +57,6 @@ async fn main() -> Result<()> {
         max_shards: cameodb_config.server.node.max_shards,
         writer_memory_min_mb: cameodb_config.search.writer_memory_min_mb,
         writer_memory_max_mb: cameodb_config.search.writer_memory_max_mb,
-        writer_memory_default_mb: cameodb_config.server.node.writer_memory_default_mb,
         wal_sync: cameodb_config.storage.wal_sync,
         default_batch_size: cameodb_config.storage.default_batch_size,
     };

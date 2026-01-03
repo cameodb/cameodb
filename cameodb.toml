@@ -8,7 +8,6 @@ cors_enabled = true
 [server.node]
 max_shards = 8
 init_shards = 4
-writer_memory_default_mb = 32
 
 [storage]
 data_paths = ["./data/cameodb"]

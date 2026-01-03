@@ -61,9 +61,9 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             shard_path: PathBuf::from("/tmp/cameodb_default_shard"),
-            writer_memory_budget: 32 * 1024 * 1024, // 32MB default
             writer_memory_min_mb: 16,               // 16MB minimum
             writer_memory_max_mb: 256,              // 256MB maximum
+            writer_memory_budget: 16 * 1024 * 1024, // start at min when unknown
             default_batch_size: 1000,               // 1000 operations default
             wal_sync: true,
         }
@@ -82,7 +82,7 @@ impl StorageConfig {
             let size_mb = metadata.len() / (1024 * 1024);
             let optimal_budget = match size_mb {
                 0..=50 => min_budget_bytes,       // Very small indices: min budget (16MB)
-                51..=200 => default_budget_bytes, // Small indices: default budget (32MB)
+                51..=200 => default_budget_bytes, // Small indices: start budget (min-aligned)
                 201..=1000 => (min_budget_bytes + max_budget_bytes) / 2, // Medium indices: mid-range (136MB)
                 1001..=5000 => (max_budget_bytes * 3) / 4, // Large indices: 75% of max (192MB)
                 _ => max_budget_bytes,                     // Very large indices: max budget (256MB)
@@ -91,10 +91,8 @@ impl StorageConfig {
             // Ensure result is within configured bounds
             optimal_budget.max(min_budget_bytes).min(max_budget_bytes)
         } else {
-            // New index, use default budget
-            default_budget_bytes
-                .max(min_budget_bytes)
-                .min(max_budget_bytes)
+            // New index, use minimum budget (starting point will scale as data is written)
+            min_budget_bytes
         }
     }
 }

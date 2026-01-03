@@ -31,7 +31,7 @@ use uuid::Uuid;
 // Re-export key types for convenience
 // TODO: Enable cluster actor exports when integration is complete
 // pub use cluster_actor::{GetActivePeers, PeerInfo};
-pub use utils::get_preferred_listen_address;
+pub use utils::resolve_listen_address;
 
 /// Result returned after the swarm runtime has been launched
 #[derive(Debug)]
@@ -242,8 +242,8 @@ async fn create_production_swarm(
 
     info!("🔐 Node identity: {}", peer_id);
 
-    // Get optimized listen address using smart interface binding
-    let listen_addr = get_preferred_listen_address(config.cluster_port)?;
+    // Get optimized listen address using configured interfaces (fallback to 0.0.0.0)
+    let listen_addr = resolve_listen_address(&config.listen_addrs, config.cluster_port)?;
 
     // Create custom network behaviour with production settings
     let behaviour = DhtBehaviour::new(
@@ -284,6 +284,10 @@ async fn create_production_swarm(
     // Start listening on the optimized address
     swarm.listen_on(listen_addr.clone())?;
     info!("🎧 Swarm listening on: {}", listen_addr);
+    // Log all active listeners to show OS-resolved interfaces/ports (after potential port rebinding)
+    for addr in swarm.listeners() {
+        info!("   📡 Active listener: {}", addr);
+    }
 
     // Connect to bootstrap peers for DHT initialization
     let bootstrap_addrs = convert_bootstrap_nodes_to_multiaddrs(&config.bootstrap_nodes);

@@ -71,8 +71,6 @@ pub struct NodeConfig {
     /// Tantivy writer memory configuration (per shard)
     pub writer_memory_min_mb: usize,
     pub writer_memory_max_mb: usize,
-    /// Default writer memory per shard in MB (will be clamped to min/max range)
-    pub writer_memory_default_mb: usize,
     /// Enable WAL fsync for durability
     pub wal_sync: bool,
     /// Default batch size for smart commit calculations
@@ -86,7 +84,6 @@ impl Default for NodeConfig {
             max_shards: 8,
             writer_memory_min_mb: 16,
             writer_memory_max_mb: 256,
-            writer_memory_default_mb: 32,
             wal_sync: true,
             default_batch_size: 1000,
         }
@@ -1668,14 +1665,8 @@ impl NodeOrchestrator {
     fn create_shard_storage_config(&self, shard_id: Uuid) -> StorageConfig {
         let shard_path = self.config.storage_path.join(format!("shard-{}", shard_id));
 
-        // Use default writer memory, clamped to configured min/max range
-        let writer_memory_mb = std::cmp::min(
-            std::cmp::max(
-                self.config.writer_memory_min_mb,
-                self.config.writer_memory_default_mb,
-            ),
-            self.config.writer_memory_max_mb,
-        );
+        // Start at the minimum writer memory; storage will scale between min/max as the index grows.
+        let writer_memory_mb = self.config.writer_memory_min_mb;
 
         StorageConfig {
             shard_path,
