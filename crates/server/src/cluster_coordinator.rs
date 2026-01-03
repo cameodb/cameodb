@@ -156,6 +156,7 @@ pub struct PeerShardsDiscovered {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeRemoteShards {
     pub node_id: Uuid,
+    pub node_name: String,
     pub shards: HashMap<Uuid, ShardMetadata>,
 }
 
@@ -235,6 +236,7 @@ impl ClusterCoordinator {
             cluster.local_node_id,
             NodeInfo {
                 node_id: cluster.local_node_id,
+                node_name: Some(cluster.local_node_name.clone()),
                 address: format!("0.0.0.0:{}", cluster.cluster_config.cluster_port),
                 status: NodeStatus::Connected,
                 shard_count: 0,
@@ -277,6 +279,7 @@ impl ClusterCoordinator {
                     pn.node_id,
                     NodeInfo {
                         node_id: pn.node_id,
+                        node_name: None, // Will be populated from peer discovery
                         address: pn.address.clone(),
                         status: crate::distributed::NodeStatus::Disconnected, // Start as Disconnected, wait for discovery
                         shard_count: pn.shard_count,
@@ -290,9 +293,10 @@ impl ClusterCoordinator {
             cluster.local_node_id,
             NodeInfo {
                 node_id: cluster.local_node_id,
+                node_name: None, // Local node name will be set separately
                 address: format!("0.0.0.0:{}", cluster.cluster_config.cluster_port),
                 status: crate::distributed::NodeStatus::Connected,
-                shard_count: 0, // Will be updated by RegisterLocalShards
+                shard_count: 0,
             },
         );
 
@@ -383,6 +387,17 @@ impl ClusterCoordinator {
         self.state = state;
     }
 
+    /// Format node identity as "NAME (UUID)" for human-readable logging
+    fn format_node_identity(&self, node_id: Uuid) -> String {
+        if let Some(node_info) = self.expected_nodes.get(&node_id) {
+            node_info.format_identity()
+        } else if let Some(peer_info) = self.cluster.peer_nodes.get(&node_id) {
+            peer_info.format_identity()
+        } else {
+            node_id.to_string()
+        }
+    }
+
     /// Persist current cluster state snapshot to disk (event-driven)
     /// Only persists when generation changes to avoid redundant writes
     fn persist_snapshot(&mut self) {
@@ -412,6 +427,7 @@ impl ClusterCoordinator {
                 })
                 .or_insert_with(|| NodeInfo {
                     node_id: local_id,
+                    node_name: None, // Local node name
                     address: format!("0.0.0.0:{}", self.cluster.cluster_config.cluster_port),
                     status: crate::distributed::NodeStatus::Connected,
                     shard_count: local_shard_count,
@@ -674,6 +690,7 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
                 let remote_coord_name = format!("coordinator-{}", peer_id);
                 let msg = MergeRemoteShards {
                     node_id: local_node_id,
+                    node_name: self.cluster.local_node_name.clone(),
                     shards: shards_to_broadcast
                         .iter()
                         .cloned()
@@ -1073,7 +1090,8 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
     ) -> Self::Reply {
         self.cluster
             .peer_discovered(msg.node_id, msg.address.clone());
-        info!(node = %msg.node_id, addr = %msg.address, "ClusterCoordinator: peer discovered");
+        let node_identity = self.format_node_identity(msg.node_id);
+        info!(node = %node_identity, addr = %msg.address, "ClusterCoordinator: peer discovered");
 
         // Persist snapshot after peer discovery (debounced)
         self.persist_snapshot();
@@ -1132,9 +1150,11 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
                                         "Merging remote shard assignments"
                                     );
                                     // Merge remote shards into local coordinator
+                                    // Note: node_name will be populated from the remote response
                                     if let Err(e) = self_ref
                                         .tell(MergeRemoteShards {
                                             node_id,
+                                            node_name: String::new(), // Placeholder, will be updated from peer info
                                             shards: remote_shards,
                                         })
                                         .await
@@ -1168,8 +1188,18 @@ impl Message<PeerShardsDiscovered> for ClusterCoordinator {
         msg: PeerShardsDiscovered,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // Parse peer_id string to UUID
+        let peer_uuid = match Uuid::parse_str(&msg.peer_id) {
+            Ok(uuid) => uuid,
+            Err(e) => {
+                warn!(peer_id = %msg.peer_id, error = %e, "Failed to parse peer UUID");
+                return;
+            }
+        };
+
+        let node_identity = self.format_node_identity(peer_uuid);
         info!(
-            peer = %msg.peer_id,
+            peer = %node_identity,
             shard_count = msg.shards.len(),
             "ClusterCoordinator: discovered shards from DHT"
         );
@@ -1211,7 +1241,8 @@ impl Message<PeerLost> for ClusterCoordinator {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.cluster.peer_lost(msg.node_id);
-        warn!(node = %msg.node_id, "ClusterCoordinator: peer lost");
+        let node_identity = self.format_node_identity(msg.node_id);
+        warn!(node = %node_identity, "ClusterCoordinator: peer lost");
 
         // Persist snapshot after peer loss
         self.persist_snapshot();
@@ -1232,18 +1263,26 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let node_id = msg.node_id;
+        let node_name = msg.node_name;
         let actual_shards = msg.shards;
 
+        // Update peer info with node name
+        if let Some(peer) = self.cluster.peer_nodes.get_mut(&node_id) {
+            peer.node_name = Some(node_name.clone());
+            peer.shard_count = actual_shards.len();
+        }
+
+        // Update expected_nodes with node name
+        if let Some(expected) = self.expected_nodes.get_mut(&node_id) {
+            expected.node_name = Some(node_name.clone());
+        }
+
+        let node_identity = self.format_node_identity(node_id);
         info!(
-            node = %node_id,
+            node = %node_identity,
             shard_count = actual_shards.len(),
             "ClusterCoordinator: receiving remote shard push"
         );
-
-        // Update peer shard count in DistributedCluster for visibility
-        if let Some(peer) = self.cluster.peer_nodes.get_mut(&node_id) {
-            peer.shard_count = actual_shards.len();
-        }
 
         // Extract expected shards for this node from snapshot
         let expected_for_node: HashMap<Uuid, &ShardMetadata> = self
@@ -1552,7 +1591,7 @@ mod tests {
     fn make_cluster() -> DistributedCluster {
         let cfg = ClusterConfig::default();
         let path = std::env::temp_dir();
-        DistributedCluster::new(cfg, Uuid::new_v4(), path)
+        DistributedCluster::new(cfg, Uuid::new_v4(), "TST".to_string(), path)
     }
 
     #[test]
@@ -1593,6 +1632,7 @@ mod tests {
             owner,
             NodeInfo {
                 node_id: owner,
+                node_name: None,
                 address: "127.0.0.1:9000".into(),
                 status: NodeStatus::Connected,
                 shard_count: 0,
@@ -1652,6 +1692,7 @@ mod tests {
             n1,
             NodeInfo {
                 node_id: n1,
+                node_name: None,
                 address: "127.0.0.1:9101".into(),
                 status: NodeStatus::Connected,
                 shard_count: 0,
@@ -1661,6 +1702,7 @@ mod tests {
             n2,
             NodeInfo {
                 node_id: n2,
+                node_name: None,
                 address: "127.0.0.1:9102".into(),
                 status: NodeStatus::Connected,
                 shard_count: 0,

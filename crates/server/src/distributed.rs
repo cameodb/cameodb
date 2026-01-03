@@ -27,6 +27,8 @@ pub struct DistributedCluster {
     pub peer_nodes: HashMap<Uuid, NodeInfo>,
     /// Local node identity
     pub local_node_id: Uuid,
+    /// Local node name (3-char Base36)
+    pub local_node_name: String,
     /// Handle to the running swarm runtime (if started)
     swarm_handle: Option<SwarmRuntimeHandle>,
     /// Count of successful bootstrap peer connections
@@ -42,12 +44,25 @@ pub struct DistributedCluster {
 pub struct NodeInfo {
     /// Unique node identifier
     pub node_id: Uuid,
+    /// Human-readable node name (3-char Base36)
+    pub node_name: Option<String>,
     /// Node's cluster address
     pub address: String,
     /// Node status (Connected, Disconnected, etc.)
     pub status: NodeStatus,
     /// Number of active shards on this node
     pub shard_count: usize,
+}
+
+impl NodeInfo {
+    /// Format node identity as "NAME (UUID)" for human-readable display
+    pub fn format_identity(&self) -> String {
+        if let Some(name) = &self.node_name {
+            format!("{} ({})", name, self.node_id)
+        } else {
+            self.node_id.to_string()
+        }
+    }
 }
 
 /// Status of a node in the cluster
@@ -59,12 +74,18 @@ pub enum NodeStatus {
 
 impl DistributedCluster {
     /// Create a new distributed cluster manager
-    pub fn new(cluster_config: ClusterConfig, local_node_id: Uuid, storage_path: PathBuf) -> Self {
+    pub fn new(
+        cluster_config: ClusterConfig,
+        local_node_id: Uuid,
+        local_node_name: String,
+        storage_path: PathBuf,
+    ) -> Self {
         Self {
             cluster_config,
             storage_path,
             peer_nodes: HashMap::new(),
             local_node_id,
+            local_node_name,
             swarm_handle: None,
             bootstrap_successes: 0,
             dial_failures: 0,
@@ -98,6 +119,7 @@ impl DistributedCluster {
         } = swarm::init_distributed_swarm(
             &self.cluster_config,
             self.local_node_id,
+            self.local_node_name.clone(),
             &self.storage_path,
         )
         .await?;
@@ -160,12 +182,27 @@ impl DistributedCluster {
 
     /// Record a peer discovery/update event.
     pub fn peer_discovered(&mut self, node_id: Uuid, address: String) {
+        self.peer_discovered_with_name(node_id, address, None);
+    }
+
+    /// Record a peer discovery/update event with optional node name.
+    pub fn peer_discovered_with_name(
+        &mut self,
+        node_id: Uuid,
+        address: String,
+        node_name: Option<String>,
+    ) {
         let entry = self.peer_nodes.entry(node_id).or_insert(NodeInfo {
             node_id,
+            node_name: node_name.clone(),
             address: address.clone(),
             status: NodeStatus::Connected,
             shard_count: 0,
         });
+        // Update node name if provided
+        if let Some(name) = node_name {
+            entry.node_name = Some(name);
+        }
         // Prefer the newer address only if it differs from the current one to track last-good
         if entry.address != address {
             entry.address = address;

@@ -106,10 +106,11 @@ async fn main() -> Result<()> {
         .load_persisted_cluster()
         .expect("Failed to load persisted cluster state");
 
-    // Initialize distributed cluster via ClusterCoordinator actor
+    // Initialize distributed cluster
     let distributed_cluster = DistributedCluster::new(
         cameodb_config.cluster.clone(),
         node_id,
+        orchestrator.identity().name.clone(),
         cameodb_config.storage.data_paths[0].clone(),
     );
 

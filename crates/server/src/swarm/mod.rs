@@ -198,6 +198,7 @@ fn select_preferred_address(addrs: &[Multiaddr]) -> Option<Multiaddr> {
 pub async fn init_distributed_swarm(
     config: &ClusterConfig,
     node_uuid: Uuid,
+    node_name: String,
     storage_path: &Path,
 ) -> Result<SwarmStartup> {
     if !config.distributed_actors {
@@ -214,7 +215,7 @@ pub async fn init_distributed_swarm(
     info!("🚀 Initializing distributed libp2p swarm");
 
     // Create production-ready swarm with Kademlia DHT
-    let startup = create_production_swarm(config, node_uuid, storage_path).await?;
+    let startup = create_production_swarm(config, node_uuid, node_name, storage_path).await?;
 
     info!("✅ Production swarm initialized successfully");
     info!("   📡 Peer ID: {}", startup.peer_id);
@@ -234,6 +235,7 @@ pub async fn init_distributed_swarm(
 async fn create_production_swarm(
     config: &ClusterConfig,
     node_uuid: Uuid,
+    node_name: String,
     storage_path: &Path,
 ) -> Result<SwarmStartup> {
     // Load or generate cryptographic identity for this node
@@ -251,6 +253,7 @@ async fn create_production_swarm(
         Some(libp2p::kad::Mode::Server), // Server mode for stable operation
         keypair.public(),
         node_uuid,
+        node_name,
     )?;
 
     info!("🏗️  Created Kademlia DHT behaviour for peer discovery");
@@ -825,9 +828,37 @@ fn handle_identify_event(
                 .add_address(&peer_id, addr.clone());
         }
 
-        // Try to extract Node UUID from agent version string: "cameodb/1.0.0/{UUID}"
+        // Try to extract Node name and UUID from agent version string: "cameodb/1.0.0/{NAME}/{UUID}"
         let parts: Vec<&str> = info.agent_version.split('/').collect();
-        if parts.len() >= 3 {
+        if parts.len() >= 4 {
+            let node_name = parts[2];
+            let uuid_str = parts[3];
+            if let Ok(uuid) = uuid::Uuid::parse_str(uuid_str) {
+                peer_book
+                    .uuid_by_peer
+                    .insert(peer_id.to_string(), uuid.to_string());
+                if let Some(addr) = select_preferred_address(&info.listen_addrs) {
+                    peer_book
+                        .addr_by_peer
+                        .insert(peer_id.to_string(), addr.to_string());
+                }
+
+                info!(
+                    "✨ Discovered Node identity from Identify protocol: {} ({})",
+                    node_name, uuid
+                );
+
+                // Trigger peer resolution immediately without waiting for DHT
+                let _ = event_tx.send(CoordinatorEvent::PeerUuidDiscovered {
+                    peer_id: peer_id.to_string(),
+                    node_uuid: uuid.to_string(),
+                    address: select_preferred_address(&info.listen_addrs).map(|a| a.to_string()),
+                });
+            } else {
+                warn!("⚠️  Invalid UUID in agent version: {}", uuid_str);
+            }
+        } else if parts.len() >= 3 {
+            // Fallback for old format without node name: "cameodb/1.0.0/{UUID}"
             let uuid_str = parts[2];
             if let Ok(uuid) = uuid::Uuid::parse_str(uuid_str) {
                 peer_book
@@ -839,9 +870,11 @@ fn handle_identify_event(
                         .insert(peer_id.to_string(), addr.to_string());
                 }
 
-                info!("✨ Discovered Node UUID from Identify protocol: {}", uuid);
+                info!(
+                    "✨ Discovered Node UUID from Identify protocol (legacy format): {}",
+                    uuid
+                );
 
-                // Trigger peer resolution immediately without waiting for DHT
                 let _ = event_tx.send(CoordinatorEvent::PeerUuidDiscovered {
                     peer_id: peer_id.to_string(),
                     node_uuid: uuid.to_string(),
