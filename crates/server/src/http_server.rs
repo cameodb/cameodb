@@ -84,6 +84,7 @@ pub struct HealthResponse {
     // Local node info
     pub status: String,
     pub node_id: String,
+    pub node_name: String,
     pub active_shards: usize,
     // Cluster status fields (from ClusterCoordinator)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -375,6 +376,7 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
     let response = HealthResponse {
         status: "green".to_string(),
         node_id: identity.uuid.to_string(),
+        node_name: identity.name.clone(),
         active_shards: shard_count,
         cluster_name: cluster_status.as_ref().map(|s| s.cluster_name.clone()),
         distributed_enabled: cluster_status.as_ref().map(|s| s.distributed_enabled),

@@ -139,9 +139,10 @@ pub struct RequestBootstrapRedial {
 pub struct GetKnownPeers;
 
 /// Response containing known peer information for broadcast.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnownPeer {
     pub node_id: Uuid,
+    pub node_name: Option<String>,
     pub address: String,
 }
 
@@ -1560,6 +1561,7 @@ impl Message<GetKnownPeers> for ClusterCoordinator {
             .values()
             .map(|info| KnownPeer {
                 node_id: info.node_id,
+                node_name: info.node_name.clone(),
                 address: info.address.clone(),
             })
             .collect()

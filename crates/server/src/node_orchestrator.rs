@@ -1211,20 +1211,51 @@ impl RouterActor {
                 let mut node_details: Vec<JsonValue> = Vec::new();
 
                 for result in &all_results {
-                    // Extract node_id from each response
+                    // Extract node_id and node_name from each response
                     let node_id = result
                         .get("node_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                         .to_string();
 
-                    // Collect per-node details
-                    node_details.push(serde_json::json!({
-                        "node_id": node_id,
-                        "indexes": result.get("indexes").cloned().unwrap_or(serde_json::json!([])),
-                        "total_indexes": result.get("total_indexes").and_then(|v| v.as_u64()).unwrap_or(0),
-                        "total_shards": result.get("total_shards").and_then(|v| v.as_u64()).unwrap_or(0),
-                    }));
+                    let node_name = result
+                        .get("node_name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    // Collect per-node details with node_name immediately after node_id
+                    let mut node_detail_map = serde_json::Map::new();
+                    node_detail_map.insert("node_id".to_string(), serde_json::json!(node_id));
+                    if let Some(name) = node_name {
+                        node_detail_map.insert("node_name".to_string(), serde_json::json!(name));
+                    }
+                    node_detail_map.insert(
+                        "indexes".to_string(),
+                        result
+                            .get("indexes")
+                            .cloned()
+                            .unwrap_or(serde_json::json!([])),
+                    );
+                    node_detail_map.insert(
+                        "total_indexes".to_string(),
+                        serde_json::json!(
+                            result
+                                .get("total_indexes")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                        ),
+                    );
+                    node_detail_map.insert(
+                        "total_shards".to_string(),
+                        serde_json::json!(
+                            result
+                                .get("total_shards")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                        ),
+                    );
+
+                    node_details.push(serde_json::Value::Object(node_detail_map));
 
                     // Aggregate index stats across nodes
                     if let Some(indexes) = result.get("indexes").and_then(|v| v.as_array()) {
@@ -2232,9 +2263,13 @@ impl NodeOrchestrator {
 
     async fn orch_list_indexes(&self) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
-            return Ok(
-                serde_json::json!({"indexes": [], "total_indexes": 0, "node_id": self.identity.uuid.to_string(), "total_shards": 0}),
-            );
+            return Ok(serde_json::json!({
+                "indexes": [],
+                "total_indexes": 0,
+                "node_id": self.identity.uuid.to_string(),
+                "node_name": self.identity.name.clone(),
+                "total_shards": 0
+            }));
         }
         let mut all: HashMap<String, (u64, u64, Vec<String>, usize)> = HashMap::new();
         for shard in self.shards.values() {
@@ -2280,9 +2315,13 @@ impl NodeOrchestrator {
                 })
             })
             .collect();
-        Ok(
-            serde_json::json!({"indexes": indexes, "total_indexes": indexes.len(), "node_id": self.identity.uuid.to_string(), "total_shards": self.shards.len()}),
-        )
+        Ok(serde_json::json!({
+            "indexes": indexes,
+            "total_indexes": indexes.len(),
+            "node_id": self.identity.uuid.to_string(),
+            "node_name": self.identity.name.clone(),
+            "total_shards": self.shards.len()
+        }))
     }
 
     /// Helper: Load schema from first shard
