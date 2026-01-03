@@ -1568,14 +1568,13 @@ impl NodeOrchestrator {
         JsonValue::Object(map)
     }
 
-    /// Creates a new NodeOrchestrator with the given configuration.
-    pub async fn new(config: NodeConfig) -> Result<Self, OrchestratorError> {
+    /// Creates a new NodeOrchestrator with the given configuration and identity.
+    pub async fn new(
+        config: NodeConfig,
+        identity: NodeIdentity,
+    ) -> Result<Self, OrchestratorError> {
         // Ensure storage directory exists
         fs::create_dir_all(&config.storage_path)?;
-
-        // Load or create node identity
-        let identity_path = config.storage_path.join("node_identity.json");
-        let identity = NodeIdentity::load_or_create(identity_path)?;
 
         info!("Node identity: {} ({})", identity.name, identity.uuid);
 

@@ -348,38 +348,66 @@ async fn create_production_swarm(
 }
 
 /// Load existing keypair from node_identity.json or generate a new one
-fn load_or_generate_keypair(storage_path: &Path) -> Result<(Keypair, NodeIdentity)> {
+pub fn load_or_generate_keypair(storage_path: &Path) -> Result<(Keypair, NodeIdentity)> {
     let identity_path = storage_path.join("node_identity.json");
 
-    // Load the identity (creates if doesn't exist, though NodeOrchestrator should have created it)
-    let mut identity = NodeIdentity::load_or_create(identity_path.clone())
-        .map_err(|e| anyhow::anyhow!("Failed to load node identity: {}", e))?;
-
-    // Check if we have a valid keypair stored
-    if let Some(key_bytes) = &identity.keypair {
-        info!("🔑 Loading existing libp2p keypair from node_identity.json");
-        match Keypair::from_protobuf_encoding(key_bytes) {
-            Ok(kp) => return Ok((kp, identity)),
+    // 1. Try to load existing identity to get the keypair
+    let existing_identity = if identity_path.exists() {
+        match NodeIdentity::load(identity_path.clone()) {
+            Ok(id) => Some(id),
             Err(e) => {
                 warn!(
-                    "⚠️  Failed to decode existing keypair from identity: {}. Generating new one.",
+                    "⚠️  Failed to load existing identity: {}. Will recreate.",
                     e
                 );
+                None
             }
         }
-    }
+    } else {
+        None
+    };
 
-    info!("🔑 Generating new Ed25519 keypair for libp2p");
-    let keypair = Keypair::generate_ed25519();
+    // 2. Get or generate the keypair
+    let keypair = if let Some(ref identity) = existing_identity {
+        if let Some(key_bytes) = &identity.keypair {
+            info!("🔑 Loading existing libp2p keypair from node_identity.json");
+            match Keypair::from_protobuf_encoding(key_bytes) {
+                Ok(kp) => kp,
+                Err(e) => {
+                    warn!(
+                        "⚠️  Failed to decode existing keypair: {}. Generating new one.",
+                        e
+                    );
+                    Keypair::generate_ed25519()
+                }
+            }
+        } else {
+            info!("🔑 Generating new Ed25519 keypair (no keypair in identity)");
+            Keypair::generate_ed25519()
+        }
+    } else {
+        info!("🔑 Generating new Ed25519 keypair for libp2p");
+        Keypair::generate_ed25519()
+    };
 
-    // Save the keypair to the identity file
+    // 3. Derive deterministic node identity from PeerId
+    let peer_id = libp2p::PeerId::from(keypair.public());
+    let mut identity = NodeIdentity::from_peer_id_bytes(&peer_id.to_bytes());
+
+    // 4. Attach the keypair bytes to identity for persistence
     if let Ok(bytes) = keypair.to_protobuf_encoding() {
         identity.keypair = Some(bytes);
-        if let Err(e) = identity.save(&identity_path) {
-            warn!("⚠️  Failed to save keypair to node_identity.json: {}", e);
-        } else {
-            info!("💾 Saved new keypair to {:?}", identity_path);
-        }
+    }
+
+    // 5. Save the consolidated identity (overwrites old random UUID if it existed)
+    if let Err(e) = identity.save(&identity_path) {
+        warn!(
+            "⚠️  Failed to save consolidated identity to node_identity.json: {}",
+            e
+        );
+    } else {
+        info!("💾 Consolidated node identity saved to {:?}", identity_path);
+        info!("✨ Node UUID (deterministic): {}", identity.uuid);
     }
 
     Ok((keypair, identity))

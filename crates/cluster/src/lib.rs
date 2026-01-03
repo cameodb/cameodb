@@ -48,6 +48,10 @@ use thiserror::Error;
 use uuid::Uuid;
 use xxhash_rust::xxh3;
 
+/// Fixed namespace for CameoDB UUID v5 derivation.
+/// This ensures that a libp2p PeerId always maps to the same deterministic node UUID.
+pub const NAMESPACE_CAMEODB: Uuid = Uuid::from_u128(0x67e5504410b1426f9247bb680e5fe0c8);
+
 /// Number of virtual nodes (tokens) per physical node.
 ///
 /// This value balances distribution quality with memory overhead:
@@ -170,6 +174,23 @@ impl NodeIdentity {
         }
     }
 
+    /// Creates a deterministic NodeIdentity from libp2p PeerId bytes.
+    ///
+    /// This ensures the node's UUID and consistent hashing tokens are
+    /// deterministically tied to its cryptographic identity (libp2p keypair).
+    pub fn from_peer_id_bytes(peer_id_bytes: &[u8]) -> Self {
+        let uuid = Uuid::new_v5(&NAMESPACE_CAMEODB, peer_id_bytes);
+        let name = humanize_uuid(&uuid);
+        let vnode_tokens = generate_tokens(uuid);
+
+        NodeIdentity {
+            uuid,
+            name,
+            vnode_tokens,
+            keypair: None,
+        }
+    }
+
     /// Save the identity to disk.
     pub fn save(&self, path: &std::path::Path) -> Result<(), IdentityError> {
         if let Some(parent) = path.parent() {
@@ -178,6 +199,13 @@ impl NodeIdentity {
         let file = File::create(path)?;
         serde_json::to_writer_pretty(file, self)?;
         Ok(())
+    }
+
+    /// Returns Ok(identity) if found, otherwise Err.
+    pub fn load(path: PathBuf) -> Result<Self, IdentityError> {
+        let data = fs::read_to_string(path)?;
+        let identity: NodeIdentity = serde_json::from_str(&data)?;
+        Ok(identity)
     }
 
     /// Loads an existing identity from disk or creates a new one.

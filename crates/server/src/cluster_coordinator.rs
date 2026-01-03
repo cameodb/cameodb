@@ -153,7 +153,7 @@ pub struct PeerShardsDiscovered {
 }
 
 /// Message to merge remote shard assignments into local coordinator.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeRemoteShards {
     pub node_id: Uuid,
     pub shards: HashMap<Uuid, ShardMetadata>,
@@ -199,6 +199,15 @@ pub struct ClusterCoordinator {
 
     // Subscribers for topology updates
     topology_subscribers: Vec<mpsc::Sender<ConsistentRing>>,
+
+    // DHT Bootstrap tracking - DHT is used only during bootstrap, then push-only
+    bootstrap_complete: bool,
+
+    // Snapshot debouncing - avoid excessive I/O on rapid topology changes
+    last_snapshot_time: Option<std::time::Instant>,
+
+    // Track push failures per peer for DHT fallback recovery
+    push_failure_count: HashMap<Uuid, u32>,
 }
 
 impl ClusterCoordinator {
@@ -230,6 +239,9 @@ impl ClusterCoordinator {
             state_store: None,
             expected_shards: HashMap::new(),
             topology_subscribers: Vec::new(),
+            bootstrap_complete: false,
+            last_snapshot_time: None,
+            push_failure_count: HashMap::new(),
         }
     }
 
@@ -600,10 +612,60 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
 
         // Publish local shards to DHT via swarm handle
         if let Some(handle) = self.cluster.swarm_handle() {
-            if let Err(e) = handle.publish_shards(msg.node_id, msg.shards) {
+            if let Err(e) = handle.publish_shards(msg.node_id, msg.shards.clone()) {
                 warn!(error = %e, "Failed to publish shards to DHT");
             } else {
                 info!("ClusterCoordinator: published local shards to DHT");
+            }
+        }
+
+        // Broadcast local shards to all known connected peers (push on change)
+        let local_node_id = self.cluster.local_node_id;
+        let shards_to_broadcast = msg.shards;
+        let peers: Vec<(Uuid, String)> = self
+            .cluster
+            .peer_nodes
+            .iter()
+            .filter(|(_, info)| info.status == crate::distributed::NodeStatus::Connected)
+            .map(|(id, info)| (*id, info.address.clone()))
+            .collect();
+
+        if !peers.is_empty() {
+            info!(
+                peer_count = peers.len(),
+                "ClusterCoordinator: broadcasting local shards to peers"
+            );
+            for (peer_id, _peer_addr) in peers {
+                let remote_coord_name = format!("coordinator-{}", peer_id);
+                let msg = MergeRemoteShards {
+                    node_id: local_node_id,
+                    shards: shards_to_broadcast
+                        .iter()
+                        .cloned()
+                        .map(|s| (s.shard_id, s))
+                        .collect(),
+                };
+
+                task::spawn(async move {
+                    match RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name.clone())
+                        .await
+                    {
+                        Ok(Some(remote_coord)) => match remote_coord.tell(&msg).send() {
+                            Ok(_) => {
+                                debug!(node = %peer_id, "Successfully pushed shard update to remote coordinator");
+                            }
+                            Err(e) => {
+                                warn!(node = %peer_id, error = %e, "Failed to push shard update to remote coordinator");
+                            }
+                        },
+                        Ok(None) => {
+                            debug!(node = %peer_id, "Remote coordinator not found for push update");
+                        }
+                        Err(e) => {
+                            error!(node = %peer_id, error = %e, "Failed to lookup remote coordinator for push update");
+                        }
+                    }
+                });
             }
         }
     }
@@ -1082,6 +1144,8 @@ impl Message<PeerLost> for ClusterCoordinator {
     }
 }
 
+/// Remote message handler to merge remote shard assignments.
+#[remote_message("cameo.coordinator.merge_remote_shards")]
 impl Message<MergeRemoteShards> for ClusterCoordinator {
     type Reply = ();
 
@@ -1092,6 +1156,12 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
     ) -> Self::Reply {
         let node_id = msg.node_id;
         let actual_shards = msg.shards;
+
+        info!(
+            node = %node_id,
+            shard_count = actual_shards.len(),
+            "ClusterCoordinator: receiving remote shard push"
+        );
 
         // Update peer shard count in DistributedCluster for visibility
         if let Some(peer) = self.cluster.peer_nodes.get_mut(&node_id) {
@@ -1173,6 +1243,18 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
         }
 
         // Update local state with actual reported shards (source of truth)
+        // First, remove any existing assignments for this node that are NOT in the new list
+        let mut removed_count = 0;
+        self.shard_assignments.retain(|shard_id, meta| {
+            if meta.node_id == node_id {
+                if !actual_shards.contains_key(shard_id) {
+                    removed_count += 1;
+                    return false;
+                }
+            }
+            true
+        });
+
         let mut merged_count = 0;
         for (shard_id, actual_meta) in actual_shards {
             // Always use the node's reported state as source of truth
@@ -1183,11 +1265,12 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
             self.expected_shards.remove(&shard_id);
         }
 
-        if merged_count > 0 {
+        if merged_count > 0 || removed_count > 0 {
             self.rebuild_ring();
             info!(
                 node = %node_id,
                 merged_shards = merged_count,
+                removed_shards = removed_count,
                 total_shards = self.shard_assignments.len(),
                 remaining_expected = self.expected_shards.len(),
                 "ClusterCoordinator: merged remote shard assignments, ring rebuilt"

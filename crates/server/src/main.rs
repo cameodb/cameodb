@@ -51,6 +51,11 @@ async fn main() -> Result<()> {
     // Initialize tracing with configuration
     tracing_subscriber::fmt::init();
 
+    // Establish deterministic node identity from libp2p keypair
+    let (_keypair, identity) =
+        swarm::load_or_generate_keypair(&cameodb_config.storage.data_paths[0])
+            .expect("Failed to establish node identity");
+
     // Create node configuration from loaded config
     let node_config = NodeConfig {
         storage_path: cameodb_config.storage.data_paths[0].clone(),
@@ -62,7 +67,7 @@ async fn main() -> Result<()> {
     };
 
     // Create the NodeOrchestrator actor
-    let mut orchestrator = NodeOrchestrator::new(node_config).await?;
+    let mut orchestrator = NodeOrchestrator::new(node_config, identity).await?;
 
     // Initialize default shards on first boot if none exist
     let init_shards = cameodb_config.server.node.init_shards;
