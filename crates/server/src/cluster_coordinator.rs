@@ -163,6 +163,22 @@ pub struct MergeRemoteShards {
 #[derive(Debug, Clone)]
 pub struct GetClusterSnapshot;
 
+/// Internal message to record a push failure for DHT fallback tracking
+#[derive(Debug, Clone)]
+pub struct RecordPushFailure {
+    pub node_id: Uuid,
+}
+
+/// Internal message to reset push failure count on successful push
+#[derive(Debug, Clone)]
+pub struct ResetPushFailure {
+    pub node_id: Uuid,
+}
+
+/// Internal message to mark bootstrap as complete
+#[derive(Debug, Clone)]
+pub struct MarkBootstrapComplete;
+
 /// Snapshot of cluster topology for persistence
 #[derive(Debug, Clone, Reply)]
 pub struct ClusterSnapshot {
@@ -203,8 +219,8 @@ pub struct ClusterCoordinator {
     // DHT Bootstrap tracking - DHT is used only during bootstrap, then push-only
     bootstrap_complete: bool,
 
-    // Snapshot debouncing - avoid excessive I/O on rapid topology changes
-    last_snapshot_time: Option<std::time::Instant>,
+    // Track last persisted generation to avoid redundant snapshots
+    last_persisted_generation: u64,
 
     // Track push failures per peer for DHT fallback recovery
     push_failure_count: HashMap<Uuid, u32>,
@@ -240,7 +256,7 @@ impl ClusterCoordinator {
             expected_shards: HashMap::new(),
             topology_subscribers: Vec::new(),
             bootstrap_complete: false,
-            last_snapshot_time: None,
+            last_persisted_generation: 0,
             push_failure_count: HashMap::new(),
         }
     }
@@ -350,6 +366,9 @@ impl ClusterCoordinator {
             state_store: Some(state_store),
             expected_shards,
             topology_subscribers: Vec::new(),
+            bootstrap_complete: false, // Will be set after initial DHT queries complete
+            last_persisted_generation: generation,
+            push_failure_count: HashMap::new(),
         }
     }
 
@@ -365,7 +384,13 @@ impl ClusterCoordinator {
     }
 
     /// Persist current cluster state snapshot to disk (event-driven)
+    /// Only persists when generation changes to avoid redundant writes
     fn persist_snapshot(&mut self) {
+        // Skip if generation hasn't changed since last persist
+        if self.generation == self.last_persisted_generation {
+            return;
+        }
+
         if let Some(state_store) = &self.state_store {
             // 1. Calculate authoritative shard counts from assignments
             let mut shard_counts: HashMap<Uuid, usize> = HashMap::new();
@@ -454,6 +479,9 @@ impl ClusterCoordinator {
                     );
                 }
             });
+
+            // Update last persisted generation after successful dispatch
+            self.last_persisted_generation = self.generation;
         }
     }
 
@@ -607,15 +635,18 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
             "ClusterCoordinator: registered local shards"
         );
 
-        // Persist snapshot after shard registration
+        // Persist snapshot after shard registration (debounced)
         self.persist_snapshot();
 
-        // Publish local shards to DHT via swarm handle
-        if let Some(handle) = self.cluster.swarm_handle() {
-            if let Err(e) = handle.publish_shards(msg.node_id, msg.shards.clone()) {
-                warn!(error = %e, "Failed to publish shards to DHT");
-            } else {
-                info!("ClusterCoordinator: published local shards to DHT");
+        // Publish local shards to DHT ONLY during bootstrap phase
+        // After bootstrap, rely exclusively on Kameo push for real-time updates
+        if !self.bootstrap_complete {
+            if let Some(handle) = self.cluster.swarm_handle() {
+                if let Err(e) = handle.publish_shards(msg.node_id, msg.shards.clone()) {
+                    warn!(error = %e, "Failed to publish shards to DHT during bootstrap");
+                } else {
+                    info!("ClusterCoordinator: published local shards to DHT (bootstrap phase)");
+                }
             }
         }
 
@@ -635,6 +666,10 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
                 peer_count = peers.len(),
                 "ClusterCoordinator: broadcasting local shards to peers"
             );
+
+            // Clone self reference for failure tracking callback
+            let self_weak = _ctx.actor_ref().downgrade();
+
             for (peer_id, _peer_addr) in peers {
                 let remote_coord_name = format!("coordinator-{}", peer_id);
                 let msg = MergeRemoteShards {
@@ -645,6 +680,7 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
                         .map(|s| (s.shard_id, s))
                         .collect(),
                 };
+                let self_weak_clone = self_weak.clone();
 
                 task::spawn(async move {
                     match RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name.clone())
@@ -653,9 +689,19 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
                         Ok(Some(remote_coord)) => match remote_coord.tell(&msg).send() {
                             Ok(_) => {
                                 debug!(node = %peer_id, "Successfully pushed shard update to remote coordinator");
+                                // Reset failure count on success
+                                if let Some(self_ref) = self_weak_clone.upgrade() {
+                                    let _ =
+                                        self_ref.tell(ResetPushFailure { node_id: peer_id }).await;
+                                }
                             }
                             Err(e) => {
                                 warn!(node = %peer_id, error = %e, "Failed to push shard update to remote coordinator");
+                                // Track failure and trigger DHT fallback if threshold exceeded
+                                if let Some(self_ref) = self_weak_clone.upgrade() {
+                                    let _ =
+                                        self_ref.tell(RecordPushFailure { node_id: peer_id }).await;
+                                }
                             }
                         },
                         Ok(None) => {
@@ -1029,19 +1075,41 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
             .peer_discovered(msg.node_id, msg.address.clone());
         info!(node = %msg.node_id, addr = %msg.address, "ClusterCoordinator: peer discovered");
 
-        // Persist snapshot after peer discovery
+        // Persist snapshot after peer discovery (debounced)
         self.persist_snapshot();
 
         // Evaluate state (e.g., WaitingForPeers -> Active if all nodes joined)
         self.evaluate_and_transition_state();
 
-        // Trigger DHT lookup for peer shards
-        if let Some(handle) = self.cluster.swarm_handle() {
-            if let Err(e) = handle.query_shards(msg.node_id) {
-                warn!(node = %msg.node_id, error = %e, "Failed to query peer shards from DHT");
-            } else {
-                info!(node = %msg.node_id, "ClusterCoordinator: querying shards from DHT");
+        // DHT Query Guard: Only query DHT if we don't already have shard metadata for this node
+        // This avoids redundant DHT queries when Kameo push has already delivered the metadata
+        let needs_dht_query = !self
+            .shard_assignments
+            .values()
+            .any(|s| s.node_id == msg.node_id);
+
+        if needs_dht_query && !self.bootstrap_complete {
+            // Trigger DHT lookup for peer shards (bootstrap phase only)
+            if let Some(handle) = self.cluster.swarm_handle() {
+                if let Err(e) = handle.query_shards(msg.node_id) {
+                    warn!(node = %msg.node_id, error = %e, "Failed to query peer shards from DHT");
+                } else {
+                    info!(node = %msg.node_id, "ClusterCoordinator: querying shards from DHT (bootstrap)");
+                }
             }
+        } else if needs_dht_query {
+            debug!(node = %msg.node_id, "Skipping DHT query (bootstrap complete, relying on Kameo push)");
+        } else {
+            debug!(node = %msg.node_id, "Skipping DHT query (already have shard metadata)");
+        }
+
+        // Auto-complete bootstrap if we're in single-node mode (no expected peers)
+        // This allows immediate transition to push-only mode for standalone deployments
+        if !self.bootstrap_complete && self.expected_nodes.len() == 1 {
+            self.bootstrap_complete = true;
+            info!(
+                "ClusterCoordinator: Bootstrap complete (single-node mode), switching to push-only"
+            );
         }
 
         // Fetch shard metadata from remote coordinator in background task (Fallback/Redundancy)
@@ -1120,6 +1188,15 @@ impl Message<PeerShardsDiscovered> for ClusterCoordinator {
             info!(
                 total_shards = self.shard_assignments.len(),
                 "ClusterCoordinator: updated ring from DHT discovery"
+            );
+        }
+
+        // Auto-complete bootstrap after first successful DHT shard discovery
+        // This indicates DHT is functional and we can transition to push-only mode
+        if !self.bootstrap_complete && changes > 0 {
+            self.bootstrap_complete = true;
+            info!(
+                "ClusterCoordinator: Bootstrap complete after DHT shard discovery, switching to push-only mode"
             );
         }
     }
@@ -1364,6 +1441,70 @@ impl Message<RequestBootstrapRedial> for ClusterCoordinator {
         // 2. Re-dial bootstrap peers via swarm handle
         // 3. Update cluster state after successful connections
         Ok(())
+    }
+}
+
+impl Message<RecordPushFailure> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: RecordPushFailure,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        const PUSH_FAILURE_THRESHOLD: u32 = 3;
+
+        let count = self.push_failure_count.entry(msg.node_id).or_insert(0);
+        *count += 1;
+
+        if *count >= PUSH_FAILURE_THRESHOLD {
+            warn!(
+                node = %msg.node_id,
+                failure_count = *count,
+                "Push failures exceeded threshold, triggering DHT fallback"
+            );
+
+            // Trigger DHT query as fallback recovery mechanism
+            if let Some(handle) = self.cluster.swarm_handle() {
+                if let Err(e) = handle.query_shards(msg.node_id) {
+                    error!(node = %msg.node_id, error = %e, "DHT fallback query failed");
+                } else {
+                    info!(node = %msg.node_id, "Triggered DHT fallback query after push failures");
+                }
+            }
+        } else {
+            debug!(node = %msg.node_id, failure_count = *count, "Recorded push failure");
+        }
+    }
+}
+
+impl Message<ResetPushFailure> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: ResetPushFailure,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if self.push_failure_count.remove(&msg.node_id).is_some() {
+            debug!(node = %msg.node_id, "Reset push failure count after successful push");
+        }
+    }
+}
+
+impl Message<MarkBootstrapComplete> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _msg: MarkBootstrapComplete,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if !self.bootstrap_complete {
+            self.bootstrap_complete = true;
+            info!("ClusterCoordinator: Bootstrap phase complete, switching to push-only mode");
+            info!("DHT is now cold storage for recovery scenarios only");
+        }
     }
 }
 
