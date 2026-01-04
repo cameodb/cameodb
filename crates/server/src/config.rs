@@ -379,6 +379,15 @@ impl CameoDbConfig {
                 .with_context(|| "Invalid CAMEODB_DEFAULT_SEARCH_LIMIT")?;
         }
 
+        // Node configuration
+        if let Ok(label) = std::env::var("CAMEODB_NODE_LABEL") {
+            config.node.label = Some(label);
+        }
+
+        if let Ok(zone) = std::env::var("CAMEODB_NODE_ZONE") {
+            config.node.zone = zone;
+        }
+
         // Cluster configuration
         if let Ok(enabled) = std::env::var("CAMEODB_CLUSTER_ENABLED") {
             let normalized = enabled.trim().to_ascii_lowercase();
