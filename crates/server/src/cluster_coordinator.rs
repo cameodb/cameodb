@@ -559,14 +559,26 @@ impl ClusterCoordinator {
         let new_state = match &self.state {
             ClusterState::Active { .. } => {
                 // Check for degradation: if we have any inactive nodes
-                if inactive_nodes > 0 {
+                if inactive_nodes == 1 {
                     warn!(
                         active_nodes,
-                        inactive_nodes, "ClusterCoordinator: cluster degraded, some nodes inactive"
+                        inactive_nodes, "ClusterCoordinator: cluster degraded, one node inactive"
                     );
                     Some(ClusterState::Degraded {
                         active_nodes,
                         inactive_nodes,
+                    })
+                } else if inactive_nodes > 1 {
+                    error!(
+                        active_nodes,
+                        inactive_nodes,
+                        "ClusterCoordinator: cluster failed, multiple nodes inactive"
+                    );
+                    Some(ClusterState::Failed {
+                        reason: format!(
+                            "Cluster failed: {}/{} nodes active ({} missing)",
+                            active_nodes, total_expected, inactive_nodes
+                        ),
                     })
                 } else {
                     None // Still healthy
@@ -581,30 +593,27 @@ impl ClusterCoordinator {
                         active_nodes,
                         total_expected,
                     })
-                } else if active_nodes < total_expected / 2 {
-                    // Less than 50% nodes active - mark as failed
+                } else if inactive_nodes > 1 {
+                    // More than one node down - mark as failed
                     error!(
                         active_nodes,
                         total_expected,
-                        "ClusterCoordinator: cluster failed, too many nodes inactive"
+                        "ClusterCoordinator: cluster failed, multiple nodes inactive"
                     );
                     Some(ClusterState::Failed {
                         reason: format!(
-                            "Cluster lost quorum: {}/{} nodes active",
-                            active_nodes, total_expected
+                            "Cluster failed: {}/{} nodes active ({} missing)",
+                            active_nodes, total_expected, inactive_nodes
                         ),
                     })
                 } else {
-                    // Update counts if changed
-                    Some(ClusterState::Degraded {
-                        active_nodes,
-                        inactive_nodes,
-                    })
+                    // Still Degraded (one node down)
+                    None
                 }
             }
             ClusterState::Failed { .. } => {
-                // Recover if we have majority of nodes
-                if active_nodes >= total_expected / 2 {
+                // Recover if we have enough nodes
+                if inactive_nodes <= 1 {
                     info!("ClusterCoordinator: cluster recovering from failure");
                     if inactive_nodes == 0 {
                         Some(ClusterState::Active {

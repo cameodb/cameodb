@@ -81,23 +81,21 @@ pub struct SchemaUpdatePayload {
 /// Health check response
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
-    // Local node info
     pub status: String,
     pub node_id: String,
     pub node_name: String,
-    pub active_shards: usize,
-    // Cluster status fields (from ClusterCoordinator)
-    #[serde(skip_serializing_if = "Option::is_none")]
+
+    // Cluster-wide status
     pub cluster_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub distributed_enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_nodes: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub connected_nodes: Option<usize>,
-    // Counters
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_total_shards: Option<usize>,
+
+    // Local node info
+    pub active_shards: usize,
+
+    // Performance/Debug metrics
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dial_failures: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -375,15 +373,18 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
     };
 
     let response = HealthResponse {
-        status: "green".to_string(),
+        status: cluster_status
+            .as_ref()
+            .map(|s| s.health.clone())
+            .unwrap_or_else(|| "green".to_string()),
         node_id: identity.uuid.to_string(),
         node_name: identity.name.clone(),
-        active_shards: shard_count,
         cluster_name: cluster_status.as_ref().map(|s| s.cluster_name.clone()),
         distributed_enabled: cluster_status.as_ref().map(|s| s.distributed_enabled),
         total_nodes: cluster_status.as_ref().map(|s| s.total_nodes),
         connected_nodes: cluster_status.as_ref().map(|s| s.connected_nodes),
         cluster_total_shards: cluster_status.as_ref().map(|s| s.total_shards),
+        active_shards: shard_count,
         dial_failures: cluster_status.as_ref().map(|s| s.dial_failures),
         bootstrap_successes: cluster_status.as_ref().map(|s| s.bootstrap_successes),
         routing_updates: cluster_status.as_ref().map(|s| s.routing_updates),

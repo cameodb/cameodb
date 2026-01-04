@@ -8,20 +8,20 @@ use serde::{Deserialize, Serialize};
 /// State changes only via message events (PeerDiscovered/PeerLost)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ClusterState {
-    /// Cluster operational (majority of expected nodes active)
+    /// Cluster operational (all expected nodes active)
     Active {
         generation: u64,
         active_nodes: usize,
         total_expected: usize,
     },
 
-    /// Some nodes inactive but cluster functional
+    /// One node inactive (Yellow state)
     Degraded {
         active_nodes: usize,
         inactive_nodes: usize,
     },
 
-    /// Too few nodes to operate reliably
+    /// More than one node inactive (Red state)
     Failed { reason: String },
 }
 

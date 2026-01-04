@@ -256,12 +256,25 @@ impl DistributedCluster {
             .filter(|node| node.status == NodeStatus::Connected)
             .count();
 
+        let total_nodes = self.peer_nodes.len() + 1; // +1 for local node
+        let active_nodes = connected_nodes + 1; // +1 for local node
+        let missing_nodes = total_nodes.saturating_sub(active_nodes);
+
+        let health = if missing_nodes == 0 {
+            "green".to_string()
+        } else if missing_nodes == 1 {
+            "yellow".to_string()
+        } else {
+            "red".to_string()
+        };
+
         let total_shards = self.peer_nodes.values().map(|node| node.shard_count).sum();
 
         ClusterStatus {
             cluster_name: self.cluster_config.cluster_name.clone(),
-            total_nodes: self.peer_nodes.len() + 1, // +1 for local node
-            connected_nodes: connected_nodes + 1,   // +1 for local node
+            health,
+            total_nodes,
+            connected_nodes: active_nodes,
             total_shards,
             distributed_enabled: self.cluster_config.enabled,
             dial_failures: self.dial_failures,
@@ -287,6 +300,7 @@ impl Drop for DistributedCluster {
 #[derive(Debug, Clone, Reply)]
 pub struct ClusterStatus {
     pub cluster_name: String,
+    pub health: String,
     pub total_nodes: usize,
     pub connected_nodes: usize,
     pub total_shards: usize,
