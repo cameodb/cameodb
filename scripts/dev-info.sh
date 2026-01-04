@@ -31,7 +31,7 @@ echo ""
 echo "📋 Quick Start:"
 echo "   1. Setup:      ./scripts/setup/install-deps.sh"
 echo "   2. Build:      cargo build --release"
-echo "   3. Start:      cargo run --release --bin server"
+echo "   3. Start:      cargo run --release --bin cameodb"
 echo "   4. Test:       ./scripts/testing/test-api.sh"
 echo "   5. Load data:  ./scripts/data/sample-data.sh"
 echo ""
@@ -47,18 +47,18 @@ if command -v cargo &> /dev/null; then
         echo "   ❌ Project has build errors (run: cargo check --workspace)"
     fi
     
-    # Check if server binary exists
-    if [ -f "target/release/server" ]; then
+    # Check if CameoDB binary exists
+    if [ -f "target/release/cameodb" ]; then
         echo "   ✅ Release binary available"
     else
         echo "   ⚠️  Release binary not found (run: cargo build --release)"
     fi
     
-    # Check if server is running
+    # Check if CameoDB is running
     if curl -s "http://localhost:9480/_cluster/health" &> /dev/null; then
-        echo "   ✅ Server is running on port 9480"
+        echo "   ✅ CameoDB is running on port 9480"
     else
-        echo "   ℹ️  Server not running (start with: cargo run --release --bin server)"
+        echo "   ℹ️  CameoDB not running (start with: cargo run --release --bin cameodb)"
     fi
     
     echo ""

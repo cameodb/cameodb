@@ -28,8 +28,8 @@ For a quick overview of all available scripts and project status:
 **Purpose**: Initialize development cluster with sample data and shards
 - **Features**:
   - Creates sample shards with realistic data
-  - Validates server startup and data ingestion
-  - Interactive mode - keeps server running until Ctrl+C
+  - Validates CameoDB startup and data ingestion
+  - Interactive mode - keeps CameoDB running until Ctrl+C
 - **Usage**: 
   ```bash
   ./scripts/setup/init-cluster.sh        # Default port 9480
@@ -61,10 +61,10 @@ For a quick overview of all available scripts and project status:
 - **Features**:
   - Tests all HTTP endpoints (health, search, write, stream)
   - JSON response validation
-  - Automatic server startup and cleanup
+  - Automatic CameoDB startup and cleanup
   - NDJSON streaming test with timeout
 - **Usage**: `./scripts/testing/test-api.sh`
-- **Requirements**: Server must be running or script will start it
+- **Requirements**: CameoDB must be running or script will start it
 - **Audience**: Developers, QA, CI/CD pipelines
 
 #### `load-test.sh [port] [users] [requests_per_user]`
@@ -104,7 +104,7 @@ For a quick overview of all available scripts and project status:
 #### `health-check.sh [port] [timeout]`
 **Purpose**: Comprehensive health monitoring and diagnostics
 - **Features**:
-  - Server connectivity and response time testing
+  - CameoDB connectivity and response time testing
   - API endpoint validation (search, write, stream, health)
   - Performance metrics and memory usage monitoring
   - Colored output with clear status indicators
@@ -124,7 +124,7 @@ For a quick overview of all available scripts and project status:
 - **Features**:
   - Lists all available scripts with descriptions
   - Shows current project build status
-  - Displays server running status  
+  - Displays CameoDB running status  
   - Quick start guide and documentation links
 - **Usage**: `./scripts/dev-info.sh`
 - **Audience**: All developers, new contributors
@@ -170,15 +170,15 @@ cargo test --workspace              # Unit tests
 ## Configuration & Customization
 
 ### Default Settings
-- **Server Port**: 9480
+- **CameoDB Port**: 9480
 - **Health Timeout**: 10 seconds
 - **Load Test**: 10 users, 50 requests each
 - **Sample Data**: 100 documents
 
 ### Environment Variables
 Scripts respect these environment variables when available:
-- `CAMEODB_PORT`: Default server port
-- `CAMEODB_HOST`: Default server host (default: localhost)
+- `CAMEODB_PORT`: Default CameoDB port
+- `CAMEODB_HOST`: Default CameoDB host (default: localhost)
 
 ### Data Directories
 - **Production Data**: `./data/cameodb/` (git-ignored, created at runtime)
@@ -239,8 +239,8 @@ Scripts respect these environment variables when available:
 **"Command not found: jq"**
 - Run `./scripts/setup/install-deps.sh` to install missing dependencies
 
-**"Server not running on port 9480"**
-- Start server: `cargo run --release --bin server`
+**"CameoDB not running on port 9480"**
+- Start CameoDB: `cargo run --release --bin cameodb`
 - Or use init script: `./scripts/setup/init-cluster.sh`
 
 **"Permission denied"**

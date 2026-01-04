@@ -24,7 +24,7 @@ sequenceDiagram
     participant A_HTTP as HTTP API (Node A)
     participant A_Router as RouterActor (Node A)
     participant A_Coord as ClusterCoordinator (Node A)
-    participant B_Orch as NodeOrchestrator (Node B)
+    participant B_Orch as NodeOrchestrator (Node B: label="cameodb-node-2")
     participant B_Shards as MicroshardActors (Node B)
 
     Client->>A_HTTP: POST /api/{index}/search\n{ query, routing_key = "user-42" }
@@ -102,6 +102,8 @@ The router sees a remote decision and calls `handle_remote`:
 ```rust
 self.handle_remote(op, node_id, peer_addr).await
 ```
+
+This node_id is the unique UUID of the remote node.
 
 `handle_remote`:
 

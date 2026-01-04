@@ -45,7 +45,7 @@ docker-compose -f docker-compose-cluster.yml up -d
   - **Node 2 (Direct)**: `http://localhost:9482`
   - **Node 3 (Direct)**: `http://localhost:9483`
 - **Data Persistence**: Each node's data is stored in a separate subdirectory within `data/cameodb/`.
-- **Swarm Configuration**: Update the `CAMEODB_CLUSTER_NAME`, `CAMEODB_CLUSTER_PORT`, `CAMEODB_BOOTSTRAP_NODES`, and `CAMEODB_DISTRIBUTED_ACTORS` environment variables to reflect your deployment topology.
+- **Swarm Configuration**: Update the `CAMEODB_CLUSTER_NAME`, `CAMEODB_CLUSTER_PORT`, `CAMEODB_SEED_NODES`, and `CAMEODB_CLUSTER_ENABLED` environment variables to reflect your deployment topology.
 
 ## Common Commands
 

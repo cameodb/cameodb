@@ -60,8 +60,8 @@ async fn main() -> Result<()> {
     let node_config = NodeConfig {
         storage_path: cameodb_config.storage.data_paths[0].clone(),
         max_shards: cameodb_config.storage.max_shards_per_node,
-        writer_memory_min_mb: cameodb_config.search.indexer_memory_min_mb,
-        writer_memory_max_mb: cameodb_config.search.indexer_memory_max_mb,
+        indexer_memory_min_mb: cameodb_config.search.indexer_memory_min_mb,
+        indexer_memory_max_mb: cameodb_config.search.indexer_memory_max_mb,
         wal_sync: cameodb_config.storage.wal_sync,
         default_batch_size: cameodb_config.storage.default_batch_size,
     };

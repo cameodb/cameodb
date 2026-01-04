@@ -33,20 +33,20 @@ echo "🏥 CameoDB Health Check"
 echo "======================="
 echo ""
 
-# Check 1: Server Connectivity
-print_status "INFO" "Checking server connectivity on port $PORT..."
+# Check 1: CameoDB Connectivity
+print_status "INFO" "Checking CameoDB connectivity on port $PORT..."
 
 if ! curl -s --max-time $TIMEOUT "http://localhost:$PORT/_cluster/health" &> /dev/null; then
-    print_status "ERROR" "Cannot connect to CameoDB server on port $PORT"
+    print_status "ERROR" "Cannot connect to CameoDB on port $PORT"
     echo ""
     echo "Troubleshooting:"
-    echo "  1. Check if server is running: ps aux | grep server"
+    echo "  1. Check if CameoDB is running: ps aux | grep cameodb"
     echo "  2. Check if port is correct: netstat -an | grep $PORT"
-    echo "  3. Start server: cargo run --release --bin server"
+    echo "  3. Start CameoDB: cargo run --release --bin cameodb"
     exit 1
 fi
 
-print_status "OK" "Server is accessible"
+print_status "OK" "CameoDB is accessible"
 
 # Check 2: Health Endpoint
 print_status "INFO" "Fetching cluster health..."
@@ -134,10 +134,10 @@ fi
 
 # Check 5: System Resources (if available)
 if command -v ps &> /dev/null; then
-    print_status "INFO" "Checking server process..."
-    SERVER_PID=$(pgrep -f "target.*server" | head -1)
+    print_status "INFO" "Checking CameoDB process..."
+    SERVER_PID=$(pgrep -f "target.*cameodb" | head -1)
     if [ -n "$SERVER_PID" ]; then
-        print_status "OK" "Server process found (PID: $SERVER_PID)"
+        print_status "OK" "CameoDB process found (PID: $SERVER_PID)"
         
         # Get memory usage if available
         if command -v ps &> /dev/null; then
@@ -153,14 +153,14 @@ if command -v ps &> /dev/null; then
             fi
         fi
     else
-        print_status "WARN" "Server process not found via pgrep"
+        print_status "WARN" "CameoDB process not found via pgrep"
     fi
 fi
 
 echo ""
 echo "📊 Health Check Summary"
 echo "======================"
-echo "Server: http://localhost:$PORT"
+echo "CameoDB: http://localhost:$PORT"
 echo "Status: $STATUS"
 echo "Node: ${NODE_ID:0:12}..."
 echo "Shards: $ACTIVE_SHARDS"

@@ -1,8 +1,8 @@
-# CameoDB Server
+# CameoDB Node
 
 The `server` crate hosts the CameoDB node process: a high-performance, actor-based database node that combines local hybrid storage (redb + Tantivy) with distributed coordination, routing, and remote execution over libp2p + Kameo.
 
-This document focuses on the *server-side* architecture and the distributed workflows currently implemented.
+This document focuses on the *node-side* architecture and the distributed workflows currently implemented.
 
 ---
 
@@ -114,7 +114,7 @@ Each `MicroshardActor` manages a single shard’s data and index.
 
 ### 3.1 Libp2p Swarm & Kademlia
 
-The server builds a custom libp2p swarm with:
+The node builds a custom libp2p swarm with:
 
 - TCP (nodelay), QUIC, Noise, Yamux.
 - Kademlia DHT for peer discovery and routing metadata.
@@ -132,12 +132,12 @@ This wires Kameo’s remote registry into the swarm so actor lookups and remote 
 
 ### 3.2 Remote Actor Naming & Registration
 
-To make nodes discoverable for remote calls, the server uses stable actor names:
+To make nodes discoverable for remote calls, CameoDB uses stable actor names:
 
 - `orchestrator-{node_id}` for `NodeOrchestrator`.
 - `shard-{shard_id}` for `MicroshardActor` (planned for direct shard-to-shard calls).
 
-On startup, after `NodeOrchestrator` is spawned, the server:
+On startup, after `NodeOrchestrator` is spawned, the node:
 
 1. Computes the name using `orchestrator_remote_name(node_id)`.
 2. Calls `orchestrator_ref.register(name).await` to register with the Kameo registry.

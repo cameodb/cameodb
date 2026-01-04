@@ -17,10 +17,10 @@ A high-performance, distributed, shared-nothing hybrid-search database built in 
 ## 🚀 Quick Start
 
 ```bash
-# Start the server
+# Start CameoDB
 cargo run --bin cameodb
 
-# Server starts on http://localhost:9480 by default
+# CameoDB starts on http://localhost:9480 by default
 ```
 
 ## 🧠 Distributed Architecture Overview
@@ -34,7 +34,7 @@ CameoDB is designed as a **distributed, shared-nothing cluster**:
 - **Event-driven metadata** - Cluster state transitions and persistence triggered purely by actor messages (`PeerDiscovered`, `PeerLost`, `MergeRemoteShards`) with no background polling or timeouts.
 - **State reconciliation** - On boot, nodes compare expected cluster topology from snapshots vs actual peer reports, logging discrepancies and converging to distributed reality.
 
-For a detailed walkthrough of the server-side actors, routing decisions, remote flows, and metadata persistence, see:
+For a detailed walkthrough of the node-side actors, routing decisions, remote flows, and metadata persistence, see:
 
 - [`crates/server/README.md`](crates/server/README.md)
 
@@ -394,7 +394,7 @@ docker-compose -f docker/docker-compose-cluster.yml up -d
   - **Node 2 (Direct)**: `http://localhost:9482`
   - **Node 3 (Direct)**: `http://localhost:9483`
 - **Data Persistence**: Each node's data is stored in a separate subdirectory within `data/cameodb/`.
-- **Swarm Configuration**: `CAMEODB_CLUSTER_NAME`, `CAMEODB_CLUSTER_PORT`, `CAMEODB_BOOTSTRAP_NODES`, and `CAMEODB_DISTRIBUTED_ACTORS` environment variables drive the Kademlia swarm. Update them per deployment needs.
+- **Swarm Configuration**: `CAMEODB_CLUSTER_NAME`, `CAMEODB_CLUSTER_PORT`, `CAMEODB_SEED_NODES`, and `CAMEODB_CLUSTER_ENABLED` environment variables drive the Kademlia swarm. Update them per deployment needs.
 
 ### Common Docker Commands
 
@@ -413,7 +413,7 @@ For more details, see the [Docker README](docker/README.md), which includes the 
 
 ## 🔧 Configuration
 
-Server configuration via `cameodb.toml` now mirrors the runtime struct layout:
+CameoDB configuration via `cameodb.toml` now mirrors the runtime struct layout:
 
 ```toml
 [node]
@@ -527,7 +527,7 @@ CameoDB uses a multi-license policy inspired by Sentry:
 |------------------|---------|-------|
 | Core crates (e.g. `crates/cluster`, `crates/storage`, supporting libraries) | Apache-2.0 | Fully open source core with patent protection |
 | SDKs and client tooling (e.g. `crates/client`) | MIT | Maximizes compatibility (incl. GPL) |
-| Product / server application (`crates/server`) | FSL-1.1-Apache-2.0 | Restricts competitive hosting for 2 years, then reverts to Apache-2.0 |
+| Product / node application (`crates/server`) | FSL-1.1-Apache-2.0 | Restricts competitive hosting for 2 years, then reverts to Apache-2.0 |
 
 License texts are available under [`licenses/`](licenses/):
 

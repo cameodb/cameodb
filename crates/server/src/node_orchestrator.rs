@@ -68,9 +68,9 @@ pub struct NodeConfig {
     pub storage_path: PathBuf,
     /// Maximum number of shards this node can host
     pub max_shards: usize,
-    /// Tantivy writer memory configuration (per shard)
-    pub writer_memory_min_mb: usize,
-    pub writer_memory_max_mb: usize,
+    /// Tantivy indexer memory configuration (per shard)
+    pub indexer_memory_min_mb: usize,
+    pub indexer_memory_max_mb: usize,
     /// Enable WAL fsync for durability
     pub wal_sync: bool,
     /// Default batch size for smart commit calculations
@@ -82,8 +82,8 @@ impl Default for NodeConfig {
         Self {
             storage_path: PathBuf::from("./data/cameodb"),
             max_shards: 8,
-            writer_memory_min_mb: 16,
-            writer_memory_max_mb: 256,
+            indexer_memory_min_mb: 16,
+            indexer_memory_max_mb: 256,
             wal_sync: true,
             default_batch_size: 1000,
         }
@@ -1726,13 +1726,13 @@ impl NodeOrchestrator {
         let shard_path = self.config.storage_path.join(format!("shard-{}", shard_id));
 
         // Start at the minimum writer memory; storage will scale between min/max as the index grows.
-        let writer_memory_mb = self.config.writer_memory_min_mb;
+        let indexer_memory_mb = self.config.indexer_memory_min_mb;
 
         StorageConfig {
             shard_path,
-            writer_memory_budget: writer_memory_mb * 1024 * 1024, // Convert to bytes
-            writer_memory_min_mb: self.config.writer_memory_min_mb,
-            writer_memory_max_mb: self.config.writer_memory_max_mb,
+            indexer_memory_budget: indexer_memory_mb * 1024 * 1024, // Convert to bytes
+            indexer_memory_min_mb: self.config.indexer_memory_min_mb,
+            indexer_memory_max_mb: self.config.indexer_memory_max_mb,
             default_batch_size: self.config.default_batch_size,
             wal_sync: self.config.wal_sync,
         }

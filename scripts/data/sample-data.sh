@@ -13,10 +13,10 @@ DOC_COUNT=${3:-100}
 
 echo "📊 Generating $DOC_COUNT sample documents for index '$INDEX_NAME'..."
 
-# Check if server is running
+# Check if CameoDB is running
 if ! curl -s "http://localhost:$PORT/_cluster/health" &> /dev/null; then
-    echo "❌ CameoDB server is not running on port $PORT"
-    echo "   Start it first: cargo run --release --bin server"
+    echo "❌ CameoDB is not running on port $PORT"
+    echo "   Start it first: cargo run --release --bin cameodb"
     exit 1
 fi
 
@@ -101,7 +101,7 @@ for i in $(seq 1 $DOC_COUNT); do
         fi
     fi
     
-    # Small delay to avoid overwhelming the server
+    # Small delay to avoid overwhelming CameoDB
     sleep 0.01
 done
 

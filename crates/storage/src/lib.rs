@@ -46,11 +46,11 @@ pub struct StorageConfig {
     /// The root folder for this shard's data files.
     pub shard_path: PathBuf,
     /// Default memory budget for each tantivy IndexWriter in bytes.
-    pub writer_memory_budget: usize,
-    /// Minimum memory budget for IndexWriter in bytes.
-    pub writer_memory_min_mb: usize,
-    /// Maximum memory budget for IndexWriter in bytes.
-    pub writer_memory_max_mb: usize,
+    pub indexer_memory_budget: usize,
+    /// Minimum memory budget for IndexWriter in MB.
+    pub indexer_memory_min_mb: usize,
+    /// Maximum memory budget for IndexWriter in MB.
+    pub indexer_memory_max_mb: usize,
     /// Default batch size for smart commit calculations.
     pub default_batch_size: usize,
     /// Whether to call fsync() on every redb commit.
@@ -61,10 +61,10 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             shard_path: PathBuf::from("/tmp/cameodb_default_shard"),
-            writer_memory_min_mb: 16,               // 16MB minimum
-            writer_memory_max_mb: 256,              // 256MB maximum
-            writer_memory_budget: 16 * 1024 * 1024, // start at min when unknown
-            default_batch_size: 1000,               // 1000 operations default
+            indexer_memory_min_mb: 16,               // 16MB minimum
+            indexer_memory_max_mb: 256,              // 256MB maximum
+            indexer_memory_budget: 16 * 1024 * 1024, // start at min when unknown
+            default_batch_size: 1000,                // 1000 operations default
             wal_sync: true,
         }
     }
@@ -73,9 +73,9 @@ impl Default for StorageConfig {
 impl StorageConfig {
     /// Calculate optimal memory budget based on index size and configurable range
     pub fn get_optimal_memory_budget(&self, index_path: &PathBuf) -> usize {
-        let min_budget_bytes = self.writer_memory_min_mb * 1024 * 1024;
-        let max_budget_bytes = self.writer_memory_max_mb * 1024 * 1024;
-        let default_budget_bytes = self.writer_memory_budget;
+        let min_budget_bytes = self.indexer_memory_min_mb * 1024 * 1024;
+        let max_budget_bytes = self.indexer_memory_max_mb * 1024 * 1024;
+        let default_budget_bytes = self.indexer_memory_budget;
 
         // Check index size and adjust budget dynamically within configurable range
         if let Ok(metadata) = std::fs::metadata(index_path) {
@@ -480,8 +480,8 @@ impl HybridStore {
 
         // Commit strategy based on document count and configurable memory budget range
         // Scale commit frequency with memory budget: more memory = fewer commits
-        let min_budget = self.config.writer_memory_min_mb * 1024 * 1024;
-        let max_budget = self.config.writer_memory_max_mb * 1024 * 1024;
+        let min_budget = self.config.indexer_memory_min_mb * 1024 * 1024;
+        let max_budget = self.config.indexer_memory_max_mb * 1024 * 1024;
 
         // Calculate adaptive threshold based on default_batch_size and memory budget ratio
         let budget_ratio = (budget - min_budget) as f64 / (max_budget - min_budget) as f64;
@@ -1558,9 +1558,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = StorageConfig {
             shard_path: temp_dir.path().to_path_buf(),
-            writer_memory_budget: 32 * 1024 * 1024,
-            writer_memory_min_mb: 16,
-            writer_memory_max_mb: 256,
+            indexer_memory_budget: 32 * 1024 * 1024,
+            indexer_memory_min_mb: 16,
+            indexer_memory_max_mb: 256,
             default_batch_size: 1000,
             wal_sync: true,
         };

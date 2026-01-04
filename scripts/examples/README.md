@@ -12,7 +12,7 @@ This directory contains runnable examples for ingesting data into CameoDB using 
 ## 🚀 Quick Start
 
 ```bash
-# Prerequisites: CameoDB server running on localhost:9480
+# Prerequisites: CameoDB running on localhost:9480
 # Install dependencies: pip install requests
 
 # Ingest TED talks
@@ -36,9 +36,9 @@ the HTTP API.
 
 ### Prerequisites
 
-- CameoDB server running locally (defaults assume `http://localhost:9480`).
+- CameoDB running locally (defaults assume `http://localhost:9480`).
 - At least one shard available. Recent builds automatically create shards on first start
-  using the `init_shards` setting in `cameodb.toml`.
+  using the `num_shards_init` setting in `cameodb.toml`.
 - Python 3.9+ with the `requests` package installed (`python -m pip install requests`).
 
 ### Usage
@@ -114,7 +114,7 @@ python3 scripts/examples/ingest_books.py
 # Use custom index name
 python3 scripts/examples/ingest_books.py --index literature
 
-# Use custom CameoDB server
+# Use custom CameoDB node
 python3 scripts/examples/ingest_books.py --base-url http://localhost:8080
 ```
 

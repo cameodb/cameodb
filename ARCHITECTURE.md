@@ -28,6 +28,7 @@ The system is designed without a central master ("Leaderless" / "Decentralized")
 Nodes are "Self-Sovereign." They do not request an ID from a master.
 * **UUID (v4):** The immutable, cryptographic identity of the node.
 * **Friendly Name:** A Base36 string derived from the first 2 bytes of the UUID (e.g., `7FX`).
+* **Node Label:** A human-readable identifier configured via `node.label` (e.g., `cameodb-node-1`).
 * **Storage:** Identity is generated on Cold Boot and persisted to `./data/cameodb/node_identity.json`.
 
 ### 2.2. The Ring (Consistent Hashing)
@@ -52,7 +53,7 @@ The internal structure of a node is hierarchical, managed by the Kameo Actor Fra
 ```mermaid
 graph TD
     Entry[main.rs] -->|Spawns| Orchestrator[NodeOrchestrator Actor]
-    Orchestrator -->|Spawns| API[Axum HTTP Server]
+    Orchestrator -->|Spawns| API[Axum HTTP API]
     Orchestrator -->|Spawns| Router[RouterActor <br/> Request Distribution]
     Orchestrator -->|Manages| Shard1[MicroshardActor <br/> UUID-A]
     Orchestrator -->|Manages| Shard2[MicroshardActor <br/> UUID-B]
@@ -172,15 +173,18 @@ The system exposes a RESTful API built on **Axum**. It rejects the complexity of
   ```
 * **Routing Architecture:**
   - **Unicast Mode:** With `routing_key`, routes to specific shard via consistent hashing
-  - **Scatter-Gather Mode:** Without `routing_key`, broadcasts across all shards and aggregates results
+  - **Scatter-Gather Mode:** Without `routing_key`, broadcasts across all shards and aggregates results. If `limit` is omitted, the configured `default_search_limit` is used.
 * **Response Format:**
   ```json
   {
-    "results": [{"_score": 0.95, "title": "...", "body": "..."}],
-    "total_results": 42,
-    "successful_shards": 3,
+    "hits": [{"_score": 0.95, "title": "...", "body": "..."}],
+    "hits_returned": 1,
+    "total_hits": 42,
+    "limit": 20,
+    "total_shards": 4,
+    "nodes_contacted": 1,
     "failed_shards": 0,
-    "query": "search terms"
+    "took_ms": 12
   }
   ```
 * **Query Capabilities:** Full Tantivy query language including Boolean operators (`AND`, `OR`, `-`), Phrase queries (`"foo bar"`), Range queries (`[10 TO 20]`), and Fuzzy matching (`word~1`).
@@ -268,7 +272,7 @@ all_results.truncate(limit);
 ```mermaid
 flowchart TB
     subgraph Application["🎯 Application Layer"]
-        Server["🚀 server<br/>━━━━━━━━<br/>Actor System<br/>HTTP API<br/>Request Routing<br/>Orchestration"]
+        Server["🚀 CameoDB Node<br/>━━━━━━━━<br/>Actor System<br/>HTTP API<br/>Request Routing<br/>Orchestration"]
         Client["📦 client<br/>━━━━━━━━<br/>SDK<br/>Client Libraries<br/>API Bindings<br/>(planned)"]
     end
 

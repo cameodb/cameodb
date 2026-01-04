@@ -100,8 +100,8 @@ Generated documentation should be deployed via CI/CD:
    cargo test --workspace
    
    # Specific crate
-   cargo test -p cluster_core
-   cargo test -p storage_engine
+   cargo test -p cluster
+   cargo test -p storage
    
    # Integration tests only
    cargo test --test integration

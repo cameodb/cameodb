@@ -16,8 +16,8 @@
 //!       - "/mnt/disk1/cameodb"
 //!       - "/mnt/disk2/cameodb"
 //!   search:
-//!     writer_memory_min_mb: 16
-//!     writer_memory_max_mb: 256
+//!     indexer_memory_min_mb: 16
+//!     indexer_memory_max_mb: 256
 //!     total_memory_limit_mb: 1024
 //!     pressure_threshold: 0.8
 //! ```
@@ -781,7 +781,7 @@ mod tests {
     fn test_sample_config_generation() {
         let sample = CameoDbConfig::generate_sample_config().unwrap();
         assert!(sample.contains("port = 9480"));
-        assert!(sample.contains("writer_memory_min_mb = 16"));
+        assert!(sample.contains("indexer_memory_min_mb = 16"));
         assert!(sample.contains("data_paths"));
     }
 }

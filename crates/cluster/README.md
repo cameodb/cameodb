@@ -12,11 +12,16 @@ Each CameoDB node maintains a **self-sovereign identity** consisting of:
 - Used as the canonical node identifier
 - Example: `550e8400-e29b-41d4-a716-446655440000`
 
-### Human-Readable Name (Base36)
+### Friendly Name (Base36)
 - 3-character identifier derived from the first 2 bytes of the UUID
 - Uses Base36 encoding (0-9, A-Z) for compactness
 - Zero-padded to ensure exactly 3 characters
 - Examples: `A1B`, `X9Z`, `007`
+
+### Node Label (Human-Readable)
+- Optional human-friendly name configured via `node.label`
+- Used for logging, dashboards, and operational visibility
+- Example: `cameodb-node-1`
 
 **Algorithm:**
 ```rust

@@ -322,7 +322,7 @@ if redb_commit_succeeds && tantivy_commit_fails {
 - Periodic index optimization to reduce size
 
 #### Memory Usage Optimization
-- Configurable tantivy memory budget
+- Configurable tantivy memory budget (`indexer_memory_min_mb`, `indexer_memory_max_mb`)
 - Lazy loading of index segments
 - Shared memory pools where possible
 

@@ -264,9 +264,9 @@ use std::path::PathBuf;
 // Configure storage with performance optimizations
 let config = StorageConfig {
     shard_path: PathBuf::from("./data/shard1"),
-    writer_memory_budget: 32 * 1024 * 1024, // 32MB default
-    writer_memory_min_mb: 16,               // 16MB minimum
-    writer_memory_max_mb: 256,              // 256MB maximum  
+    indexer_memory_budget: 32 * 1024 * 1024, // 32MB default
+    indexer_memory_min_mb: 16,               // 16MB minimum
+    indexer_memory_max_mb: 256,              // 256MB maximum  
     default_batch_size: 1000,               // Smart commit threshold
     wal_sync: true,                         // Maximum durability
 };
@@ -391,30 +391,30 @@ use std::path::PathBuf;
 // High-performance configuration with smart commits
 let high_perf_config = StorageConfig {
     shard_path: PathBuf::from("/fast-ssd/shard1"),
-    writer_memory_budget: 64 * 1024 * 1024,  // 64MB default
-    writer_memory_min_mb: 32,                 // 32MB minimum
-    writer_memory_max_mb: 512,                // 512MB maximum
-    default_batch_size: 2000,                 // Higher commit threshold
-    wal_sync: false,                          // Skip fsync for speed
+    indexer_memory_budget: 64 * 1024 * 1024,  // 64MB default
+    indexer_memory_min_mb: 32,               // 32MB minimum
+    indexer_memory_max_mb: 512,              // 512MB maximum
+    default_batch_size: 2000,                // Higher commit threshold
+    wal_sync: false,                         // Skip fsync for speed
 };
 
 // High-durability configuration with frequent commits
 let high_durability_config = StorageConfig {
     shard_path: PathBuf::from("/redundant-storage/shard1"),
-    writer_memory_budget: 32 * 1024 * 1024,  // 32MB default
-    writer_memory_min_mb: 16,                 // 16MB minimum
-    writer_memory_max_mb: 128,                // 128MB maximum
-    default_batch_size: 500,                  // Lower commit threshold
-    wal_sync: true,                           // Always fsync
+    indexer_memory_budget: 32 * 1024 * 1024,  // 32MB default
+    indexer_memory_min_mb: 16,               // 16MB minimum
+    indexer_memory_max_mb: 128,              // 128MB maximum
+    default_batch_size: 500,                 // Lower commit threshold
+    wal_sync: true,                          // Always fsync
 };
 
 // Memory-constrained configuration
 let low_memory_config = StorageConfig {
     shard_path: PathBuf::from("./shard1"),
-    writer_memory_budget: 16 * 1024 * 1024,  // 16MB default
-    writer_memory_min_mb: 8,                  // 8MB minimum
-    writer_memory_max_mb: 32,                 // 32MB maximum
-    default_batch_size: 250,                  // Very low commit threshold
+    indexer_memory_budget: 16 * 1024 * 1024,  // 16MB default
+    indexer_memory_min_mb: 8,                // 8MB minimum
+    indexer_memory_max_mb: 32,               // 32MB maximum
+    default_batch_size: 250,                 // Very low commit threshold
     wal_sync: true,
 };
 ```
@@ -448,7 +448,7 @@ let low_memory_config = StorageConfig {
 ### Memory Usage
 - **Base**: ~10MB for empty store
 - **Per Document**: ~1KB overhead for indexing
-- **Configurable**: `writer_memory_budget` controls tantivy buffer size
+- **Configurable**: `indexer_memory_budget` controls tantivy buffer size
 
 ## Concurrency Model
 

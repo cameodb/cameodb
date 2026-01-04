@@ -3,11 +3,11 @@
 # Simple script to test CameoDB HTTP API endpoints
 echo "Testing CameoDB HTTP API..."
 
-# Start the server in background from workspace root
-cargo run --release --bin server &
+# Start CameoDB in background from workspace root
+cargo run --release --bin cameodb &
 SERVER_PID=$!
 
-# Wait for server to start
+# Wait for CameoDB to start
 sleep 5
 
 echo "Testing endpoints..."

@@ -99,34 +99,34 @@ services:
   cameodb-node1: # Primary node
     ports: ["9481:9480", "9581:9580"]
     environment:
-      - NODE_ID=node1
+      - CAMEODB_NODE_LABEL=cameodb-node-1
       - CAMEODB_CLUSTER_NAME=cameodb-production
-      - CAMEODB_DISTRIBUTED_ACTORS=true
+      - CAMEODB_CLUSTER_ENABLED=true
       - CAMEODB_HTTP_PORT=9480
       - CAMEODB_CLUSTER_PORT=9580
-      - CAMEODB_BOOTSTRAP_NODES=cameodb-node2:9580,cameodb-node3:9580
+      - CAMEODB_SEED_NODES=cameodb-node2:9580,cameodb-node3:9580
       
   cameodb-node2: # Secondary node
     ports: ["9482:9480", "9582:9580"]
     depends_on: [cameodb-node1]
     environment:
-      - NODE_ID=node2
+      - CAMEODB_NODE_LABEL=cameodb-node-2
       - CAMEODB_CLUSTER_NAME=cameodb-production
-      - CAMEODB_DISTRIBUTED_ACTORS=true
+      - CAMEODB_CLUSTER_ENABLED=true
       - CAMEODB_HTTP_PORT=9480
       - CAMEODB_CLUSTER_PORT=9580
-      - CAMEODB_BOOTSTRAP_NODES=cameodb-node1:9580,cameodb-node3:9580
+      - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node3:9580
       
   cameodb-node3: # Secondary node  
     ports: ["9483:9480", "9583:9580"]
     depends_on: [cameodb-node1]
     environment:
-      - NODE_ID=node3
+      - CAMEODB_NODE_LABEL=cameodb-node-3
       - CAMEODB_CLUSTER_NAME=cameodb-production
-      - CAMEODB_DISTRIBUTED_ACTORS=true
+      - CAMEODB_CLUSTER_ENABLED=true
       - CAMEODB_HTTP_PORT=9480
       - CAMEODB_CLUSTER_PORT=9580
-      - CAMEODB_BOOTSTRAP_NODES=cameodb-node1:9580,cameodb-node2:9580
+      - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
     
   nginx-lb: # Simple load balancer
     ports: ["9480:80"]

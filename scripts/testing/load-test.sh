@@ -36,13 +36,13 @@ echo "Requests per User: $REQUESTS_PER_USER"
 echo "Total Requests: $((CONCURRENT_USERS * REQUESTS_PER_USER))"
 echo ""
 
-# Check if server is running
+# Check if CameoDB is running
 if ! curl -s "http://localhost:$PORT/_cluster/health" &> /dev/null; then
-    print_status "ERROR" "CameoDB server is not running on port $PORT"
+    print_status "ERROR" "CameoDB is not running on port $PORT"
     exit 1
 fi
 
-print_status "OK" "Server is accessible"
+print_status "OK" "CameoDB is accessible"
 
 # Create temporary directory for results
 TEMP_DIR=$(mktemp -d)

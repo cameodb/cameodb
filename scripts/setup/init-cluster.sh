@@ -12,9 +12,9 @@ DEFAULT_PORT=9480
 PORT=${1:-$DEFAULT_PORT}
 DATA_DIR="data/cameodb"
 
-# Check if server is already running
+# Check if cameodb is already running
 if curl -s "http://localhost:$PORT/_cluster/health" &> /dev/null; then
-    echo "⚠️  CameoDB server appears to be running on port $PORT"
+    echo "⚠️  CameoDB appears to be running on port $PORT"
     echo "   Stop it first or use a different port: $0 <port>"
     exit 1
 fi
@@ -23,39 +23,39 @@ fi
 mkdir -p "$DATA_DIR"
 
 # Build the project if needed
-if [ ! -f "target/release/server" ] || [ "crates/server/src/main.rs" -nt "target/release/server" ]; then
-    echo "🏗️  Building CameoDB server..."
-    cargo build --release --bin server
+if [ ! -f "target/release/cameodb" ] || [ "crates/server/src/main.rs" -nt "target/release/cameodb" ]; then
+    echo "🏗️  Building CameoDB..."
+    cargo build --release --bin cameodb
 fi
 
-# Start server in background
-echo "🌟 Starting CameoDB server on port $PORT..."
-cargo run --release --bin server &
+# Start cameodb in background
+echo "🌟 Starting CameoDB on port $PORT..."
+cargo run --release --bin cameodb &
 SERVER_PID=$!
 
 # Function to cleanup on exit
 cleanup() {
     echo ""
-    echo "🛑 Stopping CameoDB server..."
+    echo "🛑 Stopping CameoDB..."
     kill $SERVER_PID 2>/dev/null || true
     wait $SERVER_PID 2>/dev/null || true
 }
 trap cleanup EXIT
 
-# Wait for server to start
-echo "⏳ Waiting for server to start..."
+# Wait for cameodb to start
+echo "⏳ Waiting for CameoDB to start..."
 for i in {1..30}; do
     if curl -s "http://localhost:$PORT/_cluster/health" &> /dev/null; then
         break
     fi
     sleep 1
     if [ $i -eq 30 ]; then
-        echo "❌ Server failed to start within 30 seconds"
+        echo "❌ CameoDB failed to start within 30 seconds"
         exit 1
     fi
 done
 
-echo "✅ Server is running!"
+echo "✅ CameoDB is running!"
 
 # Check cluster health
 echo "🔍 Checking cluster health..."
@@ -119,15 +119,15 @@ echo ""
 echo "🎉 CameoDB cluster initialization complete!"
 echo ""
 echo "Cluster Status:"
-echo "  • Server running on: http://localhost:$PORT"
+echo "  • CameoDB running on: http://localhost:$PORT"
 echo "  • Health endpoint: http://localhost:$PORT/_cluster/health"
 echo "  • Sample documents: 5 documents added to 'development' index"
 echo ""
-echo "Try these commands:"
+echo "Next Steps:"
 echo "  • Health check: curl http://localhost:$PORT/_cluster/health"
 echo "  • Search: curl -X POST -H 'Content-Type: application/json' -d '{\"query\": \"rust\", \"limit\": 3}' http://localhost:$PORT/api/development/search"
 echo ""
-echo "Press Ctrl+C to stop the server."
+echo "Press Ctrl+C to stop CameoDB."
 echo ""
 
 # Keep server running until interrupted
