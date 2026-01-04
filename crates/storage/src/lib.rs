@@ -696,6 +696,9 @@ impl HybridStore {
                     }
 
                     let writer = writer_arc.lock().unwrap();
+                    // Delete existing document first (upsert semantics)
+                    let term = tantivy::Term::from_field_text(fields.id, &id);
+                    writer.delete_term(term);
                     writer.add_document(tantivy_doc)?;
                 }
                 WalOp::Delete { id } => {
@@ -1317,6 +1320,9 @@ impl HybridStore {
             for (op_type, tantivy_doc, id) in tantivy_ops {
                 match op_type {
                     "add" => {
+                        // Delete existing document first (upsert semantics)
+                        let term = tantivy::Term::from_field_text(fields.id, &id);
+                        writer.delete_term(term);
                         writer.add_document(tantivy_doc)?;
                     }
                     "delete" => {
