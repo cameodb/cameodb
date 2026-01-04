@@ -1166,7 +1166,19 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
             );
         }
 
-        // Fetch shard metadata from remote coordinator in background task (Fallback/Redundancy)
+        // Collect local shards to push to the newly discovered peer
+        // This ensures bidirectional shard metadata exchange (fixes race condition where
+        // first node registers shards before peers exist, then never pushes to late joiners)
+        let local_node_id = self.cluster.local_node_id;
+        let local_node_name = self.cluster.local_node_name.clone();
+        let local_shards: Vec<ShardMetadata> = self
+            .shard_assignments
+            .values()
+            .filter(|s| s.node_id == local_node_id)
+            .cloned()
+            .collect();
+
+        // Fetch shard metadata from remote coordinator AND push local shards in background task
         let remote_coord_name = format!("coordinator-{}", msg.node_id);
         let self_weak = ctx.actor_ref().downgrade();
         let node_id = msg.node_id;
@@ -1176,6 +1188,7 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
                 match RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name.clone()).await
                 {
                     Ok(Some(remote_coord)) => {
+                        // 1. Fetch remote shards (existing behavior)
                         info!(coordinator = %remote_coord_name, "Fetching shard assignments from peer");
                         match remote_coord.ask(&GetShardAssignments).await {
                             Ok(remote_shards) => {
@@ -1201,6 +1214,32 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
                             }
                             Err(e) => {
                                 warn!(node = %node_id, error = %e, "Failed to fetch remote shard assignments");
+                            }
+                        }
+
+                        // 2. Push local shards to the newly discovered peer (NEW: fixes race condition)
+                        if !local_shards.is_empty() {
+                            info!(
+                                node = %node_id,
+                                local_shard_count = local_shards.len(),
+                                "Pushing local shards to newly discovered peer"
+                            );
+                            let push_msg = MergeRemoteShards {
+                                node_id: local_node_id,
+                                node_name: local_node_name.clone(),
+                                shards: local_shards
+                                    .iter()
+                                    .cloned()
+                                    .map(|s| (s.shard_id, s))
+                                    .collect(),
+                            };
+                            match remote_coord.tell(&push_msg).send() {
+                                Ok(_) => {
+                                    debug!(node = %node_id, "Successfully pushed local shards to new peer");
+                                }
+                                Err(e) => {
+                                    warn!(node = %node_id, error = %e, "Failed to push local shards to new peer");
+                                }
                             }
                         }
                     }
@@ -1302,16 +1341,38 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
         let node_name = msg.node_name;
         let actual_shards = msg.shards;
 
-        // Update peer info with node name
-        if let Some(peer) = self.cluster.peer_nodes.get_mut(&node_id) {
-            peer.node_name = Some(node_name.clone());
-            peer.shard_count = actual_shards.len();
-        }
+        // Ensure node is tracked in peer_nodes (may arrive before PeerDiscovered event)
+        self.cluster
+            .peer_nodes
+            .entry(node_id)
+            .and_modify(|peer| {
+                peer.node_name = Some(node_name.clone());
+                peer.shard_count = actual_shards.len();
+                peer.status = NodeStatus::Connected;
+            })
+            .or_insert_with(|| NodeInfo {
+                node_id,
+                node_name: Some(node_name.clone()),
+                address: String::new(), // Will be updated by PeerDiscovered
+                status: NodeStatus::Connected,
+                shard_count: actual_shards.len(),
+            });
 
-        // Update expected_nodes with node name
-        if let Some(expected) = self.expected_nodes.get_mut(&node_id) {
-            expected.node_name = Some(node_name.clone());
-        }
+        // Ensure node is tracked in expected_nodes (authoritative registry)
+        self.expected_nodes
+            .entry(node_id)
+            .and_modify(|expected| {
+                expected.node_name = Some(node_name.clone());
+                expected.shard_count = actual_shards.len();
+                expected.status = NodeStatus::Connected;
+            })
+            .or_insert_with(|| NodeInfo {
+                node_id,
+                node_name: Some(node_name.clone()),
+                address: String::new(),
+                status: NodeStatus::Connected,
+                shard_count: actual_shards.len(),
+            });
 
         let node_identity = self.format_node_identity(node_id);
         info!(
