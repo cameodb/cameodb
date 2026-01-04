@@ -264,7 +264,12 @@ async fn create_production_swarm(
         .with_tcp(
             tcp::Config::default().nodelay(true),
             noise::Config::new,
-            yamux::Config::default,
+            || {
+                let mut config = yamux::Config::default();
+                // Allow more concurrent streams for high-throughput cluster communication
+                config.set_max_num_streams(8192);
+                config
+            },
         )?
         .with_quic() // Add QUIC support for better connectivity
         .with_dns()? // Enable DNS resolution for hostname-based multiaddrs

@@ -47,7 +47,14 @@ impl DhtBehaviour {
             info!("⚙️  Kademlia mode set to: {:?}", mode);
         }
 
-        let kameo = remote::Behaviour::new(local_peer_id, remote::messaging::Config::default());
+        // Configure Kameo remote messaging with larger size limits for batch forwarding
+        // Default is 1MB request / 10MB response, which is too small for bulk writes
+        // Keep timeout at 30s (reasonable for large batches without blocking startup)
+        let messaging_config = remote::messaging::Config::default()
+            .with_request_size_maximum(64 * 1024 * 1024) // 64MB for large batch requests
+            .with_response_size_maximum(64 * 1024 * 1024) // 64MB for large responses
+            .with_request_timeout(std::time::Duration::from_secs(30));
+        let kameo = remote::Behaviour::new(local_peer_id, messaging_config);
 
         // Embed Node UUID and name in agent version for immediate identification during handshake
         // Format: "cameodb/1.0.0/{NAME}/{UUID}"

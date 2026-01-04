@@ -19,6 +19,8 @@ services:
       - CAMEODB_HTTP_PORT=9480
       - CAMEODB_CLUSTER_PORT=9580
       - CAMEODB_SEED_NODES=cameodb-node2:9580,cameodb-node3:9580
+      - CAMEODB_MAX_BODY_SIZE_MB=200
+      - CAMEODB_DEFAULT_BATCH_SIZE=200
     
     ports:
       - "9481:9480"
@@ -60,6 +62,8 @@ services:
       - CAMEODB_HTTP_PORT=9480
       - CAMEODB_CLUSTER_PORT=9580
       - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node3:9580
+      - CAMEODB_MAX_BODY_SIZE_MB=200
+      - CAMEODB_DEFAULT_BATCH_SIZE=200
     
     ports:
       - "9482:9480"
@@ -102,6 +106,8 @@ services:
       - CAMEODB_HTTP_PORT=9480
       - CAMEODB_CLUSTER_PORT=9580
       - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
+      - CAMEODB_MAX_BODY_SIZE_MB=200
+      - CAMEODB_DEFAULT_BATCH_SIZE=200
     
     ports:
       - "9483:9480"
@@ -148,7 +154,8 @@ services:
       server {
           listen 80;
           # Allow larger batch writes (adjust as needed)
-          client_max_body_size 64M;
+          client_max_body_size 200M;
+          client_body_buffer_size 16M;
           location / {
               proxy_pass http://cameodb_cluster;
               proxy_set_header Host $$host;
