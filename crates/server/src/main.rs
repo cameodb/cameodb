@@ -95,6 +95,9 @@ async fn main() -> Result<()> {
         orchestrator.identity().name,
         orchestrator.identity().uuid
     );
+    if let Some(label) = cameodb_config.node.label.as_deref() {
+        println!("Node label: {}", label);
+    }
     println!("Active shards: {}", orchestrator.shard_count());
 
     // Capture node_id early for remote registration

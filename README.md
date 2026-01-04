@@ -74,6 +74,9 @@ curl -s -X POST http://localhost:9480/api/books/search \
       "genres": ["Hard science fiction", "Science Fiction"]
     }
   ],
+  "hits_returned": 1,
+  "total_hits": 42,
+  "limit": 10,
   "total_shards": 4,
   "nodes_contacted": 1,
   "failed_shards": 0,
@@ -410,22 +413,50 @@ For more details, see the [Docker README](docker/README.md), which includes the 
 
 ## 🔧 Configuration
 
-Server configuration via `cameodb.toml`:
+Server configuration via `cameodb.toml` now mirrors the runtime struct layout:
 
 ```toml
-[server.http]
-host = "0.0.0.0"
-port = 9480
+[node]
+label = "cameo-node-01"
+zone = "default"
 
-[search]
-writer_memory_min_mb = 16
-writer_memory_max_mb = 256
+[network.http]
+bind_address = "0.0.0.0"
+port = 9480
+request_timeout_secs = 30
+max_body_size_mb = 200
+cors_allowed_origins = ["*"]
+
+[network.cluster]
+enabled = true
+bind_address = "0.0.0.0"
+port = 9580
+cluster_name = "cameodb-cluster"
+seed_nodes = []
+# cluster_nodes = ["/ip4/10.0.1.5/tcp/9580"] # Optional validation list
 
 [storage]
 data_paths = ["./data/cameodb"]
+disk_usage_threshold_percent = 90
 wal_sync = true
-default_batch_size = 1000
+wal_segment_size_mb = 64
+default_batch_size = 200
+num_shards_init = 4
+max_shards_per_node = 8
+
+[search]
+indexer_memory_min_mb = 16
+indexer_memory_max_mb = 256
+total_memory_limit_mb = 1024
+memory_pressure_threshold_percent = 80
+search_threads = 8
+default_search_limit = 10
 ```
+
+- `node` provides human-friendly identity fields (`label`, `zone`).
+- `network` separates HTTP and cluster transport while clarifying `bind_address`.
+- `storage` centralizes shard configuration plus disk thresholds.
+- `search` exposes indexer memory budgets **and** the new `default_search_limit`, which also drives response pagination whenever a request omits `limit`.
 
 ## � System Requirements
 

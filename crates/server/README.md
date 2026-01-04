@@ -204,11 +204,11 @@ When there is **no routing_key**, or the coordinator chooses `Broadcast` because
    - Local `handle_client_op` over local microshards.
    - Remote `try_remote` calls to selected peers, each wrapped in `timeout(broadcast_timeout, ...)`.
 4. Aggregate results:
-   - **Search**:
-     - Collect `hits` arrays from all successful responses.
-     - Merge into a single `hits` list.
-     - Sort by `_score` descending.
-     - Report `total_shards` and `failed_shards`.
+    - **Search**:
+      - Collect `hits` arrays from all successful responses.
+      - Merge into a single `hits` list capped by the configured `default_search_limit`.
+      - Sort by `_score` descending.
+      - Report `hits_returned`, `total_hits`, `limit`, plus `total_shards` and `failed_shards`.
    - **Write/BulkWrite**:
      - Report number of nodes contacted, succeeded, and failed.
    - Other operations:
