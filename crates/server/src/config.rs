@@ -48,40 +48,41 @@ pub enum ConfigError {
 /// Complete CameoDB configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameoDbConfig {
-    /// Server configuration (HTTP, networking)
-    pub server: ServerConfig,
+    /// Node-level configuration (sharding, identity)
+    #[serde(default)]
+    pub node: NodeConfig,
+
+    /// Network configuration (HTTP, cluster)
+    pub network: NetworkConfig,
 
     /// Storage configuration (data paths, sharding)
     pub storage: StorageConfig,
 
     /// Search engine configuration (Tantivy settings)
     pub search: SearchConfig,
+}
+
+/// Network configuration wrapper
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    /// HTTP server configuration
+    pub http: HttpConfig,
 
     /// Cluster configuration for distributed deployment
     #[serde(default)]
     pub cluster: ClusterConfig,
 }
 
-/// HTTP server and networking configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerConfig {
-    /// HTTP server configuration
-    pub http: HttpConfig,
-
-    /// Node-level configuration
-    pub node: NodeConfig,
-}
-
 /// HTTP server specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpConfig {
+    /// Bind address for HTTP server (default: "0.0.0.0")
+    #[serde(default = "default_http_bind_address")]
+    pub bind_address: String,
+
     /// Port for HTTP server (default: 9480)
     #[serde(default = "default_http_port")]
     pub port: u16,
-
-    /// Host to bind HTTP server (default: "0.0.0.0")
-    #[serde(default = "default_http_host")]
-    pub host: String,
 
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_request_timeout")]
@@ -91,22 +92,21 @@ pub struct HttpConfig {
     #[serde(default = "default_max_body_size_mb")]
     pub max_body_size_mb: usize,
 
-    /// Enable CORS (default: true)
-    #[serde(default = "default_cors_enabled")]
-    pub cors_enabled: bool,
+    /// CORS allowed origins (default: ["*"])
+    #[serde(default = "default_cors_allowed_origins")]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 /// Node-level configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
-    /// Maximum number of shards this node can host (default: 10)
-    #[serde(default = "default_max_shards")]
-    pub max_shards: usize,
+    /// Human-readable label for this node (optional, for logs/dashboards)
+    #[serde(default)]
+    pub label: Option<String>,
 
-    /// If no shards exist on first startup, create this many shards (default: 4)
-    /// Set to 0 to disable automatic initialization.
-    #[serde(default = "default_init_shards")]
-    pub init_shards: usize,
+    /// Topology zone for rack/datacenter awareness (default: "default")
+    #[serde(default = "default_node_zone")]
+    pub zone: String,
 }
 
 /// Storage configuration for data persistence
@@ -116,9 +116,9 @@ pub struct StorageConfig {
     /// Each path serves as a mount point for data storage
     pub data_paths: Vec<PathBuf>,
 
-    /// Disk usage threshold before rejecting new data (0.0-1.0, default: 0.9)
-    #[serde(default = "default_disk_usage_threshold")]
-    pub disk_usage_threshold: f64,
+    /// Disk usage threshold in percent (0-100, default: 90)
+    #[serde(default = "default_disk_usage_threshold_percent")]
+    pub disk_usage_threshold_percent: u8,
 
     /// Enable WAL fsync for durability (default: true)
     #[serde(default = "default_wal_sync")]
@@ -131,22 +131,41 @@ pub struct StorageConfig {
     /// Default batch size for smart commit calculations (default: 1000)
     #[serde(default = "default_default_batch_size")]
     pub default_batch_size: usize,
+
+    /// If no shards exist on first startup, create this many shards (default: 4)
+    /// Set to 0 to disable automatic initialization.
+    #[serde(default = "default_num_shards_init")]
+    pub num_shards_init: usize,
+
+    /// Maximum number of shards this node can host (default: 8)
+    #[serde(default = "default_max_shards_per_node")]
+    pub max_shards_per_node: usize,
 }
 
 /// Cluster configuration for distributed actor system
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
-    /// Enable distributed actor system (default: false)
-    #[serde(default = "default_distributed_actors")]
-    pub distributed_actors: bool,
+    /// Enable distributed cluster mode (default: false)
+    #[serde(default = "default_cluster_enabled")]
+    pub enabled: bool,
+
+    /// Bind address for cluster communication (default: "0.0.0.0")
+    #[serde(default = "default_cluster_bind_address")]
+    pub bind_address: String,
 
     /// Cluster communication port for libp2p (default: 9580)
     #[serde(default = "default_cluster_port")]
     pub cluster_port: u16,
 
-    /// Bootstrap nodes for cluster discovery
+    /// Seed nodes for initial cluster discovery
     #[serde(default)]
-    pub bootstrap_nodes: Vec<String>,
+    pub seed_nodes: Vec<String>,
+
+    /// Optional: Expected cluster nodes for validation (not used for strict cluster formation)
+    /// Used to compare against discovered nodes and emit warnings if mismatched
+    /// Format: same as seed_nodes (e.g., "/ip4/10.0.1.5/tcp/9580" or "hostname:port")
+    #[serde(default)]
+    pub cluster_nodes: Vec<String>,
 
     // Peer discovery handled by Kademlia DHT
     /// Cluster name for isolation (default: "cameodb-cluster")
@@ -217,25 +236,29 @@ pub struct MdnsFilterConfig {
 /// Tantivy search engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchConfig {
-    /// Minimum writer memory per shard in MB (default: 16)
-    #[serde(default = "default_writer_memory_min_mb")]
-    pub writer_memory_min_mb: usize,
+    /// Minimum indexer memory in MB (default: 16)
+    #[serde(default = "default_indexer_memory_min_mb")]
+    pub indexer_memory_min_mb: usize,
 
-    /// Maximum writer memory per shard in MB (default: 256)
-    #[serde(default = "default_writer_memory_max_mb")]
-    pub writer_memory_max_mb: usize,
+    /// Maximum indexer memory in MB (default: 256)
+    #[serde(default = "default_indexer_memory_max_mb")]
+    pub indexer_memory_max_mb: usize,
 
-    /// Total memory limit for all search operations in MB (default: 1024)
+    /// Total memory limit in MB (default: 1024)
     #[serde(default = "default_total_memory_limit_mb")]
     pub total_memory_limit_mb: usize,
 
-    /// Memory pressure threshold (0.0-1.0) to trigger cleanup (default: 0.8)
-    #[serde(default = "default_pressure_threshold")]
-    pub memory_pressure_threshold: f64,
+    /// Memory pressure threshold in percent (0-100, default: 80)
+    #[serde(default = "default_memory_pressure_threshold_percent")]
+    pub memory_pressure_threshold_percent: u8,
 
     /// Number of search threads (default: num_cpus)
     #[serde(default = "default_search_threads")]
     pub search_threads: usize,
+
+    /// Default search result limit when not specified in request (default: 10)
+    #[serde(default = "default_search_limit")]
+    pub default_search_limit: usize,
 }
 
 impl CameoDbConfig {
@@ -313,11 +336,11 @@ impl CameoDbConfig {
     fn apply_env_overrides(mut config: Self) -> Result<Self> {
         // HTTP configuration
         if let Ok(port) = std::env::var("CAMEODB_HTTP_PORT") {
-            config.server.http.port = port.parse().with_context(|| "Invalid CAMEODB_HTTP_PORT")?;
+            config.network.http.port = port.parse().with_context(|| "Invalid CAMEODB_HTTP_PORT")?;
         }
 
-        if let Ok(host) = std::env::var("CAMEODB_HTTP_HOST") {
-            config.server.http.host = host;
+        if let Ok(bind_addr) = std::env::var("CAMEODB_HTTP_BIND_ADDRESS") {
+            config.network.http.bind_address = bind_addr;
         }
 
         // Storage configuration
@@ -326,16 +349,16 @@ impl CameoDbConfig {
         }
 
         // Search configuration
-        if let Ok(min_mem) = std::env::var("CAMEODB_WRITER_MEMORY_MIN_MB") {
-            config.search.writer_memory_min_mb = min_mem
+        if let Ok(min_mem) = std::env::var("CAMEODB_INDEXER_MEMORY_MIN_MB") {
+            config.search.indexer_memory_min_mb = min_mem
                 .parse()
-                .with_context(|| "Invalid CAMEODB_WRITER_MEMORY_MIN_MB")?;
+                .with_context(|| "Invalid CAMEODB_INDEXER_MEMORY_MIN_MB")?;
         }
 
-        if let Ok(max_mem) = std::env::var("CAMEODB_WRITER_MEMORY_MAX_MB") {
-            config.search.writer_memory_max_mb = max_mem
+        if let Ok(max_mem) = std::env::var("CAMEODB_INDEXER_MEMORY_MAX_MB") {
+            config.search.indexer_memory_max_mb = max_mem
                 .parse()
-                .with_context(|| "Invalid CAMEODB_WRITER_MEMORY_MAX_MB")?;
+                .with_context(|| "Invalid CAMEODB_INDEXER_MEMORY_MAX_MB")?;
         }
 
         if let Ok(total_mem) = std::env::var("CAMEODB_TOTAL_MEMORY_LIMIT_MB") {
@@ -344,31 +367,41 @@ impl CameoDbConfig {
                 .with_context(|| "Invalid CAMEODB_TOTAL_MEMORY_LIMIT_MB")?;
         }
 
-        if let Ok(threshold) = std::env::var("CAMEODB_MEMORY_PRESSURE_THRESHOLD") {
-            config.search.memory_pressure_threshold = threshold
+        if let Ok(threshold) = std::env::var("CAMEODB_MEMORY_PRESSURE_THRESHOLD_PERCENT") {
+            config.search.memory_pressure_threshold_percent = threshold
                 .parse()
-                .with_context(|| "Invalid CAMEODB_MEMORY_PRESSURE_THRESHOLD")?;
+                .with_context(|| "Invalid CAMEODB_MEMORY_PRESSURE_THRESHOLD_PERCENT")?;
+        }
+
+        if let Ok(limit) = std::env::var("CAMEODB_DEFAULT_SEARCH_LIMIT") {
+            config.search.default_search_limit = limit
+                .parse()
+                .with_context(|| "Invalid CAMEODB_DEFAULT_SEARCH_LIMIT")?;
         }
 
         // Cluster configuration
-        if let Ok(distributed) = std::env::var("CAMEODB_DISTRIBUTED_ACTORS") {
-            let normalized = distributed.trim().to_ascii_lowercase();
-            config.cluster.distributed_actors = matches!(normalized.as_str(), "true" | "1" | "yes");
+        if let Ok(enabled) = std::env::var("CAMEODB_CLUSTER_ENABLED") {
+            let normalized = enabled.trim().to_ascii_lowercase();
+            config.network.cluster.enabled = matches!(normalized.as_str(), "true" | "1" | "yes");
+        }
+
+        if let Ok(bind_addr) = std::env::var("CAMEODB_CLUSTER_BIND_ADDRESS") {
+            config.network.cluster.bind_address = bind_addr;
         }
 
         if let Ok(port) = std::env::var("CAMEODB_CLUSTER_PORT") {
-            config.cluster.cluster_port = port
+            config.network.cluster.cluster_port = port
                 .parse()
                 .with_context(|| "Invalid CAMEODB_CLUSTER_PORT")?;
         }
 
         if let Ok(name) = std::env::var("CAMEODB_CLUSTER_NAME") {
             if !name.trim().is_empty() {
-                config.cluster.cluster_name = name;
+                config.network.cluster.cluster_name = name;
             }
         }
 
-        if let Ok(nodes) = std::env::var("CAMEODB_BOOTSTRAP_NODES") {
+        if let Ok(nodes) = std::env::var("CAMEODB_SEED_NODES") {
             let parsed: Vec<String> = nodes
                 .split([',', ';'])
                 .filter_map(|entry| {
@@ -382,7 +415,7 @@ impl CameoDbConfig {
                 .collect();
 
             if !parsed.is_empty() {
-                config.cluster.bootstrap_nodes = parsed;
+                config.network.cluster.seed_nodes = parsed;
             }
         }
 
@@ -399,14 +432,14 @@ impl CameoDbConfig {
     /// Validate the configuration for consistency and constraints
     pub fn validate(&self) -> Result<()> {
         // Validate HTTP configuration
-        if self.server.http.port == 0 {
+        if self.network.http.port == 0 {
             return Err(ConfigError::NetworkConfig {
                 message: "HTTP port cannot be 0".to_string(),
             }
             .into());
         }
 
-        if self.server.http.request_timeout_secs == 0 {
+        if self.network.http.request_timeout_secs == 0 {
             return Err(ConfigError::NetworkConfig {
                 message: "Request timeout must be positive".to_string(),
             }
@@ -421,47 +454,45 @@ impl CameoDbConfig {
             .into());
         }
 
-        if self.storage.disk_usage_threshold < 0.1 || self.storage.disk_usage_threshold > 1.0 {
+        if self.storage.disk_usage_threshold_percent > 100 {
             return Err(ConfigError::StorageConfig {
-                message: "Disk usage threshold must be between 0.1 and 1.0".to_string(),
+                message: "Disk usage threshold must be between 0 and 100 percent".to_string(),
             }
             .into());
         }
 
         // Validate memory configuration
-        if self.search.writer_memory_min_mb < 16 {
+        if self.search.indexer_memory_min_mb < 16 {
             return Err(ConfigError::MemoryConfig {
-                message: "Writer memory minimum cannot be less than 16MB".to_string(),
+                message: "Indexer memory minimum cannot be less than 16MB".to_string(),
             }
             .into());
         }
 
-        if self.search.writer_memory_max_mb > 1024 {
+        if self.search.indexer_memory_max_mb > 1024 {
             return Err(ConfigError::MemoryConfig {
-                message: "Writer memory maximum cannot exceed 1024MB".to_string(),
+                message: "Indexer memory maximum cannot exceed 1024MB".to_string(),
             }
             .into());
         }
 
-        if self.search.writer_memory_min_mb >= self.search.writer_memory_max_mb {
+        if self.search.indexer_memory_min_mb >= self.search.indexer_memory_max_mb {
             return Err(ConfigError::MemoryConfig {
-                message: "Writer memory minimum must be less than maximum".to_string(),
+                message: "Indexer memory minimum must be less than maximum".to_string(),
             }
             .into());
         }
 
-        if self.search.memory_pressure_threshold < 0.1
-            || self.search.memory_pressure_threshold > 1.0
-        {
+        if self.search.memory_pressure_threshold_percent > 100 {
             return Err(ConfigError::MemoryConfig {
-                message: "Memory pressure threshold must be between 0.1 and 1.0".to_string(),
+                message: "Memory pressure threshold must be between 0 and 100 percent".to_string(),
             }
             .into());
         }
 
-        if self.search.total_memory_limit_mb < self.search.writer_memory_max_mb {
+        if self.search.total_memory_limit_mb < self.search.indexer_memory_max_mb {
             return Err(ConfigError::MemoryConfig {
-                message: "Total memory limit must be at least as large as max writer memory"
+                message: "Total memory limit must be at least as large as max indexer memory"
                     .to_string(),
             }
             .into());
@@ -481,12 +512,18 @@ impl CameoDbConfig {
 impl Default for CameoDbConfig {
     fn default() -> Self {
         Self {
-            server: ServerConfig {
-                http: HttpConfig::default(),
-                node: NodeConfig::default(),
-            },
+            node: NodeConfig::default(),
+            network: NetworkConfig::default(),
             storage: StorageConfig::default(),
             search: SearchConfig::default(),
+        }
+    }
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            http: HttpConfig::default(),
             cluster: ClusterConfig::default(),
         }
     }
@@ -495,11 +532,11 @@ impl Default for CameoDbConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
+            bind_address: default_http_bind_address(),
             port: default_http_port(),
-            host: default_http_host(),
             request_timeout_secs: default_request_timeout(),
             max_body_size_mb: default_max_body_size_mb(),
-            cors_enabled: default_cors_enabled(),
+            cors_allowed_origins: default_cors_allowed_origins(),
         }
     }
 }
@@ -507,8 +544,8 @@ impl Default for HttpConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            max_shards: default_max_shards(),
-            init_shards: default_init_shards(),
+            label: None,
+            zone: default_node_zone(),
         }
     }
 }
@@ -517,10 +554,12 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             data_paths: vec![PathBuf::from("./data/cameodb")],
-            disk_usage_threshold: default_disk_usage_threshold(),
+            disk_usage_threshold_percent: default_disk_usage_threshold_percent(),
             wal_sync: default_wal_sync(),
             wal_segment_size_mb: default_wal_segment_size_mb(),
             default_batch_size: default_default_batch_size(),
+            num_shards_init: default_num_shards_init(),
+            max_shards_per_node: default_max_shards_per_node(),
         }
     }
 }
@@ -528,11 +567,12 @@ impl Default for StorageConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            writer_memory_min_mb: default_writer_memory_min_mb(),
-            writer_memory_max_mb: default_writer_memory_max_mb(),
+            indexer_memory_min_mb: default_indexer_memory_min_mb(),
+            indexer_memory_max_mb: default_indexer_memory_max_mb(),
             total_memory_limit_mb: default_total_memory_limit_mb(),
-            memory_pressure_threshold: default_pressure_threshold(),
+            memory_pressure_threshold_percent: default_memory_pressure_threshold_percent(),
             search_threads: default_search_threads(),
+            default_search_limit: default_search_limit(),
         }
     }
 }
@@ -563,9 +603,11 @@ impl Default for MdnsFilterConfig {
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
-            distributed_actors: default_distributed_actors(),
+            enabled: default_cluster_enabled(),
+            bind_address: default_cluster_bind_address(),
             cluster_port: default_cluster_port(),
-            bootstrap_nodes: Vec::new(),
+            seed_nodes: Vec::new(),
+            cluster_nodes: Vec::new(),
             cluster_name: default_cluster_name(),
             listen_addrs: Vec::new(),
             bootstrap_peers: Vec::new(),
@@ -576,31 +618,32 @@ impl Default for ClusterConfig {
 }
 
 // Default value functions for serde
+fn default_http_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
+
 fn default_http_port() -> u16 {
     9480
 }
-fn default_http_host() -> String {
-    "0.0.0.0".to_string()
-}
+
 fn default_request_timeout() -> u64 {
     30
 }
+
 fn default_max_body_size_mb() -> usize {
     20
 }
-fn default_cors_enabled() -> bool {
-    true
+
+fn default_cors_allowed_origins() -> Vec<String> {
+    vec!["*".to_string()]
 }
 
-fn default_max_shards() -> usize {
-    8
-}
-fn default_init_shards() -> usize {
-    4
+fn default_node_zone() -> String {
+    "default".to_string()
 }
 
-fn default_disk_usage_threshold() -> f64 {
-    0.9
+fn default_disk_usage_threshold_percent() -> u8 {
+    90
 }
 fn default_wal_sync() -> bool {
     true
@@ -612,28 +655,44 @@ fn default_default_batch_size() -> usize {
     1000
 }
 
-fn default_writer_memory_min_mb() -> usize {
+fn default_num_shards_init() -> usize {
+    4
+}
+fn default_max_shards_per_node() -> usize {
+    8
+}
+
+fn default_indexer_memory_min_mb() -> usize {
     16
 }
-fn default_writer_memory_max_mb() -> usize {
+fn default_indexer_memory_max_mb() -> usize {
     256
 }
 fn default_total_memory_limit_mb() -> usize {
     1024
 }
-fn default_pressure_threshold() -> f64 {
-    0.8
+fn default_memory_pressure_threshold_percent() -> u8 {
+    80
 }
 fn default_search_threads() -> usize {
     num_cpus::get()
 }
+fn default_search_limit() -> usize {
+    10
+}
 
-fn default_distributed_actors() -> bool {
+fn default_cluster_enabled() -> bool {
     false
 }
+
+fn default_cluster_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
+
 fn default_cluster_port() -> u16 {
     9580
 }
+
 fn default_cluster_name() -> String {
     "cameodb-cluster".to_string()
 }
@@ -673,10 +732,10 @@ mod tests {
     #[test]
     fn test_default_configuration() {
         let config = CameoDbConfig::default();
-        assert_eq!(config.server.http.port, 9480);
-        assert_eq!(config.server.http.host, "0.0.0.0");
-        assert_eq!(config.search.writer_memory_min_mb, 16);
-        assert_eq!(config.search.writer_memory_max_mb, 256);
+        assert_eq!(config.network.http.port, 9480);
+        assert_eq!(config.network.http.bind_address, "0.0.0.0");
+        assert_eq!(config.search.indexer_memory_min_mb, 16);
+        assert_eq!(config.search.indexer_memory_max_mb, 256);
         assert!(config.validate().is_ok());
     }
 
@@ -685,13 +744,13 @@ mod tests {
         let mut config = CameoDbConfig::default();
 
         // Test invalid memory range
-        config.search.writer_memory_min_mb = 300;
-        config.search.writer_memory_max_mb = 256;
+        config.search.indexer_memory_min_mb = 300;
+        config.search.indexer_memory_max_mb = 256;
         assert!(config.validate().is_err());
 
         // Test memory too small
-        config.search.writer_memory_min_mb = 8;
-        config.search.writer_memory_max_mb = 256;
+        config.search.indexer_memory_min_mb = 8;
+        config.search.indexer_memory_max_mb = 256;
         assert!(config.validate().is_err());
     }
 
@@ -705,7 +764,7 @@ mod tests {
 
         // Test invalid disk threshold
         config.storage.data_paths = vec![PathBuf::from("./data")];
-        config.storage.disk_usage_threshold = 1.5;
+        config.storage.disk_usage_threshold_percent = 150;
         assert!(config.validate().is_err());
     }
 

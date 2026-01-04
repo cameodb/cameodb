@@ -59,18 +59,23 @@ async fn main() -> Result<()> {
     // Create node configuration from loaded config
     let node_config = NodeConfig {
         storage_path: cameodb_config.storage.data_paths[0].clone(),
-        max_shards: cameodb_config.server.node.max_shards,
-        writer_memory_min_mb: cameodb_config.search.writer_memory_min_mb,
-        writer_memory_max_mb: cameodb_config.search.writer_memory_max_mb,
+        max_shards: cameodb_config.storage.max_shards_per_node,
+        writer_memory_min_mb: cameodb_config.search.indexer_memory_min_mb,
+        writer_memory_max_mb: cameodb_config.search.indexer_memory_max_mb,
         wal_sync: cameodb_config.storage.wal_sync,
         default_batch_size: cameodb_config.storage.default_batch_size,
     };
 
     // Create the NodeOrchestrator actor
-    let mut orchestrator = NodeOrchestrator::new(node_config, identity).await?;
+    let mut orchestrator = NodeOrchestrator::new(
+        node_config,
+        identity,
+        cameodb_config.search.default_search_limit,
+    )
+    .await?;
 
     // Initialize default shards on first boot if none exist
-    let init_shards = cameodb_config.server.node.init_shards;
+    let init_shards = cameodb_config.storage.num_shards_init;
     if orchestrator.shard_count() == 0 && init_shards > 0 {
         for _ in 0..init_shards {
             let shard_id = uuid::Uuid::new_v4();
@@ -108,7 +113,7 @@ async fn main() -> Result<()> {
 
     // Initialize distributed cluster
     let distributed_cluster = DistributedCluster::new(
-        cameodb_config.cluster.clone(),
+        cameodb_config.network.cluster.clone(),
         node_id,
         orchestrator.identity().name.clone(),
         cameodb_config.storage.data_paths[0].clone(),
@@ -212,7 +217,8 @@ async fn main() -> Result<()> {
     let router_actor = RouterActor::with_config(
         orchestrator_ref.clone(),
         coordinator_actor.clone(),
-        &cameodb_config.cluster.messaging,
+        &cameodb_config.network.cluster.messaging,
+        cameodb_config.search.default_search_limit,
     );
 
     let app_state = AppState {
@@ -224,8 +230,8 @@ async fn main() -> Result<()> {
     let app = create_router(app_state);
 
     // Extract HTTP configuration
-    let http_config = &cameodb_config.server.http;
-    let bind_address = format!("{}:{}", http_config.host, http_config.port);
+    let http_config = &cameodb_config.network.http;
+    let bind_address = format!("{}:{}", http_config.bind_address, http_config.port);
 
     // Print startup information
     println!("🚀 CameoDB HTTP Server starting on http://{}", bind_address);
@@ -242,10 +248,13 @@ async fn main() -> Result<()> {
     println!();
     println!("⚙️  Configuration:");
     println!("  Data Paths: {:?}", cameodb_config.storage.data_paths);
-    println!("  Max Shards: {}", cameodb_config.server.node.max_shards);
     println!(
-        "  Writer Memory: {}-{}MB",
-        cameodb_config.search.writer_memory_min_mb, cameodb_config.search.writer_memory_max_mb
+        "  Max Shards: {}",
+        cameodb_config.storage.max_shards_per_node
+    );
+    println!(
+        "  Indexer Memory: {}-{}MB",
+        cameodb_config.search.indexer_memory_min_mb, cameodb_config.search.indexer_memory_max_mb
     );
     println!(
         "  Total Memory Limit: {}MB",

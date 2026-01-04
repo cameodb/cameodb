@@ -1012,12 +1012,13 @@ impl HybridStore {
 
     /// Search documents in a specific index
     /// Uses tantivy for search, then batch-retrieves complete documents from redb
+    /// Returns (results, total_hits) where total_hits is the total number of matching documents
     pub fn search_documents(
         &self,
         index: &str,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<(f32, JsonValue)>, StoreError> {
+    ) -> Result<(Vec<(f32, JsonValue)>, usize), StoreError> {
         use tracing::{debug, warn};
 
         // Get reader and field mapping from cache or disk
@@ -1025,7 +1026,7 @@ impl HybridStore {
             Some(r) => r,
             None => {
                 warn!(index = %index, "No tantivy reader found for index");
-                return Ok(Vec::new());
+                return Ok((Vec::new(), 0));
             }
         };
 
@@ -1048,7 +1049,7 @@ impl HybridStore {
 
         if query_fields.is_empty() {
             warn!(index = %index, "No indexed fields available for search");
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
         debug!(
@@ -1062,20 +1063,26 @@ impl HybridStore {
         let query_parser = tantivy::query::QueryParser::for_index(tantivy_index, query_fields);
         let parsed_query = query_parser.parse_query(query)?;
 
-        // Execute search on tantivy index
-        let top_docs = searcher.search(
-            &parsed_query,
-            &tantivy::collector::TopDocs::with_limit(limit),
-        )?;
+        // Execute search with both TopDocs and Count collectors to get total hits
+        let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit);
+        let count_collector = tantivy::collector::Count;
+        let mut multi_collector = tantivy::collector::MultiCollector::new();
+        let top_docs_handle = multi_collector.add_collector(top_docs_collector);
+        let count_handle = multi_collector.add_collector(count_collector);
+
+        let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
+        let top_docs = top_docs_handle.extract(&mut multi_fruit);
+        let total_hits = count_handle.extract(&mut multi_fruit);
 
         debug!(
             index = %index,
-            hits_found = top_docs.len(),
+            hits_returned = top_docs.len(),
+            total_hits = total_hits,
             "Tantivy search completed"
         );
 
         if top_docs.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), total_hits));
         }
 
         // Step 1: Extract document IDs from tantivy results
@@ -1167,7 +1174,7 @@ impl HybridStore {
             }
         }
 
-        Ok(results)
+        Ok((results, total_hits))
     }
 
     /// Apply multiple write operations atomically to a specific index

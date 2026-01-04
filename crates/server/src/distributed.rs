@@ -263,7 +263,7 @@ impl DistributedCluster {
             total_nodes: self.peer_nodes.len() + 1, // +1 for local node
             connected_nodes: connected_nodes + 1,   // +1 for local node
             total_shards,
-            distributed_enabled: self.cluster_config.distributed_actors,
+            distributed_enabled: self.cluster_config.enabled,
             dial_failures: self.dial_failures,
             bootstrap_successes: self.bootstrap_successes,
             routing_updates: self.routing_updates,

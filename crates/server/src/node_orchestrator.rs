@@ -144,6 +144,13 @@ pub struct SearchRequest {
     pub limit: usize,
 }
 
+/// Search result with hits and total count
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub hits: Vec<(f32, JsonValue)>,
+    pub total_hits: usize,
+}
+
 /// Search stream request message for MicroshardActor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)] // Streaming temporarily stubbed
@@ -230,6 +237,7 @@ pub struct SearchHit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchReply {
     pub hits: Vec<SearchHit>,
+    pub total_hits: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,7 +379,7 @@ impl MicroshardActor {
     pub async fn handle_search(
         &self,
         request: SearchRequest,
-    ) -> Result<Vec<(f32, JsonValue)>, OrchestratorError> {
+    ) -> Result<SearchResult, OrchestratorError> {
         let store = self.store.as_ref().ok_or_else(|| {
             OrchestratorError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -385,7 +393,7 @@ impl MicroshardActor {
 
         // Use spawn_blocking to execute search on blocking thread pool
         let index = request.index.clone();
-        let results =
+        let (results, total_hits) =
             tokio::task::spawn_blocking(move || store.search_documents(&index, &query, limit))
                 .await
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
@@ -394,7 +402,10 @@ impl MicroshardActor {
                     _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
                 })?;
 
-        Ok(results)
+        Ok(SearchResult {
+            hits: results,
+            total_hits,
+        })
     }
 
     /// Handles streaming search requests using channel bridge pattern.
@@ -423,7 +434,7 @@ impl MicroshardActor {
             // In a real implementation, this would use tantivy's streaming search capabilities
             match store.search_documents(&index, &query, 1000) {
                 // Get more results for chunking
-                Ok(results) => {
+                Ok((results, _total_hits)) => {
                     // Send results in chunks of 50
                     const CHUNK_SIZE: usize = 50;
                     for chunk in results.chunks(CHUNK_SIZE) {
@@ -780,11 +791,13 @@ impl Message<SearchRequest> for MicroshardActor {
     ) -> Self::Reply {
         self.handle_search(msg)
             .await
-            .map(|hits| SearchReply {
-                hits: hits
+            .map(|result| SearchReply {
+                hits: result
+                    .hits
                     .into_iter()
                     .map(|(score, doc)| SearchHit { score, doc })
                     .collect(),
+                total_hits: result.total_hits,
             })
             .map_err(RemoteError::from)
     }
@@ -838,6 +851,7 @@ pub struct RouterActor {
     broadcast_timeout: Duration,
     broadcast_fanout_limit: usize,
     remote_retry_attempts: u8,
+    default_search_limit: usize,
     broadcasts_total: Arc<AtomicU64>,
     broadcast_failures: Arc<AtomicU64>,
 }
@@ -848,13 +862,14 @@ impl RouterActor {
         orchestrator: ActorRef<NodeOrchestrator>,
         coordinator: ActorRef<ClusterCoordinator>,
     ) -> Self {
-        Self::with_config(orchestrator, coordinator, &MessagingConfig::default())
+        Self::with_config(orchestrator, coordinator, &MessagingConfig::default(), 10)
     }
 
     pub fn with_config(
         orchestrator: ActorRef<NodeOrchestrator>,
         coordinator: ActorRef<ClusterCoordinator>,
         messaging: &MessagingConfig,
+        default_search_limit: usize,
     ) -> Self {
         Self {
             orchestrator,
@@ -863,6 +878,7 @@ impl RouterActor {
             broadcast_timeout: Duration::from_secs(messaging.broadcast_timeout_secs),
             broadcast_fanout_limit: messaging.broadcast_fanout_limit,
             remote_retry_attempts: messaging.remote_retry_attempts,
+            default_search_limit,
             broadcasts_total: Arc::new(AtomicU64::new(0)),
             broadcast_failures: Arc::new(AtomicU64::new(0)),
         }
@@ -997,12 +1013,13 @@ impl RouterActor {
 
         // If this is a search, prefer fastest/local results and stop after hitting the limit.
         if let ClientOp::Search { limit, .. } = &op {
-            let limit = limit.unwrap_or(10);
+            let limit = limit.unwrap_or(self.default_search_limit);
             let mut merged_hits: Vec<JsonValue> = Vec::with_capacity(limit);
             let mut total_shards_queried = 0usize;
             let mut error_count = 0u64;
             let mut nodes_contacted = 0usize;
             let mut max_took_ms: Option<u64> = None;
+            let mut total_hits_sum = 0usize;
 
             // Helper to push hits from a result up to the remaining limit
             fn push_hits(
@@ -1012,6 +1029,7 @@ impl RouterActor {
                 total_shards_queried: &mut usize,
                 nodes_contacted: &mut usize,
                 max_took_ms: &mut Option<u64>,
+                total_hits_sum: &mut usize,
             ) {
                 if merged_hits.len() >= limit {
                     return;
@@ -1026,6 +1044,9 @@ impl RouterActor {
                 }
                 if let Some(shards) = value.get("shards_responded").and_then(|s| s.as_u64()) {
                     *total_shards_queried += shards as usize;
+                }
+                if let Some(total) = value.get("total_hits").and_then(|t| t.as_u64()) {
+                    *total_hits_sum += total as usize;
                 }
                 *nodes_contacted += 1;
                 if let Some(t) = value.get("took_ms").and_then(|v| v.as_u64()) {
@@ -1045,6 +1066,7 @@ impl RouterActor {
                     &mut total_shards_queried,
                     &mut nodes_contacted,
                     &mut max_took_ms,
+                    &mut total_hits_sum,
                 ),
                 Err(e) => {
                     error_count += 1;
@@ -1065,6 +1087,7 @@ impl RouterActor {
                         &mut total_shards_queried,
                         &mut nodes_contacted,
                         &mut max_took_ms,
+                        &mut total_hits_sum,
                     ),
                     Ok(Err(e)) => {
                         error_count += 1;
@@ -1095,6 +1118,9 @@ impl RouterActor {
 
             return Ok(serde_json::json!({
                 "hits": merged_hits,
+                "hits_returned": merged_hits.len(),
+                "total_hits": total_hits_sum,
+                "limit": limit,
                 "total_shards": total_shards_queried,
                 "nodes_contacted": nodes_contacted,
                 "failed_shards": error_count,
@@ -1140,7 +1166,7 @@ impl RouterActor {
             ClientOp::Search { limit, .. } => {
                 // Enforce a global limit across merged results to avoid returning
                 // (limit * nodes) hits when broadcasting.
-                let limit = limit.unwrap_or(10);
+                let limit = limit.unwrap_or(self.default_search_limit);
 
                 // For search operations, if we only have local results (no remote peers),
                 // return the local response directly to preserve shard-level details
@@ -1483,6 +1509,8 @@ pub struct NodeOrchestrator {
     coordinator: Option<ActorRef<ClusterCoordinator>>,
     /// Per-index schema cache to avoid repeated metadata reads
     schema_cache: RwLock<HashMap<String, IndexSchema>>,
+    /// Default search result limit when not specified in request
+    default_search_limit: usize,
 }
 
 impl NodeOrchestrator {
@@ -1603,6 +1631,7 @@ impl NodeOrchestrator {
     pub async fn new(
         config: NodeConfig,
         identity: NodeIdentity,
+        default_search_limit: usize,
     ) -> Result<Self, OrchestratorError> {
         // Ensure storage directory exists
         fs::create_dir_all(&config.storage_path)?;
@@ -1617,6 +1646,7 @@ impl NodeOrchestrator {
             round_robin_counter: AtomicUsize::new(0),
             coordinator: None,
             schema_cache: RwLock::new(HashMap::new()),
+            default_search_limit,
         };
 
         // Discover and hydrate existing shards
@@ -1870,7 +1900,10 @@ impl NodeOrchestrator {
                 index,
                 query,
                 limit,
-            } => self.orch_search(&index, &query, limit.unwrap_or(10)).await,
+            } => {
+                self.orch_search(&index, &query, limit.unwrap_or(self.default_search_limit))
+                    .await
+            }
             ClientOp::Stream { index, query } => Ok(
                 serde_json::json!({"message": "Stream initiated", "index": index, "query": query}),
             ),
@@ -2105,7 +2138,9 @@ impl NodeOrchestrator {
     ) -> Result<JsonValue, OrchestratorError> {
         let start = std::time::Instant::now();
         if self.shards.is_empty() {
-            return Ok(serde_json::json!({"hits": [], "total": 0, "took_ms": 0}));
+            return Ok(
+                serde_json::json!({"hits": [], "hits_returned": 0, "total_hits": 0, "took_ms": 0}),
+            );
         }
         let mut handles = Vec::new();
         for (&shard_id, shard) in self.shards.iter() {
@@ -2123,10 +2158,12 @@ impl NodeOrchestrator {
         let mut results: Vec<(Uuid, f32, JsonValue)> = Vec::new();
         let mut errors = Vec::new();
         let mut shard_success = 0usize;
+        let mut total_hits_sum = 0usize;
         for h in handles {
             match h.await {
                 Ok((shard_id, Ok(r))) => {
-                    for (score, doc) in r {
+                    total_hits_sum += r.total_hits;
+                    for (score, doc) in r.hits {
                         results.push((shard_id, score, doc));
                     }
                     shard_success += 1;
@@ -2162,9 +2199,15 @@ impl NodeOrchestrator {
                 doc
             })
             .collect();
-        Ok(
-            serde_json::json!({"hits": hits, "total": hits.len(), "took_ms": start.elapsed().as_millis(), "errors": errors, "shards_responded": shard_success}),
-        )
+        Ok(serde_json::json!({
+            "hits": hits,
+            "hits_returned": hits.len(),
+            "total_hits": total_hits_sum,
+            "limit": limit,
+            "took_ms": start.elapsed().as_millis(),
+            "errors": errors,
+            "shards_responded": shard_success
+        }))
     }
 
     async fn orch_create_config(

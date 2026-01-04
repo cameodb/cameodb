@@ -399,6 +399,38 @@ impl ClusterCoordinator {
         }
     }
 
+    /// Validate configured cluster_nodes against discovered nodes
+    /// Emits warnings if there are mismatches (for operational awareness)
+    fn validate_cluster_nodes(&self) {
+        // Skip if no cluster_nodes configured
+        if self.cluster.cluster_config.cluster_nodes.is_empty() {
+            return;
+        }
+
+        let configured_count = self.cluster.cluster_config.cluster_nodes.len();
+        let discovered_count = self.expected_nodes.len();
+
+        // Warn if counts don't match
+        if configured_count != discovered_count {
+            warn!(
+                configured = configured_count,
+                discovered = discovered_count,
+                "Cluster node count mismatch: configured {} nodes but discovered {} nodes",
+                configured_count,
+                discovered_count
+            );
+        }
+
+        // Log configured vs discovered for visibility
+        info!(
+            "Cluster validation: {} configured nodes, {} discovered nodes",
+            configured_count, discovered_count
+        );
+
+        // Additional detailed comparison could be added here in the future
+        // (e.g., comparing addresses, but would need address normalization)
+    }
+
     /// Persist current cluster state snapshot to disk (event-driven)
     /// Only persists when generation changes to avoid redundant writes
     fn persist_snapshot(&mut self) {
@@ -505,6 +537,9 @@ impl ClusterCoordinator {
     /// Evaluate cluster state and transition if needed (reactive, message-driven)
     /// Called after PeerDiscovered/PeerLost to update cluster state
     fn evaluate_and_transition_state(&mut self) {
+        // Validate cluster_nodes configuration against discovered nodes
+        self.validate_cluster_nodes();
+
         // Count currently connected peers + local node
         let connected_peers = self
             .cluster

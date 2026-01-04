@@ -201,8 +201,8 @@ pub async fn init_distributed_swarm(
     node_name: String,
     storage_path: &Path,
 ) -> Result<SwarmStartup> {
-    if !config.distributed_actors {
-        info!("Distributed actors disabled, running in single-node mode");
+    if !config.enabled {
+        info!("Cluster mode disabled, running in standalone single-node mode");
         return Ok(SwarmStartup {
             peer_id: PeerId::random(),
             listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
@@ -292,48 +292,48 @@ async fn create_production_swarm(
         info!("   📡 Active listener: {}", addr);
     }
 
-    // Connect to bootstrap peers for DHT initialization
-    let bootstrap_addrs = convert_bootstrap_nodes_to_multiaddrs(&config.bootstrap_nodes);
+    // Connect to seed nodes for DHT initialization
+    let seed_addrs = convert_seed_nodes_to_multiaddrs(&config.seed_nodes);
     let mut connected_peers = 0;
 
     info!(
-        "🔍 Bootstrap configuration: {} nodes configured",
-        config.bootstrap_nodes.len()
+        "🔍 Seed node configuration: {} nodes configured",
+        config.seed_nodes.len()
     );
-    for node in &config.bootstrap_nodes {
-        info!("   - Bootstrap node: {}", node);
+    for node in &config.seed_nodes {
+        info!("   - Seed node: {}", node);
     }
 
-    for addr in bootstrap_addrs {
-        info!("📞 Attempting to dial bootstrap peer: {}", addr);
+    for addr in seed_addrs {
+        info!("📞 Attempting to dial seed node: {}", addr);
         match swarm.dial(addr.clone()) {
             Ok(_) => {
                 connected_peers += 1;
                 info!("✅ Successfully initiated dial to: {}", addr);
             }
             Err(e) => {
-                warn!("⚠️  Failed to dial bootstrap peer {}: {:?}", addr, e);
+                warn!("⚠️  Failed to dial seed node {}: {:?}", addr, e);
             }
         }
     }
 
     info!(
-        "📊 Bootstrap dial summary: {} successful, {} total",
+        "📊 Seed node dial summary: {} successful, {} total",
         connected_peers,
-        config.bootstrap_nodes.len()
+        config.seed_nodes.len()
     );
 
     // Bootstrap Kademlia DHT if we have peers
     if connected_peers > 0 {
         match swarm.behaviour_mut().bootstrap_kademlia() {
             Ok(_) => info!(
-                "🚀 Kademlia DHT bootstrap initiated with {} peers",
+                "🚀 Kademlia DHT bootstrap initiated with {} seed nodes",
                 connected_peers
             ),
             Err(e) => warn!("⚠️  Kademlia bootstrap failed: {}", e),
         }
     } else {
-        info!("📋 No bootstrap peers available - running in standalone mode");
+        info!("📋 No seed nodes available - running in standalone mode");
     }
 
     // Start the swarm runtime task to process events
@@ -416,13 +416,13 @@ pub fn load_or_generate_keypair(storage_path: &Path) -> Result<(Keypair, NodeIde
     Ok((keypair, identity))
 }
 
-/// Convert IP:port format bootstrap nodes to full multiaddr format
-fn convert_bootstrap_nodes_to_multiaddrs(bootstrap_nodes: &[String]) -> Vec<Multiaddr> {
+/// Convert IP:port format seed nodes to full multiaddr format
+fn convert_seed_nodes_to_multiaddrs(seed_nodes: &[String]) -> Vec<Multiaddr> {
     use std::net::IpAddr;
 
     let mut multiaddrs = Vec::new();
 
-    for node in bootstrap_nodes {
+    for node in seed_nodes {
         // Handle IP:port or Host:port format (e.g., "192.168.1.100:9580" or "cameodb-node2:9580" or "[::1]:9580")
         // Use rsplit_once to correctly handle IPv6 addresses that contain colons
         if let Some((host, port)) = node.rsplit_once(':') {
@@ -896,7 +896,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_convert_bootstrap_nodes() {
+    fn test_convert_seed_nodes() {
         let inputs = vec![
             "127.0.0.1:9580".to_string(),
             "cameodb-node2:9580".to_string(),
@@ -905,7 +905,7 @@ mod tests {
             "/ip4/10.0.0.1/tcp/8000".to_string(), // Direct multiaddr
         ];
 
-        let results = convert_bootstrap_nodes_to_multiaddrs(&inputs);
+        let results = convert_seed_nodes_to_multiaddrs(&inputs);
 
         assert_eq!(results.len(), 5);
         assert_eq!(results[0].to_string(), "/ip4/127.0.0.1/tcp/9580");
@@ -922,7 +922,7 @@ mod tests {
             "nodoport".to_string(),     // No port
         ];
 
-        let results = convert_bootstrap_nodes_to_multiaddrs(&inputs);
+        let results = convert_seed_nodes_to_multiaddrs(&inputs);
         assert_eq!(results.len(), 0);
     }
 }
