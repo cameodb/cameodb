@@ -253,6 +253,29 @@ curl -s http://localhost:9480/api/books/_config
 }
 ```
 
+#### 🗑️ Delete Index
+Permanently delete an index and all its data across the cluster.
+
+```bash
+DELETE /api/{index}
+```
+
+**Example:**
+```bash
+curl -s -X DELETE http://localhost:9480/api/books
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "index": "books",
+  "deleted_from_shards": 4,
+  "total_shards": 4,
+  "errors": null
+}
+```
+
 #### List All Indexes
 Get comprehensive information about all available indexes.
 

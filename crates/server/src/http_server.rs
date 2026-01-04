@@ -9,7 +9,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -126,6 +126,7 @@ pub fn create_router(state: AppState) -> Router {
         // Schema maintenance
         .route("/api/{index}/_schema", patch(update_schema_handler))
         // Index management
+        .route("/api/{index}", delete(delete_index_handler))
         .route("/_indexes", get(list_indexes_handler))
         .route("/_cluster/_indexes", get(list_cluster_indexes_handler))
         // Health check
@@ -463,6 +464,23 @@ async fn update_schema_handler(
         "updated_fields": updated_fields,
         "message": "Schema updated successfully. New writes will respect updated indexed flags."
     })))
+}
+
+/// Handler for deleting an index and all its data
+async fn delete_index_handler(
+    Path(index): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<JsonValue>, AppError> {
+    info!("Delete index request - index: {}", index);
+
+    let client_op = ClientOp::DeleteIndex { index };
+
+    // Use Broadcast to delete from all nodes in cluster
+    let result = state
+        .router
+        .route_and_handle(client_op, None, OperationType::Write)
+        .await?;
+    Ok(Json(result))
 }
 
 /// Fallback handler for 404/405 to return JSON error shape

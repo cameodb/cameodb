@@ -302,6 +302,10 @@ let results = store.search_documents("employees", "software engineer", 10)?;
 for (score, doc) in results {
     println!("Score: {:.3}, ID: {}", score, doc["id"]);
 }
+
+// Delete all data for an index
+store.delete_index_data("employees")?;
+println!("Index 'employees' deleted successfully");
 ```
 
 ### Async Integration (Critical)

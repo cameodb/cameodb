@@ -9,7 +9,7 @@ This document focuses on the *node-side* architecture and the distributed workfl
 ## 1. Core Responsibilities
 
 - **HTTP API surface**
-  - Routes: `/api/{index}/search` (JSON), `/api/{index}/stream` (NDJSON, JSON fallback), `/api/{index}/document` (PUT), `/api/{index}/_bulk` (POST), `/api/{index}/_config` (GET/PUT), `/api/{index}/_schema` (PATCH), `/_indexes`, `/_cluster/_indexes`, `/_cluster/health`.
+  - Routes: `/api/{index}/search` (JSON), `/api/{index}/stream` (NDJSON, JSON fallback), `/api/{index}/document` (PUT), `/api/{index}/_bulk` (POST), `/api/{index}/_config` (GET/PUT), `/api/{index}/_schema` (PATCH), `/api/{index}` (DELETE), `/_indexes`, `/_cluster/_indexes`, `/_cluster/health`.
   - Translates requests into strongly-typed operations (`ClientOp`) and hands them to `RouterActor`.
   - Middleware: compression/decompression, trace, permissive CORS, request body limit; ConnectInfo enabled at serve for client addr extraction.
 - **Local orchestration**
@@ -37,6 +37,7 @@ The `RouterActor` is the primary ingress for database operations on a node.
   - `BulkWrite { index, docs }`
   - `CreateConfig`, `GetConfig` (Schema management)
   - `ListIndexes`, `ListClusterIndexes` (Metadata)
+  - `DeleteIndex { index }` (Index Management)
 - Responsibilities:
   - Ask the `ClusterCoordinator` for a routing decision:
     - `RoutingDecision::Local`

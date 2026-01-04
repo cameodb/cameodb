@@ -283,6 +283,8 @@ pub enum ClientOp {
     ListIndexes,
     /// List all indexes across the cluster (broadcast)
     ListClusterIndexes,
+    /// Delete an index and all its data
+    DeleteIndex { index: String },
 }
 
 // ============================================================================
@@ -601,6 +603,30 @@ impl MicroshardActor {
         })?;
 
         Ok(all_seq_ids)
+    }
+
+    /// Deletes all data for an index from this shard's storage
+    pub async fn delete_index(&self, index: &str) -> Result<(), OrchestratorError> {
+        let store = self.store.as_ref().ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "HybridStore not initialized",
+            ))
+        })?;
+
+        let store = Arc::clone(store);
+        let index = index.to_string();
+
+        // Use spawn_blocking to execute delete on blocking thread pool
+        tokio::task::spawn_blocking(move || store.delete_index_data(&index))
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
+            .map_err(|e: StoreError| match e {
+                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
+                _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
+            })?;
+
+        Ok(())
     }
 }
 
@@ -1919,7 +1945,59 @@ impl NodeOrchestrator {
             }
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
             ClientOp::ListIndexes | ClientOp::ListClusterIndexes => self.orch_list_indexes().await,
+            ClientOp::DeleteIndex { index } => self.orch_delete_index(&index).await,
         }
+    }
+
+    /// Delete an index and all its data from all local shards
+    async fn orch_delete_index(&self, index: &str) -> Result<JsonValue, OrchestratorError> {
+        if self.shards.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards available",
+            )));
+        }
+
+        let mut deleted_from_shards = 0;
+        let mut errors = Vec::new();
+
+        // Delete index data from all local shards
+        for (shard_id, shard) in &self.shards {
+            match shard.delete_index(index).await {
+                Ok(_) => {
+                    deleted_from_shards += 1;
+                    tracing::info!(
+                        shard_id = %shard_id,
+                        index = %index,
+                        "Deleted index data from shard"
+                    );
+                }
+                Err(e) => {
+                    // Log but continue - index might not exist on this shard
+                    tracing::warn!(
+                        shard_id = %shard_id,
+                        index = %index,
+                        error = %e,
+                        "Failed to delete index from shard (may not exist)"
+                    );
+                    errors.push(format!("shard {}: {}", shard_id, e));
+                }
+            }
+        }
+
+        // Clear schema cache for this index
+        {
+            let mut cache = self.schema_cache.write().unwrap();
+            cache.remove(index);
+        }
+
+        Ok(serde_json::json!({
+            "success": true,
+            "index": index,
+            "deleted_from_shards": deleted_from_shards,
+            "total_shards": self.shards.len(),
+            "errors": if errors.is_empty() { None } else { Some(errors) }
+        }))
     }
 
     async fn orch_write(
