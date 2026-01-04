@@ -406,7 +406,7 @@ cargo test -p cluster test_ring_operations
 ```mermaid
 flowchart TD
     subgraph Server["server crate"]
-        A["RouterActor\nNodeOrchestrator"]
+        Entry[main.rs] -->|Spawns| A["RouterActor\nNodeOrchestrator\nClusterCoordinator"]
     end
 
     subgraph Storage["storage crate"]

@@ -53,13 +53,18 @@ The internal structure of a node is hierarchical, managed by the Kameo Actor Fra
 ```mermaid
 graph TD
     Entry[main.rs] -->|Spawns| Orchestrator[NodeOrchestrator Actor]
-    Orchestrator -->|Spawns| API[Axum HTTP API]
-    Orchestrator -->|Spawns| Router[RouterActor <br/> Request Distribution]
+    Entry -->|Spawns| API[Axum HTTP API]
+    Entry -->|Spawns| Router[RouterActor <br/> Request Distribution]
+    Entry -->|Spawns| Coord[ClusterCoordinator Actor]
     Orchestrator -->|Manages| Shard1[MicroshardActor <br/> UUID-A]
     Orchestrator -->|Manages| Shard2[MicroshardActor <br/> UUID-B]
     
-    Router -->|Unicast/Scatter-Gather| Shard1
-    Router -->|Unicast/Scatter-Gather| Shard2
+    API -->|Sends ClientOp| Router
+    Router -->|RouteOperation| Coord
+    Coord -->|RoutingDecision| Router
+    Router -->|Local/Remote| Orchestrator
+    Orchestrator --> Shard1
+    Orchestrator --> Shard2
     Shard1 -->|spawn_blocking| HybridStore1[HybridStore <br/> Redb + Tantivy]
     Shard2 -->|spawn_blocking| HybridStore2[HybridStore <br/> Redb + Tantivy]
     

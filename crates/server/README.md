@@ -408,6 +408,7 @@ sequenceDiagram
     participant LocalOrch as NodeOrchestrator (local)
     participant LocalShards as MicroshardActors (local)
     participant RemoteOrchN as NodeOrchestrator (remote peers)
+    participant RemoteShardsN as MicroshardActors (remote peers)
 
     Client->>HTTP: HTTP search without routing_key
     HTTP->>Router: ClientOp::Search
@@ -427,7 +428,9 @@ sequenceDiagram
     and Remote fan-out
         loop for each selected peer
             Router->>RemoteOrchN: Kameo remote ask(ClientOp::Search)\n(timeout = broadcast_timeout)
-            RemoteOrchN->>RemoteOrchN: search over its microshards
+            RemoteOrchN->>RemoteShardsN: shard-level search
+            RemoteShardsN->>RemoteShardsN: Tantivy search via spawn_blocking
+            RemoteShardsN-->>RemoteOrchN: hits per shard
             RemoteOrchN-->>Router: remote JSON result { hits, ... } or error
         end
     end
