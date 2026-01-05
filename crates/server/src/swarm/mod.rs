@@ -18,6 +18,7 @@ use libp2p::{
     tcp, yamux,
 };
 use std::collections::HashMap;
+use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -251,6 +252,17 @@ async fn create_production_swarm(
         config.cluster_port,
     )?;
 
+    // Capture our own listen IPs for self-dial filtering
+    let mut listen_ip4 = None;
+    let mut listen_ip6 = None;
+    for p in listen_addr.iter() {
+        match p {
+            libp2p::multiaddr::Protocol::Ip4(ip) => listen_ip4 = Some(ip),
+            libp2p::multiaddr::Protocol::Ip6(ip) => listen_ip6 = Some(ip),
+            _ => {}
+        }
+    }
+
     // Create custom network behaviour with production settings
     let behaviour = DhtBehaviour::new(
         peer_id,
@@ -314,12 +326,31 @@ async fn create_production_swarm(
     }
 
     for addr in seed_addrs {
-        // Skip self-dialing by checking against our listeners
-        // Note: This matches IP-based seed nodes. DNS-based ones might still attempt dial
-        // but libp2p Swarm will gracefully handle self-dials if they resolve to local.
+        // Skip self-dialing by checking against our listeners and resolved listen IPs
         if swarm.listeners().any(|l| l == &addr) {
-            info!("⏭️  Skipping self-dial to local seed node: {}", addr);
+            info!(
+                "⏭️  Skipping self-dial to local seed node (listener match): {}",
+                addr
+            );
             continue;
+        }
+        if let Some(ip4) = listen_ip4 {
+            if addr.to_string().starts_with(&format!("/ip4/{}/tcp/", ip4)) {
+                info!(
+                    "⏭️  Skipping self-dial to local seed node (ip4 match): {}",
+                    addr
+                );
+                continue;
+            }
+        }
+        if let Some(ip6) = listen_ip6 {
+            if addr.to_string().starts_with(&format!("/ip6/{}/tcp/", ip6)) {
+                info!(
+                    "⏭️  Skipping self-dial to local seed node (ip6 match): {}",
+                    addr
+                );
+                continue;
+            }
         }
 
         info!("📞 Attempting to dial seed node: {}", addr);
@@ -340,8 +371,9 @@ async fn create_production_swarm(
         config.seed_nodes.len()
     );
 
-    // Bootstrap Kademlia DHT if we have peers
-    if connected_peers > 0 {
+    // Bootstrap Kademlia DHT only when we have at least one non-self connected peer.
+    let has_connected_peer = swarm.connected_peers().any(|p| p != &peer_id);
+    if connected_peers > 0 && has_connected_peer {
         match swarm.behaviour_mut().bootstrap_kademlia() {
             Ok(_) => info!(
                 "🚀 Kademlia DHT bootstrap initiated with {} seed nodes",
@@ -349,6 +381,10 @@ async fn create_production_swarm(
             ),
             Err(e) => warn!("⚠️  Kademlia bootstrap failed: {}", e),
         }
+    } else if connected_peers > 0 {
+        info!(
+            "⌛ Seed dials started but no peers connected yet; deferring bootstrap until a peer connects"
+        );
     } else {
         info!("📋 No seed nodes available - running in standalone mode");
     }
@@ -468,21 +504,61 @@ fn convert_seed_nodes_to_multiaddrs(seed_nodes: &[String]) -> Vec<Multiaddr> {
                         }
                     }
                     Err(_) => {
-                        // Hostname: emit dns4 then dns6 to bias IPv4 first
-                        let addr4 = format!("/dns4/{}/tcp/{}", clean_host, port_num);
-                        if let Ok(ma) = addr4.parse::<Multiaddr>() {
-                            info!("✅ Converted bootstrap node {} to {}", node, ma);
-                            multiaddrs.push(ma);
-                        } else {
-                            warn!(
-                                "⚠️  Failed to parse bootstrap node '{}' as dns4 multiaddr",
-                                node
-                            );
-                        }
-
-                        let addr6 = format!("/dns6/{}/tcp/{}", clean_host, port_num);
-                        if let Ok(ma) = addr6.parse::<Multiaddr>() {
-                            multiaddrs.push(ma);
+                        // Hostname: resolve to prefer IPv4 and avoid dns6 noise when A records exist
+                        let mut first_v6 = None;
+                        let mut emitted_v4 = false;
+                        match (clean_host, port_num).to_socket_addrs() {
+                            Ok(iter) => {
+                                for sa in iter {
+                                    match sa.ip() {
+                                        IpAddr::V4(v4) => {
+                                            let addr = format!("/ip4/{}/tcp/{}", v4, port_num);
+                                            if let Ok(ma) = addr.parse::<Multiaddr>() {
+                                                info!(
+                                                    "✅ Resolved bootstrap node {} to {}",
+                                                    node, ma
+                                                );
+                                                multiaddrs.push(ma);
+                                                emitted_v4 = true;
+                                            }
+                                            // Prefer first IPv4; do not emit further addresses
+                                            break;
+                                        }
+                                        IpAddr::V6(v6) => {
+                                            if first_v6.is_none() {
+                                                first_v6 = Some(v6);
+                                            }
+                                        }
+                                    }
+                                }
+                                if !emitted_v4 {
+                                    if let Some(v6) = first_v6 {
+                                        let addr = format!("/ip6/{}/tcp/{}", v6, port_num);
+                                        if let Ok(ma) = addr.parse::<Multiaddr>() {
+                                            info!(
+                                                "✅ Resolved bootstrap node {} to IPv6 {}",
+                                                node, ma
+                                            );
+                                            multiaddrs.push(ma);
+                                        }
+                                    } else {
+                                        warn!(
+                                            "⚠️  Bootstrap node '{}' resolved to no usable IP",
+                                            node
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "⚠️  DNS resolution failed for bootstrap node '{}': {}. Falling back to dns4.",
+                                    node, e
+                                );
+                                let addr4 = format!("/dns4/{}/tcp/{}", clean_host, port_num);
+                                if let Ok(ma) = addr4.parse::<Multiaddr>() {
+                                    multiaddrs.push(ma);
+                                }
+                            }
                         }
                     }
                 }
@@ -946,7 +1022,7 @@ mod tests {
 
         assert_eq!(results.len(), 5);
         assert_eq!(results[0].to_string(), "/ip4/127.0.0.1/tcp/9580");
-        assert_eq!(results[1].to_string(), "/dns/cameodb-node2/tcp/9580");
+        assert_eq!(results[1].to_string(), "/dns4/cameodb-node2/tcp/9580");
         assert_eq!(results[2].to_string(), "/ip6/::1/tcp/9580");
         assert_eq!(results[3].to_string(), "/ip4/192.168.1.50/tcp/4000");
         assert_eq!(results[4].to_string(), "/ip4/10.0.0.1/tcp/8000");
