@@ -33,6 +33,10 @@ async fn main() -> Result<()> {
             "client" => {
                 return client::run_cli().await;
             }
+            // Allow calling client subcommands directly: `cameodb health`, `cameodb index list`, etc.
+            "health" | "index" | "search" => {
+                return client::run_cli().await;
+            }
             "--version" | "-V" => {
                 println!("cameodb {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
