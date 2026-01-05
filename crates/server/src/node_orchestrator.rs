@@ -1859,7 +1859,7 @@ impl NodeOrchestrator {
                 .map(|shard_id| self.shard_metadata(shard_id))
                 .collect();
             if !shards.is_empty() {
-                coordinator
+                let _: () = coordinator
                     .ask(RegisterLocalShards {
                         node_id: self.identity.uuid,
                         shards,

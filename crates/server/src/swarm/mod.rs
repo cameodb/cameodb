@@ -310,6 +310,14 @@ async fn create_production_swarm(
     }
 
     for addr in seed_addrs {
+        // Skip self-dialing by checking against our listeners
+        // Note: This matches IP-based seed nodes. DNS-based ones might still attempt dial
+        // but libp2p Swarm will gracefully handle self-dials if they resolve to local.
+        if swarm.listeners().any(|l| l == &addr) {
+            info!("⏭️  Skipping self-dial to local seed node: {}", addr);
+            continue;
+        }
+
         info!("📞 Attempting to dial seed node: {}", addr);
         match swarm.dial(addr.clone()) {
             Ok(_) => {
@@ -702,19 +710,23 @@ fn handle_kademlia_event(
             }
 
             // Dial the peer to establish connection for Kameo actor communication
-            // Use preferred address (IPv4 > IPv6 > first)
-            if let Some(addr) = select_preferred_address(&addr_vec) {
-                match swarm.dial(addr.clone()) {
-                    Ok(_) => {
-                        peer_book
-                            .addr_by_peer
-                            .insert(peer.to_string(), addr.to_string());
-                        info!("📞 Dialing Kademlia-discovered peer: {} at {}", peer, addr);
-                    }
-                    Err(e) => {
-                        debug!("⚠️  Failed to dial peer {}: {}", peer, e);
+            // Skip self-dialing
+            if peer != *swarm.local_peer_id() {
+                if let Some(addr) = select_preferred_address(&addr_vec) {
+                    match swarm.dial(addr.clone()) {
+                        Ok(_) => {
+                            peer_book
+                                .addr_by_peer
+                                .insert(peer.to_string(), addr.to_string());
+                            info!("📞 Dialing Kademlia-discovered peer: {} at {}", peer, addr);
+                        }
+                        Err(e) => {
+                            debug!("⚠️  Failed to dial peer {}: {}", peer, e);
+                        }
                     }
                 }
+            } else {
+                debug!("⏭️  Skipping self-dial to local peer: {}", peer);
             }
 
             let _ = event_tx.send(CoordinatorEvent::RoutingUpdated {

@@ -13,12 +13,16 @@ services:
     user: "65532:65532"
     
     environment:
+      - RUST_LOG=debug
       - CAMEODB_NODE_LABEL=cameodb-node-1
       - CAMEODB_CLUSTER_NAME=cameodb-production
       - CAMEODB_CLUSTER_ENABLED=true
+      - CAMEODB_HTTP_BIND_ADDRESS=cameodb-node1
       - CAMEODB_HTTP_PORT=9480
+      - CAMEODB_CLUSTER_BIND_ADDRESS=cameodb-node1
       - CAMEODB_CLUSTER_PORT=9580
-      - CAMEODB_SEED_NODES=cameodb-node2:9580,cameodb-node3:9580
+      - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
+      - CAMEODB_CLUSTER_NODES=cameodb-node1:9580,cameodb-node2:9580,cameodb-node3:9580
       - CAMEODB_MAX_BODY_SIZE_MB=200
       - CAMEODB_DEFAULT_BATCH_SIZE=200
     
@@ -56,12 +60,16 @@ services:
     user: "65532:65532"
     
     environment:
+      - RUST_LOG=debug
       - CAMEODB_NODE_LABEL=cameodb-node-2
       - CAMEODB_CLUSTER_NAME=cameodb-production
       - CAMEODB_CLUSTER_ENABLED=true
+      - CAMEODB_HTTP_BIND_ADDRESS=cameodb-node2
       - CAMEODB_HTTP_PORT=9480
+      - CAMEODB_CLUSTER_BIND_ADDRESS=cameodb-node2
       - CAMEODB_CLUSTER_PORT=9580
-      - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node3:9580
+      - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
+      - CAMEODB_CLUSTER_NODES=cameodb-node1:9580,cameodb-node2:9580,cameodb-node3:9580
       - CAMEODB_MAX_BODY_SIZE_MB=200
       - CAMEODB_DEFAULT_BATCH_SIZE=200
     
@@ -100,12 +108,16 @@ services:
     user: "65532:65532"
     
     environment:
+      - RUST_LOG=debug
       - CAMEODB_NODE_LABEL=cameodb-node-3
       - CAMEODB_CLUSTER_NAME=cameodb-production
       - CAMEODB_CLUSTER_ENABLED=true
+      - CAMEODB_HTTP_BIND_ADDRESS=cameodb-node3
       - CAMEODB_HTTP_PORT=9480
+      - CAMEODB_CLUSTER_BIND_ADDRESS=cameodb-node3
       - CAMEODB_CLUSTER_PORT=9580
       - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
+      - CAMEODB_CLUSTER_NODES=cameodb-node1:9580,cameodb-node2:9580,cameodb-node3:9580
       - CAMEODB_MAX_BODY_SIZE_MB=200
       - CAMEODB_DEFAULT_BATCH_SIZE=200
     

@@ -183,10 +183,6 @@ pub struct ClusterConfig {
     /// Messaging configuration
     #[serde(default)]
     pub messaging: MessagingConfig,
-
-    /// mDNS interface filtering options
-    #[serde(default)]
-    pub mdns_filter: MdnsFilterConfig,
 }
 
 /// Messaging configuration for Kameo remote actors
@@ -215,22 +211,6 @@ pub struct MessagingConfig {
     /// Maximum number of local shards to fan out to when broadcasting
     #[serde(default = "default_broadcast_fanout_limit")]
     pub broadcast_fanout_limit: usize,
-}
-
-/// mDNS interface filtering configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MdnsFilterConfig {
-    /// Additional interface patterns to allow (besides defaults)
-    #[serde(default)]
-    pub allow_patterns: Vec<String>,
-
-    /// Additional interface patterns to deny
-    #[serde(default)]
-    pub deny_patterns: Vec<String>,
-
-    /// Enable IPv6 mDNS discovery (default: false)
-    #[serde(default = "default_ipv6_enabled")]
-    pub ipv6_enabled: bool,
 }
 
 /// Tantivy search engine configuration
@@ -428,6 +408,24 @@ impl CameoDbConfig {
             }
         }
 
+        if let Ok(nodes) = std::env::var("CAMEODB_CLUSTER_NODES") {
+            let parsed: Vec<String> = nodes
+                .split([',', ';'])
+                .filter_map(|entry| {
+                    let trimmed = entry.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                })
+                .collect();
+
+            if !parsed.is_empty() {
+                config.network.cluster.cluster_nodes = parsed;
+            }
+        }
+
         Ok(config)
     }
 
@@ -599,16 +597,6 @@ impl Default for MessagingConfig {
     }
 }
 
-impl Default for MdnsFilterConfig {
-    fn default() -> Self {
-        Self {
-            allow_patterns: Vec::new(),
-            deny_patterns: Vec::new(),
-            ipv6_enabled: default_ipv6_enabled(),
-        }
-    }
-}
-
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
@@ -621,7 +609,6 @@ impl Default for ClusterConfig {
             listen_addrs: Vec::new(),
             bootstrap_peers: Vec::new(),
             messaging: MessagingConfig::default(),
-            mdns_filter: MdnsFilterConfig::default(),
         }
     }
 }
@@ -728,10 +715,6 @@ fn default_broadcast_timeout_secs() -> u64 {
 
 fn default_broadcast_fanout_limit() -> usize {
     16
-}
-
-fn default_ipv6_enabled() -> bool {
-    false
 }
 
 #[cfg(test)]

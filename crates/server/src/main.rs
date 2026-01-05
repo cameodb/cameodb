@@ -15,7 +15,7 @@ use cluster_coordinator::{
 };
 use cluster_state::ClusterStateStore;
 use config::CameoDbConfig;
-use distributed::DistributedCluster;
+use distributed::{ClusterStatus, DistributedCluster};
 use http_server::{AppState, create_router};
 use node_orchestrator::{
     NodeConfig, NodeOrchestrator, ProposeShard, RouterActor, UpdateTopology,
@@ -147,21 +147,25 @@ async fn main() -> Result<()> {
             println!("⚠️  Distributed swarm initialization failed, continuing in single-node mode");
         }
         Ok(peer_id) => {
+            let peer_id: String = peer_id;
             // Get cluster status via actor
-            if let Ok(cluster_status) = coordinator_actor.ask(GetStatus).await
-                && cluster_status.distributed_enabled
-            {
-                println!("🌐 Distributed swarm initialized:");
-                println!("  📡 Cluster: {}", cluster_status.cluster_name);
-                println!("  🆔 Peer ID: {}", peer_id);
-                println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
-                println!("  ✅ Connected: {}", cluster_status.connected_nodes);
+            let status_result: Result<ClusterStatus, _> = coordinator_actor.ask(GetStatus).await;
+            if let Ok(cluster_status) = status_result {
+                if cluster_status.distributed_enabled {
+                    println!("🌐 Distributed swarm initialized:");
+                    println!("  📡 Cluster: {}", cluster_status.cluster_name);
+                    println!("  🆔 Peer ID: {}", peer_id);
+                    println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
+                    println!("  ✅ Connected: {}", cluster_status.connected_nodes);
 
-                // Discover peers via actor
-                if let Ok(peers) = coordinator_actor.ask(DiscoverPeers).await
-                    && !peers.is_empty()
-                {
-                    println!("  👥 Discovered {} peer nodes", peers.len());
+                    // Discover peers via actor
+                    let discover_result: Result<Vec<crate::distributed::NodeInfo>, _> =
+                        coordinator_actor.ask(DiscoverPeers).await;
+                    if let Ok(peers) = discover_result {
+                        if !peers.is_empty() {
+                            println!("  👥 Discovered {} peer nodes", peers.len());
+                        }
+                    }
                 }
             }
         }
