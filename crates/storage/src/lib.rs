@@ -64,7 +64,7 @@ impl Default for StorageConfig {
             indexer_memory_min_mb: 16,               // 16MB minimum
             indexer_memory_max_mb: 256,              // 256MB maximum
             indexer_memory_budget: 16 * 1024 * 1024, // start at min when unknown
-            default_batch_size: 1000,                // 1000 operations default
+            default_batch_size: 200,                 // 200 operations default
             wal_sync: true,
         }
     }

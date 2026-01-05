@@ -41,6 +41,29 @@ async fn main() -> Result<()> {
                 println!("{}", CameoDbConfig::generate_sample_config()?);
                 return Ok(());
             }
+            "--help" | "-h" => {
+                println!(
+                    "cameodb {}\n\n\
+                     Usage:\n  \
+                     cameodb [OPTIONS]\n  \
+                     cameodb generate-config\n  \
+                     cameodb client <subcommand>\n\n\
+                     Options:\n  \
+                     -h, --help       Show this help message\n  \
+                     -V, --version    Show version information\n\n\
+                     Commands:\n  \
+                     generate-config  Print a sample configuration file\n  \
+                     client           Run the bundled client CLI (health, index, search)\n\n\
+                     Client examples:\n  \
+                     cameodb client health\n  \
+                     cameodb client index list\n  \
+                     cameodb client search myindex \"foo bar\" --limit 5 --url http://host:9480\n\n\
+                     When no command is provided, cameodb starts the server using configuration\n  \
+                     loaded from config files and environment variables.",
+                    env!("CARGO_PKG_VERSION")
+                );
+                return Ok(());
+            }
             _ => {}
         }
     }

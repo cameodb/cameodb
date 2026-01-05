@@ -10,7 +10,7 @@ max_body_size_mb = 200
 cors_allowed_origins = ["*"]
 
 [network.cluster]
-enabled = true
+enabled = false
 bind_address = "0.0.0.0"
 port = 9580
 cluster_name = "cameodb-cluster"

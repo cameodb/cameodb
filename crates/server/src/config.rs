@@ -101,7 +101,7 @@ pub struct HttpConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     /// Human-readable label for this node (optional, for logs/dashboards)
-    #[serde(default)]
+    #[serde(default = "default_node_label_opt")]
     pub label: Option<String>,
 
     /// Topology zone for rack/datacenter awareness (default: "default")
@@ -551,7 +551,7 @@ impl Default for HttpConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            label: None,
+            label: default_node_label_opt(),
             zone: default_node_zone(),
         }
     }
@@ -627,11 +627,15 @@ fn default_request_timeout() -> u64 {
 }
 
 fn default_max_body_size_mb() -> usize {
-    20
+    32
 }
 
 fn default_cors_allowed_origins() -> Vec<String> {
     vec!["*".to_string()]
+}
+
+fn default_node_label_opt() -> Option<String> {
+    Some("cameodb".to_string())
 }
 
 fn default_node_zone() -> String {
@@ -648,7 +652,7 @@ fn default_wal_segment_size_mb() -> usize {
     64
 }
 fn default_default_batch_size() -> usize {
-    1000
+    200
 }
 
 fn default_num_shards_init() -> usize {
