@@ -172,8 +172,8 @@ services:
               proxy_pass http://cameodb_cluster;
               proxy_set_header Host $$host;
               proxy_set_header X-Real-IP $$remote_addr;
-              proxy_read_timeout 300s;
-              proxy_send_timeout 300s;
+              proxy_read_timeout 120s;
+              proxy_send_timeout 120s;
               proxy_request_buffering off;
           }
       }' > /etc/nginx/conf.d/default.conf &&

@@ -244,8 +244,12 @@ async fn create_production_swarm(
 
     info!("🔐 Node identity: {}", peer_id);
 
-    // Get optimized listen address using configured interfaces (fallback to 0.0.0.0)
-    let listen_addr = resolve_listen_address(&config.listen_addrs, config.cluster_port)?;
+    // Get optimized listen address using configured bind + interfaces (fallback handled inside)
+    let listen_addr = resolve_listen_address(
+        &config.bind_address,
+        &config.listen_addrs,
+        config.cluster_port,
+    )?;
 
     // Create custom network behaviour with production settings
     let behaviour = DhtBehaviour::new(
@@ -429,7 +433,8 @@ pub fn load_or_generate_keypair(storage_path: &Path) -> Result<(Keypair, NodeIde
     Ok((keypair, identity))
 }
 
-/// Convert IP:port format seed nodes to full multiaddr format
+/// Convert seed nodes to prioritized multiaddr list.
+/// Preference per node: ip4 -> dns4 -> ip6 -> dns6 (only variants that apply are emitted).
 fn convert_seed_nodes_to_multiaddrs(seed_nodes: &[String]) -> Vec<Multiaddr> {
     use std::net::IpAddr;
 
@@ -447,23 +452,38 @@ fn convert_seed_nodes_to_multiaddrs(seed_nodes: &[String]) -> Vec<Multiaddr> {
                     host
                 };
 
-                // Determine protocol based on whether host is an IP or DNS name
-                let multiaddr_str = match clean_host.parse::<IpAddr>() {
-                    Ok(IpAddr::V4(_)) => format!("/ip4/{}/tcp/{}", clean_host, port_num),
-                    Ok(IpAddr::V6(_)) => format!("/ip6/{}/tcp/{}", clean_host, port_num),
-                    Err(_) => format!("/dns/{}/tcp/{}", clean_host, port_num),
-                };
-
-                match multiaddr_str.parse::<Multiaddr>() {
-                    Ok(addr) => {
-                        info!("✅ Converted bootstrap node {} to {}", node, addr);
-                        multiaddrs.push(addr);
+                match clean_host.parse::<IpAddr>() {
+                    Ok(IpAddr::V4(_)) => {
+                        let addr = format!("/ip4/{}/tcp/{}", clean_host, port_num);
+                        if let Ok(ma) = addr.parse::<Multiaddr>() {
+                            info!("✅ Converted bootstrap node {} to {}", node, ma);
+                            multiaddrs.push(ma);
+                        }
                     }
-                    Err(e) => {
-                        warn!(
-                            "⚠️  Failed to parse bootstrap node '{}' as multiaddr: {}",
-                            node, e
-                        );
+                    Ok(IpAddr::V6(_)) => {
+                        let addr = format!("/ip6/{}/tcp/{}", clean_host, port_num);
+                        if let Ok(ma) = addr.parse::<Multiaddr>() {
+                            info!("✅ Converted bootstrap node {} to {}", node, ma);
+                            multiaddrs.push(ma);
+                        }
+                    }
+                    Err(_) => {
+                        // Hostname: emit dns4 then dns6 to bias IPv4 first
+                        let addr4 = format!("/dns4/{}/tcp/{}", clean_host, port_num);
+                        if let Ok(ma) = addr4.parse::<Multiaddr>() {
+                            info!("✅ Converted bootstrap node {} to {}", node, ma);
+                            multiaddrs.push(ma);
+                        } else {
+                            warn!(
+                                "⚠️  Failed to parse bootstrap node '{}' as dns4 multiaddr",
+                                node
+                            );
+                        }
+
+                        let addr6 = format!("/dns6/{}/tcp/{}", clean_host, port_num);
+                        if let Ok(ma) = addr6.parse::<Multiaddr>() {
+                            multiaddrs.push(ma);
+                        }
                     }
                 }
             } else {
