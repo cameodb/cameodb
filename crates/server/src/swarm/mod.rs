@@ -155,6 +155,7 @@ struct SwarmRuntimeMetrics {
     kademlia_updates: u64,
     connections_established: u64,
     connections_closed: u64,
+    bootstrapped: bool,
 }
 
 impl SwarmRuntimeMetrics {
@@ -371,21 +372,8 @@ async fn create_production_swarm(
         config.seed_nodes.len()
     );
 
-    // Bootstrap Kademlia DHT only when we have at least one non-self connected peer.
-    let has_connected_peer = swarm.connected_peers().any(|p| p != &peer_id);
-    if connected_peers > 0 && has_connected_peer {
-        match swarm.behaviour_mut().bootstrap_kademlia() {
-            Ok(_) => info!(
-                "🚀 Kademlia DHT bootstrap initiated with {} seed nodes",
-                connected_peers
-            ),
-            Err(e) => warn!("⚠️  Kademlia bootstrap failed: {}", e),
-        }
-    } else if connected_peers > 0 {
-        info!(
-            "⌛ Seed dials started but no peers connected yet; deferring bootstrap until a peer connects"
-        );
-    } else {
+    // Bootstrap is deferred to the swarm runtime and will trigger on first non-self peer connect.
+    if connected_peers == 0 {
         info!("📋 No seed nodes available - running in standalone mode");
     }
 
@@ -683,6 +671,34 @@ fn handle_swarm_event(
                 peer_id,
                 established_in.as_millis()
             );
+
+            // Trigger bootstrap on first non-self peer connection
+            if !metrics.bootstrapped && peer_id != *swarm.local_peer_id() {
+                let kad_has_peer = {
+                    let kad = &mut swarm.behaviour_mut().kademlia;
+                    kad.kbuckets().any(|b| !b.is_empty())
+                };
+
+                if kad_has_peer {
+                    match swarm.behaviour_mut().bootstrap_kademlia() {
+                        Ok(_) => {
+                            metrics.bootstrapped = true;
+                            info!(
+                                "🚀 Kademlia DHT bootstrap triggered on first peer connect ({})",
+                                peer_id
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "⚠️  Deferred bootstrap failed on peer connect {}: {}",
+                                peer_id, e
+                            );
+                        }
+                    }
+                } else {
+                    info!("⌛ Deferring bootstrap: Kademlia has no known peers yet");
+                }
+            }
         }
         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
             metrics.connections_closed += 1;

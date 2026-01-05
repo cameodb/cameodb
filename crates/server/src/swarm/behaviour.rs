@@ -167,6 +167,13 @@ impl DhtBehaviour {
 
     /// Bootstrap the Kademlia DHT
     pub fn bootstrap_kademlia(&mut self) -> Result<(), anyhow::Error> {
+        // Skip bootstrap if we have no peers; prevents noisy "No known peers" warnings in standalone mode
+        let has_peer = self.kademlia.kbuckets().any(|b| !b.is_empty());
+        if !has_peer {
+            info!("⌛ Skipping Kademlia bootstrap: no known peers");
+            return Ok(());
+        }
+
         info!("🚀 Bootstrapping Kademlia DHT");
         match self.kademlia.bootstrap() {
             Ok(_id) => Ok(()),

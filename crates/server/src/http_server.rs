@@ -87,7 +87,7 @@ pub struct HealthResponse {
 
     // Cluster-wide status
     pub cluster_name: Option<String>,
-    pub distributed_enabled: Option<bool>,
+    pub cluster_enabled: Option<bool>,
     pub total_nodes: Option<usize>,
     pub connected_nodes: Option<usize>,
     pub cluster_total_shards: Option<usize>,
@@ -380,7 +380,7 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
         node_id: identity.uuid.to_string(),
         node_name: identity.name.clone(),
         cluster_name: cluster_status.as_ref().map(|s| s.cluster_name.clone()),
-        distributed_enabled: cluster_status.as_ref().map(|s| s.distributed_enabled),
+        cluster_enabled: cluster_status.as_ref().map(|s| s.cluster_enabled),
         total_nodes: cluster_status.as_ref().map(|s| s.total_nodes),
         connected_nodes: cluster_status.as_ref().map(|s| s.connected_nodes),
         cluster_total_shards: cluster_status.as_ref().map(|s| s.total_shards),

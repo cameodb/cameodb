@@ -77,7 +77,7 @@ pub struct HealthResponse {
     pub node_id: String,
     pub active_shards: usize,
     pub cluster_name: Option<String>,
-    pub distributed_enabled: Option<bool>,
+    pub cluster_enabled: Option<bool>,
     pub total_nodes: Option<usize>,
     pub connected_nodes: Option<usize>,
 }
