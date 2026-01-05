@@ -675,7 +675,7 @@ fn default_memory_pressure_threshold_percent() -> u8 {
     80
 }
 fn default_search_threads() -> usize {
-    num_cpus::get()
+    8
 }
 fn default_search_limit() -> usize {
     10
