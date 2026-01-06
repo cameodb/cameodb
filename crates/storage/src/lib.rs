@@ -495,7 +495,7 @@ impl HybridStore {
     }
 
     /// Get operation count for an index since last commit
-    fn get_operations_count(&self, index: &str) -> u64 {
+    pub fn get_operations_count(&self, index: &str) -> u64 {
         let counter_map = self.operations_counter.read().unwrap();
         if let Some(counter) = counter_map.get(index) {
             return counter.load(Ordering::SeqCst);
@@ -529,27 +529,32 @@ impl HybridStore {
         }
     }
 
+    /// Force a commit for a specific index
+    pub fn commit_index(&self, index: &str) -> Result<(), StoreError> {
+        let writers = self.writers.read().unwrap();
+        if let Some(writer_arc) = writers.get(index) {
+            let mut writer = writer_arc.lock().unwrap();
+            writer.commit()?;
+            self.reset_operations_counter(index);
+
+            // Refresh budget cache after commit since index size likely changed
+            let index_path = self.config.shard_path.join("indices").join(index);
+            let new_budget = self.config.get_optimal_memory_budget(&index_path);
+            let mut cache = self.budget_cache.write().unwrap();
+            cache.insert(index.to_string(), new_budget);
+        }
+        Ok(())
+    }
+
     /// Perform smart commit based on operation count
     fn maybe_commit_writer(&self, index: &str) -> Result<bool, StoreError> {
         let ops_count = self.get_operations_count(index);
 
         if self.should_commit_writer(index, ops_count) {
-            let writers = self.writers.read().unwrap();
-            if let Some(writer_arc) = writers.get(index) {
-                let mut writer = writer_arc.lock().unwrap();
-                writer.commit()?;
-                self.reset_operations_counter(index);
-
-                // Refresh budget cache after commit since index size likely changed
-                let index_path = self.config.shard_path.join("indices").join(index);
-                let new_budget = self.config.get_optimal_memory_budget(&index_path);
-                let mut cache = self.budget_cache.write().unwrap();
-                cache.insert(index.to_string(), new_budget);
-
-                return Ok(true); // Commit performed
-            }
+            self.commit_index(index)?;
+            return Ok(true);
         }
-        Ok(false) // No commit needed
+        Ok(false)
     }
 
     /// Multi-tenant apply_write method

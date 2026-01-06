@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, RwLock,
+    Arc,
     atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
 };
 use std::time::{Duration, Instant};
@@ -30,7 +30,7 @@ use kameo::message::{Context, Message};
 use kameo::{Actor, RemoteActor, remote_message};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock as AsyncRwLock, mpsc};
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
@@ -333,6 +333,8 @@ pub struct MicroshardActor {
     shard_id: Uuid,
     store: Option<Arc<HybridStore>>,
     storage_config: StorageConfig,
+    /// Track active supervision tasks per index
+    supervisors: Arc<AsyncRwLock<HashMap<String, mpsc::Sender<()>>>>,
 }
 
 impl std::fmt::Debug for MicroshardActor {
@@ -351,6 +353,7 @@ impl MicroshardActor {
             shard_id,
             store: None,
             storage_config,
+            supervisors: Arc::new(AsyncRwLock::new(HashMap::new())),
         }
     }
 
@@ -408,6 +411,63 @@ impl MicroshardActor {
             hits: results,
             total_hits,
         })
+    }
+
+    /// Signal the supervisor for a specific index that a write has occurred.
+    /// Spawns a new supervisor if one doesn't exist.
+    async fn signal_supervisor(&self, index: String) {
+        let store = match self.store.as_ref() {
+            Some(s) => s.clone(),
+            None => return,
+        };
+
+        // Check if data is actually pending
+        if store.get_operations_count(&index) == 0 {
+            return;
+        }
+
+        let mut supervisors = self.supervisors.write().await;
+        if let Some(tx) = supervisors.get(&index) {
+            // Signal existing supervisor to reset its timer
+            let _ = tx.try_send(());
+        } else {
+            // Spawn new supervisor task
+            // Larger buffer to avoid dropping reset signals during bursts
+            let (tx, mut rx) = mpsc::channel(64);
+            let index_clone = index.clone();
+            let timeout_dur = Duration::from_secs(5); // Default 5s idle timeout
+            let supervisors_arc = self.supervisors.clone();
+
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = rx.recv() => {
+                            // Signal received, timer implicitly resets by continuing loop
+                            continue;
+                        }
+                        _ = tokio::time::sleep(timeout_dur) => {
+                            // Timer expired without a signal, trigger commit
+                            let index_inner = index_clone.clone();
+                            let store_inner = store.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if let Err(e) = store_inner.commit_index(&index_inner) {
+                                    error!(index = %index_inner, error = %e, "Supervisor failed to commit index");
+                                } else {
+                                    info!(index = %index_inner, "Supervisor successfully committed index after idle timeout");
+                                }
+                            }).await;
+
+                            // Self-cleanup from the supervisors map
+                            let mut supervisors = supervisors_arc.write().await;
+                            supervisors.remove(&index_clone);
+                            break;
+                        }
+                    }
+                }
+            });
+
+            supervisors.insert(index, tx);
+        }
     }
 
     /// Handles streaming search requests using channel bridge pattern.
@@ -520,6 +580,9 @@ impl MicroshardActor {
                 _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
             })?;
 
+        // Signal supervisor for this index
+        self.signal_supervisor(request.index).await;
+
         Ok(seq_id)
     }
 
@@ -586,6 +649,10 @@ impl MicroshardActor {
             }
         }
 
+        // Collect unique indices from grouped ops
+        let unique_indices: std::collections::HashSet<String> =
+            ops_by_index.keys().cloned().collect();
+
         // Use spawn_blocking to execute batch write on blocking thread pool
         let all_seq_ids = tokio::task::spawn_blocking(move || {
             let mut all_results = Vec::new();
@@ -601,6 +668,11 @@ impl MicroshardActor {
             StoreError::Io(io_err) => OrchestratorError::Io(io_err),
             _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
         })?;
+
+        // Signal supervisors for all indices in the batch
+        for index in unique_indices {
+            self.signal_supervisor(index).await;
+        }
 
         Ok(all_seq_ids)
     }
@@ -1534,7 +1606,7 @@ pub struct NodeOrchestrator {
     /// Optional coordinator reference for shard registration
     coordinator: Option<ActorRef<ClusterCoordinator>>,
     /// Per-index schema cache to avoid repeated metadata reads
-    schema_cache: RwLock<HashMap<String, IndexSchema>>,
+    schema_cache: AsyncRwLock<HashMap<String, IndexSchema>>,
     /// Default search result limit when not specified in request
     default_search_limit: usize,
 }
@@ -1587,18 +1659,15 @@ impl NodeOrchestrator {
     }
 
     /// Fetch a schema from cache if present.
-    fn get_cached_schema(&self, index: &str) -> Option<IndexSchema> {
-        self.schema_cache
-            .read()
-            .ok()
-            .and_then(|map| map.get(index).cloned())
+    async fn get_cached_schema(&self, index: &str) -> Option<IndexSchema> {
+        let map = self.schema_cache.read().await;
+        map.get(index).cloned()
     }
 
     /// Insert or replace a schema in the cache.
-    fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
-        if let Ok(mut map) = self.schema_cache.write() {
-            map.insert(index.to_string(), schema.clone());
-        }
+    async fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
+        let mut map = self.schema_cache.write().await;
+        map.insert(index.to_string(), schema.clone());
     }
 
     fn default_shard_count(&self) -> u32 {
@@ -1671,7 +1740,7 @@ impl NodeOrchestrator {
             routing_ring: ConsistentRing::new(),
             round_robin_counter: AtomicUsize::new(0),
             coordinator: None,
-            schema_cache: RwLock::new(HashMap::new()),
+            schema_cache: AsyncRwLock::new(HashMap::new()),
             default_search_limit,
         };
 
@@ -1987,7 +2056,7 @@ impl NodeOrchestrator {
 
         // Clear schema cache for this index
         {
-            let mut cache = self.schema_cache.write().unwrap();
+            let mut cache = self.schema_cache.write().await;
             cache.remove(index);
         }
 
@@ -2019,7 +2088,7 @@ impl NodeOrchestrator {
         let updated =
             validate_and_evolve_schema(index, &doc, &mut schema_cache, &self.shards).await?;
         if updated {
-            self.put_cached_schema(index, &schema_cache);
+            self.put_cached_schema(index, &schema_cache).await;
         }
 
         // Derive effective routing key:
@@ -2082,7 +2151,7 @@ impl NodeOrchestrator {
 
         // Update cache once after processing all docs
         if schema_updated {
-            self.put_cached_schema(index, &schema_cache);
+            self.put_cached_schema(index, &schema_cache).await;
         }
 
         // Group documents by target shard using the same routing key strategy
@@ -2339,7 +2408,7 @@ impl NodeOrchestrator {
         }
 
         let shard_count = schema.shard_count;
-        self.put_cached_schema(index, &schema);
+        self.put_cached_schema(index, &schema).await;
 
         Ok(serde_json::json!({
             "acknowledged": true,
@@ -2350,7 +2419,7 @@ impl NodeOrchestrator {
     }
 
     async fn orch_get_config(&self, index: &str) -> Result<JsonValue, OrchestratorError> {
-        if let Some(cached) = self.get_cached_schema(index) {
+        if let Some(cached) = self.get_cached_schema(index).await {
             let field_names = Self::sorted_field_names(&cached);
             let fields = Self::sorted_fields_map(&cached);
             let shard_count = self.default_shard_count();
@@ -2370,7 +2439,7 @@ impl NodeOrchestrator {
                 if let Some(s) = schema {
                     let field_names = Self::sorted_field_names(&s);
                     let fields = Self::sorted_fields_map(&s);
-                    self.put_cached_schema(index, &s);
+                    self.put_cached_schema(index, &s).await;
                     let shard_count = self.default_shard_count();
                     return Ok(Self::schema_response(field_names, fields, shard_count));
                 }
@@ -2447,7 +2516,7 @@ impl NodeOrchestrator {
 
     /// Helper: Load schema from first shard
     async fn load_schema(&self, index: &str) -> Result<IndexSchema, OrchestratorError> {
-        if let Some(cached) = self.get_cached_schema(index) {
+        if let Some(cached) = self.get_cached_schema(index).await {
             return Ok(cached);
         }
 
@@ -2460,7 +2529,7 @@ impl NodeOrchestrator {
                     .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
                     .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
                 if let Some(schema) = schema {
-                    self.put_cached_schema(index, &schema);
+                    self.put_cached_schema(index, &schema).await;
                     return Ok(schema);
                 }
             }
