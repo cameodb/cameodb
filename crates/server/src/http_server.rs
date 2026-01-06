@@ -112,7 +112,12 @@ pub struct AppState {
 }
 
 /// Creates the main HTTP router with all endpoints and middleware
-pub fn create_router(state: AppState) -> Router {
+///
+/// # Arguments
+/// * `state` - Application state with actor references
+/// * `max_body_size_mb` - Maximum request body size in MB (from config)
+pub fn create_router(state: AppState, max_body_size_mb: usize) -> Router {
+    let body_limit_bytes = max_body_size_mb * 1024 * 1024;
     Router::new()
         // API routes
         .route("/api/{index}/search", post(search_handler))
@@ -135,7 +140,7 @@ pub fn create_router(state: AppState) -> Router {
         .layer(CompressionLayer::new())
         // Allow compressed requests
         .layer(DecompressionLayer::new())
-        .layer(RequestBodyLimitLayer::new(20 * 1024 * 1024)) // 20MB limit
+        .layer(RequestBodyLimitLayer::new(body_limit_bytes))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
 }

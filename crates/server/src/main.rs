@@ -260,8 +260,8 @@ async fn main() -> Result<()> {
         coordinator: coordinator_actor.clone(),
     };
 
-    // Create the HTTP router with shared state
-    let app = create_router(app_state);
+    // Create the HTTP router with shared state and configured body limit
+    let app = create_router(app_state, cameodb_config.network.http.max_body_size_mb);
 
     // Extract HTTP configuration
     let http_config = &cameodb_config.network.http;

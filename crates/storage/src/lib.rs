@@ -382,6 +382,55 @@ impl HybridStore {
         Ok(SchemaFields { id, indexed_fields })
     }
 
+    /// Derive IndexSchema from a Tantivy index's schema.
+    /// This reads back the actual persisted schema from Tantivy and converts it
+    /// to our IndexSchema format, ensuring we're in sync with what Tantivy has.
+    fn derive_index_schema_from_tantivy(tantivy_index: &Index, shard_count: u32) -> IndexSchema {
+        use tantivy::schema::FieldType;
+
+        let schema = tantivy_index.schema();
+        let mut fields = HashMap::new();
+
+        for (_field, field_entry) in schema.fields() {
+            let name = field_entry.name();
+            if name == "id" {
+                continue; // Skip the id field, it's implicit
+            }
+
+            let field_type = match field_entry.field_type() {
+                FieldType::Str(_) => {
+                    // Check if it uses raw tokenizer (exact/boolean) or default (text)
+                    // For simplicity, we'll mark all text as "text" - the tokenizer info
+                    // is in the indexing options but we preserve the type
+                    "text".to_string()
+                }
+                FieldType::U64(_) => "u64".to_string(),
+                FieldType::I64(_) => "i64".to_string(),
+                FieldType::F64(_) => "f64".to_string(),
+                FieldType::Bool(_) => "boolean".to_string(),
+                FieldType::Date(_) => "date".to_string(),
+                FieldType::Bytes(_) => "bytes".to_string(),
+                FieldType::JsonObject(_) => "json".to_string(),
+                FieldType::IpAddr(_) => "ip".to_string(),
+                FieldType::Facet(_) => "facet".to_string(),
+            };
+
+            fields.insert(
+                name.to_string(),
+                FieldDef {
+                    name: name.to_string(),
+                    field_type,
+                    indexed: true, // All fields in Tantivy schema are indexed
+                },
+            );
+        }
+
+        IndexSchema {
+            shard_count,
+            fields,
+        }
+    }
+
     /// Helper method: get_or_create_index
     fn get_or_create_index(
         &self,
@@ -405,21 +454,23 @@ impl HybridStore {
             .get_schema_cached(index)?
             .unwrap_or_else(|| Arc::new(IndexSchema::default()));
 
-        let (schema, fields) = Self::create_schema_from_definition(&index_schema);
+        let (schema, _) = Self::create_schema_from_definition(&index_schema);
 
-        // Create or open tantivy index
-        let tantivy_index = if index_path.join("meta.json").exists() {
-            Index::open_in_dir(&index_path)?
+        // Create or open tantivy index, and get the correct field handles
+        let (tantivy_index, fields, sync_schema) = if index_path.join("meta.json").exists() {
+            // Opening existing index: must use Field handles from the opened index's schema
+            let opened_index = Index::open_in_dir(&index_path)?;
+            let fields = Self::load_fields_from_existing_index(&opened_index)?;
+            (opened_index, fields, false)
         } else {
+            // Creating new index: use the schema and fields we just built
             fs::create_dir_all(&index_path)?;
-            Index::create_in_dir(&index_path, schema)?
-        };
+            let new_index = Index::create_in_dir(&index_path, schema)?;
 
-        // For existing indexes, reload fields from disk to match stored schema
-        let fields = if index_path.join("meta.json").exists() {
-            Self::load_fields_from_existing_index(&tantivy_index)?
-        } else {
-            fields
+            // After creating the index, read back the actual Tantivy schema and sync it.
+            // This ensures our cached schema matches exactly what Tantivy persisted.
+            let fields = Self::load_fields_from_existing_index(&new_index)?;
+            (new_index, fields, true)
         };
 
         // Create writer with dynamic memory budget based on index size
@@ -441,6 +492,20 @@ impl HybridStore {
         {
             let mut fields_cache = self.fields_cache.write().unwrap();
             fields_cache.insert(index.to_string(), fields.clone());
+        }
+
+        // If we just created a new index, sync our cached schema with what Tantivy persisted.
+        // This ensures our IndexSchema exactly matches the Tantivy schema (which is immutable).
+        if sync_schema {
+            let synced_schema =
+                Self::derive_index_schema_from_tantivy(&tantivy_index, index_schema.shard_count);
+            // Update the in-memory schema cache
+            {
+                let mut schema_cache = self.schema_cache.write().unwrap();
+                schema_cache.insert(index.to_string(), Arc::new(synced_schema.clone()));
+            }
+            // Persist the synced schema to redb
+            self.store_schema(index, &synced_schema)?;
         }
 
         // Initialize sequence counter for this index if needed
@@ -963,18 +1028,19 @@ impl HybridStore {
         }
     }
 
-    /// Get SchemaFields from cache or derive from an existing Tantivy index.
+    /// Get SchemaFields from cache or derive from the opened Tantivy index.
+    /// Field handles must come from the actual opened index to be valid.
     fn get_fields_for_index(
         &self,
         index: &str,
         tantivy_index: &Index,
     ) -> Result<SchemaFields, StoreError> {
-        // Fast path: cache
+        // Fast path: fields already cached
         if let Some(fields) = self.fields_cache.read().unwrap().get(index).cloned() {
             return Ok(fields);
         }
 
-        // Slow path: derive from index and cache
+        // Derive fields from the opened Tantivy index (Field handles must match the index)
         let fields = Self::load_fields_from_existing_index(tantivy_index)?;
         {
             let mut cache = self.fields_cache.write().unwrap();

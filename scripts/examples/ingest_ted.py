@@ -97,7 +97,8 @@ def build_document(row: Dict[str, str]) -> Optional[Dict[str, Any]]:
         "view_count": safe_int(row.get("viewCount"), default=0),
         "like_count": safe_int(row.get("likeCount"), default=0),
         "comment_count": safe_int(row.get("commentCount"), default=0),
-        "caption": parse_bool(row.get("caption", "false")),
+        # Force caption to text to avoid schema inference as boolean
+        "caption": "true" if parse_bool(row.get("caption", "false")) else "false",
         "published_at": parse_datetime(row.get("release_date", ""), row.get("release_time", "")),
         "duration_seconds": parse_duration_to_seconds(row.get("duration", "")),
     }
