@@ -17,6 +17,9 @@ services:
     # Permissions: Distroless nonroot user
     user: "65532:65532"
 
+    environment:
+      - RUST_LOG=debug
+      
     # RUNTIME VOLUMES
     # Note: No certificates here. Only Config and Data.
     volumes:
