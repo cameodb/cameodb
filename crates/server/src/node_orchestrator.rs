@@ -449,18 +449,25 @@ impl MicroshardActor {
                             // Timer expired without a signal, trigger commit
                             let index_inner = index_clone.clone();
                             let store_inner = store.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
+                            let commit_ok = tokio::task::spawn_blocking(move || {
                                 if let Err(e) = store_inner.commit_index(&index_inner) {
                                     error!(index = %index_inner, error = %e, "Supervisor failed to commit index");
+                                    false
                                 } else {
                                     info!(index = %index_inner, "Supervisor successfully committed index after idle timeout");
+                                    true
                                 }
-                            }).await;
+                            }).await.unwrap_or(false);
 
-                            // Self-cleanup from the supervisors map
-                            let mut supervisors = supervisors_arc.write().await;
-                            supervisors.remove(&index_clone);
-                            break;
+                            if commit_ok {
+                                // Self-cleanup from the supervisors map
+                                let mut supervisors = supervisors_arc.write().await;
+                                supervisors.remove(&index_clone);
+                                break;
+                            } else {
+                                // Keep supervisor alive; next signal resets timer, next timeout retries
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1441,19 +1448,24 @@ impl RouterActor {
                 }
 
                 // Convert to JSON array
-                let cluster_indexes: Vec<JsonValue> = index_map
+                let mut cluster_indexes: Vec<(String, JsonValue)> = index_map
                     .into_values()
                     .map(|stats| {
-                        serde_json::json!({
+                        let name = stats.name.clone();
+                        let json = serde_json::json!({
                             "name": stats.name,
                             "document_count": stats.document_count,
                             "total_size_bytes": stats.total_size_bytes,
                             "size_mb": stats.total_size_bytes / (1024 * 1024),
                             "shard_count": stats.shard_count,
                             "field_names": stats.field_names,
-                        })
+                        });
+                        (name, json)
                     })
                     .collect();
+                cluster_indexes.sort_by(|a, b| a.0.cmp(&b.0));
+                let cluster_indexes: Vec<JsonValue> =
+                    cluster_indexes.into_iter().map(|(_, json)| json).collect();
 
                 Ok(serde_json::json!({
                     "indexes": cluster_indexes,
@@ -2326,7 +2338,8 @@ impl NodeOrchestrator {
             }
         }
 
-        results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by score descending
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(limit);
         let hits: Vec<JsonValue> = results
             .into_iter()
@@ -2484,7 +2497,7 @@ impl NodeOrchestrator {
                 }
             }
         }
-        let indexes: Vec<JsonValue> = all
+        let mut indexes: Vec<(String, JsonValue)> = all
             .into_iter()
             .map(|(n, (d, s, mut f, c))| {
                 // Sort fields by name, with "id" (if present) always first.
@@ -2495,16 +2508,19 @@ impl NodeOrchestrator {
                     _ => a.cmp(b),
                 });
 
-                serde_json::json!({
+                let json = serde_json::json!({
                     "name": n,
                     "document_count": d,
                     "total_size_bytes": s,
                     "size_mb": s/(1024*1024),
                     "shard_count": c,
                     "field_names": f,
-                })
+                });
+                (n, json)
             })
             .collect();
+        indexes.sort_by(|a, b| a.0.cmp(&b.0));
+        let indexes: Vec<JsonValue> = indexes.into_iter().map(|(_, json)| json).collect();
         Ok(serde_json::json!({
             "indexes": indexes,
             "total_indexes": indexes.len(),
