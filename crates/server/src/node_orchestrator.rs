@@ -20,7 +20,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
 };
 use std::time::{Duration, Instant};
 
@@ -1613,8 +1613,6 @@ pub struct NodeOrchestrator {
     config: NodeConfig,
     /// Consistent hash ring for routing writes based on routing keys
     routing_ring: ConsistentRing,
-    /// Round-robin counter for writes without routing key
-    round_robin_counter: AtomicUsize,
     /// Optional coordinator reference for shard registration
     coordinator: Option<ActorRef<ClusterCoordinator>>,
     /// Per-index schema cache to avoid repeated metadata reads
@@ -1750,7 +1748,6 @@ impl NodeOrchestrator {
             identity,
             config,
             routing_ring: ConsistentRing::new(),
-            round_robin_counter: AtomicUsize::new(0),
             coordinator: None,
             schema_cache: AsyncRwLock::new(HashMap::new()),
             default_search_limit,
@@ -1977,20 +1974,6 @@ impl NodeOrchestrator {
         self.shards.keys().copied().next()
     }
 
-    /// Selects a shard using round-robin distribution.
-    fn select_shard_round_robin(&self) -> Option<Uuid> {
-        if self.shards.is_empty() {
-            return None;
-        }
-
-        let shard_ids: Vec<Uuid> = self.shards.keys().copied().collect();
-        let index = self
-            .round_robin_counter
-            .fetch_add(1, AtomicOrdering::Relaxed)
-            % shard_ids.len();
-        Some(shard_ids[index])
-    }
-
     /// Gets the number of active shards.
     pub fn shard_count(&self) -> usize {
         self.shards.len()
@@ -2103,12 +2086,13 @@ impl NodeOrchestrator {
             self.put_cached_schema(index, &schema_cache).await;
         }
 
-        // Derive effective routing key:
-        // 1) explicit routing_key from payload (if provided)
-        // 2) fallback to document id field (doc["id"])
-        // 3) fallback to deterministic key derived from document bytes
+        // Derive effective routing key (deterministic priority):
+        // 1) Explicit routing_key from payload
+        // 2) Document id argument
+        // 3) Fallback to deterministic key derived from document bytes
         let effective_routing_key = routing_key
             .clone()
+            .or_else(|| (!id.is_empty()).then(|| id.clone()))
             .or_else(|| derive_routing_key_from_doc(&doc));
 
         let target = self.route_write(&effective_routing_key)?;
@@ -2175,6 +2159,7 @@ impl NodeOrchestrator {
             let effective_routing_key = doc
                 .routing_key
                 .clone()
+                .or_else(|| (!doc.id.is_empty()).then(|| doc.id.clone()))
                 .or_else(|| derive_routing_key_from_doc(&doc.doc));
 
             match self.route_write(&effective_routing_key) {
@@ -2556,14 +2541,19 @@ impl NodeOrchestrator {
         })
     }
 
-    /// Helper: Route write to shard
+    /// Helper: Route write to shard using deterministic key (no round-robin).
     fn route_write(&self, routing_key: &Option<String>) -> Result<Uuid, OrchestratorError> {
-        let target = if let Some(key) = routing_key {
-            self.select_shard_for_key(key)
-                .or_else(|| self.first_shard_id())
-        } else {
-            self.select_shard_round_robin()
-        };
+        let key = routing_key.as_ref().ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Missing routing key for write",
+            ))
+        })?;
+
+        let target = self
+            .select_shard_for_key(key)
+            .or_else(|| self.first_shard_id());
+
         target.ok_or_else(|| {
             OrchestratorError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -2580,17 +2570,11 @@ impl NodeOrchestrator {
 /// 2. Otherwise, serialize the document to JSON bytes, take a prefix,
 ///    and hex-encode it to produce a stable routing key string.
 fn derive_routing_key_from_doc(doc: &JsonValue) -> Option<String> {
-    // Prefer explicit id field in the document body
-    if let Some(id_value) = doc.get("id").and_then(|v| v.as_str())
-        && !id_value.is_empty()
-    {
-        return Some(id_value.to_string());
-    }
-
     // Fallback: derive from JSON bytes (deterministic for same document)
     let mut bytes = serde_json::to_vec(doc).ok()?;
     if bytes.is_empty() {
-        return None;
+        // Use a fixed token to remain deterministic for empty objects
+        return Some("empty-doc".to_string());
     }
 
     // Limit the number of bytes used to keep the key reasonably sized
