@@ -433,7 +433,6 @@ pub enum StoreError {
 pub enum WalOp {
     Put {
         id: String,
-        body: String,
         json_blob: Option<JsonValue>,
     },
     Delete {
@@ -444,14 +443,12 @@ pub enum WalOp {
 /// Helper struct for zero-copy serialization of stored documents
 #[derive(Serialize)]
 struct StoredDoc<'a> {
-    body: &'a str,
     json_blob: Option<&'a JsonValue>,
 }
 
 /// Owned version for deserialization from redb
 #[derive(Deserialize)]
 struct StoredDocOwned {
-    body: String,
     json_blob: Option<JsonValue>,
 }
 
@@ -999,11 +996,7 @@ impl HybridStore {
 
             // Apply to data table
             match op {
-                WalOp::Put {
-                    id,
-                    body,
-                    json_blob,
-                } => {
+                WalOp::Put { id, json_blob } => {
                     // Step 1: Get cached schema for field filtering and evolution
                     let schema = self
                         .get_schema_cached(index)?
@@ -1035,7 +1028,6 @@ impl HybridStore {
 
                     // Step 2: Serialize complete document for redb (all fields)
                     let doc_data = StoredDoc {
-                        body: &body,
                         json_blob: json_blob.as_ref(),
                     };
                     let doc_bytes = serde_json::to_vec(&doc_data)
@@ -1054,13 +1046,6 @@ impl HybridStore {
                         }
 
                         if let Some(tantivy_field) = fields.indexed_fields.get(field_name) {
-                            // Pull value from body (special casing by name) or json_blob map
-                            if field_name == "body" {
-                                tantivy_doc.add_text(*tantivy_field, &body);
-                                continue;
-                            }
-
-                            // For other fields, look into json_blob
                             if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
                                 if let Some(field_value) = json_obj.get(field_name) {
                                     match field_def.field_type {
@@ -1676,7 +1661,6 @@ impl HybridStore {
                 // Build complete JSON document with all fields
                 let mut complete_doc = serde_json::json!({
                     "id": doc_id,
-                    "body": stored_doc.body,
                 });
 
                 // Merge json_blob fields into root document
@@ -1744,11 +1728,7 @@ impl HybridStore {
 
                 // Apply to data table and prepare tantivy operations
                 match op {
-                    WalOp::Put {
-                        id,
-                        body,
-                        json_blob,
-                    } => {
+                    WalOp::Put { id, json_blob } => {
                         // Step 1: Get cached schema for field filtering
                         let schema = self
                             .get_schema_cached(index)?
@@ -1756,7 +1736,6 @@ impl HybridStore {
 
                         // Step 2: Serialize complete document for redb (all fields)
                         let doc_data = StoredDoc {
-                            body: &body,
                             json_blob: json_blob.as_ref(),
                         };
                         let doc_bytes = serde_json::to_vec(&doc_data)
@@ -1774,11 +1753,6 @@ impl HybridStore {
                             }
 
                             if let Some(tantivy_field) = fields.indexed_fields.get(field_name) {
-                                if field_name == "body" {
-                                    tantivy_doc.add_text(*tantivy_field, &body);
-                                    continue;
-                                }
-
                                 if let Some(json_obj) =
                                     json_blob.as_ref().and_then(|v| v.as_object())
                                     && let Some(field_value) = json_obj.get(field_name)
@@ -2171,7 +2145,6 @@ mod tests {
         // Write to index1
         let op1 = WalOp::Put {
             id: "doc1".to_string(),
-            body: "content for index1".to_string(),
             json_blob: None,
         };
         let seq1 = store.apply_write("index1", op1).unwrap();
@@ -2180,7 +2153,6 @@ mod tests {
         // Write to index2
         let op2 = WalOp::Put {
             id: "doc1".to_string(),
-            body: "content for index2".to_string(),
             json_blob: None,
         };
         let seq2 = store.apply_write("index2", op2).unwrap();

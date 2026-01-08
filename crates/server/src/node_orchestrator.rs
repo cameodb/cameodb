@@ -551,14 +551,9 @@ impl MicroshardActor {
             .to_string();
 
         // Do not synthesize or transform a body; preserve the document as json_blob only.
-        let body = String::new();
         let json_blob = Some(doc.clone());
 
-        let op = WalOp::Put {
-            id,
-            body,
-            json_blob,
-        };
+        let op = WalOp::Put { id, json_blob };
 
         // Use spawn_blocking to execute write on blocking thread pool
         let index = request.index.clone();
@@ -599,13 +594,9 @@ impl MicroshardActor {
             match op {
                 ClientOp::Write { index, id, doc, .. } => {
                     // Do not synthesize or transform a body; preserve the document as json_blob only.
-                    let body = String::new();
-                    let json_blob = Some(doc.clone());
-
                     let wal_op = WalOp::Put {
                         id,
-                        body,
-                        json_blob,
+                        json_blob: Some(doc.clone()),
                     };
 
                     ops_by_index.entry(index).or_default().push(wal_op);
