@@ -56,15 +56,17 @@ def parse_publication_date(date_str: str) -> Optional[str]:
     date_str = (date_str or "").strip()
     if not date_str:
         return None
-    
-    # Handle ISO date format (YYYY-MM-DD)
-    if len(date_str) == 10 and date_str.count('-') == 2:
-        return date_str
-    
-    # Handle year-only format
+
+    # Normalize to RFC3339 so storage infers Tantivy Date
+    # If YYYY-MM-DD provided, append midnight UTC
+    if len(date_str) == 10 and date_str.count("-") == 2:
+        return f"{date_str}T00:00:00Z"
+
+    # If year-only, pick Jan 1st midnight UTC
     if len(date_str) == 4 and date_str.isdigit():
-        return f"{date_str}-01-01"
-    
+        return f"{date_str}-01-01T00:00:00Z"
+
+    # If already RFC3339-ish, return as-is
     return date_str
 
 
