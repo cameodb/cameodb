@@ -59,14 +59,13 @@ def build_document(line: str) -> Optional[Dict[str, Any]]:
     urls = parse_urls(urls_raw)
     if not urls:
         return None
-    doc_body = {
-        "id": sha1,  # required by CameoDB validators
-        "urls": urls,
-    }
     return {
         "id": sha1,
         # routing_key omitted: server will hash `id` for sharding
-        "doc": doc_body,
+        "doc": {
+            "id": sha1,  # required by CameoDB validators
+            "urls": urls,
+        },
     }
 
 

@@ -103,19 +103,6 @@ def build_document(row: Dict[str, str]) -> Optional[Dict[str, Any]]:
         "duration_seconds": parse_duration_to_seconds(row.get("duration", "")),
     }
     
-    # Create searchable body text from key fields
-    body_parts = []
-    if doc_content.get("title"):
-        body_parts.append(doc_content["title"])
-    if doc_content.get("speaker"):
-        body_parts.append(f"Speaker: {doc_content['speaker']}")
-    if doc_content.get("description"):
-        body_parts.append(doc_content["description"])
-    if tags:
-        body_parts.append(f"Tags: {', '.join(tags)}")
-    
-    doc_content["body"] = " | ".join(body_parts)
-    
     # Build the DocPayload format for bulk API
     doc_content["id"] = video_id
 

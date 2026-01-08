@@ -3,6 +3,7 @@
 
 import argparse
 import json
+from datetime import datetime, timezone
 import sys
 import time
 from dataclasses import dataclass
@@ -66,8 +67,14 @@ def parse_publication_date(date_str: str) -> Optional[str]:
     if len(date_str) == 4 and date_str.isdigit():
         return f"{date_str}-01-01T00:00:00Z"
 
-    # If already RFC3339-ish, return as-is
-    return date_str
+    # Attempt to parse arbitrary ISO-like inputs; if parseable, normalize to Z
+    try:
+        dt = datetime.fromisoformat(date_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except ValueError:
+        return None  # Avoid downgrading schema by emitting non-date text
 
 
 def build_document(line: str) -> Optional[Dict[str, Any]]:
@@ -98,19 +105,6 @@ def build_document(line: str) -> Optional[Dict[str, Any]]:
         "genres": genres,
         "summary": summary.strip() if summary else "",
     }
-    
-    # Create searchable body text from key fields
-    body_parts = []
-    if doc_content.get("title"):
-        body_parts.append(doc_content["title"])
-    if doc_content.get("author"):
-        body_parts.append(f"Author: {doc_content['author']}")
-    if doc_content.get("summary"):
-        body_parts.append(doc_content["summary"])
-    if genres:
-        body_parts.append(f"Genres: {', '.join(genres)}")
-    
-    doc_content["body"] = " | ".join(body_parts)
     
     # Use book_id as the document ID
     doc_content["id"] = book_id
