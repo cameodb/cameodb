@@ -44,7 +44,15 @@ def parse_urls(urls_text: str) -> List[str]:
     except (SyntaxError, ValueError):
         return []
     if isinstance(parsed, list):
-        return [str(u) for u in parsed if u]
+        # Deduplicate while preserving order
+        seen = set()
+        deduped = []
+        for u in parsed:
+            u_str = str(u)
+            if u_str and u_str not in seen:
+                seen.add(u_str)
+                deduped.append(u_str)
+        return deduped
     return []
 
 
