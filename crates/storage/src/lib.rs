@@ -97,12 +97,153 @@ impl StorageConfig {
     }
 }
 
+/// Native Tantivy field types with proper enum for type safety.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum TantivyFieldType {
+    /// Tokenized text for full-text search
+    Text,
+    /// Untokenized string (exact match)
+    String,
+    /// 64-bit signed integer
+    I64,
+    /// 64-bit unsigned integer
+    U64,
+    /// 64-bit floating point
+    F64,
+    /// Date/Time (stored as timestamp)
+    Date,
+    /// Boolean (stored as "true"/"false")
+    Boolean,
+    /// Binary data
+    Bytes,
+    /// IP address (IPv4/IPv6)
+    Ip,
+    /// Nested JSON object
+    Json,
+    /// Categorical/facet field
+    Facet,
+}
+
+impl Default for TantivyFieldType {
+    fn default() -> Self {
+        TantivyFieldType::Text
+    }
+}
+
+impl TantivyFieldType {
+    /// Convert to string representation (for serialization)
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            TantivyFieldType::Text => "text",
+            TantivyFieldType::String => "string",
+            TantivyFieldType::I64 => "i64",
+            TantivyFieldType::U64 => "u64",
+            TantivyFieldType::F64 => "f64",
+            TantivyFieldType::Date => "date",
+            TantivyFieldType::Boolean => "boolean",
+            TantivyFieldType::Bytes => "bytes",
+            TantivyFieldType::Ip => "ip",
+            TantivyFieldType::Json => "json",
+            TantivyFieldType::Facet => "facet",
+        }
+    }
+}
+
 /// Field definition for schema evolution and validation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FieldDef {
     pub name: String,
-    pub field_type: String,
+    pub field_type: TantivyFieldType,
     pub indexed: bool,
+    pub stored: bool,
+    pub fast: bool,
+}
+
+impl FieldDef {
+    /// Create a new field definition with sensible defaults
+    pub fn new(name: String, field_type: TantivyFieldType) -> Self {
+        let stored = matches!(
+            field_type,
+            TantivyFieldType::Text | TantivyFieldType::String | TantivyFieldType::Json
+        );
+        let fast = matches!(
+            field_type,
+            TantivyFieldType::I64
+                | TantivyFieldType::U64
+                | TantivyFieldType::F64
+                | TantivyFieldType::Date
+        );
+
+        Self {
+            name,
+            field_type,
+            indexed: true,
+            stored,
+            fast,
+        }
+    }
+
+    /// Infer field type from JSON value for schema evolution
+    pub fn infer_from_value(name: String, value: &JsonValue) -> Self {
+        let field_type = Self::infer_type_from_value(value);
+        Self::new(name, field_type)
+    }
+
+    /// Create a non-indexed field definition for background schema evolution
+    /// New fields discovered during writes are marked as non-indexed to avoid
+    /// requiring Tantivy schema rebuilds. They can be stored in redb and later
+    /// promoted to indexed fields through explicit schema updates.
+    pub fn new_non_indexed(name: String, value: &JsonValue) -> Self {
+        let field_type = Self::infer_type_from_value(value);
+        let stored = matches!(
+            field_type,
+            TantivyFieldType::Text | TantivyFieldType::String | TantivyFieldType::Json
+        );
+        let fast = matches!(
+            field_type,
+            TantivyFieldType::I64
+                | TantivyFieldType::U64
+                | TantivyFieldType::F64
+                | TantivyFieldType::Date
+        );
+
+        Self {
+            name,
+            field_type,
+            indexed: false, // Non-indexed by default for background evolution
+            stored,
+            fast,
+        }
+    }
+
+    /// Infer Tantivy field type from JSON value
+    pub fn infer_type_from_value(value: &JsonValue) -> TantivyFieldType {
+        match value {
+            JsonValue::Number(n) => {
+                if n.is_i64() {
+                    TantivyFieldType::I64
+                } else if n.is_u64() {
+                    TantivyFieldType::U64
+                } else {
+                    TantivyFieldType::F64
+                }
+            }
+            JsonValue::Bool(_) => TantivyFieldType::Boolean,
+            JsonValue::String(s) => {
+                // Check for ISO 8601 date
+                if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+                    TantivyFieldType::Date
+                } else if s.parse::<std::net::IpAddr>().is_ok() {
+                    TantivyFieldType::Ip
+                } else {
+                    TantivyFieldType::Text
+                }
+            }
+            JsonValue::Array(_) => TantivyFieldType::Text, // Arrays as text for compatibility
+            JsonValue::Object(_) => TantivyFieldType::Json, // Nested objects as JSON
+            JsonValue::Null => TantivyFieldType::Text,
+        }
+    }
 }
 
 /// Index schema definition for validation and evolution.
@@ -110,6 +251,114 @@ pub struct FieldDef {
 pub struct IndexSchema {
     pub shard_count: u32,
     pub fields: HashMap<String, FieldDef>,
+}
+
+impl IndexSchema {
+    /// Add or evolve a field based on JSON value (schema evolution)
+    /// New fields are added as non-indexed to avoid Tantivy schema rebuilds.
+    /// Existing fields can have their types evolved if compatible.
+    pub fn evolve_field(&mut self, name: String, value: &JsonValue) -> bool {
+        use std::collections::hash_map::Entry;
+
+        let inferred_type = FieldDef::infer_type_from_value(value);
+
+        match self.fields.entry(name.clone()) {
+            Entry::Vacant(entry) => {
+                // New field - create as non-indexed for background evolution
+                // This allows the field to be stored in redb without requiring
+                // Tantivy schema changes. Fields can be promoted to indexed later.
+                let field_def = FieldDef::new_non_indexed(name, value);
+                entry.insert(field_def);
+                true
+            }
+            Entry::Occupied(mut entry) => {
+                // Existing field - check if type evolution is needed
+                let current_def = entry.get();
+
+                // Only evolve if the inferred type is "more specific" or compatible
+                if Self::should_evolve_field_static(current_def, inferred_type.clone()) {
+                    let mut new_def = current_def.clone();
+                    new_def.field_type = inferred_type;
+                    entry.insert(new_def);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Determine if a field should evolve to a new type (static version to avoid borrowing issues)
+    fn should_evolve_field_static(current: &FieldDef, new_type: TantivyFieldType) -> bool {
+        // Don't evolve if types are the same
+        if current.field_type == new_type {
+            return false;
+        }
+
+        // Evolution rules - only allow certain upgrades
+        match (&current.field_type, new_type) {
+            // Text can be refined to more specific types
+            (TantivyFieldType::Text, TantivyFieldType::Date) => true,
+            (TantivyFieldType::Text, TantivyFieldType::Ip) => true,
+            (TantivyFieldType::Text, TantivyFieldType::I64) => true,
+            (TantivyFieldType::Text, TantivyFieldType::U64) => true,
+            (TantivyFieldType::Text, TantivyFieldType::F64) => true,
+            (TantivyFieldType::Text, TantivyFieldType::Boolean) => true,
+            (TantivyFieldType::Text, TantivyFieldType::Json) => true,
+
+            // Numeric types can be upgraded to more general types
+            (TantivyFieldType::I64, TantivyFieldType::F64) => true,
+            (TantivyFieldType::U64, TantivyFieldType::F64) => true,
+
+            // String can be upgraded to Text (for tokenization)
+            (TantivyFieldType::String, TantivyFieldType::Text) => true,
+
+            _ => false, // Prevent downgrades or incompatible changes
+        }
+    }
+
+    /// Evolve schema based on a JSON document
+    pub fn evolve_from_document(&mut self, json_blob: &JsonValue) -> Vec<String> {
+        let mut evolved_fields = Vec::new();
+
+        if let Some(obj) = json_blob.as_object() {
+            for (field_name, field_value) in obj {
+                if self.evolve_field(field_name.clone(), field_value) {
+                    evolved_fields.push(field_name.clone());
+                }
+            }
+        }
+
+        evolved_fields
+    }
+
+    /// Promote a field from non-indexed to indexed status
+    /// This requires a Tantivy schema rebuild and should be done explicitly.
+    /// Returns true if the field was promoted, false if it was already indexed or doesn't exist.
+    pub fn promote_field_to_indexed(&mut self, field_name: &str) -> bool {
+        if let Some(field_def) = self.fields.get_mut(field_name) {
+            if !field_def.indexed {
+                field_def.indexed = true;
+                tracing::info!(
+                    field = %field_name,
+                    field_type = ?field_def.field_type,
+                    "Promoted field to indexed status - requires Tantivy schema rebuild"
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get all non-indexed fields in the schema
+    /// Useful for identifying fields that can be promoted to indexed status.
+    pub fn get_non_indexed_fields(&self) -> Vec<String> {
+        self.fields
+            .iter()
+            .filter(|(_, field_def)| !field_def.indexed)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
 }
 
 impl Default for IndexSchema {
@@ -313,41 +562,117 @@ impl HybridStore {
         index_cache.insert(key.to_string(), value);
     }
 
-    /// Build Tantivy schema and field map from index schema definition.
+    /// Build Tantivy schema and field map from index schema definition using native Tantivy types.
     fn create_schema_from_definition(index_schema: &IndexSchema) -> (Schema, SchemaFields) {
+        use tantivy::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
+
         let mut schema_builder = Schema::builder();
 
-        // ID field is always present
+        // ID field is always present - untokenized string for exact matching
         let id_field = schema_builder.add_text_field("id", STRING | STORED);
 
         let mut indexed_fields = HashMap::new();
 
         for (name, field_def) in &index_schema.fields {
-            if name == "id" {
+            if name == "id" || !field_def.indexed {
                 continue;
             }
 
-            if !field_def.indexed {
-                continue;
-            }
-
-            let field = match field_def.field_type.as_str() {
-                // Textual fields use the default TEXT options
-                "text" => schema_builder.add_text_field(name, TEXT),
-                // Array is treated as multi-valued text
-                "array" => schema_builder.add_text_field(name, TEXT),
-                // Numeric types (FAST allows range queries and sorting)
-                "f64" | "number" => schema_builder.add_f64_field(name, FAST | INDEXED | STORED),
-                "i64" => schema_builder.add_i64_field(name, FAST | INDEXED | STORED),
-                "u64" => schema_builder.add_u64_field(name, FAST | INDEXED | STORED),
-                // Date type
-                "date" => schema_builder.add_date_field(name, FAST | INDEXED | STORED),
-                // Boolean (stored as untokenized string "true"/"false")
-                "boolean" => schema_builder.add_text_field(name, STRING | STORED),
-                // Exact (stored as untokenized string, preserved punctuation)
-                "exact" => schema_builder.add_text_field(name, STRING | STORED),
-                // Fallback to text for unknown types
-                _ => schema_builder.add_text_field(name, TEXT),
+            let field = match field_def.field_type {
+                TantivyFieldType::Text => {
+                    let mut options = TextOptions::default();
+                    if field_def.stored {
+                        options = options.set_stored();
+                    }
+                    options = options.set_indexing_options(
+                        TextFieldIndexing::default()
+                            .set_tokenizer("default")
+                            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                    );
+                    schema_builder.add_text_field(name, options)
+                }
+                TantivyFieldType::String => {
+                    let options = if field_def.stored {
+                        STRING | STORED
+                    } else {
+                        STRING
+                    };
+                    schema_builder.add_text_field(name, options)
+                }
+                TantivyFieldType::I64 => {
+                    if field_def.stored && field_def.fast {
+                        schema_builder.add_i64_field(name, INDEXED | STORED | FAST)
+                    } else if field_def.stored {
+                        schema_builder.add_i64_field(name, INDEXED | STORED)
+                    } else if field_def.fast {
+                        schema_builder.add_i64_field(name, INDEXED | FAST)
+                    } else {
+                        schema_builder.add_i64_field(name, INDEXED)
+                    }
+                }
+                TantivyFieldType::U64 => {
+                    if field_def.stored && field_def.fast {
+                        schema_builder.add_u64_field(name, INDEXED | STORED | FAST)
+                    } else if field_def.stored {
+                        schema_builder.add_u64_field(name, INDEXED | STORED)
+                    } else if field_def.fast {
+                        schema_builder.add_u64_field(name, INDEXED | FAST)
+                    } else {
+                        schema_builder.add_u64_field(name, INDEXED)
+                    }
+                }
+                TantivyFieldType::F64 => {
+                    if field_def.stored && field_def.fast {
+                        schema_builder.add_f64_field(name, INDEXED | STORED | FAST)
+                    } else if field_def.stored {
+                        schema_builder.add_f64_field(name, INDEXED | STORED)
+                    } else if field_def.fast {
+                        schema_builder.add_f64_field(name, INDEXED | FAST)
+                    } else {
+                        schema_builder.add_f64_field(name, INDEXED)
+                    }
+                }
+                TantivyFieldType::Date => {
+                    if field_def.stored && field_def.fast {
+                        schema_builder.add_date_field(name, INDEXED | STORED | FAST)
+                    } else if field_def.stored {
+                        schema_builder.add_date_field(name, INDEXED | STORED)
+                    } else if field_def.fast {
+                        schema_builder.add_date_field(name, INDEXED | FAST)
+                    } else {
+                        schema_builder.add_date_field(name, INDEXED)
+                    }
+                }
+                TantivyFieldType::Boolean => {
+                    let options = if field_def.stored {
+                        STRING | STORED
+                    } else {
+                        STRING
+                    };
+                    schema_builder.add_text_field(name, options)
+                }
+                TantivyFieldType::Bytes => schema_builder.add_bytes_field(name, STORED),
+                TantivyFieldType::Ip => {
+                    if field_def.stored {
+                        schema_builder.add_ip_addr_field(name, INDEXED | STORED)
+                    } else {
+                        schema_builder.add_ip_addr_field(name, INDEXED)
+                    }
+                }
+                TantivyFieldType::Json => {
+                    if field_def.stored {
+                        schema_builder.add_json_field(name, TEXT | STORED)
+                    } else {
+                        schema_builder.add_json_field(name, TEXT)
+                    }
+                }
+                TantivyFieldType::Facet => {
+                    if field_def.stored {
+                        schema_builder.add_facet_field(name, INDEXED | STORED)
+                    } else {
+                        schema_builder.add_facet_field(name, INDEXED)
+                    }
+                }
             };
 
             indexed_fields.insert(name.clone(), field);
@@ -399,28 +724,40 @@ impl HybridStore {
 
             let field_type = match field_entry.field_type() {
                 FieldType::Str(_) => {
-                    // Check if it uses raw tokenizer (exact/boolean) or default (text)
-                    // For simplicity, we'll mark all text as "text" - the tokenizer info
-                    // is in the indexing options but we preserve the type
-                    "text".to_string()
+                    // Check if it's indexed with STRING flag (untokenized) or default TEXT
+                    // For simplicity, we'll check if it's stored but not indexed as a heuristic
+                    let is_indexed = field_entry.is_indexed();
+                    let is_stored = field_entry.is_stored();
+                    if is_stored && !is_indexed {
+                        TantivyFieldType::String
+                    } else {
+                        TantivyFieldType::Text
+                    }
                 }
-                FieldType::U64(_) => "u64".to_string(),
-                FieldType::I64(_) => "i64".to_string(),
-                FieldType::F64(_) => "f64".to_string(),
-                FieldType::Bool(_) => "boolean".to_string(),
-                FieldType::Date(_) => "date".to_string(),
-                FieldType::Bytes(_) => "bytes".to_string(),
-                FieldType::JsonObject(_) => "json".to_string(),
-                FieldType::IpAddr(_) => "ip".to_string(),
-                FieldType::Facet(_) => "facet".to_string(),
+                FieldType::U64(_) => TantivyFieldType::U64,
+                FieldType::I64(_) => TantivyFieldType::I64,
+                FieldType::F64(_) => TantivyFieldType::F64,
+                FieldType::Bool(_) => TantivyFieldType::Boolean,
+                FieldType::Date(_) => TantivyFieldType::Date,
+                FieldType::Bytes(_) => TantivyFieldType::Bytes,
+                FieldType::JsonObject(_) => TantivyFieldType::Json,
+                FieldType::IpAddr(_) => TantivyFieldType::Ip,
+                FieldType::Facet(_) => TantivyFieldType::Facet,
             };
+
+            // Determine field options from Tantivy's field entry
+            let indexed = field_entry.is_indexed();
+            let stored = field_entry.is_stored();
+            let fast = field_entry.is_fast();
 
             fields.insert(
                 name.to_string(),
                 FieldDef {
                     name: name.to_string(),
                     field_type,
-                    indexed: true, // All fields in Tantivy schema are indexed
+                    indexed,
+                    stored,
+                    fast,
                 },
             );
         }
@@ -608,7 +945,13 @@ impl HybridStore {
             let mut cache = self.budget_cache.write().unwrap();
             cache.insert(index.to_string(), new_budget);
         }
+
         Ok(())
+    }
+
+    /// Force commit writer for an index (for testing)
+    pub fn commit_writer(&self, index: &str) -> Result<(), StoreError> {
+        self.commit_index(index)
     }
 
     /// Perform smart commit based on operation count
@@ -661,10 +1004,34 @@ impl HybridStore {
                     body,
                     json_blob,
                 } => {
-                    // Step 1: Get cached schema for field filtering
+                    // Step 1: Get cached schema for field filtering and evolution
                     let schema = self
                         .get_schema_cached(index)?
                         .unwrap_or_else(|| Arc::new(IndexSchema::default()));
+
+                    // Step 1.5: Evolve schema if new fields are present
+                    let mut evolved_schema = None;
+                    if let Some(json_blob) = &json_blob {
+                        let mut schema_mut = (*schema).clone();
+                        let evolved_fields = schema_mut.evolve_from_document(json_blob);
+                        if !evolved_fields.is_empty() {
+                            tracing::debug!(
+                                index = %index,
+                                evolved_fields = ?evolved_fields,
+                                "Evolved schema with new non-indexed fields (will persist in redb transaction)"
+                            );
+                            // Store evolved schema for persistence in this transaction
+                            evolved_schema = Some(schema_mut.clone());
+
+                            // Update cache immediately for subsequent reads
+                            let schema_arc = Arc::new(schema_mut);
+                            if let Ok(mut cache) = self.schema_cache.write() {
+                                cache.insert(index.to_string(), schema_arc);
+                            }
+                            // Note: No need to invalidate fields cache since new fields are non-indexed
+                            // and won't affect Tantivy schema
+                        }
+                    }
 
                     // Step 2: Serialize complete document for redb (all fields)
                     let doc_data = StoredDoc {
@@ -696,34 +1063,45 @@ impl HybridStore {
                             // For other fields, look into json_blob
                             if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
                                 if let Some(field_value) = json_obj.get(field_name) {
-                                    match field_def.field_type.as_str() {
-                                        "array" => {
-                                            if let Some(arr) = field_value.as_array() {
+                                    match field_def.field_type {
+                                        TantivyFieldType::Text => {
+                                            if let Some(s) = field_value.as_str() {
+                                                tantivy_doc.add_text(*tantivy_field, s);
+                                            } else {
+                                                let field_str = serde_json::to_string(field_value)
+                                                    .map_err(|e| {
+                                                        StoreError::Serialization(e.to_string())
+                                                    })?;
+                                                tantivy_doc.add_text(*tantivy_field, &field_str);
+                                            }
+                                        }
+                                        TantivyFieldType::String => {
+                                            if let Some(s) = field_value.as_str() {
+                                                tantivy_doc.add_text(*tantivy_field, s);
+                                            } else if let Some(arr) = field_value.as_array() {
                                                 for item in arr {
-                                                    let item_str = serde_json::to_string(item)
-                                                        .map_err(|e| {
-                                                            StoreError::Serialization(e.to_string())
-                                                        })?;
-                                                    tantivy_doc.add_text(*tantivy_field, &item_str);
+                                                    if let Some(s) = item.as_str() {
+                                                        tantivy_doc.add_text(*tantivy_field, s);
+                                                    }
                                                 }
                                             }
                                         }
-                                        "f64" | "number" => {
+                                        TantivyFieldType::F64 => {
                                             if let Some(n) = field_value.as_f64() {
                                                 tantivy_doc.add_f64(*tantivy_field, n);
                                             }
                                         }
-                                        "i64" => {
+                                        TantivyFieldType::I64 => {
                                             if let Some(n) = field_value.as_i64() {
                                                 tantivy_doc.add_i64(*tantivy_field, n);
                                             }
                                         }
-                                        "u64" => {
+                                        TantivyFieldType::U64 => {
                                             if let Some(n) = field_value.as_u64() {
                                                 tantivy_doc.add_u64(*tantivy_field, n);
                                             }
                                         }
-                                        "date" => {
+                                        TantivyFieldType::Date => {
                                             if let Some(s) = field_value.as_str()
                                                 && let Ok(dt) =
                                                     chrono::DateTime::parse_from_rfc3339(s)
@@ -733,7 +1111,7 @@ impl HybridStore {
                                                 tantivy_doc.add_date(*tantivy_field, tantivy_dt);
                                             }
                                         }
-                                        "boolean" => {
+                                        TantivyFieldType::Boolean => {
                                             if let Some(b) = field_value.as_bool() {
                                                 tantivy_doc.add_text(
                                                     *tantivy_field,
@@ -741,23 +1119,47 @@ impl HybridStore {
                                                 );
                                             }
                                         }
-                                        "exact" => {
+                                        TantivyFieldType::Bytes => {
                                             if let Some(arr) = field_value.as_array() {
+                                                let mut bytes = Vec::new();
                                                 for item in arr {
-                                                    if let Some(s) = item.as_str() {
-                                                        tantivy_doc.add_text(*tantivy_field, s);
+                                                    if let Some(n) = item.as_u64() {
+                                                        bytes.push(n as u8);
                                                     }
                                                 }
-                                            } else if let Some(s) = field_value.as_str() {
-                                                tantivy_doc.add_text(*tantivy_field, s);
+                                                if !bytes.is_empty() {
+                                                    tantivy_doc.add_bytes(
+                                                        *tantivy_field,
+                                                        bytes.as_slice(),
+                                                    );
+                                                }
                                             }
                                         }
-                                        _ => {
-                                            let field_str = serde_json::to_string(field_value)
+                                        TantivyFieldType::Ip => {
+                                            if let Some(s) = field_value.as_str()
+                                                && let Ok(ip) = s.parse::<std::net::IpAddr>()
+                                            {
+                                                // Convert any IP address to IPv6 for Tantivy compatibility
+                                                let ipv6 = match ip {
+                                                    std::net::IpAddr::V4(ipv4) => {
+                                                        ipv4.to_ipv6_mapped()
+                                                    }
+                                                    std::net::IpAddr::V6(ipv6) => ipv6,
+                                                };
+                                                tantivy_doc.add_ip_addr(*tantivy_field, ipv6);
+                                            }
+                                        }
+                                        TantivyFieldType::Json => {
+                                            let json_str = serde_json::to_string(field_value)
                                                 .map_err(|e| {
                                                     StoreError::Serialization(e.to_string())
                                                 })?;
-                                            tantivy_doc.add_text(*tantivy_field, &field_str);
+                                            tantivy_doc.add_text(*tantivy_field, &json_str);
+                                        }
+                                        TantivyFieldType::Facet => {
+                                            if let Some(s) = field_value.as_str() {
+                                                tantivy_doc.add_facet(*tantivy_field, &s);
+                                            }
                                         }
                                     }
                                 }
@@ -770,6 +1172,15 @@ impl HybridStore {
                     let term = tantivy::Term::from_field_text(fields.id, &id);
                     writer.delete_term(term);
                     writer.add_document(tantivy_doc)?;
+
+                    // Persist evolved schema in the same transaction
+                    if let Some(ref evolved) = evolved_schema {
+                        let schema_bytes = serde_json::to_vec(evolved)
+                            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                        let mut schema_table = write_txn.open_table(TABLE_SCHEMA)?;
+                        schema_table.insert(index, schema_bytes.as_slice())?;
+                        tracing::trace!(index = %index, "Persisted evolved schema in redb transaction");
+                    }
                 }
                 WalOp::Delete { id } => {
                     let mut data_table = write_txn.open_table(data_table_def)?;
@@ -976,8 +1387,42 @@ impl HybridStore {
         let mut cache = self.schema_cache.write().unwrap();
         cache.remove(index);
 
+        // Also invalidate fields cache since it depends on schema
         let mut fields_cache = self.fields_cache.write().unwrap();
         fields_cache.remove(index);
+
+        tracing::debug!(index = %index, "Invalidated schema and fields cache");
+    }
+
+    /// Evolve schema from a JSON document and invalidate caches if changed
+    pub fn evolve_schema_from_document(
+        &self,
+        index: &str,
+        json_blob: &JsonValue,
+    ) -> Result<Vec<String>, StoreError> {
+        // Get current schema
+        let mut schema = self
+            .get_schema_cached(index)?
+            .unwrap_or_else(|| Arc::new(IndexSchema::default()));
+
+        // Make it mutable for evolution
+        let evolved_fields = Arc::make_mut(&mut schema).evolve_from_document(json_blob);
+
+        if !evolved_fields.is_empty() {
+            tracing::info!(
+                index = %index,
+                evolved_fields = ?evolved_fields,
+                "Schema evolved with new fields"
+            );
+
+            // Store the evolved schema
+            self.store_schema_and_cache(index, &schema)?;
+
+            // Invalidate caches to force rebuild with new schema
+            self.invalidate_schema_cache(index);
+        }
+
+        Ok(evolved_fields)
     }
 
     /// Update both redb and cache atomically
@@ -1338,24 +1783,103 @@ impl HybridStore {
                                     json_blob.as_ref().and_then(|v| v.as_object())
                                     && let Some(field_value) = json_obj.get(field_name)
                                 {
-                                    match field_def.field_type.as_str() {
-                                        "array" => {
-                                            if let Some(arr) = field_value.as_array() {
+                                    match field_def.field_type {
+                                        TantivyFieldType::Text => {
+                                            if let Some(s) = field_value.as_str() {
+                                                tantivy_doc.add_text(*tantivy_field, s);
+                                            } else {
+                                                let field_str = serde_json::to_string(field_value)
+                                                    .map_err(|e| {
+                                                        StoreError::Serialization(e.to_string())
+                                                    })?;
+                                                tantivy_doc.add_text(*tantivy_field, &field_str);
+                                            }
+                                        }
+                                        TantivyFieldType::String => {
+                                            if let Some(s) = field_value.as_str() {
+                                                tantivy_doc.add_text(*tantivy_field, s);
+                                            } else if let Some(arr) = field_value.as_array() {
                                                 for item in arr {
-                                                    let item_str = serde_json::to_string(item)
-                                                        .map_err(|e| {
-                                                            StoreError::Serialization(e.to_string())
-                                                        })?;
-                                                    tantivy_doc.add_text(*tantivy_field, &item_str);
+                                                    if let Some(s) = item.as_str() {
+                                                        tantivy_doc.add_text(*tantivy_field, s);
+                                                    }
                                                 }
                                             }
                                         }
-                                        _ => {
-                                            let field_str = serde_json::to_string(field_value)
+                                        TantivyFieldType::F64 => {
+                                            if let Some(n) = field_value.as_f64() {
+                                                tantivy_doc.add_f64(*tantivy_field, n);
+                                            }
+                                        }
+                                        TantivyFieldType::I64 => {
+                                            if let Some(n) = field_value.as_i64() {
+                                                tantivy_doc.add_i64(*tantivy_field, n);
+                                            }
+                                        }
+                                        TantivyFieldType::U64 => {
+                                            if let Some(n) = field_value.as_u64() {
+                                                tantivy_doc.add_u64(*tantivy_field, n);
+                                            }
+                                        }
+                                        TantivyFieldType::Date => {
+                                            if let Some(s) = field_value.as_str()
+                                                && let Ok(dt) =
+                                                    chrono::DateTime::parse_from_rfc3339(s)
+                                            {
+                                                let tantivy_dt =
+                                                    DateTime::from_timestamp_secs(dt.timestamp());
+                                                tantivy_doc.add_date(*tantivy_field, tantivy_dt);
+                                            }
+                                        }
+                                        TantivyFieldType::Boolean => {
+                                            if let Some(b) = field_value.as_bool() {
+                                                tantivy_doc.add_text(
+                                                    *tantivy_field,
+                                                    if b { "true" } else { "false" },
+                                                );
+                                            }
+                                        }
+                                        TantivyFieldType::Bytes => {
+                                            if let Some(arr) = field_value.as_array() {
+                                                let mut bytes = Vec::new();
+                                                for item in arr {
+                                                    if let Some(n) = item.as_u64() {
+                                                        bytes.push(n as u8);
+                                                    }
+                                                }
+                                                if !bytes.is_empty() {
+                                                    tantivy_doc.add_bytes(
+                                                        *tantivy_field,
+                                                        bytes.as_slice(),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        TantivyFieldType::Ip => {
+                                            if let Some(s) = field_value.as_str()
+                                                && let Ok(ip) = s.parse::<std::net::IpAddr>()
+                                            {
+                                                // Convert any IP address to IPv6 for Tantivy compatibility
+                                                let ipv6 = match ip {
+                                                    std::net::IpAddr::V4(ipv4) => {
+                                                        ipv4.to_ipv6_mapped()
+                                                    }
+                                                    std::net::IpAddr::V6(ipv6) => ipv6,
+                                                };
+                                                tantivy_doc.add_ip_addr(*tantivy_field, ipv6);
+                                            }
+                                        }
+                                        TantivyFieldType::Json => {
+                                            let json_str = serde_json::to_string(field_value)
                                                 .map_err(|e| {
                                                     StoreError::Serialization(e.to_string())
                                                 })?;
-                                            tantivy_doc.add_text(*tantivy_field, &field_str);
+                                            tantivy_doc.add_text(*tantivy_field, &json_str);
+                                        }
+                                        TantivyFieldType::Facet => {
+                                            if let Some(s) = field_value.as_str() {
+                                                tantivy_doc.add_facet(*tantivy_field, &s);
+                                            }
                                         }
                                     }
                                 }
@@ -1676,7 +2200,178 @@ mod tests {
         assert!(index2_path.exists());
 
         // Verify index2 still works
-        let data = store.get_by_key("index2", "doc1").unwrap();
-        assert!(data.is_some());
+    }
+
+    #[test]
+    fn test_field_type_inference() {
+        use crate::{FieldDef, TantivyFieldType};
+        use serde_json::json;
+
+        // Test field type inference from JSON values
+        let test_cases = vec![
+            (json!("hello"), TantivyFieldType::Text),
+            (json!("2023-01-01T00:00:00Z"), TantivyFieldType::Date),
+            (json!("192.168.1.1"), TantivyFieldType::Ip),
+            (json!(42), TantivyFieldType::I64),
+            (json!(3.14), TantivyFieldType::F64),
+            (json!(true), TantivyFieldType::Boolean),
+            (json!(null), TantivyFieldType::Text),
+            (json!([1, 2, 3]), TantivyFieldType::Text),
+            (json!({"key": "value"}), TantivyFieldType::Json),
+        ];
+
+        for (value, expected_type) in test_cases {
+            let inferred_type = FieldDef::infer_type_from_value(&value);
+            assert_eq!(
+                inferred_type, expected_type,
+                "Failed to infer type for value: {:?}",
+                value
+            );
+        }
+
+        println!("✅ Field type inference works correctly!");
+    }
+
+    #[test]
+    fn test_field_def_creation() {
+        use crate::{FieldDef, TantivyFieldType};
+
+        // Test FieldDef creation with different types
+        let text_field = FieldDef::new("title".to_string(), TantivyFieldType::Text);
+        assert_eq!(text_field.field_type, TantivyFieldType::Text);
+        assert!(text_field.indexed);
+        assert!(text_field.stored); // Text fields are stored by default
+        assert!(!text_field.fast); // Text fields are not fast by default
+
+        let i64_field = FieldDef::new("count".to_string(), TantivyFieldType::I64);
+        assert_eq!(i64_field.field_type, TantivyFieldType::I64);
+        assert!(i64_field.indexed);
+        assert!(!i64_field.stored); // Numeric fields are NOT stored by default
+        assert!(i64_field.fast); // Numeric fields are fast by default
+
+        let json_field = FieldDef::new("metadata".to_string(), TantivyFieldType::Json);
+        assert_eq!(json_field.field_type, TantivyFieldType::Json);
+        assert!(json_field.indexed);
+        assert!(json_field.stored); // JSON fields are stored by default
+        assert!(!json_field.fast); // JSON fields are not fast by default
+
+        println!("✅ FieldDef creation works correctly!");
+    }
+
+    #[test]
+    fn test_schema_evolution() {
+        use crate::{IndexSchema, TantivyFieldType};
+        use serde_json::json;
+
+        let mut schema = IndexSchema::default();
+
+        // Add initial fields
+        let doc1 = json!({
+            "name": "Test",
+            "value": 123
+        });
+
+        let evolved_fields = schema.evolve_from_document(&doc1);
+        assert_eq!(evolved_fields.len(), 2);
+        assert_eq!(schema.fields.len(), 2);
+
+        // Verify field types
+        assert_eq!(
+            schema.fields.get("name").unwrap().field_type,
+            TantivyFieldType::Text
+        );
+        assert_eq!(
+            schema.fields.get("value").unwrap().field_type,
+            TantivyFieldType::I64
+        );
+
+        // Evolve with new document
+        let doc2 = json!({
+            "name": "Test 2",
+            "value": 456.789, // Should evolve to F64
+            "created_at": "2023-01-01T00:00:00Z" // New field
+        });
+
+        let evolved_fields = schema.evolve_from_document(&doc2);
+        assert_eq!(evolved_fields.len(), 2); // value evolved + created_at added
+        assert_eq!(schema.fields.len(), 3);
+
+        // Verify evolution
+        assert_eq!(
+            schema.fields.get("value").unwrap().field_type,
+            TantivyFieldType::F64
+        );
+        assert_eq!(
+            schema.fields.get("created_at").unwrap().field_type,
+            TantivyFieldType::Date
+        );
+
+        println!("✅ Schema evolution works correctly!");
+    }
+
+    #[test]
+    fn test_background_schema_evolution() {
+        use crate::{IndexSchema, TantivyFieldType};
+        use serde_json::json;
+
+        let mut schema = IndexSchema::default();
+
+        // Add initial document with new fields
+        let doc = json!({
+            "title": "Test Document",
+            "count": 42,
+            "timestamp": "2023-01-01T00:00:00Z"
+        });
+
+        let evolved_fields = schema.evolve_from_document(&doc);
+        assert_eq!(evolved_fields.len(), 3, "Should discover 3 new fields");
+
+        // Verify all new fields are non-indexed
+        let title_field = schema.fields.get("title").unwrap();
+        assert_eq!(title_field.field_type, TantivyFieldType::Text);
+        assert!(!title_field.indexed, "New fields should be non-indexed");
+        assert!(title_field.stored, "Text fields should be stored");
+
+        let count_field = schema.fields.get("count").unwrap();
+        assert_eq!(count_field.field_type, TantivyFieldType::I64);
+        assert!(!count_field.indexed, "New fields should be non-indexed");
+        assert!(count_field.fast, "Numeric fields should be fast");
+
+        let timestamp_field = schema.fields.get("timestamp").unwrap();
+        assert_eq!(timestamp_field.field_type, TantivyFieldType::Date);
+        assert!(!timestamp_field.indexed, "New fields should be non-indexed");
+
+        // Verify we can get non-indexed fields
+        let non_indexed = schema.get_non_indexed_fields();
+        assert_eq!(non_indexed.len(), 3, "Should have 3 non-indexed fields");
+        assert!(non_indexed.contains(&"title".to_string()));
+        assert!(non_indexed.contains(&"count".to_string()));
+        assert!(non_indexed.contains(&"timestamp".to_string()));
+
+        // Test promoting a field to indexed
+        let promoted = schema.promote_field_to_indexed("title");
+        assert!(promoted, "Should successfully promote field");
+        assert!(
+            schema.fields.get("title").unwrap().indexed,
+            "Field should now be indexed"
+        );
+
+        // Verify non-indexed count decreased
+        let non_indexed_after = schema.get_non_indexed_fields();
+        assert_eq!(
+            non_indexed_after.len(),
+            2,
+            "Should have 2 non-indexed fields after promotion"
+        );
+        assert!(
+            !non_indexed_after.contains(&"title".to_string()),
+            "Promoted field should not be in list"
+        );
+
+        // Test promoting already indexed field
+        let promoted_again = schema.promote_field_to_indexed("title");
+        assert!(!promoted_again, "Should not promote already indexed field");
+
+        println!("✅ Background schema evolution works correctly!");
     }
 }

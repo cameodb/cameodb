@@ -44,7 +44,9 @@ use crate::config::MessagingConfig;
 use cluster::{ConsistentRing, IdentityError, NodeIdentity, generate_tokens};
 use kameo::actor::RemoteActorRef;
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use storage::{FieldDef, HybridStore, IndexSchema, StorageConfig, StoreError, WalOp};
+use storage::{
+    FieldDef, HybridStore, IndexSchema, StorageConfig, StoreError, TantivyFieldType, WalOp,
+};
 
 // ============================================================================
 // Remote Actor Naming Constants
@@ -754,22 +756,32 @@ async fn validate_and_evolve_schema(
     if let Some(obj) = doc.as_object() {
         for (key, value) in obj {
             let inferred_type = if key == "id" {
-                "text"
+                TantivyFieldType::Text
             } else {
                 match value {
                     JsonValue::String(s) => {
                         // Try to infer date from string
                         if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
-                            "date"
+                            TantivyFieldType::Date
+                        } else if s.parse::<std::net::IpAddr>().is_ok() {
+                            TantivyFieldType::Ip
                         } else {
-                            "text"
+                            TantivyFieldType::Text
                         }
                     }
-                    JsonValue::Number(_) => "f64",
-                    JsonValue::Bool(_) => "boolean",
-                    JsonValue::Array(_) => "array",
-                    JsonValue::Object(_) => "object",
-                    JsonValue::Null => "null",
+                    JsonValue::Number(n) => {
+                        if n.is_i64() {
+                            TantivyFieldType::I64
+                        } else if n.is_u64() {
+                            TantivyFieldType::U64
+                        } else {
+                            TantivyFieldType::F64
+                        }
+                    }
+                    JsonValue::Bool(_) => TantivyFieldType::Boolean,
+                    JsonValue::Array(_) => TantivyFieldType::Text, // Arrays as text
+                    JsonValue::Object(_) => TantivyFieldType::Json, // Objects as JSON
+                    JsonValue::Null => TantivyFieldType::Text,
                 }
             };
 
@@ -778,18 +790,37 @@ async fn validate_and_evolve_schema(
                 // 1. Exact match is always allowed
                 let mut is_compatible = existing_field.field_type == inferred_type;
 
-                // 2. Allow "text" (inferred) to match "exact" (schema)
-                if !is_compatible && inferred_type == "text" {
-                    if existing_field.field_type == "exact" {
+                // 2. Allow Text to match String (for backward compatibility with exact fields)
+                if !is_compatible && inferred_type == TantivyFieldType::Text {
+                    if existing_field.field_type == TantivyFieldType::String {
                         is_compatible = true;
                     }
                 }
 
-                // 3. Allow "array" (inferred) to match "text", "exact" (schema)
-                // Tantivy supports multi-valued fields for all text/string types
-                if !is_compatible && inferred_type == "array" {
-                    if existing_field.field_type == "text" || existing_field.field_type == "exact" {
-                        is_compatible = true;
+                // 3. Allow Text to evolve to more specific types
+                if !is_compatible && existing_field.field_type == TantivyFieldType::Text {
+                    match inferred_type {
+                        TantivyFieldType::Date
+                        | TantivyFieldType::Ip
+                        | TantivyFieldType::I64
+                        | TantivyFieldType::U64
+                        | TantivyFieldType::F64
+                        | TantivyFieldType::Boolean
+                        | TantivyFieldType::Json => {
+                            is_compatible = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // 4. Allow numeric upgrades
+                if !is_compatible {
+                    match (&existing_field.field_type, inferred_type.clone()) {
+                        (TantivyFieldType::I64, TantivyFieldType::F64)
+                        | (TantivyFieldType::U64, TantivyFieldType::F64) => {
+                            is_compatible = true;
+                        }
+                        _ => {}
                     }
                 }
 
@@ -797,7 +828,7 @@ async fn validate_and_evolve_schema(
                     return Err(OrchestratorError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "Type mismatch for field '{}': expected '{}', got '{}'",
+                            "Type mismatch for field '{}': expected {:?}, got {:?}",
                             key, existing_field.field_type, inferred_type
                         ),
                     )));
@@ -805,11 +836,7 @@ async fn validate_and_evolve_schema(
             } else {
                 // New field: Update schema_cache (Append-Only)
                 // Mark new fields indexed by default so they become searchable on arrival
-                let new_field = FieldDef {
-                    name: key.clone(),
-                    field_type: inferred_type.to_string(),
-                    indexed: true,
-                };
+                let new_field = FieldDef::new(key.clone(), inferred_type);
                 schema_cache.fields.insert(key.clone(), new_field);
                 schema_updated = true;
             }
@@ -2364,11 +2391,7 @@ impl NodeOrchestrator {
         if !schema.fields.contains_key("id") {
             schema.fields.insert(
                 "id".to_string(),
-                FieldDef {
-                    name: "id".to_string(),
-                    field_type: "text".to_string(),
-                    indexed: true,
-                },
+                FieldDef::new("id".to_string(), TantivyFieldType::Text),
             );
         }
 
