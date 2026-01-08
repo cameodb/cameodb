@@ -550,28 +550,9 @@ impl MicroshardActor {
             })?
             .to_string();
 
-        // Map document to WalOp::Put with proper body and json_blob mapping
-        let (body, json_blob) = match &doc {
-            JsonValue::Object(obj) => {
-                // Extract body field if present, otherwise use entire doc as body
-                let body = obj
-                    .get("body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&doc.to_string())
-                    .to_string();
-
-                // Store entire doc as json_blob for structured queries
-                (body, Some(doc.clone()))
-            }
-            JsonValue::String(s) => {
-                // If doc is just a string, use it as body
-                (s.clone(), None)
-            }
-            _ => {
-                // For other types, convert to string for body and store as json_blob
-                (doc.to_string(), Some(doc.clone()))
-            }
-        };
+        // Do not synthesize or transform a body; preserve the document as json_blob only.
+        let body = String::new();
+        let json_blob = Some(doc.clone());
 
         let op = WalOp::Put {
             id,
@@ -617,28 +598,9 @@ impl MicroshardActor {
         for op in ops {
             match op {
                 ClientOp::Write { index, id, doc, .. } => {
-                    // Map document to WalOp::Put with proper body and json_blob mapping
-                    let (body, json_blob) = match &doc {
-                        JsonValue::Object(obj) => {
-                            // Extract body field if present, otherwise use entire doc as body
-                            let body = obj
-                                .get("body")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(&doc.to_string())
-                                .to_string();
-
-                            // Store entire doc as json_blob for structured queries
-                            (body, Some(doc.clone()))
-                        }
-                        JsonValue::String(s) => {
-                            // If doc is just a string, use it as body
-                            (s.clone(), None)
-                        }
-                        _ => {
-                            // For other types, convert to string for body and store as json_blob
-                            (doc.to_string(), Some(doc.clone()))
-                        }
-                    };
+                    // Do not synthesize or transform a body; preserve the document as json_blob only.
+                    let body = String::new();
+                    let json_blob = Some(doc.clone());
 
                     let wal_op = WalOp::Put {
                         id,
