@@ -584,6 +584,68 @@ cargo clippy --all-targets -- -D warnings
 ./scripts/testing/load-test.sh
 ```
 
+## 📦 RPM Package Building
+
+CameoDB supports building RPM packages for x86_64 Linux distributions using cargo-zigbuild for cross-compilation.
+
+### Prerequisites
+
+Install the required cargo extensions for cross-compilation and RPM generation:
+```bash
+# Install cargo-zigbuild for cross-compilation
+cargo install cargo-zigbuild
+
+# Install cargo-generate-rpm for RPM package generation
+cargo install cargo-generate-rpm
+```
+
+### Build RPM Package
+
+```bash
+# Build the binary for Linux x86_64 musl target
+cd crates/server
+cargo zigbuild --release --target x86_64-unknown-linux-musl
+
+# Generate RPM package with standard naming
+cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
+  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.0-1.x86_64.rpm \
+  --set-metadata 'package.name="cameodb"'
+
+# The RPM package will be available at:
+# target/x86_64-unknown-linux-musl/release/cameodb-0.2.0-1.x86_64.rpm
+```
+
+### RPM Package Contents
+
+- **Binary**: `/usr/local/bin/cameodb` (statically linked, no external dependencies)
+- **Config**: `/etc/cameodb/cameodb.toml`
+- **Service**: `/usr/lib/systemd/system/cameodb.service`
+- **User/Group**: `cameodb` (created automatically during install)
+- **Data Directory**: `/var/lib/cameodb` (created with proper permissions)
+
+### Installation on Target System
+
+```bash
+# Verify RPM package before installation
+rpm -qpi cameodb-0.2.0-1.x86_64.rpm
+
+# Check package contents
+rpm -qpl cameodb-0.2.0-1.x86_64.rpm
+
+# Install the RPM package
+sudo rpm -i cameodb-0.2.0-1.x86_64.rpm
+
+# Start and enable the service
+sudo systemctl daemon-reload
+sudo systemctl enable cameodb
+sudo systemctl start cameodb
+
+# Check status
+sudo systemctl status cameodb
+```
+
 ---
+
+## 🤝 Contributing
 
 **CameoDB** - High-performance distributed hybrid-search database built in Rust

@@ -3,6 +3,7 @@ name = "server"
 version = "0.2.0"
 edition = "2024"
 license = "FSL-1.1-Apache-2.0"
+description = "A high-performance distributed hybrid-search database"
 
 [[bin]]
 name = "cameodb"
@@ -40,3 +41,47 @@ chrono = { version = "0.4.42", features = ["serde"] }
 [dev-dependencies]
 tempfile = "3.8"
 axum-test = "15.0"
+
+[package.metadata.generate-rpm]
+release = "1"
+assets = [
+    # NOTE: When running inside the crate, the path to target might change depending on where you run cargo build.
+    # Usually relative to the workspace root, so ../../target might be needed if not using --target-dir
+    # However, cargo-generate-rpm usually handles strictly defined paths.
+    # Ensure this path points to where the binary actually compiles.
+    { source = "../../target/x86_64-unknown-linux-musl/release/cameodb", dest = "/usr/local/bin/cameodb", mode = "755" },
+    { source = "cameodb.toml", dest = "/etc/cameodb/cameodb.toml", mode = "644", config = true },
+    { source = "cameodb.service", dest = "/usr/lib/systemd/system/cameodb.service", mode = "644" }
+]
+
+pre_install_script = """
+getent group cameodb >/dev/null || groupadd -r cameodb
+getent passwd cameodb >/dev/null || \
+    useradd -r -g cameodb -d /var/lib/cameodb -s /sbin/nologin \
+    -c "CameoDB User" cameodb
+exit 0
+"""
+
+post_install_script = """
+if [ ! -d /var/lib/cameodb ]; then
+    mkdir -p /var/lib/cameodb
+fi
+chown cameodb:cameodb /var/lib/cameodb
+chmod 700 /var/lib/cameodb
+
+if [ $1 -eq 1 ]; then
+    systemctl daemon-reload
+    systemctl preset cameodb.service
+fi
+"""
+
+pre_uninstall_script = """
+if [ $1 -eq 0 ]; then
+    systemctl --no-reload disable --now cameodb.service
+fi
+"""
+
+post_trans_script = """
+systemctl daemon-reload
+systemctl try-restart cameodb.service
+"""
