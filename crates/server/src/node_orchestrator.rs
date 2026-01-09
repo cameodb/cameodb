@@ -2040,7 +2040,7 @@ impl NodeOrchestrator {
             "index": index,
             "deleted_from_shards": deleted_from_shards,
             "total_shards": self.shards.len(),
-            "errors": if errors.is_empty() { None } else { Some(errors) }
+            "errors": errors  // Always return array, empty if no errors
         }))
     }
 

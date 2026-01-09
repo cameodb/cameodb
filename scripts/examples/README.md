@@ -4,10 +4,10 @@ This directory contains runnable examples for ingesting data into CameoDB using 
 
 ## 📊 Available Datasets
 
-| Dataset | Script | Records | Format | Batch Size | Description |
-|---------|--------|---------|--------|------------|-------------|
-| **TED Talks** | `ingest_ted.py` | ~4,600 | CSV (semicolon) | 500 docs / 5MB | YouTube TED talks metadata with descriptions |
-| **Book Summaries** | `ingest_books.py` | 16,559 | TSV (tab) | 400 docs / 4MB | CMU Book Summaries with plot synopses |
+| Dataset | Script | Records | Format | Batch Size | Memory Limit | Description |
+|---------|--------|---------|--------|------------|-------------|-------------|
+| **TED Talks** | `ingest_ted.py` | ~4,600 | CSV (semicolon) | 1000 docs / 4MB | YouTube TED talks metadata with descriptions |
+| **Book Summaries** | `ingest_books.py` | 16,559 | TSV (tab) | 1000 docs / 8MB | CMU Book Summaries with plot synopses |
 
 ## 🚀 Quick Start
 
@@ -24,6 +24,14 @@ python3 scripts/examples/ingest_books.py
 # Test with dry run first
 python3 scripts/examples/ingest_ted.py --dry-run
 python3 scripts/examples/ingest_books.py --dry-run
+
+# Custom data files
+python3 scripts/examples/ingest_ted.py --data /path/to/custom/ted.csv
+python3 scripts/examples/ingest_books.py --data /path/to/custom/books.txt
+
+# Size analysis (check memory usage and safety)
+python3 scripts/examples/size_analysis.py
+python3 scripts/examples/size_analysis.py 1500 books  # Test custom batch size
 ```
 
 ---
@@ -155,39 +163,45 @@ Each book is indexed with the following fields:
 
 ### Performance
 
-- **Batch Processing**: Uses configurable batch sizes (default: 400 documents)
-- **Memory Management**: Respects byte limits (default: 4MB per batch)  
+- **Batch Processing**: Uses optimized batch sizes (500-1000 documents per batch)
+- **Memory Management**: Respects byte limits (2-6MB per batch)  
 - **Atomic Operations**: Each batch is processed atomically across shards
-- **Expected Throughput**: ~1,000-3,000 docs/sec with optimized batching (Rust 2024 performance improvements)
+- **Expected Throughput**: ~2,000-5,000 docs/sec with optimized batching (Rust 2024 performance improvements)
 - **Smart Commits**: Dynamic commit thresholds based on memory budgets (16MB-256MB)
 - **Parallel Sharding**: Automatic document distribution across multiple shards
+- **Cluster-Aware**: Real-time cluster health monitoring and accurate shard reporting
 
 ### Command Line Options
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--base-url` | `http://localhost:9480` | CameoDB HTTP base URL |
-| `--index` | `books` | Target index name |
-| `--data` | `scripts/data/booksummaries.txt` | Path to book summaries data file |
-| `--dry-run` | `false` | Print sample documents instead of sending |
-| `--batch-size` | `400` | Maximum documents per batch |
-| `--max-batch-mb` | `4` | Maximum batch size in MB |
+| Option | Books Default | TED Default | URLs Default | Description |
+|--------|--------------|------------|--------------|-------------|
+| `--base-url` | `http://localhost:9480` | `http://localhost:9480` | `http://localhost:9480` | CameoDB HTTP base URL |
+| `--index` | `books` | `ted` | `urls` | Target index name |
+| `--data` | `scripts/data/booksummaries.txt` | `scripts/data/youtube_ted_2024_03_17.csv` | `scripts/data/urls.csv` | Path to data file |
+| `--dry-run` | `false` | `false` | `false` | Print sample documents instead of sending |
+| `--batch-size` | `1000` | `1000` | `1000` | Maximum documents per batch |
+| `--max-batch-mb` | `8` | `4` | `2` | Maximum batch size in MB |
 
 ### Example Output
 
 ```
-Starting batch ingestion with max batch size: 200, max bytes: 4MB
-Batch 1: 200/200 docs indexed (4 shards success, 0 failed) in 0.23s
-Batch 2: 200/200 docs indexed (4 shards success, 0 failed) in 0.07s
+Starting batch ingestion with max batch size: 1000, max bytes: 8MB
+Target index: 'books' (will use 4 shards)
+Cluster: cameodb-cluster
+Cluster status: green
+
+Batch 1: 1000/1000 docs indexed (1000/1000 operations successful, 0 failed) in 0.82s
+Batch 2: 1000/1000 docs indexed (1000/1000 operations successful, 0 failed) in 0.78s
 ...
-Batch 82: 200/200 docs indexed (4 shards success, 0 failed) in 0.05s
-Batch 83: 159/159 docs indexed (4 shards success, 0 failed) in 0.10s
+Batch 16: 1000/1000 docs indexed (1000/1000 operations successful, 0 failed) in 0.81s
+Batch 17: 559/559 docs indexed (559/559 operations successful, 0 failed) in 0.15s
 
 Ingestion completed:
   Total processed: 16559 documents
   Total indexed: 16559 documents
-  Batches sent: 83
-  Total time: 6.69s
-  Throughput: 2473.8 docs/sec
+  Batches sent: 17
+  Total time: 3.24s
+  Throughput: 5108.4 docs/sec
   Index: 'books'
+  Index created with 4 shards
 ```

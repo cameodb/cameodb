@@ -15,9 +15,9 @@ import requests
 
 DEFAULT_BASE_URL = "http://localhost:9480"
 DEFAULT_INDEX = "ted"
-DEFAULT_CSV_PATH = Path("scripts/data/youtube_ted_2024_03_17.csv")
-DEFAULT_BATCH_SIZE = 400
-DEFAULT_MAX_BATCH_BYTES = 2 * 1024 * 1024  # 2MB
+DEFAULT_DATA_PATH = Path("scripts/data/youtube_ted_2024_03_17.csv")
+DEFAULT_BATCH_SIZE = 1000
+DEFAULT_MAX_BATCH_BYTES = 4 * 1024 * 1024  # 4MB
 
 
 @dataclass
@@ -129,6 +129,17 @@ def safe_int(raw: Optional[str], default: Optional[int] = None) -> Optional[int]
         return default
 
 
+def get_cluster_health(base_url: str) -> Optional[Dict[str, Any]]:
+    """Get cluster health information including active shard count."""
+    try:
+        url = f"{base_url.rstrip('/')}/_cluster/health"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException:
+        return None
+
+
 def send_batch(base_url: str, index: str, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Send a batch of documents to CameoDB bulk API."""
     url = f"{base_url.rstrip('/')}/api/{index}/_bulk"
@@ -144,21 +155,31 @@ def send_batch(base_url: str, index: str, batch: List[Dict[str, Any]]) -> Dict[s
 def ingest(
     base_url: str,
     index: str,
-    csv_path: Path,
+    data_path: Path,
     dry_run: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
 ) -> None:
     """Ingest TED talks data using batch processing for optimal performance."""
-    if not csv_path.exists():
-        raise SystemExit(f"CSV file not found: {csv_path}")
+    if not data_path.exists():
+        raise SystemExit(f"Data file not found: {data_path}")
 
+    # Get cluster health to show actual shard count
+    health = get_cluster_health(base_url)
+    active_shards = health.get("active_shards", "unknown") if health else "unknown"
+    cluster_name = health.get("cluster_name", "unknown") if health else "unknown"
+    
     print(
-        "Starting batch ingestion with max batch size: "
+        f"Starting batch ingestion with max batch size: "
         f"{batch_size}, max bytes: {max_batch_bytes // 1024 // 1024}MB"
     )
+    print(f"Target index: '{index}' (will use {active_shards} shards)")
+    print(f"Cluster: {cluster_name}")
+    if health:
+        print(f"Cluster status: {health.get('status', 'unknown')}")
+    print()
 
-    with csv_path.open(newline="", encoding="utf-8") as handle:
+    with data_path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle, delimiter=";")
 
         buffer = BatchBuffer(docs=[])
@@ -182,23 +203,27 @@ def ingest(
             try:
                 result = send_batch(base_url, index, docs_to_send)
                 batch_indexed = result.get("items_written", 0)
+                items_received = result.get("items_received", len(docs_to_send))
                 errors = result.get("errors", [])
-                successful_shards = 4 - len(errors)  # Calculate from errors
-                failed_shards = len(errors)
+                
+                # Calculate operation information from actual response
+                total_operations = len(docs_to_send)
+                failed_operations = len(errors)
+                successful_operations = total_operations - failed_operations
 
                 batch_time = time.time() - batch_start
                 total_indexed += batch_indexed
                 total_processed += len(docs_to_send)
 
                 print(
-                    f"Batch {batch_count}: {batch_indexed}/{len(docs_to_send)} docs indexed "
-                    f"({successful_shards} shards success, {failed_shards} failed) "
+                    f"Batch {batch_count}: {batch_indexed}/{items_received} docs indexed "
+                    f"({successful_operations}/{total_operations} operations successful, {failed_operations} failed) "
                     f"in {batch_time:.2f}s"
                 )
 
-                if failed_shards > 0:
+                if failed_operations > 0:
                     print(
-                        f"  Warning: {failed_shards} shards failed in batch {batch_count}"
+                        f"  Warning: {failed_operations} operations failed in batch {batch_count}"
                     )
             except Exception as exc:  # pragma: no cover - network failure path
                 print(f"Batch {batch_count} failed: {exc}")
@@ -235,6 +260,8 @@ def ingest(
 
     if dry_run:
         print(f"Dry run completed: {total_processed} documents processed in {total_time:.2f}s")
+        if health:
+            print(f"  Index '{index}' will be created with {active_shards} shards")
     else:
         docs_per_sec = total_indexed / total_time if total_time > 0 else 0
         print(f"\nIngestion completed:")
@@ -244,6 +271,8 @@ def ingest(
         print(f"  Total time: {total_time:.2f}s")
         print(f"  Throughput: {docs_per_sec:.1f} docs/sec")
         print(f"  Index: '{index}'")
+        if health:
+            print(f"  Index created with {active_shards} shards")
 
 
 def main() -> None:
@@ -259,10 +288,10 @@ def main() -> None:
         help=f"Target index name (default: {DEFAULT_INDEX})",
     )
     parser.add_argument(
-        "--csv",
+        "--data",
         type=Path,
-        default=DEFAULT_CSV_PATH,
-        help=f"Path to TED CSV (default: {DEFAULT_CSV_PATH})",
+        default=DEFAULT_DATA_PATH,
+        help=f"Path to TED CSV data (default: {DEFAULT_DATA_PATH})",
     )
     parser.add_argument(
         "--dry-run",
@@ -288,7 +317,7 @@ def main() -> None:
     ingest(
         base_url=args.base_url,
         index=args.index,
-        csv_path=args.csv,
+        data_path=args.data,
         dry_run=args.dry_run,
         batch_size=args.batch_size,
         max_batch_bytes=max_batch_bytes,
