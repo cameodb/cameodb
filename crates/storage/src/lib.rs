@@ -162,10 +162,9 @@ pub struct FieldDef {
 impl FieldDef {
     /// Create a new field definition with sensible defaults
     pub fn new(name: String, field_type: TantivyFieldType) -> Self {
-        let stored = matches!(
-            field_type,
-            TantivyFieldType::Text | TantivyFieldType::String | TantivyFieldType::Json
-        );
+        // Only ID field should be stored in Tantivy
+        // All other fields are indexed-only, complete data comes from redb
+        let stored = name == "id";
         let fast = matches!(
             field_type,
             TantivyFieldType::I64
@@ -195,10 +194,8 @@ impl FieldDef {
     /// promoted to indexed fields through explicit schema updates.
     pub fn new_non_indexed(name: String, value: &JsonValue) -> Self {
         let field_type = Self::infer_type_from_value(value);
-        let stored = matches!(
-            field_type,
-            TantivyFieldType::Text | TantivyFieldType::String | TantivyFieldType::Json
-        );
+        // Only ID field should be stored in Tantivy
+        let stored = name == "id";
         let fast = matches!(
             field_type,
             TantivyFieldType::I64
@@ -577,99 +574,47 @@ impl HybridStore {
 
             let field = match field_def.field_type {
                 TantivyFieldType::Text => {
-                    let mut options = TextOptions::default();
-                    if field_def.stored {
-                        options = options.set_stored();
-                    }
-                    options = options.set_indexing_options(
+                    let options = TextOptions::default().set_indexing_options(
                         TextFieldIndexing::default()
                             .set_tokenizer("default")
                             .set_index_option(IndexRecordOption::WithFreqsAndPositions),
                     );
                     schema_builder.add_text_field(name, options)
                 }
-                TantivyFieldType::String => {
-                    let options = if field_def.stored {
-                        STRING | STORED
-                    } else {
-                        STRING
-                    };
-                    schema_builder.add_text_field(name, options)
-                }
+                TantivyFieldType::String => schema_builder.add_text_field(name, STRING),
                 TantivyFieldType::I64 => {
-                    if field_def.stored && field_def.fast {
-                        schema_builder.add_i64_field(name, INDEXED | STORED | FAST)
-                    } else if field_def.stored {
-                        schema_builder.add_i64_field(name, INDEXED | STORED)
-                    } else if field_def.fast {
+                    if field_def.fast {
                         schema_builder.add_i64_field(name, INDEXED | FAST)
                     } else {
                         schema_builder.add_i64_field(name, INDEXED)
                     }
                 }
                 TantivyFieldType::U64 => {
-                    if field_def.stored && field_def.fast {
-                        schema_builder.add_u64_field(name, INDEXED | STORED | FAST)
-                    } else if field_def.stored {
-                        schema_builder.add_u64_field(name, INDEXED | STORED)
-                    } else if field_def.fast {
+                    if field_def.fast {
                         schema_builder.add_u64_field(name, INDEXED | FAST)
                     } else {
                         schema_builder.add_u64_field(name, INDEXED)
                     }
                 }
                 TantivyFieldType::F64 => {
-                    if field_def.stored && field_def.fast {
-                        schema_builder.add_f64_field(name, INDEXED | STORED | FAST)
-                    } else if field_def.stored {
-                        schema_builder.add_f64_field(name, INDEXED | STORED)
-                    } else if field_def.fast {
+                    if field_def.fast {
                         schema_builder.add_f64_field(name, INDEXED | FAST)
                     } else {
                         schema_builder.add_f64_field(name, INDEXED)
                     }
                 }
                 TantivyFieldType::Date => {
-                    if field_def.stored && field_def.fast {
-                        schema_builder.add_date_field(name, INDEXED | STORED | FAST)
-                    } else if field_def.stored {
-                        schema_builder.add_date_field(name, INDEXED | STORED)
-                    } else if field_def.fast {
+                    if field_def.fast {
                         schema_builder.add_date_field(name, INDEXED | FAST)
                     } else {
                         schema_builder.add_date_field(name, INDEXED)
                     }
                 }
-                TantivyFieldType::Boolean => {
-                    let options = if field_def.stored {
-                        STRING | STORED
-                    } else {
-                        STRING
-                    };
-                    schema_builder.add_text_field(name, options)
-                }
-                TantivyFieldType::Bytes => schema_builder.add_bytes_field(name, STORED),
-                TantivyFieldType::Ip => {
-                    if field_def.stored {
-                        schema_builder.add_ip_addr_field(name, INDEXED | STORED)
-                    } else {
-                        schema_builder.add_ip_addr_field(name, INDEXED)
-                    }
-                }
-                TantivyFieldType::Json => {
-                    if field_def.stored {
-                        schema_builder.add_json_field(name, TEXT | STORED)
-                    } else {
-                        schema_builder.add_json_field(name, TEXT)
-                    }
-                }
-                TantivyFieldType::Facet => {
-                    if field_def.stored {
-                        schema_builder.add_facet_field(name, INDEXED | STORED)
-                    } else {
-                        schema_builder.add_facet_field(name, INDEXED)
-                    }
-                }
+                TantivyFieldType::Boolean => schema_builder.add_text_field(name, STRING),
+                TantivyFieldType::Bytes => schema_builder.add_bytes_field(name, INDEXED),
+                TantivyFieldType::Ip => schema_builder.add_ip_addr_field(name, INDEXED),
+                TantivyFieldType::Json => schema_builder.add_json_field(name, TEXT),
+                TantivyFieldType::Facet => schema_builder.add_facet_field(name, INDEXED),
             };
 
             indexed_fields.insert(name.clone(), field);
