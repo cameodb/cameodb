@@ -290,9 +290,9 @@ use std::path::PathBuf;
 // Configure storage with performance optimizations
 let config = StorageConfig {
     shard_path: PathBuf::from("./data/shard1"),
-    indexer_memory_budget: 32 * 1024 * 1024, // 32MB default
-    indexer_memory_min_mb: 16,               // 16MB minimum
-    indexer_memory_max_mb: 256,              // 256MB maximum  
+    indexer_memory_budget: 64 * 1024 * 1024, // 64MB default (increased from 32MB)
+    indexer_memory_min_mb: 32,               // 32MB minimum (increased from 16MB)
+    indexer_memory_max_mb: 512,              // 512MB maximum (increased from 256MB)
     default_batch_size: 1000,               // Smart commit threshold
     wal_sync: true,                         // Maximum durability
 };
@@ -422,8 +422,8 @@ use std::path::PathBuf;
 let high_perf_config = StorageConfig {
     shard_path: PathBuf::from("/fast-ssd/shard1"),
     indexer_memory_budget: 64 * 1024 * 1024,  // 64MB default
-    indexer_memory_min_mb: 32,               // 32MB minimum
-    indexer_memory_max_mb: 512,              // 512MB maximum
+    indexer_memory_min_mb: 32,               // 32MB minimum (increased from 16MB)
+    indexer_memory_max_mb: 512,              // 512MB maximum (increased from 256MB)
     default_batch_size: 2000,                // Higher commit threshold
     wal_sync: false,                         // Skip fsync for speed
 };
@@ -432,7 +432,7 @@ let high_perf_config = StorageConfig {
 let high_durability_config = StorageConfig {
     shard_path: PathBuf::from("/redundant-storage/shard1"),
     indexer_memory_budget: 32 * 1024 * 1024,  // 32MB default
-    indexer_memory_min_mb: 16,               // 16MB minimum
+    indexer_memory_min_mb: 32,               // 32MB minimum (increased from 16MB)
     indexer_memory_max_mb: 128,              // 128MB maximum
     default_batch_size: 500,                 // Lower commit threshold
     wal_sync: true,                          // Always fsync
@@ -441,9 +441,9 @@ let high_durability_config = StorageConfig {
 // Memory-constrained configuration
 let low_memory_config = StorageConfig {
     shard_path: PathBuf::from("./shard1"),
-    indexer_memory_budget: 16 * 1024 * 1024,  // 16MB default
-    indexer_memory_min_mb: 8,                // 8MB minimum
-    indexer_memory_max_mb: 32,               // 32MB maximum
+    indexer_memory_budget: 32 * 1024 * 1024,  // 32MB default (increased from 16MB)
+    indexer_memory_min_mb: 32,                // 32MB minimum (increased from 8MB)
+    indexer_memory_max_mb: 64,               // 64MB maximum (increased from 32MB)
     default_batch_size: 250,                 // Very low commit threshold
     wal_sync: true,
 };
@@ -461,7 +461,7 @@ let low_memory_config = StorageConfig {
 
 ### Multi-Tenant Performance
 - **Index Isolation**: No performance interference between indices
-- **Memory Scaling**: Dynamic memory budgets based on index size (16MB-256MB)
+- **Memory Scaling**: Dynamic memory budgets based on index size (32MB-512MB)
 - **Commit Optimization**: Per-index smart commits with configurable thresholds
 - **Cache Efficiency**: Independent IndexWriter/IndexReader caches per index
 
@@ -718,7 +718,7 @@ Supports standard tantivy query syntax:
 ### Search Performance Characteristics
 - **Latency**: ~10-100ms per index (depends on index size and query complexity)
 - **Multi-tenant Isolation**: Each index maintains independent search performance
-- **Memory Scaling**: Dynamic memory budgets (16MB-256MB) based on index size
+- **Memory Scaling**: Dynamic memory budgets (32MB-512MB) based on index size
 - **Indexing**: Automatic when documents are written via `apply_write` or `apply_batch`
 - **Smart Commits**: Configurable commit frequency optimizes search freshness vs performance
 
@@ -826,7 +826,7 @@ impl MicroshardActor {
 
 ### Performance Optimizations
 - **Smart Commit Strategy**: ✅ Implemented - Adaptive commit frequency based on memory budget
-- **Dynamic Memory Budgets**: ✅ Implemented - Per-index memory scaling (16MB-256MB)
+- **Dynamic Memory Budgets**: ✅ Implemented - Per-index memory scaling (32MB-512MB)
 - **Atomic Batch Processing**: ✅ Implemented - Single transaction for multiple operations
 - **Multi-tenant Caching**: ✅ Implemented - Independent caches per index
 - **Operation Counting**: ✅ Implemented - Lock-free AtomicU64 counters per index

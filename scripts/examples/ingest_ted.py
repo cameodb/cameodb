@@ -16,8 +16,8 @@ import requests
 DEFAULT_BASE_URL = "http://localhost:9480"
 DEFAULT_INDEX = "ted"
 DEFAULT_DATA_PATH = Path("scripts/data/youtube_ted_2024_03_17.csv")
-DEFAULT_BATCH_SIZE = 1000
-DEFAULT_MAX_BATCH_BYTES = 4 * 1024 * 1024  # 4MB
+DEFAULT_BATCH_SIZE = 4000
+DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024  # 16MB (safe under 64MB Kameo limit)
 
 
 @dataclass

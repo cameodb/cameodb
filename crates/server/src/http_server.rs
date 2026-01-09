@@ -6,7 +6,7 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tower_http::{
     compression::CompressionLayer, cors::CorsLayer, decompression::DecompressionLayer,
-    limit::RequestBodyLimitLayer, trace::TraceLayer,
+    trace::TraceLayer,
 };
 use tracing::{error, info};
 
@@ -140,7 +140,7 @@ pub fn create_router(state: AppState, max_body_size_mb: usize) -> Router {
         .layer(CompressionLayer::new())
         // Allow compressed requests
         .layer(DecompressionLayer::new())
-        .layer(RequestBodyLimitLayer::new(body_limit_bytes))
+        .layer(DefaultBodyLimit::max(body_limit_bytes))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
 }

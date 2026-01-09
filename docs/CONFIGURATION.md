@@ -41,9 +41,9 @@ port = 9480
 data_paths = ["./data/cameodb"]
 
 [search]
-indexer_memory_min_mb = 16
-indexer_memory_max_mb = 256
-total_memory_limit_mb = 1024
+indexer_memory_min_mb = 32
+indexer_memory_max_mb = 512
+total_memory_limit_mb = 4096
 default_search_limit = 10
 ```
 
@@ -110,14 +110,14 @@ zone = "default"
 
 ```toml
 [search]
-# Minimum memory for each indexer thread in MB (default: 16)
-indexer_memory_min_mb = 16
+# Minimum memory for each indexer thread in MB (default: 32)
+indexer_memory_min_mb = 32
 
-# Maximum memory for each indexer thread in MB (default: 256)
-indexer_memory_max_mb = 256
+# Maximum memory for each indexer thread in MB (default: 512)
+indexer_memory_max_mb = 512
 
-# Total memory limit for all search operations in MB (default: 1024)
-total_memory_limit_mb = 1024
+# Total memory limit for all search operations in MB (default: 4096)
+total_memory_limit_mb = 4096
 
 # Threshold for memory pressure (percent, default: 80)
 memory_pressure_threshold_percent = 80
@@ -240,6 +240,8 @@ total_memory_limit_mb = 8192
 
 # Aggressive memory usage
 memory_pressure_threshold_percent = 90
+search_threads = 16
+default_batch_size = 2000
 ```
 
 #### Storage Optimization
@@ -297,9 +299,9 @@ default_batch_size = 1000
 max_shards_per_node = 20
 
 [search]
-indexer_memory_min_mb = 16
-indexer_memory_max_mb = 256
-total_memory_limit_mb = 2048
+indexer_memory_min_mb = 32
+indexer_memory_max_mb = 512
+total_memory_limit_mb = 4096
 memory_pressure_threshold_percent = 80
 search_threads = 8
 default_search_limit = 10

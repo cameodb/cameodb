@@ -468,9 +468,9 @@ num_shards_init = 4
 max_shards_per_node = 8
 
 [search]
-indexer_memory_min_mb = 16
-indexer_memory_max_mb = 256
-total_memory_limit_mb = 1024
+indexer_memory_min_mb = 32
+indexer_memory_max_mb = 512
+total_memory_limit_mb = 4096
 memory_pressure_threshold_percent = 80
 search_threads = 8
 default_search_limit = 10

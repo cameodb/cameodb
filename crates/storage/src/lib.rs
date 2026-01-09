@@ -61,10 +61,10 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             shard_path: PathBuf::from("/tmp/cameodb_default_shard"),
-            indexer_memory_min_mb: 16,               // 16MB minimum
-            indexer_memory_max_mb: 256,              // 256MB maximum
-            indexer_memory_budget: 16 * 1024 * 1024, // start at min when unknown
-            default_batch_size: 1000, // 1000 operations default (matches Python scripts)
+            indexer_memory_min_mb: 32, // 32MB minimum (increased from 16MB)
+            indexer_memory_max_mb: 512, // 512MB maximum (increased from 256MB)
+            indexer_memory_budget: 64 * 1024 * 1024, // start at 64MB (increased from 16MB)
+            default_batch_size: 1000,  // 1000 operations default (matches Python scripts)
             wal_sync: true,
         }
     }
@@ -81,11 +81,11 @@ impl StorageConfig {
         if let Ok(metadata) = std::fs::metadata(index_path) {
             let size_mb = metadata.len() / (1024 * 1024);
             let optimal_budget = match size_mb {
-                0..=50 => min_budget_bytes,       // Very small indices: min budget (16MB)
-                51..=200 => default_budget_bytes, // Small indices: start budget (min-aligned)
-                201..=1000 => (min_budget_bytes + max_budget_bytes) / 2, // Medium indices: mid-range (136MB)
-                1001..=5000 => (max_budget_bytes * 3) / 4, // Large indices: 75% of max (192MB)
-                _ => max_budget_bytes,                     // Very large indices: max budget (256MB)
+                0..=100 => min_budget_bytes, // Very small indices: min budget (32MB)
+                101..=500 => default_budget_bytes, // Small indices: start budget (64MB)
+                501..=2000 => (min_budget_bytes + max_budget_bytes) / 2, // Medium indices: mid-range (272MB)
+                2001..=8000 => (max_budget_bytes * 1) / 2, // Large indices: 50% of max (256MB)
+                _ => max_budget_bytes,                     // Very large indices: max budget (512MB)
             };
 
             // Ensure result is within configured bounds

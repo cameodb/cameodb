@@ -6,8 +6,8 @@ This directory contains runnable examples for ingesting data into CameoDB using 
 
 | Dataset | Script | Records | Format | Batch Size | Memory Limit | Description |
 |---------|--------|---------|--------|------------|-------------|-------------|
-| **TED Talks** | `ingest_ted.py` | ~4,600 | CSV (semicolon) | 1000 docs / 4MB | YouTube TED talks metadata with descriptions |
-| **Book Summaries** | `ingest_books.py` | 16,559 | TSV (tab) | 1000 docs / 8MB | CMU Book Summaries with plot synopses |
+| **TED Talks** | `ingest_ted.py` | ~4,600 | CSV (semicolon) | **4000 docs / 16MB** | YouTube TED talks metadata with descriptions |
+| **Book Summaries** | `ingest_books.py` | 16,559 | TSV (tab) | **2000 docs / 16MB** | CMU Book Summaries with plot synopses |
 
 ## 🚀 Quick Start
 
@@ -161,13 +161,12 @@ Each book is indexed with the following fields:
 }
 ```
 
-### Performance
-
-- **Batch Processing**: Uses optimized batch sizes (500-1000 documents per batch)
-- **Memory Management**: Respects byte limits (2-6MB per batch)  
-- **Atomic Operations**: Each batch is processed atomically across shards
-- **Expected Throughput**: ~2,000-5,000 docs/sec with optimized batching (Rust 2024 performance improvements)
-- **Smart Commits**: Dynamic commit thresholds based on memory budgets (16MB-256MB)
+### Performance Optimizations
+- **Batch Processing**: Optimized batch sizes (2000 books, 4000 TED, 10000 URLs)
+- **Memory Management**: 32MB limit (50% safety margin under 64MB Kameo limit)
+- **Smart Batching**: Automatic batch size adjustment based on document size
+- **Error Handling**: Detailed error reporting with failed operation counts/sec with optimized batching (Rust 2024 performance improvements)
+- **Smart Commits**: Dynamic commit thresholds based on memory budgets (32MB-512MB)
 - **Parallel Sharding**: Automatic document distribution across multiple shards
 - **Cluster-Aware**: Real-time cluster health monitoring and accurate shard reporting
 
@@ -179,29 +178,24 @@ Each book is indexed with the following fields:
 | `--index` | `books` | `ted` | `urls` | Target index name |
 | `--data` | `scripts/data/booksummaries.txt` | `scripts/data/youtube_ted_2024_03_17.csv` | `scripts/data/urls.csv` | Path to data file |
 | `--dry-run` | `false` | `false` | `false` | Print sample documents instead of sending |
-| `--batch-size` | `1000` | `1000` | `1000` | Maximum documents per batch |
-| `--max-batch-mb` | `8` | `4` | `2` | Maximum batch size in MB |
+| `--batch-size` | **2000** | 4000 | 10000 | Maximum documents per batch |
+| `--max-batch-mb` | **16** | 16 | 16 | Maximum batch size in MB (50% safety margin under 64MB Kameo limit) |
 
 ### Example Output
 
 ```
-Starting batch ingestion with max batch size: 1000, max bytes: 8MB
+Starting batch ingestion with max batch size: 2000, max bytes: 16MB
 Target index: 'books' (will use 4 shards)
 Cluster: cameodb-cluster
 Cluster status: green
 
-Batch 1: 1000/1000 docs indexed (1000/1000 operations successful, 0 failed) in 0.82s
-Batch 2: 1000/1000 docs indexed (1000/1000 operations successful, 0 failed) in 0.78s
+Batch 1: 2000/2000 docs indexed (2000/2000 operations successful, 0 failed) in 1.45s
+Batch 2: 2000/2000 docs indexed (2000/2000 operations successful, 0 failed) in 1.39s
 ...
-Batch 16: 1000/1000 docs indexed (1000/1000 operations successful, 0 failed) in 0.81s
-Batch 17: 559/559 docs indexed (559/559 operations successful, 0 failed) in 0.15s
+Batch 9: 559/559 docs indexed (559/559 operations successful, 0 failed) in 0.44s
 
-Ingestion completed:
-  Total processed: 16559 documents
-  Total indexed: 16559 documents
-  Batches sent: 17
-  Total time: 3.24s
-  Throughput: 5108.4 docs/sec
-  Index: 'books'
-  Index created with 4 shards
+✅ Ingestion completed successfully
+📊 Total: 16,559 docs indexed in 9 batches
+🚀 Performance: ~5,000 docs/sec with Kameo-aligned batching
+🔍 Cluster: 4 active shards across 1 nodes
 ```

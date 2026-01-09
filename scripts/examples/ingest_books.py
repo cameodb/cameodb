@@ -15,8 +15,8 @@ import requests
 DEFAULT_BASE_URL = "http://localhost:9480"
 DEFAULT_INDEX = "books"
 DEFAULT_DATA_PATH = Path("scripts/data/booksummaries.txt")
-DEFAULT_BATCH_SIZE = 1000
-DEFAULT_MAX_BATCH_BYTES = 8 * 1024 * 1024  # 8MB
+DEFAULT_BATCH_SIZE = 2000
+DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024  # 16MB (safe under 64MB Kameo limit)
 
 
 @dataclass

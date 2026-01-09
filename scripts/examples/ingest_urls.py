@@ -15,8 +15,8 @@ import requests
 DEFAULT_BASE_URL = "http://localhost:9480"
 DEFAULT_INDEX = "urls"
 DEFAULT_DATA_PATH = Path("scripts/data/urls.csv")
-DEFAULT_BATCH_SIZE = 1000
-DEFAULT_MAX_BATCH_BYTES = 2 * 1024 * 1024  # 2MB
+DEFAULT_BATCH_SIZE = 10000
+DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024  # 16MB (safe under 64MB Kameo limit)
 
 
 @dataclass
