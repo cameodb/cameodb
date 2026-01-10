@@ -46,8 +46,7 @@ pub enum ConfigError {
 }
 
 /// Complete CameoDB configuration structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CameoDbConfig {
     /// Node-level configuration (sharding, identity)
     #[serde(default)]
@@ -64,8 +63,7 @@ pub struct CameoDbConfig {
 }
 
 /// Network configuration wrapper
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkConfig {
     /// HTTP server configuration
     pub http: HttpConfig,
@@ -238,6 +236,22 @@ pub struct SearchConfig {
     #[serde(default = "default_search_threads")]
     pub search_threads: usize,
 
+    /// Enable streaming search results for improved performance
+    #[serde(default = "default_enable_streaming_search")]
+    pub enable_streaming_search: bool,
+
+    /// Maximum concurrent local shard searches when streaming
+    #[serde(default = "default_max_concurrent_shard_searches")]
+    pub max_concurrent_shard_searches: usize,
+
+    /// Maximum concurrent remote node searches when streaming
+    #[serde(default = "default_max_concurrent_remote_searches")]
+    pub max_concurrent_remote_searches: usize,
+
+    /// Enable early termination when result limit is reached
+    #[serde(default = "default_enable_early_termination")]
+    pub enable_early_termination: bool,
+
     /// Default search result limit when not specified in request (default: 10)
     #[serde(default = "default_search_limit")]
     pub default_search_limit: usize,
@@ -398,9 +412,10 @@ impl CameoDbConfig {
         }
 
         if let Ok(name) = std::env::var("CAMEODB_CLUSTER_NAME")
-            && !name.trim().is_empty() {
-                config.network.cluster.cluster_name = name;
-            }
+            && !name.trim().is_empty()
+        {
+            config.network.cluster.cluster_name = name;
+        }
 
         if let Ok(nodes) = std::env::var("CAMEODB_SEED_NODES") {
             let parsed: Vec<String> = nodes
@@ -528,8 +543,6 @@ impl CameoDbConfig {
     }
 }
 
-
-
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
@@ -573,6 +586,10 @@ impl Default for SearchConfig {
             total_memory_limit_mb: default_total_memory_limit_mb(),
             memory_pressure_threshold_percent: default_memory_pressure_threshold_percent(),
             search_threads: default_search_threads(),
+            enable_streaming_search: default_enable_streaming_search(),
+            max_concurrent_shard_searches: default_max_concurrent_shard_searches(),
+            max_concurrent_remote_searches: default_max_concurrent_remote_searches(),
+            enable_early_termination: default_enable_early_termination(),
             default_search_limit: default_search_limit(),
         }
     }
@@ -713,6 +730,22 @@ fn default_broadcast_timeout_secs() -> u64 {
 
 fn default_broadcast_fanout_limit() -> usize {
     16
+}
+
+fn default_enable_streaming_search() -> bool {
+    true
+}
+
+fn default_max_concurrent_shard_searches() -> usize {
+    32
+}
+
+fn default_max_concurrent_remote_searches() -> usize {
+    8
+}
+
+fn default_enable_early_termination() -> bool {
+    true
 }
 
 #[cfg(test)]

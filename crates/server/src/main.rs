@@ -178,21 +178,23 @@ async fn main() -> Result<()> {
             // Get cluster status via actor
             let status_result: Result<ClusterStatus, _> = coordinator_actor.ask(GetStatus).await;
             if let Ok(cluster_status) = status_result
-                && cluster_status.cluster_enabled {
-                    println!("🌐 Distributed swarm initialized:");
-                    println!("  📡 Cluster: {}", cluster_status.cluster_name);
-                    println!("  🆔 Peer ID: {}", peer_id);
-                    println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
-                    println!("  ✅ Connected: {}", cluster_status.connected_nodes);
+                && cluster_status.cluster_enabled
+            {
+                println!("🌐 Distributed swarm initialized:");
+                println!("  📡 Cluster: {}", cluster_status.cluster_name);
+                println!("  🆔 Peer ID: {}", peer_id);
+                println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
+                println!("  ✅ Connected: {}", cluster_status.connected_nodes);
 
-                    // Discover peers via actor
-                    let discover_result: Result<Vec<crate::distributed::NodeInfo>, _> =
-                        coordinator_actor.ask(DiscoverPeers).await;
-                    if let Ok(peers) = discover_result
-                        && !peers.is_empty() {
-                            println!("  👥 Discovered {} peer nodes", peers.len());
-                        }
+                // Discover peers via actor
+                let discover_result: Result<Vec<crate::distributed::NodeInfo>, _> =
+                    coordinator_actor.ask(DiscoverPeers).await;
+                if let Ok(peers) = discover_result
+                    && !peers.is_empty()
+                {
+                    println!("  👥 Discovered {} peer nodes", peers.len());
                 }
+            }
         }
     }
 
@@ -250,6 +252,7 @@ async fn main() -> Result<()> {
         orchestrator_ref.clone(),
         coordinator_actor.clone(),
         &cameodb_config.network.cluster.messaging,
+        &cameodb_config.search,
         cameodb_config.search.default_search_limit,
     );
 
