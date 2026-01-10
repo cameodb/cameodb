@@ -166,7 +166,7 @@ Each book is indexed with the following fields:
 - **Memory Management**: 32MB limit (50% safety margin under 64MB Kameo limit)
 - **Smart Batching**: Automatic batch size adjustment based on document size
 - **Error Handling**: Detailed error reporting with failed operation counts/sec with optimized batching (Rust 2024 performance improvements)
-- **Smart Commits**: Dynamic commit thresholds based on memory budgets (32MB-512MB)
+- **Supervised Smart Commits**: Dynamic commit thresholds based on memory budgets (32MB-512MB) with eventual durability guarantees via async supervision
 - **Parallel Sharding**: Automatic document distribution across multiple shards
 - **Cluster-Aware**: Real-time cluster health monitoring and accurate shard reporting
 

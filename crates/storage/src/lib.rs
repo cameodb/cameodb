@@ -937,6 +937,9 @@ impl HybridStore {
         let wal_data =
             serde_json::to_vec(&op).map_err(|e| StoreError::Serialization(e.to_string()))?;
 
+        // Step 1.5: Evolve schema if new fields are present (declare outside transaction scope)
+        let mut evolved_schema = None;
+
         let mut write_txn = self.kv.begin_write()?;
         {
             // Set durability based on config (except for schema changes which always use Immediate)
@@ -946,7 +949,7 @@ impl HybridStore {
                 Durability::None
             };
             write_txn.set_durability(durability)?;
-            tracing::trace!(index = %index, durability = ?durability, "Transaction durability set");
+            tracing::trace!(index = %index, durability = ?durability, "Data transaction durability set (user data)");
 
             let mut wal_table = write_txn.open_table(wal_table_def)?;
             wal_table.insert(seq_id, wal_data.as_slice())?;
@@ -959,8 +962,6 @@ impl HybridStore {
                         .get_schema_cached(index)?
                         .unwrap_or_else(|| Arc::new(IndexSchema::default()));
 
-                    // Step 1.5: Evolve schema if new fields are present
-                    let mut evolved_schema = None;
                     if let Some(json_blob) = &json_blob {
                         let mut schema_mut = (*schema).clone();
                         let evolved_fields = schema_mut.evolve_from_document(json_blob);
@@ -968,9 +969,9 @@ impl HybridStore {
                             tracing::debug!(
                                 index = %index,
                                 evolved_fields = ?evolved_fields,
-                                "Evolved schema with new non-indexed fields (will persist in redb transaction)"
+                                "Evolved schema with new non-indexed fields (will persist in separate transaction)"
                             );
-                            // Store evolved schema for persistence in this transaction
+                            // Store evolved schema for persistence after data transaction
                             evolved_schema = Some(schema_mut.clone());
 
                             // Update cache immediately for subsequent reads
@@ -1114,15 +1115,6 @@ impl HybridStore {
                     let term = tantivy::Term::from_field_text(fields.id, &id);
                     writer.delete_term(term);
                     writer.add_document(tantivy_doc)?;
-
-                    // Persist evolved schema in the same transaction
-                    if let Some(ref evolved) = evolved_schema {
-                        let schema_bytes = serde_json::to_vec(evolved)
-                            .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                        let mut schema_table = write_txn.open_table(TABLE_SCHEMA)?;
-                        schema_table.insert(index, schema_bytes.as_slice())?;
-                        tracing::trace!(index = %index, "Persisted evolved schema in redb transaction");
-                    }
                 }
                 WalOp::Delete { id } => {
                     let mut data_table = write_txn.open_table(data_table_def)?;
@@ -1137,6 +1129,33 @@ impl HybridStore {
         }
 
         write_txn.commit()?;
+
+        // Persist schema evolution in separate transaction with Immediate durability
+        if let Some(evolved) = evolved_schema {
+            // Note: Schema persistence failure is critical but doesn't affect data consistency
+            // The data has already been committed successfully, but schema evolution failed
+            match self.persist_schema_evolution(index, &evolved) {
+                Ok(()) => {
+                    // Update cache after successful persistence
+                    if let Ok(mut cache) = self.schema_cache.write() {
+                        cache.insert(index.to_string(), Arc::new(evolved));
+                    }
+                    tracing::info!(index = %index, "Schema evolution persisted successfully");
+                }
+                Err(e) => {
+                    tracing::error!(
+                        index = %index,
+                        error = %e,
+                        "CRITICAL: Schema evolution failed after data commit. Data was saved but schema may be inconsistent."
+                    );
+                    // Return error to signal the issue, but note that data was already committed
+                    return Err(StoreError::Serialization(format!(
+                        "Schema evolution failed for index {}: {}. Data was committed but schema may be inconsistent.",
+                        index, e
+                    )));
+                }
+            }
+        }
 
         // Increment operation counter and perform smart commit if needed
         self.increment_operations(index);
@@ -1287,6 +1306,30 @@ impl HybridStore {
         }
         write_txn.commit()?;
 
+        Ok(())
+    }
+
+    /// Persist schema evolution with Immediate durability (critical metadata)
+    fn persist_schema_evolution(
+        &self,
+        index_name: &str,
+        schema: &IndexSchema,
+    ) -> Result<(), StoreError> {
+        let schema_bytes =
+            serde_json::to_vec(schema).map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+        let mut write_txn = self.kv.begin_write()?;
+        {
+            // Schema evolution always uses Immediate durability for critical metadata
+            write_txn.set_durability(Durability::Immediate)?;
+            tracing::trace!(index = %index_name, durability = "Immediate", "Schema evolution persistence durability set");
+
+            let mut schema_table = write_txn.open_table(TABLE_SCHEMA)?;
+            schema_table.insert(index_name, schema_bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+
+        tracing::debug!(index = %index_name, "Schema evolution persisted with Immediate durability");
         Ok(())
     }
 
@@ -1689,7 +1732,7 @@ impl HybridStore {
                 Durability::None
             };
             write_txn.set_durability(durability)?;
-            tracing::trace!(index = %index, batch_size = batch_size, durability = ?durability, "Bulk write transaction durability set");
+            tracing::trace!(index = %index, batch_size = batch_size, durability = ?durability, "Bulk data transaction durability set (user data)");
 
             let mut wal_table = write_txn.open_table(wal_table_def)?;
             let mut data_table = write_txn.open_table(data_table_def)?;
@@ -1882,7 +1925,7 @@ impl HybridStore {
             }
 
             // Perform smart commit if needed, or force commit for very large batches
-            if batch_size >= 1000 {
+            if batch_size >= self.config.default_batch_size as u64 {
                 // Force commit for very large batches
                 writer.commit()?;
                 self.reset_operations_counter(index);
@@ -1890,7 +1933,7 @@ impl HybridStore {
         }
 
         // Use smart commit logic for normal batches (when writer lock is released)
-        if batch_size < 1000 {
+        if batch_size < self.config.default_batch_size as u64 {
             self.maybe_commit_writer(index)?;
         }
 

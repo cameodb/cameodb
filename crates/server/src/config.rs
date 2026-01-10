@@ -333,6 +333,12 @@ impl CameoDbConfig {
             config.storage.wal_sync = matches!(normalized.as_str(), "true" | "1" | "yes");
         }
 
+        if let Ok(batch_size) = std::env::var("CAMEODB_STORAGE_DEFAULT_BATCH_SIZE") {
+            config.storage.default_batch_size = batch_size
+                .parse()
+                .with_context(|| "Invalid CAMEODB_STORAGE_DEFAULT_BATCH_SIZE")?;
+        }
+
         // Search configuration
         if let Ok(min_mem) = std::env::var("CAMEODB_INDEXER_MEMORY_MIN_MB") {
             config.search.indexer_memory_min_mb = min_mem
@@ -657,7 +663,7 @@ fn default_wal_segment_size_mb() -> usize {
     64
 }
 fn default_default_batch_size() -> usize {
-    200
+    1000
 }
 
 fn default_num_shards_init() -> usize {

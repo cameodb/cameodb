@@ -11,7 +11,7 @@ A high-performance, distributed, shared-nothing hybrid-search database built in 
 - 🌐 **Distributed Ready** - Actor-based architecture with consistent hashing
 - 🔁 **Event-Driven Persistence** - Zero-polling cluster metadata with state reconciliation
 - 🐳 **Docker Deployment** - Production-ready containerized setup
-- 📈 **Performance Optimized** - Smart commits, memory budgets, and adaptive batching
+- 📈 **Performance Optimized** - Supervised Smart Commits, memory budgets, and adaptive batching
 - 🦀 **Modern Rust 2024** - Built with latest Rust standards and performance optimizations
 
 ## 🚀 Quick Start
@@ -372,7 +372,7 @@ python3 scripts/examples/ingest_books.py --dry-run
 ## 📈 Performance Features
 
 - **Batch Processing**: Atomic bulk operations across shards
-- **Smart Commits**: Memory-aware commit strategies
+- **Supervised Smart Commits**: Memory-aware commit strategies with eventual durability guarantees
 - **Consistent Hashing**: Optimal data distribution
 - **Streaming Search**: Real-time result streaming for large queries
 - **Schema Evolution**: Dynamic field addition and validation

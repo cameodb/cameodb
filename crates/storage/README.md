@@ -188,7 +188,7 @@ pub fn apply_write(&self, index: &str, op: WalOp) -> Result<u64, StoreError> {
     // Commit redb transaction (WAL + data)
     write_txn.commit()?;
 
-    // Smart commit: may or may not commit Tantivy immediately
+    // Supervised Smart Commits: may or may not commit Tantivy immediately
     self.increment_operations(index);
     self.maybe_commit_writer(index)?;
 
@@ -293,7 +293,7 @@ let config = StorageConfig {
     indexer_memory_budget: 64 * 1024 * 1024, // 64MB default (increased from 32MB)
     indexer_memory_min_mb: 32,               // 32MB minimum (increased from 16MB)
     indexer_memory_max_mb: 512,              // 512MB maximum (increased from 256MB)
-    default_batch_size: 1000,               // Smart commit threshold
+    default_batch_size: 1000,               // Supervised Smart Commits threshold
     wal_sync: true,                         // Maximum durability
 };
 
@@ -374,7 +374,7 @@ async fn batch_insert(
         }
     }).collect();
     
-    // Atomic batch processing with smart commits
+    // Atomic batch processing with Supervised Smart Commits
     let sequence_ids = tokio::task::spawn_blocking({
         let store = store.clone();
         let index = index.to_string();
@@ -418,7 +418,7 @@ async fn individual_insert(
 use storage::StorageConfig;
 use std::path::PathBuf;
 
-// High-performance configuration with smart commits
+// High-performance configuration with Supervised Smart Commits
 let high_perf_config = StorageConfig {
     shard_path: PathBuf::from("/fast-ssd/shard1"),
     indexer_memory_budget: 64 * 1024 * 1024,  // 64MB default
@@ -449,20 +449,131 @@ let low_memory_config = StorageConfig {
 };
 ```
 
+## Supervised Smart Commits
+
+CameoDB implements sophisticated **Supervised Smart Commits** that provide both high performance and strong durability guarantees for Tantivy search indices.
+
+### Architecture Overview
+
+The system combines two complementary commit mechanisms:
+
+#### 1. Smart Commits (Immediate Performance)
+- **Trigger**: Operation count threshold reached (adaptive based on memory budget)
+- **Behavior**: Immediate Tantivy commit during write operations
+- **Purpose**: Memory management and performance optimization
+- **Adaptive Threshold**: 500-8000 operations based on index memory budget (32MB-512MB)
+
+#### 2. Supervised Eventual Commits (Durability Guarantee)
+- **Trigger**: 5 seconds of inactivity after last write
+- **Behavior**: Background commit via async supervisor tasks
+- **Purpose**: Data durability guarantee for low-volume write patterns
+- **Self-cleanup**: Supervisors automatically remove themselves after successful commits
+
+### Implementation Details
+
+#### Smart Commit Algorithm
+```rust
+// Adaptive threshold calculation:
+let budget_ratio = (budget - min_budget) as f64 / (max_budget - min_budget) as f64;
+let base_ops = (default_batch_size * (0.5 + budget_ratio * 7.5)) as u64;
+// Result: 500 ops (32MB) -> 8000 ops (512MB)
+```
+
+#### Supervisor Mechanism
+```rust
+// Per-index async supervisor:
+tokio::spawn(async move {
+    loop {
+        tokio::select! {
+            Some(()) = rx.recv() => continue;  // Write activity - reset timer
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                // Timeout - eventual commit
+                store_inner.commit_index(&index_inner);
+                break; // Self-cleanup
+            }
+        }
+    }
+});
+```
+
+### Behavior Scenarios
+
+#### High-Volume Workloads
+```
+Write 1 → Signal supervisor (timer: 5s)
+Write 2 → Signal supervisor (timer: 5s)
+... (smart commit triggers at default_batch_size ops)
+Commit → Supervisor self-cleanup
+```
+
+#### Low-Volume Workloads
+```
+Write 1 → Signal supervisor (timer: 5s)
+... (no more writes)
+5s pass → Timeout → Eventual commit
+Commit → Supervisor self-cleanup
+```
+
+### Benefits
+
+#### Performance Benefits
+- **High-Volume**: Smart commits reduce commit overhead during bursts
+- **Low-Volume**: Eventual commits prevent unnecessary commits
+- **Memory Efficiency**: Adaptive thresholds based on index size
+- **Multi-Tenant**: Per-index supervision and commit strategies
+
+#### Durability Guarantees
+- **Maximum 5-second window**: Data loss window bounded by supervisor timeout
+- **Large Batches (≥ default_batch_size)**: **Immediate commit** regardless of threshold
+- **Consistency**: All writes eventually become searchable
+- **Crash Safety**: Supervisor state is lightweight, easily recreated
+
+#### Operational Simplicity
+- **Zero Configuration**: Works out of the box with sensible defaults
+- **Self-Healing**: Automatic retry and cleanup mechanisms
+- **Resource Efficient**: Supervisors only exist for active indices
+- **Async/Sync Safe**: Proper isolation between async supervision and sync storage operations
+
+### Configuration
+
+```toml
+[search]
+indexer_memory_min_mb = 32      # Minimum memory budget
+indexer_memory_max_mb = 512     # Maximum memory budget  
+default_batch_size = 1000       # Base smart commit threshold
+# Supervisor timeout is fixed at 5 seconds (configurable in future versions)
+```
+
+### Environment Variables
+
+You can also configure the batch size via environment variable:
+
+```bash
+# Set default batch size to 500 operations
+export CAMEODB_STORAGE_DEFAULT_BATCH_SIZE=500
+
+# Set default batch size to 2000 operations for high-throughput workloads
+export CAMEODB_STORAGE_DEFAULT_BATCH_SIZE=2000
+```
+
+**Priority Order**: Environment variables override TOML configuration values.
+
+This supervised strategy ensures optimal performance across all write patterns while maintaining strong data durability guarantees.
+
 ## Performance Characteristics
 
 ### Write Performance (Rust 2024 Optimized)
 - **Single Operations**: ~0.5-3ms per operation (depends on fsync setting)
 - **Batch Operations**: ~0.05-0.5ms per operation in batch (significant improvement)
 - **Throughput**: ~2000-15000 ops/sec individual, ~10000-100000 ops/sec batched
-- **Smart Commits**: Adaptive commit frequency based on memory budget and batch size
+- **Supervised Smart Commits**: Adaptive commit frequency based on memory budget and batch size, with eventual durability guarantees via async supervision
 - **Modern Error Handling**: Rust 2024 `std::io::Error::other()` for better performance
 - **Bottlenecks**: Disk I/O (fsync), tantivy indexing, mutex contention
 
 ### Multi-Tenant Performance
 - **Index Isolation**: No performance interference between indices
 - **Memory Scaling**: Dynamic memory budgets based on index size (32MB-512MB)
-- **Commit Optimization**: Per-index smart commits with configurable thresholds
+- **Commit Optimization**: Per-index Supervised Smart Commits with configurable thresholds and eventual durability guarantees
 - **Cache Efficiency**: Independent IndexWriter/IndexReader caches per index
 
 ### Read Performance  
@@ -504,7 +615,7 @@ tokio::spawn(async move {
 - **IndexWriter cache**
   - `IndexWriter` is cached per index in an `Arc<Mutex<IndexWriter>>`
   - Writers are created on first access and reused across writes
-  - Smart commit logic uses per-index operation counters to decide when to call `commit()`
+  - Supervised Smart Commits logic uses per-index operation counters to decide when to call `commit()`
 
 - **IndexReader cache (internal)**
   - `HybridStore` maintains an internal reader cache, but `search_documents` currently:
@@ -720,7 +831,7 @@ Supports standard tantivy query syntax:
 - **Multi-tenant Isolation**: Each index maintains independent search performance
 - **Memory Scaling**: Dynamic memory budgets (32MB-512MB) based on index size
 - **Indexing**: Automatic when documents are written via `apply_write` or `apply_batch`
-- **Smart Commits**: Configurable commit frequency optimizes search freshness vs performance
+- **Supervised Smart Commits**: Configurable commit frequency optimizes search freshness vs performance with eventual durability guarantees
 
 ## Supported Schema Field Types
 
@@ -825,7 +936,7 @@ impl MicroshardActor {
 - **Metrics**: Performance monitoring and health checks per index
 
 ### Performance Optimizations
-- **Smart Commit Strategy**: ✅ Implemented - Adaptive commit frequency based on memory budget
+- **Supervised Smart Commits**: ✅ Implemented - Adaptive commit frequency based on memory budget with eventual durability guarantees via async supervision
 - **Dynamic Memory Budgets**: ✅ Implemented - Per-index memory scaling (32MB-512MB)
 - **Atomic Batch Processing**: ✅ Implemented - Single transaction for multiple operations
 - **Multi-tenant Caching**: ✅ Implemented - Independent caches per index
