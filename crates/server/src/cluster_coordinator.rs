@@ -518,15 +518,15 @@ impl ClusterCoordinator {
                 .cloned()
                 .collect();
 
-            if !local_shards.is_empty() {
-                if let Some(handle) = self.cluster.swarm_handle() {
-                    if let Err(e) = handle.publish_shards(local_node_id, local_shards) {
-                        warn!(error = %e, "Failed to re-publish local shards to DHT after peer discovery");
-                    } else {
-                        debug!(
-                            "ClusterCoordinator: re-published local shards to DHT after gaining first peer"
-                        );
-                    }
+            if !local_shards.is_empty()
+                && let Some(handle) = self.cluster.swarm_handle()
+            {
+                if let Err(e) = handle.publish_shards(local_node_id, local_shards) {
+                    warn!(error = %e, "Failed to re-publish local shards to DHT after peer discovery");
+                } else {
+                    debug!(
+                        "ClusterCoordinator: re-published local shards to DHT after gaining first peer"
+                    );
                 }
             }
         }
@@ -740,13 +740,13 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
 
         // Publish local shards to DHT ONLY during bootstrap phase
         // After bootstrap, rely exclusively on Kameo push for real-time updates
-        if !self.bootstrap_complete {
-            if let Some(handle) = self.cluster.swarm_handle() {
-                if let Err(e) = handle.publish_shards(msg.node_id, msg.shards.clone()) {
-                    warn!(error = %e, "Failed to publish shards to DHT during bootstrap");
-                } else {
-                    info!("ClusterCoordinator: published local shards to DHT (bootstrap phase)");
-                }
+        if !self.bootstrap_complete
+            && let Some(handle) = self.cluster.swarm_handle()
+        {
+            if let Err(e) = handle.publish_shards(msg.node_id, msg.shards.clone()) {
+                warn!(error = %e, "Failed to publish shards to DHT during bootstrap");
+            } else {
+                info!("ClusterCoordinator: published local shards to DHT (bootstrap phase)");
             }
         }
         // Broadcast ALL known shards to all known connected peers (transitive propagation)
@@ -800,7 +800,8 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
                                             .tell::<ResetPushFailure>(ResetPushFailure {
                                                 node_id: peer_id,
                                             })
-                                            .send();
+                                            .send()
+                                            .await;
                                     }
                                 }
                                 Err(e) => {
@@ -811,7 +812,8 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
                                             .tell::<TrackPushFailure>(TrackPushFailure {
                                                 node_id: peer_id,
                                             })
-                                            .send();
+                                            .send()
+                                            .await;
                                     }
                                 }
                             },
@@ -1042,21 +1044,18 @@ impl Message<InitSwarm> for ClusterCoordinator {
                                         } else {
                                             debug!(peer_id = %peer_id, address = %meta.address.clone().unwrap_or_default(), "ClusterCoordinator: peer lost before UUID resolution");
                                         }
-                                    } else {
-                                        if let Some(uuid_str) = node_uuid {
-                                            if let Ok(uuid) = Uuid::parse_str(&uuid_str) {
-                                                if let Err(err) = coordinator
-                                                    .ask(PeerLost { node_id: uuid })
-                                                    .await
-                                                {
-                                                    warn!(error = %err, address = %event_addr, "ClusterCoordinator: failed to forward peer lost with uuid (uncached)");
-                                                }
-                                            } else {
-                                                warn!(peer_id = %peer_id, uuid = %uuid_str, "ClusterCoordinator: invalid uuid supplied for uncached peer");
+                                    } else if let Some(uuid_str) = node_uuid {
+                                        if let Ok(uuid) = Uuid::parse_str(&uuid_str) {
+                                            if let Err(err) =
+                                                coordinator.ask(PeerLost { node_id: uuid }).await
+                                            {
+                                                warn!(error = %err, address = %event_addr, "ClusterCoordinator: failed to forward peer lost with uuid (uncached)");
                                             }
                                         } else {
-                                            debug!(peer_id = %peer_id, address = %event_addr, "ClusterCoordinator: peer lost with no cached metadata");
+                                            warn!(peer_id = %peer_id, uuid = %uuid_str, "ClusterCoordinator: invalid uuid supplied for uncached peer");
                                         }
+                                    } else {
+                                        debug!(peer_id = %peer_id, address = %event_addr, "ClusterCoordinator: peer lost with no cached metadata");
                                     }
                                 }
                                 CoordinatorEvent::DialFailed { peer_id, error } => {
@@ -1346,7 +1345,8 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
                                             node_name: String::new(), // Placeholder, will be updated from peer info
                                             shards: remote_shards,
                                         })
-                                        .send();
+                                        .send()
+                                        .await;
                                 }
                             }
                             Err(e) => {
@@ -1577,11 +1577,9 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
         // First, remove any existing assignments for this node that are NOT in the new list
         let mut removed_count = 0;
         self.shard_assignments.retain(|shard_id, meta| {
-            if meta.node_id == node_id {
-                if !actual_shards.contains_key(shard_id) {
-                    removed_count += 1;
-                    return false;
-                }
+            if meta.node_id == node_id && !actual_shards.contains_key(shard_id) {
+                removed_count += 1;
+                return false;
             }
             true
         });
@@ -1795,12 +1793,11 @@ impl Message<GetKnownPeers> for ClusterCoordinator {
 
 impl Drop for ClusterCoordinator {
     fn drop(&mut self) {
-        if let Some(handle) = self.cluster.swarm_handle() {
-            if handle.is_running() {
-                if let Err(error) = handle.shutdown() {
-                    warn!(%error, "ClusterCoordinator drop: failed to signal swarm shutdown");
-                }
-            }
+        if let Some(handle) = self.cluster.swarm_handle()
+            && handle.is_running()
+            && let Err(error) = handle.shutdown()
+        {
+            warn!(%error, "ClusterCoordinator drop: failed to signal swarm shutdown");
         }
     }
 }

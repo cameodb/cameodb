@@ -177,8 +177,8 @@ async fn main() -> Result<()> {
             let peer_id: String = peer_id;
             // Get cluster status via actor
             let status_result: Result<ClusterStatus, _> = coordinator_actor.ask(GetStatus).await;
-            if let Ok(cluster_status) = status_result {
-                if cluster_status.cluster_enabled {
+            if let Ok(cluster_status) = status_result
+                && cluster_status.cluster_enabled {
                     println!("🌐 Distributed swarm initialized:");
                     println!("  📡 Cluster: {}", cluster_status.cluster_name);
                     println!("  🆔 Peer ID: {}", peer_id);
@@ -188,13 +188,11 @@ async fn main() -> Result<()> {
                     // Discover peers via actor
                     let discover_result: Result<Vec<crate::distributed::NodeInfo>, _> =
                         coordinator_actor.ask(DiscoverPeers).await;
-                    if let Ok(peers) = discover_result {
-                        if !peers.is_empty() {
+                    if let Ok(peers) = discover_result
+                        && !peers.is_empty() {
                             println!("  👥 Discovered {} peer nodes", peers.len());
                         }
-                    }
                 }
-            }
         }
     }
 

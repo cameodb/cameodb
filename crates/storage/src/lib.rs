@@ -84,7 +84,7 @@ impl StorageConfig {
                 0..=100 => min_budget_bytes, // Very small indices: min budget (32MB)
                 101..=500 => default_budget_bytes, // Small indices: start budget (64MB)
                 501..=2000 => (min_budget_bytes + max_budget_bytes) / 2, // Medium indices: mid-range (272MB)
-                2001..=8000 => (max_budget_bytes * 1) / 2, // Large indices: 50% of max (256MB)
+                2001..=8000 => max_budget_bytes / 2, // Large indices: 50% of max (256MB)
                 _ => max_budget_bytes,                     // Very large indices: max budget (512MB)
             };
 
@@ -99,8 +99,10 @@ impl StorageConfig {
 
 /// Native Tantivy field types with proper enum for type safety.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum TantivyFieldType {
     /// Tokenized text for full-text search
+    #[default]
     Text,
     /// Untokenized string (exact match)
     String,
@@ -124,11 +126,6 @@ pub enum TantivyFieldType {
     Facet,
 }
 
-impl Default for TantivyFieldType {
-    fn default() -> Self {
-        TantivyFieldType::Text
-    }
-}
 
 impl TantivyFieldType {
     /// Convert to string representation (for serialization)
@@ -333,8 +330,8 @@ impl IndexSchema {
     /// This requires a Tantivy schema rebuild and should be done explicitly.
     /// Returns true if the field was promoted, false if it was already indexed or doesn't exist.
     pub fn promote_field_to_indexed(&mut self, field_name: &str) -> bool {
-        if let Some(field_def) = self.fields.get_mut(field_name) {
-            if !field_def.indexed {
+        if let Some(field_def) = self.fields.get_mut(field_name)
+            && !field_def.indexed {
                 field_def.indexed = true;
                 tracing::info!(
                     field = %field_name,
@@ -343,7 +340,6 @@ impl IndexSchema {
                 );
                 return true;
             }
-        }
         false
     }
 
@@ -1003,9 +999,9 @@ impl HybridStore {
                             continue;
                         }
 
-                        if let Some(tantivy_field) = fields.indexed_fields.get(field_name) {
-                            if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
-                                if let Some(field_value) = json_obj.get(field_name) {
+                        if let Some(tantivy_field) = fields.indexed_fields.get(field_name)
+                            && let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object())
+                                && let Some(field_value) = json_obj.get(field_name) {
                                     match field_def.field_type {
                                         TantivyFieldType::Text => {
                                             if let Some(s) = field_value.as_str() {
@@ -1106,8 +1102,6 @@ impl HybridStore {
                                         }
                                     }
                                 }
-                            }
-                        }
                     }
 
                     let writer = writer_arc.lock().unwrap();
@@ -1769,8 +1763,8 @@ impl HybridStore {
                                 continue;
                             }
 
-                            if let Some(tantivy_field) = fields.indexed_fields.get(field_name) {
-                                if let Some(json_obj) =
+                            if let Some(tantivy_field) = fields.indexed_fields.get(field_name)
+                                && let Some(json_obj) =
                                     json_blob.as_ref().and_then(|v| v.as_object())
                                     && let Some(field_value) = json_obj.get(field_name)
                                 {
@@ -1874,7 +1868,6 @@ impl HybridStore {
                                         }
                                     }
                                 }
-                            }
                         }
 
                         tantivy_ops.push(("add", tantivy_doc, id));
@@ -2229,19 +2222,26 @@ mod tests {
         let text_field = FieldDef::new("title".to_string(), TantivyFieldType::Text);
         assert_eq!(text_field.field_type, TantivyFieldType::Text);
         assert!(text_field.indexed);
-        assert!(text_field.stored); // Text fields are stored by default
+        assert!(!text_field.stored); // Only "id" field is stored in Tantivy
         assert!(!text_field.fast); // Text fields are not fast by default
 
         let i64_field = FieldDef::new("count".to_string(), TantivyFieldType::I64);
         assert_eq!(i64_field.field_type, TantivyFieldType::I64);
         assert!(i64_field.indexed);
-        assert!(!i64_field.stored); // Numeric fields are NOT stored by default
+        assert!(!i64_field.stored); // Only "id" field is stored in Tantivy
         assert!(i64_field.fast); // Numeric fields are fast by default
+
+        // Test the "id" field special case
+        let id_field = FieldDef::new("id".to_string(), TantivyFieldType::Text);
+        assert_eq!(id_field.field_type, TantivyFieldType::Text);
+        assert!(id_field.indexed);
+        assert!(id_field.stored); // "id" field is stored in Tantivy
+        assert!(!id_field.fast); // Text fields are not fast by default
 
         let json_field = FieldDef::new("metadata".to_string(), TantivyFieldType::Json);
         assert_eq!(json_field.field_type, TantivyFieldType::Json);
         assert!(json_field.indexed);
-        assert!(json_field.stored); // JSON fields are stored by default
+        assert!(!json_field.stored); // Only "id" field is stored in Tantivy
         assert!(!json_field.fast); // JSON fields are not fast by default
 
         println!("✅ FieldDef creation works correctly!");
@@ -2319,7 +2319,10 @@ mod tests {
         let title_field = schema.fields.get("title").unwrap();
         assert_eq!(title_field.field_type, TantivyFieldType::Text);
         assert!(!title_field.indexed, "New fields should be non-indexed");
-        assert!(title_field.stored, "Text fields should be stored");
+        assert!(
+            !title_field.stored,
+            "Only 'id' field should be stored in Tantivy"
+        );
 
         let count_field = schema.fields.get("count").unwrap();
         assert_eq!(count_field.field_type, TantivyFieldType::I64);

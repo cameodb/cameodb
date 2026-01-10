@@ -215,7 +215,7 @@ async fn stream_handler(
             }
             Err(e) => Err(std::io::Error::other(e)),
         }))
-        .map(|res| res.map_err(|e| std::io::Error::other(e)));
+        .map(|res| res.map_err(std::io::Error::other));
 
         let body = Body::from_stream(stream);
         let mut resp = Response::new(body);

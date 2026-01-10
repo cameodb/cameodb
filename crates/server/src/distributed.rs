@@ -286,13 +286,11 @@ impl DistributedCluster {
 
 impl Drop for DistributedCluster {
     fn drop(&mut self) {
-        if let Some(handle) = self.swarm_handle.as_ref() {
-            if handle.is_running() {
-                if let Err(error) = handle.shutdown() {
+        if let Some(handle) = self.swarm_handle.as_ref()
+            && handle.is_running()
+                && let Err(error) = handle.shutdown() {
                     warn!(%error, "failed to signal swarm shutdown during drop");
                 }
-            }
-        }
     }
 }
 

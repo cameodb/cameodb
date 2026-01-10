@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 /// 3) First valid DNS (unspecified) entry
 /// 4) First valid IPv6 entry
 /// 5) First valid DNS v6 entry
+///
 /// If none are provided or valid, falls back to 0.0.0.0.
 ///
 /// We prepend the explicit bind_address (if set) ahead of listen_addrs to ensure that
@@ -69,14 +70,14 @@ pub fn resolve_listen_address(
     }
 
     // If no IP candidates, try resolving bind_address as DNS to an IP (prefer IPv4).
-    if !bind_address.trim().is_empty() {
-        if let Some(addr) = resolve_hostname_to_ip(bind_address, port) {
-            info!(
-                "🎧 Resolved DNS bind address {} -> {} for cluster listen",
-                bind_address, addr
-            );
-            return Ok(addr);
-        }
+    if !bind_address.trim().is_empty()
+        && let Some(addr) = resolve_hostname_to_ip(bind_address, port)
+    {
+        info!(
+            "🎧 Resolved DNS bind address {} -> {} for cluster listen",
+            bind_address, addr
+        );
+        return Ok(addr);
     }
 
     // Fallback to 0.0.0.0
@@ -208,11 +209,11 @@ fn parse_listen_entry(entry: &str, port: u16) -> Vec<Multiaddr> {
                     }
                 }
             }
-            if let Some(v6) = first_v6 {
-                if let Ok(addr) = format!("/ip6/{}/tcp/{}", v6, port_num).parse() {
-                    out.push(addr);
-                    return out;
-                }
+            if let Some(v6) = first_v6
+                && let Ok(addr) = format!("/ip6/{}/tcp/{}", v6, port_num).parse()
+            {
+                out.push(addr);
+                return out;
             }
             warn!(
                 "⚠️  Ignoring listen address '{}': DNS resolved to no usable IP",

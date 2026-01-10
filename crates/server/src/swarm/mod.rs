@@ -335,24 +335,22 @@ async fn create_production_swarm(
             );
             continue;
         }
-        if let Some(ip4) = listen_ip4 {
-            if addr.to_string().starts_with(&format!("/ip4/{}/tcp/", ip4)) {
+        if let Some(ip4) = listen_ip4
+            && addr.to_string().starts_with(&format!("/ip4/{}/tcp/", ip4)) {
                 info!(
                     "⏭️  Skipping self-dial to local seed node (ip4 match): {}",
                     addr
                 );
                 continue;
             }
-        }
-        if let Some(ip6) = listen_ip6 {
-            if addr.to_string().starts_with(&format!("/ip6/{}/tcp/", ip6)) {
+        if let Some(ip6) = listen_ip6
+            && addr.to_string().starts_with(&format!("/ip6/{}/tcp/", ip6)) {
                 info!(
                     "⏭️  Skipping self-dial to local seed node (ip6 match): {}",
                     addr
                 );
                 continue;
             }
-        }
 
         info!("📞 Attempting to dial seed node: {}", addr);
         match swarm.dial(addr.clone()) {

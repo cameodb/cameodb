@@ -50,6 +50,9 @@ use storage::{
     FieldDef, HybridStore, IndexSchema, StorageConfig, StoreError, TantivyFieldType, WalOp,
 };
 
+// Type alias for routing results to reduce complexity
+type RoutingResult = Result<(usize, DocPayload, Option<String>), OrchestratorError>;
+
 // ============================================================================
 // Remote Actor Naming Constants
 // ============================================================================
@@ -764,10 +767,11 @@ async fn validate_and_evolve_schema(
                 let mut is_compatible = existing_field.field_type == inferred_type;
 
                 // 2. Allow Text to match String (for backward compatibility with exact fields)
-                if !is_compatible && inferred_type == TantivyFieldType::Text {
-                    if existing_field.field_type == TantivyFieldType::String {
-                        is_compatible = true;
-                    }
+                if !is_compatible
+                    && inferred_type == TantivyFieldType::Text
+                    && existing_field.field_type == TantivyFieldType::String
+                {
+                    is_compatible = true;
                 }
 
                 // 3. Allow Text to evolve to more specific types
@@ -1424,10 +1428,10 @@ impl RouterActor {
                             if let Some(fields) = idx.get("field_names").and_then(|v| v.as_array())
                             {
                                 for field in fields {
-                                    if let Some(field_str) = field.as_str() {
-                                        if !entry.field_names.contains(&field_str.to_string()) {
-                                            entry.field_names.push(field_str.to_string());
-                                        }
+                                    if let Some(field_str) = field.as_str()
+                                        && !entry.field_names.contains(&field_str.to_string())
+                                    {
+                                        entry.field_names.push(field_str.to_string());
                                     }
                                 }
                             }
@@ -1778,10 +1782,11 @@ impl NodeOrchestrator {
                     let mut is_compatible = existing_field.field_type == inferred_type;
 
                     // Allow Text to match String (backward compatibility)
-                    if !is_compatible && inferred_type == TantivyFieldType::Text {
-                        if existing_field.field_type == TantivyFieldType::String {
-                            is_compatible = true;
-                        }
+                    if !is_compatible
+                        && inferred_type == TantivyFieldType::Text
+                        && existing_field.field_type == TantivyFieldType::String
+                    {
+                        is_compatible = true;
                     }
 
                     // Allow Text to evolve to more specific types
@@ -2923,18 +2928,18 @@ impl NodeOrchestrator {
             return Ok(cached);
         }
 
-        if let Some(shard) = self.shards.values().next() {
-            if let Some(store) = &shard.store {
-                let sc = Arc::clone(store);
-                let idx = index.to_string();
-                let schema = tokio::task::spawn_blocking(move || sc.get_schema(&idx))
-                    .await
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-                if let Some(schema) = schema {
-                    self.put_cached_schema(index, &schema).await;
-                    return Ok(schema);
-                }
+        if let Some(shard) = self.shards.values().next()
+            && let Some(store) = &shard.store
+        {
+            let sc = Arc::clone(store);
+            let idx = index.to_string();
+            let schema = tokio::task::spawn_blocking(move || sc.get_schema(&idx))
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+            if let Some(schema) = schema {
+                self.put_cached_schema(index, &schema).await;
+                return Ok(schema);
             }
         }
         Ok(IndexSchema {
@@ -2977,7 +2982,7 @@ impl NodeOrchestrator {
         let first_shard_id = self.first_shard_id();
 
         // Route documents in parallel using rayon for CPU-bound work
-        let routing_results: Vec<Result<(usize, DocPayload, Option<String>), OrchestratorError>> =
+        let routing_results: Vec<RoutingResult> =
             docs.into_par_iter()
                 .map(|doc| {
                     // Calculate effective routing key

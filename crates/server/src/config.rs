@@ -47,6 +47,7 @@ pub enum ConfigError {
 
 /// Complete CameoDB configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct CameoDbConfig {
     /// Node-level configuration (sharding, identity)
     #[serde(default)]
@@ -64,6 +65,7 @@ pub struct CameoDbConfig {
 
 /// Network configuration wrapper
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct NetworkConfig {
     /// HTTP server configuration
     pub http: HttpConfig,
@@ -395,11 +397,10 @@ impl CameoDbConfig {
                 .with_context(|| "Invalid CAMEODB_CLUSTER_PORT")?;
         }
 
-        if let Ok(name) = std::env::var("CAMEODB_CLUSTER_NAME") {
-            if !name.trim().is_empty() {
+        if let Ok(name) = std::env::var("CAMEODB_CLUSTER_NAME")
+            && !name.trim().is_empty() {
                 config.network.cluster.cluster_name = name;
             }
-        }
 
         if let Ok(nodes) = std::env::var("CAMEODB_SEED_NODES") {
             let parsed: Vec<String> = nodes
@@ -480,9 +481,9 @@ impl CameoDbConfig {
         }
 
         // Validate memory configuration
-        if self.search.indexer_memory_min_mb < 16 {
+        if self.search.indexer_memory_min_mb < 32 {
             return Err(ConfigError::MemoryConfig {
-                message: "Indexer memory minimum cannot be less than 16MB".to_string(),
+                message: "Indexer memory minimum cannot be less than 32MB".to_string(),
             }
             .into());
         }
@@ -527,25 +528,7 @@ impl CameoDbConfig {
     }
 }
 
-impl Default for CameoDbConfig {
-    fn default() -> Self {
-        Self {
-            node: NodeConfig::default(),
-            network: NetworkConfig::default(),
-            storage: StorageConfig::default(),
-            search: SearchConfig::default(),
-        }
-    }
-}
 
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self {
-            http: HttpConfig::default(),
-            cluster: ClusterConfig::default(),
-        }
-    }
-}
 
 impl Default for HttpConfig {
     fn default() -> Self {
@@ -674,10 +657,10 @@ fn default_max_shards_per_node() -> usize {
 }
 
 fn default_indexer_memory_min_mb() -> usize {
-    16
+    32
 }
 fn default_indexer_memory_max_mb() -> usize {
-    256
+    512
 }
 fn default_total_memory_limit_mb() -> usize {
     1024
@@ -741,8 +724,9 @@ mod tests {
         let config = CameoDbConfig::default();
         assert_eq!(config.network.http.port, 9480);
         assert_eq!(config.network.http.bind_address, "0.0.0.0");
-        assert_eq!(config.search.indexer_memory_min_mb, 16);
-        assert_eq!(config.search.indexer_memory_max_mb, 256);
+        assert_eq!(config.search.indexer_memory_min_mb, 32); // Updated from 16
+        assert_eq!(config.search.indexer_memory_max_mb, 512); // Updated from 256
+        assert_eq!(config.storage.default_batch_size, 1000); // New parameter
         assert!(config.validate().is_ok());
     }
 
@@ -751,13 +735,13 @@ mod tests {
         let mut config = CameoDbConfig::default();
 
         // Test invalid memory range
-        config.search.indexer_memory_min_mb = 300;
-        config.search.indexer_memory_max_mb = 256;
+        config.search.indexer_memory_min_mb = 600;
+        config.search.indexer_memory_max_mb = 512;
         assert!(config.validate().is_err());
 
         // Test memory too small
-        config.search.indexer_memory_min_mb = 8;
-        config.search.indexer_memory_max_mb = 256;
+        config.search.indexer_memory_min_mb = 16; // Below current min of 32
+        config.search.indexer_memory_max_mb = 512;
         assert!(config.validate().is_err());
     }
 
@@ -779,7 +763,27 @@ mod tests {
     fn test_sample_config_generation() {
         let sample = CameoDbConfig::generate_sample_config().unwrap();
         assert!(sample.contains("port = 9480"));
-        assert!(sample.contains("indexer_memory_min_mb = 16"));
+        assert!(sample.contains("indexer_memory_min_mb = 32")); // Updated from 16
+        assert!(sample.contains("default_batch_size = 1000")); // New parameter
         assert!(sample.contains("data_paths"));
+    }
+
+    #[test]
+    fn test_default_batch_size_setting() {
+        // Set a specific batch size via environment variable
+        unsafe {
+            std::env::set_var("CAMEODB_STORAGE_DEFAULT_BATCH_SIZE", "750");
+        }
+
+        // Load config and verify the value
+        let config = CameoDbConfig::load().unwrap();
+        assert_eq!(config.storage.default_batch_size, 750);
+
+        // Clean up
+        unsafe {
+            std::env::remove_var("CAMEODB_STORAGE_DEFAULT_BATCH_SIZE");
+        }
+
+        println!("✅ Batch size configuration works!");
     }
 }
