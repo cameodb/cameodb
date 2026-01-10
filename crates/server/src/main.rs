@@ -283,8 +283,8 @@ async fn main() -> Result<()> {
     println!("⚙️  Configuration:");
     println!("  Data Paths: {:?}", cameodb_config.storage.data_paths);
     println!(
-        "  Max Shards: {}",
-        cameodb_config.storage.max_shards_per_node
+        "  Number of shards: {}",
+        cameodb_config.storage.num_shards_init
     );
     let durability_label = if cameodb_config.storage.wal_sync {
         "Immediate"
