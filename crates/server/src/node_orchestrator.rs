@@ -15,6 +15,7 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
+use futures::future::join_all;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
@@ -1930,6 +1931,125 @@ impl NodeOrchestrator {
         Ok(())
     }
 
+    /// Process local shard batches in parallel for maximum performance.
+    ///
+    /// This method takes all local shard batches and processes them concurrently
+    /// using tokio tasks, providing significant speedup for multi-shard operations.
+    async fn parallel_local_shard_processing(
+        &self,
+        index: &str,
+        local_batches: HashMap<Uuid, Vec<(DocPayload, Option<String>)>>,
+    ) -> Result<(usize, Vec<String>), OrchestratorError> {
+        if local_batches.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+
+        tracing::debug!(
+            local_shard_count = local_batches.len(),
+            total_docs = local_batches.values().map(|v| v.len()).sum::<usize>(),
+            "Starting parallel local shard processing"
+        );
+
+        // Clone necessary data for parallel processing
+        let index = index.to_string();
+        let shards = self.shards.clone();
+
+        // Create parallel tasks for each local shard
+        let shard_tasks: Vec<_> = local_batches
+            .into_iter()
+            .map(|(shard_id, batch)| {
+                let index = index.clone();
+                let shards = shards.clone();
+
+                tokio::spawn(async move {
+                    Self::process_single_local_shard_static(shard_id, batch, index, shards).await
+                })
+            })
+            .collect();
+
+        // Await all shard operations concurrently
+        let shard_results = join_all(shard_tasks).await;
+
+        // Aggregate results
+        let mut total_written = 0usize;
+        let mut all_errors = Vec::new();
+
+        for result in shard_results {
+            match result {
+                Ok(Ok((written, errors))) => {
+                    total_written += written;
+                    all_errors.extend(errors);
+                }
+                Ok(Err(e)) => {
+                    all_errors.push(format!("Shard processing failed: {}", e));
+                }
+                Err(e) => {
+                    all_errors.push(format!("Task join error: {}", e));
+                }
+            }
+        }
+
+        tracing::debug!(
+            total_written = total_written,
+            error_count = all_errors.len(),
+            "Parallel local shard processing completed"
+        );
+
+        Ok((total_written, all_errors))
+    }
+
+    /// Process a single local shard batch (static method for parallel execution).
+    ///
+    /// This method handles the actual write operations for one shard,
+    /// converting documents to ClientOps and calling the shard actor.
+    async fn process_single_local_shard_static(
+        shard_id: Uuid,
+        batch: Vec<(DocPayload, Option<String>)>,
+        index: String,
+        shards: HashMap<Uuid, MicroshardActor>,
+    ) -> Result<(usize, Vec<String>), OrchestratorError> {
+        if let Some(shard) = shards.get(&shard_id) {
+            tracing::debug!(
+                shard_id = %shard_id,
+                count = batch.len(),
+                "Processing bulk write batch for local shard"
+            );
+
+            let ops: Vec<ClientOp> = batch
+                .into_iter()
+                .map(|(d, effective_routing_key)| ClientOp::Write {
+                    index: index.clone(),
+                    id: d.id,
+                    routing_key: effective_routing_key,
+                    doc: d.doc,
+                })
+                .collect();
+
+            match shard.handle_batch_write(BatchWriteRequest { ops }).await {
+                Ok(seq_ids) => {
+                    tracing::debug!(
+                        shard_id = %shard_id,
+                        written_count = seq_ids.len(),
+                        "Local shard batch processed successfully"
+                    );
+                    Ok((seq_ids.len(), Vec::new()))
+                }
+                Err(e) => {
+                    let error_msg = format!("Shard {}: {}", shard_id, e);
+                    tracing::warn!(error = %error_msg, "Local shard batch processing failed");
+                    Ok((0, vec![error_msg]))
+                }
+            }
+        } else {
+            let error_msg = format!("Local shard {} not found", shard_id);
+            tracing::error!(error = %error_msg, "Shard not found during processing");
+            Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                error_msg,
+            )))
+        }
+    }
+
     /// Forward a bulk batch to a remote node's orchestrator.
     async fn forward_bulk_to_remote(
         &self,
@@ -2484,37 +2604,22 @@ impl NodeOrchestrator {
                 .collect();
         }
 
+        // Separate local and remote batches for parallel processing
+        let mut local_batches = HashMap::new();
+        let mut remote_batches = Vec::new();
         let mut written = 0usize;
         let mut errors = Vec::new();
+
         for (shard_id, batch) in batches {
             let owner_node = shard_assignments.get(&shard_id).map(|m| m.node_id);
 
             match owner_node {
                 Some(node_id) if node_id == self.identity.uuid => {
-                    if let Some(shard) = self.shards.get(&shard_id) {
-                        tracing::debug!(
-                            shard_id = %shard_id,
-                            count = batch.len(),
-                            "Processing bulk write batch for local shard"
-                        );
-                        let ops: Vec<ClientOp> = batch
-                            .into_iter()
-                            .map(|(d, effective_routing_key)| ClientOp::Write {
-                                index: index.to_string(),
-                                id: d.id,
-                                routing_key: effective_routing_key,
-                                doc: d.doc,
-                            })
-                            .collect();
-                        match shard.handle_batch_write(BatchWriteRequest { ops }).await {
-                            Ok(seq_ids) => written += seq_ids.len(),
-                            Err(e) => errors.push(format!("Shard {}: {}", shard_id, e)),
-                        }
-                    } else {
-                        errors.push(format!("Local shard {} not found", shard_id));
-                    }
+                    // Local shard - add to parallel processing
+                    local_batches.insert(shard_id, batch);
                 }
                 Some(node_id) => {
+                    // Remote shard - keep sequential for now (Phase 3.2)
                     let peer_addr = peer_addrs.get(&node_id).cloned();
                     if let Some(addr) = peer_addr {
                         tracing::debug!(
@@ -2531,18 +2636,7 @@ impl NodeOrchestrator {
                                 doc: d.doc,
                             })
                             .collect();
-                        match self
-                            .forward_bulk_to_remote(node_id, &addr, index, docs_for_remote)
-                            .await
-                        {
-                            Ok(items) => {
-                                written += items;
-                            }
-                            Err(e) => errors.push(format!(
-                                "Remote shard {} (node {}) forwarding failed: {}",
-                                shard_id, node_id, e
-                            )),
-                        }
+                        remote_batches.push((node_id, addr, docs_for_remote));
                     } else {
                         errors.push(format!(
                             "No peer address for owner {} of shard {}",
@@ -2556,6 +2650,29 @@ impl NodeOrchestrator {
                         shard_id
                     ));
                 }
+            }
+        }
+
+        // Phase 3.1: Parallel Local Shard Processing
+        let (local_written, local_errors) = self
+            .parallel_local_shard_processing(index, local_batches)
+            .await?;
+        written += local_written;
+        errors.extend(local_errors);
+
+        // Sequential Remote Forwarding (Phase 3.2 - to be parallelized later)
+        for (node_id, addr, docs_for_remote) in remote_batches {
+            match self
+                .forward_bulk_to_remote(node_id, &addr, index, docs_for_remote)
+                .await
+            {
+                Ok(items) => {
+                    written += items;
+                }
+                Err(e) => errors.push(format!(
+                    "Remote shard {} (node {}) forwarding failed: {}",
+                    node_id, node_id, e
+                )),
             }
         }
         Ok(
