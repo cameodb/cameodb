@@ -98,7 +98,7 @@ impl StorageConfig {
 }
 
 /// Native Tantivy field types with proper enum for type safety.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum TantivyFieldType {
     /// Tokenized text for full-text search
     Text,

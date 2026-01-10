@@ -34,6 +34,7 @@ tracing-subscriber = { workspace = true }
 toml = { workspace = true }
 serde_yml = { workspace = true }
 num_cpus = { workspace = true }
+rayon = "1.10"
 libp2p = { workspace = true, features = ["tokio", "tcp", "noise", "yamux", "quic", "macros", "identify", "dns"] }
 xxhash-rust = { workspace = true }
 chrono = { version = "0.4.42", features = ["serde"] }

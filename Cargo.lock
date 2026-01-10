@@ -3645,6 +3645,7 @@ dependencies = [
  "kameo",
  "libp2p",
  "num_cpus",
+ "rayon",
  "redb",
  "serde",
  "serde_json",

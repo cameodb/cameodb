@@ -15,6 +15,7 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -662,6 +663,24 @@ impl MicroshardActor {
 
         Ok(())
     }
+}
+
+/// Result of parallel schema validation for a single document
+#[derive(Debug, Clone)]
+struct SchemaValidationResult {
+    needs_evolution: bool,
+    new_fields: Vec<(String, TantivyFieldType)>,
+    validation_error: Option<String>,
+}
+
+/// Schema validation summary for batch processing
+#[derive(Debug)]
+struct SchemaValidationSummary {
+    total_docs: usize,
+    valid_docs: usize,
+    evolution_needed: bool,
+    all_new_fields: std::collections::HashSet<(String, TantivyFieldType)>,
+    errors: Vec<String>,
 }
 
 /// Validates and evolves schema for a document.
@@ -1602,6 +1621,315 @@ pub struct NodeOrchestrator {
 }
 
 impl NodeOrchestrator {
+    /// Validates schema for documents in parallel, then evolves schema sequentially.
+    ///
+    /// This method uses a two-stage approach:
+    /// Stage 1: Parallel validation (read-only, CPU-bound)
+    /// Stage 2: Sequential schema evolution (write operations only when needed)
+    async fn staged_schema_validation(
+        &self,
+        index: &str,
+        docs: &[DocPayload],
+        schema_cache: &mut IndexSchema,
+    ) -> Result<SchemaValidationSummary, OrchestratorError> {
+        if docs.is_empty() {
+            return Ok(SchemaValidationSummary {
+                total_docs: 0,
+                valid_docs: 0,
+                evolution_needed: false,
+                all_new_fields: std::collections::HashSet::new(),
+                errors: Vec::new(),
+            });
+        }
+
+        // Stage 1: Parallel validation (read-only)
+        let validation_results = self
+            .parallel_validate_schema(index, docs, schema_cache)
+            .await?;
+
+        // Stage 2: Aggregate results and identify evolution needs
+        let mut summary = SchemaValidationSummary {
+            total_docs: docs.len(),
+            valid_docs: 0,
+            evolution_needed: false,
+            all_new_fields: std::collections::HashSet::new(),
+            errors: Vec::new(),
+        };
+
+        for result in validation_results {
+            if result.validation_error.is_none() {
+                summary.valid_docs += 1;
+                if result.needs_evolution {
+                    summary.evolution_needed = true;
+                    for new_field in result.new_fields {
+                        summary.all_new_fields.insert(new_field);
+                    }
+                }
+            } else {
+                summary.errors.push(result.validation_error.unwrap());
+            }
+        }
+
+        // Stage 3: Sequential schema evolution (only if needed)
+        if summary.evolution_needed && !summary.all_new_fields.is_empty() {
+            self.evolve_schema_sequential(
+                index,
+                schema_cache,
+                &summary.all_new_fields,
+                &self.shards,
+            )
+            .await?;
+        }
+
+        tracing::debug!(
+            total_docs = summary.total_docs,
+            valid_docs = summary.valid_docs,
+            evolution_needed = summary.evolution_needed,
+            new_fields_count = summary.all_new_fields.len(),
+            errors_count = summary.errors.len(),
+            "Staged schema validation completed"
+        );
+
+        Ok(summary)
+    }
+
+    /// Parallel schema validation (read-only, no mutations)
+    async fn parallel_validate_schema(
+        &self,
+        _index: &str,
+        docs: &[DocPayload],
+        schema_cache: &IndexSchema,
+    ) -> Result<Vec<SchemaValidationResult>, OrchestratorError> {
+        // Clone schema cache for parallel read-only access
+        let schema_cache_clone = schema_cache.clone();
+        let is_initial_creation = schema_cache.fields.is_empty();
+
+        // Parallel validation using rayon
+        let results: Vec<SchemaValidationResult> = docs
+            .par_iter()
+            .enumerate()
+            .map(|(_doc_index, doc_payload)| {
+                self.validate_single_document_readonly(
+                    &doc_payload.doc,
+                    &schema_cache_clone,
+                    is_initial_creation,
+                )
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Read-only validation for a single document (no mutations)
+    fn validate_single_document_readonly(
+        &self,
+        doc: &JsonValue,
+        schema_cache: &IndexSchema,
+        _is_initial_creation: bool,
+    ) -> SchemaValidationResult {
+        // Check 1: Ensure doc["id"] exists
+        if !doc.is_object() || !doc.as_object().unwrap().contains_key("id") {
+            return SchemaValidationResult {
+                needs_evolution: false,
+                new_fields: Vec::new(),
+                validation_error: Some("Document must contain an 'id' field".to_string()),
+            };
+        }
+
+        let mut needs_evolution = false;
+        let mut new_fields = Vec::new();
+
+        // Check 2: Validate fields and identify new ones
+        if let Some(obj) = doc.as_object() {
+            for (key, value) in obj {
+                let inferred_type = if key == "id" {
+                    TantivyFieldType::Text
+                } else {
+                    match value {
+                        JsonValue::String(s) => {
+                            // Try to infer date from string
+                            if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+                                TantivyFieldType::Date
+                            } else if s.parse::<std::net::IpAddr>().is_ok() {
+                                TantivyFieldType::Ip
+                            } else {
+                                TantivyFieldType::Text
+                            }
+                        }
+                        JsonValue::Number(n) => {
+                            if n.is_i64() {
+                                TantivyFieldType::I64
+                            } else if n.is_u64() {
+                                TantivyFieldType::U64
+                            } else {
+                                TantivyFieldType::F64
+                            }
+                        }
+                        JsonValue::Bool(_) => TantivyFieldType::Boolean,
+                        JsonValue::Array(_) => TantivyFieldType::Text, // Arrays as text
+                        JsonValue::Object(_) => TantivyFieldType::Json, // Objects as JSON
+                        JsonValue::Null => TantivyFieldType::Text,
+                    }
+                };
+
+                if let Some(existing_field) = schema_cache.fields.get(key) {
+                    // Check type compatibility (read-only)
+                    let mut is_compatible = existing_field.field_type == inferred_type;
+
+                    // Allow Text to match String (backward compatibility)
+                    if !is_compatible && inferred_type == TantivyFieldType::Text {
+                        if existing_field.field_type == TantivyFieldType::String {
+                            is_compatible = true;
+                        }
+                    }
+
+                    // Allow Text to evolve to more specific types
+                    if !is_compatible && existing_field.field_type == TantivyFieldType::Text {
+                        match inferred_type {
+                            TantivyFieldType::Date
+                            | TantivyFieldType::Ip
+                            | TantivyFieldType::I64
+                            | TantivyFieldType::U64
+                            | TantivyFieldType::F64
+                            | TantivyFieldType::Boolean
+                            | TantivyFieldType::Json => {
+                                is_compatible = true;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Allow numeric upgrades
+                    if !is_compatible {
+                        match (&existing_field.field_type, inferred_type.clone()) {
+                            (TantivyFieldType::I64, TantivyFieldType::F64)
+                            | (TantivyFieldType::U64, TantivyFieldType::F64) => {
+                                is_compatible = true;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !is_compatible {
+                        return SchemaValidationResult {
+                            needs_evolution: false,
+                            new_fields: Vec::new(),
+                            validation_error: Some(format!(
+                                "Type mismatch for field '{}': expected {:?}, got {:?}",
+                                key, existing_field.field_type, inferred_type
+                            )),
+                        };
+                    }
+                } else {
+                    // New field detected
+                    needs_evolution = true;
+                    new_fields.push((key.clone(), inferred_type));
+                }
+            }
+        }
+
+        SchemaValidationResult {
+            needs_evolution,
+            new_fields,
+            validation_error: None,
+        }
+    }
+
+    /// Sequential schema evolution (write operations, single-threaded)
+    async fn evolve_schema_sequential(
+        &self,
+        index: &str,
+        schema_cache: &mut IndexSchema,
+        new_fields: &std::collections::HashSet<(String, TantivyFieldType)>,
+        shards: &HashMap<Uuid, MicroshardActor>,
+    ) -> Result<(), OrchestratorError> {
+        let is_initial_creation = schema_cache.fields.is_empty();
+        let mut schema_updated = false;
+
+        for (field_name, field_type) in new_fields {
+            if !schema_cache.fields.contains_key(field_name) {
+                let indexed = is_initial_creation; // All fields indexed in initial creation
+                let mut new_field = FieldDef::new(field_name.clone(), field_type.clone());
+                new_field.indexed = indexed;
+
+                schema_cache.fields.insert(field_name.clone(), new_field);
+                schema_updated = true;
+
+                tracing::debug!(
+                    index = %index,
+                    field_name = %field_name,
+                    field_type = ?field_type,
+                    indexed = indexed,
+                    "Added new field to schema"
+                );
+            }
+        }
+
+        // Persist updated schema to storage if changed
+        if schema_updated {
+            let index_name = index.to_string();
+            let schema_clone = schema_cache.clone();
+
+            // Collect all stores from local shards
+            let stores: Vec<Arc<HybridStore>> = shards
+                .values()
+                .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
+                .collect();
+
+            if stores.is_empty() {
+                return Err(OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No local stores available to persist schema",
+                )));
+            }
+
+            // Persist to all stores concurrently
+            let handles: Vec<_> = stores
+                .into_iter()
+                .map(|store| {
+                    let idx = index_name.clone();
+                    let sch = schema_clone.clone();
+                    tokio::task::spawn_blocking(move || store.store_schema_and_cache(&idx, &sch))
+                })
+                .collect();
+
+            // Await all results
+            for handle in handles {
+                handle
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::Io(std::io::Error::other(format!(
+                            "Failed to spawn schema update task: {}",
+                            e
+                        )))
+                    })?
+                    .map_err(|e| {
+                        OrchestratorError::Io(std::io::Error::other(format!(
+                            "Failed to store schema: {}",
+                            e
+                        )))
+                    })?;
+            }
+
+            if is_initial_creation {
+                tracing::info!(
+                    index = %index,
+                    field_count = schema_cache.fields.len(),
+                    "Initial schema created with all fields indexed=true"
+                );
+            } else {
+                tracing::info!(
+                    index = %index,
+                    total_fields = schema_cache.fields.len(),
+                    new_fields_count = new_fields.len(),
+                    "Schema evolved with new fields"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Forward a bulk batch to a remote node's orchestrator.
     async fn forward_bulk_to_remote(
         &self,
@@ -2108,56 +2436,37 @@ impl NodeOrchestrator {
             )));
         }
 
-        // Load schema and validate/evolve for all documents before writing
+        // Load schema and perform staged validation for all documents before writing
         let mut schema_cache = self.load_schema(index).await?;
-        let mut schema_updated = false;
 
-        for doc_payload in &docs {
-            let updated = validate_and_evolve_schema(
-                index,
-                &doc_payload.doc,
-                &mut schema_cache,
-                &self.shards,
-            )
+        // Use staged schema validation: parallel validation + sequential evolution
+        let validation_summary = self
+            .staged_schema_validation(index, &docs, &mut schema_cache)
             .await?;
-            if updated {
-                schema_updated = true;
-            }
-        }
 
-        // Update cache once after processing all docs
-        if schema_updated {
+        // Update cache once after processing all docs if schema evolved
+        if validation_summary.evolution_needed {
             self.put_cached_schema(index, &schema_cache).await;
         }
 
-        // Group documents by target shard using the same routing key strategy
-        // as single-write: explicit routing_key → doc id → derived key.
-        let items_received = docs.len();
-        let mut batches: HashMap<Uuid, Vec<(DocPayload, Option<String>)>> = HashMap::new();
-        let mut routing_errors = Vec::new();
-        for doc in docs {
-            let effective_routing_key = doc
-                .routing_key
-                .clone()
-                .or_else(|| (!doc.id.is_empty()).then(|| doc.id.clone()))
-                .or_else(|| derive_routing_key_from_doc(&doc.doc));
-
-            match self.route_write(&effective_routing_key) {
-                Ok(target) => {
-                    batches
-                        .entry(target)
-                        .or_default()
-                        .push((doc, effective_routing_key));
-                }
-                Err(err) => {
-                    routing_errors.push(format!("routing failed for doc {}: {}", doc.id, err));
-                }
-            }
+        // Check for validation errors
+        if !validation_summary.errors.is_empty() {
+            tracing::warn!(
+                error_count = validation_summary.errors.len(),
+                total_docs = validation_summary.total_docs,
+                "Some documents failed schema validation"
+            );
+            // Continue processing valid documents, errors are tracked separately
         }
+
+        // Group documents by target shard using parallel routing for better performance
+        let items_received = docs.len();
+        let batches = self.parallel_route_documents(docs).await?;
+        let unique_shards = batches.len();
 
         tracing::debug!(
             items_received = items_received,
-            unique_shards = batches.len(),
+            unique_shards = unique_shards,
             "BulkWrite grouped items by shard"
         );
 
@@ -2176,7 +2485,7 @@ impl NodeOrchestrator {
         }
 
         let mut written = 0usize;
-        let mut errors = routing_errors;
+        let mut errors = Vec::new();
         for (shard_id, batch) in batches {
             let owner_node = shard_assignments.get(&shard_id).map(|m| m.node_id);
 
@@ -2515,6 +2824,125 @@ impl NodeOrchestrator {
             shard_count: self.default_shard_count(),
             fields: HashMap::new(),
         })
+    }
+
+    /// Route documents to shards in parallel using pre-allocated vectors for performance.
+    ///
+    /// This method uses a lock-free approach with pre-allocated vectors per shard,
+    /// avoiding HashMap contention during parallel routing.
+    async fn parallel_route_documents(
+        &self,
+        docs: Vec<DocPayload>,
+    ) -> Result<HashMap<Uuid, Vec<(DocPayload, Option<String>)>>, OrchestratorError> {
+        use std::collections::HashMap;
+
+        if docs.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let docs_count = docs.len();
+
+        // Pre-create shard index mapping for fast array access
+        let shard_ids: Vec<Uuid> = self.shards.keys().copied().collect();
+        let shard_index_map: HashMap<Uuid, usize> = shard_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i))
+            .collect();
+
+        // Pre-allocate vectors for each shard (avoid HashMap contention)
+        let mut per_shard_docs: Vec<Vec<(DocPayload, Option<String>)>> =
+            Vec::with_capacity(shard_ids.len());
+        per_shard_docs.resize_with(shard_ids.len(), Vec::new);
+
+        // Clone routing ring for parallel access (read-only)
+        let routing_ring = self.routing_ring.clone();
+        let first_shard_id = self.first_shard_id();
+
+        // Route documents in parallel using rayon for CPU-bound work
+        let routing_results: Vec<Result<(usize, DocPayload, Option<String>), OrchestratorError>> =
+            docs.into_par_iter()
+                .map(|doc| {
+                    // Calculate effective routing key
+                    let effective_routing_key = doc
+                        .routing_key
+                        .clone()
+                        .or_else(|| (!doc.id.is_empty()).then(|| doc.id.clone()))
+                        .or_else(|| derive_routing_key_from_doc(&doc.doc));
+
+                    // Route to shard using consistent hash ring
+                    let target =
+                        match effective_routing_key.as_ref() {
+                            Some(key) => routing_ring
+                                .get_owner(key)
+                                .or(first_shard_id)
+                                .ok_or_else(|| {
+                                    OrchestratorError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::NotFound,
+                                        "No shard available for routing",
+                                    ))
+                                })?,
+                            None => {
+                                return Err(OrchestratorError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "Missing routing key for document",
+                                )));
+                            }
+                        };
+
+                    // Find shard index
+                    let shard_index = shard_index_map.get(&target).copied().ok_or_else(|| {
+                        OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Shard {} not found in local mapping", target),
+                        ))
+                    })?;
+
+                    Ok((shard_index, doc, effective_routing_key))
+                })
+                .collect();
+
+        // Collect results into per-shard vectors (sequential but fast)
+        let mut error_count = 0;
+        for result in routing_results {
+            match result {
+                Ok((shard_index, doc, routing_key)) => {
+                    per_shard_docs[shard_index].push((doc, routing_key));
+                }
+                Err(e) => {
+                    error_count += 1;
+                    tracing::warn!("Routing error: {}", e);
+                    // Continue processing other documents
+                }
+            }
+        }
+
+        // Convert vectors back to HashMap for compatibility with existing code
+        let mut batches: HashMap<Uuid, Vec<(DocPayload, Option<String>)>> = HashMap::new();
+        for (shard_index, docs) in per_shard_docs.into_iter().enumerate() {
+            if !docs.is_empty() {
+                let shard_id = shard_ids[shard_index];
+                batches.insert(shard_id, docs);
+            }
+        }
+
+        if error_count > 0 {
+            tracing::warn!(
+                total_errors = error_count,
+                total_docs = docs_count,
+                "Some documents failed routing during parallel processing"
+            );
+        }
+
+        tracing::debug!(
+            total_docs = docs_count,
+            successful_routes = batches.values().map(|v| v.len()).sum::<usize>(),
+            unique_shards = batches.len(),
+            routing_errors = error_count,
+            "Parallel routing completed"
+        );
+
+        Ok(batches)
     }
 
     /// Helper: Route write to shard using deterministic key (no round-robin).
