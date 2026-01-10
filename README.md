@@ -601,12 +601,31 @@ cargo install cargo-generate-rpm
 
 ### Build RPM Package
 
+**Option 1: Standard Cargo Build (Recommended for hardened executables)**
 ```bash
-# Build the binary for Linux x86_64 musl target
-cd crates/server
+# Build hardened executable with security mitigations (flags in .cargo/config.toml)
+cargo build --release --target x86_64-unknown-linux-musl
+
+# OR override with explicit RUSTFLAGS:
+RUSTFLAGS="-C relocation-model=pie -C relro-level=full -C link-arg=-Wl,-z,now -C link-arg=-fstack-protector -C link-arg=-D_FORTIFY_SOURCE=2" \
+cargo build --release --target x86_64-unknown-linux-musl
+
+# Generate RPM package (run from project root directory)
+cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
+  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.0-1.x86_64.rpm \
+  --set-metadata 'package.name="cameodb"'
+```
+
+**Option 2: Cross-compilation with cargo-zigbuild (supports hardening)**
+```bash
+# Build hardened binary for Linux x86_64 musl target (flags in .cargo/config.toml)
 cargo zigbuild --release --target x86_64-unknown-linux-musl
 
-# Generate RPM package with standard naming
+# OR override with explicit RUSTFLAGS:
+RUSTFLAGS="-C relocation-model=pie -C relro-level=full -C link-arg=-Wl,-z,now -C link-arg=-fstack-protector -C link-arg=-D_FORTIFY_SOURCE=2" \
+cargo zigbuild --release --target x86_64-unknown-linux-musl
+
+# Generate RPM package with standard naming (run from project root directory)
 cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
   -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.0-1.x86_64.rpm \
   --set-metadata 'package.name="cameodb"'
@@ -614,6 +633,25 @@ cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-re
 # The RPM package will be available at:
 # target/x86_64-unknown-linux-musl/release/cameodb-0.2.0-1.x86_64.rpm
 ```
+
+**Note**: Two approaches for hardening flags:
+1. **Pre-configured**: Hardening flags are set in `.cargo/config.toml` and applied automatically
+2. **Explicit override**: Use `RUSTFLAGS="..."` to override or customize flags as shown above
+
+Hardening flags explained:
+- `-C relocation-model=pie` enables Position Independent Executable for ASLR support
+- `-C relro-level=full` enables Full RELRO (Relocation Read-Only) 
+- `-C link-arg=-Wl,-z,now` enables immediate symbol binding
+- `-C link-arg=-fstack-protector` enables stack protection against buffer overflows
+- `-C link-arg=-D_FORTIFY_SOURCE=2` enables fortified memory functions for additional safety
+- `opt-level = 3` (release profile) required for fortified functions to work properly
+- Both cargo build and cargo-zigbuild support these rustc-native flags
+
+**Verification**: 
+- For dynamic binaries (gnu): `file` shows "pie executable"
+- For static binaries (musl): `file` shows "executable" but hardening is still applied
+- Use `greadelf -d` or check binary headers to verify PIE and RELRO on static binaries
+- Fortified functions replace unsafe C library calls with checked versions
 
 ### RPM Package Contents
 
