@@ -283,7 +283,11 @@ pub enum ClientOp {
         limit: Option<usize>,
     },
     /// Streaming search operation across shards of an index
-    Stream { index: String, query: String },
+    Stream {
+        index: String,
+        query: String,
+        limit: Option<usize>,
+    },
     /// Write operation to insert/update a document
     Write {
         index: String,
@@ -1009,7 +1013,9 @@ impl RouterActor {
             Ok(RoutingDecision::Local) => self.handle_client_op(op).await,
             Ok(RoutingDecision::Broadcast) => {
                 // Use streaming for search operations if enabled
-                if self.enable_streaming_search && matches!(op, ClientOp::Search { .. }) {
+                if self.enable_streaming_search
+                    && matches!(op, ClientOp::Search { .. } | ClientOp::Stream { .. })
+                {
                     self.handle_broadcast_streaming(op).await
                 } else {
                     self.handle_broadcast(op).await
@@ -1498,192 +1504,199 @@ impl RouterActor {
         let start_time = std::time::Instant::now();
 
         // Handle search operations with streaming
-        if let ClientOp::Search {
-            index,
-            query,
-            limit,
-        } = op
-        {
-            let limit = limit.unwrap_or(self.default_search_limit);
+        match op {
+            ClientOp::Search {
+                index,
+                query,
+                limit,
+            }
+            | ClientOp::Stream {
+                index,
+                query,
+                limit,
+            } => {
+                let limit = limit.unwrap_or(self.default_search_limit);
 
-            // Create local search stream
-            let local_future = async {
-                // Forward to orchestrator for streaming local search
-                match self
-                    .orchestrator
-                    .ask(ClientOp::Search {
-                        index: index.clone(),
-                        query: query.clone(),
-                        limit: Some(limit),
-                    })
-                    .await
-                {
-                    Ok(_result) => StreamingSearchResult::Local {
-                        shard_id: Uuid::nil(), // Local node
-                        hits: Vec::new(),      // Will be populated from result
-                        total_hits: 0,
-                        took_ms: 0,
-                    },
-                    Err(_e) => StreamingSearchResult::Local {
-                        shard_id: Uuid::nil(),
-                        hits: Vec::new(),
-                        total_hits: 0,
-                        took_ms: 0,
-                    },
-                }
-            };
-
-            // Create remote search streams
-            let remote_futures: Vec<_> = peers
-                .into_iter()
-                .take(self.broadcast_fanout_limit)
-                .map(|peer| {
-                    let op_clone = ClientOp::Search {
-                        index: index.clone(),
-                        query: query.clone(),
-                        limit: Some(limit),
-                    };
-                    let node_id = peer.node_id;
-                    let peer_addr = peer.address;
-                    async move {
-                        let result = timeout(
-                            self.broadcast_timeout,
-                            self.try_remote(op_clone, node_id, &peer_addr),
-                        )
+                // Create local search stream
+                let local_future = async {
+                    // Forward to orchestrator for streaming local search
+                    match self
+                        .orchestrator
+                        .ask(ClientOp::Search {
+                            index: index.clone(),
+                            query: query.clone(),
+                            limit: Some(limit),
+                        })
                         .await
-                        .unwrap_or(Err(OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "Remote operation timed out",
-                        ))));
-                        StreamingSearchResult::Remote { node_id, result }
+                    {
+                        Ok(_result) => StreamingSearchResult::Local {
+                            shard_id: Uuid::nil(), // Local node
+                            hits: Vec::new(),      // Will be populated from result
+                            total_hits: 0,
+                            took_ms: 0,
+                        },
+                        Err(_e) => StreamingSearchResult::Local {
+                            shard_id: Uuid::nil(),
+                            hits: Vec::new(),
+                            total_hits: 0,
+                            took_ms: 0,
+                        },
                     }
-                })
-                .collect();
+                };
 
-            // Combine local and remote into a single stream using boxed futures
-            let mut search_futures = FuturesUnordered::new();
-            search_futures.push(Box::pin(local_future)
-                as Pin<Box<dyn Future<Output = StreamingSearchResult> + Send>>);
-            for future in remote_futures {
-                search_futures
-                    .push(Box::pin(future)
-                        as Pin<Box<dyn Future<Output = StreamingSearchResult> + Send>>);
-            }
-
-            // Process results as they arrive with early termination
-            let mut all_hits = Vec::new();
-            let mut total_hits_sum = 0usize;
-            let mut shards_queried = 0usize;
-            let mut nodes_contacted = 0usize;
-            let mut errors = Vec::new();
-
-            while let Some(search_result) = search_futures.next().await {
-                // Early termination if limit reached and enabled
-                if self.enable_early_termination && all_hits.len() >= limit {
-                    break;
-                }
-
-                match search_result {
-                    StreamingSearchResult::Local { .. } => {
-                        // Use streaming local search for improved performance
-                        match self
-                            .orchestrator
-                            .ask(ClientOp::Search {
-                                index: index.clone(),
-                                query: query.clone(),
-                                limit: Some(limit),
-                            })
+                // Create remote search streams
+                let remote_futures: Vec<_> = peers
+                    .into_iter()
+                    .take(self.broadcast_fanout_limit)
+                    .map(|peer| {
+                        let op_clone = ClientOp::Search {
+                            index: index.clone(),
+                            query: query.clone(),
+                            limit: Some(limit),
+                        };
+                        let node_id = peer.node_id;
+                        let peer_addr = peer.address;
+                        async move {
+                            let result = timeout(
+                                self.broadcast_timeout,
+                                self.try_remote(op_clone, node_id, &peer_addr),
+                            )
                             .await
-                        {
-                            Ok(result) => {
-                                // Parse the JSON result and convert to SearchResults format
-                                if let Some(hits) = result.get("hits").and_then(|h| h.as_array()) {
-                                    for hit in hits {
-                                        if all_hits.len() < limit {
-                                            all_hits.push(hit.clone());
+                            .unwrap_or(Err(OrchestratorError::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "Remote operation timed out",
+                            ))));
+                            StreamingSearchResult::Remote { node_id, result }
+                        }
+                    })
+                    .collect();
+
+                // Combine local and remote into a single stream using boxed futures
+                let mut search_futures = FuturesUnordered::new();
+                search_futures.push(Box::pin(local_future)
+                    as Pin<Box<dyn Future<Output = StreamingSearchResult> + Send>>);
+                for future in remote_futures {
+                    search_futures.push(Box::pin(future)
+                        as Pin<Box<dyn Future<Output = StreamingSearchResult> + Send>>);
+                }
+
+                // Process results as they arrive with early termination
+                let mut all_hits = Vec::new();
+                let mut total_hits_sum = 0usize;
+                let mut shards_queried = 0usize;
+                let mut nodes_contacted = 0usize;
+                let mut errors = Vec::new();
+
+                while let Some(search_result) = search_futures.next().await {
+                    // Early termination if limit reached and enabled
+                    if self.enable_early_termination && all_hits.len() >= limit {
+                        break;
+                    }
+
+                    match search_result {
+                        StreamingSearchResult::Local { .. } => {
+                            // Use streaming local search for improved performance
+                            match self
+                                .orchestrator
+                                .ask(ClientOp::Search {
+                                    index: index.clone(),
+                                    query: query.clone(),
+                                    limit: Some(limit),
+                                })
+                                .await
+                            {
+                                Ok(result) => {
+                                    // Parse the JSON result and convert to SearchResults format
+                                    if let Some(hits) =
+                                        result.get("hits").and_then(|h| h.as_array())
+                                    {
+                                        for hit in hits {
+                                            if all_hits.len() < limit {
+                                                all_hits.push(hit.clone());
+                                            }
                                         }
                                     }
+                                    if let Some(total) =
+                                        result.get("total_hits").and_then(|t| t.as_u64())
+                                    {
+                                        total_hits_sum += total as usize;
+                                    }
+                                    if let Some(shards) =
+                                        result.get("shards_responded").and_then(|s| s.as_u64())
+                                    {
+                                        shards_queried += shards as usize;
+                                    }
+                                    nodes_contacted += 1;
                                 }
-                                if let Some(total) =
-                                    result.get("total_hits").and_then(|t| t.as_u64())
-                                {
-                                    total_hits_sum += total as usize;
+                                Err(e) => {
+                                    errors.push(format!("Local streaming search failed: {}", e));
                                 }
-                                if let Some(shards) =
-                                    result.get("shards_responded").and_then(|s| s.as_u64())
-                                {
-                                    shards_queried += shards as usize;
-                                }
-                                nodes_contacted += 1;
-                            }
-                            Err(e) => {
-                                errors.push(format!("Local streaming search failed: {}", e));
                             }
                         }
-                    }
-                    StreamingSearchResult::Remote { node_id, result } => {
-                        nodes_contacted += 1;
-                        match result {
-                            Ok(val) => {
-                                if let Some(hits) = val.get("hits").and_then(|h| h.as_array()) {
-                                    for hit in hits {
-                                        if all_hits.len() < limit {
-                                            all_hits.push(hit.clone());
+                        StreamingSearchResult::Remote { node_id, result } => {
+                            nodes_contacted += 1;
+                            match result {
+                                Ok(val) => {
+                                    if let Some(hits) = val.get("hits").and_then(|h| h.as_array()) {
+                                        for hit in hits {
+                                            if all_hits.len() < limit {
+                                                all_hits.push(hit.clone());
+                                            }
                                         }
                                     }
+                                    if let Some(total) =
+                                        val.get("total_hits").and_then(|t| t.as_u64())
+                                    {
+                                        total_hits_sum += total as usize;
+                                    }
+                                    if let Some(shards) =
+                                        val.get("shards_responded").and_then(|s| s.as_u64())
+                                    {
+                                        shards_queried += shards as usize;
+                                    }
                                 }
-                                if let Some(total) = val.get("total_hits").and_then(|t| t.as_u64())
-                                {
-                                    total_hits_sum += total as usize;
+                                Err(e) => {
+                                    errors.push(format!(
+                                        "Remote node {} search failed: {}",
+                                        node_id, e
+                                    ));
                                 }
-                                if let Some(shards) =
-                                    val.get("shards_responded").and_then(|s| s.as_u64())
-                                {
-                                    shards_queried += shards as usize;
-                                }
-                            }
-                            Err(e) => {
-                                errors
-                                    .push(format!("Remote node {} search failed: {}", node_id, e));
                             }
                         }
                     }
                 }
+
+                // Sort by score descending and apply limit
+                all_hits.sort_by(|a, b| {
+                    let score_a = a.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                    let score_b = b.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                    score_b
+                        .partial_cmp(&score_a)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                all_hits.truncate(limit);
+
+                return Ok(serde_json::json!({
+                    "hits": all_hits,
+                    "hits_returned": all_hits.len(),
+                    "total_hits": total_hits_sum,
+                    "limit": limit,
+                    "total_shards": shards_queried,
+                    "nodes_contacted": nodes_contacted,
+                    "failed_shards": errors.len(),
+                    "took_ms": start_time.elapsed().as_millis(),
+                    "errors": errors
+                }));
             }
-
-            // Sort by score descending and apply limit
-            all_hits.sort_by(|a, b| {
-                let score_a = a.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-                let score_b = b.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-                score_b
-                    .partial_cmp(&score_a)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            all_hits.truncate(limit);
-
-            return Ok(serde_json::json!({
-                "hits": all_hits,
-                "hits_returned": all_hits.len(),
-                "total_hits": total_hits_sum,
-                "limit": limit,
-                "total_shards": shards_queried,
-                "nodes_contacted": nodes_contacted,
-                "failed_shards": errors.len(),
-                "took_ms": start_time.elapsed().as_millis(),
-                "errors": errors
-            }));
+            _ => {
+                // For non-search operations, fall back to broadcast request handling
+                self.handle_broadcast_request(op).await
+            }
         }
-
-        // For non-search operations, fall back to traditional broadcast
-        self.handle_broadcast_traditional(op).await
     }
 
-    /// Traditional broadcast method for non-search operations
-    #[allow(dead_code)] // Streaming infrastructure - will be fully utilized in production
-    async fn handle_broadcast_traditional(
-        &self,
-        op: ClientOp,
-    ) -> Result<JsonValue, OrchestratorError> {
+    /// Broadcast request method for non-search operations
+    async fn handle_broadcast_request(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
         // Implementation for non-search operations (write, bulk_write, etc.)
         // This is the existing handle_broadcast logic
         self.handle_broadcast(op).await
@@ -2622,9 +2635,15 @@ impl NodeOrchestrator {
                 self.orch_search(&index, &query, limit.unwrap_or(self.default_search_limit))
                     .await
             }
-            ClientOp::Stream { index, query } => Ok(
-                serde_json::json!({"message": "Stream initiated", "index": index, "query": query}),
-            ),
+            ClientOp::Stream {
+                index,
+                query,
+                limit,
+            } => {
+                // Use streaming search with the same logic as Search but optimized for HTTP streaming
+                let search_limit = limit.unwrap_or(self.default_search_limit);
+                self.orch_search(&index, &query, search_limit).await
+            }
             ClientOp::Write {
                 index,
                 id,

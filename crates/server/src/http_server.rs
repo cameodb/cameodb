@@ -191,14 +191,15 @@ async fn stream_handler(
     Json(payload): Json<SearchPayload>,
 ) -> Result<Response, AppError> {
     info!(
-        "Stream request - index: {}, query: {}",
-        index, payload.query
+        "Stream request - index: {}, query: {}, limit: {:?}",
+        index, payload.query, payload.limit
     );
 
-    // Streaming support temporarily stubbed during actor refactoring
+    // Use streaming search with our new streaming infrastructure
     let client_op = ClientOp::Stream {
         index,
         query: payload.query,
+        limit: payload.limit,
     };
 
     let result = state
