@@ -1517,9 +1517,8 @@ impl RouterActor {
             } => {
                 let limit = limit.unwrap_or(self.default_search_limit);
 
-                // Create local search stream
+                // Create local search stream using improved concurrent approach
                 let local_future = async {
-                    // Forward to orchestrator for streaming local search
                     match self
                         .orchestrator
                         .ask(ClientOp::Search {
@@ -1529,13 +1528,27 @@ impl RouterActor {
                         })
                         .await
                     {
-                        Ok(_result) => StreamingSearchResult::Local {
+                        Ok(result) => StreamingSearchResult::Local {
                             shard_id: Uuid::nil(), // Local node
-                            hits: Vec::new(),      // Will be populated from result
-                            total_hits: 0,
+                            hits: result
+                                .get("hits")
+                                .and_then(|h| h.as_array())
+                                .map(|arr| arr.to_vec())
+                                .unwrap_or_default()
+                                .iter()
+                                .filter_map(|hit| {
+                                    hit.get("_score")
+                                        .and_then(|s| s.as_f64())
+                                        .map(|score| (score as f32, hit.clone()))
+                                })
+                                .collect(),
+                            total_hits: result
+                                .get("total_hits")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0) as usize,
                             took_ms: 0,
                         },
-                        Err(_e) => StreamingSearchResult::Local {
+                        Err(_) => StreamingSearchResult::Local {
                             shard_id: Uuid::nil(),
                             hits: Vec::new(),
                             total_hits: 0,
@@ -1594,44 +1607,35 @@ impl RouterActor {
                     }
 
                     match search_result {
-                        StreamingSearchResult::Local { .. } => {
-                            // Use streaming local search for improved performance
-                            match self
-                                .orchestrator
-                                .ask(ClientOp::Search {
-                                    index: index.clone(),
-                                    query: query.clone(),
-                                    limit: Some(limit),
-                                })
-                                .await
-                            {
-                                Ok(result) => {
-                                    // Parse the JSON result and convert to SearchResults format
-                                    if let Some(hits) =
-                                        result.get("hits").and_then(|h| h.as_array())
-                                    {
-                                        for hit in hits {
-                                            if all_hits.len() < limit {
-                                                all_hits.push(hit.clone());
-                                            }
-                                        }
+                        StreamingSearchResult::Local {
+                            shard_id,
+                            hits,
+                            total_hits,
+                            took_ms: _,
+                        } => {
+                            // Process streaming local search results
+                            for (score, doc) in hits {
+                                if all_hits.len() < limit {
+                                    let mut hit_doc = doc;
+                                    if let JsonValue::Object(ref mut o) = hit_doc {
+                                        o.insert(
+                                            "_score".to_string(),
+                                            JsonValue::Number(
+                                                serde_json::Number::from_f64(score as f64)
+                                                    .unwrap_or(serde_json::Number::from(0)),
+                                            ),
+                                        );
+                                        o.insert(
+                                            "shard_id".to_string(),
+                                            JsonValue::String(shard_id.to_string()),
+                                        );
                                     }
-                                    if let Some(total) =
-                                        result.get("total_hits").and_then(|t| t.as_u64())
-                                    {
-                                        total_hits_sum += total as usize;
-                                    }
-                                    if let Some(shards) =
-                                        result.get("shards_responded").and_then(|s| s.as_u64())
-                                    {
-                                        shards_queried += shards as usize;
-                                    }
-                                    nodes_contacted += 1;
-                                }
-                                Err(e) => {
-                                    errors.push(format!("Local streaming search failed: {}", e));
+                                    all_hits.push(hit_doc);
                                 }
                             }
+                            total_hits_sum += total_hits;
+                            shards_queried += 1;
+                            nodes_contacted += 1;
                         }
                         StreamingSearchResult::Remote { node_id, result } => {
                             nodes_contacted += 1;
