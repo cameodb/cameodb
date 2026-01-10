@@ -1680,7 +1680,7 @@ impl RouterActor {
                 });
                 all_hits.truncate(limit);
 
-                return Ok(serde_json::json!({
+                Ok(serde_json::json!({
                     "hits": all_hits,
                     "hits_returned": all_hits.len(),
                     "total_hits": total_hits_sum,
@@ -1690,7 +1690,7 @@ impl RouterActor {
                     "failed_shards": errors.len(),
                     "took_ms": start_time.elapsed().as_millis(),
                     "errors": errors
-                }));
+                }))
             }
             _ => {
                 // For non-search operations, fall back to broadcast request handling
