@@ -328,6 +328,11 @@ impl CameoDbConfig {
             config.storage.data_paths = data_paths.split(':').map(PathBuf::from).collect();
         }
 
+        if let Ok(wal_sync) = std::env::var("CAMEODB_STORAGE_WAL_SYNC") {
+            let normalized = wal_sync.trim().to_ascii_lowercase();
+            config.storage.wal_sync = matches!(normalized.as_str(), "true" | "1" | "yes");
+        }
+
         // Search configuration
         if let Ok(min_mem) = std::env::var("CAMEODB_INDEXER_MEMORY_MIN_MB") {
             config.search.indexer_memory_min_mb = min_mem

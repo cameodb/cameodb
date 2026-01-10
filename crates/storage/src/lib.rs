@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tantivy::query::QueryParserError;
@@ -405,6 +405,9 @@ pub enum StoreError {
 
     #[error("redb commit error: {0}")]
     Commit(#[from] redb::CommitError),
+
+    #[error("redb durability error: {0}")]
+    Durability(#[from] redb::SetDurabilityError),
 
     #[error("tantivy error: {0}")]
     Tantivy(#[from] tantivy::TantivyError),
@@ -934,8 +937,17 @@ impl HybridStore {
         let wal_data =
             serde_json::to_vec(&op).map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-        let write_txn = self.kv.begin_write()?;
+        let mut write_txn = self.kv.begin_write()?;
         {
+            // Set durability based on config (except for schema changes which always use Immediate)
+            let durability = if self.config.wal_sync {
+                Durability::Immediate
+            } else {
+                Durability::None
+            };
+            write_txn.set_durability(durability)?;
+            tracing::trace!(index = %index, durability = ?durability, "Transaction durability set");
+
             let mut wal_table = write_txn.open_table(wal_table_def)?;
             wal_table.insert(seq_id, wal_data.as_slice())?;
 
@@ -1166,8 +1178,12 @@ impl HybridStore {
         }
 
         // Delete redb tables completely using delete_table() for efficiency
-        let write_txn = self.kv.begin_write()?;
+        let mut write_txn = self.kv.begin_write()?;
         {
+            // Index deletion always uses Immediate durability for critical metadata operations
+            write_txn.set_durability(Durability::Immediate)?;
+            tracing::trace!(index = %index, durability = "Immediate", "Index deletion durability set");
+
             let data_table_name = format!("data_{}", index);
             let wal_table_name = format!("wal_{}", index);
             let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
@@ -1260,8 +1276,12 @@ impl HybridStore {
         let schema_bytes =
             serde_json::to_vec(schema).map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-        let write_txn = self.kv.begin_write()?;
+        let mut write_txn = self.kv.begin_write()?;
         {
+            // Schema changes always use Immediate durability for critical metadata
+            write_txn.set_durability(Durability::Immediate)?;
+            tracing::trace!(index = %index_name, durability = "Immediate", "Schema persistence durability set");
+
             let mut schema_table = write_txn.open_table(TABLE_SCHEMA)?;
             schema_table.insert(index_name, schema_bytes.as_slice())?;
         }
@@ -1657,11 +1677,20 @@ impl HybridStore {
         let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
 
         // Single transaction for all operations
-        let write_txn = self.kv.begin_write()?;
+        let mut write_txn = self.kv.begin_write()?;
         let mut tantivy_ops = Vec::new();
         let batch_size = ops.len() as u64;
 
         {
+            // Set durability based on config for bulk operations
+            let durability = if self.config.wal_sync {
+                Durability::Immediate
+            } else {
+                Durability::None
+            };
+            write_txn.set_durability(durability)?;
+            tracing::trace!(index = %index, batch_size = batch_size, durability = ?durability, "Bulk write transaction durability set");
+
             let mut wal_table = write_txn.open_table(wal_table_def)?;
             let mut data_table = write_txn.open_table(data_table_def)?;
 

@@ -286,6 +286,12 @@ async fn main() -> Result<()> {
         "  Max Shards: {}",
         cameodb_config.storage.max_shards_per_node
     );
+    let durability_label = if cameodb_config.storage.wal_sync {
+        "Immediate"
+    } else {
+        "Eventual"
+    };
+    println!("  Durability: {}", durability_label);
     println!(
         "  Indexer Memory: {}-{}MB",
         cameodb_config.search.indexer_memory_min_mb, cameodb_config.search.indexer_memory_max_mb
