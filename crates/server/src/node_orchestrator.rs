@@ -15,7 +15,6 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
-use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -204,6 +203,10 @@ pub struct BatchWriteRequest {
     pub ops: Vec<ClientOp>,
 }
 
+/// Shutdown request message for MicroshardActor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShutdownShard;
+
 /// Remote-friendly error type for cross-node microshard calls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RemoteError {
@@ -309,7 +312,7 @@ pub enum ClientOp {
     /// List all indexes across the cluster (broadcast)
     ListClusterIndexes,
     /// Delete an index and all its data
-    DeleteIndex { index: String },
+    DeleteIndex { index: String, delete_schema: bool },
 }
 
 // ============================================================================
@@ -333,6 +336,10 @@ pub struct GetShardIds;
 pub struct UpdateTopology {
     pub ring: ConsistentRing,
 }
+
+/// Message to shutdown all shards gracefully.
+#[derive(Debug, Clone)]
+pub struct ShutdownAllShards;
 
 /// Response containing node identity info for actor replies.
 #[derive(Debug, Clone, kameo::Reply)]
@@ -452,7 +459,10 @@ impl MicroshardActor {
         };
 
         // Check if data is actually pending
-        if store.get_operations_count(&index) == 0 {
+        // This is a fast read-only operation on AtomicU64, safe to call directly
+        let ops_count = store.get_operations_count(&index);
+
+        if ops_count == 0 {
             return;
         }
 
@@ -558,6 +568,12 @@ impl MicroshardActor {
         &self,
         request: BatchWriteRequest,
     ) -> Result<Vec<u64>, OrchestratorError> {
+        tracing::debug!(
+            shard_id = %self.shard_id,
+            ops_count = request.ops.len(),
+            "MicroshardActor: Starting batch write"
+        );
+
         let store = self.store.as_ref().ok_or_else(|| {
             OrchestratorError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -567,6 +583,7 @@ impl MicroshardActor {
 
         let store = Arc::clone(store);
         let ops = request.ops;
+        let shard_id = self.shard_id;
 
         // Group operations by index
         let mut ops_by_index: std::collections::HashMap<String, Vec<WalOp>> =
@@ -597,15 +614,40 @@ impl MicroshardActor {
         let unique_indices: std::collections::HashSet<String> =
             ops_by_index.keys().cloned().collect();
 
+        tracing::debug!(
+            shard_id = %shard_id,
+            unique_indices = unique_indices.len(),
+            "MicroshardActor: Executing batch write on blocking thread"
+        );
+
         // Use spawn_blocking to execute batch write on blocking thread pool
         let all_seq_ids = tokio::task::spawn_blocking(move || {
+            tracing::debug!(
+                shard_id = %shard_id,
+                "MicroshardActor: Inside blocking thread, executing storage operations"
+            );
+
             let mut all_results = Vec::new();
             let mut total_new_docs = 0usize;
             for (index, wal_ops) in ops_by_index {
+                tracing::debug!(
+                    shard_id = %shard_id,
+                    index = %index,
+                    ops_count = wal_ops.len(),
+                    "MicroshardActor: Processing index in blocking thread"
+                );
+
                 let (seq_ids, new_docs) = store.apply_batch(&index, wal_ops)?;
                 all_results.extend(seq_ids);
                 total_new_docs += new_docs;
             }
+
+            tracing::debug!(
+                shard_id = %shard_id,
+                total_ops = all_results.len(),
+                "MicroshardActor: Storage operations completed, returning from blocking thread"
+            );
+
             Ok::<(Vec<u64>, usize), StoreError>((all_results, total_new_docs))
         })
         .await
@@ -615,10 +657,11 @@ impl MicroshardActor {
             _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
         })?;
 
-        // Signal supervisors for all indices in the batch
-        for index in unique_indices {
-            self.signal_supervisor(index).await;
-        }
+        tracing::info!(
+            shard_id = %shard_id,
+            seq_count = all_seq_ids.0.len(),
+            "MicroshardActor: Batch write fully completed, returning result"
+        );
 
         // Extract just the sequence IDs to match expected return type
         let (seq_ids, _new_docs) = all_seq_ids;
@@ -626,7 +669,11 @@ impl MicroshardActor {
     }
 
     /// Deletes all data for an index from this shard's storage
-    pub async fn delete_index(&self, index: &str) -> Result<(), OrchestratorError> {
+    pub async fn delete_index(
+        &self,
+        index: &str,
+        delete_schema: bool,
+    ) -> Result<(), OrchestratorError> {
         let store = self.store.as_ref().ok_or_else(|| {
             OrchestratorError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -638,7 +685,7 @@ impl MicroshardActor {
         let index = index.to_string();
 
         // Use spawn_blocking to execute delete on blocking thread pool
-        tokio::task::spawn_blocking(move || store.delete_index_data(&index))
+        tokio::task::spawn_blocking(move || store.delete_index_data(&index, delete_schema))
             .await
             .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
             .map_err(|e: StoreError| match e {
@@ -923,6 +970,34 @@ impl Message<BatchWriteRequest> for MicroshardActor {
                 sequence_ids,
             })
             .map_err(RemoteError::from)
+    }
+}
+
+/// Message implementation for MicroshardActor shutdown operations
+impl Message<ShutdownShard> for MicroshardActor {
+    type Reply = Result<(), RemoteError>;
+
+    async fn handle(
+        &mut self,
+        _msg: ShutdownShard,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        tracing::info!(shard_id = %self.shard_id, "MicroshardActor: Shutting down shard");
+
+        if let Some(store) = self.store.as_ref() {
+            let store_clone = store.clone();
+            // Call shutdown in spawn_blocking since it's a blocking operation
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = store_clone.shutdown() {
+                    tracing::error!(error = %e, "Failed to shutdown storage");
+                }
+            })
+            .await
+            .map_err(|e| RemoteError::Other(format!("Shutdown task failed: {}", e)))?;
+        }
+
+        tracing::info!(shard_id = %self.shard_id, "MicroshardActor: Shutdown completed");
+        Ok(())
     }
 }
 
@@ -2267,10 +2342,10 @@ impl NodeOrchestrator {
         Ok(())
     }
 
-    /// Process local shard batches in parallel for maximum performance.
+    /// Process local shard batches sequentially, relying on actor message queues for proper isolation.
     ///
-    /// This method takes all local shard batches and processes them concurrently
-    /// using tokio tasks, providing significant speedup for multi-shard operations.
+    /// Each shard actor processes its messages sequentially from its own queue,
+    /// preventing concurrent access to shared storage resources.
     async fn parallel_local_shard_processing(
         &self,
         index: &str,
@@ -2286,107 +2361,89 @@ impl NodeOrchestrator {
         tracing::debug!(
             local_shard_count = shard_count,
             total_docs = total_docs,
-            "Starting parallel local shard processing"
+            "Starting local shard processing"
         );
 
-        // Clone necessary data for parallel processing
-        let index = index.to_string();
-        let shards = self.shards.clone();
-
-        // Create parallel tasks for each local shard
-        let shard_tasks: Vec<_> = local_batches
-            .into_iter()
-            .map(|(shard_id, batch)| {
-                let index = index.clone();
-                let shards = shards.clone();
-
-                tokio::spawn(async move {
-                    Self::process_single_local_shard_static(shard_id, batch, index, shards).await
-                })
-            })
-            .collect();
-
-        // Await all shard operations concurrently
-        let shard_results = join_all(shard_tasks).await;
-
-        // Aggregate results
         let mut total_written = 0usize;
         let mut all_errors = Vec::new();
 
-        for result in shard_results {
-            match result {
-                Ok(Ok((written, errors))) => {
-                    total_written += written;
-                    all_errors.extend(errors);
-                }
-                Ok(Err(e)) => {
-                    all_errors.push(format!("Shard processing failed: {}", e));
-                }
-                Err(e) => {
-                    all_errors.push(format!("Task join error: {}", e));
-                }
-            }
-        }
+        // Collect shard_ids before consuming local_batches in the loop
+        let shard_ids: Vec<Uuid> = local_batches.keys().copied().collect();
 
-        tracing::debug!(
-            total_written = total_written,
-            error_count = all_errors.len(),
-            "Parallel local shard processing completed"
-        );
-
-        Ok((total_written, all_errors))
-    }
-
-    /// Process a single local shard batch (static method for parallel execution).
-    ///
-    /// This method handles the actual write operations for one shard,
-    /// converting documents to ClientOps and calling the shard actor.
-    async fn process_single_local_shard_static(
-        shard_id: Uuid,
-        batch: Vec<(DocPayload, Option<String>)>,
-        index: String,
-        shards: HashMap<Uuid, MicroshardActor>,
-    ) -> Result<(usize, Vec<String>), OrchestratorError> {
-        if let Some(shard) = shards.get(&shard_id) {
+        // Process each shard sequentially to avoid concurrent access to shared storage
+        for (shard_id, batch) in local_batches {
             tracing::debug!(
                 shard_id = %shard_id,
                 count = batch.len(),
                 "Processing bulk write batch for local shard"
             );
 
-            let ops: Vec<ClientOp> = batch
-                .into_iter()
-                .map(|(d, effective_routing_key)| ClientOp::Write {
-                    index: index.clone(),
-                    id: d.id,
-                    routing_key: effective_routing_key,
-                    doc: d.doc,
-                })
-                .collect();
+            if let Some(shard) = self.shards.get(&shard_id) {
+                let ops: Vec<ClientOp> = batch
+                    .into_iter()
+                    .map(|(d, effective_routing_key)| ClientOp::Write {
+                        index: index.to_string(),
+                        id: d.id,
+                        routing_key: effective_routing_key,
+                        doc: d.doc,
+                    })
+                    .collect();
 
-            match shard.handle_batch_write(BatchWriteRequest { ops }).await {
-                Ok(seq_ids) => {
-                    tracing::debug!(
-                        shard_id = %shard_id,
-                        written_count = seq_ids.len(),
-                        "Local shard batch processed successfully"
-                    );
-                    Ok((seq_ids.len(), Vec::new()))
+                match shard.handle_batch_write(BatchWriteRequest { ops }).await {
+                    Ok(seq_ids) => {
+                        tracing::info!(
+                            shard_id = %shard_id,
+                            written_count = seq_ids.len(),
+                            "Local shard batch completed successfully"
+                        );
+                        total_written += seq_ids.len();
+                    }
+                    Err(e) => {
+                        let error_msg = format!("Shard {}: {}", shard_id, e);
+                        tracing::warn!(error = %error_msg, "Local shard batch processing failed");
+                        all_errors.push(error_msg);
+                    }
                 }
-                Err(e) => {
-                    let error_msg = format!("Shard {}: {}", shard_id, e);
-                    tracing::warn!(error = %error_msg, "Local shard batch processing failed");
-                    Ok((0, vec![error_msg]))
+            } else {
+                let error_msg = format!("Local shard {} not found", shard_id);
+                tracing::error!(error = %error_msg, "Shard not found during processing");
+                all_errors.push(error_msg);
+            }
+        }
+
+        tracing::info!(
+            "Local shard processing completed - total_written: {}, errors: {}",
+            total_written,
+            all_errors.len()
+        );
+
+        // Commit all indices after batch processing to prevent Tantivy contention
+        if !all_errors.is_empty() {
+            tracing::warn!(
+                "Skipping commit due to {} errors during batch processing",
+                all_errors.len()
+            );
+        } else {
+            // Commit from all shards that were processed
+            for shard_id in shard_ids {
+                if let Some(shard) = self.shards.get(&shard_id) {
+                    if let Some(store) = &shard.store {
+                        // Commit the index to ensure all writes are persisted
+                        if let Err(e) = tokio::task::spawn_blocking({
+                            let store = store.clone();
+                            let index = index.to_string();
+                            move || store.commit_index(&index)
+                        })
+                        .await
+                        {
+                            tracing::warn!(shard_id = %shard_id, error = %e, "Failed to commit index after batch processing");
+                        }
+                    }
                 }
             }
-        } else {
-            let error_msg = format!("Local shard {} not found", shard_id);
-            tracing::error!(error = %error_msg, "Shard not found during processing");
-            Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                error_msg,
-            )))
         }
+
+        Ok((total_written, all_errors))
     }
 
     /// Forward a bulk batch to a remote node's orchestrator.
@@ -2718,6 +2775,56 @@ impl NodeOrchestrator {
         Ok(())
     }
 
+    /// Shutdown all shards gracefully, committing pending writes and releasing resources.
+    pub async fn shutdown_all_shards(&self) -> Result<(), OrchestratorError> {
+        tracing::info!("NodeOrchestrator: Shutting down all shards");
+
+        let mut errors = Vec::new();
+
+        for (shard_id, shard) in self.shards.iter() {
+            tracing::debug!(shard_id = %shard_id, "Shutting down shard");
+
+            if let Some(store) = shard.store.as_ref() {
+                let store_clone = store.clone();
+                let shard_id_clone = *shard_id;
+
+                // Call shutdown in spawn_blocking since it's a blocking operation
+                match tokio::task::spawn_blocking(move || {
+                    tracing::info!(shard_id = %shard_id_clone, "Calling storage shutdown");
+                    store_clone.shutdown()
+                })
+                .await
+                {
+                    Ok(Ok(())) => {
+                        tracing::debug!(shard_id = %shard_id, "Shard storage shutdown successful");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(shard_id = %shard_id, error = %e, "Shard storage shutdown failed");
+                        errors.push(format!("Shard {} shutdown error: {}", shard_id, e));
+                    }
+                    Err(e) => {
+                        tracing::error!(shard_id = %shard_id, error = %e, "Failed to execute shutdown task");
+                        errors.push(format!("Shard {} task error: {}", shard_id, e));
+                    }
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            tracing::info!("NodeOrchestrator: All shards shut down successfully");
+            Ok(())
+        } else {
+            tracing::warn!(
+                error_count = errors.len(),
+                "NodeOrchestrator: Some shards failed to shutdown"
+            );
+            Err(OrchestratorError::Io(std::io::Error::other(format!(
+                "Shutdown errors: {}",
+                errors.join("; ")
+            ))))
+        }
+    }
+
     /// Registers a shard with the routing ring for consistent hashing.
     fn register_shard_for_routing(&mut self, shard_id: Uuid) {
         let simple = shard_id.simple().to_string();
@@ -2782,12 +2889,19 @@ impl NodeOrchestrator {
             }
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
             ClientOp::ListIndexes | ClientOp::ListClusterIndexes => self.orch_list_indexes().await,
-            ClientOp::DeleteIndex { index } => self.orch_delete_index(&index).await,
+            ClientOp::DeleteIndex {
+                index,
+                delete_schema,
+            } => self.orch_delete_index(&index, delete_schema).await,
         }
     }
 
     /// Delete an index and all its data from all local shards
-    async fn orch_delete_index(&self, index: &str) -> Result<JsonValue, OrchestratorError> {
+    async fn orch_delete_index(
+        &self,
+        index: &str,
+        delete_schema: bool,
+    ) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
             return Err(OrchestratorError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -2800,12 +2914,13 @@ impl NodeOrchestrator {
 
         // Delete index data from all local shards
         for (shard_id, shard) in &self.shards {
-            match shard.delete_index(index).await {
+            match shard.delete_index(index, delete_schema).await {
                 Ok(_) => {
                     deleted_from_shards += 1;
                     tracing::info!(
                         shard_id = %shard_id,
                         index = %index,
+                        delete_schema = delete_schema,
                         "Deleted index data from shard"
                     );
                 }
@@ -3539,6 +3654,18 @@ impl Message<UpdateTopology> for NodeOrchestrator {
             "NodeOrchestrator: received global topology update"
         );
         self.routing_ring = msg.ring;
+    }
+}
+
+impl Message<ShutdownAllShards> for NodeOrchestrator {
+    type Reply = Result<(), OrchestratorError>;
+
+    async fn handle(
+        &mut self,
+        _msg: ShutdownAllShards,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.shutdown_all_shards().await
     }
 }
 

@@ -324,6 +324,15 @@ async fn main() -> Result<()> {
     tokio::signal::ctrl_c().await?;
     println!("Shutting down...");
 
+    // Shutdown all shards gracefully to commit pending writes
+    tracing::info!("Shutting down all shards...");
+    if let Err(e) = orchestrator_ref
+        .ask(crate::node_orchestrator::ShutdownAllShards)
+        .await
+    {
+        tracing::error!(error = %e, "Failed to shutdown shards gracefully");
+    }
+
     // Signal coordinator to shutdown swarm gracefully
     let _ = coordinator_actor.ask(ShutdownSwarm).await;
 

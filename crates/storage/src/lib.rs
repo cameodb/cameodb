@@ -532,6 +532,71 @@ impl HybridStore {
         })
     }
 
+    /// Gracefully shutdown the HybridStore, releasing all locks and resources
+    pub fn shutdown(&self) -> Result<(), StoreError> {
+        tracing::info!("HybridStore: Starting graceful shutdown");
+
+        // Check which indices have pending operations
+        let operations_counter = self.operations_counter.read().unwrap();
+        let indices_with_pending_ops: Vec<String> = operations_counter
+            .iter()
+            .filter(|(_, counter)| counter.load(Ordering::SeqCst) > 0)
+            .map(|(index, _)| index.clone())
+            .collect();
+        drop(operations_counter);
+
+        if indices_with_pending_ops.is_empty() {
+            tracing::info!("No pending operations, skipping commits during shutdown");
+        } else {
+            tracing::info!(
+                indices_count = indices_with_pending_ops.len(),
+                indices = ?indices_with_pending_ops,
+                "Committing indices with pending operations during shutdown"
+            );
+        }
+
+        // Commit only writers with pending operations
+        let writers = self.writers.read().unwrap();
+        for (index, writer_arc) in writers.iter() {
+            if indices_with_pending_ops.contains(index) {
+                match writer_arc.try_lock() {
+                    Ok(mut writer) => {
+                        tracing::debug!(index = %index, "Committing index during shutdown");
+                        if let Err(e) = writer.commit() {
+                            tracing::warn!(index = %index, error = %e, "Failed to commit index during shutdown");
+                        }
+                    }
+                    Err(_) => {
+                        tracing::warn!(index = %index, "Writer lock busy during shutdown, skipping commit");
+                    }
+                }
+            } else {
+                tracing::debug!(index = %index, "No pending operations, skipping commit during shutdown");
+            }
+        }
+
+        // Clear all caches
+        {
+            let mut schema_cache = self.schema_cache.write().unwrap();
+            schema_cache.clear();
+        }
+        {
+            let mut budget_cache = self.budget_cache.write().unwrap();
+            budget_cache.clear();
+        }
+        {
+            let mut operations_counter = self.operations_counter.write().unwrap();
+            operations_counter.clear();
+        }
+        {
+            let mut current_seq = self.current_seq.write().unwrap();
+            current_seq.clear();
+        }
+
+        tracing::info!("HybridStore: Graceful shutdown completed");
+        Ok(())
+    }
+
     /// Get a value from the read cache if present.
     fn get_from_cache(&self, index: &str, key: &str) -> Option<Vec<u8>> {
         let cache_map = self.read_cache.read().unwrap();
@@ -830,7 +895,7 @@ impl HybridStore {
         let default_batch = self.config.default_batch_size as f64;
 
         // Scale from 50% of default (min memory) to 800% of default (max memory)
-        // e.g., default=1000: 500 ops (16MB) -> 8000 ops (256MB)
+        // e.g., default=2000: 1000 ops (16MB) -> 16000 ops (256MB)
         let base_ops = (default_batch * (0.5 + budget_ratio * 7.5)) as u64;
 
         operations_since_commit >= base_ops
@@ -1159,7 +1224,8 @@ impl HybridStore {
     }
 
     /// Delete all data for an index using redb's efficient delete_table() function
-    pub fn delete_index_data(&self, index: &str) -> Result<(), StoreError> {
+    /// If delete_schema is true, also removes schema metadata from TABLE_SCHEMA
+    pub fn delete_index_data(&self, index: &str, delete_schema: bool) -> Result<(), StoreError> {
         // Remove from caches first
         {
             let mut writers = self.writers.write().unwrap();
@@ -1206,6 +1272,15 @@ impl HybridStore {
             // Note: delete_table returns bool indicating if table existed, we ignore the result
             let _ = write_txn.delete_table(data_table_def)?;
             let _ = write_txn.delete_table(wal_table_def)?;
+
+            // Conditionally delete schema metadata if requested
+            if delete_schema {
+                tracing::debug!(index = %index, "Deleting schema metadata from TABLE_SCHEMA");
+                let mut schema_table = write_txn.open_table(TABLE_SCHEMA)?;
+                let _ = schema_table.remove(index)?;
+            } else {
+                tracing::debug!(index = %index, "Keeping schema metadata in TABLE_SCHEMA");
+            }
         }
         write_txn.commit()?;
 
@@ -1700,11 +1775,16 @@ impl HybridStore {
             return Ok((Vec::new(), 0));
         }
 
+        tracing::debug!(
+            index = %index,
+            ops_count = ops.len(),
+            "HybridStore: Starting apply_batch"
+        );
+
         // Get or create the index
         let (writer_arc, fields) = self.get_or_create_index(index)?;
 
         // Generate sequence IDs for all operations in one atomic operation
-        // Use lazy generation to avoid large Vec allocation
         let start_seq = {
             let seq_map = self.current_seq.read().unwrap();
             let counter = seq_map.get(index).ok_or_else(|| {
@@ -1713,15 +1793,11 @@ impl HybridStore {
                     index
                 ))
             })?;
-
-            // Batch generate sequence IDs in one atomic operation
-            counter.fetch_add(ops.len() as u64, Ordering::SeqCst) + 1
+            counter.fetch_add(ops.len() as u64, Ordering::SeqCst) + 1 - ops.len() as u64
         };
-
-        // Create iterator for sequential IDs without allocating full Vec
         let seq_ids_iter = (0..ops.len()).map(|i| start_seq + i as u64);
 
-        // Create dynamic table definitions
+        // Generate sequence IDs for all operations in one atomic operation
         let data_table_name = format!("data_{}", index);
         let wal_table_name = format!("wal_{}", index);
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
@@ -1912,7 +1988,6 @@ impl HybridStore {
         // Apply all tantivy operations with optimized selective deletes
         {
             let writer = writer_arc.lock().unwrap();
-
             // Step 1: Delete only updated documents (selective optimization)
             if !updated_document_ids.is_empty() {
                 tracing::debug!(
@@ -1952,8 +2027,9 @@ impl HybridStore {
                 }
             }
 
-            // Apply smart commit logic (same as individual writes)
-            let committed = self.maybe_commit_writer(index)?;
+            // Skip commits during batch processing to prevent Tantivy contention
+            // Commits will be handled by supervisor after all shards are processed
+            let committed = false;
 
             tracing::debug!(
                 index = %index,
@@ -1965,6 +2041,13 @@ impl HybridStore {
                 "Bulk write completed with selective Tantivy optimization and smart commits"
             );
         }
+
+        tracing::debug!(
+            index = %index,
+            seq_count = seq_ids.len(),
+            new_docs = new_documents_count,
+            "HybridStore: apply_batch completed successfully"
+        );
 
         Ok((seq_ids, new_documents_count))
     }
@@ -2210,8 +2293,8 @@ mod tests {
         assert!(index1_path.exists());
         assert!(index2_path.exists());
 
-        // Delete index1
-        store.delete_index_data("index1").unwrap();
+        // Delete index1 (with schema deletion)
+        store.delete_index_data("index1", true).unwrap();
 
         // Verify index1 is gone but index2 remains
         assert!(!index1_path.exists());

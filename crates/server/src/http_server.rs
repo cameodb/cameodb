@@ -6,7 +6,7 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -20,7 +20,7 @@ use tower_http::{
     compression::CompressionLayer, cors::CorsLayer, decompression::DecompressionLayer,
     trace::TraceLayer,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::cluster_coordinator::{ClusterCoordinator, GetStatus, OperationType};
 use crate::node_orchestrator::{ClientOp, DocPayload, RouterActor};
@@ -94,6 +94,8 @@ pub struct HealthResponse {
 
     // Local node info
     pub active_shards: usize,
+    pub total_indexes: usize,
+    pub indexes_with_data: usize,
 
     // Performance/Debug metrics
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -304,6 +306,24 @@ async fn bulk_write_handler(
         .router
         .route_and_handle(client_op, routing_hint, OperationType::Write)
         .await?;
+
+    // Debug: Log response size to identify potential serialization issues
+    let response_str = serde_json::to_string(&result).unwrap_or_default();
+    let response_size = response_str.len();
+    info!(
+        "Bulk write completed - response size: {} bytes, keys: {}",
+        response_size,
+        result.as_object().map(|o| o.keys().count()).unwrap_or(0)
+    );
+
+    // If response is very large, this could cause HTTP/2 issues
+    if response_size > 1_000_000 {
+        warn!(
+            "Large bulk response ({} bytes) may cause HTTP/2 issues",
+            response_size
+        );
+    }
+
     Ok(Json(result))
 }
 
@@ -378,6 +398,35 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
         }
     };
 
+    // Get index statistics
+    let (total_indexes, indexes_with_data) = match state
+        .router
+        .route_and_handle(ClientOp::ListIndexes, None, OperationType::Read)
+        .await
+    {
+        Ok(response) => {
+            if let Some(indexes_array) = response.get("indexes").and_then(|v| v.as_array()) {
+                let total = indexes_array.len();
+                let with_data = indexes_array
+                    .iter()
+                    .filter(|idx| {
+                        idx.get("document_count")
+                            .and_then(|c| c.as_u64())
+                            .unwrap_or(0)
+                            > 0
+                    })
+                    .count();
+                (total, with_data)
+            } else {
+                (0, 0)
+            }
+        }
+        Err(_) => {
+            error!("Failed to get index statistics for health check");
+            (0, 0)
+        }
+    };
+
     let response = HealthResponse {
         status: cluster_status
             .as_ref()
@@ -391,6 +440,8 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
         connected_nodes: cluster_status.as_ref().map(|s| s.connected_nodes),
         cluster_total_shards: cluster_status.as_ref().map(|s| s.total_shards),
         active_shards: shard_count,
+        total_indexes,
+        indexes_with_data,
         dial_failures: cluster_status.as_ref().map(|s| s.dial_failures),
         bootstrap_successes: cluster_status.as_ref().map(|s| s.bootstrap_successes),
         routing_updates: cluster_status.as_ref().map(|s| s.routing_updates),
@@ -477,10 +528,17 @@ async fn update_schema_handler(
 async fn delete_index_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
+    Query(params): Query<DeleteIndexParams>,
 ) -> Result<Json<JsonValue>, AppError> {
-    info!("Delete index request - index: {}", index);
+    info!(
+        "Delete index request - index: {}, delete_schema: {:?}",
+        index, params.delete_schema
+    );
 
-    let client_op = ClientOp::DeleteIndex { index };
+    let client_op = ClientOp::DeleteIndex {
+        index,
+        delete_schema: params.delete_schema.unwrap_or(false),
+    };
 
     // Use Broadcast to delete from all nodes in cluster
     let result = state
@@ -488,6 +546,11 @@ async fn delete_index_handler(
         .route_and_handle(client_op, None, OperationType::Write)
         .await?;
     Ok(Json(result))
+}
+
+#[derive(Deserialize, Default)]
+struct DeleteIndexParams {
+    delete_schema: Option<bool>,
 }
 
 /// Fallback handler for 404/405 to return JSON error shape

@@ -60,7 +60,7 @@ fn test_storage_engine_basics() {
 
     // Test index deletion
     store
-        .delete_index_data("test_index")
+        .delete_index_data("test_index", false)
         .expect("Failed to delete index");
 
     // Note: delete_index_data removes the index data but not the schema
