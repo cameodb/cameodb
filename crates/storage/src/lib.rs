@@ -2166,7 +2166,7 @@ impl HybridStore {
 
             // Intermediate commit if batch size exceeds 3x the normal commit threshold
             // This allows large batches to commit periodically without waiting for full threshold
-            let committed = if batch_size as u64 > current_threshold * 3 {
+            let committed = if batch_size > current_threshold * 3 {
                 tracing::debug!(
                     index = %index,
                     batch_size = batch_size,
@@ -2185,7 +2185,7 @@ impl HybridStore {
 
             // Optimize memory budget for batch processing to reduce segment creation
             // Use the same threshold calculation for consistency
-            if batch_size as u64 > current_threshold * 2 {
+            if batch_size > current_threshold * 2 {
                 // Increase memory budget temporarily for large batches to create fewer segments
                 let current_budget = {
                     let cache = self.budget_cache.read().unwrap();
@@ -2210,7 +2210,7 @@ impl HybridStore {
 
                     // Update cached budget for this batch
                     let mut cache = self.budget_cache.write().unwrap();
-                    cache.insert(index.to_string(), increased_budget as usize);
+                    cache.insert(index.to_string(), increased_budget);
                 }
             }
 
@@ -2500,7 +2500,7 @@ mod tests {
             (json!("2023-01-01T00:00:00Z"), TantivyFieldType::Date),
             (json!("192.168.1.1"), TantivyFieldType::Ip),
             (json!(42), TantivyFieldType::I64),
-            (json!(3.14), TantivyFieldType::F64),
+            (json!(std::f64::consts::PI), TantivyFieldType::F64),
             (json!(true), TantivyFieldType::Boolean),
             (json!(null), TantivyFieldType::Text),
             (json!([1, 2, 3]), TantivyFieldType::Text),

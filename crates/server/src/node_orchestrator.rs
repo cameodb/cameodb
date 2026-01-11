@@ -1732,10 +1732,9 @@ impl RouterActor {
                                         // Track unique shard IDs from individual documents
                                         if let Some(shard_id) =
                                             hit_doc.get("shard_id").and_then(|s| s.as_str())
+                                            && let Ok(uuid) = Uuid::parse_str(shard_id)
                                         {
-                                            if let Ok(uuid) = Uuid::parse_str(shard_id) {
-                                                unique_shard_ids.insert(uuid);
-                                            }
+                                            unique_shard_ids.insert(uuid);
                                         }
                                     }
                                     all_hits.push(hit_doc);
@@ -2494,7 +2493,7 @@ impl NodeOrchestrator {
             // Commit from all shards that were processed in parallel for better performance
             let commit_tasks: Vec<_> = shard_ids
                 .iter()
-                .map(|shard_id| {
+                .filter_map(|shard_id| {
                     if let Some(shard) = self.shards.get(shard_id) {
                         if let Some(store) = &shard.store {
                             let store = store.clone();
@@ -2511,7 +2510,6 @@ impl NodeOrchestrator {
                         None
                     }
                 })
-                .filter_map(|task| task)
                 .collect();
 
             // Execute all commits in parallel and collect results
