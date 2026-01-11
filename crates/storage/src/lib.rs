@@ -85,7 +85,7 @@ impl StorageConfig {
                 101..=500 => default_budget_bytes, // Small indices: start budget (64MB)
                 501..=2000 => (min_budget_bytes + max_budget_bytes) / 2, // Medium indices: mid-range (272MB)
                 2001..=8000 => max_budget_bytes / 2, // Large indices: 50% of max (256MB)
-                _ => max_budget_bytes,                     // Very large indices: max budget (512MB)
+                _ => max_budget_bytes,               // Very large indices: max budget (512MB)
             };
 
             // Ensure result is within configured bounds
@@ -98,8 +98,7 @@ impl StorageConfig {
 }
 
 /// Native Tantivy field types with proper enum for type safety.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum TantivyFieldType {
     /// Tokenized text for full-text search
     #[default]
@@ -125,7 +124,6 @@ pub enum TantivyFieldType {
     /// Categorical/facet field
     Facet,
 }
-
 
 impl TantivyFieldType {
     /// Convert to string representation (for serialization)
@@ -331,15 +329,16 @@ impl IndexSchema {
     /// Returns true if the field was promoted, false if it was already indexed or doesn't exist.
     pub fn promote_field_to_indexed(&mut self, field_name: &str) -> bool {
         if let Some(field_def) = self.fields.get_mut(field_name)
-            && !field_def.indexed {
-                field_def.indexed = true;
-                tracing::info!(
-                    field = %field_name,
-                    field_type = ?field_def.field_type,
-                    "Promoted field to indexed status - requires Tantivy schema rebuild"
-                );
-                return true;
-            }
+            && !field_def.indexed
+        {
+            field_def.indexed = true;
+            tracing::info!(
+                field = %field_name,
+                field_type = ?field_def.field_type,
+                "Promoted field to indexed status - requires Tantivy schema rebuild"
+            );
+            return true;
+        }
         false
     }
 
@@ -1001,107 +1000,100 @@ impl HybridStore {
 
                         if let Some(tantivy_field) = fields.indexed_fields.get(field_name)
                             && let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object())
-                                && let Some(field_value) = json_obj.get(field_name) {
-                                    match field_def.field_type {
-                                        TantivyFieldType::Text => {
-                                            if let Some(s) = field_value.as_str() {
+                            && let Some(field_value) = json_obj.get(field_name)
+                        {
+                            match field_def.field_type {
+                                TantivyFieldType::Text => {
+                                    if let Some(s) = field_value.as_str() {
+                                        tantivy_doc.add_text(*tantivy_field, s);
+                                    } else {
+                                        let field_str = serde_json::to_string(field_value)
+                                            .map_err(|e| {
+                                                StoreError::Serialization(e.to_string())
+                                            })?;
+                                        tantivy_doc.add_text(*tantivy_field, &field_str);
+                                    }
+                                }
+                                TantivyFieldType::String => {
+                                    if let Some(s) = field_value.as_str() {
+                                        tantivy_doc.add_text(*tantivy_field, s);
+                                    } else if let Some(arr) = field_value.as_array() {
+                                        for item in arr {
+                                            if let Some(s) = item.as_str() {
                                                 tantivy_doc.add_text(*tantivy_field, s);
-                                            } else {
-                                                let field_str = serde_json::to_string(field_value)
-                                                    .map_err(|e| {
-                                                        StoreError::Serialization(e.to_string())
-                                                    })?;
-                                                tantivy_doc.add_text(*tantivy_field, &field_str);
-                                            }
-                                        }
-                                        TantivyFieldType::String => {
-                                            if let Some(s) = field_value.as_str() {
-                                                tantivy_doc.add_text(*tantivy_field, s);
-                                            } else if let Some(arr) = field_value.as_array() {
-                                                for item in arr {
-                                                    if let Some(s) = item.as_str() {
-                                                        tantivy_doc.add_text(*tantivy_field, s);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        TantivyFieldType::F64 => {
-                                            if let Some(n) = field_value.as_f64() {
-                                                tantivy_doc.add_f64(*tantivy_field, n);
-                                            }
-                                        }
-                                        TantivyFieldType::I64 => {
-                                            if let Some(n) = field_value.as_i64() {
-                                                tantivy_doc.add_i64(*tantivy_field, n);
-                                            }
-                                        }
-                                        TantivyFieldType::U64 => {
-                                            if let Some(n) = field_value.as_u64() {
-                                                tantivy_doc.add_u64(*tantivy_field, n);
-                                            }
-                                        }
-                                        TantivyFieldType::Date => {
-                                            if let Some(s) = field_value.as_str()
-                                                && let Ok(dt) =
-                                                    chrono::DateTime::parse_from_rfc3339(s)
-                                            {
-                                                let tantivy_dt =
-                                                    DateTime::from_timestamp_secs(dt.timestamp());
-                                                tantivy_doc.add_date(*tantivy_field, tantivy_dt);
-                                            }
-                                        }
-                                        TantivyFieldType::Boolean => {
-                                            if let Some(b) = field_value.as_bool() {
-                                                tantivy_doc.add_text(
-                                                    *tantivy_field,
-                                                    if b { "true" } else { "false" },
-                                                );
-                                            }
-                                        }
-                                        TantivyFieldType::Bytes => {
-                                            if let Some(arr) = field_value.as_array() {
-                                                let mut bytes = Vec::new();
-                                                for item in arr {
-                                                    if let Some(n) = item.as_u64() {
-                                                        bytes.push(n as u8);
-                                                    }
-                                                }
-                                                if !bytes.is_empty() {
-                                                    tantivy_doc.add_bytes(
-                                                        *tantivy_field,
-                                                        bytes.as_slice(),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        TantivyFieldType::Ip => {
-                                            if let Some(s) = field_value.as_str()
-                                                && let Ok(ip) = s.parse::<std::net::IpAddr>()
-                                            {
-                                                // Convert any IP address to IPv6 for Tantivy compatibility
-                                                let ipv6 = match ip {
-                                                    std::net::IpAddr::V4(ipv4) => {
-                                                        ipv4.to_ipv6_mapped()
-                                                    }
-                                                    std::net::IpAddr::V6(ipv6) => ipv6,
-                                                };
-                                                tantivy_doc.add_ip_addr(*tantivy_field, ipv6);
-                                            }
-                                        }
-                                        TantivyFieldType::Json => {
-                                            let json_str = serde_json::to_string(field_value)
-                                                .map_err(|e| {
-                                                    StoreError::Serialization(e.to_string())
-                                                })?;
-                                            tantivy_doc.add_text(*tantivy_field, &json_str);
-                                        }
-                                        TantivyFieldType::Facet => {
-                                            if let Some(s) = field_value.as_str() {
-                                                tantivy_doc.add_facet(*tantivy_field, &s);
                                             }
                                         }
                                     }
                                 }
+                                TantivyFieldType::F64 => {
+                                    if let Some(n) = field_value.as_f64() {
+                                        tantivy_doc.add_f64(*tantivy_field, n);
+                                    }
+                                }
+                                TantivyFieldType::I64 => {
+                                    if let Some(n) = field_value.as_i64() {
+                                        tantivy_doc.add_i64(*tantivy_field, n);
+                                    }
+                                }
+                                TantivyFieldType::U64 => {
+                                    if let Some(n) = field_value.as_u64() {
+                                        tantivy_doc.add_u64(*tantivy_field, n);
+                                    }
+                                }
+                                TantivyFieldType::Date => {
+                                    if let Some(s) = field_value.as_str()
+                                        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
+                                    {
+                                        let tantivy_dt =
+                                            DateTime::from_timestamp_secs(dt.timestamp());
+                                        tantivy_doc.add_date(*tantivy_field, tantivy_dt);
+                                    }
+                                }
+                                TantivyFieldType::Boolean => {
+                                    if let Some(b) = field_value.as_bool() {
+                                        tantivy_doc.add_text(
+                                            *tantivy_field,
+                                            if b { "true" } else { "false" },
+                                        );
+                                    }
+                                }
+                                TantivyFieldType::Bytes => {
+                                    if let Some(arr) = field_value.as_array() {
+                                        let mut bytes = Vec::new();
+                                        for item in arr {
+                                            if let Some(n) = item.as_u64() {
+                                                bytes.push(n as u8);
+                                            }
+                                        }
+                                        if !bytes.is_empty() {
+                                            tantivy_doc.add_bytes(*tantivy_field, bytes.as_slice());
+                                        }
+                                    }
+                                }
+                                TantivyFieldType::Ip => {
+                                    if let Some(s) = field_value.as_str()
+                                        && let Ok(ip) = s.parse::<std::net::IpAddr>()
+                                    {
+                                        // Convert any IP address to IPv6 for Tantivy compatibility
+                                        let ipv6 = match ip {
+                                            std::net::IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
+                                            std::net::IpAddr::V6(ipv6) => ipv6,
+                                        };
+                                        tantivy_doc.add_ip_addr(*tantivy_field, ipv6);
+                                    }
+                                }
+                                TantivyFieldType::Json => {
+                                    let json_str = serde_json::to_string(field_value)
+                                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                                    tantivy_doc.add_text(*tantivy_field, &json_str);
+                                }
+                                TantivyFieldType::Facet => {
+                                    if let Some(s) = field_value.as_str() {
+                                        tantivy_doc.add_facet(*tantivy_field, &s);
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     let writer = writer_arc.lock().unwrap();
@@ -1691,9 +1683,9 @@ impl HybridStore {
         // Get or create the index
         let (writer_arc, fields) = self.get_or_create_index(index)?;
 
-        // Generate sequence IDs for all operations
-        let mut seq_ids = Vec::with_capacity(ops.len());
-        {
+        // Generate sequence IDs for all operations in one atomic operation
+        // Use lazy generation to avoid large Vec allocation
+        let start_seq = {
             let seq_map = self.current_seq.read().unwrap();
             let counter = seq_map.get(index).ok_or_else(|| {
                 StoreError::IndexNotFound(format!(
@@ -1702,10 +1694,12 @@ impl HybridStore {
                 ))
             })?;
 
-            for _ in 0..ops.len() {
-                seq_ids.push(counter.fetch_add(1, Ordering::SeqCst) + 1);
-            }
-        }
+            // Batch generate sequence IDs in one atomic operation
+            counter.fetch_add(ops.len() as u64, Ordering::SeqCst) + 1
+        };
+
+        // Create iterator for sequential IDs without allocating full Vec
+        let seq_ids_iter = (0..ops.len()).map(|i| start_seq + i as u64);
 
         // Create dynamic table definitions
         let data_table_name = format!("data_{}", index);
@@ -1717,6 +1711,9 @@ impl HybridStore {
         let mut write_txn = self.kv.begin_write()?;
         let mut tantivy_ops = Vec::new();
         let batch_size = ops.len() as u64;
+
+        // Collect sequence IDs during processing
+        let mut seq_ids = Vec::with_capacity(ops.len());
 
         {
             // Set durability based on config for bulk operations
@@ -1731,11 +1728,15 @@ impl HybridStore {
             let mut wal_table = write_txn.open_table(wal_table_def)?;
             let mut data_table = write_txn.open_table(data_table_def)?;
 
-            for (op, seq_id) in ops.into_iter().zip(seq_ids.iter()) {
+            // Process operations and collect sequence IDs
+            for (op, seq_id) in ops.into_iter().zip(seq_ids_iter) {
                 // Write to WAL
                 let wal_data = serde_json::to_vec(&op)
                     .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                wal_table.insert(*seq_id, wal_data.as_slice())?;
+                wal_table.insert(seq_id, wal_data.as_slice())?;
+
+                // Collect sequence ID for final result
+                seq_ids.push(seq_id);
 
                 // Apply to data table and prepare tantivy operations
                 match op {
@@ -1766,108 +1767,103 @@ impl HybridStore {
                             if let Some(tantivy_field) = fields.indexed_fields.get(field_name)
                                 && let Some(json_obj) =
                                     json_blob.as_ref().and_then(|v| v.as_object())
-                                    && let Some(field_value) = json_obj.get(field_name)
-                                {
-                                    match field_def.field_type {
-                                        TantivyFieldType::Text => {
-                                            if let Some(s) = field_value.as_str() {
-                                                tantivy_doc.add_text(*tantivy_field, s);
-                                            } else {
-                                                let field_str = serde_json::to_string(field_value)
-                                                    .map_err(|e| {
-                                                        StoreError::Serialization(e.to_string())
-                                                    })?;
-                                                tantivy_doc.add_text(*tantivy_field, &field_str);
-                                            }
-                                        }
-                                        TantivyFieldType::String => {
-                                            if let Some(s) = field_value.as_str() {
-                                                tantivy_doc.add_text(*tantivy_field, s);
-                                            } else if let Some(arr) = field_value.as_array() {
-                                                for item in arr {
-                                                    if let Some(s) = item.as_str() {
-                                                        tantivy_doc.add_text(*tantivy_field, s);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        TantivyFieldType::F64 => {
-                                            if let Some(n) = field_value.as_f64() {
-                                                tantivy_doc.add_f64(*tantivy_field, n);
-                                            }
-                                        }
-                                        TantivyFieldType::I64 => {
-                                            if let Some(n) = field_value.as_i64() {
-                                                tantivy_doc.add_i64(*tantivy_field, n);
-                                            }
-                                        }
-                                        TantivyFieldType::U64 => {
-                                            if let Some(n) = field_value.as_u64() {
-                                                tantivy_doc.add_u64(*tantivy_field, n);
-                                            }
-                                        }
-                                        TantivyFieldType::Date => {
-                                            if let Some(s) = field_value.as_str()
-                                                && let Ok(dt) =
-                                                    chrono::DateTime::parse_from_rfc3339(s)
-                                            {
-                                                let tantivy_dt =
-                                                    DateTime::from_timestamp_secs(dt.timestamp());
-                                                tantivy_doc.add_date(*tantivy_field, tantivy_dt);
-                                            }
-                                        }
-                                        TantivyFieldType::Boolean => {
-                                            if let Some(b) = field_value.as_bool() {
-                                                tantivy_doc.add_text(
-                                                    *tantivy_field,
-                                                    if b { "true" } else { "false" },
-                                                );
-                                            }
-                                        }
-                                        TantivyFieldType::Bytes => {
-                                            if let Some(arr) = field_value.as_array() {
-                                                let mut bytes = Vec::new();
-                                                for item in arr {
-                                                    if let Some(n) = item.as_u64() {
-                                                        bytes.push(n as u8);
-                                                    }
-                                                }
-                                                if !bytes.is_empty() {
-                                                    tantivy_doc.add_bytes(
-                                                        *tantivy_field,
-                                                        bytes.as_slice(),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        TantivyFieldType::Ip => {
-                                            if let Some(s) = field_value.as_str()
-                                                && let Ok(ip) = s.parse::<std::net::IpAddr>()
-                                            {
-                                                // Convert any IP address to IPv6 for Tantivy compatibility
-                                                let ipv6 = match ip {
-                                                    std::net::IpAddr::V4(ipv4) => {
-                                                        ipv4.to_ipv6_mapped()
-                                                    }
-                                                    std::net::IpAddr::V6(ipv6) => ipv6,
-                                                };
-                                                tantivy_doc.add_ip_addr(*tantivy_field, ipv6);
-                                            }
-                                        }
-                                        TantivyFieldType::Json => {
-                                            let json_str = serde_json::to_string(field_value)
+                                && let Some(field_value) = json_obj.get(field_name)
+                            {
+                                match field_def.field_type {
+                                    TantivyFieldType::Text => {
+                                        if let Some(s) = field_value.as_str() {
+                                            tantivy_doc.add_text(*tantivy_field, s);
+                                        } else {
+                                            let field_str = serde_json::to_string(field_value)
                                                 .map_err(|e| {
                                                     StoreError::Serialization(e.to_string())
                                                 })?;
-                                            tantivy_doc.add_text(*tantivy_field, &json_str);
+                                            tantivy_doc.add_text(*tantivy_field, &field_str);
                                         }
-                                        TantivyFieldType::Facet => {
-                                            if let Some(s) = field_value.as_str() {
-                                                tantivy_doc.add_facet(*tantivy_field, &s);
+                                    }
+                                    TantivyFieldType::String => {
+                                        if let Some(s) = field_value.as_str() {
+                                            tantivy_doc.add_text(*tantivy_field, s);
+                                        } else if let Some(arr) = field_value.as_array() {
+                                            for item in arr {
+                                                if let Some(s) = item.as_str() {
+                                                    tantivy_doc.add_text(*tantivy_field, s);
+                                                }
                                             }
                                         }
                                     }
+                                    TantivyFieldType::F64 => {
+                                        if let Some(n) = field_value.as_f64() {
+                                            tantivy_doc.add_f64(*tantivy_field, n);
+                                        }
+                                    }
+                                    TantivyFieldType::I64 => {
+                                        if let Some(n) = field_value.as_i64() {
+                                            tantivy_doc.add_i64(*tantivy_field, n);
+                                        }
+                                    }
+                                    TantivyFieldType::U64 => {
+                                        if let Some(n) = field_value.as_u64() {
+                                            tantivy_doc.add_u64(*tantivy_field, n);
+                                        }
+                                    }
+                                    TantivyFieldType::Date => {
+                                        if let Some(s) = field_value.as_str()
+                                            && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
+                                        {
+                                            let tantivy_dt =
+                                                DateTime::from_timestamp_secs(dt.timestamp());
+                                            tantivy_doc.add_date(*tantivy_field, tantivy_dt);
+                                        }
+                                    }
+                                    TantivyFieldType::Boolean => {
+                                        if let Some(b) = field_value.as_bool() {
+                                            tantivy_doc.add_text(
+                                                *tantivy_field,
+                                                if b { "true" } else { "false" },
+                                            );
+                                        }
+                                    }
+                                    TantivyFieldType::Bytes => {
+                                        if let Some(arr) = field_value.as_array() {
+                                            let mut bytes = Vec::new();
+                                            for item in arr {
+                                                if let Some(n) = item.as_u64() {
+                                                    bytes.push(n as u8);
+                                                }
+                                            }
+                                            if !bytes.is_empty() {
+                                                tantivy_doc
+                                                    .add_bytes(*tantivy_field, bytes.as_slice());
+                                            }
+                                        }
+                                    }
+                                    TantivyFieldType::Ip => {
+                                        if let Some(s) = field_value.as_str()
+                                            && let Ok(ip) = s.parse::<std::net::IpAddr>()
+                                        {
+                                            // Convert any IP address to IPv6 for Tantivy compatibility
+                                            let ipv6 = match ip {
+                                                std::net::IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
+                                                std::net::IpAddr::V6(ipv6) => ipv6,
+                                            };
+                                            tantivy_doc.add_ip_addr(*tantivy_field, ipv6);
+                                        }
+                                    }
+                                    TantivyFieldType::Json => {
+                                        let json_str =
+                                            serde_json::to_string(field_value).map_err(|e| {
+                                                StoreError::Serialization(e.to_string())
+                                            })?;
+                                        tantivy_doc.add_text(*tantivy_field, &json_str);
+                                    }
+                                    TantivyFieldType::Facet => {
+                                        if let Some(s) = field_value.as_str() {
+                                            tantivy_doc.add_facet(*tantivy_field, &s);
+                                        }
+                                    }
                                 }
+                            }
                         }
 
                         tantivy_ops.push(("add", tantivy_doc, id));
@@ -1912,9 +1908,14 @@ impl HybridStore {
                 }
             }
 
-            // Increment operations counter by batch size
-            for _ in 0..batch_size {
-                self.increment_operations(index);
+            // Increment operations counter by batch size in one operation
+            {
+                let mut counter_map = self.operations_counter.write().unwrap();
+                if let Some(counter) = counter_map.get_mut(index) {
+                    counter.fetch_add(batch_size, Ordering::SeqCst);
+                } else {
+                    counter_map.insert(index.to_string(), AtomicU64::new(batch_size));
+                }
             }
 
             // Perform smart commit if needed, or force commit for very large batches

@@ -1529,7 +1529,7 @@ impl RouterActor {
                         .await
                     {
                         Ok(result) => StreamingSearchResult::Local {
-                            shard_id: Uuid::nil(), // Local node
+                            shard_id: Uuid::nil(), // Individual shard IDs are in the documents
                             hits: result
                                 .get("hits")
                                 .and_then(|h| h.as_array())
@@ -1598,6 +1598,7 @@ impl RouterActor {
                 let mut total_hits_sum = 0usize;
                 let mut shards_queried = 0usize;
                 let mut nodes_contacted = 0usize;
+                let mut unique_shard_ids = std::collections::HashSet::new();
                 let mut errors = Vec::new();
 
                 while let Some(search_result) = search_futures.next().await {
@@ -1608,7 +1609,7 @@ impl RouterActor {
 
                     match search_result {
                         StreamingSearchResult::Local {
-                            shard_id,
+                            shard_id: _,
                             hits,
                             total_hits,
                             took_ms: _,
@@ -1625,16 +1626,20 @@ impl RouterActor {
                                                     .unwrap_or(serde_json::Number::from(0)),
                                             ),
                                         );
-                                        o.insert(
-                                            "shard_id".to_string(),
-                                            JsonValue::String(shard_id.to_string()),
-                                        );
+                                        // Track unique shard IDs from individual documents
+                                        if let Some(shard_id) =
+                                            hit_doc.get("shard_id").and_then(|s| s.as_str())
+                                        {
+                                            if let Ok(uuid) = Uuid::parse_str(shard_id) {
+                                                unique_shard_ids.insert(uuid);
+                                            }
+                                        }
                                     }
                                     all_hits.push(hit_doc);
                                 }
                             }
                             total_hits_sum += total_hits;
-                            shards_queried += 1;
+                            shards_queried = unique_shard_ids.len();
                             nodes_contacted += 1;
                         }
                         StreamingSearchResult::Remote { node_id, result } => {
@@ -1917,9 +1922,36 @@ impl NodeOrchestrator {
         docs: &[DocPayload],
         schema_cache: &IndexSchema,
     ) -> Result<Vec<SchemaValidationResult>, OrchestratorError> {
-        // Clone schema cache for parallel read-only access
-        let schema_cache_clone = schema_cache.clone();
+        tracing::debug!(
+            "Using parallel Rayon validation for {} documents",
+            docs.len()
+        );
+
         let is_initial_creation = schema_cache.fields.is_empty();
+
+        // Fast path: if schema is mature and batch is small, skip expensive clone
+        let use_fast_path = !is_initial_creation && docs.len() < 1000;
+
+        if use_fast_path {
+            // Use read-only reference to avoid cloning
+            tracing::debug!("Using fast path validation for {} documents", docs.len());
+            let results: Vec<SchemaValidationResult> = docs
+                .par_iter()
+                .enumerate()
+                .map(|(_doc_index, doc_payload)| {
+                    self.validate_single_document_readonly_fast(
+                        &doc_payload.doc,
+                        schema_cache, // Pass by reference, no clone
+                        is_initial_creation,
+                    )
+                })
+                .collect();
+            return Ok(results);
+        }
+
+        // Full clone only for large batches or initial schema creation
+        tracing::debug!("Using full schema clone for {} documents", docs.len());
+        let schema_cache_clone = schema_cache.clone();
 
         // Parallel validation using rayon
         let results: Vec<SchemaValidationResult> = docs
@@ -1935,6 +1967,89 @@ impl NodeOrchestrator {
             .collect();
 
         Ok(results)
+    }
+
+    /// Read-only validation for a single document (no mutations) - fast path
+    fn validate_single_document_readonly_fast(
+        &self,
+        doc: &JsonValue,
+        schema_cache: &IndexSchema, // Pass by reference, no clone needed
+        _is_initial_creation: bool,
+    ) -> SchemaValidationResult {
+        // Check 1: Ensure doc["id"] exists
+        if !doc.is_object() || !doc.as_object().unwrap().contains_key("id") {
+            return SchemaValidationResult {
+                needs_evolution: false,
+                new_fields: Vec::new(),
+                validation_error: Some("Document missing required 'id' field".to_string()),
+            };
+        }
+
+        // Check 2: Validate against existing schema (no evolution in fast path)
+        if let Some(obj) = doc.as_object() {
+            for (key, value) in obj {
+                if key == "id" {
+                    continue; // Skip ID field
+                }
+
+                // Only check if field exists in schema, don't add new fields
+                if !schema_cache.fields.contains_key(key) {
+                    // In fast path, we don't track new fields for schema evolution
+                    // This is a performance optimization for mature schemas
+                    continue;
+                }
+
+                // Type validation against existing schema
+                if let Some(field_def) = schema_cache.fields.get(key) {
+                    let inferred_type = if key == "id" {
+                        TantivyFieldType::Text
+                    } else {
+                        match value {
+                            JsonValue::String(s) => {
+                                // Try to infer date from string
+                                if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+                                    TantivyFieldType::Date
+                                } else if s.parse::<std::net::IpAddr>().is_ok() {
+                                    TantivyFieldType::Ip
+                                } else {
+                                    TantivyFieldType::Text
+                                }
+                            }
+                            JsonValue::Number(n) => {
+                                if n.is_i64() {
+                                    TantivyFieldType::I64
+                                } else if n.is_u64() {
+                                    TantivyFieldType::U64
+                                } else {
+                                    TantivyFieldType::F64
+                                }
+                            }
+                            JsonValue::Bool(_) => TantivyFieldType::Boolean,
+                            JsonValue::Array(_) => TantivyFieldType::Text, // Arrays as text
+                            JsonValue::Object(_) => TantivyFieldType::Json, // Objects as JSON
+                            JsonValue::Null => TantivyFieldType::Text,
+                        }
+                    };
+
+                    if inferred_type != field_def.field_type {
+                        return SchemaValidationResult {
+                            needs_evolution: false,
+                            new_fields: Vec::new(),
+                            validation_error: Some(format!(
+                                "Type mismatch for field '{}': expected {:?}, got {:?}",
+                                key, field_def.field_type, inferred_type
+                            )),
+                        };
+                    }
+                }
+            }
+        }
+
+        SchemaValidationResult {
+            needs_evolution: false, // Fast path never needs evolution
+            new_fields: Vec::new(), // No new fields tracked in fast path
+            validation_error: None,
+        }
     }
 
     /// Read-only validation for a single document (no mutations)
@@ -2161,9 +2276,12 @@ impl NodeOrchestrator {
             return Ok((0, Vec::new()));
         }
 
+        let total_docs: usize = local_batches.values().map(|v| v.len()).sum();
+        let shard_count = local_batches.len();
+
         tracing::debug!(
-            local_shard_count = local_batches.len(),
-            total_docs = local_batches.values().map(|v| v.len()).sum::<usize>(),
+            local_shard_count = shard_count,
+            total_docs = total_docs,
             "Starting parallel local shard processing"
         );
 
@@ -2787,8 +2905,8 @@ impl NodeOrchestrator {
             .staged_schema_validation(index, &docs, &mut schema_cache)
             .await?;
 
-        // Update cache once after processing all docs if schema evolved
-        if validation_summary.evolution_needed {
+        // Update cache only if schema evolved AND wasn't already cached during load
+        if validation_summary.evolution_needed && self.get_cached_schema(index).await.is_none() {
             self.put_cached_schema(index, &schema_cache).await;
         }
 
