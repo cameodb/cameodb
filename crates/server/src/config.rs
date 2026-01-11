@@ -255,6 +255,10 @@ pub struct SearchConfig {
     /// Default search result limit when not specified in request (default: 10)
     #[serde(default = "default_search_limit")]
     pub default_search_limit: usize,
+
+    /// Supervisor idle timeout in seconds before auto-commit (default: 10)
+    #[serde(default = "default_supervisor_timeout_secs")]
+    pub supervisor_timeout_secs: u64,
 }
 
 impl CameoDbConfig {

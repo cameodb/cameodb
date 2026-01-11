@@ -123,8 +123,9 @@ pub fn create_router(state: AppState, max_body_size_mb: usize) -> Router {
     Router::new()
         // API routes
         .route("/api/{index}/search", post(search_handler))
-        .route("/api/{index}/stream", post(stream_handler))
+        .route("/api/{index}/search/stream", post(search_stream_handler))
         .route("/api/{index}/document", put(write_handler))
+        .route("/api/{index}/document/stream", post(write_stream_handler))
         .route("/api/{index}/_bulk", post(bulk_write_handler))
         .route("/api/{index}/_config", put(create_config_handler))
         .route("/api/{index}/_config", get(get_config_handler))
@@ -187,7 +188,7 @@ async fn list_cluster_indexes_handler(
 }
 
 /// Handler for streaming search operations
-async fn stream_handler(
+async fn search_stream_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
     Json(payload): Json<SearchPayload>,
@@ -325,6 +326,83 @@ async fn bulk_write_handler(
     }
 
     Ok(Json(result))
+}
+
+/// Handler for streaming document write operations (NDJSON input)
+async fn write_stream_handler(
+    Path(index): Path<String>,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    info!("Write stream request - index: {}", index);
+
+    // Parse NDJSON body into individual documents
+    let mut docs = Vec::new();
+    let mut line_count = 0;
+
+    for line in body.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+
+        line_count += 1;
+        let doc_payload: DocPayload = serde_json::from_slice(line).map_err(|e| {
+            AppError(anyhow::anyhow!(
+                "Failed to parse document on line {}: {}",
+                line_count,
+                e
+            ))
+        })?;
+        docs.push(doc_payload);
+    }
+
+    if docs.is_empty() {
+        return Err(AppError(anyhow::anyhow!(
+            "No documents found in request body"
+        )));
+    }
+
+    info!(
+        "Write stream processing - index: {}, docs: {}",
+        index,
+        docs.len()
+    );
+
+    // Derive a routing hint from the first document to avoid cluster-wide broadcast
+    let routing_hint = docs.first().and_then(|doc| {
+        doc.routing_key.clone().or_else(|| {
+            if !doc.id.is_empty() {
+                Some(doc.id.clone())
+            } else {
+                // Fallback: hash the document bytes to keep routing stable
+                serde_json::to_vec(&doc.doc)
+                    .ok()
+                    .map(|bytes| format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes)))
+            }
+        })
+    });
+
+    let client_op = ClientOp::BulkWrite { index, docs };
+
+    let result = state
+        .router
+        .route_and_handle(client_op, routing_hint, OperationType::Write)
+        .await?;
+
+    // Return result as JSON
+    let bytes = serde_json::to_vec(&result).map_err(|e| {
+        AppError(anyhow::anyhow!(
+            "Failed to serialize write stream result: {}",
+            e
+        ))
+    })?;
+
+    let mut resp = Response::new(Body::from(bytes));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(resp)
 }
 
 /// Handler for creating/updating index configuration/schema
