@@ -390,6 +390,12 @@ impl CameoDbConfig {
                 .with_context(|| "Invalid CAMEODB_DEFAULT_SEARCH_LIMIT")?;
         }
 
+        if let Ok(timeout) = std::env::var("CAMEODB_SUPERVISOR_TIMEOUT_SECS") {
+            config.search.supervisor_timeout_secs = timeout
+                .parse()
+                .with_context(|| "Invalid CAMEODB_SUPERVISOR_TIMEOUT_SECS")?;
+        }
+
         // Node configuration
         if let Ok(label) = std::env::var("CAMEODB_NODE_LABEL") {
             config.node.label = Some(label);
@@ -595,6 +601,7 @@ impl Default for SearchConfig {
             max_concurrent_remote_searches: default_max_concurrent_remote_searches(),
             enable_early_termination: default_enable_early_termination(),
             default_search_limit: default_search_limit(),
+            supervisor_timeout_secs: default_supervisor_timeout_secs(),
         }
     }
 }
@@ -694,6 +701,10 @@ fn default_search_threads() -> usize {
 }
 fn default_search_limit() -> usize {
     10
+}
+
+fn default_supervisor_timeout_secs() -> u64 {
+    5
 }
 
 fn default_cluster_enabled() -> bool {

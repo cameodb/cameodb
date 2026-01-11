@@ -35,7 +35,7 @@ echo -e "\n4. Stream Test (first 200 chars):"
 timeout 2s curl -s -X POST \
   -H "Content-Type: application/json" \
   -d '{"query": "test"}' \
-  http://localhost:9480/api/testindex/stream | head -c 200
+  http://localhost:9480/api/testindex/search/stream | head -c 200
 
 echo -e "\n\nAPI tests completed!"
 

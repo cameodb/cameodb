@@ -107,7 +107,7 @@ print_status "INFO" "Testing streaming endpoint..."
 STREAM_TEST=$(timeout 3s curl -s -X POST \
     -H "Content-Type: application/json" \
     -d '{"query": "health"}' \
-    "http://localhost:$PORT/api/healthcheck/stream" | head -c 100)
+    "http://localhost:$PORT/api/healthcheck/search/stream" | head -c 100)
 
 if [ -n "$STREAM_TEST" ]; then
     print_status "OK" "Streaming endpoint responding"

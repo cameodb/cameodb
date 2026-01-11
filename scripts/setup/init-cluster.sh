@@ -107,7 +107,7 @@ echo "🌊 Testing streaming search..."
 STREAM_RESPONSE=$(timeout 3s curl -s -X POST \
     -H "Content-Type: application/json" \
     -d '{"query": "database"}' \
-    "http://localhost:$PORT/api/development/stream" | head -c 200)
+    "http://localhost:$PORT/api/development/search/stream" | head -c 200)
 
 if [ -n "$STREAM_RESPONSE" ]; then
     echo "✅ Streaming search is working"

@@ -476,7 +476,12 @@ impl MicroshardActor {
             // Larger buffer to avoid dropping reset signals during bursts
             let (tx, mut rx) = mpsc::channel(64);
             let index_clone = index.clone();
-            let timeout_dur = Duration::from_secs(10); // 10s timeout to allow batch processing to complete
+            // Read supervisor timeout from environment variable or use default
+            let supervisor_timeout_secs = std::env::var("CAMEODB_SUPERVISOR_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5); // Default to 5 seconds
+            let timeout_dur = Duration::from_secs(supervisor_timeout_secs); // Configurable timeout to allow batch processing to complete
             let supervisors_arc = self.supervisors.clone();
 
             tokio::spawn(async move {

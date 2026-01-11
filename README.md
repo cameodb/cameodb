@@ -88,12 +88,12 @@ curl -s -X POST http://localhost:9480/api/books/search \
 Get search results as a real-time stream for large result sets.
 
 ```bash
-POST /api/{index}/stream
+POST /api/{index}/search/stream
 ```
 
 **Example:**
 ```bash
-curl -s -X POST http://localhost:9480/api/books/stream \
+curl -s -X POST http://localhost:9480/api/books/search/stream \
   -H "Content-Type: application/json" \
   -d '{"query": "fantasy adventure"}' \
   --no-buffer
@@ -101,11 +101,7 @@ curl -s -X POST http://localhost:9480/api/books/stream \
 
 **Response:** NDJSON stream (one hit per line). If no `hits` array is present, falls back to a single JSON body.
 
-> **Note:** Currently, the streaming backend returns a confirmation message as the distributed streaming logic is being finalized.
-
-```json
-{"message": "Stream initiated", "index": "books", "query": "fantasy adventure"}
-```
+> **Note:** Streaming search returns results as NDJSON for improved performance with large result sets.
 
 ### 📝 Document Operations
 
@@ -183,6 +179,35 @@ curl -s -X POST http://localhost:9480/api/books/_bulk \
   "took_ms": 45
 }
 ```
+
+#### Streaming Write Documents
+Insert or update multiple documents using NDJSON streaming for large datasets.
+
+```bash
+POST /api/{index}/document/stream
+```
+
+**Example:**
+```bash
+cat << 'EOF' | curl -s -X POST http://localhost:9480/api/books/document/stream \
+  -H "Content-Type: application/json" \
+  --data-binary @-
+{"id": "book_002", "doc": {"title": "Clean Code", "author": "Robert C. Martin", "genres": ["Programming"]}}
+{"id": "book_003", "doc": {"title": "Design Patterns", "author": "Gang of Four", "genres": ["Programming", "Software Engineering"]}}
+EOF
+```
+
+**Response:**
+```json
+{
+  "took_ms": 42,
+  "items_received": 2,
+  "items_written": 2,
+  "errors": []
+}
+```
+
+> **Note:** Streaming write accepts NDJSON (one JSON document per line) for memory-efficient processing of large datasets.
 
 ### ⚙️ Index Management
 
@@ -463,7 +488,7 @@ data_paths = ["./data/cameodb"]
 disk_usage_threshold_percent = 90
 wal_sync = true
 wal_segment_size_mb = 64
-default_batch_size = 200
+default_batch_size = 1000
 num_shards_init = 4
 max_shards_per_node = 8
 
@@ -473,13 +498,18 @@ indexer_memory_max_mb = 512
 total_memory_limit_mb = 4096
 memory_pressure_threshold_percent = 80
 search_threads = 8
+enable_streaming_search = true
+max_concurrent_shard_searches = 32
+max_concurrent_remote_searches = 8
+enable_early_termination = true
+supervisor_timeout_secs = 5
 default_search_limit = 10
 ```
 
 - `node` provides human-friendly identity fields (`label`, `zone`).
 - `network` separates HTTP and cluster transport while clarifying `bind_address`.
 - `storage` centralizes shard configuration plus disk thresholds.
-- `search` exposes indexer memory budgets **and** the new `default_search_limit`, which also drives response pagination whenever a request omits `limit`.
+- `search` exposes indexer memory budgets, streaming search settings, supervisor timeout for auto-commits, and `default_search_limit` for response pagination.
 
 ## � System Requirements
 
