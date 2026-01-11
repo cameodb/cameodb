@@ -152,6 +152,9 @@ pub struct FieldDef {
     pub indexed: bool,
     pub stored: bool,
     pub fast: bool,
+    // Additional options for Text fields
+    pub tokenizer: Option<String>,
+    pub index_record_option: Option<String>, // "Basic", "WithFreqs", "WithFreqsAndPositions"
 }
 
 impl FieldDef {
@@ -174,6 +177,8 @@ impl FieldDef {
             indexed: true,
             stored,
             fast,
+            tokenizer: None, // Will be set when creating from actual Tantivy schema
+            index_record_option: None, // Will be set when creating from actual Tantivy schema
         }
     }
 
@@ -205,6 +210,8 @@ impl FieldDef {
             indexed: false, // Non-indexed by default for background evolution
             stored,
             fast,
+            tokenizer: None,
+            index_record_option: None,
         }
     }
 
@@ -637,11 +644,18 @@ impl HybridStore {
 
             let field = match field_def.field_type {
                 TantivyFieldType::Text => {
-                    let options = TextOptions::default().set_indexing_options(
+                    let mut options = TextOptions::default().set_indexing_options(
                         TextFieldIndexing::default()
-                            .set_tokenizer("default")
-                            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                            .set_tokenizer(field_def.tokenizer.as_deref().unwrap_or("default"))
+                            .set_index_option(match field_def.index_record_option.as_deref() {
+                                Some("Basic") => IndexRecordOption::Basic,
+                                Some("WithFreqs") => IndexRecordOption::WithFreqs,
+                                _ => IndexRecordOption::WithFreqsAndPositions,
+                            }),
                     );
+                    if field_def.stored {
+                        options = options.set_stored();
+                    }
                     schema_builder.add_text_field(name, options)
                 }
                 TantivyFieldType::String => schema_builder.add_text_field(name, STRING),
@@ -673,7 +687,7 @@ impl HybridStore {
                         schema_builder.add_date_field(name, INDEXED)
                     }
                 }
-                TantivyFieldType::Boolean => schema_builder.add_text_field(name, STRING),
+                TantivyFieldType::Boolean => schema_builder.add_bool_field(name, INDEXED),
                 TantivyFieldType::Bytes => schema_builder.add_bytes_field(name, INDEXED),
                 TantivyFieldType::Ip => schema_builder.add_ip_addr_field(name, INDEXED),
                 TantivyFieldType::Json => schema_builder.add_json_field(name, TEXT),
@@ -755,6 +769,19 @@ impl HybridStore {
             let stored = field_entry.is_stored();
             let fast = field_entry.is_fast();
 
+            // Capture additional options for Text fields
+            let (tokenizer, index_record_option) =
+                if let FieldType::Str(_) = field_entry.field_type() {
+                    // For now, we'll use defaults - the exact options can be enhanced later
+                    // The key issue is ensuring field types match, not the exact indexing options
+                    (
+                        Some("default".to_string()),
+                        Some("WithFreqsAndPositions".to_string()),
+                    )
+                } else {
+                    (None, None)
+                };
+
             fields.insert(
                 name.to_string(),
                 FieldDef {
@@ -763,6 +790,8 @@ impl HybridStore {
                     indexed,
                     stored,
                     fast,
+                    tokenizer,
+                    index_record_option,
                 },
             );
         }
@@ -815,6 +844,20 @@ impl HybridStore {
             (new_index, fields, true)
         };
 
+        // IMPORTANT: Only sync schema when we actually created a new index
+        // This ensures we don't overwrite persisted schema when index was deleted
+        if sync_schema {
+            let synced_schema =
+                Self::derive_index_schema_from_tantivy(&tantivy_index, index_schema.shard_count);
+            // Update the in-memory schema cache
+            {
+                let mut schema_cache = self.schema_cache.write().unwrap();
+                schema_cache.insert(index.to_string(), Arc::new(synced_schema.clone()));
+            }
+            // Persist the synced schema to redb
+            self.store_schema(index, &synced_schema)?;
+        }
+
         // Create writer with dynamic memory budget based on index size
         let optimal_budget = self.config.get_optimal_memory_budget(&index_path);
 
@@ -834,20 +877,6 @@ impl HybridStore {
         {
             let mut fields_cache = self.fields_cache.write().unwrap();
             fields_cache.insert(index.to_string(), fields.clone());
-        }
-
-        // If we just created a new index, sync our cached schema with what Tantivy persisted.
-        // This ensures our IndexSchema exactly matches the Tantivy schema (which is immutable).
-        if sync_schema {
-            let synced_schema =
-                Self::derive_index_schema_from_tantivy(&tantivy_index, index_schema.shard_count);
-            // Update the in-memory schema cache
-            {
-                let mut schema_cache = self.schema_cache.write().unwrap();
-                schema_cache.insert(index.to_string(), Arc::new(synced_schema.clone()));
-            }
-            // Persist the synced schema to redb
-            self.store_schema(index, &synced_schema)?;
         }
 
         // Initialize sequence counter for this index if needed
@@ -929,10 +958,19 @@ impl HybridStore {
     }
 
     /// Reset operation counter after commit
-    fn reset_operations_counter(&self, index: &str) {
+    pub fn reset_operations_counter(&self, index: &str) {
         let counter_map = self.operations_counter.read().unwrap();
         if let Some(counter) = counter_map.get(index) {
             counter.store(0, Ordering::SeqCst);
+        }
+    }
+
+    /// Reset operation counter to a specific value (for intermediate commits)
+    /// This allows the supervisor to continue working while resetting the counter
+    pub fn reset_operations_counter_to(&self, index: &str, value: u64) {
+        let counter_map = self.operations_counter.read().unwrap();
+        if let Some(counter) = counter_map.get(index) {
+            counter.store(value, Ordering::SeqCst);
         }
     }
 
@@ -951,6 +989,33 @@ impl HybridStore {
             cache.insert(index.to_string(), new_budget);
         }
 
+        Ok(())
+    }
+
+    /// Refresh writer cache for an index to handle lock contention
+    /// This removes and recreates the writer to ensure clean state
+    pub fn refresh_writer(&self, index: &str) -> Result<(), StoreError> {
+        tracing::debug!(index = %index, "Refreshing writer cache to resolve lock contention");
+
+        // Remove existing writer from cache
+        {
+            let mut writers = self.writers.write().unwrap();
+            writers.remove(index);
+        }
+
+        // Force garbage collection to ensure locks are released
+        {
+            let index_path = self.config.shard_path.join("indices").join(index);
+            if let Ok(tantivy_index) = tantivy::Index::open_in_dir(&index_path) {
+                // This will help ensure any lingering locks are released
+                drop(tantivy_index);
+            }
+        }
+
+        // Minimal delay to ensure writer cache cleanup completes
+        std::thread::sleep(std::time::Duration::from_micros(100));
+
+        // Recreate the writer (will be done lazily on next access)
         Ok(())
     }
 
@@ -1018,9 +1083,16 @@ impl HybridStore {
             match op {
                 WalOp::Put { id, json_blob } => {
                     // Step 1: Get cached schema for field filtering and evolution
-                    let schema = self
-                        .get_schema_cached(index)?
-                        .unwrap_or_else(|| Arc::new(IndexSchema::default()));
+                    // If not in cache, load from persisted metadata
+                    let schema = if let Some(schema) = self.get_schema_cached(index)? {
+                        schema
+                    } else {
+                        // Load from metadata if not in cache
+                        tracing::debug!(index = %index, "Loading schema from metadata store");
+                        self.get_schema(index)?
+                            .map(Arc::new)
+                            .unwrap_or_else(|| Arc::new(IndexSchema::default()))
+                    };
 
                     if let Some(json_blob) = &json_blob {
                         let mut schema_mut = (*schema).clone();
@@ -1840,9 +1912,16 @@ impl HybridStore {
                 match op {
                     WalOp::Put { id, json_blob } => {
                         // Step 1: Get cached schema for field filtering
-                        let schema = self
-                            .get_schema_cached(index)?
-                            .unwrap_or_else(|| Arc::new(IndexSchema::default()));
+                        // If not in cache, load from persisted metadata
+                        let schema = if let Some(schema) = self.get_schema_cached(index)? {
+                            schema
+                        } else {
+                            // Load from metadata if not in cache
+                            tracing::debug!(index = %index, "Loading schema from metadata store for batch");
+                            self.get_schema(index)?
+                                .map(Arc::new)
+                                .unwrap_or_else(|| Arc::new(IndexSchema::default()))
+                        };
 
                         // Step 2: Serialize complete document for redb (all fields)
                         let doc_data = StoredDoc {
@@ -1987,7 +2066,39 @@ impl HybridStore {
 
         // Apply all tantivy operations with optimized selective deletes
         {
-            let writer = writer_arc.lock().unwrap();
+            // Try to acquire writer lock, with retry logic for lock contention
+            let mut writer = {
+                let mut attempts = 0;
+                let max_attempts = 3;
+                loop {
+                    match writer_arc.try_lock() {
+                        Ok(w) => break w,
+                        Err(_) if attempts < max_attempts => {
+                            // Attempt to refresh writer cache and retry
+                            if attempts == 0 {
+                                tracing::warn!(index = %index, "Writer lock contention detected, refreshing writer cache");
+                            } else {
+                                tracing::debug!(index = %index, attempt = attempts + 1, "Retrying writer lock acquisition");
+                            }
+
+                            self.refresh_writer(index)?;
+                            attempts += 1;
+
+                            // Small delay to allow other threads to release locks
+                            std::thread::sleep(std::time::Duration::from_millis(1 << attempts));
+                            continue;
+                        }
+                        Err(_) => {
+                            // Still failed after all retries
+                            return Err(StoreError::Serialization(format!(
+                                "Failed to acquire writer lock after {} attempts",
+                                max_attempts + 1
+                            )));
+                        }
+                    }
+                }
+            };
+
             // Step 1: Delete only updated documents (selective optimization)
             if !updated_document_ids.is_empty() {
                 tracing::debug!(
@@ -2027,9 +2138,81 @@ impl HybridStore {
                 }
             }
 
-            // Skip commits during batch processing to prevent Tantivy contention
-            // Commits will be handled by supervisor after all shards are processed
-            let committed = false;
+            // Adaptive commit strategy: use configuration-based thresholds for intermediate commits
+            // Calculate the current commit threshold for this index based on memory budget
+            let current_threshold = {
+                let budget = {
+                    let cache = self.budget_cache.read().unwrap();
+                    if let Some(b) = cache.get(index) {
+                        *b
+                    } else {
+                        // Fallback: calculate and cache
+                        let index_path = self.config.shard_path.join("indices").join(index);
+                        let b = self.config.get_optimal_memory_budget(&index_path);
+                        let mut cache = self.budget_cache.write().unwrap();
+                        cache.insert(index.to_string(), b);
+                        b
+                    }
+                };
+
+                let min_budget = self.config.indexer_memory_min_mb * 1024 * 1024;
+                let max_budget = self.config.indexer_memory_max_mb * 1024 * 1024;
+                let budget_ratio = (budget - min_budget) as f64 / (max_budget - min_budget) as f64;
+                let default_batch = self.config.default_batch_size as f64;
+
+                // Same calculation as should_commit_writer for consistency
+                (default_batch * (0.5 + budget_ratio * 7.5)) as u64
+            };
+
+            // Intermediate commit if batch size exceeds 3x the normal commit threshold
+            // This allows large batches to commit periodically without waiting for full threshold
+            let committed = if batch_size as u64 > current_threshold * 3 {
+                tracing::debug!(
+                    index = %index,
+                    batch_size = batch_size,
+                    threshold = current_threshold,
+                    "Large batch exceeds 3x threshold, performing intermediate commit"
+                );
+                // Commit and reset counter to threshold value to allow supervisor to continue working
+                writer.commit()?;
+                // Reset to threshold instead of 0 to keep supervisor active
+                self.reset_operations_counter_to(index, current_threshold);
+                true
+            } else {
+                // Skip commits for normal batches to prevent Tantivy contention
+                false
+            };
+
+            // Optimize memory budget for batch processing to reduce segment creation
+            // Use the same threshold calculation for consistency
+            if batch_size as u64 > current_threshold * 2 {
+                // Increase memory budget temporarily for large batches to create fewer segments
+                let current_budget = {
+                    let cache = self.budget_cache.read().unwrap();
+                    cache.get(index).copied().unwrap_or_else(|| {
+                        // Fallback if not cached
+                        let index_path = self.config.shard_path.join("indices").join(index);
+                        self.config.get_optimal_memory_budget(&index_path)
+                    })
+                };
+
+                let increased_budget = (current_budget as f64 * 1.5) as usize;
+                let max_budget = self.config.indexer_memory_max_mb * 1024 * 1024;
+
+                if increased_budget <= max_budget {
+                    tracing::debug!(
+                        index = %index,
+                        batch_size = batch_size,
+                        old_budget_mb = current_budget / 1024 / 1024,
+                        new_budget_mb = increased_budget / 1024 / 1024,
+                        "Increasing memory budget for batch processing (2x threshold exceeded)"
+                    );
+
+                    // Update cached budget for this batch
+                    let mut cache = self.budget_cache.write().unwrap();
+                    cache.insert(index.to_string(), increased_budget as usize);
+                }
+            }
 
             tracing::debug!(
                 index = %index,
@@ -2040,6 +2223,9 @@ impl HybridStore {
                 committed = committed,
                 "Bulk write completed with selective Tantivy optimization and smart commits"
             );
+
+            // Explicit drop of writer to ensure lock release before leaving scope
+            drop(writer);
         }
 
         tracing::debug!(

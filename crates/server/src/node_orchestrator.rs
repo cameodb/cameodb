@@ -15,6 +15,7 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
+use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -475,7 +476,7 @@ impl MicroshardActor {
             // Larger buffer to avoid dropping reset signals during bursts
             let (tx, mut rx) = mpsc::channel(64);
             let index_clone = index.clone();
-            let timeout_dur = Duration::from_secs(5); // Default 5s idle timeout
+            let timeout_dur = Duration::from_secs(10); // 10s timeout to allow batch processing to complete
             let supervisors_arc = self.supervisors.clone();
 
             tokio::spawn(async move {
@@ -514,6 +515,18 @@ impl MicroshardActor {
             });
 
             supervisors.insert(index, tx);
+        }
+    }
+
+    /// Reset supervisor for a specific index before final commits
+    /// This prevents race condition while keeping supervisor alive for future writes
+    async fn reset_supervisor_before_commit(&self, index: &str) {
+        let supervisors = self.supervisors.write().await;
+        if let Some(tx) = supervisors.get(index) {
+            // Send reset signal to restart the timer
+            if tx.try_send(()).is_ok() {
+                tracing::debug!(index = %index, "Reset supervisor timer before final commits");
+            }
         }
     }
 
@@ -613,6 +626,12 @@ impl MicroshardActor {
         // Collect unique indices from grouped ops
         let unique_indices: std::collections::HashSet<String> =
             ops_by_index.keys().cloned().collect();
+
+        // Signal supervisor for each index BEFORE processing batch
+        // This ensures supervisor exists for batch-only scenarios (no individual writes)
+        for index in &unique_indices {
+            self.signal_supervisor(index.clone()).await;
+        }
 
         tracing::debug!(
             shard_id = %shard_id,
@@ -2028,18 +2047,17 @@ impl NodeOrchestrator {
             return Ok(results);
         }
 
-        // Full clone only for large batches or initial schema creation
-        tracing::debug!("Using full schema clone for {} documents", docs.len());
-        let schema_cache_clone = schema_cache.clone();
+        // For initial schema creation, we'll do field discovery in the evolution step
+        // This keeps validation read-only and evolution write-only
 
-        // Parallel validation using rayon
+        // Parallel validation using rayon - schema is now pre-populated
         let results: Vec<SchemaValidationResult> = docs
             .par_iter()
             .enumerate()
             .map(|(_doc_index, doc_payload)| {
                 self.validate_single_document_readonly(
                     &doc_payload.doc,
-                    &schema_cache_clone,
+                    schema_cache, // Use reference, schema is now stable
                     is_initial_creation,
                 )
             })
@@ -2247,7 +2265,7 @@ impl NodeOrchestrator {
         }
     }
 
-    /// Sequential schema evolution (write operations, single-threaded)
+    /// Optimized schema evolution for batch processing
     async fn evolve_schema_sequential(
         &self,
         index: &str,
@@ -2256,29 +2274,65 @@ impl NodeOrchestrator {
         shards: &HashMap<Uuid, MicroshardActor>,
     ) -> Result<(), OrchestratorError> {
         let is_initial_creation = schema_cache.fields.is_empty();
-        let mut schema_updated = false;
 
-        for (field_name, field_type) in new_fields {
-            if !schema_cache.fields.contains_key(field_name) {
-                let indexed = is_initial_creation; // All fields indexed in initial creation
+        // For initial creation with many fields, do optimized batch processing
+        if is_initial_creation && new_fields.len() > 10 {
+            tracing::debug!(
+                index = %index,
+                fields_count = new_fields.len(),
+                "Optimized initial schema creation with batch field addition"
+            );
+
+            // Add all fields at once for better performance
+            let indexed = true; // All fields indexed in initial creation
+            for (field_name, field_type) in new_fields {
+                if !schema_cache.fields.contains_key(field_name) {
+                    let mut new_field = FieldDef::new(field_name.clone(), field_type.clone());
+                    new_field.indexed = indexed;
+                    schema_cache.fields.insert(field_name.clone(), new_field);
+                }
+            }
+
+            tracing::info!(
+                index = %index,
+                total_fields = schema_cache.fields.len(),
+                "Initial schema created with batch optimization"
+            );
+        } else {
+            // Filter only truly new fields to avoid redundant work
+            let fields_to_add: Vec<_> = new_fields
+                .iter()
+                .filter(|(field_name, _)| !schema_cache.fields.contains_key(field_name))
+                .collect();
+
+            if fields_to_add.is_empty() {
+                return Ok(());
+            }
+
+            tracing::debug!(
+                index = %index,
+                fields_count = fields_to_add.len(),
+                is_initial_creation = is_initial_creation,
+                "Batch adding new fields to schema"
+            );
+
+            // Batch add all fields at once for better performance
+            let indexed = is_initial_creation; // All fields indexed in initial creation
+            for (field_name, field_type) in &fields_to_add {
                 let mut new_field = FieldDef::new(field_name.clone(), field_type.clone());
                 new_field.indexed = indexed;
-
                 schema_cache.fields.insert(field_name.clone(), new_field);
-                schema_updated = true;
-
-                tracing::debug!(
-                    index = %index,
-                    field_name = %field_name,
-                    field_type = ?field_type,
-                    indexed = indexed,
-                    "Added new field to schema"
-                );
             }
+
+            tracing::info!(
+                index = %index,
+                fields_count = fields_to_add.len(),
+                "Schema evolution completed - batch added fields"
+            );
         }
 
         // Persist updated schema to storage if changed
-        if schema_updated {
+        if !new_fields.is_empty() {
             let index_name = index.to_string();
             let schema_clone = schema_cache.clone();
 
@@ -2417,30 +2471,74 @@ impl NodeOrchestrator {
             all_errors.len()
         );
 
-        // Commit all indices after batch processing to prevent Tantivy contention
+        // Optimized commit strategy: parallel commits with adaptive timing
         if !all_errors.is_empty() {
             tracing::warn!(
                 "Skipping commit due to {} errors during batch processing",
                 all_errors.len()
             );
         } else {
-            // Commit from all shards that were processed
-            for shard_id in shard_ids {
-                if let Some(shard) = self.shards.get(&shard_id) {
-                    if let Some(store) = &shard.store {
-                        // Commit the index to ensure all writes are persisted
-                        if let Err(e) = tokio::task::spawn_blocking({
+            // Reset supervisor timers to prevent race condition with final commits
+            // This keeps supervisors alive but gives them fresh timers
+            for shard_id in &shard_ids {
+                if let Some(shard) = self.shards.get(shard_id) {
+                    shard.reset_supervisor_before_commit(index).await;
+                }
+            }
+
+            // Commit from all shards that were processed in parallel for better performance
+            let commit_tasks: Vec<_> = shard_ids
+                .iter()
+                .map(|shard_id| {
+                    if let Some(shard) = self.shards.get(shard_id) {
+                        if let Some(store) = &shard.store {
                             let store = store.clone();
                             let index = index.to_string();
-                            move || store.commit_index(&index)
-                        })
-                        .await
-                        {
+                            let shard_id = *shard_id;
+                            Some(tokio::task::spawn_blocking(move || {
+                                let result = store.commit_index(&index);
+                                (shard_id, result)
+                            }))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .filter_map(|task| task)
+                .collect();
+
+            // Execute all commits in parallel and collect results
+            let commit_results = join_all(commit_tasks).await;
+
+            let mut successful_commits = 0;
+            let mut failed_commits = 0;
+
+            for result in commit_results {
+                match result {
+                    Ok((shard_id, commit_result)) => match commit_result {
+                        Ok(()) => {
+                            successful_commits += 1;
+                            tracing::debug!(shard_id = %shard_id, "Commit successful");
+                        }
+                        Err(e) => {
+                            failed_commits += 1;
                             tracing::warn!(shard_id = %shard_id, error = %e, "Failed to commit index after batch processing");
                         }
+                    },
+                    Err(e) => {
+                        failed_commits += 1;
+                        tracing::warn!(error = %e, "Commit task failed");
                     }
                 }
             }
+
+            tracing::info!(
+                successful_commits = successful_commits,
+                failed_commits = failed_commits,
+                "Parallel batch commits completed"
+            );
         }
 
         Ok((total_written, all_errors))
@@ -2995,6 +3093,7 @@ impl NodeOrchestrator {
             routing_key: effective_routing_key.clone(),
             doc,
         };
+
         match shard.handle_write(req).await {
             Ok(seq) => Ok(
                 serde_json::json!({"id": id, "result": "created", "version": seq, "shard_id": target.to_string()}),
