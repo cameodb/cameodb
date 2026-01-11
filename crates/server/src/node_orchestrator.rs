@@ -600,11 +600,13 @@ impl MicroshardActor {
         // Use spawn_blocking to execute batch write on blocking thread pool
         let all_seq_ids = tokio::task::spawn_blocking(move || {
             let mut all_results = Vec::new();
+            let mut total_new_docs = 0usize;
             for (index, wal_ops) in ops_by_index {
-                let seq_ids = store.apply_batch(&index, wal_ops)?;
+                let (seq_ids, new_docs) = store.apply_batch(&index, wal_ops)?;
                 all_results.extend(seq_ids);
+                total_new_docs += new_docs;
             }
-            Ok::<Vec<u64>, StoreError>(all_results)
+            Ok::<(Vec<u64>, usize), StoreError>((all_results, total_new_docs))
         })
         .await
         .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
@@ -618,7 +620,9 @@ impl MicroshardActor {
             self.signal_supervisor(index).await;
         }
 
-        Ok(all_seq_ids)
+        // Extract just the sequence IDs to match expected return type
+        let (seq_ids, _new_docs) = all_seq_ids;
+        Ok(seq_ids)
     }
 
     /// Deletes all data for an index from this shard's storage

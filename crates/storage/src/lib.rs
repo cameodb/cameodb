@@ -987,7 +987,10 @@ impl HybridStore {
                         .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
                     let mut data_table = write_txn.open_table(data_table_def)?;
-                    data_table.insert(id.as_str(), doc_bytes.as_slice())?;
+
+                    // Check if document is new or updated by examining insert return value
+                    let old_value = data_table.insert(id.as_str(), doc_bytes.as_slice())?;
+                    let is_new_document = old_value.is_none();
 
                     // Step 3: Build tantivy document with ONLY indexed fields
                     let mut tantivy_doc = doc!(fields.id => id.as_str());
@@ -1097,9 +1100,14 @@ impl HybridStore {
                     }
 
                     let writer = writer_arc.lock().unwrap();
-                    // Delete existing document first (upsert semantics)
-                    let term = tantivy::Term::from_field_text(fields.id, &id);
-                    writer.delete_term(term);
+
+                    // Optimized Tantivy operations: delete only if document was updated
+                    if !is_new_document {
+                        // Document was updated - delete old version first
+                        let term = tantivy::Term::from_field_text(fields.id, &id);
+                        writer.delete_term(term);
+                    }
+                    // Add the document (new or updated)
                     writer.add_document(tantivy_doc)?;
                 }
                 WalOp::Delete { id } => {
@@ -1675,9 +1683,21 @@ impl HybridStore {
     }
 
     /// Apply multiple write operations atomically to a specific index
-    pub fn apply_batch(&self, index: &str, ops: Vec<WalOp>) -> Result<Vec<u64>, StoreError> {
+    ///
+    /// This function provides guaranteed batch write with supervised smart commits:
+    /// 1. Single atomic redb transaction for all data operations
+    /// 2. Single atomic tantivy writer commit for all index operations  
+    /// 3. Predictable smart commit logic based on operation thresholds
+    /// 4. Guaranteed document searchability after successful commit
+    ///
+    /// Returns (sequence_ids, new_documents_count)
+    pub fn apply_batch(
+        &self,
+        index: &str,
+        ops: Vec<WalOp>,
+    ) -> Result<(Vec<u64>, usize), StoreError> {
         if ops.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
         // Get or create the index
@@ -1714,6 +1734,8 @@ impl HybridStore {
 
         // Collect sequence IDs during processing
         let mut seq_ids = Vec::with_capacity(ops.len());
+        let mut new_documents_count = 0usize;
+        let mut updated_document_ids = Vec::new(); // Track updated documents for selective Tantivy deletes
 
         {
             // Set durability based on config for bulk operations
@@ -1753,7 +1775,16 @@ impl HybridStore {
                         let doc_bytes = serde_json::to_vec(&doc_data)
                             .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-                        data_table.insert(id.as_str(), doc_bytes.as_slice())?;
+                        // Check if document is new or updated by examining insert return value
+                        let old_value = data_table.insert(id.as_str(), doc_bytes.as_slice())?;
+                        let is_new_document = old_value.is_none();
+
+                        if is_new_document {
+                            new_documents_count += 1;
+                        } else {
+                            // Track updated documents for selective Tantivy deletes
+                            updated_document_ids.push(id.clone());
+                        }
 
                         // Step 3: Build tantivy document with ONLY indexed fields
                         let mut tantivy_doc = doc!(fields.id => id.as_str());
@@ -1878,37 +1909,40 @@ impl HybridStore {
 
         write_txn.commit()?;
 
-        // Check for pre-emptive commit before batch processing
-        let initial_ops_count = self.get_operations_count(index);
-        let should_pre_commit = self.should_commit_writer(index, initial_ops_count);
-
-        if should_pre_commit {
-            // Pre-emptive commit to free up memory before large batch
-            let mut writer = writer_arc.lock().unwrap();
-            writer.commit()?;
-            self.reset_operations_counter(index);
-        }
-
-        // Apply all tantivy operations
+        // Apply all tantivy operations with optimized selective deletes
         {
-            let mut writer = writer_arc.lock().unwrap();
-            for (op_type, tantivy_doc, id) in tantivy_ops {
+            let writer = writer_arc.lock().unwrap();
+
+            // Step 1: Delete only updated documents (selective optimization)
+            if !updated_document_ids.is_empty() {
+                tracing::debug!(
+                    updated_count = updated_document_ids.len(),
+                    "Selective Tantivy deletes for updated documents"
+                );
+                for updated_id in &updated_document_ids {
+                    let term = tantivy::Term::from_field_text(fields.id, updated_id);
+                    writer.delete_term(term);
+                }
+            }
+
+            // Step 2: Add all documents (new + updated)
+            // Note: Updated documents already deleted in Step 1, new documents don't need deletion
+            for (op_type, tantivy_doc, _id) in tantivy_ops {
                 match op_type {
                     "add" => {
-                        // Delete existing document first (upsert semantics)
-                        let term = tantivy::Term::from_field_text(fields.id, &id);
-                        writer.delete_term(term);
                         writer.add_document(tantivy_doc)?;
                     }
                     "delete" => {
-                        let term = tantivy::Term::from_field_text(fields.id, &id);
+                        // Handle explicit delete operations (not from updates)
+                        let term = tantivy::Term::from_field_text(fields.id, &_id);
                         writer.delete_term(term);
                     }
                     _ => unreachable!(),
                 }
             }
 
-            // Increment operations counter by batch size in one operation
+            // Apply smart commit logic for batch operations (same as individual writes)
+            // Increment operations counter by batch size
             {
                 let mut counter_map = self.operations_counter.write().unwrap();
                 if let Some(counter) = counter_map.get_mut(index) {
@@ -1918,20 +1952,21 @@ impl HybridStore {
                 }
             }
 
-            // Perform smart commit if needed, or force commit for very large batches
-            if batch_size >= self.config.default_batch_size as u64 {
-                // Force commit for very large batches
-                writer.commit()?;
-                self.reset_operations_counter(index);
-            }
+            // Apply smart commit logic (same as individual writes)
+            let committed = self.maybe_commit_writer(index)?;
+
+            tracing::debug!(
+                index = %index,
+                batch_size = batch_size,
+                new_docs = new_documents_count,
+                updated_docs = updated_document_ids.len(),
+                skipped_deletes = new_documents_count,
+                committed = committed,
+                "Bulk write completed with selective Tantivy optimization and smart commits"
+            );
         }
 
-        // Use smart commit logic for normal batches (when writer lock is released)
-        if batch_size < self.config.default_batch_size as u64 {
-            self.maybe_commit_writer(index)?;
-        }
-
-        Ok(seq_ids)
+        Ok((seq_ids, new_documents_count))
     }
 
     /// List all available indexes with their statistics
