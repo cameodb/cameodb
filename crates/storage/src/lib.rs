@@ -259,6 +259,11 @@ impl IndexSchema {
     pub fn evolve_field(&mut self, name: String, value: &JsonValue) -> bool {
         use std::collections::hash_map::Entry;
 
+        // CRITICAL: Never evolve the mandatory 'id' field
+        if name == "id" {
+            return false; // id field is mandatory and should never evolve
+        }
+
         let inferred_type = FieldDef::infer_type_from_value(value);
 
         match self.fields.entry(name.clone()) {
@@ -729,6 +734,7 @@ impl HybridStore {
     /// Derive IndexSchema from a Tantivy index's schema.
     /// This reads back the actual persisted schema from Tantivy and converts it
     /// to our IndexSchema format, ensuring we're in sync with what Tantivy has.
+    /// NOTE: Excludes the mandatory 'id' field since it's implicit in Tantivy
     fn derive_index_schema_from_tantivy(tantivy_index: &Index, shard_count: u32) -> IndexSchema {
         use tantivy::schema::FieldType;
 
@@ -738,7 +744,7 @@ impl HybridStore {
         for (_field, field_entry) in schema.fields() {
             let name = field_entry.name();
             if name == "id" {
-                continue; // Skip the id field, it's implicit
+                continue; // Skip the mandatory id field - it's implicit in Tantivy
             }
 
             let field_type = match field_entry.field_type() {
@@ -770,17 +776,46 @@ impl HybridStore {
             let fast = field_entry.is_fast();
 
             // Capture additional options for Text fields
-            let (tokenizer, index_record_option) =
-                if let FieldType::Str(_) = field_entry.field_type() {
-                    // For now, we'll use defaults - the exact options can be enhanced later
-                    // The key issue is ensuring field types match, not the exact indexing options
-                    (
-                        Some("default".to_string()),
-                        Some("WithFreqsAndPositions".to_string()),
-                    )
-                } else {
-                    (None, None)
+            let (tokenizer, index_record_option) = if let FieldType::Str(text_options) =
+                field_entry.field_type()
+            {
+                // Extract the actual tokenizer and index options from Tantivy
+                let tokenizer_name = match text_options.get_indexing_options() {
+                    Some(opts) => {
+                        let token_name = opts.tokenizer().to_string();
+                        tracing::debug!(field_name = %name, tokenizer = %token_name, "Extracted tokenizer from Tantivy");
+                        Some(token_name)
+                    }
+                    None => {
+                        tracing::debug!(field_name = %name, "No indexing options found, using default tokenizer");
+                        Some("default".to_string())
+                    }
                 };
+
+                let index_option = match text_options.get_indexing_options() {
+                    Some(opts) => {
+                        let opt_str = match opts.index_option() {
+                            tantivy::schema::IndexRecordOption::Basic => "Basic".to_string(),
+                            tantivy::schema::IndexRecordOption::WithFreqs => {
+                                "WithFreqs".to_string()
+                            }
+                            tantivy::schema::IndexRecordOption::WithFreqsAndPositions => {
+                                "WithFreqsAndPositions".to_string()
+                            }
+                        };
+                        tracing::debug!(field_name = %name, index_option = %opt_str, "Extracted index option from Tantivy");
+                        Some(opt_str)
+                    }
+                    None => {
+                        tracing::debug!(field_name = %name, "No indexing options found, using default index option");
+                        Some("WithFreqsAndPositions".to_string())
+                    }
+                };
+                (tokenizer_name, index_option)
+            } else {
+                tracing::debug!(field_name = %name, field_type = ?field_entry.field_type(), "Non-text field, no tokenizer options");
+                (None, None)
+            };
 
             fields.insert(
                 name.to_string(),
@@ -847,15 +882,44 @@ impl HybridStore {
         // IMPORTANT: Only sync schema when we actually created a new index
         // This ensures we don't overwrite persisted schema when index was deleted
         if sync_schema {
-            let synced_schema =
+            // Derive schema from Tantivy (this is the source of truth)
+            let mut tantivy_schema =
                 Self::derive_index_schema_from_tantivy(&tantivy_index, index_schema.shard_count);
-            // Update the in-memory schema cache
+
+            // CRITICAL: Always add the mandatory 'id' field to our schema cache
+            // The 'id' field is implicit in Tantivy but required for our validation
+            tantivy_schema.fields.insert(
+                "id".to_string(),
+                FieldDef {
+                    name: "id".to_string(),
+                    field_type: TantivyFieldType::Text,
+                    indexed: true,
+                    stored: true,
+                    fast: false,
+                    tokenizer: Some("raw".to_string()),
+                    index_record_option: Some("Basic".to_string()),
+                },
+            );
+
+            // IMPORTANT: Cache should ALWAYS reflect Tantivy schema + mandatory id field
+            // Our stored schema is just metadata for evolution tracking
             {
                 let mut schema_cache = self.schema_cache.write().unwrap();
-                schema_cache.insert(index.to_string(), Arc::new(synced_schema.clone()));
+                schema_cache.insert(index.to_string(), Arc::new(tantivy_schema.clone()));
             }
-            // Persist the synced schema to redb
-            self.store_schema(index, &synced_schema)?;
+
+            // Persist our stored schema (metadata) to redb for evolution tracking
+            // This is NOT used for cache - only for reference and evolution
+            self.store_schema(index, &index_schema)?;
+
+            // CRITICAL: Clear reader cache to ensure search sees latest commits
+            // This prevents searches from using stale readers that don't see newly written documents
+            {
+                let mut readers = self.readers.write().unwrap();
+                readers.remove(index);
+            }
+
+            tracing::debug!(index = %index, "Schema synced: Tantivy schema + id field cached, reader cache cleared");
         }
 
         // Create writer with dynamic memory budget based on index size
@@ -1191,10 +1255,7 @@ impl HybridStore {
                                 }
                                 TantivyFieldType::Boolean => {
                                     if let Some(b) = field_value.as_bool() {
-                                        tantivy_doc.add_text(
-                                            *tantivy_field,
-                                            if b { "true" } else { "false" },
-                                        );
+                                        tantivy_doc.add_bool(*tantivy_field, b);
                                     }
                                 }
                                 TantivyFieldType::Bytes => {
@@ -1491,9 +1552,10 @@ impl HybridStore {
         }
     }
 
-    /// Get schema from cache, or load from redb and cache it
+    /// Get schema from cache, or load from Tantivy and cache it
+    /// IMPORTANT: Always prefers Tantivy schema (source of truth) over stored schema
     pub fn get_schema_cached(&self, index: &str) -> Result<Option<Arc<IndexSchema>>, StoreError> {
-        // Fast path: check cache
+        // Fast path: check cache first
         {
             let cache = self.schema_cache.read().unwrap();
             if let Some(schema) = cache.get(index) {
@@ -1501,18 +1563,31 @@ impl HybridStore {
             }
         }
 
-        // Slow path: load from redb
-        if let Some(schema) = self.get_schema(index)? {
-            let schema_arc = Arc::new(schema);
+        // Slow path: load from Tantivy (source of truth), not from stored schema
+        // Get the index path and open the Tantivy index directly
+        let index_path = self.config.shard_path.join("indices").join(index);
+        if index_path.exists() {
+            let tantivy_index = Index::open_in_dir(&index_path)?;
 
-            // Update cache
-            if let Ok(mut cache) = self.schema_cache.write() {
-                cache.insert(index.to_string(), Arc::clone(&schema_arc));
+            // Derive schema from Tantivy (this is the source of truth)
+            let tantivy_schema = Self::derive_index_schema_from_tantivy(&tantivy_index, 4);
+
+            // Cache the Tantivy schema
+            {
+                let mut cache = self.schema_cache.write().unwrap();
+                cache.insert(index.to_string(), Arc::new(tantivy_schema.clone()));
             }
 
-            Ok(Some(schema_arc))
+            tracing::debug!(index = %index, "Loaded and cached schema from Tantivy (source of truth)");
+            Ok(Some(Arc::new(tantivy_schema)))
         } else {
-            Ok(None)
+            // Fallback: try to load from stored schema (metadata only)
+            if let Some(stored_schema) = self.get_schema(index)? {
+                tracing::debug!(index = %index, "Using stored schema as fallback (Tantivy not available)");
+                Ok(Some(Arc::new(stored_schema)))
+            } else {
+                Ok(None)
+            }
         }
     }
 
@@ -2004,10 +2079,7 @@ impl HybridStore {
                                     }
                                     TantivyFieldType::Boolean => {
                                         if let Some(b) = field_value.as_bool() {
-                                            tantivy_doc.add_text(
-                                                *tantivy_field,
-                                                if b { "true" } else { "false" },
-                                            );
+                                            tantivy_doc.add_bool(*tantivy_field, b);
                                         }
                                     }
                                     TantivyFieldType::Bytes => {

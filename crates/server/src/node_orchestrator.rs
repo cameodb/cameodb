@@ -3381,27 +3381,23 @@ impl NodeOrchestrator {
     }
 
     async fn orch_get_config(&self, index: &str) -> Result<JsonValue, OrchestratorError> {
-        if let Some(cached) = self.get_cached_schema(index).await {
-            let field_names = Self::sorted_field_names(&cached);
-            let fields = Self::sorted_fields_map(&cached);
-            let shard_count = self.default_shard_count();
-            return Ok(Self::schema_response(field_names, fields, shard_count));
-        }
-
-        // Try each shard until we find a schema; this tolerates cases where the first shard
-        // might not yet have the schema materialized locally.
+        // IMPORTANT: Always get fresh schema from storage layer
+        // The storage layer maintains the authoritative schema derived from Tantivy
+        // This prevents orchestrator cache staleness issues
         for shard in self.shards.values() {
             if let Some(store) = &shard.store {
                 let sc = Arc::clone(store);
                 let idx = index.to_string();
-                let schema = tokio::task::spawn_blocking(move || sc.get_schema(&idx))
+
+                // Use spawn_blocking to safely call blocking storage function
+                let schema = tokio::task::spawn_blocking(move || sc.get_schema_cached(&idx))
                     .await
                     .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
                     .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+
                 if let Some(s) = schema {
                     let field_names = Self::sorted_field_names(&s);
                     let fields = Self::sorted_fields_map(&s);
-                    self.put_cached_schema(index, &s).await;
                     let shard_count = self.default_shard_count();
                     return Ok(Self::schema_response(field_names, fields, shard_count));
                 }
