@@ -272,13 +272,16 @@ async fn main() -> Result<()> {
     println!("🚀 CameoDB HTTP Server starting on http://{}", bind_address);
     println!("🎯 API endpoints:");
     println!("  POST /api/{{index}}/search - Standard search");
-    println!("  POST /api/{{index}}/stream - Streaming search");
+    println!("  POST /api/{{index}}/search/stream - Streaming search");
     println!("  PUT  /api/{{index}}/document - Write document");
+    println!("  POST /api/{{index}}/document/stream - Streaming write");
     println!("  POST /api/{{index}}/_bulk - Bulk write documents");
     println!("  PUT  /api/{{index}}/_config - Create/update index schema");
     println!("  GET  /api/{{index}}/_config - Retrieve index schema");
     println!("  PATCH /api/{{index}}/_schema - Update index schema");
+    println!("  DELETE /api/{{index}} - Delete index (?delete_schema=true/false)");
     println!("  GET  /_indexes - List all indexes with statistics");
+    println!("  GET  /_cluster/_indexes - List cluster indexes");
     println!("  GET  /_cluster/health - Health check");
     println!();
     println!("⚙️  Configuration:");
