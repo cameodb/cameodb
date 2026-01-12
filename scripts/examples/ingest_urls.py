@@ -3,6 +3,8 @@
 
 import argparse
 import ast
+import csv
+import datetime
 import json
 import sys
 import time
@@ -13,7 +15,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 DEFAULT_BASE_URL = "http://localhost:9480"
-DEFAULT_INDEX = "urls"
+DEFAULT_INDEX = "dynamic_analysis"
 DEFAULT_DATA_PATH = Path("scripts/data/urls.csv")
 DEFAULT_BATCH_SIZE = 10000
 DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024  # 16MB (safe under 64MB Kameo limit)
@@ -38,6 +40,15 @@ class BatchBuffer:
         return bool(self.docs)
 
 
+def parse_datetime_to_rfc3339(datetime_str: str) -> str:
+    """Convert datetime string 'YYYY-MM-DD HH:MM:SS' to RFC3339 format."""
+    try:
+        dt = datetime.datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
+        return dt.isoformat() + "Z"  # Add Z for UTC
+    except ValueError:
+        return datetime_str  # Return original if parsing fails
+
+
 def parse_urls(urls_text: str) -> List[str]:
     try:
         parsed = ast.literal_eval(urls_text)
@@ -56,24 +67,96 @@ def parse_urls(urls_text: str) -> List[str]:
     return []
 
 
+def parse_threat_names(threat_text: str) -> List[str]:
+    """Parse threat_names array like "[('Upatre')]" into list of strings."""
+    try:
+        parsed = ast.literal_eval(threat_text)
+    except (SyntaxError, ValueError):
+        return []
+    if isinstance(parsed, list):
+        threats = []
+        for item in parsed:
+            if isinstance(item, tuple) and len(item) > 0:
+                threats.append(str(item[0]))
+            elif isinstance(item, str):
+                threats.append(item)
+        return threats
+    return []
+
+
+def parse_file_types(file_types_text: str) -> List[str]:
+    """Parse file_types array like "[('MS-DOS executable...')]" into list of strings."""
+    try:
+        parsed = ast.literal_eval(file_types_text)
+    except (SyntaxError, ValueError):
+        return []
+    if isinstance(parsed, list):
+        file_types = []
+        for item in parsed:
+            if isinstance(item, tuple) and len(item) > 0:
+                file_types.append(str(item[0]))
+            elif isinstance(item, str):
+                file_types.append(item)
+        return file_types
+    return []
+
+
 def build_document(line: str) -> Optional[Dict[str, Any]]:
-    # Expecting: "sha1","['url1','url2']"
-    parts = [p.strip().strip('"') for p in line.split(",", maxsplit=1)]
-    if len(parts) != 2:
+    """Parse a CSV line with proper CSV parsing to handle commas within quoted fields."""
+    try:
+        # Use csv.reader to properly parse the line
+        reader = csv.reader([line])
+        parts = next(reader)
+    except (csv.Error, StopIteration):
         return None
-    sha1, urls_raw = parts
+    
+    if len(parts) != 9:
+        return None
+    
+    sha1, first_analysis, last_analysis, platform, classification, risk_score_str, threat_names_raw, file_types_raw, urls_raw = parts
+    
     if not sha1:
         return None
+    
+    # Parse URLs
     urls = parse_urls(urls_raw)
     if not urls:
         return None
+    
+    # Parse risk score
+    try:
+        risk_score = float(risk_score_str)
+    except (ValueError, TypeError):
+        risk_score = 0.0
+    
+    # Parse threat names and file types
+    threat_names = parse_threat_names(threat_names_raw)
+    file_types = parse_file_types(file_types_raw)
+    
+    # Convert dates to RFC3339 format for proper schema detection
+    first_analysis_iso = parse_datetime_to_rfc3339(first_analysis)
+    last_analysis_iso = parse_datetime_to_rfc3339(last_analysis)
+    
+    # Build the document content
+    doc_content: Dict[str, Any] = {
+        "sha1": sha1,
+        "first_analysis": first_analysis_iso,
+        "last_analysis": last_analysis_iso,
+        "platform": platform,
+        "classification": classification,
+        "risk_score": risk_score,
+        "threat_names": threat_names,
+        "file_types": file_types,
+        "urls": urls,
+    }
+    
+    # Add id to doc content like TED and Books loaders
+    doc_content["id"] = sha1
+    
     return {
         "id": sha1,
-        # routing_key omitted: server will hash `id` for sharding
-        "doc": {
-            "id": sha1,  # required by CameoDB validators
-            "urls": urls,
-        },
+        "doc": {k: v for k, v in doc_content.items() if v is not None},
+        "routing_key": sha1,  # Add routing_key like TED and Books loaders
     }
 
 

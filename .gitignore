@@ -115,6 +115,7 @@ coverage.xml
 
 # Production data directory (created at runtime)
 /data/cameodb/
+/data/examples/
 
 # Test artifacts and temporary files
 *.tmp
