@@ -3886,8 +3886,7 @@ impl Message<GetLightweightIndexStats> for NodeOrchestrator {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // Fast startup-friendly index stats without loading Tantivy indices
-        let mut total_indexes = 0usize;
-        let mut indexes_with_data = 0usize;
+        let mut all_index_names = std::collections::HashSet::new();
 
         for shard in self.shards.values() {
             if let Some(store) = &shard.store {
@@ -3897,12 +3896,16 @@ impl Message<GetLightweightIndexStats> for NodeOrchestrator {
                     tokio::task::spawn_blocking(move || sc.get_index_names_lightweight()).await
                     && let Ok(names) = index_names
                 {
-                    total_indexes += names.len();
-                    // For lightweight check, assume all have data (conservative estimate)
-                    indexes_with_data += names.len();
+                    // Add all index names to a set to deduplicate across shards
+                    for name in names {
+                        all_index_names.insert(name);
+                    }
                 }
             }
         }
+
+        let total_indexes = all_index_names.len();
+        let indexes_with_data = total_indexes; // For lightweight check, assume all have data
 
         (total_indexes, indexes_with_data)
     }
