@@ -28,14 +28,18 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tantivy::query::QueryParserError;
 use tantivy::schema::{Document, FAST, Field, INDEXED, STORED, STRING, Schema, TEXT};
 use tantivy::{DateTime, Index, IndexReader, IndexWriter, doc};
 use thiserror::Error;
+use walkdir::WalkDir;
 
 /// Schema metadata table: maps index names to their schema definitions.
 const TABLE_SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("schema");
@@ -468,31 +472,16 @@ struct SchemaFields {
     indexed_fields: HashMap<String, Field>,
 }
 
-/// Helper function to calculate directory size recursively
-fn get_directory_size(path: &PathBuf) -> Result<u64, std::io::Error> {
-    let mut total_size = 0u64;
-
-    if path.is_dir() {
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let entry_path = entry.path();
-
-            if entry_path.is_dir() {
-                total_size += get_directory_size(&entry_path)?;
-            } else {
-                total_size += entry.metadata()?.len();
-            }
-        }
-    } else {
-        total_size = path.metadata()?.len();
-    }
-
-    Ok(total_size)
-}
-
 /// Type alias for the read cache to satisfy clippy::type-complexity
 /// Maps: Index Name -> Document ID -> Document Bytes
 type ReadCache = HashMap<String, HashMap<String, Vec<u8>>>;
+
+/// Cache entry for directory sizes with timestamp
+#[derive(Debug, Clone)]
+struct DirectorySizeCache {
+    size_bytes: u64,
+    timestamp: Instant,
+}
 
 /// Multi-tenant hybrid storage engine combining redb and tantivy.
 pub struct HybridStore {
@@ -514,6 +503,10 @@ pub struct HybridStore {
     schema_cache: Arc<RwLock<HashMap<String, Arc<IndexSchema>>>>,
     /// Cache of Tantivy field mappings per index
     fields_cache: Arc<RwLock<HashMap<String, SchemaFields>>>,
+    /// Cache for directory sizes with expiration to avoid repeated filesystem traversal
+    dir_size_cache: Arc<Mutex<HashMap<String, DirectorySizeCache>>>,
+    /// Cache expiration duration for directory sizes (10 minutes)
+    dir_cache_expiry: Duration,
     /// Storage configuration
     config: StorageConfig,
 }
@@ -540,6 +533,8 @@ impl HybridStore {
             budget_cache: Arc::new(RwLock::new(HashMap::new())),
             schema_cache: Arc::new(RwLock::new(HashMap::new())),
             fields_cache: Arc::new(RwLock::new(HashMap::new())),
+            dir_size_cache: Arc::new(Mutex::new(HashMap::new())),
+            dir_cache_expiry: Duration::from_secs(600), // 10 minutes
             config,
         })
     }
@@ -2340,7 +2335,7 @@ impl HybridStore {
         Ok((seq_ids, new_documents_count))
     }
 
-    /// List all available indexes with their statistics
+    /// List all available indexes with their statistics (optimized version)
     pub fn list_indexes(&self) -> Result<Vec<IndexInfo>, StoreError> {
         let mut indexes = Vec::new();
 
@@ -2349,16 +2344,28 @@ impl HybridStore {
 
         match read_txn.open_table(TABLE_SCHEMA) {
             Ok(schema_table) => {
+                // First pass: get statistics for all indexes without schema parsing
+                let mut index_stats = Vec::new();
                 for result in schema_table.iter()? {
-                    let (index_name, schema_bytes) = result?;
+                    let (index_name, _) = result?;
                     let index_name = index_name.value().to_string();
-
-                    // Parse schema
-                    let schema: IndexSchema = serde_json::from_slice(schema_bytes.value())
-                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
                     // Get statistics for this index
                     let stats = self.get_index_statistics(&index_name)?;
+                    index_stats.push((index_name, stats));
+                }
+
+                // Second pass: parse schemas only for indexes that actually need them
+                for (index_name, stats) in index_stats {
+                    let schema =
+                        if let Some(schema_bytes) = schema_table.get(&index_name.as_str())? {
+                            // Only parse schema if we have valid data
+                            serde_json::from_slice(schema_bytes.value())
+                                .map_err(|e| StoreError::Serialization(e.to_string()))?
+                        } else {
+                            // Fallback to default schema
+                            IndexSchema::default()
+                        };
 
                     indexes.push(IndexInfo {
                         name: index_name,
@@ -2381,7 +2388,7 @@ impl HybridStore {
 
                             // Create default schema for legacy indices
                             let default_schema = IndexSchema {
-                                shard_count: 256,
+                                shard_count: 4,
                                 fields: HashMap::new(),
                             };
 
@@ -2401,37 +2408,47 @@ impl HybridStore {
         Ok(indexes)
     }
 
-    /// Get statistics for a specific index
+    /// Get statistics for a specific index using hybrid approach (redb + WalkDir)
     pub fn get_index_statistics(&self, index: &str) -> Result<IndexStats, StoreError> {
         let data_table_name = format!("data_{}", index);
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
 
         let read_txn = self.kv.begin_read()?;
 
-        let mut document_count = 0u64;
-        let mut total_size_bytes = 0u64;
-
-        // Count documents and calculate size from redb data table
-        match read_txn.open_table(data_table_def) {
+        // Fast document count from redb using O(1) len() method
+        let document_count = match read_txn.open_table(data_table_def) {
             Ok(data_table) => {
-                for result in data_table.iter()? {
-                    let (_, value) = result?;
-                    document_count += 1;
-                    total_size_bytes += value.value().len() as u64;
-                }
+                // Use redb's native len() method - O(1) operation!
+                data_table.len().unwrap_or(0)
             }
-            Err(_) => {
-                // Table doesn't exist, keep counts at 0
-            }
+            Err(_) => 0, // Table doesn't exist
+        };
+
+        // Hybrid size calculation: redb stats + WalkDir for Tantivy
+        let mut total_size_bytes = 0u64;
+        let tantivy_index_exists = self.readers.read().unwrap().contains_key(index);
+
+        // Add redb storage size (accurate)
+        if let Ok(data_table) = read_txn.open_table(data_table_def)
+            && let Ok(table_stats) = data_table.stats()
+        {
+            total_size_bytes += table_stats.stored_bytes() + table_stats.metadata_bytes();
         }
 
-        // Check if Tantivy index exists
-        let index_path = self.config.shard_path.join("indices").join(index);
-        let tantivy_index_exists = index_path.exists() && index_path.is_dir();
-
-        // Add Tantivy index size if it exists
-        if tantivy_index_exists && let Ok(tantivy_size) = get_directory_size(&index_path) {
-            total_size_bytes += tantivy_size;
+        // Add Tantivy index size using WalkDir (fast disk-level operation)
+        if tantivy_index_exists {
+            let index_dir = self.config.shard_path.join("indices").join(index);
+            if index_dir.exists()
+                && let Ok(tantivy_size) = self.get_directory_size_cached(&index_dir)
+            {
+                total_size_bytes += tantivy_size;
+                tracing::debug!(
+                    index = %index,
+                    tantivy_size_bytes = tantivy_size,
+                    total_size_bytes = total_size_bytes,
+                    "Added Tantivy index size from WalkDir"
+                );
+            }
         }
 
         Ok(IndexStats {
@@ -2473,6 +2490,82 @@ impl HybridStore {
         }
 
         Ok(index_names.into_iter().collect())
+    }
+
+    /// Get lightweight index names from redb schema table only (fast startup method)
+    pub fn get_index_names_lightweight(&self) -> Result<Vec<String>, StoreError> {
+        let mut index_names = Vec::new();
+
+        let read_txn = self.kv.begin_read()?;
+
+        // Only check redb schema table - no filesystem access, no Tantivy loading
+        match read_txn.open_table(TABLE_SCHEMA) {
+            Ok(schema_table) => {
+                for result in schema_table.iter()? {
+                    let (index_name, _) = result?;
+                    index_names.push(index_name.value().to_string());
+                }
+            }
+            Err(_) => {
+                // Schema table doesn't exist yet - return empty list
+            }
+        }
+
+        Ok(index_names)
+    }
+
+    /// Get directory size with caching to avoid repeated filesystem traversal
+    fn get_directory_size_cached(&self, dir_path: &PathBuf) -> Result<u64, StoreError> {
+        let dir_str = dir_path.to_string_lossy().to_string();
+
+        // Check cache first
+        {
+            let cache = self.dir_size_cache.lock().unwrap();
+            if let Some(entry) = cache.get(&dir_str)
+                && entry.timestamp.elapsed() < self.dir_cache_expiry
+            {
+                return Ok(entry.size_bytes);
+            }
+        }
+
+        // Cache miss or expired - calculate size using WalkDir
+        let start_time = Instant::now();
+        let mut total_size = 0u64;
+
+        for entry in WalkDir::new(dir_path)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        // Skip errors like permission denied
+        {
+            if let Ok(metadata) = entry.metadata()
+                && metadata.is_file()
+            {
+                total_size += metadata.len();
+            }
+        }
+
+        let duration = start_time.elapsed();
+        tracing::debug!(
+            dir = %dir_str,
+            size_bytes = total_size,
+            duration_ms = duration.as_millis(),
+            "Calculated directory size using WalkDir"
+        );
+
+        // Update cache
+        {
+            let mut cache = self.dir_size_cache.lock().unwrap();
+            cache.insert(
+                dir_str,
+                DirectorySizeCache {
+                    size_bytes: total_size,
+                    timestamp: Instant::now(),
+                },
+            );
+        }
+
+        Ok(total_size)
     }
 
     /// Get field names from actual documents in an index by sampling

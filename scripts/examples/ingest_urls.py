@@ -250,6 +250,7 @@ def ingest(
 
                 batch_time = time.time() - batch_start
                 total_indexed += batch_indexed
+                total_processed += len(docs_to_send)
 
                 print(
                     f"Batch {batch_count}: {batch_indexed}/{items_received} docs indexed "

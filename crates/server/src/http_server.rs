@@ -476,32 +476,14 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
         }
     };
 
-    // Get index statistics
-    let (total_indexes, indexes_with_data) = match state
-        .router
-        .route_and_handle(ClientOp::ListIndexes, None, OperationType::Read)
-        .await
+    // Get index statistics efficiently without loading Tantivy indices
+    // Use a lightweight method that only checks redb tables
+    let (total_indexes, indexes_with_data) = match state.router.get_lightweight_index_stats().await
     {
-        Ok(response) => {
-            if let Some(indexes_array) = response.get("indexes").and_then(|v| v.as_array()) {
-                let total = indexes_array.len();
-                let with_data = indexes_array
-                    .iter()
-                    .filter(|idx| {
-                        idx.get("document_count")
-                            .and_then(|c| c.as_u64())
-                            .unwrap_or(0)
-                            > 0
-                    })
-                    .count();
-                (total, with_data)
-            } else {
-                (0, 0)
-            }
-        }
-        Err(_) => {
-            error!("Failed to get index statistics for health check");
-            (0, 0)
+        Ok(stats) => stats,
+        Err(err) => {
+            warn!(error = ?err, "Failed to get lightweight index stats, using defaults");
+            (0, 0) // Safe defaults for startup
         }
     };
 

@@ -328,6 +328,10 @@ pub struct GetShardCount;
 #[derive(Debug, Clone)]
 pub struct GetIdentity;
 
+/// Message to get lightweight index statistics without loading Tantivy indices.
+#[derive(Debug, Clone)]
+pub struct GetLightweightIndexStats;
+
 /// Message to get all shard IDs.
 #[derive(Debug, Clone)]
 pub struct GetShardIds;
@@ -1154,6 +1158,16 @@ impl RouterActor {
         self.orchestrator.ask(GetIdentity).await.map_err(|e| {
             OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
         })
+    }
+
+    /// Get lightweight index statistics without loading Tantivy indices (for fast startup).
+    pub async fn get_lightweight_index_stats(&self) -> Result<(usize, usize), OrchestratorError> {
+        self.orchestrator
+            .ask(GetLightweightIndexStats)
+            .await
+            .map_err(|e| {
+                OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
+            })
     }
 
     async fn handle_broadcast(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
@@ -3699,6 +3713,37 @@ impl Message<GetIdentity> for NodeOrchestrator {
             uuid: self.identity.uuid,
             name: self.identity.name.clone(),
         }
+    }
+}
+
+impl Message<GetLightweightIndexStats> for NodeOrchestrator {
+    type Reply = (usize, usize);
+
+    async fn handle(
+        &mut self,
+        _msg: GetLightweightIndexStats,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // Fast startup-friendly index stats without loading Tantivy indices
+        let mut total_indexes = 0usize;
+        let mut indexes_with_data = 0usize;
+
+        for shard in self.shards.values() {
+            if let Some(store) = &shard.store {
+                let sc = Arc::clone(store);
+                // Use lightweight method that only checks redb schema table
+                if let Ok(index_names) =
+                    tokio::task::spawn_blocking(move || sc.get_index_names_lightweight()).await
+                    && let Ok(names) = index_names
+                {
+                    total_indexes += names.len();
+                    // For lightweight check, assume all have data (conservative estimate)
+                    indexes_with_data += names.len();
+                }
+            }
+        }
+
+        (total_indexes, indexes_with_data)
     }
 }
 

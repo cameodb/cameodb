@@ -14,6 +14,7 @@ thiserror = { workspace = true }
 tantivy = { workspace = true }
 tracing = { workspace = true }
 chrono = { version = "0.4.42", features = ["serde"] }
+walkdir = "2.4"
 
 [dev-dependencies]
 uuid = { workspace = true }
