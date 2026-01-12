@@ -513,9 +513,9 @@ impl CameoDbConfig {
             .into());
         }
 
-        if self.search.indexer_memory_max_mb > 1024 {
+        if self.search.indexer_memory_max_mb > 4096 {
             return Err(ConfigError::MemoryConfig {
-                message: "Indexer memory maximum cannot exceed 1024MB".to_string(),
+                message: "Indexer memory maximum cannot exceed 4096MB".to_string(),
             }
             .into());
         }
