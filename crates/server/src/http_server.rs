@@ -445,7 +445,7 @@ async fn get_config_handler(
 async fn list_indexes_handler(State(state): State<AppState>) -> Result<Json<JsonValue>, AppError> {
     info!("List indexes request");
 
-    let client_op = ClientOp::ListIndexes;
+    let client_op = ClientOp::GetLightweightIndexes;
 
     let result = state
         .router

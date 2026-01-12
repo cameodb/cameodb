@@ -36,7 +36,7 @@ use kameo::{Actor, RemoteActor, remote_message};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock as AsyncRwLock, mpsc};
 use tokio::time::timeout;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::cluster_coordinator::{
@@ -310,6 +310,8 @@ pub enum ClientOp {
     GetConfig { index: String },
     /// List all available indexes with statistics
     ListIndexes,
+    /// Lightweight index listing without full schema parsing (optimized for _indexes endpoint)
+    GetLightweightIndexes,
     /// List all indexes across the cluster (broadcast)
     ListClusterIndexes,
     /// Delete an index and all its data
@@ -2725,6 +2727,11 @@ impl NodeOrchestrator {
                         warn!(%shard_id, error = %err, "Failed to register hydrated shard");
                     }
                     info!("Hydrated shard {}", shard_id);
+
+                    // Preload schemas for all indexes in this shard for instant field availability
+                    if let Err(err) = self.preload_schemas_for_shard(shard_id).await {
+                        warn!(%shard_id, error = %err, "Failed to preload schemas for shard");
+                    }
                 }
                 Err(e) => {
                     error!("Failed to hydrate shard {}: {}", shard_id, e);
@@ -3004,6 +3011,7 @@ impl NodeOrchestrator {
             }
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
             ClientOp::ListIndexes | ClientOp::ListClusterIndexes => self.orch_list_indexes().await,
+            ClientOp::GetLightweightIndexes => self.orch_lightweight_indexes().await,
             ClientOp::DeleteIndex {
                 index,
                 delete_schema,
@@ -3487,6 +3495,159 @@ impl NodeOrchestrator {
             "node_name": self.identity.name.clone(),
             "total_shards": self.shards.len()
         }))
+    }
+
+    /// Lightweight index listing without full schema parsing (optimized for _indexes endpoint)
+    async fn orch_lightweight_indexes(&self) -> Result<JsonValue, OrchestratorError> {
+        if self.shards.is_empty() {
+            return Ok(serde_json::json!({
+                "indexes": [],
+                "total_indexes": 0,
+                "node_id": self.identity.uuid.to_string(),
+                "node_name": self.identity.name.clone(),
+                "total_shards": 0
+            }));
+        }
+
+        let mut all: HashMap<String, (u64, u64, usize, Vec<String>)> = HashMap::new();
+
+        for shard in self.shards.values() {
+            if let Some(store) = &shard.store {
+                let sc = Arc::clone(store);
+
+                // Use lightweight method that only gets index names and basic stats
+                let index_names = tokio::task::spawn_blocking({
+                    let sc_clone = Arc::clone(&sc);
+                    move || sc_clone.get_index_names_lightweight()
+                })
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+
+                for index_name in index_names {
+                    // Get statistics using the hybrid approach (cached + efficient)
+                    let index_name_clone = index_name.clone();
+                    let stats = tokio::task::spawn_blocking({
+                        let sc_clone = Arc::clone(&sc);
+                        move || sc_clone.get_index_statistics(&index_name_clone)
+                    })
+                    .await
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+
+                    // Get fields from schema cache, with fallback to load from storage
+                    let fields = if let Some(schema) = self.get_cached_schema(&index_name).await {
+                        schema.fields.keys().cloned().collect()
+                    } else {
+                        // Schema not cached, try to load it from storage (lightweight operation)
+                        let index_name_clone = index_name.clone();
+                        let schema_result = tokio::task::spawn_blocking({
+                            let sc_clone = Arc::clone(&sc);
+                            move || sc_clone.get_schema(&index_name_clone)
+                        })
+                        .await
+                        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+
+                        if let Some(schema) = schema_result {
+                            // Cache the schema for future requests
+                            self.put_cached_schema(&index_name, &schema).await;
+                            schema.fields.keys().cloned().collect()
+                        } else {
+                            Vec::new() // No schema found
+                        }
+                    };
+
+                    let entry = all.entry(index_name).or_insert((0, 0, 0, Vec::new()));
+                    entry.0 += stats.document_count;
+                    entry.1 += stats.total_size_bytes;
+                    entry.2 += 1; // shard count
+
+                    // Merge fields, avoiding duplicates
+                    for field in fields {
+                        if !entry.3.contains(&field) {
+                            entry.3.push(field);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut indexes: Vec<(String, JsonValue)> = all
+            .into_iter()
+            .map(|(name, (doc_count, size_bytes, shard_count, mut fields))| {
+                // Sort fields by name, with "id" (if present) always first.
+                fields.sort_by(|a, b| match (a.as_str(), b.as_str()) {
+                    ("id", "id") => std::cmp::Ordering::Equal,
+                    ("id", _) => std::cmp::Ordering::Less,
+                    (_, "id") => std::cmp::Ordering::Greater,
+                    _ => a.cmp(b),
+                });
+
+                let json = serde_json::json!({
+                    "name": name,
+                    "document_count": doc_count,
+                    "total_size_bytes": size_bytes,
+                    "size_mb": size_bytes / (1024 * 1024),
+                    "shard_count": shard_count,
+                    "fields": fields, // Now included from schema cache!
+                });
+                (name, json)
+            })
+            .collect();
+
+        indexes.sort_by(|a, b| a.0.cmp(&b.0));
+        let indexes: Vec<JsonValue> = indexes.into_iter().map(|(_, json)| json).collect();
+
+        Ok(serde_json::json!({
+            "indexes": indexes,
+            "total_indexes": indexes.len(),
+            "node_id": self.identity.uuid.to_string(),
+            "node_name": self.identity.name.clone(),
+            "total_shards": self.shards.len()
+        }))
+    }
+
+    /// Preload all schemas for a given shard into the cache for instant field availability
+    async fn preload_schemas_for_shard(&mut self, shard_id: Uuid) -> Result<(), OrchestratorError> {
+        if let Some(shard) = self.shards.get(&shard_id)
+            && let Some(store) = &shard.store
+        {
+            let sc = Arc::clone(store);
+
+            // Get all index names for this shard
+            let index_names = tokio::task::spawn_blocking({
+                let sc_clone = Arc::clone(&sc);
+                move || sc_clone.get_index_names_lightweight()
+            })
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+
+            info!(shard_id = %shard_id, index_count = index_names.len(), "Preloading schemas for shard");
+
+            // Preload schema for each index
+            for index_name in index_names {
+                let index_name_clone = index_name.clone();
+                let schema_result = tokio::task::spawn_blocking({
+                    let sc_clone = Arc::clone(&sc);
+                    move || sc_clone.get_schema(&index_name_clone)
+                })
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+
+                if let Some(schema) = schema_result {
+                    // Cache the schema for instant access
+                    self.put_cached_schema(&index_name, &schema).await;
+                    debug!(shard_id = %shard_id, index = %index_name, field_count = schema.fields.len(), "Preloaded schema");
+                }
+            }
+
+            info!(shard_id = %shard_id, "Schema preloading complete for shard");
+        }
+
+        Ok(())
     }
 
     /// Helper: Load schema from first shard
