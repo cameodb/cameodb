@@ -2516,15 +2516,38 @@ impl HybridStore {
 
     /// Get directory size with caching to avoid repeated filesystem traversal
     fn get_directory_size_cached(&self, dir_path: &PathBuf) -> Result<u64, StoreError> {
-        let dir_str = dir_path.to_string_lossy().to_string();
+        // Create deterministic cache key from shard path and index name
+        // Extract index name from path like "/path/to/shard/indices/index_name"
+        let cache_key = if let Some(index_name) = dir_path.file_name().and_then(|n| n.to_str()) {
+            format!("{}:{}", self.config.shard_path.display(), index_name)
+        } else {
+            // Fallback to full path if we can't extract index name
+            dir_path.to_string_lossy().to_string()
+        };
 
         // Check cache first
         {
             let cache = self.dir_size_cache.lock().unwrap();
-            if let Some(entry) = cache.get(&dir_str)
-                && entry.timestamp.elapsed() < self.dir_cache_expiry
-            {
-                return Ok(entry.size_bytes);
+            if let Some(entry) = cache.get(&cache_key) {
+                let elapsed = entry.timestamp.elapsed();
+                if elapsed < self.dir_cache_expiry {
+                    tracing::debug!(
+                        cache_key = %cache_key,
+                        size_bytes = entry.size_bytes,
+                        cache_age_ms = elapsed.as_millis(),
+                        "Directory size cache HIT"
+                    );
+                    return Ok(entry.size_bytes);
+                } else {
+                    tracing::debug!(
+                        cache_key = %cache_key,
+                        cache_age_ms = elapsed.as_millis(),
+                        expiry_ms = self.dir_cache_expiry.as_millis(),
+                        "Directory size cache EXPIRED"
+                    );
+                }
+            } else {
+                tracing::debug!(cache_key = %cache_key, "Directory size cache MISS");
             }
         }
 
@@ -2547,7 +2570,7 @@ impl HybridStore {
 
         let duration = start_time.elapsed();
         tracing::debug!(
-            dir = %dir_str,
+            dir = %dir_path.to_string_lossy(),
             size_bytes = total_size,
             duration_ms = duration.as_millis(),
             "Calculated directory size using WalkDir"
@@ -2557,11 +2580,18 @@ impl HybridStore {
         {
             let mut cache = self.dir_size_cache.lock().unwrap();
             cache.insert(
-                dir_str,
+                cache_key.clone(), // Use the deterministic cache key
                 DirectorySizeCache {
                     size_bytes: total_size,
                     timestamp: Instant::now(),
                 },
+            );
+            tracing::debug!(
+                cache_key = %cache_key,
+                size_bytes = total_size,
+                duration_ms = duration.as_millis(),
+                cache_size = cache.len(),
+                "Directory size cache UPDATED"
             );
         }
 
