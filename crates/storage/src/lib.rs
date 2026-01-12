@@ -1038,6 +1038,32 @@ impl HybridStore {
         }
     }
 
+    /// Smart refresh strategy for reader cache
+    /// Tries fast reload first, falls back to remove + recreate if reload fails
+    /// This preserves cache when possible while ensuring data freshness
+    fn smart_refresh_reader(&self, index: &str) -> Result<(), StoreError> {
+        // Fast path: Try to reload existing reader
+        if let Some(reader) = self.readers.read().unwrap().get(index) {
+            match reader.reload() {
+                Ok(_) => {
+                    tracing::debug!(index = %index, "Reader reloaded successfully (fast path)");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(index = %index, error = %e, "Reader reload failed, falling back to recreation");
+                }
+            }
+        }
+
+        // Fallback: Remove and recreate (reliable path)
+        {
+            let mut readers = self.readers.write().unwrap();
+            readers.remove(index);
+        }
+        tracing::debug!(index = %index, "Reader cache cleared, will recreate on next search (reliable path)");
+        Ok(())
+    }
+
     /// Force a commit for a specific index
     pub fn commit_index(&self, index: &str) -> Result<(), StoreError> {
         let writers = self.writers.read().unwrap();
@@ -1045,6 +1071,10 @@ impl HybridStore {
             let mut writer = writer_arc.lock().unwrap();
             writer.commit()?;
             self.reset_operations_counter(index);
+
+            // CRITICAL: Smart refresh reader cache after commit to ensure search sees latest data
+            // This tries fast reload first, falls back to cache clearing if needed
+            self.smart_refresh_reader(index)?;
 
             // Refresh budget cache after commit since index size likely changed
             let index_path = self.config.shard_path.join("indices").join(index);
