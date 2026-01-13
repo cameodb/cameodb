@@ -8,6 +8,7 @@ use kameo::actor::RemoteActorRef;
 use kameo::message::{Context, Message};
 use kameo::{Actor, RemoteActor, Reply, remote_message};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -167,6 +168,19 @@ pub struct PeerNodeMetadataDiscovered {
     pub total_document_count: u64,
 }
 
+/// Message to set the local orchestrator reference
+#[derive(Debug, Clone)]
+pub struct SetLocalOrchestrator {
+    pub orchestrator: kameo::actor::ActorRef<crate::node_orchestrator::NodeOrchestrator>,
+}
+
+/// Message to coordinate index deletion across all nodes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteIndexCluster {
+    pub index: String,
+    pub delete_schema: bool,
+}
+
 /// Message when a single shard is discovered via DHT.
 #[derive(Debug, Clone)]
 pub struct PeerShardDiscovered {
@@ -263,6 +277,9 @@ pub struct ClusterCoordinator {
     generation: u64,
     state_store: Option<Arc<ClusterStateStore>>,
 
+    /// Reference to local orchestrator for coordinated operations
+    local_orchestrator: Option<kameo::actor::ActorRef<crate::node_orchestrator::NodeOrchestrator>>,
+
     // Track expected shards from snapshot for reconciliation
     expected_shards: HashMap<Uuid, ShardMetadata>,
 
@@ -301,25 +318,25 @@ impl ClusterCoordinator {
         let configured_nodes = cluster.cluster_config.cluster_nodes.len();
         let total_expected = configured_nodes.max(1); // At least the local node
         let active_nodes = 1;
-        let inactive_nodes = total_expected.saturating_sub(active_nodes);
+        let _inactive_nodes = total_expected.saturating_sub(active_nodes); // Prefix with _ to suppress warning
 
-        let state = if inactive_nodes == 0 {
+        info!(
+            generation = 1,
+            expected_nodes = total_expected,
+            configured_in_config = configured_nodes,
+            "ClusterCoordinator: initialized"
+        );
+
+        let state = if total_expected == 1 {
             ClusterState::Active {
                 generation: 1,
-                active_nodes,
-                total_expected,
-            }
-        } else if inactive_nodes == 1 {
-            ClusterState::Degraded {
-                active_nodes,
-                inactive_nodes,
+                active_nodes: 1,
+                total_expected: 1,
             }
         } else {
-            ClusterState::Failed {
-                reason: format!(
-                    "Cluster starting with {}/{} nodes active ({} missing)",
-                    active_nodes, total_expected, inactive_nodes
-                ),
+            ClusterState::Degraded {
+                active_nodes: 1,
+                inactive_nodes: total_expected.saturating_sub(1),
             }
         };
 
@@ -331,6 +348,7 @@ impl ClusterCoordinator {
             expected_nodes,
             generation: 1,
             state_store: None,
+            local_orchestrator: None,
             expected_shards: HashMap::new(),
             topology_subscribers: Vec::new(),
             bootstrap_complete: false,
@@ -464,6 +482,7 @@ impl ClusterCoordinator {
             expected_nodes,
             generation,
             state_store: Some(state_store),
+            local_orchestrator: None,
             expected_shards,
             topology_subscribers: Vec::new(),
             bootstrap_complete: false, // Will be set after initial DHT queries complete
@@ -887,7 +906,23 @@ impl ClusterCoordinator {
         // operation_type reserved for future policy; currently unused
         let _ = operation_type;
 
+        // Debug logging for troubleshooting
+        info!(
+            "RouteOperation: routing_key={:?}, ring_size={}, shard_assignments={}, expected_nodes={}",
+            routing_key,
+            self.ring.len(),
+            self.shard_assignments.len(),
+            self.expected_nodes.len()
+        );
+
+        // Special handling for index deletion - always route locally
+        // The local handler will coordinate with remote nodes
         if let Some(key) = routing_key {
+            // Check if this looks like an index deletion (heuristic based on operation context)
+            // In a proper implementation, we should pass the operation type or context
+            // For now, we'll rely on the fact that delete operations come with routing keys
+            // and the local orchestrator will handle the coordination
+
             if let Some(shard_id) = self.route_for_key(&key) {
                 if let Some(owner_node) = self.shard_owner(&shard_id) {
                     if owner_node == self.cluster.local_node_id {
@@ -913,8 +948,23 @@ impl ClusterCoordinator {
                     shard_assignments = self.shard_assignments.len(),
                     "RouteOperation: ring empty or no shard found for key - this may indicate incomplete shard registration"
                 );
+
+                // For single-node clusters, route locally instead of broadcasting
+                // This handles cases where shards haven't been registered yet
+                if self.expected_nodes.len() <= 1 {
+                    info!("RouteOperation: single-node cluster detected, routing locally");
+                    return RoutingDecision::Local;
+                }
+
                 return RoutingDecision::Broadcast;
             }
+        }
+
+        // For single-node clusters, route locally instead of broadcasting
+        // This handles operations without routing keys (like some admin operations)
+        if self.expected_nodes.len() <= 1 {
+            info!("RouteOperation: single-node cluster with no routing key, routing locally");
+            return RoutingDecision::Local;
         }
 
         info!("RouteOperation: no routing_key provided, broadcasting");
@@ -1738,6 +1788,159 @@ impl Message<PeerNodeMetadataDiscovered> for ClusterCoordinator {
 
         self.last_seen_state
             .insert(node_uuid, (msg.generation, msg.checksum));
+    }
+}
+
+impl Message<SetLocalOrchestrator> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SetLocalOrchestrator,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        info!("ClusterCoordinator: received local orchestrator reference");
+        self.local_orchestrator = Some(msg.orchestrator);
+    }
+}
+
+impl Message<DeleteIndexCluster> for ClusterCoordinator {
+    type Reply = Result<JsonValue, String>;
+
+    async fn handle(
+        &mut self,
+        msg: DeleteIndexCluster,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        info!(
+            index = %msg.index,
+            delete_schema = %msg.delete_schema,
+            "ClusterCoordinator: coordinating index deletion across cluster"
+        );
+
+        // 1. Delete from local node first
+        let local_result = if let Some(local_orchestrator) = &self.local_orchestrator {
+            local_orchestrator
+                .ask(crate::node_orchestrator::DeleteIndex {
+                    index: msg.index.clone(),
+                    delete_schema: msg.delete_schema,
+                })
+                .await
+                .map_err(|e| {
+                    crate::node_orchestrator::OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Failed to communicate with local orchestrator: {}", e),
+                    ))
+                })
+        } else {
+            Err(crate::node_orchestrator::OrchestratorError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Local orchestrator not available",
+                ),
+            ))
+        };
+
+        // 2. Forward delete request to all remote nodes
+        let known_peers: Vec<KnownPeer> = self.cluster
+            .peer_nodes
+            .values()
+            .map(|info| KnownPeer {
+                node_id: info.node_id,
+                node_name: info.node_name.clone(),
+                address: info.address.clone(),
+            })
+            .collect();
+        let mut remote_results = Vec::new();
+        
+        for peer in known_peers {
+            let remote_orchestrator_name = crate::node_orchestrator::orchestrator_remote_name(&peer.node_id);
+            
+            match kameo::actor::RemoteActorRef::<crate::node_orchestrator::NodeOrchestrator>::lookup(remote_orchestrator_name.as_str()).await {
+                Ok(Some(remote_orchestrator)) => {
+                    let delete_msg = crate::node_orchestrator::DeleteIndex {
+                        index: msg.index.clone(),
+                        delete_schema: msg.delete_schema,
+                    };
+                    
+                    match remote_orchestrator.ask(&delete_msg).await {
+                        Ok(result) => {
+                            info!(
+                                node_id = %peer.node_id,
+                                address = %peer.address,
+                                "Successfully deleted index from remote node"
+                            );
+                            remote_results.push(Ok(result));
+                        }
+                        Err(e) => {
+                            warn!(
+                                node_id = %peer.node_id,
+                                address = %peer.address,
+                                error = %e,
+                                "Failed to delete index from remote node"
+                            );
+                            remote_results.push(Err(format!("Remote node {} failed: {}", peer.node_id, e)));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    warn!(
+                        node_id = %peer.node_id,
+                        address = %peer.address,
+                        "Remote orchestrator not found for index deletion"
+                    );
+                    remote_results.push(Err(format!("Remote orchestrator not found for node {}", peer.node_id)));
+                }
+                Err(e) => {
+                    warn!(
+                        node_id = %peer.node_id,
+                        address = %peer.address,
+                        error = %e,
+                        "Failed to lookup remote orchestrator for index deletion"
+                    );
+                    remote_results.push(Err(format!("Lookup failed for node {}: {}", peer.node_id, e)));
+                }
+            }
+        }
+        
+        // Combine local and remote results
+        let mut all_errors = Vec::new();
+        
+        // Check local result
+        match local_result {
+            Ok(_) => {
+                info!("Index deletion succeeded on local node");
+            }
+            Err(e) => {
+                error!(error = %e, "Index deletion failed on local node");
+                all_errors.push(format!("Local node: {}", e));
+            }
+        }
+        
+        // Check remote results
+        for (i, result) in remote_results.into_iter().enumerate() {
+            match result {
+                Ok(_) => {
+                    info!("Index deletion succeeded on remote node {}", i + 1);
+                }
+                Err(e) => {
+                    warn!(error = %e, "Index deletion failed on remote node {}", i + 1);
+                    all_errors.push(format!("Remote node {}: {}", i + 1, e));
+                }
+            }
+        }
+        
+        // Return overall result
+        if all_errors.is_empty() {
+            Ok(serde_json::json!({
+                "status": "success",
+                "message": "Index deleted successfully across all nodes",
+                "index": msg.index,
+                "delete_schema": msg.delete_schema
+            }))
+        } else {
+            Err(format!("Index deletion completed with errors: {}", all_errors.join("; ")))
+        }
     }
 }
 

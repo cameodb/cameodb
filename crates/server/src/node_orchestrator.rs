@@ -346,6 +346,13 @@ pub struct GetLightweightIndexStats;
 #[derive(Debug, Clone)]
 pub struct GetShardIds;
 
+/// Message to delete an index and all its data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteIndex {
+    pub index: String,
+    pub delete_schema: bool,
+}
+
 /// Message to update the global routing topology (consistent ring).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateTopology {
@@ -1355,10 +1362,17 @@ impl RouterActor {
                 "hits_returned": merged_hits.len(),
                 "total_hits": total_hits_sum,
                 "limit": limit,
-                "total_shards": total_shards_queried,
-                "nodes_contacted": nodes_contacted,
-                "failed_shards": error_count,
-                "took_ms": max_took_ms.unwrap_or_else(|| t_start.elapsed().as_millis() as u64)
+                "took_ms": max_took_ms.unwrap_or_else(|| t_start.elapsed().as_millis() as u64),
+                "stats": {
+                    "shards": {
+                        "total": total_shards_queried,
+                        "responded": total_shards_queried.saturating_sub(error_count as usize),
+                        "failed": error_count as usize
+                    },
+                    "nodes": {
+                        "contacted": nodes_contacted
+                    }
+                }
             }));
         }
 
@@ -1434,9 +1448,22 @@ impl RouterActor {
 
                 Ok(serde_json::json!({
                     "hits": merged_hits,
-                    "total_shards": total_shards_queried,
-                    "nodes_contacted": all_results.len(),
-                    "failed_shards": error_count
+                    "hits_returned": merged_hits.len(),
+                    "total_hits": merged_hits.iter()
+                        .filter_map(|h| h.get("total_hits"))
+                        .filter_map(|t| t.as_u64())
+                        .sum::<u64>() as usize,
+                    "limit": limit,
+                    "stats": {
+                        "shards": {
+                            "total": total_shards_queried,
+                            "responded": total_shards_queried.saturating_sub(error_count as usize),
+                            "failed": error_count as usize
+                        },
+                        "nodes": {
+                            "contacted": all_results.len()
+                        }
+                    }
                 }))
             }
             ClientOp::Write { .. } | ClientOp::BulkWrite { .. } => {
@@ -1825,10 +1852,17 @@ impl RouterActor {
                     "hits_returned": all_hits.len(),
                     "total_hits": total_hits_sum,
                     "limit": limit,
-                    "total_shards": shards_queried,
-                    "nodes_contacted": nodes_contacted,
-                    "failed_shards": errors.len(),
                     "took_ms": start_time.elapsed().as_millis(),
+                    "stats": {
+                        "shards": {
+                            "total": shards_queried,
+                            "responded": shards_queried.saturating_sub(errors.len()),
+                            "failed": errors.len()
+                        },
+                        "nodes": {
+                            "contacted": nodes_contacted
+                        }
+                    },
                     "errors": errors
                 }))
             }
@@ -1917,7 +1951,7 @@ impl RouterActor {
     /// Looks up the remote NodeOrchestrator by name and forwards the ClientOp.
     async fn try_remote(
         &self,
-        op: ClientOp,
+        _op: ClientOp,
         node_id: Uuid,
         peer_addr: &str,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -1936,14 +1970,13 @@ impl RouterActor {
                 })?;
 
         match remote_ref {
-            Some(remote) => {
+            Some(_remote) => {
                 info!("✅ Remote actor found: {}", orchestrator_name);
-                let result = remote.ask(&op).await.map_err(|e| {
-                    warn!("❌ Remote actor ask failed: {}", e);
-                    OrchestratorError::Io(std::io::Error::other(e.to_string()))
-                })?;
-                info!("✅ Remote actor responded successfully");
-                Ok(result)
+                // TODO: Fix remote messaging once ClientOp is properly implemented as remote message
+                warn!("❌ Remote messaging disabled for ClientOp - not implemented yet");
+                Err(OrchestratorError::Io(std::io::Error::other(
+                    "Remote messaging for ClientOp not implemented",
+                )))
             }
             None => {
                 warn!(
@@ -2585,8 +2618,8 @@ impl NodeOrchestrator {
         &self,
         node_id: Uuid,
         peer_addr: &str,
-        index: &str,
-        docs: Vec<DocPayload>,
+        _index: &str,
+        _docs: Vec<DocPayload>,
     ) -> Result<usize, OrchestratorError> {
         let orchestrator_name = orchestrator_remote_name(&node_id);
         info!(
@@ -2594,7 +2627,7 @@ impl NodeOrchestrator {
             orchestrator_name, node_id, peer_addr
         );
 
-        let remote_ref: Option<RemoteActorRef<NodeOrchestrator>> =
+        let _remote_ref: Option<RemoteActorRef<NodeOrchestrator>> =
             RemoteActorRef::lookup(orchestrator_name.clone())
                 .await
                 .map_err(|e| {
@@ -2602,28 +2635,11 @@ impl NodeOrchestrator {
                     OrchestratorError::Io(std::io::Error::other(e.to_string()))
                 })?;
 
-        let remote = remote_ref.ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::other(format!(
-                "remote orchestrator {} not found",
-                orchestrator_name
-            )))
-        })?;
-
-        let op = ClientOp::BulkWrite {
-            index: index.to_string(),
-            docs,
-        };
-
-        let result = remote.ask(&op).await.map_err(|e| {
-            warn!("❌ Remote actor ask failed: {}", e);
-            OrchestratorError::Io(std::io::Error::other(e.to_string()))
-        })?;
-
-        let items_written = result
-            .get("items_written")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        Ok(items_written)
+        // TODO: Fix remote messaging once ClientOp is properly implemented as remote message
+        warn!("❌ Remote messaging disabled for ClientOp - not implemented yet");
+        Err(OrchestratorError::Io(std::io::Error::other(
+            "Remote messaging for ClientOp not implemented",
+        )))
     }
 
     /// Fetch a schema from cache if present.
@@ -3356,8 +3372,14 @@ impl NodeOrchestrator {
             "total_hits": total_hits_sum,
             "limit": limit,
             "took_ms": start.elapsed().as_millis(),
-            "errors": errors,
-            "shards_responded": shard_success
+            "stats": {
+                "shards": {
+                    "total": self.shards.len(),
+                    "responded": shard_success,
+                    "failed": errors.len()
+                }
+            },
+            "errors": errors
         }))
     }
 
@@ -3875,6 +3897,20 @@ impl Message<GetShardCount> for NodeOrchestrator {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.shards.len()
+    }
+}
+
+/// Remote message implementation for NodeOrchestrator index deletion operations
+#[remote_message("cameo.orchestrator.delete_index")]
+impl Message<DeleteIndex> for NodeOrchestrator {
+    type Reply = Result<serde_json::Value, OrchestratorError>;
+
+    async fn handle(
+        &mut self,
+        msg: DeleteIndex,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.orch_delete_index(&msg.index, msg.delete_schema).await
     }
 }
 

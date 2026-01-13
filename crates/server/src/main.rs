@@ -179,42 +179,59 @@ async fn main() -> Result<()> {
     }
     println!("Active shards: {}", orchestrator.shard_count());
 
+    // NOW spawn the NodeOrchestrator as an actor (after all setup is done)
+    let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
+    let remote_name = orchestrator_remote_name(&node_id);
+
+    // Set orchestrator reference on coordinator for coordinated operations
+    let _ = coordinator_actor
+        .ask(crate::cluster_coordinator::SetLocalOrchestrator {
+            orchestrator: orchestrator_ref.clone(),
+        })
+        .await;
+
     // NOW initialize swarm via actor message (after shards are registered)
-    let swarm_initialized = match coordinator_actor.ask(InitSwarm).await {
+    let (swarm_initialized, cluster_enabled) = match coordinator_actor.ask(InitSwarm).await {
         Err(err) => {
             tracing::warn!(error = ?err, "Failed to initialize distributed swarm");
             println!("⚠️  Distributed swarm initialization failed, continuing in single-node mode");
-            false
+            (false, false)
         }
         Ok(peer_id) => {
             let peer_id: String = peer_id;
             // Get cluster status via actor
             let status_result: Result<ClusterStatus, _> = coordinator_actor.ask(GetStatus).await;
-            if let Ok(cluster_status) = status_result
-                && cluster_status.cluster_enabled
-            {
-                println!("🌐 Distributed swarm initialized:");
-                println!("  📡 Cluster: {}", cluster_status.cluster_name);
-                println!("  🆔 Peer ID: {}", peer_id);
-                println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
-                println!("  ✅ Connected: {}", cluster_status.connected_nodes);
+            if let Ok(cluster_status) = status_result {
+                if cluster_status.cluster_enabled {
+                    println!("🌐 Distributed swarm initialized:");
+                    println!("  📡 Cluster: {}", cluster_status.cluster_name);
+                    println!("  🆔 Peer ID: {}", peer_id);
+                    println!("  🔗 Total nodes: {}", cluster_status.total_nodes);
+                    println!("  ✅ Connected: {}", cluster_status.connected_nodes);
 
-                // Discover peers via actor
-                let discover_result: Result<Vec<crate::distributed::NodeInfo>, _> =
-                    coordinator_actor.ask(DiscoverPeers).await;
-                if let Ok(peers) = discover_result
-                    && !peers.is_empty()
-                {
-                    println!("  👥 Discovered {} peer nodes", peers.len());
+                    // Discover peers via actor
+                    let discover_result: Result<Vec<crate::distributed::NodeInfo>, _> =
+                        coordinator_actor.ask(DiscoverPeers).await;
+                    if let Ok(peers) = discover_result
+                        && !peers.is_empty()
+                    {
+                        println!("  👥 Discovered {} peer nodes", peers.len());
+                    }
+                } else {
+                    println!("🏠 Running in single-node mode (cluster disabled)");
                 }
+                (true, cluster_status.cluster_enabled)
+            } else {
+                // If we can't get status, assume cluster is disabled for safety
+                println!("🏠 Running in single-node mode (cluster status unknown)");
+                (true, false)
             }
-            true
         }
     };
 
     // Register coordinator for remote access AFTER swarm is initialized
     let coordinator_remote_name = format!("coordinator-{}", node_id);
-    if swarm_initialized {
+    if swarm_initialized && cluster_enabled {
         if let Err(e) = coordinator_actor
             .register(coordinator_remote_name.clone())
             .await
@@ -223,21 +240,21 @@ async fn main() -> Result<()> {
         } else {
             tracing::info!(name = %coordinator_remote_name, "Registered coordinator for remote access");
         }
+    } else if !cluster_enabled {
+        tracing::info!("Cluster disabled, skipping coordinator remote registration");
     } else {
         tracing::warn!("Swarm not initialized, skipping coordinator remote registration");
     }
 
-    // Spawn NodeOrchestrator as an actor and register with remote registry
-    let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
-    let remote_name = orchestrator_remote_name(&node_id);
-
     // Register orchestrator for remote access ONLY after swarm is initialized
-    if swarm_initialized {
+    if swarm_initialized && cluster_enabled {
         if let Err(e) = orchestrator_ref.register(remote_name.clone()).await {
             tracing::warn!(name = %remote_name, error = %e, "Failed to register orchestrator for remote access");
         } else {
             tracing::info!(name = %remote_name, "Registered orchestrator for remote access");
         }
+    } else if !cluster_enabled {
+        tracing::info!("Cluster disabled, skipping orchestrator remote registration");
     } else {
         tracing::warn!("Swarm not initialized, skipping orchestrator remote registration");
     }

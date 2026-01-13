@@ -595,16 +595,19 @@ async fn delete_index_handler(
         index, params.delete_schema
     );
 
-    let client_op = ClientOp::DeleteIndex {
-        index,
+    // Use cluster coordinator for proper cluster-wide index deletion
+    let delete_msg = crate::cluster_coordinator::DeleteIndexCluster {
+        index: index.clone(),
         delete_schema: params.delete_schema.unwrap_or(false),
     };
 
-    // Use Broadcast to delete from all nodes in cluster
-    let result = state
-        .router
-        .route_and_handle(client_op, None, OperationType::Write)
-        .await?;
+    let result = state.coordinator.ask(delete_msg).await.map_err(|e| {
+        AppError(anyhow::anyhow!(
+            "Failed to delete index across cluster: {}",
+            e
+        ))
+    })?;
+
     Ok(Json(result))
 }
 
