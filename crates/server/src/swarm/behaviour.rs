@@ -323,14 +323,6 @@ impl DhtBehaviour {
         self.kademlia.get_record(key)
     }
 
-    /// Query DHT for all shards of a node (legacy method for backward compatibility)
-    /// This now queries node metadata first, then individual shards
-    pub fn query_shards(&mut self, node_uuid: uuid::Uuid) -> kad::QueryId {
-        // For now, just query node metadata
-        // The swarm event handler will trigger individual shard queries based on metadata
-        self.query_node_metadata(node_uuid)
-    }
-
     /// Bootstrap the Kademlia DHT
     pub fn bootstrap_kademlia(&mut self) -> Result<(), anyhow::Error> {
         // Skip bootstrap if we have no peers; prevents noisy "No known peers" warnings in standalone mode

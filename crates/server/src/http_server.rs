@@ -456,17 +456,6 @@ async fn list_indexes_handler(State(state): State<AppState>) -> Result<Json<Json
 
 /// Handler for cluster health check
 async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResponse>, AppError> {
-    let identity = state
-        .router
-        .get_identity()
-        .await
-        .map_err(|e| AppError(anyhow::anyhow!(e)))?;
-    let shard_count = state
-        .router
-        .get_shard_count()
-        .await
-        .map_err(|e| AppError(anyhow::anyhow!(e)))?;
-
     // Query cluster status from coordinator
     let cluster_status = match state.coordinator.ask(GetStatus).await {
         Ok(status) => Some(status),
@@ -476,15 +465,45 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
         }
     };
 
-    // Get index statistics efficiently without loading Tantivy indices
-    // Use a lightweight method that only checks redb tables
-    let (total_indexes, indexes_with_data) = match state.router.get_lightweight_index_stats().await
+    // Get basic shard count and node info from orchestrator
+    let shard_count = state.router.shard_count().await;
+    let node_id = match state.router.handle_client_op(ClientOp::GetIdentity).await {
+        Ok(result) => result
+            .get("node_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("local")
+            .to_string(),
+        Err(_) => "local".to_string(),
+    };
+
+    // Get lightweight index statistics for health check
+    let (total_indexes, indexes_with_data) = match state
+        .router
+        .handle_client_op(ClientOp::GetLightweightIndexes)
+        .await
     {
-        Ok(stats) => stats,
-        Err(err) => {
-            warn!(error = ?err, "Failed to get lightweight index stats, using defaults");
-            (0, 0) // Safe defaults for startup
+        Ok(result) => {
+            let total = result
+                .get("total_indexes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let empty_vec = vec![];
+            let indexes_array = result
+                .get("indexes")
+                .and_then(|arr| arr.as_array())
+                .unwrap_or(&empty_vec);
+            let with_data = indexes_array
+                .iter()
+                .filter(|idx| {
+                    idx.get("document_count")
+                        .and_then(|c| c.as_u64())
+                        .unwrap_or(0)
+                        > 0
+                })
+                .count();
+            (total, with_data)
         }
+        Err(_) => (0, 0), // Fallback to 0 if lightweight indexes fails
     };
 
     let response = HealthResponse {
@@ -492,8 +511,11 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
             .as_ref()
             .map(|s| s.health.clone())
             .unwrap_or_else(|| "green".to_string()),
-        node_id: identity.uuid.to_string(),
-        node_name: identity.name.clone(),
+        node_id,
+        node_name: cluster_status
+            .as_ref()
+            .map(|s| s.cluster_name.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
         cluster_name: cluster_status.as_ref().map(|s| s.cluster_name.clone()),
         cluster_enabled: cluster_status.as_ref().map(|s| s.cluster_enabled),
         total_nodes: cluster_status.as_ref().map(|s| s.total_nodes),

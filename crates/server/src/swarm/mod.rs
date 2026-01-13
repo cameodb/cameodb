@@ -5,7 +5,6 @@
 //! swarm initialization and manages the event loop processing.
 
 pub mod behaviour;
-pub mod cluster_actor;
 pub mod utils;
 
 use crate::config::ClusterConfig;
@@ -25,13 +24,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::{select, sync::watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-// TODO: Add cluster state actor integration for peer management
-// use cluster_actor::{ClusterStateActor, PeerDiscovered, PeerLost};
-// use kameo::prelude::{ActorRef, spawn};
 
 // Re-export key types for convenience
-// TODO: Enable cluster actor exports when integration is complete
-// pub use cluster_actor::{GetActivePeers, PeerInfo};
 pub use utils::resolve_listen_address;
 
 /// Result returned after the swarm runtime has been launched
@@ -85,10 +79,6 @@ pub enum CoordinatorEvent {
     PeerShardDiscovered {
         node_uuid: String,
         shard: crate::cluster_coordinator::ShardMetadata,
-    },
-    PeerShardsDiscovered {
-        peer_id: String,
-        shards: Vec<crate::cluster_coordinator::ShardMetadata>,
     },
 }
 
@@ -155,10 +145,10 @@ impl SwarmRuntimeHandle {
         Ok(())
     }
 
-    /// Query shards for a remote node from the DHT
-    pub fn query_shards(&self, node_uuid: Uuid) -> Result<()> {
+    /// Query node metadata for a remote node from the DHT
+    pub fn query_node_metadata(&self, node_uuid: Uuid) -> Result<()> {
         if let Some(tx) = &self.cmd_tx {
-            tx.send(SwarmCommand::QueryShards { node_uuid })
+            tx.send(SwarmCommand::QueryNodeMetadata { node_uuid })
                 .map_err(|_| anyhow::anyhow!("Swarm runtime channel closed"))?;
         }
         Ok(())
@@ -654,7 +644,7 @@ pub enum SwarmCommand {
         generation: u64,
         checksum: u64,
     },
-    QueryShards {
+    QueryNodeMetadata {
         node_uuid: Uuid,
     },
     #[allow(dead_code)]
@@ -680,8 +670,8 @@ fn handle_swarm_command(cmd: SwarmCommand, swarm: &mut libp2p::Swarm<DhtBehaviou
                 warn!("⚠️  Failed to publish shards to DHT: {}", e);
             }
         }
-        SwarmCommand::QueryShards { node_uuid } => {
-            swarm.behaviour_mut().query_shards(node_uuid);
+        SwarmCommand::QueryNodeMetadata { node_uuid } => {
+            swarm.behaviour_mut().query_node_metadata(node_uuid);
         }
         SwarmCommand::QueryShard {
             node_uuid,
@@ -986,33 +976,6 @@ fn handle_kademlia_event(
                             }
                         }
                     }
-                } else if key_str.starts_with("cameodb-shards-") {
-                    // Legacy support for old format (now just plain JSON)
-                    let peer_id_str = key_str.trim_start_matches("cameodb-shards-");
-
-                    // Direct JSON deserialization for backward compatibility
-                    let shards = match serde_json::from_slice::<
-                        Vec<crate::cluster_coordinator::ShardMetadata>,
-                    >(&record.value)
-                    {
-                        Ok(shards) => shards,
-                        Err(e) => {
-                            warn!("Failed to deserialize legacy shard metadata: {}", e);
-                            return;
-                        }
-                    };
-
-                    info!(
-                        "🎯 DHT Legacy Shards Found: Peer {} -> {} shards ({} bytes)",
-                        peer_id_str,
-                        shards.len(),
-                        record.value.len()
-                    );
-
-                    let _ = event_tx.send(CoordinatorEvent::PeerShardsDiscovered {
-                        peer_id: peer_id_str.to_string(),
-                        shards,
-                    });
                 }
             }
             _ => {

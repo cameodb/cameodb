@@ -13,7 +13,6 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::ClusterConfig;
-use crate::node_orchestrator::MicroshardActor;
 use crate::swarm::{self, CoordinatorEvent, SwarmRuntimeHandle, SwarmStartup};
 
 /// Distributed cluster manager for CameoDB nodes
@@ -137,24 +136,6 @@ impl DistributedCluster {
         Ok((peer_id.to_string(), events))
     }
 
-    /// Register a local shard actor with the distributed registry
-    #[allow(dead_code)] // Framework method, used when Kameo remote features are enabled
-    pub async fn register_shard(&mut self, shard_id: Uuid, _actor: &MicroshardActor) -> Result<()> {
-        let shard_name = format!("shard-{}", shard_id);
-
-        info!(
-            shard_id = %shard_id,
-            shard_name = %shard_name,
-            "Registering shard for distributed access (stub)"
-        );
-
-        // Note: Actual shard registration happens via NodeOrchestrator -> ClusterCoordinator
-        // and implicit Kameo registration if MicroshardActor is marked RemoteActor.
-        // This method is kept for future direct-shard-registration if needed.
-
-        Ok(())
-    }
-
     /// Discover and connect to peer nodes in the cluster
     pub async fn discover_peers(&mut self) -> Result<Vec<NodeInfo>> {
         info!(
@@ -222,32 +203,6 @@ impl DistributedCluster {
         self.dial_failures = self.dial_failures.saturating_add(1);
     }
 
-    /// Route a request to the appropriate shard, potentially on a remote node
-    #[allow(dead_code)] // Framework method, used when Kameo remote features are enabled
-    pub async fn route_to_shard(&self, shard_id: Uuid, operation: &str) -> Result<String> {
-        let _shard_name = format!("shard-{}", shard_id);
-
-        info!(
-            shard_id = %shard_id,
-            operation = %operation,
-            "Routing operation to distributed shard (stub)"
-        );
-
-        // Note: Actual routing happens via RouterActor -> ClusterCoordinator -> NodeOrchestrator.
-        // This method is legacy/simulated logic and should not be used in the new architecture.
-        // We return an error to ensure callers migrate to the proper flow.
-
-        // TODO: When Kameo remote features are available and if direct shard routing is needed:
-        // if let Some(remote_shard) = RemoteActorRef::<MicroshardActor>::lookup(&shard_name).await? {
-        //     let result = remote_shard.ask(&operation_message).await?;
-        //     return Ok(result);
-        // }
-
-        Err(anyhow::anyhow!(
-            "Direct DistributedCluster routing is deprecated. Use RouterActor."
-        ))
-    }
-
     /// Get cluster status and health information
     pub fn get_cluster_status(&self) -> ClusterStatus {
         let connected_nodes = self
@@ -288,9 +243,10 @@ impl Drop for DistributedCluster {
     fn drop(&mut self) {
         if let Some(handle) = self.swarm_handle.as_ref()
             && handle.is_running()
-                && let Err(error) = handle.shutdown() {
-                    warn!(%error, "failed to signal swarm shutdown during drop");
-                }
+            && let Err(error) = handle.shutdown()
+        {
+            warn!(%error, "failed to signal swarm shutdown during drop");
+        }
     }
 }
 

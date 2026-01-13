@@ -166,29 +166,6 @@ impl<'de> Deserialize<'de> for OrchestratorError {
     }
 }
 
-/// Message to propose creating a new shard on this node.
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone)]
-pub struct ProposeShard {
-    pub shard_id: Uuid,
-}
-
-/// Search request message for MicroshardActor.
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchRequest {
-    pub index: String,
-    pub query_string: String,
-    pub limit: usize,
-}
-
-/// Search result with hits and total count
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchResult {
-    pub hits: Vec<SearchHit>,
-    pub total_hits: usize,
-}
-
 /// Document payload for write operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocPayload {
@@ -202,17 +179,49 @@ pub struct DocPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteRequest {
     pub index: String,
-    pub routing_key: Option<String>,
+    pub routing_key: String,
     pub doc: JsonValue,
+}
+
+/// Response containing write result from MicroshardActor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteReply {
+    pub sequence: u64,
 }
 
 /// Batch write request message for MicroshardActor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchWriteRequest {
-    pub ops: Vec<ClientOp>,
+    pub index: String,
+    pub docs: Vec<DocPayload>,
 }
 
-/// Shutdown request message for MicroshardActor.
+/// Response containing batch write result from MicroshardActor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchWriteReply {
+    pub items_written: u64,
+    pub errors: Vec<String>,
+}
+
+/// Search request message for MicroshardActor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchRequest {
+    pub index: String,
+    pub query: String,
+    pub limit: Option<usize>,
+}
+
+/// Message to get the current shard count.
+#[derive(Debug, Clone)]
+pub struct GetShardCount;
+
+/// Message to propose creating a new shard on this node.
+#[derive(Debug, Clone)]
+pub struct ProposeShard {
+    pub shard_id: Uuid,
+}
+
+/// Message to delete an index and all its data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShutdownShard;
 
@@ -273,17 +282,6 @@ pub struct SearchReply {
     pub total_hits: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WriteReply {
-    pub sequence_id: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BatchWriteReply {
-    pub sequence_ids: Vec<u64>,
-    pub items_processed: usize,
-}
-
 /// Client operation messages for RouterActor.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,37 +318,12 @@ pub enum ClientOp {
     ListIndexes,
     /// Lightweight index listing without full schema parsing (optimized for _indexes endpoint)
     GetLightweightIndexes,
+    /// Get node identity information
+    GetIdentity,
     /// List all indexes across the cluster (broadcast)
     ListClusterIndexes,
     /// Delete an index and all its data
     DeleteIndex { index: String, delete_schema: bool },
-}
-
-// ============================================================================
-// NodeOrchestrator Messages (for future actor-based communication)
-// ============================================================================
-
-/// Message to get the current shard count.
-#[derive(Debug, Clone)]
-pub struct GetShardCount;
-
-/// Message to get the node identity.
-#[derive(Debug, Clone)]
-pub struct GetIdentity;
-
-/// Message to get lightweight index statistics without loading Tantivy indices.
-#[derive(Debug, Clone)]
-pub struct GetLightweightIndexStats;
-
-/// Message to get all shard IDs.
-#[derive(Debug, Clone)]
-pub struct GetShardIds;
-
-/// Message to delete an index and all its data
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteIndex {
-    pub index: String,
-    pub delete_schema: bool,
 }
 
 /// Message to update the global routing topology (consistent ring).
@@ -387,6 +360,8 @@ pub struct MicroshardActor {
     shard_id: Uuid,
     store: Option<Arc<HybridStore>>,
     storage_config: StorageConfig,
+    /// Default search limit for this shard
+    default_search_limit: usize,
     /// Track active supervision tasks per index
     supervisors: Arc<AsyncRwLock<HashMap<String, mpsc::Sender<()>>>>,
 }
@@ -402,11 +377,12 @@ impl std::fmt::Debug for MicroshardActor {
 }
 
 impl MicroshardActor {
-    pub fn new(shard_id: Uuid, storage_config: StorageConfig) -> Self {
+    pub fn new(shard_id: Uuid, storage_config: StorageConfig, default_search_limit: usize) -> Self {
         Self {
             shard_id,
             store: None,
             storage_config,
+            default_search_limit,
             supervisors: Arc::new(AsyncRwLock::new(HashMap::new())),
         }
     }
@@ -438,7 +414,7 @@ impl MicroshardActor {
     pub async fn handle_search(
         &self,
         request: SearchRequest,
-    ) -> Result<SearchResult, OrchestratorError> {
+    ) -> Result<SearchReply, OrchestratorError> {
         let store = self.store.as_ref().ok_or_else(|| {
             OrchestratorError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -447,8 +423,8 @@ impl MicroshardActor {
         })?;
 
         let store = Arc::clone(store);
-        let query = request.query_string;
-        let limit = request.limit;
+        let query = request.query;
+        let limit = request.limit.unwrap_or(self.default_search_limit);
 
         // Use spawn_blocking to execute search on blocking thread pool
         let index = request.index.clone();
@@ -466,7 +442,7 @@ impl MicroshardActor {
             .map(|(score, doc)| SearchHit { score, doc })
             .collect();
 
-        Ok(SearchResult {
+        Ok(SearchReply {
             hits: search_hits,
             total_hits,
         })
@@ -609,7 +585,7 @@ impl MicroshardActor {
     ) -> Result<Vec<u64>, OrchestratorError> {
         tracing::debug!(
             shard_id = %self.shard_id,
-            ops_count = request.ops.len(),
+            docs_count = request.docs.len(),
             "MicroshardActor: Starting batch write"
         );
 
@@ -621,32 +597,23 @@ impl MicroshardActor {
         })?;
 
         let store = Arc::clone(store);
-        let ops = request.ops;
+        let docs = request.docs;
         let shard_id = self.shard_id;
 
         // Group operations by index
         let mut ops_by_index: std::collections::HashMap<String, Vec<WalOp>> =
             std::collections::HashMap::new();
 
-        for op in ops {
-            match op {
-                ClientOp::Write { index, id, doc, .. } => {
-                    // Do not synthesize or transform a body; preserve the document as json_blob only.
-                    let wal_op = WalOp::Put {
-                        id,
-                        json_blob: Some(doc.clone()),
-                    };
+        for doc_payload in docs {
+            let wal_op = WalOp::Put {
+                id: doc_payload.id,
+                json_blob: Some(doc_payload.doc),
+            };
 
-                    ops_by_index.entry(index).or_default().push(wal_op);
-                }
-                _ => {
-                    // For now, only support Write operations in batch
-                    return Err(OrchestratorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Only Write operations are supported in batch requests",
-                    )));
-                }
-            }
+            ops_by_index
+                .entry(doc_payload.routing_key.unwrap_or_default())
+                .or_default()
+                .push(wal_op);
         }
 
         // Collect unique indices from grouped ops
@@ -993,7 +960,9 @@ impl Message<WriteRequest> for MicroshardActor {
     ) -> Self::Reply {
         self.handle_write(msg)
             .await
-            .map(|sequence_id| WriteReply { sequence_id })
+            .map(|sequence_id| WriteReply {
+                sequence: sequence_id,
+            })
             .map_err(RemoteError::from)
     }
 }
@@ -1011,8 +980,8 @@ impl Message<BatchWriteRequest> for MicroshardActor {
         self.handle_batch_write(msg)
             .await
             .map(|sequence_ids| BatchWriteReply {
-                items_processed: sequence_ids.len(),
-                sequence_ids,
+                items_written: sequence_ids.len() as u64,
+                errors: vec![],
             })
             .map_err(RemoteError::from)
     }
@@ -1171,29 +1140,13 @@ impl RouterActor {
     }
 
     /// Get the number of active shards (for health check).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn get_shard_count(&self) -> Result<usize, OrchestratorError> {
-        self.orchestrator.ask(GetShardCount).await.map_err(|e| {
-            OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
-        })
-    }
-
-    /// Get the node identity (for health check).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn get_identity(&self) -> Result<NodeIdentityInfo, OrchestratorError> {
-        self.orchestrator.ask(GetIdentity).await.map_err(|e| {
-            OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
-        })
-    }
-
-    /// Get lightweight index statistics without loading Tantivy indices (for fast startup).
-    pub async fn get_lightweight_index_stats(&self) -> Result<(usize, usize), OrchestratorError> {
-        self.orchestrator
-            .ask(GetLightweightIndexStats)
-            .await
-            .map_err(|e| {
-                OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
-            })
+    pub async fn shard_count(&self) -> usize {
+        // Forward to orchestrator actor
+        (self
+            .orchestrator
+            .ask(crate::node_orchestrator::GetShardCount)
+            .await)
+            .unwrap_or_default()
     }
 
     async fn handle_broadcast(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
@@ -2503,17 +2456,22 @@ impl NodeOrchestrator {
             );
 
             if let Some(shard) = self.shards.get(&shard_id) {
-                let ops: Vec<ClientOp> = batch
+                let docs: Vec<DocPayload> = batch
                     .into_iter()
-                    .map(|(d, effective_routing_key)| ClientOp::Write {
-                        index: index.to_string(),
+                    .map(|(d, effective_routing_key)| DocPayload {
                         id: d.id,
                         routing_key: effective_routing_key,
                         doc: d.doc,
                     })
                     .collect();
 
-                match shard.handle_batch_write(BatchWriteRequest { ops }).await {
+                match shard
+                    .handle_batch_write(BatchWriteRequest {
+                        index: index.to_string(),
+                        docs,
+                    })
+                    .await
+                {
                     Ok(seq_ids) => {
                         tracing::info!(
                             shard_id = %shard_id,
@@ -2750,7 +2708,8 @@ impl NodeOrchestrator {
             }
 
             let storage_config = self.create_shard_storage_config(shard_id);
-            let mut microshard = MicroshardActor::new(shard_id, storage_config);
+            let mut microshard =
+                MicroshardActor::new(shard_id, storage_config, self.default_search_limit);
 
             match microshard.start().await {
                 Ok(()) => {
@@ -2850,7 +2809,8 @@ impl NodeOrchestrator {
 
         // Create and start microshard actor
         let storage_config = self.create_shard_storage_config(shard_id);
-        let mut microshard = MicroshardActor::new(shard_id, storage_config);
+        let mut microshard =
+            MicroshardActor::new(shard_id, storage_config, self.default_search_limit);
         microshard.start().await?;
 
         // Add to shards map
@@ -3044,6 +3004,7 @@ impl NodeOrchestrator {
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
             ClientOp::ListIndexes | ClientOp::ListClusterIndexes => self.orch_list_indexes().await,
             ClientOp::GetLightweightIndexes => self.orch_lightweight_indexes().await,
+            ClientOp::GetIdentity => self.orch_get_identity().await,
             ClientOp::DeleteIndex {
                 index,
                 delete_schema,
@@ -3147,7 +3108,7 @@ impl NodeOrchestrator {
         })?;
         let req = WriteRequest {
             index: index.to_string(),
-            routing_key: effective_routing_key.clone(),
+            routing_key: effective_routing_key.unwrap_or_default(),
             doc,
         };
 
@@ -3312,8 +3273,8 @@ impl NodeOrchestrator {
         for (&shard_id, shard) in self.shards.iter() {
             let req = SearchRequest {
                 index: index.to_string(),
-                query_string: query.to_string(),
-                limit,
+                query: query.to_string(),
+                limit: Some(limit),
             };
             let s = shard.clone();
             handles.push(tokio::spawn(async move {
@@ -3646,6 +3607,15 @@ impl NodeOrchestrator {
         }))
     }
 
+    /// Get node identity information
+    async fn orch_get_identity(&self) -> Result<JsonValue, OrchestratorError> {
+        Ok(serde_json::json!({
+            "node_id": self.identity.uuid.to_string(),
+            "node_name": self.identity.name.clone(),
+            "total_shards": self.shards.len()
+        }))
+    }
+
     /// Preload all schemas for a given shard into the cache for instant field availability
     async fn preload_schemas_for_shard(&mut self, shard_id: Uuid) -> Result<(), OrchestratorError> {
         if let Some(shard) = self.shards.get(&shard_id)
@@ -3885,9 +3855,7 @@ fn derive_routing_key_from_doc(doc: &JsonValue) -> Option<String> {
 }
 
 // ============================================================================
-// NodeOrchestrator Message Handlers (for future actor-based communication)
-// ============================================================================
-
+/// Message handler for GetShardCount
 impl Message<GetShardCount> for NodeOrchestrator {
     type Reply = usize;
 
@@ -3900,93 +3868,6 @@ impl Message<GetShardCount> for NodeOrchestrator {
     }
 }
 
-/// Remote message implementation for NodeOrchestrator index deletion operations
-#[remote_message("cameo.orchestrator.delete_index")]
-impl Message<DeleteIndex> for NodeOrchestrator {
-    type Reply = Result<serde_json::Value, OrchestratorError>;
-
-    async fn handle(
-        &mut self,
-        msg: DeleteIndex,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.orch_delete_index(&msg.index, msg.delete_schema).await
-    }
-}
-
-impl Message<GetIdentity> for NodeOrchestrator {
-    type Reply = NodeIdentityInfo;
-
-    async fn handle(
-        &mut self,
-        _msg: GetIdentity,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        NodeIdentityInfo {
-            uuid: self.identity.uuid,
-            name: self.identity.name.clone(),
-        }
-    }
-}
-
-impl Message<GetLightweightIndexStats> for NodeOrchestrator {
-    type Reply = (usize, usize);
-
-    async fn handle(
-        &mut self,
-        _msg: GetLightweightIndexStats,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        // Fast startup-friendly index stats without loading Tantivy indices
-        let mut all_index_names = std::collections::HashSet::new();
-
-        for shard in self.shards.values() {
-            if let Some(store) = &shard.store {
-                let sc = Arc::clone(store);
-                // Use lightweight method that only checks redb schema table
-                if let Ok(index_names) =
-                    tokio::task::spawn_blocking(move || sc.get_index_names_lightweight()).await
-                    && let Ok(names) = index_names
-                {
-                    // Add all index names to a set to deduplicate across shards
-                    for name in names {
-                        all_index_names.insert(name);
-                    }
-                }
-            }
-        }
-
-        let total_indexes = all_index_names.len();
-        let indexes_with_data = total_indexes; // For lightweight check, assume all have data
-
-        (total_indexes, indexes_with_data)
-    }
-}
-
-impl Message<GetShardIds> for NodeOrchestrator {
-    type Reply = Vec<Uuid>;
-
-    async fn handle(
-        &mut self,
-        _msg: GetShardIds,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.shards.keys().copied().collect()
-    }
-}
-
-impl Message<ProposeShard> for NodeOrchestrator {
-    type Reply = Result<Uuid, OrchestratorError>;
-
-    async fn handle(
-        &mut self,
-        msg: ProposeShard,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.handle_propose_shard(msg).await
-    }
-}
-
 #[remote_message("cameo.orchestrator.client_op")]
 impl Message<ClientOp> for NodeOrchestrator {
     type Reply = Result<JsonValue, OrchestratorError>;
@@ -3996,7 +3877,13 @@ impl Message<ClientOp> for NodeOrchestrator {
         msg: ClientOp,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.handle_client_op(msg).await
+        match msg {
+            ClientOp::DeleteIndex {
+                index,
+                delete_schema,
+            } => self.orch_delete_index(&index, delete_schema).await,
+            _ => self.handle_client_op(msg).await,
+        }
     }
 }
 

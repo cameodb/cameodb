@@ -78,7 +78,6 @@ pub struct PeerLost {
 #[derive(Debug, Clone)]
 pub struct RouteShard {
     pub shard_id: Uuid,
-    pub operation: String,
 }
 
 /// Metadata describing a shard and its owning node.
@@ -145,13 +144,6 @@ pub struct KnownPeer {
     pub node_id: Uuid,
     pub node_name: Option<String>,
     pub address: String,
-}
-
-/// Message when shards are discovered for a peer via DHT.
-#[derive(Debug, Clone)]
-pub struct PeerShardsDiscovered {
-    pub peer_id: String,
-    pub shards: Vec<ShardMetadata>,
 }
 
 /// Message when node metadata is discovered via DHT.
@@ -1240,15 +1232,6 @@ impl Message<InitSwarm> for ClusterCoordinator {
                                         warn!(node_uuid = %node_uuid, "Failed to parse node UUID from DHT");
                                     }
                                 }
-                                CoordinatorEvent::PeerShardsDiscovered { peer_id, shards } => {
-                                    // peer_id here is actually the Node UUID string from the DHT key
-                                    if let Err(err) = coordinator
-                                        .ask(PeerShardsDiscovered { peer_id, shards })
-                                        .await
-                                    {
-                                        warn!(error = %err, "ClusterCoordinator: failed to forward peer shards discovered");
-                                    }
-                                }
                                 CoordinatorEvent::PeerNodeMetadataDiscovered {
                                     node_uuid,
                                     node_name,
@@ -1519,7 +1502,7 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
         if needs_dht_query && !self.bootstrap_complete {
             // Phase 1: Query node metadata (fast, small record)
             if let Some(handle) = self.cluster.swarm_handle() {
-                if let Err(e) = handle.query_shards(msg.node_id) {
+                if let Err(e) = handle.query_node_metadata(msg.node_id) {
                     warn!(node = %msg.node_id, error = %e, "Failed to query peer node metadata from DHT");
                 } else {
                     info!(node = %msg.node_id, "ClusterCoordinator: querying node metadata from DHT (bootstrap phase 1)");
@@ -1639,54 +1622,6 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
         } else {
             debug!(node = %msg.node_id, "Skipping actor-based shard exchange (discovery phase)");
         }
-    }
-}
-
-impl Message<PeerShardsDiscovered> for ClusterCoordinator {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: PeerShardsDiscovered,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        // Parse peer_id string to UUID
-        let peer_uuid = match Uuid::parse_str(&msg.peer_id) {
-            Ok(uuid) => uuid,
-            Err(e) => {
-                warn!(peer_id = %msg.peer_id, error = %e, "Failed to parse peer UUID");
-                return;
-            }
-        };
-
-        let node_identity = self.format_node_identity(peer_uuid);
-        info!(
-            peer = %node_identity,
-            shard_count = msg.shards.len(),
-            "ClusterCoordinator: discovered shards from DHT"
-        );
-
-        let mut changes = 0;
-        for shard in msg.shards {
-            // Update or insert shard metadata
-            // We trust the DHT record as it's published by the owner
-            self.shard_assignments.insert(shard.shard_id, shard);
-            changes += 1;
-        }
-
-        if changes > 0 {
-            self.generation += 1;
-            self.rebuild_ring();
-            self.evaluate_and_transition_state();
-            self.persist_snapshot();
-            info!(
-                total_shards = self.shard_assignments.len(),
-                "ClusterCoordinator: updated ring from DHT discovery"
-            );
-        }
-
-        // Stability is now managed centrally in evaluate_and_transition_state.
-        // We no longer trigger bootstrap_complete based on partial DHT discoveries.
     }
 }
 
@@ -1821,7 +1756,7 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
         // 1. Delete from local node first
         let local_result = if let Some(local_orchestrator) = &self.local_orchestrator {
             local_orchestrator
-                .ask(crate::node_orchestrator::DeleteIndex {
+                .ask(crate::node_orchestrator::ClientOp::DeleteIndex {
                     index: msg.index.clone(),
                     delete_schema: msg.delete_schema,
                 })
@@ -1858,7 +1793,7 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
             
             match kameo::actor::RemoteActorRef::<crate::node_orchestrator::NodeOrchestrator>::lookup(remote_orchestrator_name.as_str()).await {
                 Ok(Some(remote_orchestrator)) => {
-                    let delete_msg = crate::node_orchestrator::DeleteIndex {
+                    let delete_msg = crate::node_orchestrator::ClientOp::DeleteIndex {
                         index: msg.index.clone(),
                         delete_schema: msg.delete_schema,
                     };
@@ -2289,17 +2224,9 @@ impl Message<RouteShard> for ClusterCoordinator {
         msg: RouteShard,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match self
-            .cluster
-            .route_to_shard(msg.shard_id, &msg.operation)
-            .await
-        {
-            Ok(res) => Ok(res),
-            Err(err) => {
-                warn!(error = %err, shard_id = %msg.shard_id, "ClusterCoordinator: route_to_shard failed");
-                Err(err)
-            }
-        }
+        // This method is deprecated - direct shard routing should use RouterActor
+        warn!(shard_id = %msg.shard_id, "ClusterCoordinator: RouteShard message is deprecated, use RouterActor");
+        Err(anyhow::anyhow!("Direct shard routing is deprecated. Use RouterActor."))
     }
 }
 
@@ -2427,7 +2354,7 @@ impl Message<TrackPushFailure> for ClusterCoordinator {
 
             // Trigger DHT query as fallback recovery mechanism
             if let Some(handle) = self.cluster.swarm_handle() {
-                if let Err(e) = handle.query_shards(msg.node_id) {
+                if let Err(e) = handle.query_node_metadata(msg.node_id) {
                     error!(node = %msg.node_id, error = %e, "DHT fallback query failed");
                 } else {
                     info!(node = %msg.node_id, "Triggered DHT fallback query after push failures");
