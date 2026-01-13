@@ -467,13 +467,21 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
 
     // Get basic shard count and node info from orchestrator
     let shard_count = state.router.shard_count().await;
-    let node_id = match state.router.handle_client_op(ClientOp::GetIdentity).await {
-        Ok(result) => result
-            .get("node_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("local")
-            .to_string(),
-        Err(_) => "local".to_string(),
+    let (node_id, node_name) = match state.router.handle_client_op(ClientOp::GetIdentity).await {
+        Ok(result) => {
+            let node_id = result
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("local")
+                .to_string();
+            let node_name = result
+                .get("node_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            (node_id, node_name)
+        }
+        Err(_) => ("local".to_string(), "unknown".to_string()),
     };
 
     // Get lightweight index statistics for health check
@@ -512,10 +520,7 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
             .map(|s| s.health.clone())
             .unwrap_or_else(|| "green".to_string()),
         node_id,
-        node_name: cluster_status
-            .as_ref()
-            .map(|s| s.cluster_name.clone())
-            .unwrap_or_else(|| "unknown".to_string()),
+        node_name,
         cluster_name: cluster_status.as_ref().map(|s| s.cluster_name.clone()),
         cluster_enabled: cluster_status.as_ref().map(|s| s.cluster_enabled),
         total_nodes: cluster_status.as_ref().map(|s| s.total_nodes),
