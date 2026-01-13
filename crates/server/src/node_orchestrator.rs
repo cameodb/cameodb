@@ -599,6 +599,7 @@ impl MicroshardActor {
         let store = Arc::clone(store);
         let docs = request.docs;
         let shard_id = self.shard_id;
+        let index_name = request.index; // Use the actual index name from request
 
         // Group operations by index
         let mut ops_by_index: std::collections::HashMap<String, Vec<WalOp>> =
@@ -611,7 +612,7 @@ impl MicroshardActor {
             };
 
             ops_by_index
-                .entry(doc_payload.routing_key.unwrap_or_default())
+                .entry(index_name.clone()) // Use the actual index name, not routing_key
                 .or_default()
                 .push(wal_op);
         }
