@@ -153,11 +153,62 @@ pub struct PeerShardsDiscovered {
     pub shards: Vec<ShardMetadata>,
 }
 
+/// Message when node metadata is discovered via DHT.
+#[derive(Debug, Clone)]
+pub struct PeerNodeMetadataDiscovered {
+    pub node_uuid: String,
+    pub node_name: String,
+    pub shard_count: u32,
+    pub generation: u64,
+    pub checksum: u64,
+    pub address: Option<String>,
+    pub status: String,
+    pub total_storage_bytes: u64,
+    pub total_document_count: u64,
+}
+
+/// Message when a single shard is discovered via DHT.
+#[derive(Debug, Clone)]
+pub struct PeerShardDiscovered {
+    pub node_uuid: String,
+    pub shard: ShardMetadata,
+}
+
 /// Message to merge remote shard assignments into local coordinator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeRemoteShards {
     pub node_id: Uuid,
     pub node_name: String,
+    pub shards: HashMap<Uuid, ShardMetadata>,
+    /// Generation of the sender's cluster state (for deduplication)
+    pub generation: u64,
+    /// Checksum of all shard metadata (for quick comparison)
+    pub shard_checksum: u64,
+}
+
+/// Message to query remote cluster state version before pushing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryClusterState {
+    pub node_id: Uuid,
+    pub generation: u64,
+    pub shard_checksum: u64,
+}
+
+/// Response to QueryClusterState with remote state info
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterStateResponse {
+    pub node_id: Uuid,
+    pub generation: u64,
+    pub shard_checksum: u64,
+    pub needs_full_sync: bool,
+}
+
+/// Internal message to perform intelligent shard exchange with a peer
+#[derive(Debug, Clone)]
+pub struct ExchangeShardsWithPeer {
+    pub peer_id: Uuid,
+    pub generation: u64,
+    pub checksum: u64,
     pub shards: HashMap<Uuid, ShardMetadata>,
 }
 
@@ -226,6 +277,9 @@ pub struct ClusterCoordinator {
 
     // Track push failures per peer for DHT fallback recovery
     push_failure_count: HashMap<Uuid, u32>,
+
+    // Track last seen generation and checksum per node for deduplication
+    last_seen_state: HashMap<Uuid, (u64, u64)>,
 }
 
 impl ClusterCoordinator {
@@ -282,6 +336,7 @@ impl ClusterCoordinator {
             bootstrap_complete: false,
             last_persisted_generation: 0,
             push_failure_count: HashMap::new(),
+            last_seen_state: HashMap::new(),
         }
     }
 
@@ -414,6 +469,7 @@ impl ClusterCoordinator {
             bootstrap_complete: false, // Will be set after initial DHT queries complete
             last_persisted_generation: generation,
             push_failure_count: HashMap::new(),
+            last_seen_state: HashMap::new(),
         }
     }
 
@@ -438,6 +494,144 @@ impl ClusterCoordinator {
         } else {
             node_id.to_string()
         }
+    }
+
+    /// Calculate checksum of all shard metadata for quick comparison
+    fn calculate_shard_checksum(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+
+        // Sort shard IDs for consistent hashing
+        let mut shard_ids: Vec<_> = self.shard_assignments.keys().collect();
+        shard_ids.sort();
+
+        for shard_id in shard_ids {
+            if let Some(meta) = self.shard_assignments.get(shard_id) {
+                // Hash the key components that determine shard state
+                shard_id.hash(&mut hasher);
+                meta.node_id.hash(&mut hasher);
+                meta.document_count.hash(&mut hasher);
+                meta.storage_bytes.hash(&mut hasher);
+
+                // Hash vnode tokens for routing consistency
+                for token in &meta.vnode_tokens {
+                    token.hash(&mut hasher);
+                }
+            }
+        }
+
+        hasher.finish()
+    }
+
+    /// Check if remote node needs our cluster state based on generation and checksum
+    fn remote_needs_update(
+        &self,
+        remote_generation: u64,
+        remote_checksum: u64,
+        node_id: Uuid,
+    ) -> bool {
+        let local_generation = self.generation;
+        let local_checksum = self.calculate_shard_checksum();
+
+        // Check if we've seen this exact state from this node before
+        if let Some((last_gen, last_checksum)) = self.last_seen_state.get(&node_id) {
+            // If this node is sending us the same state we've already recorded, skip
+            if *last_gen == remote_generation && *last_checksum == remote_checksum {
+                return false;
+            }
+        }
+
+        // If data is identical (same checksum) but generations differ, we need to sync generations
+        if local_checksum == remote_checksum {
+            // Data is the same, but we need to converge on the highest generation
+            return remote_generation > local_generation;
+        }
+
+        // Data differs - we need to exchange
+        true
+    }
+
+    /// Update the last seen state for a node
+    fn update_last_seen_state(&mut self, node_id: Uuid, generation: u64, checksum: u64) {
+        self.last_seen_state.insert(node_id, (generation, checksum));
+    }
+
+    /// Update local generation to match higher remote generation when data is identical
+    fn sync_generation_if_needed(&mut self, remote_generation: u64, remote_checksum: u64) {
+        let local_generation = self.generation;
+        let local_checksum = self.calculate_shard_checksum();
+
+        // If data is identical but remote has higher generation, update our generation
+        if local_checksum == remote_checksum && remote_generation > local_generation {
+            info!(
+                old_generation = local_generation,
+                new_generation = remote_generation,
+                "Updating local generation to match remote (data identical)"
+            );
+            self.generation = remote_generation;
+        }
+    }
+
+    /// Get current cluster state info for comparison
+    fn get_cluster_state_info(&self) -> (u64, u64) {
+        (self.generation, self.calculate_shard_checksum())
+    }
+
+    /// Intelligently exchange shard metadata with remote node using deduplication
+    async fn exchange_shards_with_peer(
+        &self,
+        peer_id: Uuid,
+        local_generation: u64,
+        local_checksum: u64,
+        all_shards: HashMap<Uuid, ShardMetadata>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let remote_coord_name = format!("coordinator-{}", peer_id);
+
+        // First, query remote node's state
+        let remote_coord = RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name.clone())
+            .await?
+            .ok_or("Remote coordinator not found")?;
+
+        let query_msg = QueryClusterState {
+            node_id: self.cluster.local_node_id,
+            generation: local_generation,
+            shard_checksum: local_checksum,
+        };
+
+        let response = remote_coord.ask(&query_msg).await?;
+
+        // Only push if remote node needs our data
+        if response.needs_full_sync {
+            debug!(
+                remote_peer = %peer_id,
+                remote_generation = response.generation,
+                remote_checksum = response.shard_checksum,
+                "Remote node needs shard update, pushing full state"
+            );
+
+            let shard_count = all_shards.len();
+            let push_msg = MergeRemoteShards {
+                node_id: self.cluster.local_node_id,
+                node_name: self.cluster.local_node_name.clone(),
+                shards: all_shards,
+                generation: local_generation,
+                shard_checksum: local_checksum,
+            };
+
+            remote_coord.tell(&push_msg).send()?;
+            info!(remote_peer = %peer_id, shard_count = shard_count, "Successfully pushed shard updates");
+        } else {
+            debug!(
+                remote_peer = %peer_id,
+                remote_generation = response.generation,
+                remote_checksum = response.shard_checksum,
+                "Remote node already has current shard state, skipping push"
+            );
+        }
+
+        Ok(())
     }
 
     /// Persist current cluster state snapshot to disk (event-driven)
@@ -521,7 +715,13 @@ impl ClusterCoordinator {
             if !local_shards.is_empty()
                 && let Some(handle) = self.cluster.swarm_handle()
             {
-                if let Err(e) = handle.publish_shards(local_node_id, local_shards) {
+                if let Err(e) = handle.publish_shards(
+                    local_node_id,
+                    self.cluster.local_node_name.clone(),
+                    local_shards,
+                    self.generation,
+                    self.calculate_shard_checksum(),
+                ) {
                     warn!(error = %e, "Failed to re-publish local shards to DHT after peer discovery");
                 } else {
                     debug!(
@@ -565,10 +765,13 @@ impl ClusterCoordinator {
                     );
                     for (peer_id, _) in peers {
                         let remote_coord_name = format!("coordinator-{}", peer_id);
+                        let (local_generation, local_checksum) = self.get_cluster_state_info();
                         let msg = MergeRemoteShards {
                             node_id: local_node_id,
                             node_name: self.cluster.local_node_name.clone(),
                             shards: all_shards.clone(),
+                            generation: local_generation,
+                            shard_checksum: local_checksum,
                         };
                         task::spawn(async move {
                             if let Ok(Some(remote_coord)) =
@@ -701,11 +904,15 @@ impl ClusterCoordinator {
                         return RoutingDecision::Broadcast;
                     }
                 } else {
-                    warn!(%shard_id, "RouteOperation: shard owner unknown, broadcasting");
+                    error!(%shard_id, "RouteOperation: CRITICAL - shard found but owner unknown! This indicates inconsistent state.");
                     return RoutingDecision::Broadcast;
                 }
             } else {
-                warn!("RouteOperation: ring empty, broadcasting");
+                warn!(
+                    ring_size = self.ring.len(),
+                    shard_assignments = self.shard_assignments.len(),
+                    "RouteOperation: ring empty or no shard found for key - this may indicate incomplete shard registration"
+                );
                 return RoutingDecision::Broadcast;
             }
         }
@@ -743,7 +950,13 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
         if !self.bootstrap_complete
             && let Some(handle) = self.cluster.swarm_handle()
         {
-            if let Err(e) = handle.publish_shards(msg.node_id, msg.shards.clone()) {
+            if let Err(e) = handle.publish_shards(
+                msg.node_id,
+                self.cluster.local_node_name.clone(),
+                msg.shards.clone(),
+                self.generation,
+                self.calculate_shard_checksum(),
+            ) {
                 warn!(error = %e, "Failed to publish shards to DHT during bootstrap");
             } else {
                 info!("ClusterCoordinator: published local shards to DHT (bootstrap phase)");
@@ -770,58 +983,35 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
                 info!(
                     peer_count = peers.len(),
                     shard_count = all_shards.len(),
-                    "ClusterCoordinator: broadcasting all shard assignments to peers (stable phase)"
+                    "ClusterCoordinator: intelligently exchanging shard assignments with peers (stable phase)"
                 );
 
                 // Clone self reference for failure tracking callback
                 let self_weak = _ctx.actor_ref().downgrade();
+                let (local_generation, local_checksum) = self.get_cluster_state_info();
 
                 for (peer_id, _peer_addr) in peers {
-                    let remote_coord_name = format!("coordinator-{}", peer_id);
-                    let msg = MergeRemoteShards {
-                        node_id: local_node_id,
-                        node_name: self.cluster.local_node_name.clone(),
-                        shards: all_shards.clone(),
-                    };
                     let self_weak_clone = self_weak.clone();
+                    let peer_shards = all_shards.clone();
+                    let peer_generation = local_generation;
+                    let peer_checksum = local_checksum;
 
                     task::spawn(async move {
-                        match RemoteActorRef::<ClusterCoordinator>::lookup(
-                            remote_coord_name.clone(),
-                        )
-                        .await
-                        {
-                            Ok(Some(remote_coord)) => match remote_coord.tell(&msg).send() {
-                                Ok(_) => {
-                                    debug!(node = %peer_id, "Successfully pushed shard update to remote coordinator");
-                                    // Reset failure count on success
-                                    if let Some(self_ref) = self_weak_clone.upgrade() {
-                                        let _ = self_ref
-                                            .tell::<ResetPushFailure>(ResetPushFailure {
-                                                node_id: peer_id,
-                                            })
-                                            .send()
-                                            .await;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(node = %peer_id, error = %e, "Failed to push shard update to remote coordinator");
-                                    // Track failure and trigger DHT fallback if threshold exceeded
-                                    if let Some(self_ref) = self_weak_clone.upgrade() {
-                                        let _ = self_ref
-                                            .tell::<TrackPushFailure>(TrackPushFailure {
-                                                node_id: peer_id,
-                                            })
-                                            .send()
-                                            .await;
-                                    }
-                                }
-                            },
-                            Ok(None) => {
-                                warn!(node = %peer_id, "Remote coordinator not found for push update");
+                        match self_weak_clone.upgrade() {
+                            Some(self_ref) => {
+                                // Send a message to perform intelligent exchange
+                                let exchange_msg = ExchangeShardsWithPeer {
+                                    peer_id,
+                                    generation: peer_generation,
+                                    checksum: peer_checksum,
+                                    shards: peer_shards,
+                                };
+                                let _ = self_ref.tell(exchange_msg).send().await;
                             }
-                            Err(e) => {
-                                error!(node = %peer_id, error = %e, "Failed to lookup remote coordinator for push update");
+                            None => {
+                                debug!(
+                                    "ClusterCoordinator dropped during intelligent shard exchange"
+                                );
                             }
                         }
                     });
@@ -1007,6 +1197,42 @@ impl Message<InitSwarm> for ClusterCoordinator {
                                         .await
                                     {
                                         warn!(error = %err, "ClusterCoordinator: failed to forward peer shards discovered");
+                                    }
+                                }
+                                CoordinatorEvent::PeerNodeMetadataDiscovered {
+                                    node_uuid,
+                                    node_name,
+                                    shard_count,
+                                    generation,
+                                    checksum,
+                                    address,
+                                    status,
+                                    total_storage_bytes,
+                                    total_document_count,
+                                } => {
+                                    if let Err(err) = coordinator
+                                        .ask(PeerNodeMetadataDiscovered {
+                                            node_uuid,
+                                            node_name,
+                                            shard_count,
+                                            generation,
+                                            checksum,
+                                            address,
+                                            status,
+                                            total_storage_bytes,
+                                            total_document_count,
+                                        })
+                                        .await
+                                    {
+                                        warn!(error = %err, "ClusterCoordinator: failed to forward peer node metadata discovered");
+                                    }
+                                }
+                                CoordinatorEvent::PeerShardDiscovered { node_uuid, shard } => {
+                                    if let Err(err) = coordinator
+                                        .ask(PeerShardDiscovered { node_uuid, shard })
+                                        .await
+                                    {
+                                        warn!(error = %err, "ClusterCoordinator: failed to forward peer shard discovered");
                                     }
                                 }
                                 CoordinatorEvent::PeerLost {
@@ -1232,29 +1458,27 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
         // Persist snapshot after peer discovery (debounced)
         self.persist_snapshot();
 
-        // DHT Query Guard: Only query DHT if we don't already have shard metadata for this node
-        // This avoids redundant DHT queries when Kameo push has already delivered the metadata
+        // Optimized DHT Query Strategy:
+        // 1. First query node metadata only (fast)
+        // 2. Only query individual shards if metadata indicates changes
         let needs_dht_query = !self
             .shard_assignments
             .values()
             .any(|s| s.node_id == msg.node_id);
 
-        // In discovery phase, we are primarily interested in identifying nodes.
-        // Once stability is reached, evaluate_and_transition_state will trigger
-        // a full actor-push sync of shard metadata.
         if needs_dht_query && !self.bootstrap_complete {
-            // Trigger DHT lookup for peer shards (bootstrap phase only)
+            // Phase 1: Query node metadata (fast, small record)
             if let Some(handle) = self.cluster.swarm_handle() {
                 if let Err(e) = handle.query_shards(msg.node_id) {
-                    warn!(node = %msg.node_id, error = %e, "Failed to query peer shards from DHT");
+                    warn!(node = %msg.node_id, error = %e, "Failed to query peer node metadata from DHT");
                 } else {
-                    info!(node = %msg.node_id, "ClusterCoordinator: querying shards from DHT (bootstrap)");
+                    info!(node = %msg.node_id, "ClusterCoordinator: querying node metadata from DHT (bootstrap phase 1)");
                 }
             }
         } else if needs_dht_query {
             debug!(node = %msg.node_id, "Skipping DHT query (bootstrap complete, relying on Kameo push)");
         } else {
-            debug!(node = %msg.node_id, "Skipping DHT query (already have shard metadata)");
+            debug!(node = %msg.node_id, "Already have shard metadata for this node");
         }
 
         // Removed redundant single-node bootstrap completion.
@@ -1267,6 +1491,7 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
             let local_node_id = self.cluster.local_node_id;
             let local_node_name = self.cluster.local_node_name.clone();
             let all_shards = self.shard_assignments.clone();
+            let (local_generation, local_checksum) = self.get_cluster_state_info();
 
             // Fetch shard metadata from remote coordinator AND push ALL shards in background task
             let remote_coord_name = format!("coordinator-{}", msg.node_id);
@@ -1315,6 +1540,8 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
                             node_id: local_node_id,
                             node_name: local_node_name,
                             shards: all_shards,
+                            generation: local_generation,
+                            shard_checksum: local_checksum,
                         };
                         match remote_coord.tell(&push_msg).send() {
                             Ok(_) => {
@@ -1339,11 +1566,14 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
                                     );
                                     // Merge remote shards into local coordinator
                                     // Note: node_name will be populated from the remote response
+                                    // For DHT-received shards, we use placeholder generation/checksum (0) as they're from bootstrap
                                     let _ = self_ref
                                         .tell::<MergeRemoteShards>(MergeRemoteShards {
                                             node_id,
                                             node_name: String::new(), // Placeholder, will be updated from peer info
                                             shards: remote_shards,
+                                            generation: 0, // Placeholder for DHT bootstrap data
+                                            shard_checksum: 0, // Placeholder for DHT bootstrap data
                                         })
                                         .send()
                                         .await;
@@ -1410,6 +1640,157 @@ impl Message<PeerShardsDiscovered> for ClusterCoordinator {
     }
 }
 
+impl Message<PeerNodeMetadataDiscovered> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: PeerNodeMetadataDiscovered,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // Parse node_uuid string to UUID
+        let node_uuid = match Uuid::parse_str(&msg.node_uuid) {
+            Ok(uuid) => uuid,
+            Err(e) => {
+                warn!(node_uuid = %msg.node_uuid, error = %e, "Failed to parse node UUID from metadata");
+                return;
+            }
+        };
+
+        let node_identity = self.format_node_identity(node_uuid);
+        info!(
+            peer = %node_identity,
+            node_name = %msg.node_name,
+            shard_count = %msg.shard_count,
+            generation = %msg.generation,
+            storage = %msg.total_storage_bytes,
+            documents = %msg.total_document_count,
+            status = %msg.status,
+            "ClusterCoordinator: discovered node metadata from DHT"
+        );
+
+        // Update expected_nodes with additional information
+        self.expected_nodes
+            .entry(node_uuid)
+            .and_modify(|node_info| {
+                if let Some(ref addr) = msg.address {
+                    node_info.address = addr.clone();
+                }
+                node_info.node_name = Some(msg.node_name.clone());
+                node_info.shard_count = msg.shard_count as usize;
+                // Update status based on DHT metadata
+                node_info.status = match msg.status.as_str() {
+                    "Connected" => crate::distributed::NodeStatus::Connected,
+                    _ => crate::distributed::NodeStatus::Disconnected, // Default to Disconnected for unknown status
+                };
+            })
+            .or_insert_with(|| NodeInfo {
+                node_id: node_uuid,
+                node_name: Some(msg.node_name.clone()),
+                address: msg.address.unwrap_or_else(|| "unknown".to_string()),
+                status: match msg.status.as_str() {
+                    "Connected" => crate::distributed::NodeStatus::Connected,
+                    _ => crate::distributed::NodeStatus::Disconnected, // Default to Disconnected for unknown status
+                },
+                shard_count: msg.shard_count as usize,
+            });
+
+        // Check if we need to query individual shards
+        // Only query if metadata indicates changes
+        if let Some((last_gen, last_checksum)) = self.last_seen_state.get(&node_uuid)
+            && *last_gen == msg.generation
+            && *last_checksum == msg.checksum
+        {
+            debug!(
+                peer = %node_identity,
+                "ClusterCoordinator: node metadata unchanged, skipping shard queries"
+            );
+            return;
+        }
+
+        // Metadata has changed, query individual shards that we don't have
+        let existing_shard_ids: std::collections::HashSet<_> = self
+            .shard_assignments
+            .values()
+            .filter(|s| s.node_id == node_uuid)
+            .map(|s| s.shard_id)
+            .collect();
+
+        // For now, we don't know which specific shard IDs to query
+        // In a full implementation, we would:
+        // 1. Maintain a list of known shard IDs for each node
+        // 2. Query only the missing/changed shards
+        // 3. Use the query_shard method for granular updates
+
+        // TODO: Implement individual shard queries based on shard count
+        // For now, we'll trigger a full shard query if we have no shards for this node
+        if existing_shard_ids.is_empty() && msg.shard_count > 0 {
+            info!(
+                peer = %node_identity,
+                shard_count = %msg.shard_count,
+                "ClusterCoordinator: no local shards for peer, will query all shards"
+            );
+            // Fall back to querying all shards (legacy behavior)
+            // We can't query individual shards without knowing their IDs
+            // So we'll need to wait for the peer to push shard metadata via Kameo
+            debug!(peer = %node_identity, "Waiting for shard metadata via Kameo push");
+        }
+
+        self.last_seen_state
+            .insert(node_uuid, (msg.generation, msg.checksum));
+    }
+}
+
+impl Message<PeerShardDiscovered> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: PeerShardDiscovered,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // Parse node_uuid string to UUID
+        let node_uuid = match Uuid::parse_str(&msg.node_uuid) {
+            Ok(uuid) => uuid,
+            Err(e) => {
+                warn!(node_uuid = %msg.node_uuid, error = %e, "Failed to parse node UUID from shard discovery");
+                return;
+            }
+        };
+
+        let node_identity = self.format_node_identity(node_uuid);
+        debug!(
+            peer = %node_identity,
+            shard_id = %msg.shard.shard_id,
+            doc_count = %msg.shard.document_count,
+            "ClusterCoordinator: discovered individual shard from DHT"
+        );
+
+        // Update or insert shard metadata
+        // We trust the DHT record as it's published by the owner
+        let old_shard = self
+            .shard_assignments
+            .insert(msg.shard.shard_id, msg.shard.clone());
+
+        // Only increment generation if this is actually a change
+        if old_shard.as_ref().map(|s| s.document_count) != Some(msg.shard.document_count)
+            || old_shard.as_ref().map(|s| s.storage_bytes) != Some(msg.shard.storage_bytes)
+        {
+            self.generation += 1;
+            self.rebuild_ring();
+            self.evaluate_and_transition_state();
+            self.persist_snapshot();
+
+            info!(
+                peer = %node_identity,
+                shard_id = %msg.shard.shard_id,
+                total_shards = self.shard_assignments.len(),
+                "ClusterCoordinator: updated ring from individual shard discovery"
+            );
+        }
+    }
+}
+
 impl Message<PeerLost> for ClusterCoordinator {
     type Reply = ();
 
@@ -1441,6 +1822,48 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
         let node_id = msg.node_id;
         let node_name = msg.node_name;
         let actual_shards = msg.shards;
+        let remote_generation = msg.generation;
+        let remote_checksum = msg.shard_checksum;
+
+        // Check if we actually need this update
+        let (local_generation, local_checksum) = self.get_cluster_state_info();
+
+        // Always update last seen state first
+        self.update_last_seen_state(node_id, remote_generation, remote_checksum);
+
+        // Check if data is identical - if so, just sync generations and skip merge
+        if local_checksum == remote_checksum {
+            self.sync_generation_if_needed(remote_generation, remote_checksum);
+            debug!(
+                remote_node = %node_id,
+                remote_generation,
+                remote_checksum,
+                local_generation,
+                local_checksum,
+                "ClusterCoordinator: skipping merge - data identical, synced generations"
+            );
+            return;
+        }
+
+        // If we get here, data differs and we need to do the full merge
+        if !self.remote_needs_update(remote_generation, remote_checksum, node_id) {
+            debug!(
+                remote_node = %node_id,
+                remote_generation,
+                remote_checksum,
+                local_generation,
+                local_checksum,
+                "ClusterCoordinator: skipping redundant shard push"
+            );
+            return;
+        }
+
+        info!(
+            remote_node = %node_id,
+            remote_generation,
+            remote_checksum,
+            "ClusterCoordinator: processing needed shard push"
+        );
 
         // Skip tracking if this is our own node (avoid double-counting in peer_nodes)
         let is_local_node = node_id == self.cluster.local_node_id;
@@ -1613,6 +2036,48 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
     }
 }
 
+/// Remote message handler to query cluster state version for deduplication.
+#[remote_message("cameo.coordinator.query_cluster_state")]
+impl Message<QueryClusterState> for ClusterCoordinator {
+    type Reply = Result<ClusterStateResponse, String>;
+
+    async fn handle(
+        &mut self,
+        msg: QueryClusterState,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let (local_generation, local_checksum) = self.get_cluster_state_info();
+
+        // Always update last seen state first
+        self.update_last_seen_state(msg.node_id, msg.generation, msg.shard_checksum);
+
+        // Check if data is identical - if so, sync generations
+        if local_checksum == msg.shard_checksum {
+            self.sync_generation_if_needed(msg.generation, msg.shard_checksum);
+        }
+
+        let needs_full_sync =
+            self.remote_needs_update(msg.generation, msg.shard_checksum, msg.node_id);
+
+        debug!(
+            remote_node = %msg.node_id,
+            remote_generation = msg.generation,
+            remote_checksum = msg.shard_checksum,
+            local_generation,
+            local_checksum,
+            needs_full_sync,
+            "ClusterCoordinator: received cluster state query"
+        );
+
+        Ok(ClusterStateResponse {
+            node_id: self.cluster.local_node_id,
+            generation: local_generation,
+            shard_checksum: local_checksum,
+            needs_full_sync,
+        })
+    }
+}
+
 impl Message<RouteShard> for ClusterCoordinator {
     type Reply = Result<String>;
 
@@ -1644,6 +2109,45 @@ impl Message<RouteOperation> for ClusterCoordinator {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.decide_route(msg.routing_key, msg.operation_type)
+    }
+}
+
+impl Message<ExchangeShardsWithPeer> for ClusterCoordinator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: ExchangeShardsWithPeer,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // Clone shards for fallback in case the main exchange fails
+        let fallback_shards = msg.shards.clone();
+
+        match self
+            .exchange_shards_with_peer(msg.peer_id, msg.generation, msg.checksum, msg.shards)
+            .await
+        {
+            Ok(_) => {
+                // Success logged in exchange_shards_with_peer
+            }
+            Err(e) => {
+                warn!(peer = %msg.peer_id, error = %e, "Failed to exchange shards with peer");
+                // Fall back to traditional push for reliability
+                let remote_coord_name = format!("coordinator-{}", msg.peer_id);
+                if let Ok(Some(remote_coord)) =
+                    RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name.clone()).await
+                {
+                    let fallback_msg = MergeRemoteShards {
+                        node_id: self.cluster.local_node_id,
+                        node_name: self.cluster.local_node_name.clone(),
+                        shards: fallback_shards,
+                        generation: msg.generation,
+                        shard_checksum: msg.checksum,
+                    };
+                    let _ = remote_coord.tell(&fallback_msg).send();
+                }
+            }
+        }
     }
 }
 

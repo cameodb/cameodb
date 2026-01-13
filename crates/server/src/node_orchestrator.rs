@@ -54,6 +54,14 @@ use storage::{
 // Type alias for routing results to reduce complexity
 type RoutingResult = Result<(usize, DocPayload, Option<String>), OrchestratorError>;
 
+/// Helper function to detect if an operation is a write operation
+fn is_write_operation(op: &ClientOp) -> bool {
+    matches!(
+        op,
+        ClientOp::Write { .. } | ClientOp::BulkWrite { .. } | ClientOp::DeleteIndex { .. }
+    )
+}
+
 // ============================================================================
 // Streaming Search Results
 // ============================================================================
@@ -1121,6 +1129,15 @@ impl RouterActor {
         match decision {
             Ok(RoutingDecision::Local) => self.handle_client_op(op).await,
             Ok(RoutingDecision::Broadcast) => {
+                // CRITICAL: Never broadcast write operations - this causes data duplication
+                // and inconsistency. Writes must be routed to a specific shard.
+                if is_write_operation(&op) {
+                    return Err(OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Write operation cannot be broadcast - routing failed",
+                    )));
+                }
+
                 // Use streaming for search operations if enabled
                 if self.enable_streaming_search
                     && matches!(op, ClientOp::Search { .. } | ClientOp::Stream { .. })
@@ -2723,9 +2740,8 @@ impl NodeOrchestrator {
                 Ok(()) => {
                     self.shards.insert(shard_id, microshard);
                     self.register_shard_for_routing(shard_id);
-                    if let Err(err) = self.register_shard_with_coordinator(shard_id).await {
-                        warn!(%shard_id, error = %err, "Failed to register hydrated shard");
-                    }
+                    // Note: Don't register with coordinator here - it's not set yet
+                    // Registration happens via register_all_shards_with_coordinator() after coordinator is set
                     info!("Hydrated shard {}", shard_id);
 
                     // Preload schemas for all indexes in this shard for instant field availability

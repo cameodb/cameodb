@@ -71,6 +71,21 @@ pub enum CoordinatorEvent {
         node_uuid: String,
         address: Option<String>,
     },
+    PeerNodeMetadataDiscovered {
+        node_uuid: String,
+        node_name: String,
+        shard_count: u32,
+        generation: u64,
+        checksum: u64,
+        address: Option<String>,
+        status: String,
+        total_storage_bytes: u64,
+        total_document_count: u64,
+    },
+    PeerShardDiscovered {
+        node_uuid: String,
+        shard: crate::cluster_coordinator::ShardMetadata,
+    },
     PeerShardsDiscovered {
         peer_id: String,
         shards: Vec<crate::cluster_coordinator::ShardMetadata>,
@@ -123,11 +138,19 @@ impl SwarmRuntimeHandle {
     pub fn publish_shards(
         &self,
         node_uuid: Uuid,
+        node_name: String,
         shards: Vec<crate::cluster_coordinator::ShardMetadata>,
-    ) -> Result<()> {
-        if let Some(tx) = &self.cmd_tx {
-            tx.send(SwarmCommand::PublishShards { node_uuid, shards })
-                .map_err(|_| anyhow::anyhow!("Swarm runtime channel closed"))?;
+        generation: u64,
+        checksum: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref cmd_tx) = self.cmd_tx {
+            cmd_tx.send(SwarmCommand::PublishShards {
+                node_uuid,
+                node_name,
+                shards,
+                generation,
+                checksum,
+            })?;
         }
         Ok(())
     }
@@ -137,6 +160,19 @@ impl SwarmRuntimeHandle {
         if let Some(tx) = &self.cmd_tx {
             tx.send(SwarmCommand::QueryShards { node_uuid })
                 .map_err(|_| anyhow::anyhow!("Swarm runtime channel closed"))?;
+        }
+        Ok(())
+    }
+
+    /// Query a specific shard from the DHT
+    #[allow(dead_code)]
+    pub fn query_shard(&self, node_uuid: Uuid, shard_id: Uuid) -> Result<()> {
+        if let Some(tx) = &self.cmd_tx {
+            tx.send(SwarmCommand::QueryShard {
+                node_uuid,
+                shard_id,
+            })
+            .map_err(|_| anyhow::anyhow!("Swarm runtime channel closed"))?;
         }
         Ok(())
     }
@@ -336,21 +372,23 @@ async fn create_production_swarm(
             continue;
         }
         if let Some(ip4) = listen_ip4
-            && addr.to_string().starts_with(&format!("/ip4/{}/tcp/", ip4)) {
-                info!(
-                    "⏭️  Skipping self-dial to local seed node (ip4 match): {}",
-                    addr
-                );
-                continue;
-            }
+            && addr.to_string().starts_with(&format!("/ip4/{}/tcp/", ip4))
+        {
+            info!(
+                "⏭️  Skipping self-dial to local seed node (ip4 match): {}",
+                addr
+            );
+            continue;
+        }
         if let Some(ip6) = listen_ip6
-            && addr.to_string().starts_with(&format!("/ip6/{}/tcp/", ip6)) {
-                info!(
-                    "⏭️  Skipping self-dial to local seed node (ip6 match): {}",
-                    addr
-                );
-                continue;
-            }
+            && addr.to_string().starts_with(&format!("/ip6/{}/tcp/", ip6))
+        {
+            info!(
+                "⏭️  Skipping self-dial to local seed node (ip6 match): {}",
+                addr
+            );
+            continue;
+        }
 
         info!("📞 Attempting to dial seed node: {}", addr);
         match swarm.dial(addr.clone()) {
@@ -611,22 +649,47 @@ fn launch_swarm_runtime(
 pub enum SwarmCommand {
     PublishShards {
         node_uuid: Uuid,
+        node_name: String,
         shards: Vec<crate::cluster_coordinator::ShardMetadata>,
+        generation: u64,
+        checksum: u64,
     },
     QueryShards {
         node_uuid: Uuid,
+    },
+    #[allow(dead_code)]
+    QueryShard {
+        node_uuid: Uuid,
+        shard_id: Uuid,
     },
 }
 
 fn handle_swarm_command(cmd: SwarmCommand, swarm: &mut libp2p::Swarm<DhtBehaviour>) {
     match cmd {
-        SwarmCommand::PublishShards { node_uuid, shards } => {
-            if let Err(e) = swarm.behaviour_mut().publish_shards(node_uuid, &shards) {
+        SwarmCommand::PublishShards {
+            node_uuid,
+            node_name,
+            shards,
+            generation,
+            checksum,
+        } => {
+            if let Err(e) = swarm
+                .behaviour_mut()
+                .publish_shards(node_uuid, node_name, &shards, generation, checksum)
+            {
                 warn!("⚠️  Failed to publish shards to DHT: {}", e);
             }
         }
         SwarmCommand::QueryShards { node_uuid } => {
             swarm.behaviour_mut().query_shards(node_uuid);
+        }
+        SwarmCommand::QueryShard {
+            node_uuid,
+            shard_id,
+        } => {
+            swarm
+                .behaviour_mut()
+                .query_shard_metadata(node_uuid, shard_id);
         }
     }
 }
@@ -870,31 +933,86 @@ fn handle_kademlia_event(
                         node_uuid: uuid_str.to_string(),
                         address: None,
                     });
-                } else if key_str.starts_with("cameodb-shards-") {
-                    let peer_id_str = key_str.trim_start_matches("cameodb-shards-");
-
-                    match serde_json::from_slice::<Vec<crate::cluster_coordinator::ShardMetadata>>(
+                } else if key_str.starts_with("cameodb-node-") {
+                    match serde_json::from_slice::<crate::swarm::behaviour::NodeMetadata>(
                         &record.value,
                     ) {
-                        Ok(shards) => {
+                        Ok(metadata) => {
                             info!(
-                                "🎯 DHT Shards Found: Peer {} -> {} shards",
-                                peer_id_str,
-                                shards.len()
+                                "🎯 DHT Node Metadata Found: Node {} -> {} shards, gen={}, storage={} docs={}",
+                                metadata.node_uuid,
+                                metadata.shard_count,
+                                metadata.generation,
+                                metadata.total_storage_bytes,
+                                metadata.total_document_count
                             );
 
-                            let _ = event_tx.send(CoordinatorEvent::PeerShardsDiscovered {
-                                peer_id: peer_id_str.to_string(),
-                                shards,
+                            let _ = event_tx.send(CoordinatorEvent::PeerNodeMetadataDiscovered {
+                                node_uuid: metadata.node_uuid.to_string(),
+                                node_name: metadata.node_name,
+                                shard_count: metadata.shard_count,
+                                generation: metadata.generation,
+                                checksum: metadata.checksum,
+                                address: metadata.address,
+                                status: metadata.status,
+                                total_storage_bytes: metadata.total_storage_bytes,
+                                total_document_count: metadata.total_document_count,
                             });
                         }
                         Err(e) => {
-                            warn!(
-                                "⚠️  Failed to deserialize shards from DHT for peer {}: {}",
-                                peer_id_str, e
-                            );
+                            warn!("Failed to deserialize node metadata: {}", e);
                         }
                     }
+                } else if key_str.starts_with("cameodb-shard-") {
+                    let parts: Vec<&str> = key_str.split('-').collect();
+
+                    if parts.len() >= 4 {
+                        match serde_json::from_slice::<crate::cluster_coordinator::ShardMetadata>(
+                            &record.value,
+                        ) {
+                            Ok(shard) => {
+                                info!(
+                                    "🎯 DHT Shard Found: Node {} -> Shard {} ({})",
+                                    shard.node_id, shard.shard_id, shard.document_count
+                                );
+
+                                let _ = event_tx.send(CoordinatorEvent::PeerShardDiscovered {
+                                    node_uuid: shard.node_id.to_string(),
+                                    shard,
+                                });
+                            }
+                            Err(e) => {
+                                warn!("Failed to deserialize shard metadata: {}", e);
+                            }
+                        }
+                    }
+                } else if key_str.starts_with("cameodb-shards-") {
+                    // Legacy support for old format (now just plain JSON)
+                    let peer_id_str = key_str.trim_start_matches("cameodb-shards-");
+
+                    // Direct JSON deserialization for backward compatibility
+                    let shards = match serde_json::from_slice::<
+                        Vec<crate::cluster_coordinator::ShardMetadata>,
+                    >(&record.value)
+                    {
+                        Ok(shards) => shards,
+                        Err(e) => {
+                            warn!("Failed to deserialize legacy shard metadata: {}", e);
+                            return;
+                        }
+                    };
+
+                    info!(
+                        "🎯 DHT Legacy Shards Found: Peer {} -> {} shards ({} bytes)",
+                        peer_id_str,
+                        shards.len(),
+                        record.value.len()
+                    );
+
+                    let _ = event_tx.send(CoordinatorEvent::PeerShardsDiscovered {
+                        peer_id: peer_id_str.to_string(),
+                        shards,
+                    });
                 }
             }
             _ => {

@@ -10,7 +10,42 @@ use libp2p::{
     kad::{self, Mode as KadMode, store::MemoryStore},
     swarm::NetworkBehaviour,
 };
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+/// Node metadata published to DHT
+/// Contains node-level information that changes infrequently
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeMetadata {
+    pub node_uuid: uuid::Uuid,
+    pub node_name: String,
+    pub shard_count: u32,
+    pub generation: u64,
+    pub checksum: u64,
+    pub last_updated: chrono::DateTime<chrono::Utc>,
+    /// Node's cluster address (for connectivity)
+    pub address: Option<String>,
+    /// Node's status (for cluster state tracking)
+    pub status: String, // "Connected", "Disconnected", etc.
+    /// Total storage bytes across all shards
+    pub total_storage_bytes: u64,
+    /// Total document count across all shards
+    pub total_document_count: u64,
+}
+
+/// Parameters for publishing node metadata
+#[derive(Debug, Clone)]
+pub struct NodeMetadataParams {
+    pub node_uuid: uuid::Uuid,
+    pub node_name: String,
+    pub shard_count: u32,
+    pub generation: u64,
+    pub checksum: u64,
+    pub address: Option<String>,
+    pub status: String,
+    pub total_storage_bytes: u64,
+    pub total_document_count: u64,
+}
 
 /// Network behaviour for distributed peer discovery and routing
 ///
@@ -116,24 +151,36 @@ impl DhtBehaviour {
         self.kademlia.get_record(key)
     }
 
-    /// Publish local shards to DHT so peers can build the consistent hash ring
-    pub fn publish_shards(
+    /// Publish node metadata to DHT
+    /// Contains node-level information that changes infrequently
+    pub fn publish_node_metadata(
         &mut self,
-        node_uuid: uuid::Uuid,
-        shards: &[crate::cluster_coordinator::ShardMetadata],
+        params: NodeMetadataParams,
     ) -> Result<(), anyhow::Error> {
         use libp2p::kad::{Record, RecordKey};
 
-        let shards_bytes = serde_json::to_vec(shards)?;
+        let metadata = NodeMetadata {
+            node_uuid: params.node_uuid,
+            node_name: params.node_name,
+            shard_count: params.shard_count,
+            generation: params.generation,
+            checksum: params.checksum,
+            last_updated: chrono::Utc::now(),
+            address: params.address,
+            status: params.status,
+            total_storage_bytes: params.total_storage_bytes,
+            total_document_count: params.total_document_count,
+        };
 
-        // Key: cameodb-shards-{node_uuid}
-        // We use Node UUID instead of PeerID for stability across restarts if PeerID changes
-        let key_str = format!("cameodb-shards-{}", node_uuid);
+        let metadata_bytes = serde_json::to_vec(&metadata)?;
+
+        // Key: cameodb-node-{node_uuid}
+        let key_str = format!("cameodb-node-{}", metadata.node_uuid);
         let key = RecordKey::new(&key_str);
 
         let record = Record {
             key: key.clone(),
-            value: shards_bytes,
+            value: metadata_bytes,
             publisher: None,
             expires: None, // TODO: Set expiration
         };
@@ -141,28 +188,147 @@ impl DhtBehaviour {
         match self.kademlia.put_record(record, kad::Quorum::One) {
             Ok(_) => {
                 info!(
-                    "📝 Published {} shards to DHT with key {}",
-                    shards.len(),
-                    key_str
+                    "📝 Published node metadata to DHT with key {} ({} shards, gen={})",
+                    key_str, metadata.shard_count, metadata.generation
                 );
                 Ok(())
             }
             Err(e) => {
-                warn!("⚠️  Failed to publish shards to DHT: {:?}", e);
-                Err(anyhow::anyhow!("Failed to publish shards: {:?}", e))
+                warn!("⚠️  Failed to publish node metadata to DHT: {:?}", e);
+                Err(anyhow::anyhow!("Failed to publish node metadata: {:?}", e))
             }
         }
     }
 
-    /// Query DHT for a peer's shards
-    pub fn query_shards(&mut self, node_uuid: uuid::Uuid) -> kad::QueryId {
-        let key_str = format!("cameodb-shards-{}", node_uuid);
+    /// Publish individual shard metadata to DHT
+    /// Each shard gets its own record for granular updates
+    pub fn publish_shard_metadata(
+        &mut self,
+        node_uuid: uuid::Uuid,
+        shard: &crate::cluster_coordinator::ShardMetadata,
+    ) -> Result<(), anyhow::Error> {
+        use libp2p::kad::{Record, RecordKey};
+
+        let shard_bytes = serde_json::to_vec(shard)?;
+
+        // Key: cameodb-shard-{node_uuid}-{shard_id}
+        let key_str = format!("cameodb-shard-{}-{}", node_uuid, shard.shard_id);
+        let key = RecordKey::new(&key_str);
+
+        let record = Record {
+            key: key.clone(),
+            value: shard_bytes,
+            publisher: None,
+            expires: None, // TODO: Set expiration
+        };
+
+        match self.kademlia.put_record(record, kad::Quorum::One) {
+            Ok(_) => {
+                info!(
+                    "📝 Published shard {} to DHT with key {}",
+                    shard.shard_id, key_str
+                );
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    "⚠️  Failed to publish shard {} to DHT: {:?}",
+                    e, shard.shard_id
+                );
+                Err(anyhow::anyhow!(
+                    "Failed to publish shard {}: {:?}",
+                    shard.shard_id,
+                    e
+                ))
+            }
+        }
+    }
+
+    /// Publish multiple shards efficiently
+    /// Updates node metadata and publishes individual shard records
+    pub fn publish_shards(
+        &mut self,
+        node_uuid: uuid::Uuid,
+        node_name: String,
+        shards: &[crate::cluster_coordinator::ShardMetadata],
+        generation: u64,
+        checksum: u64,
+    ) -> Result<(), anyhow::Error> {
+        // Calculate totals from shards
+        let total_storage_bytes: u64 = shards.iter().map(|s| s.storage_bytes).sum();
+        let total_document_count: u64 = shards.iter().map(|s| s.document_count).sum();
+
+        // First publish node metadata
+        let params = NodeMetadataParams {
+            node_uuid,
+            node_name,
+            shard_count: shards.len() as u32,
+            generation,
+            checksum,
+            address: None, // Will be filled by swarm/identify protocol
+            status: "Connected".to_string(), // Default status
+            total_storage_bytes,
+            total_document_count,
+        };
+
+        self.publish_node_metadata(params)?;
+
+        // Then publish each shard individually
+        let mut published = 0;
+        let mut failed = 0;
+
+        for shard in shards {
+            match self.publish_shard_metadata(node_uuid, shard) {
+                Ok(_) => published += 1,
+                Err(e) => {
+                    warn!("Failed to publish shard {}: {:?}", shard.shard_id, e);
+                    failed += 1;
+                }
+            }
+        }
+
+        info!(
+            "📊 Shard publishing complete: {} published, {} failed",
+            published, failed
+        );
+
+        if failed > 0 {
+            warn!("⚠️  Some shards failed to publish to DHT");
+        }
+
+        Ok(())
+    }
+
+    /// Query DHT for a peer's node metadata
+    pub fn query_node_metadata(&mut self, node_uuid: uuid::Uuid) -> kad::QueryId {
+        let key_str = format!("cameodb-node-{}", node_uuid);
         let key = kad::RecordKey::new(&key_str);
         info!(
-            "🔍 Querying DHT for shards of node {} with key {}",
+            "🔍 Querying DHT for node metadata of {} with key {}",
             node_uuid, key_str
         );
         self.kademlia.get_record(key)
+    }
+
+    /// Query a specific shard's metadata from the DHT
+    /// TODO: Implement logic to query individual shards when node metadata changes
+    #[allow(dead_code)]
+    pub fn query_shard_metadata(
+        &mut self,
+        node_uuid: uuid::Uuid,
+        shard_id: uuid::Uuid,
+    ) -> kad::QueryId {
+        let key_str = format!("cameodb-shard-{}-{}", node_uuid, shard_id);
+        let key = kad::RecordKey::new(&key_str);
+        self.kademlia.get_record(key)
+    }
+
+    /// Query DHT for all shards of a node (legacy method for backward compatibility)
+    /// This now queries node metadata first, then individual shards
+    pub fn query_shards(&mut self, node_uuid: uuid::Uuid) -> kad::QueryId {
+        // For now, just query node metadata
+        // The swarm event handler will trigger individual shard queries based on metadata
+        self.query_node_metadata(node_uuid)
     }
 
     /// Bootstrap the Kademlia DHT

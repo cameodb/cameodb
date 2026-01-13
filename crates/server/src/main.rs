@@ -101,32 +101,6 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    // Initialize default shards on first boot if none exist
-    let init_shards = cameodb_config.storage.num_shards_init;
-    if orchestrator.shard_count() == 0 && init_shards > 0 {
-        for _ in 0..init_shards {
-            let shard_id = uuid::Uuid::new_v4();
-            if let Err(err) = orchestrator
-                .handle_propose_shard(ProposeShard { shard_id })
-                .await
-            {
-                tracing::warn!(%shard_id, %err, "Failed to create initial shard");
-            }
-        }
-        println!("Initialized {} shards", init_shards);
-    }
-
-    println!("NodeOrchestrator started successfully");
-    println!(
-        "Node identity: {} ({})",
-        orchestrator.identity().name,
-        orchestrator.identity().uuid
-    );
-    if let Some(label) = cameodb_config.node.label.as_deref() {
-        println!("Node label: {}", label);
-    }
-    println!("Active shards: {}", orchestrator.shard_count());
-
     // Capture node_id early for remote registration
     let node_id = orchestrator.identity().uuid;
 
@@ -149,29 +123,68 @@ async fn main() -> Result<()> {
         cameodb_config.storage.data_paths[0].clone(),
     );
 
-    let coordinator_actor = if let Some(persisted) = persisted_cluster {
+    // Create ClusterCoordinator but DON'T start swarm yet
+    let coordinator = if let Some(persisted) = persisted_cluster {
         tracing::info!(
             "Restoring cluster from persisted state: {} nodes, {} shards expected",
             persisted.nodes.len(),
             persisted.shards.len()
         );
-        ClusterCoordinator::spawn(ClusterCoordinator::new_with_persisted_state(
+        ClusterCoordinator::new_with_persisted_state(
             distributed_cluster,
             persisted,
             state_store.clone(),
-        ))
+        )
     } else {
         tracing::info!("Fresh cluster boot, no persisted state");
         let mut coordinator = ClusterCoordinator::new(distributed_cluster);
         coordinator.set_state_store(state_store.clone());
-        ClusterCoordinator::spawn(coordinator)
+        coordinator
     };
 
-    // Initialize swarm via actor message (MUST be done before actor registration)
-    match coordinator_actor.ask(InitSwarm).await {
+    // NOW spawn the coordinator actor
+    let coordinator_actor = ClusterCoordinator::spawn(coordinator);
+
+    // Set coordinator reference on orchestrator FIRST
+    orchestrator.set_coordinator(coordinator_actor.clone());
+
+    // NOW initialize default shards (after coordinator is set)
+    let init_shards = cameodb_config.storage.num_shards_init;
+    if orchestrator.shard_count() == 0 && init_shards > 0 {
+        for _ in 0..init_shards {
+            let shard_id = uuid::Uuid::new_v4();
+            if let Err(err) = orchestrator
+                .handle_propose_shard(ProposeShard { shard_id })
+                .await
+            {
+                tracing::warn!(%shard_id, %err, "Failed to create initial shard");
+            }
+        }
+        println!("Initialized {} shards", init_shards);
+    }
+
+    // Register all shards with coordinator (including newly created ones)
+    if let Err(err) = orchestrator.register_all_shards_with_coordinator().await {
+        tracing::warn!(error = %err, "Failed to register shards with coordinator");
+    }
+
+    println!("NodeOrchestrator started successfully");
+    println!(
+        "Node identity: {} ({})",
+        orchestrator.identity().name,
+        orchestrator.identity().uuid
+    );
+    if let Some(label) = cameodb_config.node.label.as_deref() {
+        println!("Node label: {}", label);
+    }
+    println!("Active shards: {}", orchestrator.shard_count());
+
+    // NOW initialize swarm via actor message (after shards are registered)
+    let swarm_initialized = match coordinator_actor.ask(InitSwarm).await {
         Err(err) => {
             tracing::warn!(error = ?err, "Failed to initialize distributed swarm");
             println!("⚠️  Distributed swarm initialization failed, continuing in single-node mode");
+            false
         }
         Ok(peer_id) => {
             let peer_id: String = peer_id;
@@ -195,35 +208,38 @@ async fn main() -> Result<()> {
                     println!("  👥 Discovered {} peer nodes", peers.len());
                 }
             }
+            true
         }
-    }
+    };
 
-    // Register coordinator for remote access so peers can query shard metadata
+    // Register coordinator for remote access AFTER swarm is initialized
     let coordinator_remote_name = format!("coordinator-{}", node_id);
-    if let Err(e) = coordinator_actor
-        .register(coordinator_remote_name.clone())
-        .await
-    {
-        tracing::warn!(name = %coordinator_remote_name, error = %e, "Failed to register coordinator for remote access");
+    if swarm_initialized {
+        if let Err(e) = coordinator_actor
+            .register(coordinator_remote_name.clone())
+            .await
+        {
+            tracing::warn!(name = %coordinator_remote_name, error = %e, "Failed to register coordinator for remote access");
+        } else {
+            tracing::info!(name = %coordinator_remote_name, "Registered coordinator for remote access");
+        }
     } else {
-        tracing::info!(name = %coordinator_remote_name, "Registered coordinator for remote access");
+        tracing::warn!("Swarm not initialized, skipping coordinator remote registration");
     }
-
-    // Give orchestrator a handle to the coordinator for shard registration before spawning it.
-    orchestrator.set_coordinator(coordinator_actor.clone());
-    // Register any hydrated shards with the coordinator (no-op if none).
-    orchestrator
-        .register_all_shards_with_coordinator()
-        .await
-        .ok();
 
     // Spawn NodeOrchestrator as an actor and register with remote registry
     let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
     let remote_name = orchestrator_remote_name(&node_id);
-    if let Err(e) = orchestrator_ref.register(remote_name.clone()).await {
-        tracing::warn!(name = %remote_name, error = %e, "Failed to register orchestrator for remote access");
+
+    // Register orchestrator for remote access ONLY after swarm is initialized
+    if swarm_initialized {
+        if let Err(e) = orchestrator_ref.register(remote_name.clone()).await {
+            tracing::warn!(name = %remote_name, error = %e, "Failed to register orchestrator for remote access");
+        } else {
+            tracing::info!(name = %remote_name, "Registered orchestrator for remote access");
+        }
     } else {
-        tracing::info!(name = %remote_name, "Registered orchestrator for remote access");
+        tracing::warn!("Swarm not initialized, skipping orchestrator remote registration");
     }
 
     // Subscribe orchestrator to cluster topology updates to maintain global routing awareness
