@@ -68,7 +68,7 @@ def parse_urls(urls_text: str) -> List[str]:
 
 
 def parse_threat_names(threat_text: str) -> List[str]:
-    """Parse threat_names array like "[('Upatre')]" into list of strings."""
+    """Parse threat_names array like "['Upatre']" into list of strings."""
     try:
         parsed = ast.literal_eval(threat_text)
     except (SyntaxError, ValueError):
@@ -76,16 +76,16 @@ def parse_threat_names(threat_text: str) -> List[str]:
     if isinstance(parsed, list):
         threats = []
         for item in parsed:
-            if isinstance(item, tuple) and len(item) > 0:
-                threats.append(str(item[0]))
-            elif isinstance(item, str):
+            if isinstance(item, str):
                 threats.append(item)
+            elif isinstance(item, tuple) and len(item) > 0:
+                threats.append(str(item[0]))
         return threats
     return []
 
 
 def parse_file_types(file_types_text: str) -> List[str]:
-    """Parse file_types array like "[('MS-DOS executable...')]" into list of strings."""
+    """Parse file_types array like "['MS-DOS executable...']" into list of strings."""
     try:
         parsed = ast.literal_eval(file_types_text)
     except (SyntaxError, ValueError):
@@ -93,11 +93,28 @@ def parse_file_types(file_types_text: str) -> List[str]:
     if isinstance(parsed, list):
         file_types = []
         for item in parsed:
-            if isinstance(item, tuple) and len(item) > 0:
-                file_types.append(str(item[0]))
-            elif isinstance(item, str):
+            if isinstance(item, str):
                 file_types.append(item)
+            elif isinstance(item, tuple) and len(item) > 0:
+                file_types.append(str(item[0]))
         return file_types
+    return []
+
+
+def parse_signatures(signatures_text: str) -> List[str]:
+    """Parse signatures array like "['signature1', 'signature2']" into list of strings."""
+    try:
+        parsed = ast.literal_eval(signatures_text)
+    except (SyntaxError, ValueError):
+        return []
+    if isinstance(parsed, list):
+        signatures = []
+        for item in parsed:
+            if isinstance(item, str):
+                signatures.append(item)
+            elif isinstance(item, tuple) and len(item) > 0:
+                signatures.append(str(item[0]))
+        return signatures
     return []
 
 
@@ -110,10 +127,10 @@ def build_document(line: str) -> Optional[Dict[str, Any]]:
     except (csv.Error, StopIteration):
         return None
     
-    if len(parts) != 9:
+    if len(parts) != 10:
         return None
     
-    sha1, first_analysis, last_analysis, platform, classification, risk_score_str, threat_names_raw, file_types_raw, urls_raw = parts
+    sha1, first_analysis, last_analysis, platform, classification, risk_score_str, threat_names_raw, file_types_raw, signatures_raw, urls_raw = parts
     
     if not sha1:
         return None
@@ -129,9 +146,10 @@ def build_document(line: str) -> Optional[Dict[str, Any]]:
     except (ValueError, TypeError):
         risk_score = 0.0
     
-    # Parse threat names and file types
+    # Parse threat names, file types, and signatures
     threat_names = parse_threat_names(threat_names_raw)
     file_types = parse_file_types(file_types_raw)
+    signatures = parse_signatures(signatures_raw)
     
     # Convert dates to RFC3339 format for proper schema detection
     first_analysis_iso = parse_datetime_to_rfc3339(first_analysis)
@@ -147,6 +165,7 @@ def build_document(line: str) -> Optional[Dict[str, Any]]:
         "risk_score": risk_score,
         "threat_names": threat_names,
         "file_types": file_types,
+        "signatures": signatures,
         "urls": urls,
     }
     
