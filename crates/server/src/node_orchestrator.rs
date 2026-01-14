@@ -725,6 +725,12 @@ struct SchemaValidationSummary {
     errors: Vec<String>,
 }
 
+/// Type alias for shard task result to reduce complexity
+type ShardTaskResult = Result<(Uuid, Option<MicroshardActor>), OrchestratorError>;
+
+/// Type alias for routing result to reduce complexity
+type RoutingResult = Result<(DocPayload, Option<String>, Option<Uuid>), OrchestratorError>;
+
 /// Validates and evolves schema for a document.
 ///
 /// This function implements schema validation and evolution logic:
@@ -1235,13 +1241,12 @@ impl RouterActor {
                     }
                 }
                 // Extract shard statistics from the response
-                if let Some(stats) = value.get("stats").and_then(|s| s.as_object()) {
-                    if let Some(shards) = stats.get("shards").and_then(|s| s.as_object()) {
-                        if let Some(responded) = shards.get("responded").and_then(|r| r.as_u64()) {
-                            *total_shards_queried += responded as usize;
-                        }
-                        _ = shards.get("total").and_then(|t| t.as_u64()); // Could track total shards attempted
-                    }
+                if let Some(stats) = value.get("stats").and_then(|s| s.as_object())
+                    && let Some(shards) = stats.get("shards").and_then(|s| s.as_object())
+                    && let Some(responded) = shards.get("responded").and_then(|r| r.as_u64())
+                {
+                    *total_shards_queried += responded as usize;
+                    _ = shards.get("total").and_then(|t| t.as_u64()); // Could track total shards attempted
                 }
                 if let Some(total) = value.get("total_hits").and_then(|t| t.as_u64()) {
                     *total_hits_sum += total as usize;
@@ -1780,16 +1785,12 @@ impl RouterActor {
                                     // Extract shard statistics from the response
                                     if let Some(stats) =
                                         val.get("stats").and_then(|s| s.as_object())
-                                    {
-                                        if let Some(shards) =
+                                        && let Some(shards) =
                                             stats.get("shards").and_then(|s| s.as_object())
-                                        {
-                                            if let Some(responded) =
-                                                shards.get("responded").and_then(|r| r.as_u64())
-                                            {
-                                                shards_queried += responded as usize;
-                                            }
-                                        }
+                                        && let Some(responded) =
+                                            shards.get("responded").and_then(|r| r.as_u64())
+                                    {
+                                        shards_queried += responded as usize;
                                     }
                                 }
                                 Err(e) => {
@@ -2733,36 +2734,56 @@ impl NodeOrchestrator {
         self.coordinator = Some(coordinator);
     }
 
-    /// Scans the storage directory for existing shard folders and hydrates them.
+    /// Scans the storage directory for existing shard folders and hydrates them in parallel.
     async fn hydrate_existing_shards(&mut self) -> Result<(), OrchestratorError> {
         let existing_shards = self.discover_existing_shards()?;
         info!("Found {} existing shards", existing_shards.len());
 
-        for shard_id in existing_shards {
-            if self.shards.len() >= self.config.max_shards {
-                warn!("Shard limit reached, skipping shard {}", shard_id);
-                break;
-            }
+        // Process all shards in parallel for maximum startup speed
+        let mut shard_tasks: Vec<tokio::task::JoinHandle<ShardTaskResult>> = Vec::new();
 
+        // Create tasks for all shards
+        for &shard_id in &existing_shards {
             let storage_config = self.create_shard_storage_config(shard_id);
-            let mut microshard =
-                MicroshardActor::new(shard_id, storage_config, self.default_search_limit);
+            let default_search_limit = self.default_search_limit;
 
-            match microshard.start().await {
-                Ok(()) => {
-                    self.shards.insert(shard_id, microshard);
-                    self.register_shard_for_routing(shard_id);
-                    // Note: Don't register with coordinator here - it's not set yet
-                    // Registration happens via register_all_shards_with_coordinator() after coordinator is set
-                    info!("Hydrated shard {}", shard_id);
+            let task = tokio::spawn(async move {
+                let mut microshard =
+                    MicroshardActor::new(shard_id, storage_config, default_search_limit);
 
-                    // Preload schemas for all indexes in this shard for instant field availability
-                    if let Err(err) = self.preload_schemas_for_shard(shard_id).await {
-                        warn!(%shard_id, error = %err, "Failed to preload schemas for shard");
+                match microshard.start().await {
+                    Ok(()) => {
+                        info!("Hydrated shard {}", shard_id);
+                        // Skip schema preloading for faster startup - schemas will be loaded on-demand
+                        info!(shard_id = %shard_id, "Skipping schema preloading for faster startup");
+                        Ok((shard_id, Some(microshard)))
+                    }
+                    Err(e) => {
+                        error!("Failed to hydrate shard {}: {}", shard_id, e);
+                        Ok((shard_id, None))
                     }
                 }
+            });
+            shard_tasks.push(task);
+        }
+
+        // Wait for all shard tasks to complete
+        for task in shard_tasks {
+            match task.await {
+                Ok(Ok((shard_id, Some(microshard)))) => {
+                    if self.shards.len() < self.config.max_shards {
+                        self.shards.insert(shard_id, microshard);
+                        self.register_shard_for_routing(shard_id);
+                    }
+                }
+                Ok(Ok((_, None))) => {
+                    // Shard failed to hydrate, already logged above
+                }
+                Ok(Err(e)) => {
+                    error!("Shard hydration task error: {}", e);
+                }
                 Err(e) => {
-                    error!("Failed to hydrate shard {}: {}", shard_id, e);
+                    error!("Shard hydration task panicked: {}", e);
                 }
             }
         }
@@ -2771,6 +2792,77 @@ impl NodeOrchestrator {
             "NodeOrchestrator startup complete with {} active shards",
             self.shards.len()
         );
+
+        // Preload schemas for all shards for optimal runtime performance
+        // Since all shards have the same schema for each index, we only need to load once per index
+        info!(
+            "Starting schema preloading for {} shards",
+            self.shards.len()
+        );
+
+        // Get all unique index names from the first shard (all shards have the same indexes)
+        let mut all_index_names = std::collections::HashSet::new();
+        if let Some((first_shard_id, _)) = self.shards.iter().next()
+            && let Some(shard) = self.shards.get(first_shard_id)
+            && let Some(store) = &shard.store
+        {
+            let sc = Arc::clone(store);
+            let index_names = tokio::task::spawn_blocking({
+                let sc_clone = Arc::clone(&sc);
+                move || sc_clone.get_index_names_lightweight()
+            })
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+
+            for index_name in index_names {
+                all_index_names.insert(index_name);
+            }
+        }
+
+        info!(
+            "Found {} unique indexes to preload schemas for",
+            all_index_names.len()
+        );
+
+        // Load schema for each index once (from any shard that has it)
+        for index_name in all_index_names {
+            // Try to load schema from the first available shard that has this index
+            let mut schema_loaded = false;
+            for (shard_id, shard) in &self.shards {
+                if let Some(store) = &shard.store {
+                    let sc = Arc::clone(store);
+                    let index_name_clone = index_name.clone();
+
+                    match tokio::task::spawn_blocking({
+                        let sc_clone = Arc::clone(&sc);
+                        let index = index_name_clone.clone();
+                        move || sc_clone.get_schema(&index)
+                    })
+                    .await
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                    {
+                        Some(schema) => {
+                            self.put_cached_schema(&index_name, &schema).await;
+                            debug!(index = %index_name, field_count = schema.fields.len(), "Preloaded schema from shard {}", shard_id);
+                            schema_loaded = true;
+                            break; // Schema loaded successfully, no need to check other shards
+                        }
+                        None => {
+                            // This shard doesn't have the index, try next shard
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if !schema_loaded {
+                warn!(index = %index_name, "Failed to load schema from any shard");
+            }
+        }
+
+        info!("Schema preloading completed for all indexes");
         Ok(())
     }
 
@@ -3212,9 +3304,7 @@ impl NodeOrchestrator {
         };
 
         // Route documents in parallel
-        let routing_results: Vec<
-            Result<(DocPayload, Option<String>, Option<Uuid>), OrchestratorError>,
-        > =
+        let routing_results: Vec<RoutingResult> =
             docs.into_par_iter()
                 .map(|doc| {
                     // Calculate effective routing key
@@ -3773,48 +3863,6 @@ impl NodeOrchestrator {
             "node_name": self.identity.name.clone(),
             "total_shards": self.shards.len()
         }))
-    }
-
-    /// Preload all schemas for a given shard into the cache for instant field availability
-    async fn preload_schemas_for_shard(&mut self, shard_id: Uuid) -> Result<(), OrchestratorError> {
-        if let Some(shard) = self.shards.get(&shard_id)
-            && let Some(store) = &shard.store
-        {
-            let sc = Arc::clone(store);
-
-            // Get all index names for this shard
-            let index_names = tokio::task::spawn_blocking({
-                let sc_clone = Arc::clone(&sc);
-                move || sc_clone.get_index_names_lightweight()
-            })
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-
-            info!(shard_id = %shard_id, index_count = index_names.len(), "Preloading schemas for shard");
-
-            // Preload schema for each index
-            for index_name in index_names {
-                let index_name_clone = index_name.clone();
-                let schema_result = tokio::task::spawn_blocking({
-                    let sc_clone = Arc::clone(&sc);
-                    move || sc_clone.get_schema(&index_name_clone)
-                })
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-
-                if let Some(schema) = schema_result {
-                    // Cache the schema for instant access
-                    self.put_cached_schema(&index_name, &schema).await;
-                    debug!(shard_id = %shard_id, index = %index_name, field_count = schema.fields.len(), "Preloaded schema");
-                }
-            }
-
-            info!(shard_id = %shard_id, "Schema preloading complete for shard");
-        }
-
-        Ok(())
     }
 
     /// Helper: Load schema from first shard
