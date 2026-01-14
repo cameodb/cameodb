@@ -48,7 +48,8 @@ use cluster::{ConsistentRing, IdentityError, NodeIdentity, generate_tokens};
 use kameo::actor::RemoteActorRef;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use storage::{
-    FieldDef, HybridStore, IndexSchema, StorageConfig, StoreError, TantivyFieldType, WalOp,
+    FieldDef, HybridStore, IndexSchema, ShardStatsTimings, StorageConfig, StoreError,
+    TantivyFieldType, WalOp,
 };
 
 /// Helper function to detect if an operation is a write operation
@@ -134,6 +135,9 @@ pub enum OrchestratorError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("storage error: {0}")]
+    Storage(#[from] StoreError),
 
     #[error("shard limit exceeded: {current}/{max}")]
     ShardLimitExceeded { current: usize, max: usize },
@@ -245,6 +249,7 @@ impl From<OrchestratorError> for RemoteError {
                     RemoteError::Io(e.to_string())
                 }
             }
+            OrchestratorError::Storage(e) => RemoteError::Other(e.to_string()),
             OrchestratorError::ShardLimitExceeded { current, max } => {
                 RemoteError::InvalidInput(format!("shard limit exceeded {current}/{max}"))
             }
@@ -314,11 +319,11 @@ pub enum ClientOp {
     /// List all available indexes with statistics
     ListIndexes,
     /// Lightweight index listing without full schema parsing (optimized for _indexes endpoint)
-    GetLightweightIndexes,
+    GetLightweightIndexes { include_data_size: bool },
     /// Get node identity information
     GetIdentity,
     /// List all indexes across the cluster (broadcast)
-    ListClusterIndexes,
+    ListClusterIndexes { include_data_size: bool },
     /// Delete an index and all its data
     DeleteIndex { index: String, delete_schema: bool },
 }
@@ -1093,7 +1098,10 @@ impl RouterActor {
         // Metadata operations (schema/config) always execute locally - no need to broadcast
         if matches!(
             op,
-            ClientOp::GetConfig { .. } | ClientOp::CreateConfig { .. } | ClientOp::ListIndexes
+            ClientOp::GetConfig { .. }
+                | ClientOp::CreateConfig { .. }
+                | ClientOp::ListIndexes
+                | ClientOp::ListClusterIndexes { .. }
         ) {
             return self.handle_client_op(op).await;
         }
@@ -1454,7 +1462,7 @@ impl RouterActor {
                     "errors": errors
                 }))
             }
-            ClientOp::ListClusterIndexes => {
+            ClientOp::ListClusterIndexes { .. } => {
                 // Merge index statistics from all nodes
                 let mut index_map: HashMap<String, IndexStats> = HashMap::new();
                 let mut node_details: Vec<JsonValue> = Vec::new();
@@ -3129,8 +3137,13 @@ impl NodeOrchestrator {
                 self.orch_create_config(&index, schema).await
             }
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
-            ClientOp::ListIndexes | ClientOp::ListClusterIndexes => self.orch_list_indexes().await,
-            ClientOp::GetLightweightIndexes => self.orch_lightweight_indexes().await,
+            ClientOp::ListIndexes => self.orch_list_indexes(false).await,
+            ClientOp::ListClusterIndexes { include_data_size } => {
+                self.orch_list_indexes(include_data_size).await
+            }
+            ClientOp::GetLightweightIndexes { include_data_size } => {
+                self.orch_lightweight_indexes(include_data_size).await
+            }
             ClientOp::GetIdentity => self.orch_get_identity().await,
             ClientOp::DeleteIndex {
                 index,
@@ -3677,7 +3690,10 @@ impl NodeOrchestrator {
         )))
     }
 
-    async fn orch_list_indexes(&self) -> Result<JsonValue, OrchestratorError> {
+    async fn orch_list_indexes(
+        &self,
+        include_data_size: bool,
+    ) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
             return Ok(serde_json::json!({
                 "indexes": [],
@@ -3687,64 +3703,126 @@ impl NodeOrchestrator {
                 "total_shards": 0
             }));
         }
-        let mut all: HashMap<String, (u64, u64, Vec<String>, usize)> = HashMap::new();
-        for shard in self.shards.values() {
+        let mut all: HashMap<String, (u64, u64, u64, usize)> = HashMap::new();
+        let mut field_cache: HashMap<String, Vec<String>> = HashMap::new();
+        let mut shard_tasks = Vec::new();
+
+        for (shard_id, shard) in &self.shards {
             if let Some(store) = &shard.store {
                 let sc = Arc::clone(store);
-                let stats = tokio::task::spawn_blocking(move || sc.list_indexes())
-                    .await
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-                for stat in stats {
-                    let e = all
-                        .entry(stat.name.clone())
-                        .or_insert((0, 0, Vec::new(), 0));
-                    e.0 += stat.document_count;
-                    e.1 += stat.total_size_bytes;
-                    for f in stat.schema.fields.keys() {
-                        if !e.2.contains(f) {
-                            e.2.push(f.clone());
-                        }
-                    }
-                    e.3 += 1;
-                }
+                let shard_id = *shard_id;
+                shard_tasks.push(tokio::task::spawn_blocking(
+                    move || -> Result<_, StoreError> {
+                        let snapshot = sc.gather_index_stats_snapshot(include_data_size)?;
+                        Ok((shard_id, snapshot))
+                    },
+                ));
             }
         }
-        let mut indexes: Vec<(String, JsonValue)> = all
-            .into_iter()
-            .map(|(n, (d, s, mut f, c))| {
-                // Sort fields by name, with "id" (if present) always first.
-                f.sort_by(|a, b| match (a.as_str(), b.as_str()) {
-                    ("id", "id") => std::cmp::Ordering::Equal,
-                    ("id", _) => std::cmp::Ordering::Less,
-                    (_, "id") => std::cmp::Ordering::Greater,
-                    _ => a.cmp(b),
-                });
 
-                let json = serde_json::json!({
-                    "name": n,
-                    "document_count": d,
-                    "total_size_bytes": s,
-                    "size_mb": s/(1024*1024),
-                    "shard_count": c,
-                    "field_names": f,
-                });
-                (n, json)
-            })
-            .collect();
+        let mut shard_timings: Vec<(Uuid, ShardStatsTimings)> = Vec::new();
+        for task in shard_tasks {
+            match task
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+            {
+                Ok((shard_id, snapshot)) => {
+                    shard_timings.push((shard_id, snapshot.timings.clone()));
+
+                    for (index_name, stats) in snapshot.per_index {
+                        let entry = all.entry(index_name).or_insert((0, 0, 0, 0));
+                        entry.0 += stats.document_count;
+                        entry.1 += stats.redb_bytes;
+                        entry.2 += stats.tantivy_bytes;
+
+                        if stats.document_count > 0
+                            || stats.redb_bytes > 0
+                            || stats.tantivy_bytes > 0
+                            || stats.tantivy_index_exists
+                        {
+                            entry.3 += 1;
+                        }
+                    }
+                }
+                Err(e) => return Err(OrchestratorError::from(e)),
+            }
+        }
+
+        let mut total_redb_ms: u128 = 0;
+        let mut total_tantivy_ms: u128 = 0;
+        for (shard_id, timings) in shard_timings {
+            debug!(
+                shard = %shard_id,
+                redb_ms = timings.redb_ms,
+                tantivy_ms = timings.tantivy_ms,
+                total_ms = timings.total_ms,
+                "Collected shard index statistics (full)"
+            );
+
+            total_redb_ms = total_redb_ms.max(timings.redb_ms);
+            total_tantivy_ms = total_tantivy_ms.max(timings.tantivy_ms);
+        }
+
+        let mut indexes: Vec<(String, JsonValue)> = Vec::new();
+        for (name, (doc_count, redb_bytes, tantivy_bytes, shard_count)) in all {
+            let field_names = if let Some(cached) = field_cache.get(&name) {
+                cached.clone()
+            } else {
+                let schema = self.load_schema(&name).await?;
+                let sorted = Self::sorted_field_names(&schema);
+                field_cache.insert(name.clone(), sorted.clone());
+                sorted
+            };
+
+            let total_size_bytes = tantivy_bytes + if include_data_size { redb_bytes } else { 0 };
+            let index_size_mb = tantivy_bytes / (1024 * 1024);
+
+            let mut json_obj = JsonMap::new();
+            json_obj.insert("name".to_string(), JsonValue::String(name.clone()));
+            json_obj.insert("document_count".to_string(), JsonValue::from(doc_count));
+            json_obj.insert(
+                "total_size_bytes".to_string(),
+                JsonValue::from(total_size_bytes),
+            );
+            json_obj.insert("index_size_mb".to_string(), JsonValue::from(index_size_mb));
+            if include_data_size {
+                json_obj.insert(
+                    "data_size_mb".to_string(),
+                    JsonValue::from(redb_bytes / (1024 * 1024)),
+                );
+            }
+            json_obj.insert("shard_count".to_string(), JsonValue::from(shard_count));
+            json_obj.insert(
+                "field_names".to_string(),
+                JsonValue::Array(
+                    field_names
+                        .iter()
+                        .cloned()
+                        .map(JsonValue::String)
+                        .collect::<Vec<_>>(),
+                ),
+            );
+
+            indexes.push((name, JsonValue::Object(json_obj)));
+        }
         indexes.sort_by(|a, b| a.0.cmp(&b.0));
         let indexes: Vec<JsonValue> = indexes.into_iter().map(|(_, json)| json).collect();
-        Ok(serde_json::json!({
+        let response = serde_json::json!({
             "indexes": indexes,
             "total_indexes": indexes.len(),
             "node_id": self.identity.uuid.to_string(),
             "node_name": self.identity.name.clone(),
-            "total_shards": self.shards.len()
-        }))
+            "total_shards": self.shards.len(),
+            "total_ms": total_redb_ms + total_tantivy_ms,
+        });
+        Ok(response)
     }
 
     /// Lightweight index listing without full schema parsing (optimized for _indexes endpoint)
-    async fn orch_lightweight_indexes(&self) -> Result<JsonValue, OrchestratorError> {
+    async fn orch_lightweight_indexes(
+        &self,
+        include_data_size: bool,
+    ) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
             return Ok(serde_json::json!({
                 "indexes": [],
@@ -3755,92 +3833,110 @@ impl NodeOrchestrator {
             }));
         }
 
-        let mut all: HashMap<String, (u64, u64, usize, Vec<String>)> = HashMap::new();
+        let mut all: HashMap<String, (u64, u64, u64, usize)> = HashMap::new();
+        let mut field_cache: HashMap<String, Vec<String>> = HashMap::new();
+        let mut shard_tasks = Vec::new();
 
-        for shard in self.shards.values() {
+        for (shard_id, shard) in &self.shards {
             if let Some(store) = &shard.store {
                 let sc = Arc::clone(store);
-
-                // Use lightweight method that only gets index names and basic stats
-                let index_names = tokio::task::spawn_blocking({
-                    let sc_clone = Arc::clone(&sc);
-                    move || sc_clone.get_index_names_lightweight()
-                })
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-
-                for index_name in index_names {
-                    // Get statistics using the hybrid approach (cached + efficient)
-                    let index_name_clone = index_name.clone();
-                    let stats = tokio::task::spawn_blocking({
-                        let sc_clone = Arc::clone(&sc);
-                        move || sc_clone.get_index_statistics(&index_name_clone)
-                    })
-                    .await
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-
-                    // Get fields from schema cache, with fallback to load from storage
-                    let fields = if let Some(schema) = self.get_cached_schema(&index_name).await {
-                        schema.fields.keys().cloned().collect()
-                    } else {
-                        // Schema not cached, try to load it from storage (lightweight operation)
-                        let index_name_clone = index_name.clone();
-                        let schema_result = tokio::task::spawn_blocking({
-                            let sc_clone = Arc::clone(&sc);
-                            move || sc_clone.get_schema(&index_name_clone)
-                        })
-                        .await
-                        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-
-                        if let Some(schema) = schema_result {
-                            // Cache the schema for future requests
-                            self.put_cached_schema(&index_name, &schema).await;
-                            schema.fields.keys().cloned().collect()
-                        } else {
-                            Vec::new() // No schema found
-                        }
-                    };
-
-                    let entry = all.entry(index_name).or_insert((0, 0, 0, Vec::new()));
-                    entry.0 += stats.document_count;
-                    entry.1 += stats.total_size_bytes;
-                    entry.2 += 1; // shard count
-
-                    // Merge fields, avoiding duplicates
-                    for field in fields {
-                        if !entry.3.contains(&field) {
-                            entry.3.push(field);
-                        }
-                    }
-                }
+                let shard_id = *shard_id;
+                shard_tasks.push(tokio::task::spawn_blocking(
+                    move || -> Result<_, StoreError> {
+                        let snapshot = sc.gather_index_stats_snapshot(include_data_size)?;
+                        Ok((shard_id, snapshot))
+                    },
+                ));
             }
         }
 
-        let mut indexes: Vec<(String, JsonValue)> = all
-            .into_iter()
-            .map(|(name, (doc_count, size_bytes, shard_count, mut fields))| {
-                // Sort fields by name, with "id" (if present) always first.
-                fields.sort_by(|a, b| match (a.as_str(), b.as_str()) {
-                    ("id", "id") => std::cmp::Ordering::Equal,
-                    ("id", _) => std::cmp::Ordering::Less,
-                    (_, "id") => std::cmp::Ordering::Greater,
-                    _ => a.cmp(b),
-                });
+        let mut shard_timings: Vec<(Uuid, ShardStatsTimings)> = Vec::new();
+        for task in shard_tasks {
+            match task
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+            {
+                Ok((shard_id, snapshot)) => {
+                    shard_timings.push((shard_id, snapshot.timings.clone()));
 
-                let json = serde_json::json!({
-                    "name": name,
-                    "document_count": doc_count,
-                    "total_size_bytes": size_bytes,
-                    "size_mb": size_bytes / (1024 * 1024),
-                    "shard_count": shard_count,
-                    "fields": fields, // Now included from schema cache!
-                });
-                (name, json)
-            })
-            .collect();
+                    for (index_name, stats) in snapshot.per_index {
+                        let entry = all.entry(index_name).or_insert((0, 0, 0, 0));
+                        entry.0 += stats.document_count;
+                        entry.1 += stats.redb_bytes;
+                        entry.2 += stats.tantivy_bytes;
+
+                        if stats.document_count > 0
+                            || stats.redb_bytes > 0
+                            || stats.tantivy_bytes > 0
+                            || stats.tantivy_index_exists
+                        {
+                            entry.3 += 1;
+                        }
+                    }
+                }
+                Err(e) => return Err(OrchestratorError::from(e)),
+            }
+        }
+
+        let mut total_redb_ms: u128 = 0;
+        let mut total_tantivy_ms: u128 = 0;
+        for (shard_id, timings) in shard_timings {
+            debug!(
+                shard = %shard_id,
+                redb_ms = timings.redb_ms,
+                tantivy_ms = timings.tantivy_ms,
+                total_ms = timings.total_ms,
+                "Collected shard index statistics"
+            );
+
+            total_redb_ms = total_redb_ms.max(timings.redb_ms);
+            total_tantivy_ms = total_tantivy_ms.max(timings.tantivy_ms);
+        }
+
+        let total_ms = total_redb_ms + total_tantivy_ms;
+
+        let mut indexes: Vec<(String, JsonValue)> = Vec::new();
+        for (name, (doc_count, redb_bytes, tantivy_bytes, shard_count)) in all {
+            let fields = if let Some(cached) = field_cache.get(&name) {
+                cached.clone()
+            } else {
+                let schema = self.load_schema(&name).await?;
+                let sorted = Self::sorted_field_names(&schema);
+                field_cache.insert(name.clone(), sorted.clone());
+                sorted
+            };
+
+            let total_size_bytes = tantivy_bytes + if include_data_size { redb_bytes } else { 0 };
+            let index_size_mb = tantivy_bytes / (1024 * 1024);
+
+            let mut json_obj = JsonMap::new();
+            json_obj.insert("name".to_string(), JsonValue::String(name.clone()));
+            json_obj.insert("document_count".to_string(), JsonValue::from(doc_count));
+            json_obj.insert(
+                "total_size_bytes".to_string(),
+                JsonValue::from(total_size_bytes),
+            );
+            json_obj.insert("index_size_mb".to_string(), JsonValue::from(index_size_mb));
+            if include_data_size {
+                json_obj.insert(
+                    "data_size_mb".to_string(),
+                    JsonValue::from(redb_bytes / (1024 * 1024)),
+                );
+            }
+            json_obj.insert("shard_count".to_string(), JsonValue::from(shard_count));
+            json_obj.insert(
+                "fields".to_string(),
+                JsonValue::Array(
+                    fields
+                        .iter()
+                        .cloned()
+                        .map(JsonValue::String)
+                        .collect::<Vec<_>>(),
+                ),
+            );
+
+            indexes.push((name, JsonValue::Object(json_obj)));
+        }
 
         indexes.sort_by(|a, b| a.0.cmp(&b.0));
         let indexes: Vec<JsonValue> = indexes.into_iter().map(|(_, json)| json).collect();
@@ -3850,7 +3946,8 @@ impl NodeOrchestrator {
             "total_indexes": indexes.len(),
             "node_id": self.identity.uuid.to_string(),
             "node_name": self.identity.name.clone(),
-            "total_shards": self.shards.len()
+            "total_shards": self.shards.len(),
+            "total_ms": total_ms,
         }))
     }
 

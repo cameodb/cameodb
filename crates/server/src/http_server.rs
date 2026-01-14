@@ -78,6 +78,21 @@ pub struct SchemaUpdatePayload {
     pub field_updates: std::collections::HashMap<String, bool>,
 }
 
+/// Query parameters for the list indexes endpoint
+#[derive(Debug, Deserialize, Default)]
+pub struct ListIndexesQuery {
+    /// Whether to include data size information (default: false)
+    #[serde(default)]
+    pub data_size: Option<bool>,
+}
+
+impl ListIndexesQuery {
+    /// Helper to get the data_size flag with a default of false
+    pub fn include_data_size(&self) -> bool {
+        self.data_size.unwrap_or(false)
+    }
+}
+
 /// Health check response
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -175,10 +190,13 @@ async fn search_handler(
 /// Handler for listing all indexes across the cluster
 async fn list_cluster_indexes_handler(
     State(state): State<AppState>,
+    Query(params): Query<ListIndexesQuery>,
 ) -> Result<Json<JsonValue>, AppError> {
     info!("List cluster indexes request");
 
-    let client_op = ClientOp::ListClusterIndexes;
+    let client_op = ClientOp::ListClusterIndexes {
+        include_data_size: params.include_data_size(),
+    };
 
     let result = state
         .router
@@ -442,10 +460,15 @@ async fn get_config_handler(
 }
 
 /// Handler for listing all available indexes
-async fn list_indexes_handler(State(state): State<AppState>) -> Result<Json<JsonValue>, AppError> {
+async fn list_indexes_handler(
+    State(state): State<AppState>,
+    Query(params): Query<ListIndexesQuery>,
+) -> Result<Json<JsonValue>, AppError> {
     info!("List indexes request");
 
-    let client_op = ClientOp::GetLightweightIndexes;
+    let client_op = ClientOp::GetLightweightIndexes {
+        include_data_size: params.include_data_size(),
+    };
 
     let result = state
         .router
@@ -487,7 +510,9 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
     // Get lightweight index statistics for health check
     let (total_indexes, indexes_with_data) = match state
         .router
-        .handle_client_op(ClientOp::GetLightweightIndexes)
+        .handle_client_op(ClientOp::GetLightweightIndexes {
+            include_data_size: false,
+        })
         .await
     {
         Ok(result) => {

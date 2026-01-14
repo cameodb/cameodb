@@ -29,8 +29,10 @@ fn test_storage_engine_basics() {
     );
 
     // Test index listing (empty initially)
-    let indexes = store.list_indexes().expect("Failed to list indexes");
-    assert_eq!(indexes.len(), 0, "Should start with no indexes");
+    let index_names = store
+        .get_index_names_lightweight()
+        .expect("Failed to get index names");
+    assert_eq!(index_names.len(), 0, "Should start with no indexes");
 
     // Test index creation (directories are created lazily)
     let index_path = temp_dir.path().join("indices").join("test_index");
@@ -43,19 +45,13 @@ fn test_storage_engine_basics() {
         .expect("Failed to store schema");
 
     // Now the index should appear in listings
-    let stats = store
-        .get_index_statistics("test_index")
-        .expect("Failed to get stats");
-    assert_eq!(stats.document_count, 0, "New index should have 0 documents");
-
-    // Test index listing after creation
-    let indexes_after = store
-        .list_indexes()
-        .expect("Failed to list indexes after creation");
-    assert_eq!(indexes_after.len(), 1, "Should have one index");
-    assert_eq!(
-        indexes_after[0].name, "test_index",
-        "Index name should match"
+    let index_names = store
+        .get_index_names_lightweight()
+        .expect("Failed to get index names");
+    assert_eq!(index_names.len(), 1, "Should have one index");
+    assert!(
+        index_names.contains(&"test_index".to_string()),
+        "Index name should be present"
     );
 
     // Test index deletion
@@ -66,23 +62,33 @@ fn test_storage_engine_basics() {
     // Note: delete_index_data removes the index data but not the schema
     // This is by design - schemas persist for potential recovery
     // Let's verify the index data is gone by checking statistics
-    let stats_after = store
-        .get_index_statistics("test_index")
-        .expect("Failed to get stats after delete");
+    let snapshot = store
+        .gather_index_stats_snapshot(false)
+        .expect("Failed to get stats snapshot");
+    let test_index_stats = snapshot.per_index.get("test_index");
+    assert!(
+        test_index_stats.is_some(),
+        "Index should still be present in stats"
+    );
     assert_eq!(
-        stats_after.document_count, 0,
+        test_index_stats.unwrap().document_count,
+        0,
         "Document count should be 0 after delete"
     );
 
-    // The index still appears in list_indexes because the schema exists
+    // The index still appears because the schema exists
     // This is expected behavior
-    let indexes_final = store
-        .list_indexes()
-        .expect("Failed to list indexes after delete");
+    let index_names_final = store
+        .get_index_names_lightweight()
+        .expect("Failed to get index names after delete");
     assert_eq!(
-        indexes_final.len(),
+        index_names_final.len(),
         1,
         "Index should still appear in listing due to schema persistence"
+    );
+    assert!(
+        index_names_final.contains(&"test_index".to_string()),
+        "Index name should still be present"
     );
 
     println!("✅ Storage engine basics work correctly!");
@@ -126,12 +132,15 @@ fn test_storage_configuration() {
         .store_schema_and_cache("index2", &schema2)
         .expect("Failed to store schema2");
 
-    let stats1 = store
-        .get_index_statistics("index1")
-        .expect("Failed to get stats for index1");
-    let stats2 = store
-        .get_index_statistics("index2")
-        .expect("Failed to get stats for index2");
+    let snapshot1 = store
+        .gather_index_stats_snapshot(false)
+        .expect("Failed to get stats snapshot for index1");
+    let snapshot2 = store
+        .gather_index_stats_snapshot(false)
+        .expect("Failed to get stats snapshot for index2");
+
+    let stats1 = snapshot1.per_index.get("index1").unwrap();
+    let stats2 = snapshot2.per_index.get("index2").unwrap();
 
     assert_eq!(
         stats1.document_count, 0,
@@ -143,10 +152,11 @@ fn test_storage_configuration() {
     );
 
     // Test index listing
-    let indexes = store.list_indexes().expect("Failed to list indexes");
-    assert_eq!(indexes.len(), 2, "Should have two indexes");
+    let index_names = store
+        .get_index_names_lightweight()
+        .expect("Failed to list indexes");
+    assert_eq!(index_names.len(), 2, "Should have two indexes");
 
-    let index_names: Vec<String> = indexes.iter().map(|i| i.name.clone()).collect();
     assert!(
         index_names.contains(&"index1".to_string()),
         "Should contain index1"

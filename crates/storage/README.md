@@ -262,21 +262,14 @@ Beyond raw storage, the engine tracks per-index metadata and stats:
     - `store.get_schema(index_name) -> Option<IndexSchema>`
 
 - **Index listing**
-  - Discover all known indices, their schemas, and basic stats:
-    - `store.list_indexes() -> Vec<IndexInfo>`
-  - Each `IndexInfo` includes:
-    - `name`
-    - `schema` (`IndexSchema`)
-    - `document_count`
-    - `total_size_bytes`
-    - `tantivy_index_exists`
+  - Discover all known indices with lightweight statistics:
+    - `store.get_index_names_lightweight() -> Vec<String>`
+    - `store.gather_index_stats_snapshot(include_data_size) -> ShardStatsSnapshot`
 
-- **Statistics**
-  - `store.get_index_statistics(index) -> IndexStats`
-  - Uses redb table scan + filesystem size to report:
-    - `document_count`
-    - `total_size_bytes`
-    - `tantivy_index_exists`
+- **Caching**
+  - Schema cache: In-memory caching of parsed schemas for fast access
+  - Directory size cache: Cached Tantivy index directory sizes with TTL
+  - Read cache: Optional bounded cache for frequently accessed documents
 
 ## Usage Examples
 
