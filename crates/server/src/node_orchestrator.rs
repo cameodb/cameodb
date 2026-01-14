@@ -2754,8 +2754,6 @@ impl NodeOrchestrator {
                 match microshard.start().await {
                     Ok(()) => {
                         info!("Hydrated shard {}", shard_id);
-                        // Skip schema preloading for faster startup - schemas will be loaded on-demand
-                        info!(shard_id = %shard_id, "Skipping schema preloading for faster startup");
                         Ok((shard_id, Some(microshard)))
                     }
                     Err(e) => {
