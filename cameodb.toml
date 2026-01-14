@@ -32,7 +32,7 @@ data_paths = ["./data/cameodb"]
 disk_usage_threshold_percent = 90
 wal_sync = true
 wal_segment_size_mb = 64
-default_batch_size = 2000
+default_batch_size = 5000
 num_shards_init = 4
 max_shards_per_node = 8
 
