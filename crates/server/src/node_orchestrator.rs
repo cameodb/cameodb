@@ -316,10 +316,8 @@ pub enum ClientOp {
     CreateConfig { index: String, schema: IndexSchema },
     /// Get index configuration/schema
     GetConfig { index: String },
-    /// List all available indexes with statistics
-    ListIndexes,
-    /// Lightweight index listing without full schema parsing (optimized for _indexes endpoint)
-    GetLightweightIndexes { include_data_size: bool },
+    /// List all available indexes with statistics (optimized for _indexes endpoint)
+    ListIndexes { include_data_size: bool },
     /// Get node identity information
     GetIdentity,
     /// List all indexes across the cluster (broadcast)
@@ -352,6 +350,8 @@ struct IndexStats {
     name: String,
     document_count: u64,
     total_size_bytes: u64,
+    index_size_mb: u64,
+    data_size_mb: u64,
     shard_count: usize,
     field_names: Vec<String>,
 }
@@ -1039,14 +1039,13 @@ pub struct RouterActor {
     broadcasts_total: Arc<AtomicU64>,
     broadcast_failures: Arc<AtomicU64>,
     // Streaming search configuration
-    #[allow(dead_code)] // Streaming infrastructure - will be fully utilized in production
     enable_streaming_search: bool,
-    #[allow(dead_code)] // Streaming infrastructure - will be fully utilized in production
-    max_concurrent_shard_searches: usize,
-    #[allow(dead_code)] // Streaming infrastructure - will be fully utilized in production
-    max_concurrent_remote_searches: usize,
-    #[allow(dead_code)] // Streaming infrastructure - will be fully utilized in production
     enable_early_termination: bool,
+    // TODO: Implement concurrency limits for streaming search
+    #[allow(dead_code)] // Planned feature not yet implemented
+    max_concurrent_shard_searches: usize,
+    #[allow(dead_code)] // Planned feature not yet implemented
+    max_concurrent_remote_searches: usize,
 }
 
 impl RouterActor {
@@ -1098,10 +1097,7 @@ impl RouterActor {
         // Metadata operations (schema/config) always execute locally - no need to broadcast
         if matches!(
             op,
-            ClientOp::GetConfig { .. }
-                | ClientOp::CreateConfig { .. }
-                | ClientOp::ListIndexes
-                | ClientOp::ListClusterIndexes { .. }
+            ClientOp::GetConfig { .. } | ClientOp::CreateConfig { .. }
         ) {
             return self.handle_client_op(op).await;
         }
@@ -1530,6 +1526,8 @@ impl RouterActor {
                                 name: name.clone(),
                                 document_count: 0,
                                 total_size_bytes: 0,
+                                index_size_mb: 0,
+                                data_size_mb: 0,
                                 shard_count: 0,
                                 field_names: Vec::new(),
                             });
@@ -1542,6 +1540,15 @@ impl RouterActor {
                                 .get("total_size_bytes")
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0);
+                            entry.index_size_mb += idx
+                                .get("index_size_mb")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            if let Some(data_size) =
+                                idx.get("data_size_mb").and_then(|v| v.as_u64())
+                            {
+                                entry.data_size_mb += data_size;
+                            }
                             entry.shard_count +=
                                 idx.get("shard_count").and_then(|v| v.as_u64()).unwrap_or(0)
                                     as usize;
@@ -1573,20 +1580,40 @@ impl RouterActor {
                         });
                 }
 
-                // Convert to JSON array
+                // Convert to JSON array with new format
                 let mut cluster_indexes: Vec<(String, JsonValue)> = index_map
                     .into_values()
                     .map(|stats| {
                         let name = stats.name.clone();
-                        let json = serde_json::json!({
-                            "name": stats.name,
-                            "document_count": stats.document_count,
-                            "total_size_bytes": stats.total_size_bytes,
-                            "size_mb": stats.total_size_bytes / (1024 * 1024),
-                            "shard_count": stats.shard_count,
-                            "field_names": stats.field_names,
-                        });
-                        (name, json)
+                        let mut json_obj = serde_json::Map::new();
+                        json_obj.insert("name".to_string(), serde_json::json!(stats.name));
+                        json_obj.insert(
+                            "document_count".to_string(),
+                            serde_json::json!(stats.document_count),
+                        );
+                        json_obj.insert(
+                            "total_size_bytes".to_string(),
+                            serde_json::json!(stats.total_size_bytes),
+                        );
+                        json_obj.insert(
+                            "index_size_mb".to_string(),
+                            serde_json::json!(stats.index_size_mb),
+                        );
+                        if stats.data_size_mb > 0 {
+                            json_obj.insert(
+                                "data_size_mb".to_string(),
+                                serde_json::json!(stats.data_size_mb),
+                            );
+                        }
+                        json_obj.insert(
+                            "shard_count".to_string(),
+                            serde_json::json!(stats.shard_count),
+                        );
+                        json_obj.insert(
+                            "field_names".to_string(),
+                            serde_json::json!(stats.field_names),
+                        );
+                        (name, serde_json::Value::Object(json_obj))
                     })
                     .collect();
                 cluster_indexes.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3137,12 +3164,11 @@ impl NodeOrchestrator {
                 self.orch_create_config(&index, schema).await
             }
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
-            ClientOp::ListIndexes => self.orch_list_indexes(false).await,
-            ClientOp::ListClusterIndexes { include_data_size } => {
+            ClientOp::ListIndexes { include_data_size } => {
                 self.orch_list_indexes(include_data_size).await
             }
-            ClientOp::GetLightweightIndexes { include_data_size } => {
-                self.orch_lightweight_indexes(include_data_size).await
+            ClientOp::ListClusterIndexes { include_data_size } => {
+                self.orch_list_indexes(include_data_size).await
             }
             ClientOp::GetIdentity => self.orch_get_identity().await,
             ClientOp::DeleteIndex {
@@ -3690,139 +3716,13 @@ impl NodeOrchestrator {
         )))
     }
 
+    /// List all available indexes (unified function for both local and cluster operations)
     async fn orch_list_indexes(
         &self,
         include_data_size: bool,
     ) -> Result<JsonValue, OrchestratorError> {
-        if self.shards.is_empty() {
-            return Ok(serde_json::json!({
-                "indexes": [],
-                "total_indexes": 0,
-                "node_id": self.identity.uuid.to_string(),
-                "node_name": self.identity.name.clone(),
-                "total_shards": 0
-            }));
-        }
-        let mut all: HashMap<String, (u64, u64, u64, usize)> = HashMap::new();
-        let mut field_cache: HashMap<String, Vec<String>> = HashMap::new();
-        let mut shard_tasks = Vec::new();
-
-        for (shard_id, shard) in &self.shards {
-            if let Some(store) = &shard.store {
-                let sc = Arc::clone(store);
-                let shard_id = *shard_id;
-                shard_tasks.push(tokio::task::spawn_blocking(
-                    move || -> Result<_, StoreError> {
-                        let snapshot = sc.gather_index_stats_snapshot(include_data_size)?;
-                        Ok((shard_id, snapshot))
-                    },
-                ));
-            }
-        }
-
-        let mut shard_timings: Vec<(Uuid, ShardStatsTimings)> = Vec::new();
-        for task in shard_tasks {
-            match task
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-            {
-                Ok((shard_id, snapshot)) => {
-                    shard_timings.push((shard_id, snapshot.timings.clone()));
-
-                    for (index_name, stats) in snapshot.per_index {
-                        let entry = all.entry(index_name).or_insert((0, 0, 0, 0));
-                        entry.0 += stats.document_count;
-                        entry.1 += stats.redb_bytes;
-                        entry.2 += stats.tantivy_bytes;
-
-                        if stats.document_count > 0
-                            || stats.redb_bytes > 0
-                            || stats.tantivy_bytes > 0
-                            || stats.tantivy_index_exists
-                        {
-                            entry.3 += 1;
-                        }
-                    }
-                }
-                Err(e) => return Err(OrchestratorError::from(e)),
-            }
-        }
-
-        let mut total_redb_ms: u128 = 0;
-        let mut total_tantivy_ms: u128 = 0;
-        for (shard_id, timings) in shard_timings {
-            debug!(
-                shard = %shard_id,
-                redb_ms = timings.redb_ms,
-                tantivy_ms = timings.tantivy_ms,
-                total_ms = timings.total_ms,
-                "Collected shard index statistics (full)"
-            );
-
-            total_redb_ms = total_redb_ms.max(timings.redb_ms);
-            total_tantivy_ms = total_tantivy_ms.max(timings.tantivy_ms);
-        }
-
-        let mut indexes: Vec<(String, JsonValue)> = Vec::new();
-        for (name, (doc_count, redb_bytes, tantivy_bytes, shard_count)) in all {
-            let field_names = if let Some(cached) = field_cache.get(&name) {
-                cached.clone()
-            } else {
-                let schema = self.load_schema(&name).await?;
-                let sorted = Self::sorted_field_names(&schema);
-                field_cache.insert(name.clone(), sorted.clone());
-                sorted
-            };
-
-            let total_size_bytes = tantivy_bytes + if include_data_size { redb_bytes } else { 0 };
-            let index_size_mb = tantivy_bytes / (1024 * 1024);
-
-            let mut json_obj = JsonMap::new();
-            json_obj.insert("name".to_string(), JsonValue::String(name.clone()));
-            json_obj.insert("document_count".to_string(), JsonValue::from(doc_count));
-            json_obj.insert(
-                "total_size_bytes".to_string(),
-                JsonValue::from(total_size_bytes),
-            );
-            json_obj.insert("index_size_mb".to_string(), JsonValue::from(index_size_mb));
-            if include_data_size {
-                json_obj.insert(
-                    "data_size_mb".to_string(),
-                    JsonValue::from(redb_bytes / (1024 * 1024)),
-                );
-            }
-            json_obj.insert("shard_count".to_string(), JsonValue::from(shard_count));
-            json_obj.insert(
-                "field_names".to_string(),
-                JsonValue::Array(
-                    field_names
-                        .iter()
-                        .cloned()
-                        .map(JsonValue::String)
-                        .collect::<Vec<_>>(),
-                ),
-            );
-
-            indexes.push((name, JsonValue::Object(json_obj)));
-        }
-        indexes.sort_by(|a, b| a.0.cmp(&b.0));
-        let indexes: Vec<JsonValue> = indexes.into_iter().map(|(_, json)| json).collect();
-        let response = serde_json::json!({
-            "indexes": indexes,
-            "total_indexes": indexes.len(),
-            "node_id": self.identity.uuid.to_string(),
-            "node_name": self.identity.name.clone(),
-            "total_shards": self.shards.len(),
-            "total_ms": total_redb_ms + total_tantivy_ms,
-        });
-        Ok(response)
-    }
-
-    /// Lightweight index listing without full schema parsing (optimized for _indexes endpoint)
-    async fn orch_lightweight_indexes(
-        &self,
-        include_data_size: bool,
-    ) -> Result<JsonValue, OrchestratorError> {
+        // For now, cluster mode is handled at the RouterActor level
+        // This function handles the local aggregation logic
         if self.shards.is_empty() {
             return Ok(serde_json::json!({
                 "indexes": [],
@@ -3925,7 +3825,7 @@ impl NodeOrchestrator {
             }
             json_obj.insert("shard_count".to_string(), JsonValue::from(shard_count));
             json_obj.insert(
-                "fields".to_string(),
+                "field_names".to_string(),
                 JsonValue::Array(
                     fields
                         .iter()
@@ -4037,7 +3937,6 @@ fn derive_routing_key_from_doc(doc: &JsonValue) -> Option<String> {
     Some(key)
 }
 
-// ============================================================================
 /// Message handler for GetShardCount
 impl Message<GetShardCount> for NodeOrchestrator {
     type Reply = usize;

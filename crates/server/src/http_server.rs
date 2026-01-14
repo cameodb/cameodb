@@ -466,7 +466,7 @@ async fn list_indexes_handler(
 ) -> Result<Json<JsonValue>, AppError> {
     info!("List indexes request");
 
-    let client_op = ClientOp::GetLightweightIndexes {
+    let client_op = ClientOp::ListIndexes {
         include_data_size: params.include_data_size(),
     };
 
@@ -510,7 +510,7 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
     // Get lightweight index statistics for health check
     let (total_indexes, indexes_with_data) = match state
         .router
-        .handle_client_op(ClientOp::GetLightweightIndexes {
+        .handle_client_op(ClientOp::ListIndexes {
             include_data_size: false,
         })
         .await

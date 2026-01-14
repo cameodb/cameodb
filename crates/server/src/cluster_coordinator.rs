@@ -2480,10 +2480,10 @@ mod tests {
     }
 
     #[test]
-    fn decide_route_defaults_to_broadcast_when_no_key() {
+    fn decide_route_defaults_to_local_when_no_key() {
         let cc = ClusterCoordinator::new(make_cluster());
         let decision = cc.decide_route(None, OperationType::Read);
-        assert!(matches!(decision, RoutingDecision::Broadcast));
+        assert!(matches!(decision, RoutingDecision::Local));
     }
 
     #[test]
