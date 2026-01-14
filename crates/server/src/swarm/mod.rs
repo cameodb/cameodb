@@ -17,7 +17,7 @@ use libp2p::{
     tcp, yamux,
 };
 use std::collections::HashMap;
-use std::net::ToSocketAddrs;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -203,11 +203,111 @@ struct PeerBook {
     addr_by_peer: HashMap<String, String>, // last known good address (from established conn or identify)
 }
 
+/// Check if a multiaddr resolves to a local address
+fn resolves_to_local(
+    addr: &Multiaddr,
+    listen_ip4: Option<std::net::Ipv4Addr>,
+    listen_ip6: Option<std::net::Ipv6Addr>,
+) -> bool {
+    let addr_str = addr.to_string();
+
+    // Check for DNS addresses
+    if let Some(dns_part) = addr_str.strip_prefix("/dns4/") {
+        // Parse /dns4/hostname/tcp/port format
+        if let Some((hostname, port_str)) = dns_part.split_once("/tcp/") {
+            if let Ok(port) = port_str.parse::<u16>() {
+                if let Ok(addrs) = (hostname, port).to_socket_addrs() {
+                    let addrs_vec: Vec<_> = addrs.collect();
+                    debug!(
+                        "🔍 Checking DNS4 {}:{} resolves to {:?} (local IP: {:?})",
+                        hostname, port, addrs_vec, listen_ip4
+                    );
+                    for sa in addrs_vec {
+                        match sa.ip() {
+                            IpAddr::V4(ip) => {
+                                if Some(ip) == listen_ip4 {
+                                    info!("🎯 DNS4 {} resolves to local IP {}", hostname, ip);
+                                    return true;
+                                }
+                            }
+                            IpAddr::V6(ip) => {
+                                if Some(ip) == listen_ip6 {
+                                    info!("🎯 DNS4 {} resolves to local IP {}", hostname, ip);
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    debug!("⚠️  Failed to resolve DNS4 {}:{}", hostname, port);
+                }
+            } else {
+                debug!("⚠️  Invalid port in DNS4 address: {}", port_str);
+            }
+        } else {
+            debug!("⚠️  Invalid DNS4 format: {}", dns_part);
+        }
+    } else if let Some(dns_part) = addr_str.strip_prefix("/dns6/") {
+        // Parse /dns6/hostname/tcp/port format
+        if let Some((hostname, port_str)) = dns_part.split_once("/tcp/") {
+            if let Ok(port) = port_str.parse::<u16>() {
+                if let Ok(addrs) = (hostname, port).to_socket_addrs() {
+                    let addrs_vec: Vec<_> = addrs.collect();
+                    debug!(
+                        "🔍 Checking DNS6 {}:{} resolves to {:?} (local IP: {:?})",
+                        hostname, port, addrs_vec, listen_ip6
+                    );
+                    for sa in addrs_vec {
+                        match sa.ip() {
+                            IpAddr::V4(ip) => {
+                                if Some(ip) == listen_ip4 {
+                                    info!("🎯 DNS6 {} resolves to local IP {}", hostname, ip);
+                                    return true;
+                                }
+                            }
+                            IpAddr::V6(ip) => {
+                                if Some(ip) == listen_ip6 {
+                                    info!("🎯 DNS6 {} resolves to local IP {}", hostname, ip);
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    debug!("⚠️  Failed to resolve DNS6 {}:{}", hostname, port);
+                }
+            } else {
+                debug!("⚠️  Invalid port in DNS6 address: {}", port_str);
+            }
+        } else {
+            debug!("⚠️  Invalid DNS6 format: {}", dns_part);
+        }
+    } else if addr_str.starts_with("/dns4/") || addr_str.starts_with("/dns6/") {
+        debug!("⚠️  DNS resolution failed for address: {}", addr_str);
+    }
+
+    false
+}
+
 fn select_preferred_address(addrs: &[Multiaddr]) -> Option<Multiaddr> {
-    // Prefer IPv4, then IPv6, then anything else
+    // Priority order: dns4 -> ip4 -> dns6 -> ip6 -> anything else
+    if let Some(addr) = addrs
+        .iter()
+        .find(|a| a.to_string().starts_with("/dns4/"))
+        .cloned()
+    {
+        return Some(addr);
+    }
     if let Some(addr) = addrs
         .iter()
         .find(|a| a.to_string().starts_with("/ip4/"))
+        .cloned()
+    {
+        return Some(addr);
+    }
+    if let Some(addr) = addrs
+        .iter()
+        .find(|a| a.to_string().starts_with("/dns6/"))
         .cloned()
     {
         return Some(addr);
@@ -353,6 +453,11 @@ async fn create_production_swarm(
     }
 
     for addr in seed_addrs {
+        debug!(
+            "🔍 Checking seed address: {} (local IPs: {:?}, {:?})",
+            addr, listen_ip4, listen_ip6
+        );
+
         // Skip self-dialing by checking against our listeners and resolved listen IPs
         if swarm.listeners().any(|l| l == &addr) {
             info!(
@@ -375,6 +480,16 @@ async fn create_production_swarm(
         {
             info!(
                 "⏭️  Skipping self-dial to local seed node (ip6 match): {}",
+                addr
+            );
+            continue;
+        }
+
+        // Check if DNS address resolves to local
+        debug!("🔍 About to check DNS resolution for: {}", addr);
+        if resolves_to_local(&addr, listen_ip4, listen_ip6) {
+            info!(
+                "⏭️  Skipping self-dial to local seed node (DNS resolves to local): {}",
                 addr
             );
             continue;
@@ -484,7 +599,9 @@ pub fn load_or_generate_keypair(storage_path: &Path) -> Result<(Keypair, NodeIde
 }
 
 /// Convert seed nodes to prioritized multiaddr list.
-/// Preference per node: ip4 -> dns4 -> ip6 -> dns6 (only variants that apply are emitted).
+/// Priority order: dns4 -> ip4 -> dns6 -> ip6
+/// For hostnames: try dns4 first, then fallback to dns6
+/// For IP addresses: use ip4/ip6 directly
 fn convert_seed_nodes_to_multiaddrs(seed_nodes: &[String]) -> Vec<Multiaddr> {
     use std::net::IpAddr;
 
@@ -503,6 +620,7 @@ fn convert_seed_nodes_to_multiaddrs(seed_nodes: &[String]) -> Vec<Multiaddr> {
                 };
 
                 match clean_host.parse::<IpAddr>() {
+                    // For IP addresses, use ip4/ip6 directly (priority 2 and 4)
                     Ok(IpAddr::V4(_)) => {
                         let addr = format!("/ip4/{}/tcp/{}", clean_host, port_num);
                         if let Ok(ma) = addr.parse::<Multiaddr>() {
@@ -517,61 +635,24 @@ fn convert_seed_nodes_to_multiaddrs(seed_nodes: &[String]) -> Vec<Multiaddr> {
                             multiaddrs.push(ma);
                         }
                     }
+                    // For hostnames, prioritize dns4 first (priority 1), then fallback to dns6 (priority 3)
                     Err(_) => {
-                        // Hostname: resolve to prefer IPv4 and avoid dns6 noise when A records exist
-                        let mut first_v6 = None;
-                        let mut emitted_v4 = false;
-                        match (clean_host, port_num).to_socket_addrs() {
-                            Ok(iter) => {
-                                for sa in iter {
-                                    match sa.ip() {
-                                        IpAddr::V4(v4) => {
-                                            let addr = format!("/ip4/{}/tcp/{}", v4, port_num);
-                                            if let Ok(ma) = addr.parse::<Multiaddr>() {
-                                                info!(
-                                                    "✅ Resolved bootstrap node {} to {}",
-                                                    node, ma
-                                                );
-                                                multiaddrs.push(ma);
-                                                emitted_v4 = true;
-                                            }
-                                            // Prefer first IPv4; do not emit further addresses
-                                            break;
-                                        }
-                                        IpAddr::V6(v6) => {
-                                            if first_v6.is_none() {
-                                                first_v6 = Some(v6);
-                                            }
-                                        }
-                                    }
-                                }
-                                if !emitted_v4 {
-                                    if let Some(v6) = first_v6 {
-                                        let addr = format!("/ip6/{}/tcp/{}", v6, port_num);
-                                        if let Ok(ma) = addr.parse::<Multiaddr>() {
-                                            info!(
-                                                "✅ Resolved bootstrap node {} to IPv6 {}",
-                                                node, ma
-                                            );
-                                            multiaddrs.push(ma);
-                                        }
-                                    } else {
-                                        warn!(
-                                            "⚠️  Bootstrap node '{}' resolved to no usable IP",
-                                            node
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
+                        // Try dns4 first (priority 1)
+                        let addr4 = format!("/dns4/{}/tcp/{}", clean_host, port_num);
+                        if let Ok(ma) = addr4.parse::<Multiaddr>() {
+                            info!("✅ Bootstrap node {} as dns4: {}", node, ma);
+                            multiaddrs.push(ma);
+                        } else {
+                            // Fallback to dns6 (priority 3)
+                            let addr6 = format!("/dns6/{}/tcp/{}", clean_host, port_num);
+                            if let Ok(ma) = addr6.parse::<Multiaddr>() {
+                                info!("✅ Bootstrap node {} as dns6: {}", node, ma);
+                                multiaddrs.push(ma);
+                            } else {
                                 warn!(
-                                    "⚠️  DNS resolution failed for bootstrap node '{}': {}. Falling back to dns4.",
-                                    node, e
+                                    "⚠️  Failed to create multiaddr for bootstrap node '{}'",
+                                    node
                                 );
-                                let addr4 = format!("/dns4/{}/tcp/{}", clean_host, port_num);
-                                if let Ok(ma) = addr4.parse::<Multiaddr>() {
-                                    multiaddrs.push(ma);
-                                }
                             }
                         }
                     }
@@ -905,8 +986,8 @@ fn handle_kademlia_event(
                 ..
             }))) => {
                 let key_str = String::from_utf8_lossy(record.key.as_ref());
-                if key_str.starts_with("cameodb-uuid-") {
-                    let peer_id_str = key_str.trim_start_matches("cameodb-uuid-");
+                if key_str.starts_with("cameodb-peer-") {
+                    let peer_id_str = key_str.trim_start_matches("cameodb-peer-");
                     let uuid_str = String::from_utf8_lossy(&record.value);
 
                     peer_book

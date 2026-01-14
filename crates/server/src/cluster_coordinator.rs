@@ -1426,9 +1426,11 @@ impl Message<GetStatus> for ClusterCoordinator {
         status.total_nodes = configured_nodes.max(discovered_nodes);
         status.connected_nodes = active;
 
-        // Override total_shards with the authoritative count from coordinator's assignment map
-        // This includes local shards + known remote shards
+        // Calculate total_shards from shard assignments which is our authoritative global map
         status.total_shards = self.shard_assignments.len();
+        status.active_shards = self.shard_assignments.values()
+            .filter(|s| s.node_id == self.cluster.local_node_id)
+            .count();
 
         info!(
             cluster = %status.cluster_name,
@@ -1655,10 +1657,11 @@ impl Message<PeerNodeMetadataDiscovered> for ClusterCoordinator {
         );
 
         // Update expected_nodes with additional information
+        let address_clone = msg.address.clone();
         self.expected_nodes
             .entry(node_uuid)
             .and_modify(|node_info| {
-                if let Some(ref addr) = msg.address {
+                if let Some(ref addr) = address_clone {
                     node_info.address = addr.clone();
                 }
                 node_info.node_name = Some(msg.node_name.clone());
@@ -1672,10 +1675,37 @@ impl Message<PeerNodeMetadataDiscovered> for ClusterCoordinator {
             .or_insert_with(|| NodeInfo {
                 node_id: node_uuid,
                 node_name: Some(msg.node_name.clone()),
-                address: msg.address.unwrap_or_else(|| "unknown".to_string()),
+                address: address_clone.unwrap_or_else(|| "unknown".to_string()),
                 status: match msg.status.as_str() {
                     "Connected" => crate::distributed::NodeStatus::Connected,
                     _ => crate::distributed::NodeStatus::Disconnected, // Default to Disconnected for unknown status
+                },
+                shard_count: msg.shard_count as usize,
+            });
+
+        // Also update peer_nodes with shard count for cluster status calculation
+        self.cluster.peer_nodes
+            .entry(node_uuid)
+            .and_modify(|node_info| {
+                node_info.shard_count = msg.shard_count as usize;
+                if let Some(ref addr) = msg.address {
+                    node_info.address = addr.clone();
+                }
+                if !msg.node_name.is_empty() {
+                    node_info.node_name = Some(msg.node_name.clone());
+                }
+                node_info.status = match msg.status.as_str() {
+                    "Connected" => crate::distributed::NodeStatus::Connected,
+                    _ => crate::distributed::NodeStatus::Disconnected,
+                };
+            })
+            .or_insert_with(|| NodeInfo {
+                node_id: node_uuid,
+                node_name: Some(msg.node_name.clone()),
+                address: msg.address.unwrap_or_else(|| "unknown".to_string()),
+                status: match msg.status.as_str() {
+                    "Connected" => crate::distributed::NodeStatus::Connected,
+                    _ => crate::distributed::NodeStatus::Disconnected,
                 },
                 shard_count: msg.shard_count as usize,
             });
@@ -1966,12 +1996,10 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
         // Check if we actually need this update
         let (local_generation, local_checksum) = self.get_cluster_state_info();
 
-        // Always update last seen state first
-        self.update_last_seen_state(node_id, remote_generation, remote_checksum);
-
         // Check if data is identical - if so, just sync generations and skip merge
         if local_checksum == remote_checksum {
             self.sync_generation_if_needed(remote_generation, remote_checksum);
+            self.update_last_seen_state(node_id, remote_generation, remote_checksum);
             debug!(
                 remote_node = %node_id,
                 remote_generation,
@@ -1995,6 +2023,9 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
             );
             return;
         }
+
+        // Always update last seen state after checking needs_update
+        self.update_last_seen_state(node_id, remote_generation, remote_checksum);
 
         info!(
             remote_node = %node_id,

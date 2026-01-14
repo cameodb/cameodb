@@ -114,7 +114,7 @@ impl DhtBehaviour {
         use libp2p::kad::{Record, RecordKey};
 
         // Use peer ID as part of the key to ensure uniqueness per node
-        let key_str = format!("cameodb-uuid-{}", local_peer_id);
+        let key_str = format!("cameodb-peer-{}", local_peer_id);
         let key = RecordKey::new(&key_str);
         let value = node_uuid.to_string().into_bytes();
 
@@ -142,7 +142,7 @@ impl DhtBehaviour {
 
     /// Query DHT for a peer's node UUID
     pub fn query_peer_uuid(&mut self, peer_id: &PeerId) -> kad::QueryId {
-        let key_str = format!("cameodb-uuid-{}", peer_id);
+        let key_str = format!("cameodb-peer-{}", peer_id);
         let key = kad::RecordKey::new(&key_str);
         info!(
             "🔍 Querying DHT for peer {} node UUID with key {}",

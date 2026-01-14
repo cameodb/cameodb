@@ -231,6 +231,7 @@ impl DistributedCluster {
             total_nodes,
             connected_nodes: active_nodes,
             total_shards,
+            active_shards: 0, // Will be overridden by coordinator
             cluster_enabled: self.cluster_config.enabled,
             dial_failures: self.dial_failures,
             bootstrap_successes: self.bootstrap_successes,
@@ -258,6 +259,7 @@ pub struct ClusterStatus {
     pub total_nodes: usize,
     pub connected_nodes: usize,
     pub total_shards: usize,
+    pub active_shards: usize,
     pub cluster_enabled: bool,
     pub dial_failures: u64,
     pub bootstrap_successes: u64,

@@ -51,9 +51,6 @@ use storage::{
     FieldDef, HybridStore, IndexSchema, StorageConfig, StoreError, TantivyFieldType, WalOp,
 };
 
-// Type alias for routing results to reduce complexity
-type RoutingResult = Result<(usize, DocPayload, Option<String>), OrchestratorError>;
-
 /// Helper function to detect if an operation is a write operation
 fn is_write_operation(op: &ClientOp) -> bool {
     matches!(
@@ -1237,8 +1234,14 @@ impl RouterActor {
                         merged_hits.push(hit.clone());
                     }
                 }
-                if let Some(shards) = value.get("shards_responded").and_then(|s| s.as_u64()) {
-                    *total_shards_queried += shards as usize;
+                // Extract shard statistics from the response
+                if let Some(stats) = value.get("stats").and_then(|s| s.as_object()) {
+                    if let Some(shards) = stats.get("shards").and_then(|s| s.as_object()) {
+                        if let Some(responded) = shards.get("responded").and_then(|r| r.as_u64()) {
+                            *total_shards_queried += responded as usize;
+                        }
+                        _ = shards.get("total").and_then(|t| t.as_u64()); // Could track total shards attempted
+                    }
                 }
                 if let Some(total) = value.get("total_hits").and_then(|t| t.as_u64()) {
                     *total_hits_sum += total as usize;
@@ -1774,10 +1777,19 @@ impl RouterActor {
                                     {
                                         total_hits_sum += total as usize;
                                     }
-                                    if let Some(shards) =
-                                        val.get("shards_responded").and_then(|s| s.as_u64())
+                                    // Extract shard statistics from the response
+                                    if let Some(stats) =
+                                        val.get("stats").and_then(|s| s.as_object())
                                     {
-                                        shards_queried += shards as usize;
+                                        if let Some(shards) =
+                                            stats.get("shards").and_then(|s| s.as_object())
+                                        {
+                                            if let Some(responded) =
+                                                shards.get("responded").and_then(|r| r.as_u64())
+                                            {
+                                                shards_queried += responded as usize;
+                                            }
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -1923,14 +1935,13 @@ impl RouterActor {
                     OrchestratorError::Io(std::io::Error::other(e.to_string()))
                 })?;
 
-        match remote_ref {
-            Some(_remote) => {
+        let res = match remote_ref {
+            Some(remote) => {
                 info!("✅ Remote actor found: {}", orchestrator_name);
-                // TODO: Fix remote messaging once ClientOp is properly implemented as remote message
-                warn!("❌ Remote messaging disabled for ClientOp - not implemented yet");
-                Err(OrchestratorError::Io(std::io::Error::other(
-                    "Remote messaging for ClientOp not implemented",
-                )))
+                remote
+                    .ask(&_op)
+                    .await
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
             }
             None => {
                 warn!(
@@ -1940,9 +1951,10 @@ impl RouterActor {
                 Err(OrchestratorError::Io(std::io::Error::other(format!(
                     "remote orchestrator {} not found",
                     orchestrator_name
-                ))))
+                ))))?
             }
-        }
+        };
+        Ok(res)
     }
 }
 
@@ -2577,16 +2589,19 @@ impl NodeOrchestrator {
         &self,
         node_id: Uuid,
         peer_addr: &str,
-        _index: &str,
-        _docs: Vec<DocPayload>,
+        index: &str,
+        docs: Vec<DocPayload>,
     ) -> Result<usize, OrchestratorError> {
         let orchestrator_name = orchestrator_remote_name(&node_id);
         info!(
-            "🔎 Forwarding bulk batch to remote orchestrator: name='{}', node_id={}, addr={}",
-            orchestrator_name, node_id, peer_addr
+            "🔎 Forwarding bulk batch to remote orchestrator: name='{}', node_id={}, addr={}, docs={}",
+            orchestrator_name,
+            node_id,
+            peer_addr,
+            docs.len()
         );
 
-        let _remote_ref: Option<RemoteActorRef<NodeOrchestrator>> =
+        let remote_ref: Option<RemoteActorRef<NodeOrchestrator>> =
             RemoteActorRef::lookup(orchestrator_name.clone())
                 .await
                 .map_err(|e| {
@@ -2594,11 +2609,32 @@ impl NodeOrchestrator {
                     OrchestratorError::Io(std::io::Error::other(e.to_string()))
                 })?;
 
-        // TODO: Fix remote messaging once ClientOp is properly implemented as remote message
-        warn!("❌ Remote messaging disabled for ClientOp - not implemented yet");
-        Err(OrchestratorError::Io(std::io::Error::other(
-            "Remote messaging for ClientOp not implemented",
-        )))
+        let remote = remote_ref.ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Remote orchestrator {} not found",
+                orchestrator_name
+            )))
+        })?;
+
+        // Send bulk write operation to remote node
+        let _op = ClientOp::BulkWrite {
+            index: index.to_string(),
+            docs,
+        };
+
+        let res = remote
+            .ask(&_op)
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+
+        // Extract the number of items written from the response
+        if let Some(items_written) = res.get("items_written").and_then(|v| v.as_u64()) {
+            Ok(items_written as usize)
+        } else {
+            Err(OrchestratorError::Io(std::io::Error::other(
+                "Invalid response from remote bulk write",
+            )))
+        }
     }
 
     /// Fetch a schema from cache if present.
@@ -3159,20 +3195,94 @@ impl NodeOrchestrator {
 
         // Group documents by target shard using parallel routing for better performance
         let items_received = docs.len();
-        let batches = self.parallel_route_documents(docs).await?;
+
+        // First, route all documents to determine local vs remote
+        let mut local_docs = Vec::new();
+        let mut remote_docs = Vec::new();
+
+        // Clone routing ring for parallel access
+        let routing_ring = self.routing_ring.clone();
+        let first_shard_id = self.first_shard_id();
+
+        // Get shard assignments to determine ownership (used later for remote routing)
+        let shard_assignments = if let Some(coord) = &self.coordinator {
+            coord.ask(GetShardAssignments).await.unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        // Route documents in parallel
+        let routing_results: Vec<
+            Result<(DocPayload, Option<String>, Option<Uuid>), OrchestratorError>,
+        > =
+            docs.into_par_iter()
+                .map(|doc| {
+                    // Calculate effective routing key
+                    let effective_routing_key = doc
+                        .routing_key
+                        .clone()
+                        .or_else(|| (!doc.id.is_empty()).then(|| doc.id.clone()))
+                        .or_else(|| derive_routing_key_from_doc(&doc.doc));
+
+                    // Route to shard using consistent hash ring
+                    let target_shard =
+                        match effective_routing_key.as_ref() {
+                            Some(key) => routing_ring
+                                .get_owner(key)
+                                .or(first_shard_id)
+                                .ok_or_else(|| {
+                                    OrchestratorError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::NotFound,
+                                        "No shard available for routing",
+                                    ))
+                                })?,
+                            None => {
+                                return Err(OrchestratorError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "Missing routing key for document",
+                                )));
+                            }
+                        };
+
+                    Ok((doc, effective_routing_key, Some(target_shard)))
+                })
+                .collect();
+
+        // Separate local and remote documents
+        for result in routing_results {
+            match result {
+                Ok((doc, routing_key, Some(target_shard))) => {
+                    // Check if this shard is local
+                    if self.shards.contains_key(&target_shard) {
+                        local_docs.push((doc, routing_key, target_shard));
+                    } else {
+                        remote_docs.push((doc, routing_key, target_shard));
+                    }
+                }
+                Ok((doc, _, None)) => {
+                    // No target shard - this shouldn't happen but handle gracefully
+                    tracing::warn!("Document routed to no shard: {}", doc.id);
+                }
+                Err(e) => {
+                    tracing::warn!("Routing error: {}", e);
+                }
+            }
+        }
+
+        // Group local documents by shard
+        let batches = self.group_local_documents(local_docs).await?;
         let unique_shards = batches.len();
 
         tracing::debug!(
             items_received = items_received,
             unique_shards = unique_shards,
+            remote_docs = remote_docs.len(),
             "BulkWrite grouped items by shard"
         );
 
         // Fetch shard ownership and peer addresses to forward remote batches.
-        let mut shard_assignments = HashMap::new();
         let mut peer_addrs = HashMap::new();
         if let Some(coord) = &self.coordinator {
-            shard_assignments = coord.ask(GetShardAssignments).await.unwrap_or_default();
             peer_addrs = coord
                 .ask(GetKnownPeers)
                 .await
@@ -3188,46 +3298,44 @@ impl NodeOrchestrator {
         let mut written = 0usize;
         let mut errors = Vec::new();
 
+        // Process local batches from parallel routing
         for (shard_id, batch) in batches {
-            let owner_node = shard_assignments.get(&shard_id).map(|m| m.node_id);
+            local_batches.insert(shard_id, batch);
+        }
 
-            match owner_node {
-                Some(node_id) if node_id == self.identity.uuid => {
-                    // Local shard - add to parallel processing
-                    local_batches.insert(shard_id, batch);
-                }
-                Some(node_id) => {
-                    // Remote shard - keep sequential for now (Phase 3.2)
-                    let peer_addr = peer_addrs.get(&node_id).cloned();
-                    if let Some(addr) = peer_addr {
-                        tracing::debug!(
-                            shard_id = %shard_id,
-                            owner = %node_id,
-                            count = batch.len(),
-                            "Forwarding bulk write batch to remote owner"
-                        );
-                        let docs_for_remote: Vec<DocPayload> = batch
-                            .into_iter()
-                            .map(|(d, effective_routing_key)| DocPayload {
-                                id: d.id,
-                                routing_key: effective_routing_key,
-                                doc: d.doc,
-                            })
-                            .collect();
-                        remote_batches.push((node_id, addr, docs_for_remote));
-                    } else {
-                        errors.push(format!(
-                            "No peer address for owner {} of shard {}",
-                            node_id, shard_id
-                        ));
-                    }
-                }
-                None => {
-                    errors.push(format!(
-                        "No shard assignment for shard {}; dropping batch",
-                        shard_id
-                    ));
-                }
+        // Group remote documents by owning node
+        let mut remote_by_node: HashMap<Uuid, Vec<DocPayload>> = HashMap::new();
+        for (doc, routing_key, target_shard) in remote_docs {
+            if let Some(shard_meta) = shard_assignments.get(&target_shard) {
+                let owner_node = shard_meta.node_id;
+                let doc_payload = DocPayload {
+                    id: doc.id,
+                    routing_key,
+                    doc: doc.doc,
+                };
+                remote_by_node
+                    .entry(owner_node)
+                    .or_default()
+                    .push(doc_payload);
+            } else {
+                errors.push(format!(
+                    "No shard assignment for shard {}; dropping document",
+                    target_shard
+                ));
+            }
+        }
+
+        // Convert remote batches to the expected format
+        for (node_id, docs) in remote_by_node {
+            if let Some(addr) = peer_addrs.get(&node_id) {
+                tracing::debug!(
+                    node = %node_id,
+                    count = docs.len(),
+                    "Forwarding bulk write batch to remote node"
+                );
+                remote_batches.push((node_id, addr.clone(), docs));
+            } else {
+                errors.push(format!("No peer address for node {}", node_id));
             }
         }
 
@@ -3238,24 +3346,74 @@ impl NodeOrchestrator {
         written += local_written;
         errors.extend(local_errors);
 
-        // Sequential Remote Forwarding (Phase 3.2 - to be parallelized later)
-        for (node_id, addr, docs_for_remote) in remote_batches {
-            match self
-                .forward_bulk_to_remote(node_id, &addr, index, docs_for_remote)
-                .await
-            {
-                Ok(items) => {
-                    written += items;
+        // Phase 3.2: Parallel Remote Forwarding
+        if !remote_batches.is_empty() {
+            use futures::future::join_all;
+
+            let remote_futures: Vec<_> = remote_batches
+                .into_iter()
+                .map(|(node_id, addr, docs_for_remote)| async move {
+                    self.forward_bulk_to_remote(node_id, &addr, index, docs_for_remote)
+                        .await
+                        .map(|items| (node_id, items))
+                })
+                .collect();
+
+            let remote_results = join_all(remote_futures).await;
+
+            for result in remote_results {
+                match result {
+                    Ok((_, items)) => {
+                        written += items;
+                    }
+                    Err(e) => {
+                        errors.push(format!("Remote forwarding failed: {}", e));
+                    }
                 }
-                Err(e) => errors.push(format!(
-                    "Remote shard {} (node {}) forwarding failed: {}",
-                    node_id, node_id, e
-                )),
             }
         }
-        Ok(
-            serde_json::json!({"took_ms": start.elapsed().as_millis(), "items_received": items_received, "items_written": written, "errors": errors}),
-        )
+
+        let duration = start.elapsed();
+        info!(
+            index = %index,
+            items_received = items_received,
+            items_written = written,
+            errors = errors.len(),
+            duration_ms = duration.as_millis(),
+            "BulkWrite completed"
+        );
+
+        if !errors.is_empty() {
+            warn!(
+                index = %index,
+                error_count = errors.len(),
+                "BulkWrite had some errors"
+            );
+        }
+
+        Ok(serde_json::json!({
+            "items_written": written,
+            "items_received": items_received,
+            "errors": errors,
+            "duration_ms": duration.as_millis()
+        }))
+    }
+
+    /// Helper method to group local documents by shard
+    async fn group_local_documents(
+        &self,
+        local_docs: Vec<(DocPayload, Option<String>, Uuid)>,
+    ) -> Result<HashMap<Uuid, Vec<(DocPayload, Option<String>)>>, OrchestratorError> {
+        let mut batches: HashMap<Uuid, Vec<(DocPayload, Option<String>)>> = HashMap::new();
+
+        for (doc, routing_key, shard_id) in local_docs {
+            batches
+                .entry(shard_id)
+                .or_default()
+                .push((doc, routing_key));
+        }
+
+        Ok(batches)
     }
 
     async fn orch_search(
@@ -3683,125 +3841,6 @@ impl NodeOrchestrator {
             shard_count: self.default_shard_count(),
             fields: HashMap::new(),
         })
-    }
-
-    /// Route documents to shards in parallel using pre-allocated vectors for performance.
-    ///
-    /// This method uses a lock-free approach with pre-allocated vectors per shard,
-    /// avoiding HashMap contention during parallel routing.
-    async fn parallel_route_documents(
-        &self,
-        docs: Vec<DocPayload>,
-    ) -> Result<HashMap<Uuid, Vec<(DocPayload, Option<String>)>>, OrchestratorError> {
-        use std::collections::HashMap;
-
-        if docs.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let docs_count = docs.len();
-
-        // Pre-create shard index mapping for fast array access
-        let shard_ids: Vec<Uuid> = self.shards.keys().copied().collect();
-        let shard_index_map: HashMap<Uuid, usize> = shard_ids
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| (id, i))
-            .collect();
-
-        // Pre-allocate vectors for each shard (avoid HashMap contention)
-        let mut per_shard_docs: Vec<Vec<(DocPayload, Option<String>)>> =
-            Vec::with_capacity(shard_ids.len());
-        per_shard_docs.resize_with(shard_ids.len(), Vec::new);
-
-        // Clone routing ring for parallel access (read-only)
-        let routing_ring = self.routing_ring.clone();
-        let first_shard_id = self.first_shard_id();
-
-        // Route documents in parallel using rayon for CPU-bound work
-        let routing_results: Vec<RoutingResult> =
-            docs.into_par_iter()
-                .map(|doc| {
-                    // Calculate effective routing key
-                    let effective_routing_key = doc
-                        .routing_key
-                        .clone()
-                        .or_else(|| (!doc.id.is_empty()).then(|| doc.id.clone()))
-                        .or_else(|| derive_routing_key_from_doc(&doc.doc));
-
-                    // Route to shard using consistent hash ring
-                    let target =
-                        match effective_routing_key.as_ref() {
-                            Some(key) => routing_ring
-                                .get_owner(key)
-                                .or(first_shard_id)
-                                .ok_or_else(|| {
-                                    OrchestratorError::Io(std::io::Error::new(
-                                        std::io::ErrorKind::NotFound,
-                                        "No shard available for routing",
-                                    ))
-                                })?,
-                            None => {
-                                return Err(OrchestratorError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidInput,
-                                    "Missing routing key for document",
-                                )));
-                            }
-                        };
-
-                    // Find shard index
-                    let shard_index = shard_index_map.get(&target).copied().ok_or_else(|| {
-                        OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("Shard {} not found in local mapping", target),
-                        ))
-                    })?;
-
-                    Ok((shard_index, doc, effective_routing_key))
-                })
-                .collect();
-
-        // Collect results into per-shard vectors (sequential but fast)
-        let mut error_count = 0;
-        for result in routing_results {
-            match result {
-                Ok((shard_index, doc, routing_key)) => {
-                    per_shard_docs[shard_index].push((doc, routing_key));
-                }
-                Err(e) => {
-                    error_count += 1;
-                    tracing::warn!("Routing error: {}", e);
-                    // Continue processing other documents
-                }
-            }
-        }
-
-        // Convert vectors back to HashMap for compatibility with existing code
-        let mut batches: HashMap<Uuid, Vec<(DocPayload, Option<String>)>> = HashMap::new();
-        for (shard_index, docs) in per_shard_docs.into_iter().enumerate() {
-            if !docs.is_empty() {
-                let shard_id = shard_ids[shard_index];
-                batches.insert(shard_id, docs);
-            }
-        }
-
-        if error_count > 0 {
-            tracing::warn!(
-                total_errors = error_count,
-                total_docs = docs_count,
-                "Some documents failed routing during parallel processing"
-            );
-        }
-
-        tracing::debug!(
-            total_docs = docs_count,
-            successful_routes = batches.values().map(|v| v.len()).sum::<usize>(),
-            unique_shards = batches.len(),
-            routing_errors = error_count,
-            "Parallel routing completed"
-        );
-
-        Ok(batches)
     }
 
     /// Helper: Route write to shard using deterministic key (no round-robin).
