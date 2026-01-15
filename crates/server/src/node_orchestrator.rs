@@ -3812,11 +3812,17 @@ impl NodeOrchestrator {
             let mut json_obj = JsonMap::new();
             json_obj.insert("name".to_string(), JsonValue::String(name.clone()));
             json_obj.insert("document_count".to_string(), JsonValue::from(doc_count));
-            json_obj.insert(
-                "total_size_bytes".to_string(),
-                JsonValue::from(total_size_bytes),
-            );
+
+            // Only include size fields when data size is requested
+            if include_data_size {
+                json_obj.insert(
+                    "total_size_bytes".to_string(),
+                    JsonValue::from(total_size_bytes),
+                );
+            }
+
             json_obj.insert("index_size_mb".to_string(), JsonValue::from(index_size_mb));
+
             if include_data_size {
                 json_obj.insert(
                     "data_size_mb".to_string(),

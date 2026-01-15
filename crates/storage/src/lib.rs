@@ -44,7 +44,7 @@ use walkdir::WalkDir;
 const TANTIVY_DATA_FILE_EXTENSIONS: &[&str] = &["store", "fast", "idx", "doc", "pos", "term"];
 
 /// Number of records to sample for size estimation in large tables
-const TABLE_SIZE_SAMPLE_COUNT: u64 = 1000;
+const TABLE_SIZE_SAMPLE_COUNT: u64 = 500;
 
 /// Schema metadata table: maps index names to their schema definitions.
 const TABLE_SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("schema");
@@ -2437,21 +2437,8 @@ impl HybridStore {
 
         // Step 2: Iterate & Classify Tables
         for index_name in &index_names {
-            let (document_count, redb_bytes, tantivy_bytes) = if include_data_size {
-                let (tivy, redb, doc_count) = self.get_index_sizes_cached(index_name)?;
-                (doc_count, redb, tivy)
-            } else {
-                // If not including data size, just get document count
-                let read_txn = self.kv.begin_read()?;
-                let data_table_name = format!("data_{}", index_name);
-                let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
-                let doc_count = match read_txn.open_table(data_table_def) {
-                    Ok(data_table) => data_table.len().unwrap_or(0),
-                    Err(_) => 0,
-                };
-                drop(read_txn);
-                (doc_count, 0, 0)
-            };
+            let (tantivy_bytes, redb_bytes, document_count) =
+                self.get_index_sizes_cached(index_name, include_data_size, &index_names)?;
 
             per_index.insert(
                 index_name.clone(),
@@ -2533,104 +2520,177 @@ impl HybridStore {
         Ok(index_names)
     }
 
-    /// Get unified index sizes (Tantivy directory + Redb table) with caching to avoid repeated expensive calculations.
-    /// Returns (tantivy_bytes, redb_bytes, document_count)
-    fn get_index_sizes_cached(&self, index_name: &str) -> Result<(u64, u64, u64), StoreError> {
-        // Create deterministic cache key from shard path and index name
-        let cache_key = format!("{}:{}", self.config.shard_path.display(), index_name);
+    /// Get index size statistics, optionally including the corrected redb measurement.
+    fn get_index_sizes_cached(
+        &self,
+        index_name: &str,
+        include_redb: bool,
+        all_index_names: &HashSet<String>,
+    ) -> Result<(u64, u64, u64), StoreError> {
+        let cache_suffix = if include_redb { "full" } else { "fast" };
+        let cache_key = format!(
+            "{}:{}:{}",
+            self.config.shard_path.display(),
+            cache_suffix,
+            index_name
+        );
 
-        // Check cache first
         {
             let cache = self.index_size_cache.lock().unwrap();
             if let Some(entry) = cache.get(&cache_key) {
-                let elapsed = entry.timestamp.elapsed();
-                if elapsed < self.index_cache_expiry {
-                    tracing::debug!(
-                        cache_key = %cache_key,
-                        tantivy_bytes = entry.tantivy_bytes,
-                        redb_bytes = entry.redb_bytes,
-                        document_count = entry.document_count,
-                        cache_age_ms = elapsed.as_millis(),
-                        "Index size cache HIT"
-                    );
+                if entry.timestamp.elapsed() < self.index_cache_expiry {
                     return Ok((entry.tantivy_bytes, entry.redb_bytes, entry.document_count));
-                } else {
-                    tracing::debug!(
-                        cache_key = %cache_key,
-                        cache_age_ms = elapsed.as_millis(),
-                        expiry_ms = self.index_cache_expiry.as_millis(),
-                        "Index size cache EXPIRED"
-                    );
                 }
-            } else {
-                tracing::debug!(cache_key = %cache_key, "Index size cache MISS");
             }
         }
 
-        // Cache miss or expired - calculate both sizes
-        let start_time = Instant::now();
+        let tantivy_bytes = self.measure_tantivy_bytes(index_name)?;
 
-        // Calculate Tantivy directory size
-        let index_dir = self.config.shard_path.join("indices").join(index_name);
-        let tantivy_bytes = if index_dir.exists() {
-            let mut total_size = 0u64;
-            for entry in WalkDir::new(&index_dir)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(Result::ok)
-            {
-                if let Ok(metadata) = entry.metadata()
-                    && metadata.is_file()
-                    && Self::is_tantivy_data_file(entry.path())
-                {
-                    total_size += metadata.len();
-                }
+        if !include_redb {
+            let document_count = self.get_document_count_only(index_name)?;
+            let mut cache = self.index_size_cache.lock().unwrap();
+            cache.insert(
+                cache_key,
+                IndexSizeCache {
+                    tantivy_bytes,
+                    redb_bytes: 0,
+                    document_count,
+                    timestamp: Instant::now(),
+                },
+            );
+            return Ok((tantivy_bytes, 0, document_count));
+        }
+
+        let mut per_index_stats = Vec::with_capacity(all_index_names.len());
+        let mut total_raw_redb_size = 0u64;
+
+        for idx_name in all_index_names {
+            let idx_tantivy_bytes = if idx_name == index_name {
+                tantivy_bytes
+            } else {
+                self.measure_tantivy_bytes(idx_name)?
+            };
+
+            let (doc_count, raw_redb_bytes) = self.measure_redb_stats(idx_name)?;
+            per_index_stats.push((
+                idx_name.clone(),
+                idx_tantivy_bytes,
+                doc_count,
+                raw_redb_bytes,
+            ));
+            total_raw_redb_size = total_raw_redb_size.saturating_add(raw_redb_bytes);
+        }
+
+        let physical_db_size = match std::fs::metadata(self.config.shard_path.join("store.redb")) {
+            Ok(metadata) => metadata.len(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to get database file size, using raw estimation"
+                );
+                total_raw_redb_size
             }
-            total_size
-        } else {
-            0
         };
 
-        // Calculate Redb table size
+        let correction_factor = if total_raw_redb_size > 0 {
+            physical_db_size as f64 / total_raw_redb_size as f64
+        } else {
+            1.0
+        };
+
+        let mut target_redb_bytes = 0u64;
+        let mut target_document_count = 0u64;
+
+        {
+            let mut cache = self.index_size_cache.lock().unwrap();
+            for (idx_name, idx_tantivy_bytes, doc_count, raw_redb_bytes) in per_index_stats {
+                let corrected_redb_bytes = (raw_redb_bytes as f64 * correction_factor) as u64;
+
+                let full_key = format!("{}:full:{}", self.config.shard_path.display(), idx_name);
+                cache.insert(
+                    full_key,
+                    IndexSizeCache {
+                        tantivy_bytes: idx_tantivy_bytes,
+                        redb_bytes: corrected_redb_bytes,
+                        document_count: doc_count,
+                        timestamp: Instant::now(),
+                    },
+                );
+
+                let fast_key = format!("{}:fast:{}", self.config.shard_path.display(), idx_name);
+                cache.insert(
+                    fast_key,
+                    IndexSizeCache {
+                        tantivy_bytes: idx_tantivy_bytes,
+                        redb_bytes: 0,
+                        document_count: doc_count,
+                        timestamp: Instant::now(),
+                    },
+                );
+
+                if idx_name == index_name {
+                    target_redb_bytes = corrected_redb_bytes;
+                    target_document_count = doc_count;
+                }
+            }
+        }
+
+        Ok((tantivy_bytes, target_redb_bytes, target_document_count))
+    }
+
+    fn measure_tantivy_bytes(&self, index_name: &str) -> Result<u64, StoreError> {
+        let index_dir = self.config.shard_path.join("indices").join(index_name);
+        if !index_dir.exists() {
+            return Ok(0);
+        }
+
+        let mut total_size = 0u64;
+        for entry in WalkDir::new(&index_dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if let Ok(metadata) = entry.metadata()
+                && metadata.is_file()
+                && Self::is_tantivy_data_file(entry.path())
+            {
+                total_size += metadata.len();
+            }
+        }
+
+        Ok(total_size)
+    }
+
+    fn get_document_count_only(&self, index_name: &str) -> Result<u64, StoreError> {
         let read_txn = self.kv.begin_read()?;
         let data_table_name = format!("data_{}", index_name);
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
 
-        let (document_count, redb_bytes) = match read_txn.open_table(data_table_def) {
+        let count = match read_txn.open_table(data_table_def) {
+            Ok(data_table) => data_table.len().unwrap_or(0),
+            Err(_) => 0,
+        };
+        drop(read_txn);
+
+        Ok(count)
+    }
+
+    fn measure_redb_stats(&self, index_name: &str) -> Result<(u64, u64), StoreError> {
+        let read_txn = self.kv.begin_read()?;
+        let data_table_name = format!("data_{}", index_name);
+        let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
+
+        let (doc_count, raw_bytes) = match read_txn.open_table(data_table_def) {
             Ok(data_table) => {
                 let doc_count = data_table.len().unwrap_or(0);
-                let (raw, _is_estimated) = self.calculate_table_size_estimated(&data_table)?;
-                (doc_count, raw)
+                let (raw_size, _) = self.calculate_table_size_estimated(&data_table)?;
+                (doc_count, raw_size)
             }
             Err(_) => (0, 0),
         };
         drop(read_txn);
 
-        let duration = start_time.elapsed();
-        tracing::debug!(
-            index = %index_name,
-            tantivy_bytes = tantivy_bytes,
-            redb_bytes = redb_bytes,
-            document_count = document_count,
-            duration_ms = duration.as_millis(),
-            "Calculated unified index sizes"
-        );
-
-        // Update cache
-        {
-            let mut cache = self.index_size_cache.lock().unwrap();
-            cache.insert(
-                cache_key.clone(),
-                IndexSizeCache {
-                    tantivy_bytes,
-                    redb_bytes,
-                    document_count,
-                    timestamp: Instant::now(),
-                },
-            );
-        }
-
-        Ok((tantivy_bytes, redb_bytes, document_count))
+        Ok((doc_count, raw_bytes))
     }
 
     fn is_tantivy_data_file(path: &std::path::Path) -> bool {
