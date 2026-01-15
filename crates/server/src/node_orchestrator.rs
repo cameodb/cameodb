@@ -3847,7 +3847,7 @@ impl NodeOrchestrator {
             "node_id": self.identity.uuid.to_string(),
             "node_name": self.identity.name.clone(),
             "total_shards": self.shards.len(),
-            "total_ms": total_ms,
+            "took_ms": total_ms,
         }))
     }
 
