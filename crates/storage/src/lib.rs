@@ -45,7 +45,7 @@ use walkdir::WalkDir;
 const TANTIVY_DATA_FILE_EXTENSIONS: &[&str] = &["store", "fast", "idx", "doc", "pos", "term"];
 
 /// Number of records to sample for size estimation in large tables
-const TABLE_SIZE_SAMPLE_COUNT: u64 = 256;
+const TABLE_SIZE_SAMPLE_COUNT: u64 = 200;
 
 /// Schema metadata table: maps index names to their schema definitions.
 const TABLE_SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("schema");

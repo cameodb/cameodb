@@ -2075,28 +2075,85 @@ impl NodeOrchestrator {
         }
     }
 
-    fn deterministic_shard_directory(
-        &self,
-        shard_id: Uuid,
-        known_shards: Option<&[Uuid]>,
-    ) -> PathBuf {
+    fn deterministic_shard_directory(&self, shard_id: Uuid) -> PathBuf {
         let paths_cow = self.storage_path_candidates();
-        let paths = paths_cow.as_ref();
 
-        let mut shard_ids: Vec<Uuid> = match known_shards {
-            Some(ids) => ids.to_vec(),
-            None => self.shards.keys().copied().collect(),
-        };
+        // Ensure paths are sorted for deterministic distribution
+        let mut sorted_paths: Vec<PathBuf> = paths_cow.as_ref().to_vec();
+        sorted_paths.sort();
 
-        if !shard_ids.contains(&shard_id) {
-            shard_ids.push(shard_id);
-        }
-        shard_ids.sort_unstable();
+        // Use the UUID bytes directly for stable distribution
+        // Convert first 8 bytes of UUID to u64 for modulo operation
+        let uuid_bytes = shard_id.as_bytes();
+        let hash_value = u64::from_be_bytes(
+            uuid_bytes[..8]
+                .try_into()
+                .expect("UUID has at least 8 bytes"),
+        );
 
-        let rank = shard_ids.iter().position(|id| *id == shard_id).unwrap_or(0);
+        // Round-robin distribution based on UUID hash
+        let path_index = (hash_value as usize) % sorted_paths.len();
+        let base = &sorted_paths[path_index];
 
-        let base = &paths[rank % paths.len()];
         base.join(format!("shard-{}", shard_id))
+    }
+
+    /// Generates a balanced shard ID using UUID mining for uniform distribution.
+    ///
+    /// This method "mines" a UUID that will map to the least-loaded data directory,
+    /// ensuring uniform distribution across all available storage paths while
+    /// maintaining deterministic placement (same UUID always maps to same path).
+    ///
+    /// Algorithm:
+    /// 1. Calculate current distribution by hashing existing shard UUIDs
+    /// 2. Identify the directory with the minimum shard count
+    /// 3. Generate random UUIDs until one hashes to the target directory
+    ///
+    /// Performance: Average iterations = number of directories (e.g., 6 attempts for 6 dirs)
+    pub fn generate_balanced_shard_id(&self) -> Uuid {
+        let paths_cow = self.storage_path_candidates();
+        let mut sorted_paths: Vec<PathBuf> = paths_cow.as_ref().to_vec();
+        sorted_paths.sort();
+
+        let dir_count = sorted_paths.len();
+        if dir_count == 0 {
+            return Uuid::new_v4();
+        }
+
+        // Calculate current distribution across directories
+        let mut distribution = vec![0usize; dir_count];
+        for existing_id in self.shards.keys() {
+            let bytes = existing_id.as_bytes();
+            let hash =
+                u64::from_be_bytes(bytes[..8].try_into().expect("UUID has at least 8 bytes"));
+            let idx = (hash as usize) % dir_count;
+            distribution[idx] += 1;
+        }
+
+        // Find target directory (least loaded, bias towards lower indices on ties)
+        let target_idx = distribution
+            .iter()
+            .enumerate()
+            .min_by_key(|(_idx, count)| *count)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        info!(
+            "Balancing shards: targeting dir index {} (current distribution: {:?})",
+            target_idx, distribution
+        );
+
+        // Mine a UUID that hashes to the target directory
+        loop {
+            let candidate = Uuid::new_v4();
+            let bytes = candidate.as_bytes();
+            let hash =
+                u64::from_be_bytes(bytes[..8].try_into().expect("UUID has at least 8 bytes"));
+
+            if (hash as usize) % dir_count == target_idx {
+                return candidate;
+            }
+        }
     }
 
     /// Validates schema for documents in parallel, then evolves schema sequentially.
@@ -2864,7 +2921,7 @@ impl NodeOrchestrator {
 
         // Create tasks for all shards
         for &shard_id in &existing_shards {
-            let shard_path = self.deterministic_shard_directory(shard_id, Some(&existing_shards));
+            let shard_path = self.deterministic_shard_directory(shard_id);
             let storage_config = self.create_shard_storage_config(shard_id, shard_path);
             let default_search_limit = self.default_search_limit;
 
@@ -3037,25 +3094,34 @@ impl NodeOrchestrator {
         Ok(())
     }
 
-    /// Scans the storage directory for existing shard folders.
+    /// Scans all configured storage directories for existing shard folders.
     fn discover_existing_shards(&self) -> Result<Vec<Uuid>, OrchestratorError> {
         let mut shard_ids = Vec::new();
+        let mut seen = HashSet::new();
+        let paths_cow = self.storage_path_candidates();
 
-        if !self.config.storage_path.exists() {
-            return Ok(shard_ids);
-        }
+        for base_path in paths_cow.as_ref() {
+            if !base_path.exists() {
+                continue;
+            }
 
-        for entry in fs::read_dir(&self.config.storage_path)? {
-            let entry = entry?;
-            let path = entry.path();
+            for entry in fs::read_dir(base_path)? {
+                let entry = entry?;
+                let path = entry.path();
 
-            if path.is_dir()
-                && let Some(dir_name) = path.file_name().and_then(|n| n.to_str())
-                && let Some(uuid_str) = dir_name.strip_prefix("shard-")
-                && let Ok(shard_id) = Uuid::parse_str(uuid_str)
-            {
-                shard_ids.push(shard_id);
-                info!("Discovered existing shard: {}", shard_id);
+                if path.is_dir()
+                    && let Some(dir_name) = path.file_name().and_then(|n| n.to_str())
+                    && let Some(uuid_str) = dir_name.strip_prefix("shard-")
+                    && let Ok(shard_id) = Uuid::parse_str(uuid_str)
+                    && seen.insert(shard_id)
+                {
+                    info!(
+                        %shard_id,
+                        base = %base_path.display(),
+                        "Discovered existing shard"
+                    );
+                    shard_ids.push(shard_id);
+                }
             }
         }
 
@@ -3101,7 +3167,7 @@ impl NodeOrchestrator {
         }
 
         // Create shard directory using deterministic placement
-        let shard_path = self.deterministic_shard_directory(shard_id, None);
+        let shard_path = self.deterministic_shard_directory(shard_id);
         fs::create_dir_all(&shard_path)?;
         info!("Created shard directory: {:?}", shard_path);
 

@@ -158,7 +158,8 @@ async fn main() -> Result<()> {
     let init_shards = cameodb_config.storage.num_shards_init;
     if orchestrator.shard_count() == 0 && init_shards > 0 {
         for _ in 0..init_shards {
-            let shard_id = uuid::Uuid::new_v4();
+            // Use balanced UUID generation for uniform distribution across data paths
+            let shard_id = orchestrator.generate_balanced_shard_id();
             if let Err(err) = orchestrator
                 .handle_propose_shard(ProposeShard { shard_id })
                 .await
