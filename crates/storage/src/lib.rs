@@ -44,7 +44,7 @@ use walkdir::WalkDir;
 const TANTIVY_DATA_FILE_EXTENSIONS: &[&str] = &["store", "fast", "idx", "doc", "pos", "term"];
 
 /// Number of records to sample for size estimation in large tables
-const TABLE_SIZE_SAMPLE_COUNT: u64 = 500;
+const TABLE_SIZE_SAMPLE_COUNT: u64 = 250;
 
 /// Schema metadata table: maps index names to their schema definitions.
 const TABLE_SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("schema");
@@ -2537,10 +2537,10 @@ impl HybridStore {
 
         {
             let cache = self.index_size_cache.lock().unwrap();
-            if let Some(entry) = cache.get(&cache_key) {
-                if entry.timestamp.elapsed() < self.index_cache_expiry {
-                    return Ok((entry.tantivy_bytes, entry.redb_bytes, entry.document_count));
-                }
+            if let Some(entry) = cache.get(&cache_key)
+                && entry.timestamp.elapsed() < self.index_cache_expiry
+            {
+                return Ok((entry.tantivy_bytes, entry.redb_bytes, entry.document_count));
             }
         }
 

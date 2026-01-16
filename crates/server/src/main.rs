@@ -79,13 +79,19 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     // Establish deterministic node identity from libp2p keypair
+    let primary_path = cameodb_config
+        .storage
+        .primary_path()
+        .cloned()
+        .expect("storage.data_paths must contain at least one entry");
+
     let (_keypair, identity) =
-        swarm::load_or_generate_keypair(&cameodb_config.storage.data_paths[0])
-            .expect("Failed to establish node identity");
+        swarm::load_or_generate_keypair(&primary_path).expect("Failed to establish node identity");
 
     // Create node configuration from loaded config
     let node_config = NodeConfig {
-        storage_path: cameodb_config.storage.data_paths[0].clone(),
+        storage_path: primary_path.clone(),
+        storage_paths: cameodb_config.storage.data_paths.clone(),
         max_shards: cameodb_config.storage.max_shards_per_node,
         indexer_memory_min_mb: cameodb_config.search.indexer_memory_min_mb,
         indexer_memory_max_mb: cameodb_config.search.indexer_memory_max_mb,
@@ -106,7 +112,7 @@ async fn main() -> Result<()> {
 
     // Initialize cluster state store for persistent metadata
     let state_store = Arc::new(
-        ClusterStateStore::new(cameodb_config.storage.data_paths[0].clone())
+        ClusterStateStore::new(primary_path.clone())
             .expect("Failed to initialize cluster state store"),
     );
 
@@ -120,7 +126,7 @@ async fn main() -> Result<()> {
         cameodb_config.network.cluster.clone(),
         node_id,
         orchestrator.identity().name.clone(),
-        cameodb_config.storage.data_paths[0].clone(),
+        primary_path.clone(),
     );
 
     // Create ClusterCoordinator but DON'T start swarm yet

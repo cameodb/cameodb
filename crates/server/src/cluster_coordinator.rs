@@ -1428,7 +1428,9 @@ impl Message<GetStatus> for ClusterCoordinator {
 
         // Calculate total_shards from shard assignments which is our authoritative global map
         status.total_shards = self.shard_assignments.len();
-        status.active_shards = self.shard_assignments.values()
+        status.active_shards = self
+            .shard_assignments
+            .values()
             .filter(|s| s.node_id == self.cluster.local_node_id)
             .count();
 
@@ -1684,7 +1686,8 @@ impl Message<PeerNodeMetadataDiscovered> for ClusterCoordinator {
             });
 
         // Also update peer_nodes with shard count for cluster status calculation
-        self.cluster.peer_nodes
+        self.cluster
+            .peer_nodes
             .entry(node_uuid)
             .and_modify(|node_info| {
                 node_info.shard_count = msg.shard_count as usize;
@@ -1807,7 +1810,8 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
         };
 
         // 2. Forward delete request to all remote nodes
-        let known_peers: Vec<KnownPeer> = self.cluster
+        let known_peers: Vec<KnownPeer> = self
+            .cluster
             .peer_nodes
             .values()
             .map(|info| KnownPeer {
@@ -1817,17 +1821,18 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
             })
             .collect();
         let mut remote_results = Vec::new();
-        
+
         for peer in known_peers {
-            let remote_orchestrator_name = crate::node_orchestrator::orchestrator_remote_name(&peer.node_id);
-            
+            let remote_orchestrator_name =
+                crate::node_orchestrator::orchestrator_remote_name(&peer.node_id);
+
             match kameo::actor::RemoteActorRef::<crate::node_orchestrator::NodeOrchestrator>::lookup(remote_orchestrator_name.as_str()).await {
                 Ok(Some(remote_orchestrator)) => {
                     let delete_msg = crate::node_orchestrator::ClientOp::DeleteIndex {
                         index: msg.index.clone(),
                         delete_schema: msg.delete_schema,
                     };
-                    
+
                     match remote_orchestrator.ask(&delete_msg).await {
                         Ok(result) => {
                             info!(
@@ -1867,10 +1872,10 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                 }
             }
         }
-        
+
         // Combine local and remote results
         let mut all_errors = Vec::new();
-        
+
         // Check local result
         match local_result {
             Ok(_) => {
@@ -1881,7 +1886,7 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                 all_errors.push(format!("Local node: {}", e));
             }
         }
-        
+
         // Check remote results
         for (i, result) in remote_results.into_iter().enumerate() {
             match result {
@@ -1894,7 +1899,7 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                 }
             }
         }
-        
+
         // Return overall result
         if all_errors.is_empty() {
             Ok(serde_json::json!({
@@ -1904,7 +1909,10 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                 "delete_schema": msg.delete_schema
             }))
         } else {
-            Err(format!("Index deletion completed with errors: {}", all_errors.join("; ")))
+            Err(format!(
+                "Index deletion completed with errors: {}",
+                all_errors.join("; ")
+            ))
         }
     }
 }
@@ -2257,7 +2265,9 @@ impl Message<RouteShard> for ClusterCoordinator {
     ) -> Self::Reply {
         // This method is deprecated - direct shard routing should use RouterActor
         warn!(shard_id = %msg.shard_id, "ClusterCoordinator: RouteShard message is deprecated, use RouterActor");
-        Err(anyhow::anyhow!("Direct shard routing is deprecated. Use RouterActor."))
+        Err(anyhow::anyhow!(
+            "Direct shard routing is deprecated. Use RouterActor."
+        ))
     }
 }
 

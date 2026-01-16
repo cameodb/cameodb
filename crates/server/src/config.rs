@@ -45,6 +45,20 @@ pub enum ConfigError {
     NetworkConfig { message: String },
 }
 
+impl StorageConfig {
+    /// Sort and de-duplicate data paths to ensure deterministic ordering.
+    pub fn normalize_paths(&mut self) {
+        self.data_paths.retain(|path| !path.as_os_str().is_empty());
+        self.data_paths.sort();
+        self.data_paths.dedup();
+    }
+
+    /// Return the primary data path (first in sorted list), if configured.
+    pub fn primary_path(&self) -> Option<&PathBuf> {
+        self.data_paths.first()
+    }
+}
+
 /// Complete CameoDB configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CameoDbConfig {
@@ -278,6 +292,9 @@ impl CameoDbConfig {
 
         // Apply environment variable overrides
         config = Self::apply_env_overrides(config)?;
+
+        // Normalize storage paths for deterministic behavior
+        config.storage.normalize_paths();
 
         // Validate the final configuration
         config.validate()?;

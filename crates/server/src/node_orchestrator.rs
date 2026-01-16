@@ -18,7 +18,8 @@
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::path::PathBuf;
@@ -51,6 +52,9 @@ use storage::{
     FieldDef, HybridStore, IndexSchema, ShardStatsTimings, StorageConfig, StoreError,
     TantivyFieldType, WalOp,
 };
+
+/// Type alias for routing results to reduce complexity
+type RoutingResult = Result<(DocPayload, Option<String>, Option<Uuid>), OrchestratorError>;
 
 /// Helper function to detect if an operation is a write operation
 fn is_write_operation(op: &ClientOp) -> bool {
@@ -97,11 +101,38 @@ pub fn shard_remote_name(shard_id: &Uuid) -> String {
     format!("shard-{}", shard_id)
 }
 
+// ============================================================================
+// Schema Validation Types
+// ============================================================================
+
+/// Result of validating a single document
+#[derive(Debug, Clone)]
+pub struct SchemaValidationResult {
+    pub needs_evolution: bool,
+    pub new_fields: Vec<(String, TantivyFieldType)>,
+    pub validation_error: Option<String>,
+}
+
+/// Summary of validation results for a batch of documents
+#[derive(Debug, Clone)]
+pub struct SchemaValidationSummary {
+    pub total_docs: usize,
+    pub valid_docs: usize,
+    pub evolution_needed: bool,
+    pub all_new_fields: HashSet<(String, TantivyFieldType)>,
+    pub errors: Vec<String>,
+}
+
+/// Type alias for shard hydration task results
+type ShardTaskResult = Result<(Uuid, Option<MicroshardActor>), OrchestratorError>;
+
 /// Configuration for a CameoDB node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     /// Base path for all node data storage
     pub storage_path: PathBuf,
+    /// Sorted list of candidate data paths for shard placement
+    pub storage_paths: Vec<PathBuf>,
     /// Maximum number of shards this node can host
     pub max_shards: usize,
     /// Tantivy indexer memory configuration (per shard)
@@ -115,8 +146,10 @@ pub struct NodeConfig {
 
 impl Default for NodeConfig {
     fn default() -> Self {
+        let default_path = PathBuf::from("./data/cameodb");
         Self {
-            storage_path: PathBuf::from("./data/cameodb"),
+            storage_path: default_path.clone(),
+            storage_paths: vec![default_path],
             max_shards: 8,
             indexer_memory_min_mb: 16,
             indexer_memory_max_mb: 256,
@@ -496,10 +529,10 @@ impl MicroshardActor {
                             let store_inner = store.clone();
                             let commit_ok = tokio::task::spawn_blocking(move || {
                                 if let Err(e) = store_inner.commit_index(&index_inner) {
-                                    error!(index = %index_inner, error = %e, "Supervisor failed to commit index");
+                                    tracing::error!(index = %index_inner, error = %e, "Supervisor failed to commit index");
                                     false
                                 } else {
-                                    info!(index = %index_inner, "Supervisor successfully committed index after idle timeout");
+                                    tracing::info!(index = %index_inner, "Supervisor successfully committed index after idle timeout");
                                     true
                                 }
                             }).await.unwrap_or(false);
@@ -711,30 +744,6 @@ impl MicroshardActor {
         Ok(())
     }
 }
-
-/// Result of parallel schema validation for a single document
-#[derive(Debug, Clone)]
-struct SchemaValidationResult {
-    needs_evolution: bool,
-    new_fields: Vec<(String, TantivyFieldType)>,
-    validation_error: Option<String>,
-}
-
-/// Schema validation summary for batch processing
-#[derive(Debug)]
-struct SchemaValidationSummary {
-    total_docs: usize,
-    valid_docs: usize,
-    evolution_needed: bool,
-    all_new_fields: std::collections::HashSet<(String, TantivyFieldType)>,
-    errors: Vec<String>,
-}
-
-/// Type alias for shard task result to reduce complexity
-type ShardTaskResult = Result<(Uuid, Option<MicroshardActor>), OrchestratorError>;
-
-/// Type alias for routing result to reduce complexity
-type RoutingResult = Result<(DocPayload, Option<String>, Option<Uuid>), OrchestratorError>;
 
 /// Validates and evolves schema for a document.
 ///
@@ -2013,6 +2022,38 @@ pub struct NodeOrchestrator {
 }
 
 impl NodeOrchestrator {
+    fn storage_path_candidates(&self) -> Cow<'_, [PathBuf]> {
+        if self.config.storage_paths.is_empty() {
+            Cow::Owned(vec![self.config.storage_path.clone()])
+        } else {
+            Cow::Borrowed(&self.config.storage_paths)
+        }
+    }
+
+    fn deterministic_shard_directory(
+        &self,
+        shard_id: Uuid,
+        known_shards: Option<&[Uuid]>,
+    ) -> PathBuf {
+        let paths_cow = self.storage_path_candidates();
+        let paths = paths_cow.as_ref();
+
+        let mut shard_ids: Vec<Uuid> = match known_shards {
+            Some(ids) => ids.to_vec(),
+            None => self.shards.keys().copied().collect(),
+        };
+
+        if !shard_ids.contains(&shard_id) {
+            shard_ids.push(shard_id);
+        }
+        shard_ids.sort_unstable();
+
+        let rank = shard_ids.iter().position(|id| *id == shard_id).unwrap_or(0);
+
+        let base = &paths[rank % paths.len()];
+        base.join(format!("shard-{}", shard_id))
+    }
+
     /// Validates schema for documents in parallel, then evolves schema sequentially.
     ///
     /// This method uses a two-stage approach:
@@ -2118,9 +2159,6 @@ impl NodeOrchestrator {
                 .collect();
             return Ok(results);
         }
-
-        // For initial schema creation, we'll do field discovery in the evolution step
-        // This keeps validation read-only and evolution write-only
 
         // Parallel validation using rayon - schema is now pre-populated
         let results: Vec<SchemaValidationResult> = docs
@@ -2779,7 +2817,8 @@ impl NodeOrchestrator {
 
         // Create tasks for all shards
         for &shard_id in &existing_shards {
-            let storage_config = self.create_shard_storage_config(shard_id);
+            let shard_path = self.deterministic_shard_directory(shard_id, Some(&existing_shards));
+            let storage_config = self.create_shard_storage_config(shard_id, shard_path);
             let default_search_limit = self.default_search_limit;
 
             let task = tokio::spawn(async move {
@@ -2925,9 +2964,7 @@ impl NodeOrchestrator {
     }
 
     /// Creates a storage configuration for a specific shard.
-    fn create_shard_storage_config(&self, shard_id: Uuid) -> StorageConfig {
-        let shard_path = self.config.storage_path.join(format!("shard-{}", shard_id));
-
+    fn create_shard_storage_config(&self, _shard_id: Uuid, shard_path: PathBuf) -> StorageConfig {
         // Start at the minimum writer memory; storage will scale between min/max as the index grows.
         let indexer_memory_mb = self.config.indexer_memory_min_mb;
 
@@ -2964,13 +3001,13 @@ impl NodeOrchestrator {
             });
         }
 
-        // Create shard directory
-        let shard_path = self.config.storage_path.join(format!("shard-{}", shard_id));
+        // Create shard directory using deterministic placement
+        let shard_path = self.deterministic_shard_directory(shard_id, None);
         fs::create_dir_all(&shard_path)?;
         info!("Created shard directory: {:?}", shard_path);
 
         // Create and start microshard actor
-        let storage_config = self.create_shard_storage_config(shard_id);
+        let storage_config = self.create_shard_storage_config(shard_id, shard_path.clone());
         let mut microshard =
             MicroshardActor::new(shard_id, storage_config, self.default_search_limit);
         microshard.start().await?;
@@ -3436,7 +3473,7 @@ impl NodeOrchestrator {
             if let Some(shard_meta) = shard_assignments.get(&target_shard) {
                 let owner_node = shard_meta.node_id;
                 let doc_payload = DocPayload {
-                    id: doc.id,
+                    id: doc.id.clone(),
                     routing_key,
                     doc: doc.doc,
                 };
