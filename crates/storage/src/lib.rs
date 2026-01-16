@@ -536,14 +536,38 @@ pub struct HybridStore {
 impl HybridStore {
     /// Creates a new multi-tenant HybridStore.
     pub fn new(config: StorageConfig) -> Result<Self, StoreError> {
+        let init_start = Instant::now();
+        tracing::info!(
+            shard_path = %config.shard_path.display(),
+            "HybridStore: initializing shard storage"
+        );
+
         // Create directory structure
+        let dir_start = Instant::now();
         fs::create_dir_all(&config.shard_path)?;
         let kv_path = config.shard_path.join("store.redb");
         let indices_path = config.shard_path.join("indices");
         fs::create_dir_all(&indices_path)?;
+        let dir_elapsed = dir_start.elapsed();
+        tracing::debug!(
+            shard_path = %config.shard_path.display(),
+            indices_path = %indices_path.display(),
+            elapsed_ms = dir_elapsed.as_millis(),
+            "HybridStore: ensured directory structure"
+        );
 
-        // Create shared redb database
+        // Create or open shared redb database
+        let db_file_exists = kv_path.exists();
+        let db_start = Instant::now();
         let kv = Database::create(&kv_path)?;
+        let db_elapsed = db_start.elapsed();
+        tracing::info!(
+            shard_path = %config.shard_path.display(),
+            db_path = %kv_path.display(),
+            existed = db_file_exists,
+            elapsed_ms = db_elapsed.as_millis(),
+            "HybridStore: redb database opened"
+        );
 
         Ok(HybridStore {
             kv,
@@ -557,7 +581,16 @@ impl HybridStore {
             fields_cache: Arc::new(RwLock::new(HashMap::new())),
             index_size_cache: Arc::new(Mutex::new(HashMap::new())),
             index_cache_expiry: Duration::from_secs(600), // 10 minutes
-            config,
+            config: config.clone(),
+        })
+        .map(|store| {
+            let total_elapsed = init_start.elapsed();
+            tracing::info!(
+                shard_path = %store.config.shard_path.display(),
+                elapsed_ms = total_elapsed.as_millis(),
+                "HybridStore: initialization complete"
+            );
+            store
         })
     }
 
