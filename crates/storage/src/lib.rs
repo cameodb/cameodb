@@ -27,9 +27,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
@@ -44,7 +45,7 @@ use walkdir::WalkDir;
 const TANTIVY_DATA_FILE_EXTENSIONS: &[&str] = &["store", "fast", "idx", "doc", "pos", "term"];
 
 /// Number of records to sample for size estimation in large tables
-const TABLE_SIZE_SAMPLE_COUNT: u64 = 250;
+const TABLE_SIZE_SAMPLE_COUNT: u64 = 256;
 
 /// Schema metadata table: maps index names to their schema definitions.
 const TABLE_SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("schema");
@@ -492,10 +493,6 @@ struct SchemaFields {
     indexed_fields: HashMap<String, Field>,
 }
 
-/// Type alias for the read cache to satisfy clippy::type-complexity
-/// Maps: Index Name -> Document ID -> Document Bytes
-type ReadCache = HashMap<String, HashMap<String, Vec<u8>>>;
-
 /// Unified cache entry for index sizes (both Tantivy directory and Redb table) with timestamp
 #[derive(Debug, Clone)]
 struct IndexSizeCache {
@@ -510,21 +507,21 @@ pub struct HybridStore {
     /// Shared redb database across all indices
     kv: Database,
     /// Cache of IndexWriters keyed by index name
-    writers: Arc<RwLock<HashMap<String, Arc<Mutex<IndexWriter>>>>>,
+    writers: Arc<DashMap<String, Arc<Mutex<IndexWriter>>>>,
     /// Cache of IndexReaders keyed by index name
-    readers: Arc<RwLock<HashMap<String, IndexReader>>>,
+    readers: Arc<DashMap<String, IndexReader>>,
     /// Atomic counters for WAL sequence IDs per index
-    current_seq: Arc<RwLock<HashMap<String, AtomicU64>>>,
+    current_seq: Arc<DashMap<String, AtomicU64>>,
     /// Operation counters for smart commits per index
-    operations_counter: Arc<RwLock<HashMap<String, AtomicU64>>>,
+    operations_counter: Arc<DashMap<String, AtomicU64>>,
     /// Simple per-index read cache for frequently accessed documents
-    read_cache: Arc<RwLock<ReadCache>>,
+    read_cache: Arc<DashMap<String, HashMap<String, Vec<u8>>>>,
     /// Cache of optimal memory budgets per index to avoid frequent syscalls
-    budget_cache: Arc<RwLock<HashMap<String, usize>>>,
+    budget_cache: Arc<DashMap<String, usize>>,
     /// Cache of schemas per index to avoid repeated redb reads
-    schema_cache: Arc<RwLock<HashMap<String, Arc<IndexSchema>>>>,
+    schema_cache: Arc<DashMap<String, Arc<IndexSchema>>>,
     /// Cache of Tantivy field mappings per index
-    fields_cache: Arc<RwLock<HashMap<String, SchemaFields>>>,
+    fields_cache: Arc<DashMap<String, SchemaFields>>,
     /// Unified cache for index sizes (Tantivy + Redb) with expiration to avoid repeated expensive calculations
     index_size_cache: Arc<Mutex<HashMap<String, IndexSizeCache>>>,
     /// Cache expiration duration for index sizes (10 minutes)
@@ -571,26 +568,25 @@ impl HybridStore {
 
         Ok(HybridStore {
             kv,
-            writers: Arc::new(RwLock::new(HashMap::new())),
-            readers: Arc::new(RwLock::new(HashMap::new())),
-            current_seq: Arc::new(RwLock::new(HashMap::new())),
-            operations_counter: Arc::new(RwLock::new(HashMap::new())),
-            read_cache: Arc::new(RwLock::new(HashMap::new())),
-            budget_cache: Arc::new(RwLock::new(HashMap::new())),
-            schema_cache: Arc::new(RwLock::new(HashMap::new())),
-            fields_cache: Arc::new(RwLock::new(HashMap::new())),
+            writers: Arc::new(DashMap::new()),
+            readers: Arc::new(DashMap::new()),
+            current_seq: Arc::new(DashMap::new()),
+            operations_counter: Arc::new(DashMap::new()),
+            read_cache: Arc::new(DashMap::new()),
+            budget_cache: Arc::new(DashMap::new()),
+            schema_cache: Arc::new(DashMap::new()),
+            fields_cache: Arc::new(DashMap::new()),
             index_size_cache: Arc::new(Mutex::new(HashMap::new())),
             index_cache_expiry: Duration::from_secs(600), // 10 minutes
             config: config.clone(),
         })
-        .map(|store| {
+        .inspect(|store| {
             let total_elapsed = init_start.elapsed();
             tracing::info!(
                 shard_path = %store.config.shard_path.display(),
                 elapsed_ms = total_elapsed.as_millis(),
                 "HybridStore: initialization complete"
             );
-            store
         })
     }
 
@@ -599,13 +595,12 @@ impl HybridStore {
         tracing::info!("HybridStore: Starting graceful shutdown");
 
         // Check which indices have pending operations
-        let operations_counter = self.operations_counter.read().unwrap();
-        let indices_with_pending_ops: Vec<String> = operations_counter
+        let indices_with_pending_ops: Vec<String> = self
+            .operations_counter
             .iter()
-            .filter(|(_, counter)| counter.load(Ordering::SeqCst) > 0)
-            .map(|(index, _)| index.clone())
+            .filter(|entry| entry.value().load(Ordering::SeqCst) > 0)
+            .map(|entry| entry.key().clone())
             .collect();
-        drop(operations_counter);
 
         if indices_with_pending_ops.is_empty() {
             tracing::info!("No pending operations, skipping commits during shutdown");
@@ -618,8 +613,9 @@ impl HybridStore {
         }
 
         // Commit only writers with pending operations
-        let writers = self.writers.read().unwrap();
-        for (index, writer_arc) in writers.iter() {
+        for entry in self.writers.iter() {
+            let index = entry.key();
+            let writer_arc = entry.value();
             if indices_with_pending_ops.contains(index) {
                 match writer_arc.try_lock() {
                     Ok(mut writer) => {
@@ -638,26 +634,11 @@ impl HybridStore {
         }
 
         // Clear all caches
-        {
-            let mut schema_cache = self.schema_cache.write().unwrap();
-            schema_cache.clear();
-        }
-        {
-            let mut budget_cache = self.budget_cache.write().unwrap();
-            budget_cache.clear();
-        }
-        {
-            let mut operations_counter = self.operations_counter.write().unwrap();
-            operations_counter.clear();
-        }
-        {
-            let mut current_seq = self.current_seq.write().unwrap();
-            current_seq.clear();
-        }
-        {
-            let mut index_size_cache = self.index_size_cache.lock().unwrap();
-            index_size_cache.clear();
-        }
+        self.schema_cache.clear();
+        self.budget_cache.clear();
+        self.operations_counter.clear();
+        self.current_seq.clear();
+        self.index_size_cache.lock().unwrap().clear();
 
         tracing::info!("HybridStore: Graceful shutdown completed");
         Ok(())
@@ -665,16 +646,14 @@ impl HybridStore {
 
     /// Get a value from the read cache if present.
     fn get_from_cache(&self, index: &str, key: &str) -> Option<Vec<u8>> {
-        let cache_map = self.read_cache.read().unwrap();
-        cache_map.get(index)?.get(key).cloned()
+        self.read_cache.get(index)?.get(key).cloned()
     }
 
     /// Insert a value into the read cache with a simple per-index size bound.
     fn insert_into_cache(&self, index: &str, key: &str, value: Vec<u8>) {
         const MAX_CACHE_ENTRIES_PER_INDEX: usize = 1024;
 
-        let mut cache_map = self.read_cache.write().unwrap();
-        let index_cache = cache_map.entry(index.to_string()).or_default();
+        let mut index_cache = self.read_cache.entry(index.to_string()).or_default();
 
         if index_cache.len() >= MAX_CACHE_ENTRIES_PER_INDEX
             && let Some(first_key) = index_cache.keys().next().cloned()
@@ -896,14 +875,11 @@ impl HybridStore {
         &self,
         index: &str,
     ) -> Result<(Arc<Mutex<IndexWriter>>, SchemaFields), StoreError> {
-        // Check writers cache first
+        // Fast path: Check writers cache first
+        if let Some(writer) = self.writers.get(index)
+            && let Some(fields) = self.fields_cache.get(index)
         {
-            let readers = self.writers.read().unwrap();
-            if let Some(writer) = readers.get(index)
-                && let Some(fields) = self.fields_cache.read().unwrap().get(index).cloned()
-            {
-                return Ok((Arc::clone(writer), fields));
-            }
+            return Ok((Arc::clone(writer.value()), fields.value().clone()));
         }
 
         // Create index directory and Tantivy index if it doesn't exist
@@ -957,10 +933,8 @@ impl HybridStore {
 
             // IMPORTANT: Cache should ALWAYS reflect Tantivy schema + mandatory id field
             // Our stored schema is just metadata for evolution tracking
-            {
-                let mut schema_cache = self.schema_cache.write().unwrap();
-                schema_cache.insert(index.to_string(), Arc::new(tantivy_schema.clone()));
-            }
+            self.schema_cache
+                .insert(index.to_string(), Arc::new(tantivy_schema.clone()));
 
             // Persist our stored schema (metadata) to redb for evolution tracking
             // This is NOT used for cache - only for reference and evolution
@@ -968,10 +942,7 @@ impl HybridStore {
 
             // CRITICAL: Clear reader cache to ensure search sees latest commits
             // This prevents searches from using stale readers that don't see newly written documents
-            {
-                let mut readers = self.readers.write().unwrap();
-                readers.remove(index);
-            }
+            self.readers.remove(index);
 
             tracing::debug!(index = %index, "Schema synced: Tantivy schema + id field cached, reader cache cleared");
         }
@@ -980,31 +951,23 @@ impl HybridStore {
         let optimal_budget = self.config.get_optimal_memory_budget(&index_path);
 
         // Cache the budget
-        let mut cache = self.budget_cache.write().unwrap();
-        cache.insert(index.to_string(), optimal_budget);
+        self.budget_cache.insert(index.to_string(), optimal_budget);
 
         let writer = tantivy_index.writer(optimal_budget)?;
         let writer_arc = Arc::new(Mutex::new(writer));
 
         // Store in cache
-        {
-            let mut writers = self.writers.write().unwrap();
-            writers.insert(index.to_string(), Arc::clone(&writer_arc));
-        }
-
-        {
-            let mut fields_cache = self.fields_cache.write().unwrap();
-            fields_cache.insert(index.to_string(), fields.clone());
-        }
+        self.writers
+            .insert(index.to_string(), Arc::clone(&writer_arc));
+        self.fields_cache.insert(index.to_string(), fields.clone());
 
         // Initialize sequence counter for this index if needed
-        {
-            let mut seq_map = self.current_seq.write().unwrap();
-            if !seq_map.contains_key(index) {
-                let max_seq = self.get_max_wal_id_for_index(index)?;
-                seq_map.insert(index.to_string(), AtomicU64::new(max_seq));
-            }
-        }
+        self.current_seq
+            .entry(index.to_string())
+            .or_insert_with(|| {
+                let max_seq = self.get_max_wal_id_for_index(index).unwrap_or(0);
+                AtomicU64::new(max_seq)
+            });
 
         Ok((writer_arc, fields))
     }
@@ -1013,23 +976,14 @@ impl HybridStore {
     fn should_commit_writer(&self, index: &str, operations_since_commit: u64) -> bool {
         // Get dynamic memory budget for this specific index
         // Use cached budget if available to avoid syscalls on every write
-        let budget = {
-            let cache_hit = if let Ok(cache) = self.budget_cache.read() {
-                cache.get(index).cloned()
-            } else {
-                None
-            };
-
-            if let Some(b) = cache_hit {
-                b
-            } else {
-                // Fallback: calculate and cache
-                let index_path = self.config.shard_path.join("indices").join(index);
-                let b = self.config.get_optimal_memory_budget(&index_path);
-                let mut cache = self.budget_cache.write().unwrap();
-                cache.insert(index.to_string(), b);
-                b
-            }
+        let budget = if let Some(b) = self.budget_cache.get(index) {
+            *b.value()
+        } else {
+            // Fallback: calculate and cache
+            let index_path = self.config.shard_path.join("indices").join(index);
+            let b = self.config.get_optimal_memory_budget(&index_path);
+            self.budget_cache.insert(index.to_string(), b);
+            b
         };
 
         // Commit strategy based on document count and configurable memory budget range
@@ -1050,45 +1004,34 @@ impl HybridStore {
 
     /// Get operation count for an index since last commit
     pub fn get_operations_count(&self, index: &str) -> u64 {
-        let counter_map = self.operations_counter.read().unwrap();
-        if let Some(counter) = counter_map.get(index) {
-            return counter.load(Ordering::SeqCst);
-        }
-        0
+        self.operations_counter
+            .get(index)
+            .map(|counter| counter.value().load(Ordering::SeqCst))
+            .unwrap_or(0)
     }
 
     /// Increment operation count and return new count
     fn increment_operations(&self, index: &str) -> u64 {
-        // Ensure counter exists for this index
-        {
-            let mut counter_map = self.operations_counter.write().unwrap();
-            if !counter_map.contains_key(index) {
-                counter_map.insert(index.to_string(), AtomicU64::new(0));
-            }
-        }
-
-        // Increment and return new count
-        let counter_map = self.operations_counter.read().unwrap();
-        if let Some(counter) = counter_map.get(index) {
-            return counter.fetch_add(1, Ordering::SeqCst) + 1;
-        }
-        0
+        self.operations_counter
+            .entry(index.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .value()
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
     }
 
     /// Reset operation counter after commit
     pub fn reset_operations_counter(&self, index: &str) {
-        let counter_map = self.operations_counter.read().unwrap();
-        if let Some(counter) = counter_map.get(index) {
-            counter.store(0, Ordering::SeqCst);
+        if let Some(counter) = self.operations_counter.get(index) {
+            counter.value().store(0, Ordering::SeqCst);
         }
     }
 
     /// Reset operation counter to a specific value (for intermediate commits)
     /// This allows the supervisor to continue working while resetting the counter
     pub fn reset_operations_counter_to(&self, index: &str, value: u64) {
-        let counter_map = self.operations_counter.read().unwrap();
-        if let Some(counter) = counter_map.get(index) {
-            counter.store(value, Ordering::SeqCst);
+        if let Some(counter) = self.operations_counter.get(index) {
+            counter.value().store(value, Ordering::SeqCst);
         }
     }
 
@@ -1097,8 +1040,8 @@ impl HybridStore {
     /// This preserves cache when possible while ensuring data freshness
     fn smart_refresh_reader(&self, index: &str) -> Result<(), StoreError> {
         // Fast path: Try to reload existing reader
-        if let Some(reader) = self.readers.read().unwrap().get(index) {
-            match reader.reload() {
+        if let Some(reader_ref) = self.readers.get(index) {
+            match reader_ref.value().reload() {
                 Ok(_) => {
                     tracing::debug!(index = %index, "Reader reloaded successfully (fast path)");
                     return Ok(());
@@ -1110,19 +1053,15 @@ impl HybridStore {
         }
 
         // Fallback: Remove and recreate (reliable path)
-        {
-            let mut readers = self.readers.write().unwrap();
-            readers.remove(index);
-        }
+        self.readers.remove(index);
         tracing::debug!(index = %index, "Reader cache cleared, will recreate on next search (reliable path)");
         Ok(())
     }
 
     /// Force a commit for a specific index
     pub fn commit_index(&self, index: &str) -> Result<(), StoreError> {
-        let writers = self.writers.read().unwrap();
-        if let Some(writer_arc) = writers.get(index) {
-            let mut writer = writer_arc.lock().unwrap();
+        if let Some(writer_arc) = self.writers.get(index) {
+            let mut writer = writer_arc.value().lock().unwrap();
             writer.commit()?;
             self.reset_operations_counter(index);
 
@@ -1133,8 +1072,7 @@ impl HybridStore {
             // Refresh budget cache after commit since index size likely changed
             let index_path = self.config.shard_path.join("indices").join(index);
             let new_budget = self.config.get_optimal_memory_budget(&index_path);
-            let mut cache = self.budget_cache.write().unwrap();
-            cache.insert(index.to_string(), new_budget);
+            self.budget_cache.insert(index.to_string(), new_budget);
         }
 
         Ok(())
@@ -1146,10 +1084,7 @@ impl HybridStore {
         tracing::debug!(index = %index, "Refreshing writer cache to resolve lock contention");
 
         // Remove existing writer from cache
-        {
-            let mut writers = self.writers.write().unwrap();
-            writers.remove(index);
-        }
+        self.writers.remove(index);
 
         // Force garbage collection to ensure locks are released
         {
@@ -1190,8 +1125,7 @@ impl HybridStore {
 
         // Get sequence ID for this index
         let seq_id = {
-            let seq_map = self.current_seq.read().unwrap();
-            let counter = seq_map.get(index).ok_or_else(|| {
+            let counter = self.current_seq.get(index).ok_or_else(|| {
                 StoreError::IndexNotFound(format!(
                     "Sequence counter not found for index: {}",
                     index
@@ -1256,9 +1190,7 @@ impl HybridStore {
 
                             // Update cache immediately for subsequent reads
                             let schema_arc = Arc::new(schema_mut);
-                            if let Ok(mut cache) = self.schema_cache.write() {
-                                cache.insert(index.to_string(), schema_arc);
-                            }
+                            self.schema_cache.insert(index.to_string(), schema_arc);
                             // Note: No need to invalidate fields cache since new fields are non-indexed
                             // and won't affect Tantivy schema
                         }
@@ -1413,9 +1345,8 @@ impl HybridStore {
             match self.persist_schema_evolution(index, &evolved) {
                 Ok(()) => {
                     // Update cache after successful persistence
-                    if let Ok(mut cache) = self.schema_cache.write() {
-                        cache.insert(index.to_string(), Arc::new(evolved));
-                    }
+                    self.schema_cache
+                        .insert(index.to_string(), Arc::new(evolved));
                     tracing::info!(index = %index, "Schema evolution persisted successfully");
                 }
                 Err(e) => {
@@ -1444,34 +1375,13 @@ impl HybridStore {
     /// If delete_schema is true, also removes schema metadata from TABLE_SCHEMA
     pub fn delete_index_data(&self, index: &str, delete_schema: bool) -> Result<(), StoreError> {
         // Remove from caches first
-        {
-            let mut writers = self.writers.write().unwrap();
-            writers.remove(index);
-        }
-        {
-            let mut readers = self.readers.write().unwrap();
-            readers.remove(index);
-        }
-        {
-            let mut seq_map = self.current_seq.write().unwrap();
-            seq_map.remove(index);
-        }
-        {
-            let mut read_cache = self.read_cache.write().unwrap();
-            read_cache.remove(index);
-        }
-        {
-            let mut schema_cache = self.schema_cache.write().unwrap();
-            schema_cache.remove(index);
-        }
-        {
-            let mut fields_cache = self.fields_cache.write().unwrap();
-            fields_cache.remove(index);
-        }
-        {
-            let mut budget_cache = self.budget_cache.write().unwrap();
-            budget_cache.remove(index);
-        }
+        self.writers.remove(index);
+        self.readers.remove(index);
+        self.current_seq.remove(index);
+        self.read_cache.remove(index);
+        self.schema_cache.remove(index);
+        self.fields_cache.remove(index);
+        self.budget_cache.remove(index);
 
         // Delete redb tables completely using delete_table() for efficiency
         let mut write_txn = self.kv.begin_write()?;
@@ -1640,11 +1550,8 @@ impl HybridStore {
     /// IMPORTANT: Always prefers Tantivy schema (source of truth) over stored schema
     pub fn get_schema_cached(&self, index: &str) -> Result<Option<Arc<IndexSchema>>, StoreError> {
         // Fast path: check cache first
-        {
-            let cache = self.schema_cache.read().unwrap();
-            if let Some(schema) = cache.get(index) {
-                return Ok(Some(Arc::clone(schema)));
-            }
+        if let Some(schema) = self.schema_cache.get(index) {
+            return Ok(Some(Arc::clone(schema.value())));
         }
 
         // Slow path: load from Tantivy (source of truth), not from stored schema
@@ -1657,10 +1564,8 @@ impl HybridStore {
             let tantivy_schema = Self::derive_index_schema_from_tantivy(&tantivy_index, 4);
 
             // Cache the Tantivy schema
-            {
-                let mut cache = self.schema_cache.write().unwrap();
-                cache.insert(index.to_string(), Arc::new(tantivy_schema.clone()));
-            }
+            self.schema_cache
+                .insert(index.to_string(), Arc::new(tantivy_schema.clone()));
 
             tracing::debug!(index = %index, "Loaded and cached schema from Tantivy (source of truth)");
             Ok(Some(Arc::new(tantivy_schema)))
@@ -1677,13 +1582,8 @@ impl HybridStore {
 
     /// Invalidate cache entry when schema is updated
     pub fn invalidate_schema_cache(&self, index: &str) {
-        let mut cache = self.schema_cache.write().unwrap();
-        cache.remove(index);
-
-        // Also invalidate fields cache since it depends on schema
-        let mut fields_cache = self.fields_cache.write().unwrap();
-        fields_cache.remove(index);
-
+        self.schema_cache.remove(index);
+        self.fields_cache.remove(index);
         tracing::debug!(index = %index, "Invalidated schema and fields cache");
     }
 
@@ -1729,16 +1629,10 @@ impl HybridStore {
 
         // Update cache
         let schema_arc = Arc::new(schema.clone());
-        {
-            let mut cache = self.schema_cache.write().unwrap();
-            cache.insert(index.to_string(), schema_arc);
-        }
+        self.schema_cache.insert(index.to_string(), schema_arc);
 
         // Invalidate fields cache so it rebuilds on next access
-        {
-            let mut fields_cache = self.fields_cache.write().unwrap();
-            fields_cache.remove(index);
-        }
+        self.fields_cache.remove(index);
 
         Ok(())
     }
@@ -1766,60 +1660,67 @@ impl HybridStore {
         }
     }
 
-    /// Get SchemaFields from cache or derive from the opened Tantivy index.
-    /// Field handles must come from the actual opened index to be valid.
+    /// Helper: Get fields cache (Lock-Free Read)
     fn get_fields_for_index(
         &self,
         index: &str,
         tantivy_index: &Index,
     ) -> Result<SchemaFields, StoreError> {
         // Fast path: fields already cached
-        if let Some(fields) = self.fields_cache.read().unwrap().get(index).cloned() {
-            return Ok(fields);
+        if let Some(fields) = self.fields_cache.get(index) {
+            return Ok(fields.value().clone());
         }
 
         // Derive fields from the opened Tantivy index (Field handles must match the index)
         let fields = Self::load_fields_from_existing_index(tantivy_index)?;
-        {
-            let mut cache = self.fields_cache.write().unwrap();
-            cache.insert(index.to_string(), fields.clone());
-        }
+        self.fields_cache.insert(index.to_string(), fields.clone());
         Ok(fields)
     }
 
     /// Get or create a cached IndexReader for the given index
+    /// Uses lock-free fast path with DashMap and ReloadPolicy::OnCommitWithDelay for automatic background updates
     fn get_reader(&self, index: &str) -> Result<Option<(IndexReader, SchemaFields)>, StoreError> {
-        // Check cache first
-        {
-            let readers = self.readers.read().unwrap();
-            if let Some(reader) = readers.get(index) {
-                reader.reload()?;
-                // Ensure fields are cached; if not, rebuild from index schema
-                let searcher = reader.searcher();
-                let tantivy_index = searcher.index();
-                let fields = self.get_fields_for_index(index, tantivy_index)?;
-                return Ok(Some((reader.clone(), fields)));
-            }
+        // Fast path: Zero-lock retrieval from cache
+        if let Some(reader_ref) = self.readers.get(index) {
+            let reader = reader_ref.value();
+            // Note: Manual reload() removed. Reader configured with ReloadPolicy::OnCommitWithDelay
+            // will automatically reload within milliseconds after commits.
+
+            // Get fields (fast lookup)
+            let tantivy_index = reader.searcher().index().clone();
+            let fields = self.get_fields_for_index(index, &tantivy_index)?;
+
+            return Ok(Some((reader.clone(), fields)));
         }
 
-        // Check if index directory exists
+        // Slow path: Index not cached, need to open and cache it
         let index_path = self.config.shard_path.join("indices").join(index);
         if !index_path.exists() || !index_path.join("meta.json").exists() {
             return Ok(None);
         }
 
-        // Open index and create reader
-        let tantivy_index = Index::open_in_dir(&index_path)?;
+        // Use DashMap entry API for concurrent-safe creation
+        let reader = self
+            .readers
+            .entry(index.to_string())
+            .or_try_insert_with(|| {
+                let tantivy_index = Index::open_in_dir(&index_path)?;
+
+                // Configure reader with ReloadPolicy::OnCommitWithDelay for automatic background reloading
+                // This watches meta.json and reloads within milliseconds after commits
+                let reader = tantivy_index
+                    .reader_builder()
+                    .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
+                    .try_into()?;
+
+                Ok::<IndexReader, StoreError>(reader)
+            })?;
+
+        // Warm up fields cache
+        let tantivy_index = reader.value().searcher().index().clone();
         let fields = self.get_fields_for_index(index, &tantivy_index)?;
-        let reader = tantivy_index.reader()?;
 
-        // Cache the reader
-        {
-            let mut readers = self.readers.write().unwrap();
-            readers.insert(index.to_string(), reader.clone());
-        }
-
-        Ok(Some((reader, fields)))
+        Ok(Some((reader.value().clone(), fields)))
     }
 
     /// Search documents in a specific index
@@ -2017,8 +1918,7 @@ impl HybridStore {
 
         // Generate sequence IDs for all operations in one atomic operation
         let start_seq = {
-            let seq_map = self.current_seq.read().unwrap();
-            let counter = seq_map.get(index).ok_or_else(|| {
+            let counter = self.current_seq.get(index).ok_or_else(|| {
                 StoreError::IndexNotFound(format!(
                     "Sequence counter not found for index: {}",
                     index
@@ -2285,30 +2185,23 @@ impl HybridStore {
 
             // Apply smart commit logic for batch operations (same as individual writes)
             // Increment operations counter by batch size
-            {
-                let mut counter_map = self.operations_counter.write().unwrap();
-                if let Some(counter) = counter_map.get_mut(index) {
-                    counter.fetch_add(batch_size, Ordering::SeqCst);
-                } else {
-                    counter_map.insert(index.to_string(), AtomicU64::new(batch_size));
-                }
-            }
+            self.operations_counter
+                .entry(index.to_string())
+                .or_insert_with(|| AtomicU64::new(0))
+                .value()
+                .fetch_add(batch_size, Ordering::SeqCst);
 
             // Adaptive commit strategy: use configuration-based thresholds for intermediate commits
             // Calculate the current commit threshold for this index based on memory budget
             let current_threshold = {
-                let budget = {
-                    let cache = self.budget_cache.read().unwrap();
-                    if let Some(b) = cache.get(index) {
-                        *b
-                    } else {
-                        // Fallback: calculate and cache
-                        let index_path = self.config.shard_path.join("indices").join(index);
-                        let b = self.config.get_optimal_memory_budget(&index_path);
-                        let mut cache = self.budget_cache.write().unwrap();
-                        cache.insert(index.to_string(), b);
-                        b
-                    }
+                let budget = if let Some(b) = self.budget_cache.get(index) {
+                    *b.value()
+                } else {
+                    // Fallback: calculate and cache
+                    let index_path = self.config.shard_path.join("indices").join(index);
+                    let b = self.config.get_optimal_memory_budget(&index_path);
+                    self.budget_cache.insert(index.to_string(), b);
+                    b
                 };
 
                 let min_budget = self.config.indexer_memory_min_mb * 1024 * 1024;
@@ -2343,14 +2236,15 @@ impl HybridStore {
             // Use the same threshold calculation for consistency
             if batch_size > current_threshold * 2 {
                 // Increase memory budget temporarily for large batches to create fewer segments
-                let current_budget = {
-                    let cache = self.budget_cache.read().unwrap();
-                    cache.get(index).copied().unwrap_or_else(|| {
+                let current_budget = self
+                    .budget_cache
+                    .get(index)
+                    .map(|b| *b.value())
+                    .unwrap_or_else(|| {
                         // Fallback if not cached
                         let index_path = self.config.shard_path.join("indices").join(index);
                         self.config.get_optimal_memory_budget(&index_path)
-                    })
-                };
+                    });
 
                 let increased_budget = (current_budget as f64 * 1.5) as usize;
                 let max_budget = self.config.indexer_memory_max_mb * 1024 * 1024;
@@ -2365,8 +2259,8 @@ impl HybridStore {
                     );
 
                     // Update cached budget for this batch
-                    let mut cache = self.budget_cache.write().unwrap();
-                    cache.insert(index.to_string(), increased_budget);
+                    self.budget_cache
+                        .insert(index.to_string(), increased_budget);
                 }
             }
 

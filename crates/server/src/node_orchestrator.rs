@@ -2808,6 +2808,8 @@ impl NodeOrchestrator {
     }
 
     /// Scans the storage directory for existing shard folders and hydrates them in parallel.
+    /// Shards are registered immediately as they become available, and reader warmup happens
+    /// in a detached background task to avoid blocking node startup.
     async fn hydrate_existing_shards(&mut self) -> Result<(), OrchestratorError> {
         let existing_shards = self.discover_existing_shards()?;
         info!("Found {} existing shards", existing_shards.len());
@@ -2865,76 +2867,128 @@ impl NodeOrchestrator {
             self.shards.len()
         );
 
-        // Preload schemas for all shards for optimal runtime performance
-        // Since all shards have the same schema for each index, we only need to load once per index
-        info!(
-            "Starting schema preloading for {} shards",
-            self.shards.len()
-        );
+        // Spawn detached background task for reader warmup (schema preloading)
+        // This allows the node to start serving requests immediately while readers warm up
+        let shard_count = self.shards.len();
+        if shard_count > 0 {
+            // Clone necessary data for background task
+            let shards_for_warmup: Vec<(Uuid, Option<Arc<storage::HybridStore>>)> = self
+                .shards
+                .iter()
+                .map(|(id, shard)| (*id, shard.store.clone()))
+                .collect();
 
-        // Get all unique index names from the first shard (all shards have the same indexes)
-        let mut all_index_names = std::collections::HashSet::new();
-        if let Some((first_shard_id, _)) = self.shards.iter().next()
-            && let Some(shard) = self.shards.get(first_shard_id)
-            && let Some(store) = &shard.store
-        {
-            let sc = Arc::clone(store);
-            let index_names = tokio::task::spawn_blocking({
-                let sc_clone = Arc::clone(&sc);
-                move || sc_clone.get_index_names_lightweight()
-            })
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+            tokio::spawn(async move {
+                info!(
+                    "Starting background reader warmup for {} shards",
+                    shard_count
+                );
 
-            for index_name in index_names {
-                all_index_names.insert(index_name);
-            }
-        }
-
-        info!(
-            "Found {} unique indexes to preload schemas for",
-            all_index_names.len()
-        );
-
-        // Load schema for each index once (from any shard that has it)
-        for index_name in all_index_names {
-            // Try to load schema from the first available shard that has this index
-            let mut schema_loaded = false;
-            for (shard_id, shard) in &self.shards {
-                if let Some(store) = &shard.store {
+                // Get all unique index names from the first shard (all shards have the same indexes)
+                let mut all_index_names = std::collections::HashSet::new();
+                if let Some((first_shard_id, Some(store))) = shards_for_warmup.first() {
                     let sc = Arc::clone(store);
-                    let index_name_clone = index_name.clone();
-
                     match tokio::task::spawn_blocking({
                         let sc_clone = Arc::clone(&sc);
-                        let index = index_name_clone.clone();
-                        move || sc_clone.get_schema(&index)
+                        move || sc_clone.get_index_names_lightweight()
                     })
                     .await
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
                     {
-                        Some(schema) => {
-                            self.put_cached_schema(&index_name, &schema).await;
-                            debug!(index = %index_name, field_count = schema.fields.len(), "Preloaded schema from shard {}", shard_id);
-                            schema_loaded = true;
-                            break; // Schema loaded successfully, no need to check other shards
+                        Ok(Ok(index_names)) => {
+                            for index_name in index_names {
+                                all_index_names.insert(index_name);
+                            }
+                            info!(
+                                "Found {} unique indexes for reader warmup",
+                                all_index_names.len()
+                            );
                         }
-                        None => {
-                            // This shard doesn't have the index, try next shard
-                            continue;
+                        Ok(Err(e)) => {
+                            warn!(
+                                shard_id = %first_shard_id,
+                                error = %e,
+                                "Failed to get index names for warmup"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                shard_id = %first_shard_id,
+                                error = %e,
+                                "Task panicked while getting index names"
+                            );
                         }
                     }
                 }
-            }
 
-            if !schema_loaded {
-                warn!(index = %index_name, "Failed to load schema from any shard");
-            }
+                // Warm up readers in PARALLEL for all shards and indexes
+                // This populates DashMap cache and forces Tantivy to mmap segment files
+                let warmup_start = std::time::Instant::now();
+                let mut warmup_tasks = Vec::new();
+
+                for index_name in &all_index_names {
+                    for (shard_id, store_opt) in &shards_for_warmup {
+                        if let Some(store) = store_opt {
+                            let sc = Arc::clone(store);
+                            let index = index_name.clone();
+                            let sid = *shard_id;
+
+                            // Spawn parallel warmup tasks
+                            let task = tokio::task::spawn_blocking(move || {
+                                // Trigger reader creation/caching by performing a dummy search
+                                // This warms up the DashMap cache with IndexReaders AND
+                                // forces Tantivy to mmap segment files into memory
+                                let result = sc.search_documents(&index, "*", 1);
+                                (sid, index, result)
+                            });
+                            warmup_tasks.push(task);
+                        }
+                    }
+                }
+
+                // Wait for all warmup tasks to complete
+                let total_tasks = warmup_tasks.len();
+                let mut success_count = 0;
+                let mut fail_count = 0;
+
+                for task in warmup_tasks {
+                    match task.await {
+                        Ok((shard_id, index_name, Ok(_))) => {
+                            debug!(
+                                shard_id = %shard_id,
+                                index = %index_name,
+                                "Reader warmed up successfully"
+                            );
+                            success_count += 1;
+                        }
+                        Ok((shard_id, index_name, Err(e))) => {
+                            debug!(
+                                shard_id = %shard_id,
+                                index = %index_name,
+                                error = %e,
+                                "Reader warmup failed (index may not exist in this shard)"
+                            );
+                            fail_count += 1;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Reader warmup task panicked");
+                            fail_count += 1;
+                        }
+                    }
+                }
+
+                let warmup_elapsed = warmup_start.elapsed();
+                info!(
+                    total_tasks = total_tasks,
+                    success = success_count,
+                    failed = fail_count,
+                    elapsed_ms = warmup_elapsed.as_millis(),
+                    "Background reader warmup completed for all shards"
+                );
+            });
+
+            info!("Reader warmup spawned in background, node is ready to serve requests");
         }
 
-        info!("Schema preloading completed for all indexes");
         Ok(())
     }
 
