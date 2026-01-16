@@ -393,7 +393,7 @@ pub struct IndexStats {
 }
 
 /// Per-index statistics gathered from a single shard.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexShardStats {
     pub document_count: u64,
     pub redb_bytes: u64,
@@ -403,7 +403,7 @@ pub struct IndexShardStats {
 }
 
 /// Timing metadata for shard-level statistics gathering.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShardStatsTimings {
     pub redb_ms: u128,
     pub tantivy_ms: u128,
@@ -411,7 +411,7 @@ pub struct ShardStatsTimings {
 }
 
 /// Snapshot of all index stats within a shard along with timing info.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShardStatsSnapshot {
     pub per_index: HashMap<String, IndexShardStats>,
     pub timings: ShardStatsTimings,
@@ -2332,7 +2332,7 @@ impl HybridStore {
     }
 
     /// Gather per-index statistics and timing information for this shard.
-    pub fn gather_index_stats_snapshot(
+    pub fn gather_index_stats(
         &self,
         include_data_size: bool,
     ) -> Result<ShardStatsSnapshot, StoreError> {
@@ -2391,42 +2391,8 @@ impl HybridStore {
         })
     }
 
-    /// Get list of index names from schema table and filesystem
+    /// Get list of index names from redb schema table only
     pub fn get_index_names(&self) -> Result<Vec<String>, StoreError> {
-        let mut index_names = std::collections::HashSet::new();
-
-        let read_txn = self.kv.begin_read()?;
-
-        // Get index names from schema table
-        match read_txn.open_table(TABLE_SCHEMA) {
-            Ok(schema_table) => {
-                for result in schema_table.iter()? {
-                    let (index_name, _) = result?;
-                    index_names.insert(index_name.value().to_string());
-                }
-            }
-            Err(_) => {
-                // Schema table doesn't exist yet
-            }
-        }
-
-        // Also check for indices in filesystem (legacy support)
-        let indices_dir = self.config.shard_path.join("indices");
-        if indices_dir.exists() {
-            for entry in fs::read_dir(&indices_dir)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    let index_name = entry.file_name().to_string_lossy().to_string();
-                    index_names.insert(index_name);
-                }
-            }
-        }
-
-        Ok(index_names.into_iter().collect())
-    }
-
-    /// Get lightweight index names from redb schema table only (fast startup method)
-    pub fn get_index_names_lightweight(&self) -> Result<Vec<String>, StoreError> {
         let mut index_names = Vec::new();
 
         let read_txn = self.kv.begin_read()?;

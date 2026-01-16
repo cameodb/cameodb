@@ -259,6 +259,12 @@ pub struct ProposeShard {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShutdownShard;
 
+/// Message to request shard statistics from a MicroshardActor
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetShardStats {
+    pub include_data_size: bool,
+}
+
 /// Remote-friendly error type for cross-node microshard calls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RemoteError {
@@ -481,6 +487,31 @@ impl MicroshardActor {
             hits: search_hits,
             total_hits,
         })
+    }
+
+    /// Handles shard statistics requests with spawn_blocking to avoid blocking the actor thread.
+    pub async fn handle_get_stats(
+        &self,
+        msg: GetShardStats,
+    ) -> Result<storage::ShardStatsSnapshot, OrchestratorError> {
+        let store = self.store.as_ref().ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "HybridStore not initialized",
+            ))
+        })?;
+
+        let store = Arc::clone(store);
+        let include_data_size = msg.include_data_size;
+
+        // Use spawn_blocking to execute stats gathering on blocking thread pool
+        tokio::task::spawn_blocking(move || store.gather_index_stats(include_data_size))
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
+            .map_err(|e: StoreError| match e {
+                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
+                _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
+            })
     }
 
     /// Signal the supervisor for a specific index that a write has occurred.
@@ -1002,6 +1033,20 @@ impl Message<BatchWriteRequest> for MicroshardActor {
                 errors: vec![],
             })
             .map_err(RemoteError::from)
+    }
+}
+
+/// Message implementation for MicroshardActor shard statistics operations
+#[remote_message("cameo.microshard.get_stats")]
+impl Message<GetShardStats> for MicroshardActor {
+    type Reply = Result<storage::ShardStatsSnapshot, RemoteError>;
+
+    async fn handle(
+        &mut self,
+        msg: GetShardStats,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_get_stats(msg).await.map_err(|e| e.into())
     }
 }
 
@@ -2890,7 +2935,7 @@ impl NodeOrchestrator {
                     let sc = Arc::clone(store);
                     match tokio::task::spawn_blocking({
                         let sc_clone = Arc::clone(&sc);
-                        move || sc_clone.get_index_names_lightweight()
+                        move || sc_clone.get_index_names()
                     })
                     .await
                     {
@@ -3826,28 +3871,32 @@ impl NodeOrchestrator {
 
         let mut all: HashMap<String, (u64, u64, u64, usize)> = HashMap::new();
         let mut field_cache: HashMap<String, Vec<String>> = HashMap::new();
-        let mut shard_tasks = Vec::new();
 
+        // Create GetShardStats message
+        let msg = GetShardStats { include_data_size };
+
+        // Collect futures for all shard stats requests using actor message pattern
+        let mut shard_futures = Vec::new();
         for (shard_id, shard) in &self.shards {
-            if let Some(store) = &shard.store {
-                let sc = Arc::clone(store);
-                let shard_id = *shard_id;
-                shard_tasks.push(tokio::task::spawn_blocking(
-                    move || -> Result<_, StoreError> {
-                        let snapshot = sc.gather_index_stats_snapshot(include_data_size)?;
-                        Ok((shard_id, snapshot))
-                    },
-                ));
-            }
+            let shard_id = *shard_id;
+            let shard_clone = shard.clone();
+            let msg_clone = msg.clone();
+
+            // Call handle_get_stats on each shard actor asynchronously
+            let future = async move {
+                let result = shard_clone.handle_get_stats(msg_clone).await;
+                (shard_id, result)
+            };
+            shard_futures.push(future);
         }
 
+        // Await all futures in parallel using join_all
+        let results = join_all(shard_futures).await;
+
         let mut shard_timings: Vec<(Uuid, ShardStatsTimings)> = Vec::new();
-        for task in shard_tasks {
-            match task
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-            {
-                Ok((shard_id, snapshot)) => {
+        for (shard_id, result) in results {
+            match result {
+                Ok(snapshot) => {
                     shard_timings.push((shard_id, snapshot.timings.clone()));
 
                     for (index_name, stats) in snapshot.per_index {
@@ -3865,7 +3914,7 @@ impl NodeOrchestrator {
                         }
                     }
                 }
-                Err(e) => return Err(OrchestratorError::from(e)),
+                Err(e) => return Err(e),
             }
         }
 

@@ -29,9 +29,7 @@ fn test_storage_engine_basics() {
     );
 
     // Test index listing (empty initially)
-    let index_names = store
-        .get_index_names_lightweight()
-        .expect("Failed to get index names");
+    let index_names = store.get_index_names().expect("Failed to get index names");
     assert_eq!(index_names.len(), 0, "Should start with no indexes");
 
     // Test index creation (directories are created lazily)
@@ -45,9 +43,7 @@ fn test_storage_engine_basics() {
         .expect("Failed to store schema");
 
     // Now the index should appear in listings
-    let index_names = store
-        .get_index_names_lightweight()
-        .expect("Failed to get index names");
+    let index_names = store.get_index_names().expect("Failed to get index names");
     assert_eq!(index_names.len(), 1, "Should have one index");
     assert!(
         index_names.contains(&"test_index".to_string()),
@@ -63,7 +59,7 @@ fn test_storage_engine_basics() {
     // This is by design - schemas persist for potential recovery
     // Let's verify the index data is gone by checking statistics
     let snapshot = store
-        .gather_index_stats_snapshot(false)
+        .gather_index_stats(false)
         .expect("Failed to get stats snapshot");
     let test_index_stats = snapshot.per_index.get("test_index");
     assert!(
@@ -79,7 +75,7 @@ fn test_storage_engine_basics() {
     // The index still appears because the schema exists
     // This is expected behavior
     let index_names_final = store
-        .get_index_names_lightweight()
+        .get_index_names()
         .expect("Failed to get index names after delete");
     assert_eq!(
         index_names_final.len(),
@@ -133,10 +129,10 @@ fn test_storage_configuration() {
         .expect("Failed to store schema2");
 
     let snapshot1 = store
-        .gather_index_stats_snapshot(false)
+        .gather_index_stats(false)
         .expect("Failed to get stats snapshot for index1");
     let snapshot2 = store
-        .gather_index_stats_snapshot(false)
+        .gather_index_stats(false)
         .expect("Failed to get stats snapshot for index2");
 
     let stats1 = snapshot1.per_index.get("index1").unwrap();
@@ -152,9 +148,7 @@ fn test_storage_configuration() {
     );
 
     // Test index listing
-    let index_names = store
-        .get_index_names_lightweight()
-        .expect("Failed to list indexes");
+    let index_names = store.get_index_names().expect("Failed to list indexes");
     assert_eq!(index_names.len(), 2, "Should have two indexes");
 
     assert!(

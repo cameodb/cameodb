@@ -262,9 +262,9 @@ Beyond raw storage, the engine tracks per-index metadata and stats:
     - `store.get_schema(index_name) -> Option<IndexSchema>`
 
 - **Index listing**
-  - Discover all known indices with lightweight statistics:
-    - `store.get_index_names_lightweight() -> Vec<String>`
-    - `store.gather_index_stats_snapshot(include_data_size) -> ShardStatsSnapshot`
+  - Discover all known indices with statistics:
+    - `store.get_index_names() -> Vec<String>`
+    - `store.gather_index_stats(include_data_size) -> ShardStatsSnapshot`
 
 - **Caching**
   - Schema cache: In-memory caching of parsed schemas for fast access

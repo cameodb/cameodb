@@ -507,7 +507,7 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
         Err(_) => ("local".to_string(), "unknown".to_string()),
     };
 
-    // Get lightweight index statistics for health check
+    // Get index statistics for health check
     let (total_indexes, indexes_with_data) = match state
         .router
         .handle_client_op(ClientOp::ListIndexes {
@@ -536,7 +536,7 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
                 .count();
             (total, with_data)
         }
-        Err(_) => (0, 0), // Fallback to 0 if lightweight indexes fails
+        Err(_) => (0, 0), // Fallback to 0 if index listing fails
     };
 
     let response = HealthResponse {
