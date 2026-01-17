@@ -47,6 +47,12 @@ const TANTIVY_DATA_FILE_EXTENSIONS: &[&str] = &["store", "fast", "idx", "doc", "
 /// Number of records to sample for size estimation in large tables
 const TABLE_SIZE_SAMPLE_COUNT: u64 = 200;
 
+/// Tantivy DateTime safe range limits (to avoid i64 overflow during nanosecond conversion)
+/// DateTime::from_timestamp_secs() multiplies by 1_000_000_000, so safe range is:
+/// i64::MIN / 1_000_000_000 to i64::MAX / 1_000_000_000
+const TANTIVY_MIN_TIMESTAMP_SECS: i64 = -9_223_372_036; // 1677-09-21 00:12:44 UTC
+const TANTIVY_MAX_TIMESTAMP_SECS: i64 = 9_223_372_036; // 2262-04-11 23:47:16 UTC
+
 /// Schema metadata table: maps index names to their schema definitions.
 const TABLE_SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("schema");
 
@@ -1264,8 +1270,23 @@ impl HybridStore {
                                     if let Some(s) = field_value.as_str()
                                         && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
                                     {
-                                        let tantivy_dt =
-                                            DateTime::from_timestamp_secs(dt.timestamp());
+                                        let timestamp_secs = dt.timestamp();
+                                        // Clamp to Tantivy's safe range to avoid i64 overflow
+                                        // Original date is preserved in redb json_blob
+                                        let clamped_ts = timestamp_secs.clamp(
+                                            TANTIVY_MIN_TIMESTAMP_SECS,
+                                            TANTIVY_MAX_TIMESTAMP_SECS,
+                                        );
+                                        let tantivy_dt = DateTime::from_timestamp_secs(clamped_ts);
+                                        if timestamp_secs != clamped_ts {
+                                            tracing::debug!(
+                                                field = %field_name,
+                                                input = %s,
+                                                original_ts = %timestamp_secs,
+                                                clamped_ts = %clamped_ts,
+                                                "Date clamped to Tantivy safe range"
+                                            );
+                                        }
                                         tantivy_doc.add_date(*tantivy_field, tantivy_dt);
                                     }
                                 }
@@ -1765,16 +1786,26 @@ impl HybridStore {
             return Ok((Vec::new(), 0));
         }
 
+        // Log indexed field names for debugging
+        let field_names: Vec<&str> = fields.indexed_fields.keys().map(|s| s.as_str()).collect();
         debug!(
             index = %index,
             query = %query,
             query_fields_count = query_fields.len(),
+            indexed_field_names = ?field_names,
             "Executing tantivy search"
         );
 
         // Create query parser and execute search
         let query_parser = tantivy::query::QueryParser::for_index(tantivy_index, query_fields);
         let parsed_query = query_parser.parse_query(query)?;
+
+        // Debug: log the parsed query to verify field-specific clauses are recognized
+        debug!(
+            index = %index,
+            parsed_query = %format!("{:?}", parsed_query),
+            "Parsed tantivy query"
+        );
 
         // Execute search with both TopDocs and Count collectors to get total hits
         let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit);
@@ -1818,6 +1849,13 @@ impl HybridStore {
                 });
 
                 if let Some(id_str) = id_opt {
+                    // Debug: log Tantivy's indexed values for this document
+                    debug!(
+                        index = %index,
+                        doc_id = %id_str,
+                        tantivy_doc = %json_str,
+                        "Tantivy document matched"
+                    );
                     doc_ids_with_scores.push((score, id_str.to_string()));
                 } else {
                     warn!(
@@ -2056,8 +2094,24 @@ impl HybridStore {
                                         if let Some(s) = field_value.as_str()
                                             && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
                                         {
+                                            let timestamp_secs = dt.timestamp();
+                                            // Clamp to Tantivy's safe range to avoid i64 overflow
+                                            // Original date is preserved in redb json_blob
+                                            let clamped_ts = timestamp_secs.clamp(
+                                                TANTIVY_MIN_TIMESTAMP_SECS,
+                                                TANTIVY_MAX_TIMESTAMP_SECS,
+                                            );
                                             let tantivy_dt =
-                                                DateTime::from_timestamp_secs(dt.timestamp());
+                                                DateTime::from_timestamp_secs(clamped_ts);
+                                            if timestamp_secs != clamped_ts {
+                                                tracing::debug!(
+                                                    field = %field_name,
+                                                    input = %s,
+                                                    original_ts = %timestamp_secs,
+                                                    clamped_ts = %clamped_ts,
+                                                    "Date clamped to Tantivy safe range (batch)"
+                                                );
+                                            }
                                             tantivy_doc.add_date(*tantivy_field, tantivy_dt);
                                         }
                                     }
@@ -2821,6 +2875,51 @@ mod tests {
         );
 
         println!("✅ Schema evolution works correctly!");
+    }
+
+    #[test]
+    fn test_tantivy_date_comparison_with_clamping() {
+        use tantivy::DateTime;
+
+        // Test that our clamping strategy works correctly
+        // 1606-01-01 (Volpone publication - would overflow without clamping)
+        let old_ts: i64 = -11_486_668_800;
+        let clamped_old_ts = old_ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+        let old_tantivy = DateTime::from_timestamp_secs(clamped_old_ts);
+
+        // 2023-05-27 (Query bound)
+        let new_ts: i64 = 1_685_145_600; // 2023-05-27T00:00:00Z
+        let new_tantivy = DateTime::from_timestamp_secs(new_ts);
+
+        println!(
+            "1606-01-01 (clamped to 1677): timestamp={}, tantivy={:?}",
+            clamped_old_ts, old_tantivy
+        );
+        println!(
+            "2023-05-27: timestamp={}, tantivy={:?}",
+            new_ts, new_tantivy
+        );
+
+        // With clamping, 1677 should be LESS than 2023
+        assert!(
+            old_tantivy < new_tantivy,
+            "Clamped 1677 date should be less than 2023 date"
+        );
+        assert_eq!(
+            clamped_old_ts, TANTIVY_MIN_TIMESTAMP_SECS,
+            "Pre-1677 date should be clamped to minimum"
+        );
+
+        // Test future date clamping
+        let future_ts: i64 = 10_000_000_000; // Beyond 2262
+        let clamped_future =
+            future_ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+        assert_eq!(
+            clamped_future, TANTIVY_MAX_TIMESTAMP_SECS,
+            "Post-2262 date should be clamped to maximum"
+        );
+
+        println!("✅ Tantivy DateTime clamping works correctly for out-of-range dates!");
     }
 
     #[test]

@@ -132,6 +132,31 @@ def get_cluster_health(base_url: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def ensure_schema(base_url: str, index: str) -> bool:
+    """Ensure the index schema is created with correct field types before ingestion."""
+    schema = {
+        "fields": {
+            "book_id": {"field_type": "text", "indexed": True, "stored": False},
+            "freebase_id": {"field_type": "text", "indexed": True, "stored": False},
+            "title": {"field_type": "text", "indexed": True, "stored": False},
+            "author": {"field_type": "text", "indexed": True, "stored": False},
+            "publication_date": {"field_type": "date", "indexed": True, "stored": False, "fast": True},
+            "genres": {"field_type": "text", "indexed": True, "stored": False},
+            "summary": {"field_type": "text", "indexed": True, "stored": False},
+        }
+    }
+    
+    url = f"{base_url.rstrip('/')}/api/{index}/_config"
+    try:
+        response = requests.put(url, json=schema, timeout=10)
+        response.raise_for_status()
+        print(f"Schema created/updated for index '{index}'")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: Could not create schema: {e}")
+        return False
+
+
 def send_batch(base_url: str, index: str, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Send a batch of documents to CameoDB bulk API."""
     url = f"{base_url.rstrip('/')}/api/{index}/_bulk"
@@ -155,6 +180,10 @@ def ingest(
     """Ingest book summaries data using batch processing for optimal performance."""
     if not data_path.exists():
         raise SystemExit(f"Data file not found: {data_path}")
+
+    # Optional: Pre-create schema with explicit field types before ingestion
+    # Uncomment to define schema upfront instead of relying on automatic evolution
+    # ensure_schema(base_url, index)
 
     # Get cluster health to show actual shard count
     health = get_cluster_health(base_url)

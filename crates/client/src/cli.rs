@@ -374,7 +374,7 @@ impl Hinter for IndexCompleter {
                 let current = tail.last()?;
                 if let Some((field, value_prefix)) = current.split_once(':') {
                     let trimmed_value = value_prefix
-                        .trim_start_matches(|c| matches!(c, '>' | '<' | '=' | '!'))
+                        .trim_start_matches(&['>', '<', '=', '!'][..])
                         .trim();
                     if trimmed_value.is_empty() {
                         return self

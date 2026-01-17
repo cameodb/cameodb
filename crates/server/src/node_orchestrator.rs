@@ -1610,10 +1610,10 @@ impl RouterActor {
                             if let Some(fields) = idx.get("field_names").and_then(|v| v.as_array())
                             {
                                 for field in fields {
-                                    if let Some(field_str) = field.as_str() {
-                                        if !entry.field_names.contains(&field_str.to_string()) {
-                                            entry.field_names.push(field_str.to_string());
-                                        }
+                                    if let Some(field_str) = field.as_str()
+                                        && !entry.field_names.contains(&field_str.to_string())
+                                    {
+                                        entry.field_names.push(field_str.to_string());
                                     }
                                 }
                             }
