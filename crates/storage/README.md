@@ -102,11 +102,44 @@ CameoDB implements an optimized storage strategy to minimize disk usage:
 2. **Retrieve**: Batch fetch complete documents from redb using IDs
 3. **Return**: Full JSON documents with all original fields
 
-This approach provides:
-- **50-80% smaller Tantivy indexes** (no redundant field storage)
-- **Fast search** (smaller, focused indexes)
-- **Complete document retrieval** (all fields preserved in redb)
-- **Single source of truth** (redb authoritative)
+**This split-storage strategy provides:**
+- Smaller Tantivy indices (no duplicated stored fields)
+- Faster search performance due to leaner segments
+- Full-fidelity documents retrieved from redb every time
+- A single source of truth for API responses
+
+### Date Field Range Limits
+
+Tantivy stores dates as nanosecond timestamps (`DateTime::from_timestamp_secs`). The conversion uses `i64` math, so the supported range is finite:
+
+| Limit | RFC3339 Timestamp | Unix Seconds |
+|-------|-------------------|--------------|
+| Minimum | `1677-09-21T00:12:44Z` | `-9_223_372_036` |
+| Maximum | `2262-04-11T23:47:16Z` | `9_223_372_036` |
+
+To keep indexing safe we clamp any out-of-range date **only when writing to Tantivy**. The original RFC3339 string remains untouched in redb's `json_blob`, so API responses still return the real publication (or ingestion) date. Practical implications:
+
+- Historical documents (e.g., books from the 1500s) will retrieve their true date but are indexed at the minimum bound (`1677-09-21`), so they won't satisfy queries that look for newer publication dates.
+- Far-future timestamps are clamped to the maximum bound.
+- Modern datasets (roughly 1900–present) fall inside the supported interval and incur no special handling.
+
+If you rely on date range queries, ensure that emitted timestamps stay within Tantivy's supported window or account for this clamping behavior when interpreting search results.
+
+```rust
+let timestamp_secs = dt.timestamp();
+let clamped = timestamp_secs
+    .clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+let tantivy_dt = DateTime::from_timestamp_secs(clamped);
+if timestamp_secs != clamped {
+    tracing::debug!(
+        input = %s,
+        original_ts = %timestamp_secs,
+        clamped_ts = %clamped,
+        "Date clamped to Tantivy safe range"
+    );
+}
+tantivy_doc.add_date(field, tantivy_dt);
+```
 
 ### Atomicity Guarantees
 
