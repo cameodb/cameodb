@@ -59,6 +59,8 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
                 for tool in "${MISSING_TOOLS[@]}"; do
                     sudo apt-get install -y "$tool"
                 done
+            elif command -v dnf &> /dev/null; then
+                sudo dnf install -y "${MISSING_TOOLS[@]}"
             elif command -v yum &> /dev/null; then
                 for tool in "${MISSING_TOOLS[@]}"; do
                     sudo yum install -y "$tool"
@@ -84,8 +86,37 @@ fi
 
 echo "✅ Cargo $(cargo --version | cut -d' ' -f2) is working"
 
-# Check for required Rust components
-echo "🔍 Checking Rust components..."
+# Verify Python version (3.9+)
+echo "🔍 Checking Python (3.9+)..."
+if command -v python3 &> /dev/null; then
+    PY_CHECK=$(python3 - <<'PY'
+import sys
+from sys import version_info
+if version_info < (3, 9):
+    print(f"Python {version_info.major}.{version_info.minor}.{version_info.micro}")
+    raise SystemExit(1)
+print(f"Python {version_info.major}.{version_info.minor}.{version_info.micro}")
+PY
+    )
+    if [ $? -eq 0 ]; then
+        echo "✅ ${PY_CHECK} detected"
+    else
+        echo "❌ Python 3.9+ required. Detected ${PY_CHECK}."
+        exit 1
+    fi
+else
+    echo "❌ python3 is not installed. Please install Python 3.9 or newer."
+    exit 1
+fi
+
+# Verify Docker installation
+echo "🔍 Checking Docker..."
+if command -v docker &> /dev/null; then
+    echo "✅ $(docker --version | head -n1)"
+else
+    echo "❌ Docker is not installed or not on PATH. Please install Docker Desktop/Engine."
+    exit 1
+fi
 
 # Check if we can build the project
 echo "🏗️  Testing project build..."

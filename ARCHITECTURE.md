@@ -1,6 +1,6 @@
 # Distributed Hybrid-Search Database: Architecture Design Document
 
-**Version:** 1.2.0
+**Version:** 0.2.1
 **Stack:** Rust, Kameo (Actors), Tokio, Redb, Tantivy, Axum
 **Crates:** `server`, `storage`, `cluster`, `client`
 
@@ -38,11 +38,11 @@ To ensure uniform data distribution without coordination:
 * **Ownership:** A key belongs to the first VNode found clockwise on the ring.
 
 ### 2.3. Cluster Discovery
-* **Mechanism:** Kameo DHT (Kademlia / Libp2p) for distributed node discovery.
-* **Bootstrap:** Nodes connect to a seed list for initial cluster join.
-* **Announcement:** Nodes publish their UUID and Address to the DHT group `"cluster_nodes"`.
-* **Registry:** Each node maintains a local, eventually consistent map of the Cluster Ring based on DHT gossip.
-* **Ring Management:** Local consistent hashing with deterministic token generation.
+* **Mechanism:** Kameo + libp2p DHT used primarily during bootstrap to exchange shard metadata snapshots.
+* **Bootstrap:** Nodes dial the configured seed list, publish their shard metadata (UUID, vnode tokens, storage stats), and query peer metadata keys.
+* **Announcement:** Cluster state is exchanged via `PeerShardDiscovered`, `MergeRemoteShards`, and `ClusterStateResponse` messages inside `ClusterCoordinator` rather than a flat node list.
+* **Registry:** Each coordinator persists the aggregated shard map + consistent ring locally, replaying it on restart for deterministic routing.
+* **Ring Management:** Local consistent hashing with deterministic token generation; ring updates are broadcast to subscribers (e.g., `NodeOrchestrator`) via actor channels.
 
 ---
 
@@ -81,25 +81,29 @@ graph TD
 * **Resource Guard:** Enforces `max_shards` and disk usage limits before accepting new work.
 
 ### 3.2. The RouterActor
-* **Role:** Request distribution and result aggregation across the cluster.
+* **Role:** Request distribution and result aggregation across the cluster via actor messaging (no shared locks).
 * **Routing Logic:**
-    - **Unicast:** When `routing_key` is present, uses consistent hashing for targeted delivery to specific shard.
-    - **Scatter-Gather:** When no `routing_key`, broadcasts to all shards and aggregates results for global queries.
-* **Async Patterns:** Handles concurrent requests with proper async coordination and result serialization.
+    - Delegates every client op to `ClusterCoordinator::RouteOperation` to decide between **Local**, **Remote**, or **Broadcast** execution. Write ops are never broadcast.
+    - **Remote fan-out:** Looks up remote `NodeOrchestrator` actors, retries with configurable backoff, and alerts the coordinator to redial seeds when routing fails.
+    - **Scatter-Gather:** When broadcasting reads/searches, caps fan-out, enforces per-request timeouts, and can stream shard responses incrementally with early termination once limits are satisfied.
+* **Async Patterns:** Integrates streaming NDJSON fan-in, remote retries, and topology updates without blocking, while keeping storage calls isolated inside shard actors.
 
 ### 3.3. The MicroshardActor
-* **Role:** The atomic unit of data processing with strict async/sync isolation.
+* **Role:** The atomic unit of data processing with strict async/sync isolation (spawn-blocking for `HybridStore`).
 * **Threading Model:** All blocking storage operations use `tokio::task::spawn_blocking` to prevent async runtime blocking.
 * **State Machine:**
-    1.  **`Hosting`:** Active Leader. Writes to local disk, streams to replicas.
-    2.  **`Follower`:** Passive Replica. Applies incoming WAL streams.
-    3.  **`Forwarding`:** (Soft Handoff) Routes requests to a new owner during/after migration.
+    - **Hosting (current):** Active shard role handling reads/writes locally.
+
+    - **Follower (planned):** Passive replica that replays WAL streams (replication roadmap).
+    - **Forwarding (planned):** Soft-handoff role that forwards traffic during migration.
 
 ---
 
 ## 4. Storage Engine: The "Hybrid Shard"
 
-To solve the trade-off between Search (Tantivy) and Retrieval (Redb), both engines run side-by-side within a Shard.
+To solve the trade-off between Search (Tantivy) and Retrieval (Redb), both engines run side-by-side within a Shard, letting Tantivy handle high-throughput indexing/query execution while redb keeps point lookups and WAL mutation costs predictable.
+
+**Durability & Query Guarantees:** redb provides ACID durability for every document (WAL + crash-safe commits), while Tantivy offers specialized index structures (text, numeric/date fast fields, exact tokenizers) plus the standard Tantivy query syntax for expressive search.
 
 **Directory Structure:**
 ```text
@@ -143,7 +147,8 @@ let json_doc: JsonValue = serde_json::from_str(&json_string)?;
 **Architecture Benefits:**
 - **Network Compatibility:** JSON format enables cross-language client support
 - **Type Safety:** Maintains Rust's type system throughout the conversion pipeline
-- **Performance:** Leverages tantivy's optimized JSON serialization
+- **Performance:** Uses Tantivy's native JSON conversion to avoid redundant marshaling, keeping high-QPS search fan-out responsive
+- **Durability:** Documents are serialized only after redb commits (WAL-backed), ensuring every hit represents fully durable state even during replication recovery.
 - **Actor Integration:** `Vec<(f32, JsonValue)>` seamlessly integrates with Kameo message passing
 
 ---

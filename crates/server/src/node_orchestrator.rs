@@ -1607,14 +1607,13 @@ impl RouterActor {
                                 idx.get("shard_count").and_then(|v| v.as_u64()).unwrap_or(0)
                                     as usize;
 
-                            // Merge field names (union)
                             if let Some(fields) = idx.get("field_names").and_then(|v| v.as_array())
                             {
                                 for field in fields {
-                                    if let Some(field_str) = field.as_str()
-                                        && !entry.field_names.contains(&field_str.to_string())
-                                    {
-                                        entry.field_names.push(field_str.to_string());
+                                    if let Some(field_str) = field.as_str() {
+                                        if !entry.field_names.contains(&field_str.to_string()) {
+                                            entry.field_names.push(field_str.to_string());
+                                        }
                                     }
                                 }
                             }
@@ -1622,7 +1621,6 @@ impl RouterActor {
                     }
                 }
 
-                // Sort field names for each index
                 for stats in index_map.values_mut() {
                     stats
                         .field_names
@@ -2859,16 +2857,8 @@ impl NodeOrchestrator {
         map
     }
 
-    fn schema_response(
-        field_names: Vec<String>,
-        fields: JsonMap<String, JsonValue>,
-        shard_count: u32,
-    ) -> JsonValue {
+    fn schema_response(fields: JsonMap<String, JsonValue>, shard_count: u32) -> JsonValue {
         let mut map = JsonMap::new();
-        map.insert(
-            "field_names".to_string(),
-            JsonValue::Array(field_names.into_iter().map(JsonValue::String).collect()),
-        );
         map.insert("fields".to_string(), JsonValue::Object(fields));
         map.insert(
             "shard_count".to_string(),
@@ -3905,10 +3895,9 @@ impl NodeOrchestrator {
                     .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
 
                 if let Some(s) = schema {
-                    let field_names = Self::sorted_field_names(&s);
                     let fields = Self::sorted_fields_map(&s);
                     let shard_count = self.default_shard_count();
-                    return Ok(Self::schema_response(field_names, fields, shard_count));
+                    return Ok(Self::schema_response(fields, shard_count));
                 }
             }
         }
@@ -4003,15 +3992,6 @@ impl NodeOrchestrator {
 
         let mut indexes: Vec<(String, JsonValue)> = Vec::new();
         for (name, (doc_count, redb_bytes, tantivy_bytes, shard_count)) in all {
-            let fields = if let Some(cached) = field_cache.get(&name) {
-                cached.clone()
-            } else {
-                let schema = self.load_schema(&name).await?;
-                let sorted = Self::sorted_field_names(&schema);
-                field_cache.insert(name.clone(), sorted.clone());
-                sorted
-            };
-
             let total_size_bytes = tantivy_bytes + if include_data_size { redb_bytes } else { 0 };
             let index_size_mb = tantivy_bytes / (1024 * 1024);
 
@@ -4036,15 +4016,21 @@ impl NodeOrchestrator {
                 );
             }
             json_obj.insert("shard_count".to_string(), JsonValue::from(shard_count));
+            let fields = if let Some(cached) = field_cache.get(&name) {
+                cached.clone()
+            } else {
+                match self.load_schema(&name).await {
+                    Ok(schema) => {
+                        let sorted = Self::sorted_field_names(&schema);
+                        field_cache.insert(name.clone(), sorted.clone());
+                        sorted
+                    }
+                    Err(_) => Vec::new(),
+                }
+            };
             json_obj.insert(
                 "field_names".to_string(),
-                JsonValue::Array(
-                    fields
-                        .iter()
-                        .cloned()
-                        .map(JsonValue::String)
-                        .collect::<Vec<_>>(),
-                ),
+                JsonValue::Array(fields.into_iter().map(JsonValue::String).collect()),
             );
 
             indexes.push((name, JsonValue::Object(json_obj)));

@@ -28,47 +28,56 @@ use tokio::sync::mpsc;
 async fn main() -> Result<()> {
     // Handle CLI arguments for configuration utilities and client mode
     let args: Vec<String> = std::env::args().collect();
-    if let Some(arg) = args.get(1).map(String::as_str) {
-        match arg {
-            "client" => {
-                return client::run_cli().await;
+
+    if args.len() > 1 {
+        let wants_client = args
+            .iter()
+            .skip(1)
+            .any(|arg| matches!(arg.as_str(), "client" | "health" | "index" | "search"));
+        let interactive_requested = args
+            .iter()
+            .skip(1)
+            .any(|arg| arg == "-i" || arg == "--interactive");
+
+        if wants_client || interactive_requested {
+            return client::run_cli().await;
+        }
+
+        if let Some(arg) = args.get(1).map(String::as_str) {
+            match arg {
+                "--version" | "-V" => {
+                    println!("cameodb {}", env!("CARGO_PKG_VERSION"));
+                    return Ok(());
+                }
+                "generate-config" => {
+                    println!("{}", CameoDbConfig::generate_sample_config()?);
+                    return Ok(());
+                }
+                "--help" | "-h" => {
+                    println!(
+                        "cameodb {}\n\n\
+                         Usage:\n  \
+                         cameodb [OPTIONS]\n  \
+                         cameodb generate-config\n  \
+                         cameodb client <subcommand>\n\n\
+                         Options:\n  \
+                         -h, --help       Show this help message\n  \
+                         -V, --version    Show version information\n\n\
+                         Commands:\n  \
+                         generate-config  Print a sample configuration file\n  \
+                         client           Run the bundled client CLI (health, index, search)\n\n\
+                         Client examples:\n  \
+                         cameodb client health\n  \
+                         cameodb client index list\n  \
+                         cameodb client search myindex \"foo bar\" --limit 5 --url http://host:9480\n\n\
+                         When no command is provided, cameodb starts the server using configuration\n  \
+                         loaded from config files and environment variables.",
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    return Ok(());
+                }
+                _ => {}
             }
-            // Allow calling client subcommands directly: `cameodb health`, `cameodb index list`, etc.
-            "health" | "index" | "search" => {
-                return client::run_cli().await;
-            }
-            "--version" | "-V" => {
-                println!("cameodb {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
-            }
-            "generate-config" => {
-                println!("{}", CameoDbConfig::generate_sample_config()?);
-                return Ok(());
-            }
-            "--help" | "-h" => {
-                println!(
-                    "cameodb {}\n\n\
-                     Usage:\n  \
-                     cameodb [OPTIONS]\n  \
-                     cameodb generate-config\n  \
-                     cameodb client <subcommand>\n\n\
-                     Options:\n  \
-                     -h, --help       Show this help message\n  \
-                     -V, --version    Show version information\n\n\
-                     Commands:\n  \
-                     generate-config  Print a sample configuration file\n  \
-                     client           Run the bundled client CLI (health, index, search)\n\n\
-                     Client examples:\n  \
-                     cameodb client health\n  \
-                     cameodb client index list\n  \
-                     cameodb client search myindex \"foo bar\" --limit 5 --url http://host:9480\n\n\
-                     When no command is provided, cameodb starts the server using configuration\n  \
-                     loaded from config files and environment variables.",
-                    env!("CARGO_PKG_VERSION")
-                );
-                return Ok(());
-            }
-            _ => {}
         }
     }
 

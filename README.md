@@ -515,7 +515,7 @@ default_search_limit = 10
 
 ### **Development**
 - **Rust**: 1.90.0+ with Rust 2024 Edition support
-- **OS**: macOS 11+, Ubuntu 20.04+, or Windows 10+ with WSL2
+- **OS**: macOS 11+, Ubuntu 20.04+, Fedora Linux 39+, or Windows 10+ with WSL2
 - **Memory**: 4GB RAM minimum (8GB+ recommended)
 - **Storage**: 10GB+ available space
 - **Network**: Ports 9480 (HTTP API), 9580 (cluster communication)

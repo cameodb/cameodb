@@ -38,8 +38,11 @@ impl CameoClient {
             .context("Failed to parse health response")
     }
 
-    pub async fn list_indexes(&self) -> Result<ListIndexesResponse> {
-        let url = self.base_url.join("_indexes")?;
+    pub async fn list_indexes(&self, include_data_size: bool) -> Result<ListIndexesResponse> {
+        let mut url = self.base_url.join("_indexes")?;
+        if include_data_size {
+            url.set_query(Some("data_size=true"));
+        }
         let resp = self.http.get(url).send().await?;
         if !resp.status().is_success() {
             anyhow::bail!("Failed to list indexes: {}", resp.status());
@@ -69,6 +72,20 @@ impl CameoClient {
         }
         resp.json().await.context("Failed to parse search response")
     }
+
+    pub async fn get_index_config(&self, index: &str) -> Result<IndexConfigResponse> {
+        let url = self
+            .base_url
+            .join(&format!("api/{}/_config", index))
+            .context("Invalid config URL")?;
+        let resp = self.http.get(url).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to fetch index config: {}", resp.status());
+        }
+        resp.json()
+            .await
+            .context("Failed to parse index config response")
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -94,8 +111,20 @@ pub struct ListIndexesResponse {
 pub struct IndexInfo {
     pub name: String,
     pub document_count: u64,
-    pub total_size_bytes: u64,
-    pub size_mb: u64,
+    #[serde(default)]
+    pub total_size_bytes: Option<u64>,
+    #[serde(default, alias = "size_mb")]
+    pub index_size_mb: Option<u64>,
+    #[serde(default)]
+    pub data_size_mb: Option<u64>,
     pub shard_count: usize,
+    #[serde(default)]
     pub field_names: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IndexConfigResponse {
+    pub shard_count: u32,
+    #[serde(default)]
+    pub fields: JsonValue,
 }
