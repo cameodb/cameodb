@@ -606,6 +606,7 @@ This supervised strategy ensures optimal performance across all write patterns w
 - **Point Queries**: ~0.1ms (redb B-tree lookup)
 - **Range Queries**: ~1-10ms (depends on range size)
 - **Search Queries**: ~10-100ms (depends on index size and query complexity)
+- **Phrase Queries**: Supported via Tantivy's positional indexes (cost similar to search queries)
 
 ### Storage Efficiency
 - **Compression**: Both redb and tantivy use compression
