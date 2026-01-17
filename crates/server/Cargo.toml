@@ -1,6 +1,6 @@
 [package]
 name = "server"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "FSL-1.1-Apache-2.0"
 description = "A high-performance distributed hybrid-search database"

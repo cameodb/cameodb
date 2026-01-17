@@ -642,7 +642,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 # Generate RPM package (run from project root directory)
 cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
-  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.0-1.x86_64.rpm \
+  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.1-1.x86_64.rpm \
   --set-metadata 'package.name="cameodb"'
 ```
 
@@ -657,11 +657,11 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 
 # Generate RPM package with standard naming (run from project root directory)
 cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
-  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.0-1.x86_64.rpm \
+  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.1-1.x86_64.rpm \
   --set-metadata 'package.name="cameodb"'
 
 # The RPM package will be available at:
-# target/x86_64-unknown-linux-musl/release/cameodb-0.2.0-1.x86_64.rpm
+# target/x86_64-unknown-linux-musl/release/cameodb-0.2.1-1.x86_64.rpm
 ```
 
 **Note**: Two approaches for hardening flags:
@@ -695,13 +695,13 @@ Hardening flags explained:
 
 ```bash
 # Verify RPM package before installation
-rpm -qpi cameodb-0.2.0-1.x86_64.rpm
+rpm -qpi cameodb-0.2.1-1.x86_64.rpm
 
 # Check package contents
-rpm -qpl cameodb-0.2.0-1.x86_64.rpm
+rpm -qpl cameodb-0.2.1-1.x86_64.rpm
 
 # Install the RPM package
-sudo rpm -i cameodb-0.2.0-1.x86_64.rpm
+sudo rpm -i cameodb-0.2.1-1.x86_64.rpm
 
 # Start and enable the service
 sudo systemctl daemon-reload
