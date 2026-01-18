@@ -354,7 +354,8 @@ impl IndexCompleter {
 
     fn command_suggestions(&self, prefix: &str) -> Vec<Pair> {
         let commands = vec![
-            "health", "list", "search", "connect", "conn", "exit", "quit", "help",
+            "health", "list", "search", "schema", "data", "delete", "connect", "conn", "exit",
+            "quit", "help",
         ];
         commands
             .into_iter()
@@ -368,6 +369,30 @@ impl IndexCompleter {
 
     fn list_subcommand_suggestions(&self, prefix: &str) -> Vec<Pair> {
         let subcommands = vec!["indexes", "index"];
+        subcommands
+            .into_iter()
+            .filter(|sub| sub.starts_with(prefix))
+            .map(|sub| Pair {
+                display: sub.to_string(),
+                replacement: sub.to_string(),
+            })
+            .collect()
+    }
+
+    fn schema_subcommand_suggestions(&self, prefix: &str) -> Vec<Pair> {
+        let subcommands = vec!["detect", "load"];
+        subcommands
+            .into_iter()
+            .filter(|sub| sub.starts_with(prefix))
+            .map(|sub| Pair {
+                display: sub.to_string(),
+                replacement: sub.to_string(),
+            })
+            .collect()
+    }
+
+    fn data_subcommand_suggestions(&self, prefix: &str) -> Vec<Pair> {
+        let subcommands = vec!["load"];
         subcommands
             .into_iter()
             .filter(|sub| sub.starts_with(prefix))
@@ -401,6 +426,17 @@ impl IndexCompleter {
                 let start = current_start(tokens, current);
                 Some((start, suggestions))
             }
+            // Complete schema subcommands and index for schema load
+            "schema" if tokens.len() == 2 => {
+                let suggestions = self.schema_subcommand_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
+            "schema" if tokens.len() == 3 && tokens[1] == "load" => {
+                let suggestions = self.index_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
             // Complete index name for 'search'
             "search" if tokens.len() == 2 => {
                 let suggestions = self.index_suggestions(current);
@@ -411,6 +447,23 @@ impl IndexCompleter {
             "search" if tokens.len() >= 3 => {
                 let index = tokens[1];
                 let suggestions = self.field_suggestions(index, current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
+            // Complete data subcommands and index for data load
+            "data" if tokens.len() == 2 => {
+                let suggestions = self.data_subcommand_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
+            "data" if tokens.len() == 3 && tokens[1] == "load" => {
+                let suggestions = self.index_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
+            // Complete index name for delete
+            "delete" if tokens.len() == 2 => {
+                let suggestions = self.index_suggestions(current);
                 let start = current_start(tokens, current);
                 Some((start, suggestions))
             }
