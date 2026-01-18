@@ -1075,7 +1075,7 @@ fn interactive_loop(
 
         if matches!(input.as_str(), "help" | "\\h") {
             println!(
-                "Available commands:\n  health\n  list indexes\n  list index <name>\n  search <index> <query> [limit]\n  connect <host[:port]>\n  exit | quit | \\q"
+                "Available commands:\n  health\n  list indexes\n  list index <name>\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  connect <host[:port]>\n  exit | quit | \\q"
             );
             continue;
         }
