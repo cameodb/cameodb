@@ -664,6 +664,38 @@ cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-re
 # target/x86_64-unknown-linux-musl/release/cameodb-0.2.1-1.x86_64.rpm
 ```
 
+### Signing Release Artifacts
+
+Cosign 2.x defaults to the new bundle format. Generate one `.bundle` file per artifact and ship it together with the binary and `cosign.pub` so downstream users can verify releases.
+
+```bash
+cosign sign-blob \
+  --key /usr/local/share/ca-certificates/cosign.key \
+  --bundle target/release/cameodb.bundle \
+  target/release/cameodb
+
+cosign sign-blob \
+  --key /usr/local/share/ca-certificates/cosign.key \
+  --bundle target/x86_64-unknown-linux-musl/release/cameodb.bundle \
+  target/x86_64-unknown-linux-musl/release/cameodb
+
+cosign sign-blob \
+  --key /usr/local/share/ca-certificates/cosign.key \
+  --bundle target/x86_64-unknown-linux-musl/release/cameodb-0.2.1-1.x86_64.rpm.bundle \
+  target/x86_64-unknown-linux-musl/release/cameodb-0.2.1-1.x86_64.rpm
+```
+
+**Verification example:**
+
+```bash
+cosign verify-blob \
+  --key cosign.pub \
+  --bundle cameodb.bundle \
+  cameodb
+```
+
+If you need legacy `.sig`/`.cert` files instead, add `--legacy-signatures` (or set `COSIGN_EXPERIMENTAL=0`) and keep the previous `--output-signature` / `--output-certificate` flags.
+
 **Note**: Two approaches for hardening flags:
 1. **Pre-configured**: Hardening flags are set in `.cargo/config.toml` and applied automatically
 2. **Explicit override**: Use `RUSTFLAGS="..."` to override or customize flags as shown above
