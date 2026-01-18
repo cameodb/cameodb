@@ -101,6 +101,27 @@ impl CameoClient {
         Ok(())
     }
 
+    pub async fn delete_index(&self, index: &str, delete_schema: bool) -> Result<JsonValue> {
+        let mut url = self
+            .base_url
+            .join(&format!("api/{}", index))
+            .context("Invalid delete URL")?;
+        if delete_schema {
+            url.set_query(Some("delete_schema=true"));
+        }
+
+        let resp = self.http.delete(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Delete index failed: {} - {}", status, text);
+        }
+
+        resp.json()
+            .await
+            .context("Failed to parse delete index response")
+    }
+
     pub async fn bulk_index(&self, index: &str, batch: &[JsonValue]) -> Result<()> {
         let url = self
             .base_url

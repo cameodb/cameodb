@@ -15,7 +15,7 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write, stdin, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use storage::{FieldDef, IndexSchema, TantivyFieldType};
@@ -564,6 +564,15 @@ pub enum ClientCommand {
         #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
         batch_size: usize,
     },
+
+    /// Delete an index (and optionally its schema)
+    Delete {
+        /// Target index name
+        index: String,
+        /// Also delete stored schema/config
+        #[arg(long, default_value_t = false)]
+        delete_schema: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -686,9 +695,29 @@ pub async fn run_cli() -> Result<()> {
                 load_data_from_csv(&client, &index, &file, delimiter, batch_size).await?;
             }
         },
+        ClientCommand::Delete {
+            index,
+            delete_schema,
+        } => {
+            let result = client.delete_index(&index, delete_schema).await?;
+            print_json(&result)?;
+        }
     }
 
     Ok(())
+}
+
+fn confirm_delete(index: &str) -> Result<bool> {
+    print!("Delete index \"{}\"? [yes/NO]: ", index);
+    stdout().flush().ok();
+
+    let mut input = String::new();
+    stdin()
+        .read_line(&mut input)
+        .context("Failed to read confirmation")?;
+
+    let answer = input.trim().to_ascii_lowercase();
+    Ok(answer == "yes")
 }
 
 async fn detect_schema_from_csv(
@@ -1075,7 +1104,7 @@ fn interactive_loop(
 
         if matches!(input.as_str(), "help" | "\\h") {
             println!(
-                "Available commands:\n  health\n  list indexes\n  list index <name>\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  connect <host[:port]>\n  exit | quit | \\q"
+                "Available commands:\n  health\n  list indexes\n  list index <name>\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  connect <host[:port]>\n  exit | quit | \\q"
             );
             continue;
         }
@@ -1167,6 +1196,23 @@ async fn dispatch_interactive_command(session: &mut InteractiveSession, input: &
             }
             let results = session.client().search(index, &query, limit).await?;
             print_json(&results)?;
+        }
+        "delete" => {
+            let index = parts
+                .next()
+                .ok_or_else(|| anyhow!("Usage: delete <index> [--delete-schema]"))?;
+
+            // Parse optional flag --delete-schema
+            let delete_schema = parts.any(|p| p == "--delete-schema");
+
+            if !confirm_delete(index)? {
+                println!("Aborted delete.");
+                return Ok(());
+            }
+
+            let result = session.client().delete_index(index, delete_schema).await?;
+            print_json(&result)?;
+            session.refresh_index_cache().await;
         }
         "connect" | "conn" => {
             let target = parts.collect::<Vec<_>>().join(" ");

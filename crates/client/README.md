@@ -42,6 +42,7 @@ Flags:
 | `schema detect <file> [--delimiter ...]` | Detect schema from CSV/TSV (auto or forced delimiter) |
 | `schema load <index> <file> [--delimiter ...]` | Detect schema and apply to an index |
 | `data load <index> <file> [--delimiter ...]` | Ingest CSV/TSV data in batches |
+| `delete <index> [--delete-schema]` | Delete an index; prompts `Delete index "<name>"? [yes/NO]:` and only proceeds on `yes` |
 | `connect <host[:port]>` | Switch target server and refresh cache |
 | `help` | Display built-in command reference |
 | `exit` / `quit` / `\q` | Leave the REPL |
