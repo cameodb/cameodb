@@ -14,7 +14,7 @@ import requests
 
 DEFAULT_BASE_URL = "http://localhost:9480"
 DEFAULT_INDEX = "books"
-DEFAULT_DATA_PATH = Path("scripts/data/booksummaries.txt")
+DEFAULT_DATA_PATH = Path("scripts/data/booksummaries.tsv")
 DEFAULT_BATCH_SIZE = 2000
 DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024  # 16MB (safe under 64MB Kameo limit)
 
@@ -254,10 +254,14 @@ def ingest(
                 total_processed += len(docs_to_send)
 
         for line_num, line in enumerate(handle, 1):
+            # Skip header row if present
+            if line_num == 1:
+                continue
+
             line = line.strip()
             if not line:
                 continue
-                
+
             doc = build_document(line)
             if not doc:
                 continue

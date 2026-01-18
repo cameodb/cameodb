@@ -14,3 +14,7 @@ uuid.workspace = true
 clap = { version = "4.5", features = ["derive", "env"] }
 rustyline = "13"
 dirs = "5"
+csv = "1.3"
+storage = { path = "../storage" }
+colored_json = "3"
+colored = "2"

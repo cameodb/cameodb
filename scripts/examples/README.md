@@ -39,7 +39,7 @@ python3 scripts/examples/size_analysis.py 1500 books  # Test custom batch size
 ## 🎤 TED Talks CSV Ingestion
 
 The `ingest_ted.py` script loads TED Talks metadata from the CSV file shipped under
-`scripts/data/youtube_ted_2024_03_17.csv` and writes documents into a CameoDB index via
+`scripts/data/youtube_ted_2024.csv` and writes documents into a CameoDB index via
 the HTTP API.
 
 ### Prerequisites
@@ -106,7 +106,7 @@ The `ingest_books.py` script loads the CMU Book Summaries dataset into CameoDB u
 
 ### Dataset
 
-The script processes the CMU Book Summaries dataset (`booksummaries.txt`), which contains:
+The script processes the CMU Book Summaries dataset (`booksummaries.tsv`), which contains:
 - **16,559 books** with plot summaries
 - Tab-separated format with fields: book_id, freebase_id, title, author, publication_date, genres_json, summary
 - Genres stored as JSON objects with Freebase mappings
@@ -132,13 +132,13 @@ python3 scripts/examples/ingest_books.py --base-url http://localhost:8080
 python3 scripts/examples/ingest_books.py --dry-run
 
 # Test with smaller batches
-python3 scripts/examples/ingest_books.py --dry-run --batch-size 50
+python3 scripts/examples/ingest_books.py --dry-run --batch-size 200
 ```
 
 #### Performance Tuning
 ```bash
 # Larger batches for faster ingestion (still routed via consistent hashing)
-python3 scripts/examples/ingest_books.py --batch-size 100 --max-batch-mb 4
+python3 scripts/examples/ingest_books.py --batch-size 1000 --max-batch-mb 4
 ```
 
 ### Document Structure
@@ -176,7 +176,7 @@ Each book is indexed with the following fields:
 |--------|--------------|------------|--------------|-------------|
 | `--base-url` | `http://localhost:9480` | `http://localhost:9480` | `http://localhost:9480` | CameoDB HTTP base URL |
 | `--index` | `books` | `ted` | `urls` | Target index name |
-| `--data` | `scripts/data/booksummaries.txt` | `scripts/data/youtube_ted_2024_03_17.csv` | `scripts/data/urls.csv` | Path to data file |
+| `--data` | `scripts/data/booksummaries.tsv` | `scripts/data/youtube_ted_2024.csv` | `scripts/data/urls.csv` | Path to data file |
 | `--dry-run` | `false` | `false` | `false` | Print sample documents instead of sending |
 | `--batch-size` | **2000** | 4000 | 10000 | Maximum documents per batch |
 | `--max-batch-mb` | **16** | 16 | 16 | Maximum batch size in MB (50% safety margin under 64MB Kameo limit) |

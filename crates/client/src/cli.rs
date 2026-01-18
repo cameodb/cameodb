@@ -1,18 +1,39 @@
 use crate::sdk::{CameoClient, ListIndexesResponse};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
+use colored::Colorize;
+use csv::ReaderBuilder;
 use reqwest::Url;
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Editor, Helper, error::ReadlineError};
+use serde::Serialize;
+use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
-use serde_json::{json, to_string_pretty};
+use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::{Cursor, Read};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use storage::{FieldDef, IndexSchema, TantivyFieldType};
+
+const SCHEMA_SAMPLE_LIMIT: usize = 200;
+const DEFAULT_BATCH_SIZE: usize = 4000;
+
+#[allow(dead_code)]
+#[derive(Copy, Clone)]
+enum PromptTheme {
+    Default,
+    Bash,
+    Powerline,
+    Minimal,
+}
+
+// Select the prompt theme here (Bash style by request)
+const PROMPT_THEME: PromptTheme = PromptTheme::Bash;
 
 #[derive(Parser)]
 #[command(name = "cameodb-client", about = "CameoDB CLI Client")]
@@ -33,6 +54,29 @@ pub struct ClientCli {
         global = true
     )]
     pub connect: String,
+}
+
+fn parse_header_with_hint(raw: &str) -> (String, Option<TantivyFieldType>) {
+    let mut parts = raw.splitn(2, '.');
+    let name = parts.next().unwrap_or("").to_string();
+    let hint = parts.next().and_then(map_type_hint);
+    (name, hint)
+}
+
+fn map_type_hint(hint: &str) -> Option<TantivyFieldType> {
+    match hint.to_lowercase().as_str() {
+        "text" | "string" => Some(TantivyFieldType::Text),
+        // No dedicated Exact variant; use String (untokenized) for exact semantics
+        "exact" => Some(TantivyFieldType::String),
+        "numeric" | "number" | "int" | "i64" | "integer" | "u64" => Some(TantivyFieldType::I64),
+        "decimal" | "float" | "double" | "f64" => Some(TantivyFieldType::F64),
+        "date" => Some(TantivyFieldType::Date),
+        "timestamp" => Some(TantivyFieldType::Date),
+        "bool" | "boolean" | "true" | "false" => Some(TantivyFieldType::Boolean),
+        "ip" => Some(TantivyFieldType::Ip),
+        "json" => Some(TantivyFieldType::Json),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -126,7 +170,33 @@ impl InteractiveSession {
     }
 
     fn prompt(&self) -> String {
-        format!("cameodb@{} ▶ ", self.display_host())
+        let host = self.display_host();
+        match PROMPT_THEME {
+            PromptTheme::Default => format!(
+                "{}{}{} ▶ ",
+                "cameodb".bright_green(),
+                "@".bright_blue(),
+                host.green()
+            ),
+            PromptTheme::Bash => format!(
+                "{}{}{} ▶ ",
+                "cameodb".bold().cyan(),
+                "@".white(),
+                host.bold().green()
+            ),
+            PromptTheme::Powerline => format!(
+                "{}{}{} ▶ ",
+                "cameodb".bold().magenta(),
+                "@".bright_black(),
+                host.bold().cyan()
+            ),
+            PromptTheme::Minimal => format!(
+                "{}{}{} ▶ ",
+                "cameodb".white(),
+                "@".dimmed(),
+                host.bright_green()
+            ),
+        }
     }
 
     fn display_host(&self) -> String {
@@ -166,7 +236,7 @@ async fn handle_list_command(
     match resource {
         ListResource::Indexes => {
             let indexes = client.list_indexes(include_data_size).await?;
-            println!("{}", to_string_pretty(&indexes)?);
+            print_json(&indexes)?;
             Ok(Some(indexes))
         }
         ListResource::Index => {
@@ -193,7 +263,7 @@ async fn handle_list_command(
                 "stats": stats,
                 "schema": config,
             });
-            println!("{}", to_string_pretty(&enriched)?);
+            print_json(&enriched)?;
             Ok(Some(indexes))
         }
     }
@@ -463,6 +533,63 @@ pub enum ClientCommand {
         #[arg(short, long)]
         limit: Option<usize>,
     },
+
+    /// Schema utilities
+    Schema {
+        /// Operation to perform
+        #[arg(value_enum)]
+        operation: SchemaOperation,
+        /// Target index name (required for `load`, optional for `detect`)
+        index: Option<String>,
+        /// Path or HTTP(S) URL to CSV/TSV file to parse
+        file: String,
+        /// Delimiter override (default: auto-detect first line)
+        #[arg(long, value_enum, default_value_t = Delimiter::Detect)]
+        delimiter: Delimiter,
+    },
+
+    /// Data ingestion
+    Data {
+        /// Operation to perform
+        #[arg(value_enum)]
+        operation: DataOperation,
+        /// Target index name
+        index: String,
+        /// Path or HTTP(S) URL to CSV/TSV data file
+        file: String,
+        /// Delimiter override (default: auto-detect first line)
+        #[arg(long, value_enum, default_value_t = Delimiter::Detect)]
+        delimiter: Delimiter,
+        /// Maximum documents per batch
+        #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
+        batch_size: usize,
+    },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum SchemaOperation {
+    /// Detect schema from a CSV file (samples first 200 rows)
+    Detect,
+    /// Detect schema and apply it to an index
+    Load,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum DataOperation {
+    /// Load CSV data into an index in batches
+    Load,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum Delimiter {
+    /// Auto-detect using first line (default)
+    Detect,
+    /// Comma-separated
+    Comma,
+    /// Tab-separated
+    Tab,
+    /// Semicolon-separated
+    Semicolon,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -513,7 +640,7 @@ pub async fn run_cli() -> Result<()> {
     match command {
         ClientCommand::Health => {
             let health = client.health().await?;
-            println!("{}", to_string_pretty(&health)?);
+            print_json(&health)?;
         }
         ClientCommand::List { resource, name } => {
             handle_list_command(&client, resource, name, true).await?;
@@ -524,11 +651,376 @@ pub async fn run_cli() -> Result<()> {
             limit,
         } => {
             let results = client.search(&index, &query, limit).await?;
-            println!("{}", to_string_pretty(&results)?);
+            print_json(&results)?;
         }
+        ClientCommand::Schema {
+            operation,
+            index,
+            file,
+            delimiter,
+        } => match operation {
+            SchemaOperation::Detect => {
+                let schema_json = detect_schema_from_csv(&client, &file, delimiter).await?;
+                print_json(&schema_json)?;
+            }
+            SchemaOperation::Load => {
+                let index_name = index
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("Index name is required for schema load. Usage: schema load <index> <file>"))?;
+
+                let schema_json = load_schema_from_source(&client, &file, delimiter).await?;
+                client.put_index_config(index_name, &schema_json).await?;
+                println!("Schema applied to index '{}'", index_name);
+            }
+        },
+        ClientCommand::Data {
+            operation,
+            index,
+            file,
+            delimiter,
+            batch_size,
+        } => match operation {
+            DataOperation::Load => {
+                load_data_from_csv(&client, &index, &file, delimiter, batch_size).await?;
+            }
+        },
     }
 
     Ok(())
+}
+
+async fn detect_schema_from_csv(
+    client: &CameoClient,
+    source: &str,
+    delimiter: Delimiter,
+) -> Result<JsonValue> {
+    let mut reader = open_csv_reader(client, source, delimiter).await?;
+    let raw_headers = reader
+        .headers()
+        .context("CSV file is missing headers")?
+        .clone();
+
+    let headers: Vec<(String, Option<TantivyFieldType>)> =
+        raw_headers.iter().map(parse_header_with_hint).collect();
+
+    // Require an id column and track its header name
+    let id_idx = headers
+        .iter()
+        .position(|(h, _)| h.to_lowercase().contains("id"))
+        .ok_or_else(|| anyhow!("CSV must have an id column (first header containing 'id')"))?;
+
+    let mut schema = IndexSchema::default();
+    let mut sampled = 0usize;
+
+    for record in reader.records() {
+        let record = record.context("Failed to read CSV record")?;
+        let mut obj: JsonMap<String, JsonValue> = JsonMap::new();
+
+        // Extract id field and inject canonical "id"
+        if let Some(raw_id) = record.get(id_idx) {
+            let id_val = raw_id.trim();
+            if !id_val.is_empty() {
+                obj.insert("id".to_string(), JsonValue::String(id_val.to_string()));
+            }
+        }
+
+        for (idx, value) in record.iter().enumerate() {
+            if let Some((header, _)) = headers.get(idx) {
+                let parsed = parse_csv_cell(value);
+                obj.insert(header.clone(), parsed);
+            }
+        }
+
+        schema.evolve_from_document(&JsonValue::Object(obj));
+
+        sampled += 1;
+        if sampled >= SCHEMA_SAMPLE_LIMIT {
+            break;
+        }
+    }
+
+    // Apply type hints where provided
+    for (name, hint) in &headers {
+        if let Some(t) = hint.clone() {
+            let field_def = FieldDef::new(name.clone(), t);
+            schema.fields.insert(name.clone(), field_def);
+        }
+    }
+
+    let mut schema_json = serde_json::to_value(schema).context("Failed to serialize schema")?;
+
+    // Reorder fields map to place id first
+    if let JsonValue::Object(ref mut root) = schema_json
+        && let Some(JsonValue::Object(mut fields)) = root.remove("fields")
+    {
+        let mut ordered = JsonMap::new();
+        if let Some(id_val) = fields.remove("id") {
+            ordered.insert("id".to_string(), id_val);
+        }
+        for (k, v) in fields {
+            ordered.insert(k, v);
+        }
+        root.insert("fields".to_string(), JsonValue::Object(ordered));
+    }
+
+    Ok(schema_json)
+}
+
+fn print_json<T: Serialize>(val: &T) -> Result<()> {
+    let pretty = serde_json::to_string_pretty(val)?;
+    let value: JsonValue = serde_json::from_str(&pretty)?;
+    match colored_json::to_colored_json_auto(&value) {
+        Ok(colored) => {
+            println!("{}", colored);
+        }
+        Err(_) => {
+            println!("{}", pretty);
+        }
+    }
+    Ok(())
+}
+
+async fn load_schema_from_source(
+    client: &CameoClient,
+    source: &str,
+    delimiter: Delimiter,
+) -> Result<JsonValue> {
+    // Try to parse as JSON schema first
+    let raw_bytes = fetch_bytes_source(client, source).await?;
+    if let Ok(json) = serde_json::from_slice::<JsonValue>(&raw_bytes)
+        && json.get("fields").is_some()
+    {
+        return Ok(json);
+    }
+
+    // Fallback: treat as CSV and detect
+    detect_schema_from_csv(client, source, delimiter).await
+}
+
+async fn load_data_from_csv(
+    client: &CameoClient,
+    index: &str,
+    source: &str,
+    delimiter: Delimiter,
+    batch_size: usize,
+) -> Result<()> {
+    // Ensure index/schema exists before ingesting; if missing, auto-create from source
+    let schema_exists = client.get_index_config(index).await.is_ok();
+    if !schema_exists {
+        let schema = load_schema_from_source(client, source, delimiter)
+            .await
+            .context("Failed to detect schema while auto-creating index schema")?;
+        client
+            .put_index_config(index, &schema)
+            .await
+            .with_context(|| format!("Failed to create schema for index '{}'", index))?;
+        println!(
+            "Schema was missing; detected and applied schema to index '{}' before ingest",
+            index
+        );
+    }
+
+    let mut reader = open_csv_reader(client, source, delimiter).await?;
+    let raw_headers = reader
+        .headers()
+        .context("CSV file is missing headers")?
+        .clone();
+
+    let headers: Vec<(String, Option<TantivyFieldType>)> =
+        raw_headers.iter().map(parse_header_with_hint).collect();
+
+    // Find the first header containing "id" (case-insensitive substring)
+    let id_idx = headers
+        .iter()
+        .position(|(h, _)| h.to_lowercase().contains("id"))
+        .ok_or_else(|| anyhow!("CSV must have an id column (first header containing 'id')"))?;
+    let id_header = headers
+        .get(id_idx)
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| "id".to_string());
+
+    let mut batch: Vec<JsonValue> = Vec::with_capacity(batch_size);
+    let mut total_sent = 0usize;
+
+    for record in reader.records() {
+        let record = record.context("Failed to read CSV record")?;
+        let mut doc_obj: JsonMap<String, JsonValue> = JsonMap::new();
+
+        let id_value_raw = record.get(id_idx).unwrap_or_default();
+        if id_value_raw.trim().is_empty() {
+            // Skip rows without an id; CameoDB requires an id field
+            continue;
+        }
+        let id_value = id_value_raw.trim().to_string();
+
+        for (idx, value) in record.iter().enumerate() {
+            if let Some((header, _)) = headers.get(idx) {
+                doc_obj.insert(header.clone(), parse_csv_cell(value));
+            }
+        }
+
+        // Ensure the canonical id field is present in the document body as well
+        doc_obj.insert("id".to_string(), JsonValue::String(id_value.clone()));
+
+        let routing_key = doc_obj
+            .get(&id_header)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| id_value.clone());
+
+        let payload = json!({
+            "id": id_value,
+            "routing_key": routing_key,
+            "doc": doc_obj,
+        });
+
+        batch.push(payload);
+
+        if batch.len() >= batch_size {
+            client.bulk_index(index, &batch).await?;
+            total_sent += batch.len();
+            batch.clear();
+        }
+    }
+
+    if !batch.is_empty() {
+        client.bulk_index(index, &batch).await?;
+        total_sent += batch.len();
+    }
+
+    println!(
+        "Loaded {} documents into index '{}' (batch size {})",
+        total_sent, index, batch_size
+    );
+
+    Ok(())
+}
+
+fn parse_csv_cell(raw: &str) -> JsonValue {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return JsonValue::Null;
+    }
+
+    // Booleans
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" => return JsonValue::Bool(true),
+        "false" => return JsonValue::Bool(false),
+        _ => {}
+    }
+
+    // Integers (prefer unsigned for non-negative)
+    if !trimmed.contains('.') && !trimmed.contains(['e', 'E']) {
+        if trimmed.starts_with('-') {
+            if let Ok(v) = trimmed.parse::<i64>() {
+                return JsonValue::Number(v.into());
+            }
+        } else if let Ok(v) = trimmed.parse::<u64>() {
+            return JsonValue::Number(serde_json::Number::from(v));
+        } else if let Ok(v) = trimmed.parse::<i64>() {
+            return JsonValue::Number(v.into());
+        }
+    }
+
+    // Floating point
+    if let Ok(v) = trimmed.parse::<f64>()
+        && let Some(num) = serde_json::Number::from_f64(v)
+    {
+        return JsonValue::Number(num);
+    }
+
+    // Fallback to string (dates/IPs will be inferred from string content)
+    JsonValue::String(trimmed.to_string())
+}
+
+async fn open_csv_source(client: &CameoClient, source: &str) -> Result<Box<dyn Read + Send>> {
+    let is_http = source.starts_with("http://") || source.starts_with("https://");
+
+    if is_http {
+        let url = Url::parse(source).context("Invalid URL for CSV source")?;
+        let bytes = client
+            .http()
+            .get(url)
+            .send()
+            .await
+            .context("Failed to fetch remote CSV")?
+            .bytes()
+            .await
+            .context("Failed to read remote CSV body")?;
+        Ok(Box::new(Cursor::new(bytes.to_vec())) as Box<dyn Read + Send>)
+    } else {
+        let path = Path::new(source);
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("Failed to open CSV file: {}", path.display()))?;
+        Ok(Box::new(file) as Box<dyn Read + Send>)
+    }
+}
+
+async fn open_csv_reader(
+    client: &CameoClient,
+    source: &str,
+    delimiter: Delimiter,
+) -> Result<csv::Reader<Box<dyn Read + Send>>> {
+    let mut builder = ReaderBuilder::new();
+    match delimiter {
+        Delimiter::Detect => {
+            let bytes = fetch_bytes_source(client, source).await?;
+            // Detect delimiter on first line
+            let first_line_end = bytes
+                .iter()
+                .position(|b| *b == b'\n')
+                .unwrap_or(bytes.len());
+            let first_line = &bytes[..first_line_end];
+            let tab_count = first_line.iter().filter(|b| **b == b'\t').count();
+            let comma_count = first_line.iter().filter(|b| **b == b',').count();
+            let semi_count = first_line.iter().filter(|b| **b == b';').count();
+
+            let detected = if semi_count >= tab_count && semi_count >= comma_count {
+                b';'
+            } else if tab_count >= comma_count {
+                b'\t'
+            } else {
+                b','
+            };
+            builder.delimiter(detected);
+            return Ok(builder.from_reader(Box::new(Cursor::new(bytes)) as Box<dyn Read + Send>));
+        }
+        Delimiter::Comma => {
+            builder.delimiter(b',');
+        }
+        Delimiter::Tab => {
+            builder.delimiter(b'\t');
+        }
+        Delimiter::Semicolon => {
+            builder.delimiter(b';');
+        }
+    }
+    // Re-open source since detect may have consumed none; builder will read fresh
+    let reader_source = open_csv_source(client, source).await?;
+    Ok(builder.from_reader(reader_source))
+}
+
+async fn fetch_bytes_source(client: &CameoClient, source: &str) -> Result<Vec<u8>> {
+    let is_http = source.starts_with("http://") || source.starts_with("https://");
+
+    if is_http {
+        let url = Url::parse(source).context("Invalid URL for schema source")?;
+        let bytes = client
+            .http()
+            .get(url)
+            .send()
+            .await
+            .context("Failed to fetch remote schema")?
+            .bytes()
+            .await
+            .context("Failed to read remote schema body")?;
+        Ok(bytes.to_vec())
+    } else {
+        let path = Path::new(source);
+        fs::read(path).with_context(|| format!("Failed to read schema file: {}", path.display()))
+    }
 }
 
 async fn run_interactive_shell(initial_url: String) -> Result<()> {
@@ -618,7 +1110,7 @@ async fn dispatch_interactive_command(session: &mut InteractiveSession, input: &
     match command {
         "health" => {
             let health = session.client().health().await?;
-            println!("{}", to_string_pretty(&health)?);
+            print_json(&health)?;
         }
         "list" => {
             let resource = parts.next().unwrap_or("indexes");
@@ -674,7 +1166,7 @@ async fn dispatch_interactive_command(session: &mut InteractiveSession, input: &
                 return Err(anyhow!("Usage: search <index> <query> [limit]"));
             }
             let results = session.client().search(index, &query, limit).await?;
-            println!("{}", to_string_pretty(&results)?);
+            print_json(&results)?;
         }
         "connect" | "conn" => {
             let target = parts.collect::<Vec<_>>().join(" ");

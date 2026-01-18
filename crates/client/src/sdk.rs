@@ -86,6 +86,39 @@ impl CameoClient {
             .await
             .context("Failed to parse index config response")
     }
+
+    pub async fn put_index_config(&self, index: &str, config: &JsonValue) -> Result<()> {
+        let url = self
+            .base_url
+            .join(&format!("api/{}/_config", index))
+            .context("Invalid config URL")?;
+        let resp = self.http.put(url).json(config).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to set index config: {} - {}", status, text);
+        }
+        Ok(())
+    }
+
+    pub async fn bulk_index(&self, index: &str, batch: &[JsonValue]) -> Result<()> {
+        let url = self
+            .base_url
+            .join(&format!("api/{}/_bulk", index))
+            .context("Invalid bulk URL")?;
+        let resp = self.http.post(url).json(batch).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Bulk ingest failed: {} - {}", status, text);
+        }
+        Ok(())
+    }
+
+    /// Expose underlying HTTP client for auxiliary requests (e.g., fetching CSV schema samples)
+    pub fn http(&self) -> &Client {
+        &self.http
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

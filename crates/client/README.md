@@ -15,6 +15,7 @@ An interactive command-line client for CameoDB with rich ergonomics, persistent 
 - **Robust Rustyline navigation** (arrow keys, Home/End, Ctrl-R reverse search)
 - **Optional search limit** parsing (e.g., `search books "rust" 25`)
 - **Safe async/blocking isolation** via Tokio + `spawn_blocking`
+- **Colorized JSON output** for all responses (similar to `jq`), with plain fallback
 
 ## 🚀 Getting Started
 
@@ -38,9 +39,17 @@ Flags:
 | `list indexes` | List all indexes with stats + cached field names |
 | `list index <name>` | Show detailed stats and schema for one index |
 | `search <index> <query> [limit]` | Run hybrid search with optional limit |
+| `schema detect <file> [--delimiter ...]` | Detect schema from CSV/TSV (auto or forced delimiter) |
+| `schema load <index> <file> [--delimiter ...]` | Detect schema and apply to an index |
+| `data load <index> <file> [--delimiter ...]` | Ingest CSV/TSV data in batches |
 | `connect <host[:port]>` | Switch target server and refresh cache |
 | `help` | Display built-in command reference |
 | `exit` / `quit` / `\q` | Leave the REPL |
+
+### Data & Schema helpers
+
+- `schema detect <file> [--delimiter detect|comma|tab|semicolon]` – auto-detect or force CSV/TSV delimiter (supports semicolon CSV, tab TSV).
+- `data load <index> <file> [--delimiter ...]` – ingests CSV/TSV with the same delimiter options; skips header row if present.
 
 ## ⌨️ Completion & History
 
@@ -110,6 +119,8 @@ cargo test -p client
 - `crates/client/src/cli.rs` – REPL entry point & interactive session
 - `crates/client/src/sdk.rs` – HTTP client wrapper for CameoDB API
 - `crates/client/Cargo.toml` – dependencies (`rustyline`, `dirs`, `reqwest`, ...)
+- `scripts/examples/ingest_books.py` – book summaries loader (defaults to `scripts/data/booksummaries.tsv`, tab-delimited, skips header row)
+- `scripts/examples/ingest_ted.py` – TED YouTube loader (defaults to `scripts/data/youtube_ted_2024.csv`, semicolon-delimited, skips header row)
 
 ---
 The client is ready for cluster operators and developers to explore indexes, run searches, and inspect schemas with ergonomic completions and safe async runtime integration.
