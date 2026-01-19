@@ -374,8 +374,19 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
+    // Wait for shutdown signal (Ctrl+C or systemctl stop)
+    let mut sigterm_recv =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|e| anyhow::anyhow!("Failed to setup SIGTERM handler: {}", e))?;
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Received SIGINT (Ctrl+C), shutting down...");
+        }
+        _ = sigterm_recv.recv() => {
+            tracing::info!("Received SIGTERM (systemctl stop), shutting down...");
+        }
+    }
     println!("Shutting down...");
 
     // Shutdown all shards gracefully to commit pending writes
