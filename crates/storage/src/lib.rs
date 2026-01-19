@@ -674,6 +674,21 @@ impl HybridStore {
         self.current_seq.clear();
         self.index_size_cache.lock().unwrap().clear();
 
+        // Force a final redb fsync/flush using an empty Immediate-durability transaction
+        // This reduces WAL replay on next startup and ensures the current root is persisted.
+        match self.kv.begin_write() {
+            Ok(mut txn) => {
+                if let Err(e) = txn.set_durability(Durability::Immediate) {
+                    tracing::warn!(error = %e, "Failed to set durability on shutdown flush");
+                } else if let Err(e) = txn.commit() {
+                    tracing::warn!(error = %e, "Failed to commit shutdown flush transaction");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to open shutdown flush transaction");
+            }
+        }
+
         tracing::info!("HybridStore: Graceful shutdown completed");
         Ok(())
     }
