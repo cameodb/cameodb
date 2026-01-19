@@ -44,7 +44,18 @@ impl IntoResponse for AppError {
             (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
         };
 
-        error!("API Error: {} -> {}: {}", status, message, error_msg);
+        // Log at appropriate level: DEBUG for 404 (expected), WARN for client errors, ERROR for server errors
+        match status {
+            StatusCode::NOT_FOUND => {
+                tracing::debug!("API: {} -> {}: {}", status, message, error_msg);
+            }
+            s if s.is_client_error() => {
+                warn!("API Client Error: {} -> {}: {}", status, message, error_msg);
+            }
+            _ => {
+                error!("API Server Error: {} -> {}: {}", status, message, error_msg);
+            }
+        }
 
         let body = serde_json::json!({
             "error": message,
@@ -429,10 +440,7 @@ async fn create_config_handler(
     State(state): State<AppState>,
     Json(schema): Json<IndexSchema>,
 ) -> Result<Json<JsonValue>, AppError> {
-    info!(
-        "Create config request - index: {}, shard_count: {}",
-        index, schema.shard_count
-    );
+    info!("Create config request - index: {}", index);
 
     let client_op = ClientOp::CreateConfig { index, schema };
 

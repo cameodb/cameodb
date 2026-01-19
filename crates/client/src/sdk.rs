@@ -178,7 +178,6 @@ pub struct IndexInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IndexConfigResponse {
-    pub shard_count: u32,
     #[serde(default)]
     pub fields: JsonValue,
 }

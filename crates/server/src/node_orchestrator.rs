@@ -2823,10 +2823,6 @@ impl NodeOrchestrator {
         map.insert(index.to_string(), schema.clone());
     }
 
-    fn default_shard_count(&self) -> u32 {
-        std::cmp::max(1, self.shards.len() as u32)
-    }
-
     /// Produce sorted field names with "id" first (if present), others alphabetical.
     fn sorted_field_names(schema: &IndexSchema) -> Vec<String> {
         let mut names: Vec<String> = schema.fields.keys().cloned().collect();
@@ -2857,13 +2853,9 @@ impl NodeOrchestrator {
         map
     }
 
-    fn schema_response(fields: JsonMap<String, JsonValue>, shard_count: u32) -> JsonValue {
+    fn schema_response(fields: JsonMap<String, JsonValue>) -> JsonValue {
         let mut map = JsonMap::new();
         map.insert("fields".to_string(), JsonValue::Object(fields));
-        map.insert(
-            "shard_count".to_string(),
-            JsonValue::Number(serde_json::Number::from(shard_count)),
-        );
         JsonValue::Object(map)
     }
 
@@ -3851,13 +3843,32 @@ impl NodeOrchestrator {
         let index_name = index.to_string();
         let schema_clone = schema.clone();
 
-        // Persist to all stores concurrently
+        // Persist schema AND pre-create Tantivy index to all stores concurrently
+        // This prevents race conditions where bulk writes start before the index exists
+        tracing::info!(
+            index = %index,
+            num_shards = stores.len(),
+            num_fields = schema.fields.len(),
+            "Creating schema and pre-creating Tantivy indexes on all shards"
+        );
+
         let handles: Vec<_> = stores
             .into_iter()
             .map(|store| {
                 let idx = index_name.clone();
                 let sch = schema_clone.clone();
-                tokio::task::spawn_blocking(move || store.store_schema_and_cache(&idx, &sch))
+                tokio::task::spawn_blocking(move || {
+                    // First store the schema
+                    store.store_schema_and_cache(&idx, &sch)?;
+                    tracing::debug!(index = %idx, "Schema stored and cached");
+
+                    // Then pre-create the Tantivy index with the full schema
+                    // This ensures the index exists before any writes occur
+                    drop(store.get_or_create_index(&idx)?);
+                    tracing::debug!(index = %idx, "Tantivy index created");
+
+                    Ok::<_, storage::StoreError>(())
+                })
             })
             .collect();
 
@@ -3868,13 +3879,16 @@ impl NodeOrchestrator {
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
         }
 
-        let shard_count = schema.shard_count;
         self.put_cached_schema(index, &schema).await;
+
+        tracing::info!(
+            index = %index,
+            "Schema creation completed successfully"
+        );
 
         Ok(serde_json::json!({
             "acknowledged": true,
             "index": index,
-            "shard_count": shard_count,
             "field_names": Self::sorted_field_names(&schema)
         }))
     }
@@ -3883,27 +3897,67 @@ impl NodeOrchestrator {
         // IMPORTANT: Always get fresh schema from storage layer
         // The storage layer maintains the authoritative schema derived from Tantivy
         // This prevents orchestrator cache staleness issues
-        for shard in self.shards.values() {
+
+        // If no shards are initialized yet, return a helpful error
+        if self.shards.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "No shards initialized on this node. Schema for index '{}' may exist but cannot be retrieved until shards are created.",
+                    index
+                ),
+            )));
+        }
+
+        tracing::debug!(
+            index = %index,
+            num_shards = self.shards.len(),
+            "Attempting to retrieve schema from shards"
+        );
+
+        for (shard_id, shard) in &self.shards {
             if let Some(store) = &shard.store {
                 let sc = Arc::clone(store);
                 let idx = index.to_string();
+                let sid = shard_id.clone();
 
                 // Use spawn_blocking to safely call blocking storage function
-                let schema = tokio::task::spawn_blocking(move || sc.get_schema_cached(&idx))
-                    .await
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+                let schema = tokio::task::spawn_blocking(move || {
+                    let result = sc.get_schema_cached(&idx);
+                    tracing::debug!(
+                        index = %idx,
+                        shard_id = %sid,
+                        found = result.as_ref().ok().and_then(|s| s.as_ref()).is_some(),
+                        "Schema retrieval attempt"
+                    );
+                    result
+                })
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
 
                 if let Some(s) = schema {
+                    tracing::debug!(
+                        index = %index,
+                        shard_id = %shard_id,
+                        num_fields = s.fields.len(),
+                        "Schema found in shard"
+                    );
                     let fields = Self::sorted_fields_map(&s);
-                    let shard_count = self.default_shard_count();
-                    return Ok(Self::schema_response(fields, shard_count));
+                    return Ok(Self::schema_response(fields));
                 }
             }
         }
+
+        tracing::warn!(
+            index = %index,
+            num_shards = self.shards.len(),
+            "Schema not found in any shard"
+        );
+
         Err(OrchestratorError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "No shards",
+            format!("Schema for index '{}' not found", index),
         )))
     }
 
@@ -4069,17 +4123,20 @@ impl NodeOrchestrator {
         {
             let sc = Arc::clone(store);
             let idx = index.to_string();
-            let schema = tokio::task::spawn_blocking(move || sc.get_schema(&idx))
+            // IMPORTANT: Use get_schema_cached() instead of get_schema() to match
+            // what the storage layer uses during writes. This ensures validation
+            // uses the same Tantivy-derived schema as actual write operations.
+            let schema = tokio::task::spawn_blocking(move || sc.get_schema_cached(&idx))
                 .await
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-            if let Some(schema) = schema {
+            if let Some(schema_arc) = schema {
+                let schema = (*schema_arc).clone();
                 self.put_cached_schema(index, &schema).await;
                 return Ok(schema);
             }
         }
         Ok(IndexSchema {
-            shard_count: self.default_shard_count(),
             fields: HashMap::new(),
         })
     }

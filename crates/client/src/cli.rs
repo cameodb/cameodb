@@ -367,6 +367,95 @@ impl IndexCompleter {
             .collect()
     }
 
+    fn expand_dir_part(&self, dir_part: &str) -> PathBuf {
+        if let Some(stripped) = dir_part.strip_prefix("~/")
+            && let Some(home) = dirs::home_dir()
+        {
+            return home.join(stripped);
+        }
+
+        if dir_part.is_empty() {
+            PathBuf::from(".")
+        } else {
+            PathBuf::from(dir_part)
+        }
+    }
+
+    fn file_path_suggestions(&self, prefix: &str) -> Vec<Pair> {
+        // Split prefix into directory part (with trailing slash) and file prefix
+        let (dir_part, file_prefix) = if prefix.ends_with('/') {
+            (prefix.to_string(), "".to_string())
+        } else if let Some(pos) = prefix.rfind('/') {
+            (prefix[..=pos].to_string(), prefix[pos + 1..].to_string())
+        } else {
+            ("".to_string(), prefix.to_string())
+        };
+
+        let fs_dir = self.expand_dir_part(&dir_part);
+        let mut pairs = Vec::new();
+
+        if let Ok(entries) = fs::read_dir(&fs_dir) {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let name = file_name.to_string_lossy();
+                if !name.starts_with(&file_prefix) {
+                    continue;
+                }
+
+                let mut replacement = format!("{}{}", dir_part, name);
+                let mut display = name.to_string();
+                if let Ok(md) = entry.metadata()
+                    && md.is_dir()
+                {
+                    replacement.push('/');
+                    display.push('/');
+                }
+
+                pairs.push(Pair {
+                    display,
+                    replacement,
+                });
+            }
+        }
+
+        pairs
+    }
+
+    fn delimiter_flag_suggestions(&self, prefix: &str) -> Vec<Pair> {
+        let options = ["detect", "comma", "tab", "semicolon"];
+        options
+            .iter()
+            .filter(|opt| format!("--delimiter {}", opt).starts_with(prefix))
+            .map(|opt| Pair {
+                display: format!("--delimiter {}", opt),
+                replacement: format!("--delimiter {}", opt),
+            })
+            .collect()
+    }
+
+    fn batch_size_flag_suggestions(&self, prefix: &str) -> Vec<Pair> {
+        let flag = "--batch-size ";
+        if flag.starts_with(prefix) || prefix.starts_with(flag) {
+            vec![Pair {
+                display: "--batch-size <n>".to_string(),
+                replacement: flag.to_string(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn delete_flag_suggestions(&self, prefix: &str) -> Vec<Pair> {
+        if "--delete-schema".starts_with(prefix) {
+            vec![Pair {
+                display: "--delete-schema".to_string(),
+                replacement: "--delete-schema".to_string(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn list_subcommand_suggestions(&self, prefix: &str) -> Vec<Pair> {
         let subcommands = vec!["indexes", "index"];
         subcommands
@@ -437,6 +526,19 @@ impl IndexCompleter {
                 let start = current_start(tokens, current);
                 Some((start, suggestions))
             }
+            "schema"
+                if (tokens.len() == 3 && tokens[1] == "detect")
+                    || (tokens.len() == 4 && tokens[1] == "load") =>
+            {
+                let suggestions = self.file_path_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
+            "schema" if current.starts_with('-') => {
+                let suggestions = self.delimiter_flag_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
             // Complete index name for 'search'
             "search" if tokens.len() == 2 => {
                 let suggestions = self.index_suggestions(current);
@@ -461,9 +563,29 @@ impl IndexCompleter {
                 let start = current_start(tokens, current);
                 Some((start, suggestions))
             }
+            "data" if tokens.len() == 4 && tokens[1] == "load" => {
+                let suggestions = self.file_path_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
+            "data" if current.starts_with("--delimiter") => {
+                let suggestions = self.delimiter_flag_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
+            "data" if current.starts_with("--batch-size") || current == "--batch-size" => {
+                let suggestions = self.batch_size_flag_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
             // Complete index name for delete
             "delete" if tokens.len() == 2 => {
                 let suggestions = self.index_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
+            "delete" if current.starts_with('-') => {
+                let suggestions = self.delete_flag_suggestions(current);
                 let start = current_start(tokens, current);
                 Some((start, suggestions))
             }
@@ -773,6 +895,59 @@ fn confirm_delete(index: &str) -> Result<bool> {
     Ok(answer == "yes")
 }
 
+fn parse_delimiter_arg<'a>(args: &'a [&'a str]) -> Result<(Delimiter, Vec<&'a str>)> {
+    let mut delimiter = Delimiter::Detect;
+    let mut remaining = Vec::new();
+    let mut iter = args.iter().peekable();
+
+    while let Some(&arg) = iter.next() {
+        if arg == "--delimiter" {
+            let value = iter
+                .next()
+                .copied()
+                .ok_or_else(|| anyhow!("Missing value for --delimiter"))?;
+            delimiter = match value {
+                "detect" => Delimiter::Detect,
+                "comma" => Delimiter::Comma,
+                "tab" => Delimiter::Tab,
+                "semicolon" => Delimiter::Semicolon,
+                other => {
+                    return Err(anyhow!(
+                        "Invalid delimiter '{}'. Use detect|comma|tab|semicolon.",
+                        other
+                    ));
+                }
+            };
+        } else {
+            remaining.push(arg);
+        }
+    }
+
+    Ok((delimiter, remaining))
+}
+
+fn parse_batch_size_arg<'a>(args: &'a [&'a str], default: usize) -> Result<(usize, Vec<&'a str>)> {
+    let mut batch_size = default;
+    let mut remaining = Vec::new();
+    let mut iter = args.iter().peekable();
+
+    while let Some(&arg) = iter.next() {
+        if arg == "--batch-size" {
+            let value = iter
+                .next()
+                .copied()
+                .ok_or_else(|| anyhow!("Missing value for --batch-size"))?;
+            batch_size = value
+                .parse::<usize>()
+                .map_err(|_| anyhow!("Invalid batch size '{}': expected number", value))?;
+        } else {
+            remaining.push(arg);
+        }
+    }
+
+    Ok((batch_size, remaining))
+}
+
 async fn detect_schema_from_csv(
     client: &CameoClient,
     source: &str,
@@ -787,11 +962,16 @@ async fn detect_schema_from_csv(
     let headers: Vec<(String, Option<TantivyFieldType>)> =
         raw_headers.iter().map(parse_header_with_hint).collect();
 
-    // Require an id column and track its header name
+    // Detect ID field with priority: exact match 'id' > substring match > first column
     let id_idx = headers
         .iter()
-        .position(|(h, _)| h.to_lowercase().contains("id"))
-        .ok_or_else(|| anyhow!("CSV must have an id column (first header containing 'id')"))?;
+        .position(|(h, _)| h.to_lowercase() == "id")
+        .or_else(|| {
+            headers
+                .iter()
+                .position(|(h, _)| h.to_lowercase().contains("id"))
+        })
+        .unwrap_or(0); // Use first column if no 'id' found
 
     let mut schema = IndexSchema::default();
     let mut sampled = 0usize;
@@ -800,18 +980,19 @@ async fn detect_schema_from_csv(
         let record = record.context("Failed to read CSV record")?;
         let mut obj: JsonMap<String, JsonValue> = JsonMap::new();
 
-        // Extract id field and inject canonical "id"
-        if let Some(raw_id) = record.get(id_idx) {
-            let id_val = raw_id.trim();
-            if !id_val.is_empty() {
-                obj.insert("id".to_string(), JsonValue::String(id_val.to_string()));
-            }
-        }
-
+        // Process all fields in CSV column order
         for (idx, value) in record.iter().enumerate() {
             if let Some((header, _)) = headers.get(idx) {
                 let parsed = parse_csv_cell(value);
                 obj.insert(header.clone(), parsed);
+            }
+        }
+
+        // Inject canonical "id" field from the detected source field
+        if let Some(raw_id) = record.get(id_idx) {
+            let id_val = raw_id.trim();
+            if !id_val.is_empty() {
+                obj.insert("id".to_string(), JsonValue::String(id_val.to_string()));
             }
         }
 
@@ -823,27 +1004,65 @@ async fn detect_schema_from_csv(
         }
     }
 
+    // CRITICAL: Mark all fields as indexed when loading schema from file
+    // This is different from dynamic evolution during writes, where fields start as non-indexed
+    // When explicitly creating a schema from a CSV, all fields should be indexed by default
+    for (_, field_def) in schema.fields.iter_mut() {
+        field_def.indexed = true;
+        field_def.stored = true;
+    }
+
     // Apply type hints where provided
     for (name, hint) in &headers {
         if let Some(t) = hint.clone() {
-            let field_def = FieldDef::new(name.clone(), t);
+            let mut field_def = FieldDef::new(name.clone(), t);
+            field_def.indexed = true;
+            field_def.stored = true;
             schema.fields.insert(name.clone(), field_def);
         }
     }
 
+    // Ensure 'id' field is explicitly defined in schema with proper settings
+    if !schema.fields.contains_key("id") {
+        let id_field = FieldDef {
+            name: "id".to_string(),
+            field_type: TantivyFieldType::Text,
+            indexed: true,
+            stored: true,
+            fast: false,
+            tokenizer: Some("raw".to_string()),
+            index_record_option: Some("Basic".to_string()),
+        };
+        schema.fields.insert("id".to_string(), id_field);
+    }
+
     let mut schema_json = serde_json::to_value(schema).context("Failed to serialize schema")?;
 
-    // Reorder fields map to place id first
+    // Reorder fields map: id first, then preserve CSV column order
     if let JsonValue::Object(ref mut root) = schema_json
         && let Some(JsonValue::Object(mut fields)) = root.remove("fields")
     {
         let mut ordered = JsonMap::new();
+
+        // Always place 'id' first
         if let Some(id_val) = fields.remove("id") {
             ordered.insert("id".to_string(), id_val);
         }
+
+        // Then add fields in CSV column order (preserving source structure)
+        for (header_name, _) in &headers {
+            if header_name != "id"
+                && let Some(field_val) = fields.remove(header_name)
+            {
+                ordered.insert(header_name.clone(), field_val);
+            }
+        }
+
+        // Add any remaining fields that weren't in headers (shouldn't happen, but safe)
         for (k, v) in fields {
             ordered.insert(k, v);
         }
+
         root.insert("fields".to_string(), JsonValue::Object(ordered));
     }
 
@@ -913,11 +1132,17 @@ async fn load_data_from_csv(
     let headers: Vec<(String, Option<TantivyFieldType>)> =
         raw_headers.iter().map(parse_header_with_hint).collect();
 
-    // Find the first header containing "id" (case-insensitive substring)
+    // Detect ID field with priority: exact match 'id' > substring match > first column
     let id_idx = headers
         .iter()
-        .position(|(h, _)| h.to_lowercase().contains("id"))
-        .ok_or_else(|| anyhow!("CSV must have an id column (first header containing 'id')"))?;
+        .position(|(h, _)| h.to_lowercase() == "id")
+        .or_else(|| {
+            headers
+                .iter()
+                .position(|(h, _)| h.to_lowercase().contains("id"))
+        })
+        .unwrap_or(0); // Use first column if no 'id' found
+
     let id_header = headers
         .get(id_idx)
         .map(|(h, _)| h.to_string())
@@ -1249,6 +1474,82 @@ async fn dispatch_interactive_command(session: &mut InteractiveSession, input: &
             }
             let results = session.client().search(index, &query, limit).await?;
             print_json(&results)?;
+        }
+        "schema" => {
+            let sub = parts
+                .next()
+                .ok_or_else(|| anyhow!("Usage: schema <detect|load> ..."))?;
+
+            match sub {
+                "detect" => {
+                    let remaining: Vec<&str> = parts.collect();
+                    let (delimiter, positional) = parse_delimiter_arg(&remaining)?;
+                    let file = positional.first().copied().ok_or_else(|| {
+                        anyhow!("Usage: schema detect <file> [--delimiter <delim>]")
+                    })?;
+
+                    let schema_json =
+                        detect_schema_from_csv(session.client(), file, delimiter).await?;
+                    print_json(&schema_json)?;
+                }
+                "load" => {
+                    let remaining: Vec<&str> = parts.collect();
+                    let (delimiter, positional) = parse_delimiter_arg(&remaining)?;
+                    let index = positional.first().copied().ok_or_else(|| {
+                        anyhow!("Usage: schema load <index> <file> [--delimiter <delim>]")
+                    })?;
+                    let file = positional.get(1).copied().ok_or_else(|| {
+                        anyhow!("Usage: schema load <index> <file> [--delimiter <delim>]")
+                    })?;
+
+                    let schema_json =
+                        load_schema_from_source(session.client(), file, delimiter).await?;
+                    session
+                        .client()
+                        .put_index_config(index, &schema_json)
+                        .await?;
+                    println!("Schema applied to index '{}'", index);
+                    session.refresh_index_cache().await;
+                }
+                other => {
+                    return Err(anyhow!(
+                        "Unknown schema operation '{}'. Use 'schema detect' or 'schema load'.",
+                        other
+                    ));
+                }
+            }
+        }
+        "data" => {
+            let sub = parts.next().ok_or_else(|| {
+                anyhow!("Usage: data load <index> <file> [--delimiter <delim>] [--batch-size <n>]")
+            })?;
+
+            match sub {
+                "load" => {
+                    let remaining: Vec<&str> = parts.collect();
+                    let (delimiter, positional_after_delim) = parse_delimiter_arg(&remaining)?;
+                    let (batch_size, positional) =
+                        parse_batch_size_arg(&positional_after_delim, DEFAULT_BATCH_SIZE)?;
+
+                    let index = positional
+                        .first()
+                        .copied()
+                        .ok_or_else(|| anyhow!("Usage: data load <index> <file> [--delimiter <delim>] [--batch-size <n>]"))?;
+                    let file = positional
+                        .get(1)
+                        .copied()
+                        .ok_or_else(|| anyhow!("Usage: data load <index> <file> [--delimiter <delim>] [--batch-size <n>]"))?;
+
+                    load_data_from_csv(session.client(), index, file, delimiter, batch_size)
+                        .await?;
+                }
+                other => {
+                    return Err(anyhow!(
+                        "Unknown data operation '{}'. Use 'data load'.",
+                        other
+                    ));
+                }
+            }
         }
         "delete" => {
             let index = parts

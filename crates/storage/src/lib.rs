@@ -245,9 +245,15 @@ impl FieldDef {
             }
             JsonValue::Bool(_) => TantivyFieldType::Boolean,
             JsonValue::String(s) => {
-                // Check for ISO 8601 date
-                if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+                // 1) RFC3339 (full timestamp with offset)
+                if chrono::DateTime::parse_from_rfc3339(s).is_ok()
+                    // 2) Naive datetime with common formats
+                    || Self::is_naive_datetime(s)
+                    // 3) Date-only formats
+                    || Self::is_naive_date(s)
+                {
                     TantivyFieldType::Date
+                // 4) IP detection
                 } else if s.parse::<std::net::IpAddr>().is_ok() {
                     TantivyFieldType::Ip
                 } else {
@@ -259,12 +265,43 @@ impl FieldDef {
             JsonValue::Null => TantivyFieldType::Text,
         }
     }
+
+    /// Check common naive datetime formats (no timezone) such as
+    /// - 2024-05-01 12:30:00
+    /// - 2024-05-01 12:30
+    /// - 2024-05-01T12:30:00
+    /// - 2024-05-01T12:30:00.123
+    fn is_naive_datetime(s: &str) -> bool {
+        const DATETIME_FORMATS: &[&str] = &[
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M",
+            "%Y-%m-%d %H:%M:%S%.f",
+            "%Y-%m-%dT%H:%M:%S%.f",
+        ];
+
+        DATETIME_FORMATS
+            .iter()
+            .any(|fmt| chrono::NaiveDateTime::parse_from_str(s, fmt).is_ok())
+    }
+
+    /// Check common date-only formats such as
+    /// - 2024-05-01
+    /// - 2024/05/01
+    /// - 20240501
+    fn is_naive_date(s: &str) -> bool {
+        const DATE_FORMATS: &[&str] = &["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"];
+
+        DATE_FORMATS
+            .iter()
+            .any(|fmt| chrono::NaiveDate::parse_from_str(s, fmt).is_ok())
+    }
 }
 
 /// Index schema definition for validation and evolution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IndexSchema {
-    pub shard_count: u32,
     pub fields: HashMap<String, FieldDef>,
 }
 
@@ -381,15 +418,6 @@ impl IndexSchema {
     }
 }
 
-impl Default for IndexSchema {
-    fn default() -> Self {
-        Self {
-            shard_count: 256,
-            fields: HashMap::new(),
-        }
-    }
-}
-
 /// Statistics for an index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexStats {
@@ -492,7 +520,7 @@ struct StoredDocOwned {
 
 /// Internal schema field mappings for Tantivy.
 #[derive(Debug, Clone)]
-struct SchemaFields {
+pub struct SchemaFields {
     /// Tantivy field for the document identifier
     id: Field,
     /// Map of schema field name -> Tantivy field (only indexed fields are present)
@@ -774,7 +802,7 @@ impl HybridStore {
     /// This reads back the actual persisted schema from Tantivy and converts it
     /// to our IndexSchema format, ensuring we're in sync with what Tantivy has.
     /// NOTE: Excludes the mandatory 'id' field since it's implicit in Tantivy
-    fn derive_index_schema_from_tantivy(tantivy_index: &Index, shard_count: u32) -> IndexSchema {
+    fn derive_index_schema_from_tantivy(tantivy_index: &Index) -> IndexSchema {
         use tantivy::schema::FieldType;
 
         let schema = tantivy_index.schema();
@@ -870,14 +898,12 @@ impl HybridStore {
             );
         }
 
-        IndexSchema {
-            shard_count,
-            fields,
-        }
+        IndexSchema { fields }
     }
 
     /// Helper method: get_or_create_index
-    fn get_or_create_index(
+    /// Made public to allow pre-creating indexes when schema is created
+    pub fn get_or_create_index(
         &self,
         index: &str,
     ) -> Result<(Arc<Mutex<IndexWriter>>, SchemaFields), StoreError> {
@@ -918,9 +944,8 @@ impl HybridStore {
         // IMPORTANT: Only sync schema when we actually created a new index
         // This ensures we don't overwrite persisted schema when index was deleted
         if sync_schema {
-            // Derive schema from Tantivy (this is the source of truth)
-            let mut tantivy_schema =
-                Self::derive_index_schema_from_tantivy(&tantivy_index, index_schema.shard_count);
+            // Derive schema from Tantivy (indexed fields only, excludes 'id')
+            let mut tantivy_schema = Self::derive_index_schema_from_tantivy(&tantivy_index);
 
             // CRITICAL: Always add the mandatory 'id' field to our schema cache
             // The 'id' field is implicit in Tantivy but required for our validation
@@ -937,20 +962,28 @@ impl HybridStore {
                 },
             );
 
-            // IMPORTANT: Cache should ALWAYS reflect Tantivy schema + mandatory id field
-            // Our stored schema is just metadata for evolution tracking
+            // Merge with stored schema to preserve non-indexed fields
+            // The stored schema (index_schema) contains the full field definitions
+            // including fields that may not be indexed but are part of the schema
+            for (name, field_def) in &index_schema.fields {
+                tantivy_schema
+                    .fields
+                    .entry(name.clone())
+                    .or_insert_with(|| field_def.clone());
+            }
+
+            // IMPORTANT: Cache should reflect merged schema (Tantivy + stored metadata)
             self.schema_cache
                 .insert(index.to_string(), Arc::new(tantivy_schema.clone()));
 
-            // Persist our stored schema (metadata) to redb for evolution tracking
-            // This is NOT used for cache - only for reference and evolution
-            self.store_schema(index, &index_schema)?;
+            // Persist the merged schema to redb for future reference
+            self.store_schema(index, &tantivy_schema)?;
 
             // CRITICAL: Clear reader cache to ensure search sees latest commits
             // This prevents searches from using stale readers that don't see newly written documents
             self.readers.remove(index);
 
-            tracing::debug!(index = %index, "Schema synced: Tantivy schema + id field cached, reader cache cleared");
+            tracing::debug!(index = %index, "Schema synced: Tantivy schema merged with stored metadata, cached and persisted");
         }
 
         // Create writer with dynamic memory budget based on index size
@@ -1404,6 +1437,12 @@ impl HybridStore {
         self.fields_cache.remove(index);
         self.budget_cache.remove(index);
 
+        // Invalidate size cache entries for this index
+        {
+            let mut size_cache = self.index_size_cache.lock().unwrap();
+            size_cache.retain(|key, _| !key.contains(&format!(":{}", index)));
+        }
+
         // Delete redb tables completely using delete_table() for efficiency
         let mut write_txn = self.kv.begin_write()?;
         {
@@ -1578,23 +1617,47 @@ impl HybridStore {
         // Slow path: load from Tantivy (source of truth), not from stored schema
         // Get the index path and open the Tantivy index directly
         let index_path = self.config.shard_path.join("indices").join(index);
+
+        // Always load stored schema first (may contain non-indexed fields)
+        let stored_schema = self.get_schema(index)?;
+
         if index_path.exists() {
             let tantivy_index = Index::open_in_dir(&index_path)?;
 
-            // Derive schema from Tantivy (this is the source of truth)
-            let tantivy_schema = Self::derive_index_schema_from_tantivy(&tantivy_index, 4);
+            // Derive schema from Tantivy (indexed fields only, excludes 'id')
+            let tantivy_schema = Self::derive_index_schema_from_tantivy(&tantivy_index);
 
-            // Cache the Tantivy schema
+            // If Tantivy has no indexed fields (empty or only 'id'), prefer stored schema
+            if tantivy_schema.fields.is_empty()
+                && let Some(stored) = stored_schema
+            {
+                self.schema_cache
+                    .insert(index.to_string(), Arc::new(stored.clone()));
+                tracing::debug!(index = %index, "Using stored schema (Tantivy has no indexed fields yet)");
+                return Ok(Some(Arc::new(stored)));
+            }
+
+            // Merge stored fields into Tantivy schema to preserve non-indexed fields
+            let mut merged_schema = tantivy_schema;
+            if let Some(mut stored) = stored_schema {
+                for (name, field_def) in stored.fields.drain() {
+                    merged_schema.fields.entry(name).or_insert(field_def);
+                }
+            }
+
+            // Cache the merged schema
             self.schema_cache
-                .insert(index.to_string(), Arc::new(tantivy_schema.clone()));
+                .insert(index.to_string(), Arc::new(merged_schema.clone()));
 
-            tracing::debug!(index = %index, "Loaded and cached schema from Tantivy (source of truth)");
-            Ok(Some(Arc::new(tantivy_schema)))
+            tracing::debug!(index = %index, "Loaded and cached merged schema (Tantivy + stored metadata)");
+            Ok(Some(Arc::new(merged_schema)))
         } else {
             // Fallback: try to load from stored schema (metadata only)
-            if let Some(stored_schema) = self.get_schema(index)? {
+            if let Some(stored) = stored_schema {
+                self.schema_cache
+                    .insert(index.to_string(), Arc::new(stored.clone()));
                 tracing::debug!(index = %index, "Using stored schema as fallback (Tantivy not available)");
-                Ok(Some(Arc::new(stored_schema)))
+                Ok(Some(Arc::new(stored)))
             } else {
                 Ok(None)
             }
@@ -2332,6 +2395,12 @@ impl HybridStore {
             drop(writer);
         }
 
+        // Invalidate size cache for this index to ensure fresh stats on next query
+        if new_documents_count > 0 || !updated_document_ids.is_empty() {
+            let mut size_cache = self.index_size_cache.lock().unwrap();
+            size_cache.retain(|key, _| !key.contains(&format!(":{}", index)));
+        }
+
         tracing::debug!(
             index = %index,
             seq_count = seq_ids.len(),
@@ -2421,13 +2490,18 @@ impl HybridStore {
             let (tantivy_bytes, redb_bytes, document_count) =
                 self.get_index_sizes_cached(index_name, include_data_size, &index_names)?;
 
+            // Check if Tantivy index directory exists (not just if it has size)
+            // This ensures empty indexes (after schema creation) are counted
+            let index_path = self.config.shard_path.join("indices").join(index_name);
+            let tantivy_index_exists = index_path.join("meta.json").exists();
+
             per_index.insert(
                 index_name.clone(),
                 IndexShardStats {
                     document_count,
                     redb_bytes,
                     tantivy_bytes,
-                    tantivy_index_exists: tantivy_bytes > 0,
+                    tantivy_index_exists,
                     tantivy_scan_ms: 0,
                 },
             );
