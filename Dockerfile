@@ -6,19 +6,32 @@
 ARG RUST_VERSION=1.90
 FROM rust:${RUST_VERSION}-slim AS builder
 
-# 1. Install system build dependencies
+ARG USE_ZIG=true
+ARG TARGET_ABI=musl
+
+# 1. Install system build dependencies (Zig optional)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libssl-dev \
     musl-tools \
-    gcc-aarch64-linux-gnu \
     pkg-config \
+    wget \
+    xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. MOUNT SECRET (Transient)
-# This mounts the file from your host to the destination ONLY for this command.
-# It is NOT saved to the image layer.
+# 2. Trust Zscaler (if provided) before any downloads
 RUN --mount=type=secret,id=zscaler,dst=/usr/local/share/ca-certificates/Zscaler.crt \
     update-ca-certificates
+
+# 3. Install Zig (provides complete C toolchain for musl cross-compilation). Skip when TARGET_ABI=gnu.
+ARG ZIG_VERSION=0.13.0
+RUN if [ "$USE_ZIG" = "true" ] && [ "$TARGET_ABI" = "musl" ]; then \
+    wget -q "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-$(uname -m)-${ZIG_VERSION}.tar.xz" -O zig.tar.xz && \
+    tar -xJf zig.tar.xz && \
+    mv zig-linux-$(uname -m)-${ZIG_VERSION} /usr/local/zig && \
+    rm zig.tar.xz && \
+    ln -s /usr/local/zig/zig /usr/local/bin/zig; \
+    fi
 
 # 3. Configure Cargo to use the system store (which now trusts Zscaler in memory)
 RUN mkdir -p /usr/local/cargo && \
@@ -30,12 +43,31 @@ RUN rustup default ${RUST_VERSION}
 ARG TARGETARCH
 WORKDIR /src
 
-# 4. Linker Configuration
+# 4. Configure Cargo toolchain
 RUN mkdir -p .cargo && \
-    echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml && \
-    echo 'linker = "musl-gcc"' >> .cargo/config.toml && \
-    echo '[target.aarch64-unknown-linux-musl]' >> .cargo/config.toml && \
-    echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
+    if [ "$TARGET_ABI" = "musl" ] && [ "$USE_ZIG" = "true" ]; then \
+        echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml && \
+        echo 'linker = "zig"' >> .cargo/config.toml && \
+        echo 'rustflags = ["-C", "link-arg=cc", "-C", "link-arg=-target", "-C", "link-arg=x86_64-linux-musl"]' >> .cargo/config.toml && \
+        echo '' >> .cargo/config.toml && \
+        echo '[target.aarch64-unknown-linux-musl]' >> .cargo/config.toml && \
+        echo 'linker = "zig"' >> .cargo/config.toml && \
+        echo 'rustflags = ["-C", "link-arg=cc", "-C", "link-arg=-target", "-C", "link-arg=aarch64-linux-musl"]' >> .cargo/config.toml; \
+    elif [ "$TARGET_ABI" = "musl" ]; then \
+        echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml && \
+        echo 'linker = "musl-gcc"' >> .cargo/config.toml && \
+        echo '' >> .cargo/config.toml && \
+        echo '[target.aarch64-unknown-linux-musl]' >> .cargo/config.toml && \
+        echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml; \
+    fi
+
+# 5. Set environment variables for OpenSSL vendored build when using Zig
+ENV CC_x86_64_unknown_linux_musl="zig cc -target x86_64-linux-musl" \
+    CC_aarch64_unknown_linux_musl="zig cc -target aarch64-linux-musl" \
+    AR_x86_64_unknown_linux_musl="zig ar" \
+    AR_aarch64_unknown_linux_musl="zig ar" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="zig" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="zig"
 
 # 5. Prepare Data Directory (Permission Fix)
 RUN mkdir -p /build-data/cameodb
@@ -48,16 +80,28 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     set -e; \
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; \
-    export OPENSSL_STATIC=1; \
     export PKG_CONFIG_ALLOW_CROSS=1; \
     TARGET_TRIPLE=""; \
-    case "${TARGETARCH}" in \
-        "amd64") TARGET_TRIPLE="x86_64-unknown-linux-musl";; \
-        "arm64") TARGET_TRIPLE="aarch64-unknown-linux-musl";; \
-        *) echo "Unsupported architecture: ${TARGETARCH}"; exit 1;; \
-    esac; \
-    rustup target add "${TARGET_TRIPLE}"; \
-    cargo build --release --target "${TARGET_TRIPLE}" --bin cameodb; \
+    if [ "${TARGET_ABI}" = "musl" ]; then \
+        export OPENSSL_STATIC=1; \
+        case "${TARGETARCH}" in \
+            "amd64") TARGET_TRIPLE="x86_64-unknown-linux-musl";; \
+            "arm64") TARGET_TRIPLE="aarch64-unknown-linux-musl";; \
+            *) echo "Unsupported architecture: ${TARGETARCH}"; exit 1;; \
+        esac; \
+        rustup target add "${TARGET_TRIPLE}"; \
+        cargo build --release --target "${TARGET_TRIPLE}" --bin cameodb \
+            --no-default-features \
+            --features client/native-tls-vendored; \
+    else \
+        case "${TARGETARCH}" in \
+            "amd64") TARGET_TRIPLE="x86_64-unknown-linux-gnu";; \
+            "arm64") TARGET_TRIPLE="aarch64-unknown-linux-gnu";; \
+            *) echo "Unsupported architecture: ${TARGETARCH}"; exit 1;; \
+        esac; \
+        rustup target add "${TARGET_TRIPLE}"; \
+        cargo build --release --target "${TARGET_TRIPLE}" --bin cameodb; \
+    fi; \
     cp "/src/target/${TARGET_TRIPLE}/release/cameodb" /src/cameodb;
 
 ################################################################################

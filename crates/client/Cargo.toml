@@ -4,6 +4,12 @@ version = "0.2.1"
 edition = "2024"
 license = "MIT"
 
+[features]
+default = ["native-tls"]
+native-tls = ["reqwest/native-tls"]
+native-tls-vendored = ["reqwest/native-tls-vendored"]
+rustls-tls = ["reqwest/rustls-tls"]
+
 [dependencies]
 anyhow.workspace = true
 reqwest.workspace = true
