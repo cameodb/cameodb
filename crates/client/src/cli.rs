@@ -15,7 +15,7 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Cursor, Read, Write, stdin, stdout};
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use storage::{FieldDef, IndexSchema, TantivyFieldType};
@@ -882,19 +882,6 @@ pub async fn run_cli() -> Result<()> {
     Ok(())
 }
 
-fn confirm_delete(index: &str) -> Result<bool> {
-    print!("Delete index \"{}\"? [yes/NO]: ", index);
-    stdout().flush().ok();
-
-    let mut input = String::new();
-    stdin()
-        .read_line(&mut input)
-        .context("Failed to read confirmation")?;
-
-    let answer = input.trim().to_ascii_lowercase();
-    Ok(answer == "yes")
-}
-
 fn parse_delimiter_arg<'a>(args: &'a [&'a str]) -> Result<(Delimiter, Vec<&'a str>)> {
     let mut delimiter = Delimiter::Detect;
     let mut remaining = Vec::new();
@@ -1271,6 +1258,9 @@ async fn open_csv_reader(
     delimiter: Delimiter,
 ) -> Result<csv::Reader<Box<dyn Read + Send>>> {
     let mut builder = ReaderBuilder::new();
+    // Remote TSV samples (e.g., book summaries) sometimes contain stray delimiters;
+    // allow variable-length records so schema detection doesn't abort early.
+    builder.flexible(true);
     match delimiter {
         Delimiter::Detect => {
             let bytes = fetch_bytes_source(client, source).await?;
@@ -1389,7 +1379,11 @@ fn interactive_loop(
 
         let _ = editor.add_history_entry(line.as_str());
 
-        if let Err(err) = handle.block_on(dispatch_interactive_command(&mut session, &input)) {
+        if let Err(err) = handle.block_on(dispatch_interactive_command(
+            &mut session,
+            &mut editor,
+            &input,
+        )) {
             eprintln!("⚠️  {}", err);
         }
     }
@@ -1410,7 +1404,11 @@ fn history_file_path() -> Result<PathBuf> {
     Ok(path)
 }
 
-async fn dispatch_interactive_command(session: &mut InteractiveSession, input: &str) -> Result<()> {
+async fn dispatch_interactive_command(
+    session: &mut InteractiveSession,
+    editor: &mut Editor<IndexCompleter, rustyline::history::DefaultHistory>,
+    input: &str,
+) -> Result<()> {
     let mut parts = input.split_whitespace();
     let command = parts.next().unwrap_or_default();
 
@@ -1559,9 +1557,21 @@ async fn dispatch_interactive_command(session: &mut InteractiveSession, input: &
             // Parse optional flag --delete-schema
             let delete_schema = parts.any(|p| p == "--delete-schema");
 
-            if !confirm_delete(index)? {
-                println!("Aborted delete.");
-                return Ok(());
+            // Use rustyline for confirmation to avoid stdin conflicts in interactive mode
+            let prompt = format!("Delete index \"{}\"? [yes/NO]: ", index);
+            match editor.readline(&prompt) {
+                Ok(answer) => {
+                    let confirmed = answer.trim().eq_ignore_ascii_case("yes");
+                    if !confirmed {
+                        println!("Aborted delete.");
+                        return Ok(());
+                    }
+                }
+                Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+                    println!("\nAborted delete.");
+                    return Ok(());
+                }
+                Err(err) => return Err(anyhow!("Failed to read confirmation: {}", err)),
             }
 
             let result = session.client().delete_index(index, delete_schema).await?;

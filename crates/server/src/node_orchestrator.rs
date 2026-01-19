@@ -3919,7 +3919,7 @@ impl NodeOrchestrator {
             if let Some(store) = &shard.store {
                 let sc = Arc::clone(store);
                 let idx = index.to_string();
-                let sid = shard_id.clone();
+                let sid = *shard_id;
 
                 // Use spawn_blocking to safely call blocking storage function
                 let schema = tokio::task::spawn_blocking(move || {

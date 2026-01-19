@@ -12,10 +12,22 @@ pub struct CameoClient {
 impl CameoClient {
     pub fn new(url: &str) -> Result<Self> {
         let base_url = Url::parse(url).context("Invalid URL")?;
-        Ok(Self {
-            base_url,
-            http: Client::new(),
-        })
+
+        // Configure client for large file downloads with appropriate timeouts
+        let mut builder = Client::builder()
+            .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for large files
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(90));
+
+        // For external HTTPS requests (schema detection from URLs), we need to handle
+        // certificate validation more gracefully. Check if we should accept invalid certs.
+        if std::env::var("CAMEODB_ACCEPT_INVALID_CERTS").is_ok() {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        let http = builder.build().context("Failed to build HTTP client")?;
+
+        Ok(Self { base_url, http })
     }
 
     pub async fn health(&self) -> Result<HealthResponse> {

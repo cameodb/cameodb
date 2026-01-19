@@ -30,10 +30,12 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() > 1 {
-        let wants_client = args
-            .iter()
-            .skip(1)
-            .any(|arg| matches!(arg.as_str(), "client" | "health" | "index" | "search"));
+        let wants_client = args.iter().skip(1).any(|arg| {
+            matches!(
+                arg.as_str(),
+                "client" | "health" | "index" | "search" | "schema" | "data" | "list" | "delete"
+            )
+        });
         let interactive_requested = args
             .iter()
             .skip(1)
