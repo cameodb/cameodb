@@ -52,6 +52,147 @@ For local development on macOS/Linux (system TLS):
 cargo build --release
 ```
 
+## Building for Windows
+
+### Preparing Windows Machine for Development
+
+#### 1. Install Rust via rustup
+
+Download and run the official rustup installer:
+
+```powershell
+# Download and run the installer
+# Visit: https://rustup.rs/
+# Or use PowerShell:
+winget install Rustlang.Rust.MSVC
+```
+
+Or download `rustup-init.exe` directly from https://rustup.rs/
+
+#### 2. Install Visual Studio Build Tools
+
+Windows builds require the Microsoft Visual C++ Build Tools:
+
+**Option A: Visual Studio Community (Recommended)**
+1. Download Visual Studio Community from https://visualstudio.microsoft.com/
+2. During installation, select "Desktop development with C++"
+3. Ensure these components are included:
+   - MSVC v143 - VS 2022 C++ x64/x86 build tools
+   - Windows 11 SDK (or Windows 10 SDK)
+   - C++ tools for CMake
+
+**Option B: Visual Studio Build Tools (Standalone)**
+1. Download Build Tools from https://visualstudio.microsoft.com/downloads/
+2. Select "C++ build tools" workload
+3. Include the same MSVC and SDK components as above
+
+#### 3. Verify Installation
+
+Open a new terminal (PowerShell or Command Prompt) and verify:
+
+```powershell
+# Check Rust installation
+rustc --version
+cargo --version
+
+# Check MSVC toolchain
+rustup toolchain list
+```
+
+You should see the MSVC toolchain: `stable-x86_64-pc-windows-msvc`
+
+#### 4. Additional MSVC Components (if needed)
+
+If you encounter build errors, you may need additional components:
+
+```powershell
+# Using Visual Studio Installer, add these components:
+# - MSVC v143 - VS 2022 C++ x64/x86 build tools (Latest)
+# - Windows 11 SDK (minimum required version)
+# - C++ tools for CMake
+# - ATL support (if building with certain C++ dependencies)
+```
+
+### Native Windows Build
+
+Once the machine is prepared, build CameoDB:
+
+```powershell
+cargo build --release
+```
+
+The binary will be available at:
+```
+target\release\cameodb.exe
+```
+
+### Cross-compilation to Windows from macOS/Linux
+
+#### Using cargo-xwin (Recommended)
+
+Install cargo-xwin for cross-compilation:
+
+```bash
+cargo install cargo-xwin
+```
+
+Build for Windows x64:
+
+```bash
+cargo xwin build --release --target x86_64-pc-windows-msvc
+```
+
+Build for Windows ARM64:
+
+```bash
+cargo xwin build --release --target aarch64-pc-windows-msvc
+```
+
+**Benefits:**
+- ✅ Complete Windows toolchain via XWin
+- ✅ Handles MSVC toolchain automatically
+- ✅ Works on macOS and Linux hosts
+- ✅ Produces native Windows executables
+
+#### Using traditional cross-compilation
+
+Install the Windows target:
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+```
+
+Build for Windows:
+
+```bash
+cargo build --release --target x86_64-pc-windows-msvc
+```
+
+**Note:** Traditional cross-compilation requires MSVC toolchain components to be available on your system.
+
+### TLS Configuration for Windows
+
+Windows builds support the same TLS backends:
+
+- `native-tls` (default): Uses Windows Schannel
+- `rustls-tls`: Pure Rust TLS implementation
+- `native-tls-vendored`: Not typically needed on Windows
+
+Example with rustls-tls:
+
+```bash
+cargo xwin build --release --target x86_64-pc-windows-msvc \
+    --no-default-features \
+    --features client/rustls-tls
+```
+
+### Windows-specific Considerations
+
+- **Console Window**: Use `windows-subsystem = "windows"` in Cargo.toml for GUI applications
+- **Path Separators**: Rust handles path separators automatically
+- **Permissions**: Windows uses ACLs instead of Unix permissions
+- **Services**: For Windows service deployment, consider additional service-specific configuration
+
 ## Docker builds
 
 ### Native (glibc) image (Apple Silicon host)
