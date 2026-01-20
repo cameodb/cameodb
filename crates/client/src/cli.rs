@@ -1344,7 +1344,16 @@ fn interactive_loop(
     handle: tokio::runtime::Handle,
 ) -> Result<()> {
     let completer = IndexCompleter::new(session.index_cache_handle());
-    let mut editor = Editor::new().context("Failed to initialize line editor")?;
+
+    // Configure editor with Windows-specific settings
+    let config = rustyline::Config::builder()
+        .auto_add_history(true)
+        .history_ignore_space(true)
+        .completion_type(rustyline::CompletionType::List)
+        .edit_mode(rustyline::EditMode::Emacs)
+        .build();
+
+    let mut editor = Editor::with_config(config).context("Failed to initialize line editor")?;
     editor.set_helper(Some(completer));
     if history_path.exists() {
         let _ = editor.load_history(&history_path);

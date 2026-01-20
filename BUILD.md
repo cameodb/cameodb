@@ -162,6 +162,22 @@ error: linker `link.exe` not found
 
 This indicates the C++ compiler isn't in PATH. Use Developer Command Prompt or ensure Visual Studio Build Tools are properly installed.
 
+**Interactive shell (REPL) cursor spacing issues:**
+
+If you experience cursor positioning problems or extra spacing in the interactive client shell on Windows PowerShell:
+
+1. **Cause**: Windows terminal compatibility issues with ANSI escape codes and line wrapping
+2. **Solution**: The code includes Windows-specific Rustyline configuration to handle this
+3. **Alternative terminals**: Consider using:
+   - Windows Terminal (recommended for best experience)
+   - Git Bash
+   - WSL2 terminal
+4. **PowerShell-specific**: If issues persist in PowerShell, try:
+   ```powershell
+   # Use Windows Terminal or update PowerShell to latest version
+   winget install Microsoft.WindowsTerminal
+   ```
+
 ### Cross-compilation to Windows from macOS/Linux
 
 #### Using cargo-xwin (Recommended)
