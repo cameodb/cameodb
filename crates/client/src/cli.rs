@@ -1,7 +1,6 @@
 use crate::sdk::{CameoClient, ListIndexesResponse};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
-use colored::Colorize;
 use csv::ReaderBuilder;
 use reqwest::Url;
 use rustyline::completion::{Completer, Pair};
@@ -20,20 +19,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use storage::{FieldDef, IndexSchema, TantivyFieldType};
 
+// Only import colored on non-Windows platforms
+#[cfg(not(target_os = "windows"))]
+use colored::Colorize;
+
 const SCHEMA_SAMPLE_LIMIT: usize = 200;
 const DEFAULT_BATCH_SIZE: usize = 4000;
-
-#[allow(dead_code)]
-#[derive(Copy, Clone)]
-enum PromptTheme {
-    Default,
-    Bash,
-    Powerline,
-    Minimal,
-}
-
-// Select the prompt theme here (Bash style by request)
-const PROMPT_THEME: PromptTheme = PromptTheme::Bash;
 
 #[derive(Parser)]
 #[command(name = "cameodb-client", about = "CameoDB CLI Client")]
@@ -172,7 +163,7 @@ impl InteractiveSession {
     fn prompt(&self) -> String {
         let host = self.display_host();
 
-        // Use plain text prompt on Windows to avoid cursor positioning issues
+        // Plain prompt on Windows to avoid ANSI cursor issues; colored Bash-style elsewhere
         #[cfg(target_os = "windows")]
         {
             format!("cameodb@{} ▶ ", host)
@@ -180,32 +171,12 @@ impl InteractiveSession {
 
         #[cfg(not(target_os = "windows"))]
         {
-            match PROMPT_THEME {
-                PromptTheme::Default => format!(
-                    "{}{}{} ▶ ",
-                    "cameodb".bright_green(),
-                    "@".bright_blue(),
-                    host.green()
-                ),
-                PromptTheme::Bash => format!(
-                    "{}{}{} ▶ ",
-                    "cameodb".bold().cyan(),
-                    "@".white(),
-                    host.bold().green()
-                ),
-                PromptTheme::Powerline => format!(
-                    "{}{}{} ▶ ",
-                    "cameodb".bold().magenta(),
-                    "@".bright_black(),
-                    host.bold().cyan()
-                ),
-                PromptTheme::Minimal => format!(
-                    "{}{}{} ▶ ",
-                    "cameodb".white(),
-                    "@".dimmed(),
-                    host.bright_green()
-                ),
-            }
+            format!(
+                "{}{}{} ▶ ",
+                "cameodb".bold().cyan(),
+                "@".white(),
+                host.bold().green()
+            )
         }
     }
 
