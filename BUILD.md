@@ -126,6 +126,42 @@ The binary will be available at:
 target\release\cameodb.exe
 ```
 
+#### Troubleshooting Common Windows Build Issues
+
+**Linker.exe not found error:**
+
+If you get an error like:
+```
+error: linker `link.exe` not found
+```
+
+**Solutions:**
+
+1. **Restart PowerShell/Command Prompt** after Visual Studio installation
+2. **Use Developer Command Prompt**: Open "Developer Command Prompt for VS 2022" from Start Menu
+3. **Verify MSVC toolchain is active**:
+   ```powershell
+   rustup toolchain list
+   rustup default stable-x86_64-pc-windows-msvc
+   ```
+4. **Reinstall Visual Studio Build Tools** with these specific components:
+   - MSVC v143 - VS 2022 C++ x64/x86 build tools
+   - Windows 11 SDK (minimum version 10.0.22000.0)
+   - C++ tools for CMake
+
+**"Could not find MSVC" error:**
+
+1. Run from Developer Command Prompt for VS 2022
+2. Or manually set up the environment:
+   ```powershell
+   # Find VS installation path
+   "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+   ```
+
+**"cl.exe not found" error:**
+
+This indicates the C++ compiler isn't in PATH. Use Developer Command Prompt or ensure Visual Studio Build Tools are properly installed.
+
 ### Cross-compilation to Windows from macOS/Linux
 
 #### Using cargo-xwin (Recommended)
@@ -192,6 +228,11 @@ cargo xwin build --release --target x86_64-pc-windows-msvc \
 - **Path Separators**: Rust handles path separators automatically
 - **Permissions**: Windows uses ACLs instead of Unix permissions
 - **Services**: For Windows service deployment, consider additional service-specific configuration
+- **Signal Handling**: The application uses cross-platform signal handling:
+  - Ctrl+C (SIGINT) works on all platforms
+  - SIGTERM (systemctl stop) is only available on Unix systems
+  - On Windows, only Ctrl+C shutdown is supported
+- **Network Bindings**: Windows may require administrator privileges for ports below 1024
 
 ## Docker builds
 

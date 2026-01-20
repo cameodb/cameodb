@@ -375,17 +375,26 @@ async fn main() -> Result<()> {
     });
 
     // Wait for shutdown signal (Ctrl+C or systemctl stop)
-    let mut sigterm_recv =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix;
+        let mut sigterm_recv = unix::signal(unix::SignalKind::terminate())
             .map_err(|e| anyhow::anyhow!("Failed to setup SIGTERM handler: {}", e))?;
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Received SIGINT (Ctrl+C), shutting down...");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Received SIGINT (Ctrl+C), shutting down...");
+            }
+            _ = sigterm_recv.recv() => {
+                tracing::info!("Received SIGTERM (systemctl stop), shutting down...");
+            }
         }
-        _ = sigterm_recv.recv() => {
-            tracing::info!("Received SIGTERM (systemctl stop), shutting down...");
-        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await;
+        tracing::info!("Received SIGINT (Ctrl+C), shutting down...");
     }
     println!("Shutting down...");
 
