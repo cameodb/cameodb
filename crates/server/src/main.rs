@@ -393,7 +393,9 @@ async fn main() -> Result<()> {
 
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await;
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("Failed to listen for Ctrl+C signal: {}", e);
+        }
         tracing::info!("Received SIGINT (Ctrl+C), shutting down...");
     }
     println!("Shutting down...");
