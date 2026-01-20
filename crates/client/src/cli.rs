@@ -171,31 +171,41 @@ impl InteractiveSession {
 
     fn prompt(&self) -> String {
         let host = self.display_host();
-        match PROMPT_THEME {
-            PromptTheme::Default => format!(
-                "{}{}{} ▶ ",
-                "cameodb".bright_green(),
-                "@".bright_blue(),
-                host.green()
-            ),
-            PromptTheme::Bash => format!(
-                "{}{}{} ▶ ",
-                "cameodb".bold().cyan(),
-                "@".white(),
-                host.bold().green()
-            ),
-            PromptTheme::Powerline => format!(
-                "{}{}{} ▶ ",
-                "cameodb".bold().magenta(),
-                "@".bright_black(),
-                host.bold().cyan()
-            ),
-            PromptTheme::Minimal => format!(
-                "{}{}{} ▶ ",
-                "cameodb".white(),
-                "@".dimmed(),
-                host.bright_green()
-            ),
+
+        // Use plain text prompt on Windows to avoid cursor positioning issues
+        #[cfg(target_os = "windows")]
+        {
+            format!("cameodb@{} ▶ ", host)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            match PROMPT_THEME {
+                PromptTheme::Default => format!(
+                    "{}{}{} ▶ ",
+                    "cameodb".bright_green(),
+                    "@".bright_blue(),
+                    host.green()
+                ),
+                PromptTheme::Bash => format!(
+                    "{}{}{} ▶ ",
+                    "cameodb".bold().cyan(),
+                    "@".white(),
+                    host.bold().green()
+                ),
+                PromptTheme::Powerline => format!(
+                    "{}{}{} ▶ ",
+                    "cameodb".bold().magenta(),
+                    "@".bright_black(),
+                    host.bold().cyan()
+                ),
+                PromptTheme::Minimal => format!(
+                    "{}{}{} ▶ ",
+                    "cameodb".white(),
+                    "@".dimmed(),
+                    host.bright_green()
+                ),
+            }
         }
     }
 
@@ -1345,13 +1355,24 @@ fn interactive_loop(
 ) -> Result<()> {
     let completer = IndexCompleter::new(session.index_cache_handle());
 
-    // Configure editor with Windows-specific settings
-    let config = rustyline::Config::builder()
-        .auto_add_history(true)
-        .history_ignore_space(true)
-        .completion_type(rustyline::CompletionType::List)
-        .edit_mode(rustyline::EditMode::Emacs)
-        .build();
+    // Configure editor with platform-specific settings
+    let config = if cfg!(target_os = "windows") {
+        // Windows: use simpler config to avoid cursor positioning issues
+        rustyline::Config::builder()
+            .auto_add_history(true)
+            .history_ignore_space(true)
+            .completion_type(rustyline::CompletionType::List)
+            .edit_mode(rustyline::EditMode::Emacs)
+            .build()
+    } else {
+        // Unix/Linux/macOS: full featured config
+        rustyline::Config::builder()
+            .auto_add_history(true)
+            .history_ignore_space(true)
+            .completion_type(rustyline::CompletionType::List)
+            .edit_mode(rustyline::EditMode::Emacs)
+            .build()
+    };
 
     let mut editor = Editor::with_config(config).context("Failed to initialize line editor")?;
     editor.set_helper(Some(completer));

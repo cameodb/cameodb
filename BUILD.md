@@ -164,15 +164,18 @@ This indicates the C++ compiler isn't in PATH. Use Developer Command Prompt or e
 
 **Interactive shell (REPL) cursor spacing issues:**
 
-If you experience cursor positioning problems or extra spacing in the interactive client shell on Windows PowerShell:
+If you experience text appearing far to the right and then jumping to the correct position in the interactive client shell on Windows PowerShell:
 
-1. **Cause**: Windows terminal compatibility issues with ANSI escape codes and line wrapping
-2. **Solution**: The code includes Windows-specific Rustyline configuration to handle this
-3. **Alternative terminals**: Consider using:
+1. **Cause**: Windows PowerShell has issues with ANSI escape codes in colored prompts, causing cursor positioning problems
+2. **Solution**: The code automatically detects Windows and uses:
+   - Plain text prompts (no colors) on Windows to avoid ANSI escape code issues
+   - Simplified Rustyline configuration for better Windows compatibility
+3. **Result**: Windows users get a clean `cameodb@localhost ▶ ` prompt without cursor positioning issues
+4. **Alternative terminals**: For colored prompts, consider using:
    - Windows Terminal (recommended for best experience)
    - Git Bash
    - WSL2 terminal
-4. **PowerShell-specific**: If issues persist in PowerShell, try:
+5. **PowerShell-specific**: If you want colored prompts in PowerShell, try:
    ```powershell
    # Use Windows Terminal or update PowerShell to latest version
    winget install Microsoft.WindowsTerminal
