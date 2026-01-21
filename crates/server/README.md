@@ -313,7 +313,97 @@ Simplified reactive state machine with three states:
 
 ---
 
-## 7. Current Distributed Feature Coverage
+## 7. Date Field Handling & Indexing
+
+CameoDB provides flexible date handling that accepts multiple input formats during writes and automatically normalizes them for Tantivy indexing while preserving the original JSON in redb.
+
+### 7.1 Write Path: Date Normalization
+
+When documents are indexed with date fields, the storage layer (`crates/storage`) automatically detects and normalizes various date formats:
+
+**Supported Input Formats:**
+- **RFC3339 with timezone**: `2024-01-05T12:00:00Z`, `2024-01-05T12:00:00+01:00`
+- **Naive datetime** (no timezone, assumed UTC): `2024-01-05 12:00:00`, `2024-01-05T12:00:00`
+- **Date-only** (midnight UTC): `2024-01-05`, `2024/01/05`, `20240105`
+- **Year-month** (first day of month, midnight UTC): `2024-06`, `2001-12`
+- **Year-only** (Jan 1 midnight UTC): `2024`, `2001`
+
+**Indexing Behavior:**
+1. Original JSON document stored unchanged in redb (preserves exact input)
+2. Date strings parsed and normalized to Tantivy `DateTime` (UTC timestamps)
+3. Timestamps clamped to Tantivy safe range to avoid i64 overflow
+4. Both single writes (`apply_op`) and batch writes (`apply_batch`) use consistent parsing
+
+**Example:**
+```json
+{
+  "id": "book123",
+  "title": "Database Systems",
+  "publication_date": "2001"
+}
+```
+
+Stored in redb as-is, but indexed in Tantivy as `2001-01-01T00:00:00Z` for efficient range queries and sorting.
+
+### 7.2 Schema Type Inference
+
+The `FieldDef::infer_type_from_value` method automatically detects date strings during schema evolution:
+
+1. Checks if string matches RFC3339 format
+2. Checks if string matches naive datetime formats
+3. Checks if string matches date-only formats
+4. If any match, field type is set to `TantivyFieldType::Date`
+
+This enables automatic date field detection when ingesting CSV/JSON data without explicit schema definition.
+
+### 7.3 Date Field Configuration
+
+Date fields in Tantivy are indexed with:
+- `INDEXED` - Enables range queries and filtering
+- `FAST` - Enables sorting and aggregations
+- Stored in redb only (not in Tantivy) to minimize index size
+
+**Schema Example:**
+```json
+{
+  "fields": {
+    "publication_date": {
+      "field_type": "date",
+      "indexed": true,
+      "stored": false,
+      "fast": true
+    }
+  }
+}
+```
+
+### 7.4 Implementation Details
+
+**Parser Location**: `crates/storage/src/lib.rs`
+
+```rust
+fn parse_date_str_to_tantivy(s: &str) -> Option<(DateTime, i64, i64)> {
+    // Returns (tantivy_datetime, original_timestamp, clamped_timestamp)
+    // Handles RFC3339, naive datetime, date-only, year-only
+}
+```
+
+**Single Write** (line ~1494):
+```rust
+TantivyFieldType::Date => {
+    if let Some(s) = field_value.as_str()
+        && let Some((tantivy_dt, ts, clamped)) = parse_date_str_to_tantivy(s)
+    {
+        tantivy_doc.add_date(*tantivy_field, tantivy_dt);
+    }
+}
+```
+
+**Batch Write** (line ~2203): Uses identical logic for consistency.
+
+---
+
+## 8. Current Distributed Feature Coverage
 
 The `server` crate currently supports:
 

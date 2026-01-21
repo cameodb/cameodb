@@ -1455,11 +1455,16 @@ async fn dispatch_interactive_command(
         "search" => {
             let index = parts
                 .next()
-                .ok_or_else(|| anyhow!("Usage: search <index> <query> [limit]"))?;
+                .ok_or_else(|| anyhow!("Usage: search <index> <query> [limit N]"))?;
             let mut query_parts: Vec<&str> = parts.collect();
+            // Parse optional limit: either "limit N" or just "N" at the end
             let limit = if let Some(last) = query_parts.last() {
                 if let Ok(num) = last.parse::<usize>() {
                     query_parts.pop();
+                    // Also strip "limit" keyword if present before the number
+                    if query_parts.last().map(|s| s.eq_ignore_ascii_case("limit")) == Some(true) {
+                        query_parts.pop();
+                    }
                     Some(num)
                 } else {
                     None
@@ -1469,7 +1474,7 @@ async fn dispatch_interactive_command(
             };
             let query = query_parts.join(" ");
             if query.is_empty() {
-                return Err(anyhow!("Usage: search <index> <query> [limit]"));
+                return Err(anyhow!("Usage: search <index> <query> [limit N]"));
             }
             let results = session.client().search(index, &query, limit).await?;
             print_json(&results)?;

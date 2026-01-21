@@ -99,6 +99,80 @@ The CLI mirrors Tantivy's query parser (see [docs](https://docs.rs/tantivy/lates
 
 If Tantivy adds more operators, update this table and (optionally) extend the completer to understand them.
 
+### Date field queries
+
+CameoDB automatically normalizes date literals in search queries to match the indexed format. You can use **naive date formats** directly without manual RFC3339 conversion:
+
+**Supported Date Query Formats:**
+
+| Input Format | Example Query | Normalized To | Use Case |
+| --- | --- | --- | --- |
+| Year-month | `publication_date:2024-06` | `publication_date:2024-06-01T00:00:00Z` | Match documents from a specific month |
+| Year-only | `publication_date:2024` | `publication_date:2024-01-01T00:00:00Z` | Match documents from a specific year |
+| Date-only | `publication_date:2024-01-05` | `publication_date:2024-01-05T00:00:00Z` | Match documents from a specific day |
+| Naive datetime | `publication_date:2024-01-05 12:00:00` | `publication_date:2024-01-05T12:00:00Z` | Match documents at a specific time |
+| RFC3339 | `publication_date:2024-01-05T12:00:00Z` | No change | Already normalized |
+
+**Range Queries:**
+
+```bash
+# All documents from 2001 onwards
+search books publication_date:[2001 TO *]
+
+# Documents between 2001 and 2014 (inclusive start of each year)
+search books publication_date:[2001 TO 2014]
+
+# Documents from a specific date range
+search books publication_date:[2020-01-01 TO 2020-12-31]
+
+# Documents from a specific month range
+search books publication_date:[2020-06 TO 2020-12]
+
+# Documents from a specific month to present
+search books publication_date:[2024-06 TO *]
+```
+
+**Comparison Queries:**
+
+```bash
+# Documents published after 2011
+search books publication_date:>2011
+
+# Documents published before 2009-01-01
+search books publication_date:<2009-01-01
+
+# Documents published on or after a specific date
+search books publication_date:>=2020-06-15
+
+# Documents published after a specific month
+search books publication_date:>2024-06
+
+# Documents published before a specific month
+search books publication_date:<2020-12
+```
+
+**Combined Queries:**
+
+```bash
+# Recent Rust books
+search books +title:rust +publication_date:[2020 TO *]
+
+# Classic database books
+search books +title:database +publication_date:<2000
+
+# Books from a specific year
+search books +title:programming +publication_date:2024
+
+# Books from a specific month
+search books +title:machine +publication_date:2024-06
+```
+
+**Important Notes:**
+- All naive dates are interpreted as **UTC midnight** for date-only, year-month, and year-only inputs
+- Naive datetime inputs (without timezone) are assumed to be **UTC**
+- The server automatically normalizes your input before querying Tantivy
+- Original document JSON is preserved exactly as written (normalization only affects indexing and search)
+
 ## 🛡️ Async + Blocking Safety
 
 - All HTTP calls remain async (`reqwest::Client`).

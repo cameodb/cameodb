@@ -872,10 +872,32 @@ CameoDB supports a rich set of field types for indexing and storage. These types
 | **`i64`** | 64-bit signed integer. Supports range queries and sorting. | `i64` (FAST) |
 | **`u64`** | 64-bit unsigned integer. Supports range queries and sorting. | `u64` (FAST) |
 | **`f64`** / **`number`** | 64-bit floating point. Supports range queries and sorting. | `f64` (FAST) |
-| **`date`** | DateTime field (RFC3339). Supports range queries and sorting. | `date` (FAST) |
+| **`date`** | DateTime field. Supports RFC3339, naive datetime, date-only, year-month, and year-only formats. | `date` (FAST) |
 | **`array`** | Multi-valued text field. Each element is tokenized. | `TEXT` (multi-valued) |
 
 > **Note:** All fields are `STORED` by default, meaning the original JSON value is retrievable.
+
+### Date Field Support
+
+The `date` field type provides flexible date handling with automatic normalization:
+
+**Supported Input Formats:**
+- **RFC3339 with timezone**: `2024-01-05T12:00:00Z`, `2024-01-05T12:00:00+01:00`
+- **Naive datetime** (no timezone, assumed UTC): `2024-01-05 12:00:00`, `2024-01-05T12:00:00`
+- **Date-only** (midnight UTC): `2024-01-05`, `2024/01/05`, `20240105`
+- **Year-month** (first day of month, midnight UTC): `2024-06`, `2001-12`
+- **Year-only** (Jan 1 midnight UTC): `2024`, `2001`
+
+**Normalization Behavior:**
+- All naive formats are converted to UTC midnight timestamps
+- RFC3339 timestamps are preserved as-is
+- Original JSON values are stored unchanged in redb
+- Tantivy indexes store normalized UTC timestamps for efficient queries
+
+**Query Support:**
+- Range queries: `publication_date:[2001 TO 2024]`
+- Comparison queries: `publication_date:>2011`, `publication_date:<2020-06`
+- Automatic query normalization for naive date inputs
 
 ## Serialization and Tantivy Integration
 

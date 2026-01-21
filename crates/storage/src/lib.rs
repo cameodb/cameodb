@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use chrono::{NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 use dashmap::DashMap;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
@@ -53,6 +54,18 @@ const TABLE_SIZE_SAMPLE_COUNT: u64 = 200;
 const TANTIVY_MIN_TIMESTAMP_SECS: i64 = -9_223_372_036; // 1677-09-21 00:12:44 UTC
 const TANTIVY_MAX_TIMESTAMP_SECS: i64 = 9_223_372_036; // 2262-04-11 23:47:16 UTC
 
+/// Common naive datetime and date formats used for inference and normalization
+const NAIVE_DATETIME_FORMATS: &[&str] = &[
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d %H:%M:%S%.f",
+    "%Y-%m-%dT%H:%M:%S%.f",
+];
+
+const NAIVE_DATE_FORMATS: &[&str] = &["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%Y-%m", "%Y"];
+
 /// Schema metadata table: maps index names to their schema definitions.
 const TABLE_SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("schema");
 
@@ -71,6 +84,145 @@ pub struct StorageConfig {
     pub default_batch_size: usize,
     /// Whether to call fsync() on every redb commit.
     pub wal_sync: bool,
+}
+
+/// Convert a date literal into RFC3339 Z string using the same rules as indexing.
+/// Returns None if the literal cannot be parsed as a date.
+fn normalize_date_literal(lit: &str) -> Option<String> {
+    if lit == "*" {
+        return None;
+    }
+
+    let (_, _, clamped) = parse_date_str_to_tantivy(lit)?;
+    let dt = Utc.timestamp_opt(clamped, 0).single()?;
+    Some(dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+fn normalize_date_ranges(input: &str, field: &str) -> String {
+    let prefix = format!("{}:[", field);
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0usize;
+
+    while let Some(rel) = input[idx..].find(&prefix) {
+        let start = idx + rel;
+        out.push_str(&input[idx..start]);
+
+        let inner_start = start + prefix.len();
+        if let Some(end_rel) = input[inner_start..].find(']') {
+            let end = inner_start + end_rel;
+            let inner = &input[inner_start..end];
+
+            if let Some((lower, upper)) = inner.split_once(" TO ") {
+                let lower_norm = normalize_date_literal(lower).unwrap_or_else(|| lower.to_string());
+                let upper_norm = normalize_date_literal(upper).unwrap_or_else(|| upper.to_string());
+                out.push_str(&format!("{}:[{} TO {}]", field, lower_norm, upper_norm));
+                idx = end + 1;
+                continue;
+            }
+        }
+
+        // Fallback: no closing bracket or malformed, copy the rest of the prefix char and move on
+        out.push_str(&input[start..start + prefix.len()]);
+        idx = start + prefix.len();
+    }
+
+    out.push_str(&input[idx..]);
+    out
+}
+
+fn normalize_date_comparisons(input: &str, field: &str) -> String {
+    let prefix = format!("{}:", field);
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0usize;
+
+    while let Some(rel) = input[idx..].find(&prefix) {
+        let start = idx + rel;
+        out.push_str(&input[idx..start]);
+
+        let op_idx = start + prefix.len();
+        let rest = &input[op_idx..];
+        let mut chars = rest.chars();
+        if let Some(op) = chars.next()
+            && (op == '<' || op == '>')
+        {
+            let value_start = op_idx + op.len_utf8();
+            let value_end = input[value_start..]
+                .find(char::is_whitespace)
+                .map(|r| value_start + r)
+                .unwrap_or(input.len());
+            let value = &input[value_start..value_end];
+            let norm = normalize_date_literal(value).unwrap_or_else(|| value.to_string());
+            out.push_str(&format!("{}{}{}", prefix, op, norm));
+            idx = value_end;
+            continue;
+        }
+
+        // Not a comparison; copy current char and advance
+        out.push_str(&input[start..start + prefix.len()]);
+        idx = start + prefix.len();
+    }
+
+    out.push_str(&input[idx..]);
+    out
+}
+
+fn normalize_date_literals(input: &str, field: &str) -> String {
+    let prefix = format!("{}:", field);
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0usize;
+
+    while let Some(rel) = input[idx..].find(&prefix) {
+        let start = idx + rel;
+        out.push_str(&input[idx..start]);
+
+        let value_start = start + prefix.len();
+        let value_end = input[value_start..]
+            .find(char::is_whitespace)
+            .map(|r| value_start + r)
+            .unwrap_or(input.len());
+        let value = &input[value_start..value_end];
+
+        // Skip if this looks like a range or comparison already handled
+        if value.starts_with('[') || value.starts_with('<') || value.starts_with('>') {
+            out.push_str(&input[start..value_end]);
+            idx = value_end;
+            continue;
+        }
+
+        let norm = normalize_date_literal(value).unwrap_or_else(|| value.to_string());
+        out.push_str(&format!("{}{}", prefix, norm));
+        idx = value_end;
+    }
+
+    out.push_str(&input[idx..]);
+    out
+}
+
+/// Normalize date literals in a Tantivy query string based on schema field types.
+/// Supports common forms:
+/// - field:value (single literal)
+/// - field:<value / field:>value
+/// - field:[lower TO upper]
+fn normalize_date_query(query: &str, schema: &IndexSchema) -> String {
+    let date_fields: HashSet<&str> = schema
+        .fields
+        .iter()
+        .filter(|(_, def)| matches!(def.field_type, TantivyFieldType::Date))
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    if date_fields.is_empty() {
+        return query.to_string();
+    }
+
+    let mut normalized = query.to_string();
+    for field in &date_fields {
+        normalized = normalize_date_ranges(&normalized, field);
+        normalized = normalize_date_comparisons(&normalized, field);
+        normalized = normalize_date_literals(&normalized, field);
+    }
+
+    normalized
 }
 
 impl Default for StorageConfig {
@@ -272,18 +424,9 @@ impl FieldDef {
     /// - 2024-05-01T12:30:00
     /// - 2024-05-01T12:30:00.123
     fn is_naive_datetime(s: &str) -> bool {
-        const DATETIME_FORMATS: &[&str] = &[
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d %H:%M",
-            "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%dT%H:%M",
-            "%Y-%m-%d %H:%M:%S%.f",
-            "%Y-%m-%dT%H:%M:%S%.f",
-        ];
-
-        DATETIME_FORMATS
+        NAIVE_DATETIME_FORMATS
             .iter()
-            .any(|fmt| chrono::NaiveDateTime::parse_from_str(s, fmt).is_ok())
+            .any(|fmt| NaiveDateTime::parse_from_str(s, fmt).is_ok())
     }
 
     /// Check common date-only formats such as
@@ -291,12 +434,76 @@ impl FieldDef {
     /// - 2024/05/01
     /// - 20240501
     fn is_naive_date(s: &str) -> bool {
-        const DATE_FORMATS: &[&str] = &["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"];
-
-        DATE_FORMATS
+        NAIVE_DATE_FORMATS
             .iter()
-            .any(|fmt| chrono::NaiveDate::parse_from_str(s, fmt).is_ok())
+            .any(|fmt| NaiveDate::parse_from_str(s, fmt).is_ok())
     }
+}
+
+/// Parse a date string (RFC3339, naive datetime, date-only, year-month, or year-only) into Tantivy DateTime
+fn parse_date_str_to_tantivy(s: &str) -> Option<(DateTime, i64, i64)> {
+    // RFC3339 with offset
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        let ts = dt.timestamp();
+        let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+        let tantivy_dt = DateTime::from_timestamp_secs(clamped);
+        return Some((tantivy_dt, ts, clamped));
+    }
+
+    // Naive datetime (no timezone) -> assume UTC
+    if let Some(ndt) = NAIVE_DATETIME_FORMATS
+        .iter()
+        .find_map(|fmt| NaiveDateTime::parse_from_str(s, fmt).ok())
+    {
+        let ts = Utc.from_utc_datetime(&ndt).timestamp();
+        let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+        let tantivy_dt = DateTime::from_timestamp_secs(clamped);
+        return Some((tantivy_dt, ts, clamped));
+    }
+
+    // Date-only formats that NaiveDate can parse directly (YYYY-MM-DD, YYYY/MM/DD, YYYYMMDD)
+    for fmt in &["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"] {
+        if let Ok(nd) = NaiveDate::parse_from_str(s, fmt) {
+            if let Some(ndt) = nd.and_hms_opt(0, 0, 0) {
+                let ts = Utc.from_utc_datetime(&ndt).timestamp();
+                let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+                let tantivy_dt = DateTime::from_timestamp_secs(clamped);
+                return Some((tantivy_dt, ts, clamped));
+            }
+        }
+    }
+
+    // Year-month format (YYYY-MM) -> first day of month, midnight UTC
+    // NaiveDate::parse_from_str cannot parse incomplete dates, so we handle this manually
+    if s.len() == 7 && s.chars().nth(4) == Some('-') {
+        if let (Ok(year), Ok(month)) = (s[0..4].parse::<i32>(), s[5..7].parse::<u32>()) {
+            if let Some(nd) = NaiveDate::from_ymd_opt(year, month, 1) {
+                if let Some(ndt) = nd.and_hms_opt(0, 0, 0) {
+                    let ts = Utc.from_utc_datetime(&ndt).timestamp();
+                    let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+                    let tantivy_dt = DateTime::from_timestamp_secs(clamped);
+                    return Some((tantivy_dt, ts, clamped));
+                }
+            }
+        }
+    }
+
+    // Year-only format (YYYY) -> Jan 1, midnight UTC
+    // NaiveDate::parse_from_str cannot parse year-only, so we handle this manually
+    if s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(year) = s.parse::<i32>() {
+            if let Some(nd) = NaiveDate::from_ymd_opt(year, 1, 1) {
+                if let Some(ndt) = nd.and_hms_opt(0, 0, 0) {
+                    let ts = Utc.from_utc_datetime(&ndt).timestamp();
+                    let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+                    let tantivy_dt = DateTime::from_timestamp_secs(clamped);
+                    return Some((tantivy_dt, ts, clamped));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Index schema definition for validation and evolution.
@@ -1316,22 +1523,15 @@ impl HybridStore {
                                 }
                                 TantivyFieldType::Date => {
                                     if let Some(s) = field_value.as_str()
-                                        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
+                                        && let Some((tantivy_dt, ts, clamped)) =
+                                            parse_date_str_to_tantivy(s)
                                     {
-                                        let timestamp_secs = dt.timestamp();
-                                        // Clamp to Tantivy's safe range to avoid i64 overflow
-                                        // Original date is preserved in redb json_blob
-                                        let clamped_ts = timestamp_secs.clamp(
-                                            TANTIVY_MIN_TIMESTAMP_SECS,
-                                            TANTIVY_MAX_TIMESTAMP_SECS,
-                                        );
-                                        let tantivy_dt = DateTime::from_timestamp_secs(clamped_ts);
-                                        if timestamp_secs != clamped_ts {
+                                        if ts != clamped {
                                             tracing::debug!(
                                                 field = %field_name,
                                                 input = %s,
-                                                original_ts = %timestamp_secs,
-                                                clamped_ts = %clamped_ts,
+                                                original_ts = %ts,
+                                                clamped_ts = %clamped,
                                                 "Date clamped to Tantivy safe range"
                                             );
                                         }
@@ -1874,9 +2074,12 @@ impl HybridStore {
             "Executing tantivy search"
         );
 
+        // Normalize date literals based on schema so naive inputs match indexed Date fields
+        let normalized_query = normalize_date_query(query, &schema);
+
         // Create query parser and execute search
         let query_parser = tantivy::query::QueryParser::for_index(tantivy_index, query_fields);
-        let parsed_query = query_parser.parse_query(query)?;
+        let parsed_query = query_parser.parse_query(&normalized_query)?;
 
         // Debug: log the parsed query to verify field-specific clauses are recognized
         debug!(
@@ -2170,23 +2373,15 @@ impl HybridStore {
                                     }
                                     TantivyFieldType::Date => {
                                         if let Some(s) = field_value.as_str()
-                                            && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
+                                            && let Some((tantivy_dt, ts, clamped)) =
+                                                parse_date_str_to_tantivy(s)
                                         {
-                                            let timestamp_secs = dt.timestamp();
-                                            // Clamp to Tantivy's safe range to avoid i64 overflow
-                                            // Original date is preserved in redb json_blob
-                                            let clamped_ts = timestamp_secs.clamp(
-                                                TANTIVY_MIN_TIMESTAMP_SECS,
-                                                TANTIVY_MAX_TIMESTAMP_SECS,
-                                            );
-                                            let tantivy_dt =
-                                                DateTime::from_timestamp_secs(clamped_ts);
-                                            if timestamp_secs != clamped_ts {
+                                            if ts != clamped {
                                                 tracing::debug!(
                                                     field = %field_name,
                                                     input = %s,
-                                                    original_ts = %timestamp_secs,
-                                                    clamped_ts = %clamped_ts,
+                                                    original_ts = %ts,
+                                                    clamped_ts = %clamped,
                                                     "Date clamped to Tantivy safe range (batch)"
                                                 );
                                             }
