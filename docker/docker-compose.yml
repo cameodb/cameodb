@@ -1,5 +1,6 @@
 services:
   cameodb:
+    image: cameodb:latest
     container_name: cameodb
     
     # BUILD CONFIGURATION
@@ -18,7 +19,7 @@ services:
     user: "65532:65532"
 
     environment:
-      - RUST_LOG=debug
+      - RUST_LOG=info
       
     # RUNTIME VOLUMES
     # Note: No certificates here. Only Config and Data.

@@ -4,16 +4,20 @@
 # STAGE 1: Builder (Needs Internet & Certs)
 ################################################################################
 ARG RUST_VERSION=1.90
+ARG TARGET_ABI=gnu
+ARG USE_ZIG=false
 FROM rust:${RUST_VERSION}-slim AS builder
 
-ARG USE_ZIG=true
-ARG TARGET_ABI=musl
+# Forward build args to inside the builder stage
+ARG TARGET_ABI
+ARG USE_ZIG
 
 # 1. Install system build dependencies (Zig optional)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl-dev \
     musl-tools \
+    gcc-aarch64-linux-gnu \
     pkg-config \
     wget \
     xz-utils \
@@ -45,29 +49,25 @@ WORKDIR /src
 
 # 4. Configure Cargo toolchain
 RUN mkdir -p .cargo && \
-    if [ "$TARGET_ABI" = "musl" ] && [ "$USE_ZIG" = "true" ]; then \
+    if [ "$TARGET_ABI" = "musl" ] && [ "$USE_ZIG" = "true" ] && [ "$TARGETARCH" = "amd64" ]; then \
         echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml && \
         echo 'linker = "zig"' >> .cargo/config.toml && \
-        echo 'rustflags = ["-C", "link-arg=cc", "-C", "link-arg=-target", "-C", "link-arg=x86_64-linux-musl"]' >> .cargo/config.toml && \
-        echo '' >> .cargo/config.toml && \
-        echo '[target.aarch64-unknown-linux-musl]' >> .cargo/config.toml && \
-        echo 'linker = "zig"' >> .cargo/config.toml && \
-        echo 'rustflags = ["-C", "link-arg=cc", "-C", "link-arg=-target", "-C", "link-arg=aarch64-linux-musl"]' >> .cargo/config.toml; \
-    elif [ "$TARGET_ABI" = "musl" ]; then \
+        echo 'rustflags = ["-C", "link-arg=cc", "-C", "link-arg=-target", "-C", "link-arg=x86_64-linux-musl"]' >> .cargo/config.toml; \
+    elif [ "$TARGET_ABI" = "musl" ] && [ "$TARGETARCH" = "amd64" ]; then \
         echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml && \
-        echo 'linker = "musl-gcc"' >> .cargo/config.toml && \
-        echo '' >> .cargo/config.toml && \
+        echo 'linker = "musl-gcc"' >> .cargo/config.toml; \
+    elif [ "$TARGET_ABI" = "musl" ] && [ "$TARGETARCH" = "arm64" ]; then \
         echo '[target.aarch64-unknown-linux-musl]' >> .cargo/config.toml && \
+        echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml; \
+    elif [ "$TARGET_ABI" = "gnu" ] && [ "$TARGETARCH" = "arm64" ]; then \
+        echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml && \
         echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml; \
     fi
 
-# 5. Set environment variables for OpenSSL vendored build when using Zig
+# 5. Set environment variables for OpenSSL vendored build when using Zig (only for x86_64)
 ENV CC_x86_64_unknown_linux_musl="zig cc -target x86_64-linux-musl" \
-    CC_aarch64_unknown_linux_musl="zig cc -target aarch64-linux-musl" \
     AR_x86_64_unknown_linux_musl="zig ar" \
-    AR_aarch64_unknown_linux_musl="zig ar" \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="zig" \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="zig"
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="zig"
 
 # 5. Prepare Data Directory (Permission Fix)
 RUN mkdir -p /build-data/cameodb
@@ -107,7 +107,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 ################################################################################
 # STAGE 2: Runtime (Offline / Clean)
 ################################################################################
-FROM gcr.io/distroless/static:latest AS runtime
+# Use static distroless for musl (fully static), cc-debian12 for gnu (needs glibc + libgcc)
+ARG TARGET_ABI
+FROM gcr.io/distroless/static:latest AS runtime-musl
+FROM gcr.io/distroless/cc-debian12:latest AS runtime-gnu
+FROM runtime-${TARGET_ABI} AS runtime
 
 # We COPY the binary and the config.
 # We DO NOT copy the certificates.

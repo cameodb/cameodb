@@ -480,7 +480,7 @@ impl IndexCompleter {
 
         match tokens[0] {
             // Complete main commands when first token or partial command
-            cmd if tokens.len() == 1 => {
+            _cmd if tokens.len() == 1 => {
                 let suggestions = self.command_suggestions(current);
                 let start = 0;
                 Some((start, suggestions))

@@ -463,44 +463,42 @@ fn parse_date_str_to_tantivy(s: &str) -> Option<(DateTime, i64, i64)> {
 
     // Date-only formats that NaiveDate can parse directly (YYYY-MM-DD, YYYY/MM/DD, YYYYMMDD)
     for fmt in &["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"] {
-        if let Ok(nd) = NaiveDate::parse_from_str(s, fmt) {
-            if let Some(ndt) = nd.and_hms_opt(0, 0, 0) {
-                let ts = Utc.from_utc_datetime(&ndt).timestamp();
-                let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
-                let tantivy_dt = DateTime::from_timestamp_secs(clamped);
-                return Some((tantivy_dt, ts, clamped));
-            }
+        if let Ok(nd) = NaiveDate::parse_from_str(s, fmt)
+            && let Some(ndt) = nd.and_hms_opt(0, 0, 0)
+        {
+            let ts = Utc.from_utc_datetime(&ndt).timestamp();
+            let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+            let tantivy_dt = DateTime::from_timestamp_secs(clamped);
+            return Some((tantivy_dt, ts, clamped));
         }
     }
 
     // Year-month format (YYYY-MM) -> first day of month, midnight UTC
     // NaiveDate::parse_from_str cannot parse incomplete dates, so we handle this manually
-    if s.len() == 7 && s.chars().nth(4) == Some('-') {
-        if let (Ok(year), Ok(month)) = (s[0..4].parse::<i32>(), s[5..7].parse::<u32>()) {
-            if let Some(nd) = NaiveDate::from_ymd_opt(year, month, 1) {
-                if let Some(ndt) = nd.and_hms_opt(0, 0, 0) {
-                    let ts = Utc.from_utc_datetime(&ndt).timestamp();
-                    let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
-                    let tantivy_dt = DateTime::from_timestamp_secs(clamped);
-                    return Some((tantivy_dt, ts, clamped));
-                }
-            }
-        }
+    if s.len() == 7
+        && s.chars().nth(4) == Some('-')
+        && let (Ok(year), Ok(month)) = (s[0..4].parse::<i32>(), s[5..7].parse::<u32>())
+        && let Some(nd) = NaiveDate::from_ymd_opt(year, month, 1)
+        && let Some(ndt) = nd.and_hms_opt(0, 0, 0)
+    {
+        let ts = Utc.from_utc_datetime(&ndt).timestamp();
+        let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+        let tantivy_dt = DateTime::from_timestamp_secs(clamped);
+        return Some((tantivy_dt, ts, clamped));
     }
 
     // Year-only format (YYYY) -> Jan 1, midnight UTC
     // NaiveDate::parse_from_str cannot parse year-only, so we handle this manually
-    if s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()) {
-        if let Ok(year) = s.parse::<i32>() {
-            if let Some(nd) = NaiveDate::from_ymd_opt(year, 1, 1) {
-                if let Some(ndt) = nd.and_hms_opt(0, 0, 0) {
-                    let ts = Utc.from_utc_datetime(&ndt).timestamp();
-                    let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
-                    let tantivy_dt = DateTime::from_timestamp_secs(clamped);
-                    return Some((tantivy_dt, ts, clamped));
-                }
-            }
-        }
+    if s.len() == 4
+        && s.chars().all(|c| c.is_ascii_digit())
+        && let Ok(year) = s.parse::<i32>()
+        && let Some(nd) = NaiveDate::from_ymd_opt(year, 1, 1)
+        && let Some(ndt) = nd.and_hms_opt(0, 0, 0)
+    {
+        let ts = Utc.from_utc_datetime(&ndt).timestamp();
+        let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+        let tantivy_dt = DateTime::from_timestamp_secs(clamped);
+        return Some((tantivy_dt, ts, clamped));
     }
 
     None
