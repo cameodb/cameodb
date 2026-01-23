@@ -363,11 +363,16 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
 
     // Start the HTTP server (with connect info for client addr extraction)
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
     let server_handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
+        .with_graceful_shutdown(async {
+            let _ = shutdown_rx.await;
+        })
         .await
         {
             eprintln!("Server error: {}", e);
@@ -393,12 +398,31 @@ async fn main() -> Result<()> {
 
     #[cfg(not(unix))]
     {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::warn!("Failed to listen for Ctrl+C signal: {}", e);
+        use tokio::signal::windows;
+
+        let mut sigint = windows::ctrl_c()
+            .map_err(|e| anyhow::anyhow!("Failed to setup Ctrl+C handler: {}", e))?;
+        let mut sigclose = windows::ctrl_close()
+            .map_err(|e| anyhow::anyhow!("Failed to setup CTRL_CLOSE handler: {}", e))?;
+        let mut sigshutdown = windows::ctrl_shutdown()
+            .map_err(|e| anyhow::anyhow!("Failed to setup CTRL_SHUTDOWN handler: {}", e))?;
+
+        tokio::select! {
+            _ = sigint.recv() => {
+                tracing::info!("Received CTRL+C, shutting down...");
+            }
+            _ = sigclose.recv() => {
+                tracing::info!("Received CTRL_CLOSE (service stop/console close), shutting down...");
+            }
+            _ = sigshutdown.recv() => {
+                tracing::info!("Received CTRL_SHUTDOWN (service stop), shutting down...");
+            }
         }
-        tracing::info!("Received SIGINT (Ctrl+C), shutting down...");
     }
     println!("Shutting down...");
+
+    // Signal HTTP server to drain gracefully
+    let _ = shutdown_tx.send(());
 
     // Shutdown all shards gracefully to commit pending writes
     tracing::info!("Shutting down all shards...");
@@ -412,6 +436,9 @@ async fn main() -> Result<()> {
     // Signal coordinator to shutdown swarm gracefully
     let _ = coordinator_actor.ask(ShutdownSwarm).await;
 
-    server_handle.abort();
+    if let Err(e) = server_handle.await {
+        tracing::warn!("HTTP server task ended with error: {}", e);
+    }
+
     Ok(())
 }
