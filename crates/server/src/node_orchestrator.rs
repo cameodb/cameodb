@@ -2243,42 +2243,50 @@ impl NodeOrchestrator {
         // Fast path: if schema is mature and batch is small, skip expensive clone
         let use_fast_path = !is_initial_creation && docs.len() < 1000;
 
+        // Clone data so it is Send + 'static inside spawn_blocking
+        let docs_owned: Vec<DocPayload> = docs.to_vec();
+        let schema_clone = schema_cache.clone();
+
         if use_fast_path {
-            // Use read-only reference to avoid cloning
             tracing::debug!("Using fast path validation for {} documents", docs.len());
-            let results: Vec<SchemaValidationResult> = docs
-                .par_iter()
-                .enumerate()
-                .map(|(_doc_index, doc_payload)| {
-                    self.validate_single_document_readonly_fast(
-                        &doc_payload.doc,
-                        schema_cache, // Pass by reference, no clone
-                        is_initial_creation,
-                    )
-                })
-                .collect();
+            let results = tokio::task::spawn_blocking(move || {
+                docs_owned
+                    .par_iter()
+                    .map(|doc_payload| {
+                        Self::validate_single_document_readonly_fast(
+                            &doc_payload.doc,
+                            &schema_clone,
+                            is_initial_creation,
+                        )
+                    })
+                    .collect::<Vec<SchemaValidationResult>>()
+            })
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?;
+
             return Ok(results);
         }
 
-        // Parallel validation using rayon - schema is now pre-populated
-        let results: Vec<SchemaValidationResult> = docs
-            .par_iter()
-            .enumerate()
-            .map(|(_doc_index, doc_payload)| {
-                self.validate_single_document_readonly(
-                    &doc_payload.doc,
-                    schema_cache, // Use reference, schema is now stable
-                    is_initial_creation,
-                )
-            })
-            .collect();
+        let results = tokio::task::spawn_blocking(move || {
+            docs_owned
+                .par_iter()
+                .map(|doc_payload| {
+                    Self::validate_single_document_readonly(
+                        &doc_payload.doc,
+                        &schema_clone,
+                        is_initial_creation,
+                    )
+                })
+                .collect::<Vec<SchemaValidationResult>>()
+        })
+        .await
+        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?;
 
         Ok(results)
     }
 
     /// Read-only validation for a single document (no mutations) - fast path
     fn validate_single_document_readonly_fast(
-        &self,
         doc: &JsonValue,
         schema_cache: &IndexSchema, // Pass by reference, no clone needed
         _is_initial_creation: bool,
@@ -2361,7 +2369,6 @@ impl NodeOrchestrator {
 
     /// Read-only validation for a single document (no mutations)
     fn validate_single_document_readonly(
-        &self,
         doc: &JsonValue,
         schema_cache: &IndexSchema,
         _is_initial_creation: bool,

@@ -41,6 +41,7 @@ use tantivy::query::QueryParserError;
 use tantivy::schema::{Document, FAST, Field, INDEXED, STORED, STRING, Schema, TEXT};
 use tantivy::{DateTime, Index, IndexReader, IndexWriter, doc};
 use thiserror::Error;
+use tracing::{debug, trace, warn};
 use walkdir::WalkDir;
 
 const TANTIVY_DATA_FILE_EXTENSIONS: &[&str] = &["store", "fast", "idx", "doc", "pos", "term"];
@@ -2029,8 +2030,6 @@ impl HybridStore {
         query: &str,
         limit: usize,
     ) -> Result<(Vec<(f32, JsonValue)>, usize), StoreError> {
-        use tracing::{debug, warn};
-
         // Get reader and field mapping from cache or disk
         let (reader, fields) = match self.get_reader(index)? {
             Some(r) => r,
@@ -2200,6 +2199,8 @@ impl HybridStore {
                 }
 
                 results.push((score, complete_doc));
+            } else {
+                trace!(index = %index, doc_id = %doc_id, "Document not found in redb lookup map");
             }
         }
 
@@ -2220,6 +2221,7 @@ impl HybridStore {
         index: &str,
         ops: Vec<WalOp>,
     ) -> Result<(Vec<u64>, usize), StoreError> {
+        let ops_len = ops.len();
         if ops.is_empty() {
             return Ok((Vec::new(), 0));
         }
@@ -2241,9 +2243,9 @@ impl HybridStore {
                     index
                 ))
             })?;
-            counter.fetch_add(ops.len() as u64, Ordering::SeqCst) + 1 - ops.len() as u64
+            counter.fetch_add(ops_len as u64, Ordering::SeqCst) + 1 - ops_len as u64
         };
-        let seq_ids_iter = (0..ops.len()).map(|i| start_seq + i as u64);
+        let seq_ids_iter = (0..ops_len).map(|i| start_seq + i as u64);
 
         // Generate sequence IDs for all operations in one atomic operation
         let data_table_name = format!("data_{}", index);
@@ -2251,13 +2253,64 @@ impl HybridStore {
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
         let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
 
+        #[derive(Debug)]
+        enum PreparedKind {
+            Put { json_blob: Option<JsonValue> },
+            Delete,
+        }
+
+        #[derive(Debug)]
+        struct PreparedOp {
+            wal_bytes: Vec<u8>,
+            doc_bytes: Option<Vec<u8>>,
+            id: String,
+            kind: PreparedKind,
+        }
+
+        // Step 1: Serialize outside of lock (CPU work)
+        let mut prepared_ops = Vec::with_capacity(ops_len);
+        for op in ops {
+            match op {
+                WalOp::Put { id, json_blob } => {
+                    let wal_bytes = serde_json::to_vec(&WalOp::Put {
+                        id: id.clone(),
+                        json_blob: json_blob.clone(),
+                    })
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+                    let doc_bytes = serde_json::to_vec(&StoredDoc {
+                        json_blob: json_blob.as_ref(),
+                    })
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+                    prepared_ops.push(PreparedOp {
+                        wal_bytes,
+                        doc_bytes: Some(doc_bytes),
+                        id,
+                        kind: PreparedKind::Put { json_blob },
+                    });
+                }
+                WalOp::Delete { id } => {
+                    let wal_bytes = serde_json::to_vec(&WalOp::Delete { id: id.clone() })
+                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+                    prepared_ops.push(PreparedOp {
+                        wal_bytes,
+                        doc_bytes: None,
+                        id,
+                        kind: PreparedKind::Delete,
+                    });
+                }
+            }
+        }
+
         // Single transaction for all operations
         let mut write_txn = self.kv.begin_write()?;
         let mut tantivy_ops = Vec::new();
-        let batch_size = ops.len() as u64;
+        let batch_size = ops_len as u64;
 
         // Collect sequence IDs during processing
-        let mut seq_ids = Vec::with_capacity(ops.len());
+        let mut seq_ids = Vec::with_capacity(ops_len);
         let mut new_documents_count = 0usize;
         let mut updated_document_ids = Vec::new(); // Track updated documents for selective Tantivy deletes
 
@@ -2275,18 +2328,15 @@ impl HybridStore {
             let mut data_table = write_txn.open_table(data_table_def)?;
 
             // Process operations and collect sequence IDs
-            for (op, seq_id) in ops.into_iter().zip(seq_ids_iter) {
+            for (prepared, seq_id) in prepared_ops.into_iter().zip(seq_ids_iter) {
                 // Write to WAL
-                let wal_data = serde_json::to_vec(&op)
-                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                wal_table.insert(seq_id, wal_data.as_slice())?;
+                wal_table.insert(seq_id, prepared.wal_bytes.as_slice())?;
 
                 // Collect sequence ID for final result
                 seq_ids.push(seq_id);
 
-                // Apply to data table and prepare tantivy operations
-                match op {
-                    WalOp::Put { id, json_blob } => {
+                match prepared.kind {
+                    PreparedKind::Put { json_blob } => {
                         // Step 1: Get cached schema for field filtering
                         // If not in cache, load from persisted metadata
                         let schema = if let Some(schema) = self.get_schema_cached(index)? {
@@ -2299,26 +2349,22 @@ impl HybridStore {
                                 .unwrap_or_else(|| Arc::new(IndexSchema::default()))
                         };
 
-                        // Step 2: Serialize complete document for redb (all fields)
-                        let doc_data = StoredDoc {
-                            json_blob: json_blob.as_ref(),
-                        };
-                        let doc_bytes = serde_json::to_vec(&doc_data)
-                            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                        if let Some(doc_bytes) = &prepared.doc_bytes {
+                            // Check if document is new or updated by examining insert return value
+                            let old_value =
+                                data_table.insert(prepared.id.as_str(), doc_bytes.as_slice())?;
+                            let is_new_document = old_value.is_none();
 
-                        // Check if document is new or updated by examining insert return value
-                        let old_value = data_table.insert(id.as_str(), doc_bytes.as_slice())?;
-                        let is_new_document = old_value.is_none();
-
-                        if is_new_document {
-                            new_documents_count += 1;
-                        } else {
-                            // Track updated documents for selective Tantivy deletes
-                            updated_document_ids.push(id.clone());
+                            if is_new_document {
+                                new_documents_count += 1;
+                            } else {
+                                // Track updated documents for selective Tantivy deletes
+                                updated_document_ids.push(prepared.id.clone());
+                            }
                         }
 
                         // Step 3: Build tantivy document with ONLY indexed fields
-                        let mut tantivy_doc = doc!(fields.id => id.as_str());
+                        let mut tantivy_doc = doc!(fields.id => prepared.id.as_str());
 
                         // Step 4: Index schema-defined fields individually
                         for (field_name, field_def) in &schema.fields {
@@ -2433,11 +2479,11 @@ impl HybridStore {
                             }
                         }
 
-                        tantivy_ops.push(("add", tantivy_doc, id));
+                        tantivy_ops.push(("add", tantivy_doc, prepared.id));
                     }
-                    WalOp::Delete { id } => {
-                        data_table.remove(id.as_str())?;
-                        tantivy_ops.push(("delete", doc!(), id));
+                    PreparedKind::Delete => {
+                        data_table.remove(prepared.id.as_str())?;
+                        tantivy_ops.push(("delete", doc!(), prepared.id));
                     }
                 }
             }

@@ -972,20 +972,23 @@ async fn detect_schema_from_csv(
         }
     }
 
-    // CRITICAL: Mark all fields as indexed when loading schema from file
+    // CRITICAL: Mark all fields as indexed when loading schema from CSV/TSV file
     // This is different from dynamic evolution during writes, where fields start as non-indexed
-    // When explicitly creating a schema from a CSV, all fields should be indexed by default
-    for (_, field_def) in schema.fields.iter_mut() {
+    // When explicitly creating a schema from CSV/TSV, all fields should be indexed by default
+    // IMPORTANT: Only 'id' field is stored in Tantivy; all other data comes from redb
+    for (name, field_def) in schema.fields.iter_mut() {
         field_def.indexed = true;
-        field_def.stored = true;
+        // Only 'id' field should be stored in Tantivy (architecture rule)
+        field_def.stored = name == "id";
     }
 
     // Apply type hints where provided
     for (name, hint) in &headers {
         if let Some(t) = hint.clone() {
+            // FieldDef::new already sets correct stored/fast flags per architecture
             let mut field_def = FieldDef::new(name.clone(), t);
             field_def.indexed = true;
-            field_def.stored = true;
+            // stored flag already set correctly by FieldDef::new (only 'id' = true)
             schema.fields.insert(name.clone(), field_def);
         }
     }
