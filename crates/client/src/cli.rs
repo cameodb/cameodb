@@ -17,6 +17,8 @@ use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::Duration;
 use storage::{FieldDef, IndexSchema, TantivyFieldType};
 
 // Only import colored on non-Windows platforms
@@ -25,6 +27,69 @@ use colored::Colorize;
 
 const SCHEMA_SAMPLE_LIMIT: usize = 200;
 const DEFAULT_BATCH_SIZE: usize = 4000;
+
+/// Simple progress spinner for long-running operations
+struct ProgressSpinner {
+    active: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ProgressSpinner {
+    fn new() -> Self {
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let active_clone = active.clone();
+
+        let handle = thread::spawn(move || {
+            // Use different spinner characters based on platform
+            let spinner_chars: Vec<char> = if cfg!(target_os = "windows") {
+                // Windows PowerShell/Command Prompt compatible characters
+                vec!['|', '/', '-', '\\']
+            } else {
+                // Unix-like systems - Unicode braille characters
+                vec!['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+            };
+            let mut i = 0;
+
+            while active_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                print!("\r{} ", spinner_chars[i % spinner_chars.len()]);
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+                i += 1;
+                // Use slightly slower timing on Windows for better visibility
+                let sleep_ms = if cfg!(target_os = "windows") {
+                    150
+                } else {
+                    100
+                };
+                thread::sleep(Duration::from_millis(sleep_ms));
+            }
+            // Clear the spinner character when done, leaving cursor at start of line
+            print!("\r");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        });
+
+        Self {
+            active,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(&mut self) {
+        // Signal the thread to stop
+        self.active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // Wait for the thread to finish
+        if let Some(handle) = self.handle.take() {
+            handle.join().ok();
+        }
+    }
+}
+
+impl Drop for ProgressSpinner {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "cameodb-client", about = "CameoDB CLI Client")]
@@ -916,38 +981,68 @@ fn parse_batch_size_arg<'a>(args: &'a [&'a str], default: usize) -> Result<(usiz
     Ok((batch_size, remaining))
 }
 
-/// Detect the index of the ID field from CSV headers.
+/// Result of ID field detection
+#[derive(Debug)]
+struct IdFieldDetection {
+    index: usize,
+    original_field_name: String,
+    is_shadow: bool, // true if original field != "id"
+}
+
+/// Detect the ID field from CSV headers with shadow field support.
 ///
 /// Priority order:
 /// 1. Exact match: field named "id" (case-insensitive)
 /// 2. Hash algorithms: "sha256", "sha1", "md5" (in order of complexity)
 /// 3. Substring match: any field containing "id" (case-insensitive)
 /// 4. Fallback: first column (index 0)
-fn detect_id_field_index(headers: &[(String, Option<TantivyFieldType>)]) -> usize {
+fn detect_id_field(headers: &[(String, Option<TantivyFieldType>)]) -> IdFieldDetection {
     // Hash algorithms ordered by complexity (most complex first for better distribution)
     let hash_algorithms = ["sha256", "sha1", "md5"];
 
-    headers
+    // Try exact match first
+    if let Some(pos) = headers.iter().position(|(h, _)| h.to_lowercase() == "id") {
+        return IdFieldDetection {
+            index: pos,
+            original_field_name: "id".to_string(),
+            is_shadow: false, // No shadow needed for canonical "id" field
+        };
+    }
+
+    // Look for hash algorithm fields in priority order
+    for hash_name in &hash_algorithms {
+        if let Some(pos) = headers
+            .iter()
+            .position(|(h, _)| h.to_lowercase() == *hash_name)
+        {
+            return IdFieldDetection {
+                index: pos,
+                original_field_name: hash_name.to_string(),
+                is_shadow: true, // Create shadow field for hash algorithm fields
+            };
+        }
+    }
+
+    // Look for substring match
+    if let Some(pos) = headers
         .iter()
-        .position(|(h, _)| h.to_lowercase() == "id")
-        .or_else(|| {
-            // Look for hash algorithm fields in priority order
-            for hash_name in &hash_algorithms {
-                if let Some(pos) = headers
-                    .iter()
-                    .position(|(h, _)| h.to_lowercase() == *hash_name)
-                {
-                    return Some(pos);
-                }
-            }
-            None
-        })
-        .or_else(|| {
-            headers
-                .iter()
-                .position(|(h, _)| h.to_lowercase().contains("id"))
-        })
-        .unwrap_or(0) // Use first column if no 'id' found
+        .position(|(h, _)| h.to_lowercase().contains("id"))
+    {
+        let field_name = &headers[pos].0;
+        return IdFieldDetection {
+            index: pos,
+            original_field_name: field_name.clone(),
+            is_shadow: field_name.to_lowercase() != "id", // Shadow if not canonical "id"
+        };
+    }
+
+    // Fallback: first column
+    let field_name = &headers[0].0;
+    IdFieldDetection {
+        index: 0,
+        original_field_name: field_name.clone(),
+        is_shadow: field_name.to_lowercase() != "id", // Shadow if not canonical "id"
+    }
 }
 
 async fn detect_schema_from_csv(
@@ -964,10 +1059,19 @@ async fn detect_schema_from_csv(
     let headers: Vec<(String, Option<TantivyFieldType>)> =
         raw_headers.iter().map(parse_header_with_hint).collect();
 
-    let id_idx = detect_id_field_index(&headers);
+    let id_detection = detect_id_field(&headers);
 
     let mut schema = IndexSchema::default();
     let mut sampled = 0usize;
+
+    // Add shadow field if needed (before processing records)
+    if id_detection.is_shadow {
+        let field_type = headers[id_detection.index]
+            .1
+            .clone()
+            .unwrap_or(TantivyFieldType::Text);
+        schema.add_shadow_field(id_detection.original_field_name.clone(), field_type);
+    }
 
     for record in reader.records() {
         let record = record.context("Failed to read CSV record")?;
@@ -982,7 +1086,7 @@ async fn detect_schema_from_csv(
         }
 
         // Inject canonical "id" field from the detected source field
-        if let Some(raw_id) = record.get(id_idx) {
+        if let Some(raw_id) = record.get(id_detection.index) {
             let id_val = raw_id.trim();
             if !id_val.is_empty() {
                 obj.insert("id".to_string(), JsonValue::String(id_val.to_string()));
@@ -1001,20 +1105,27 @@ async fn detect_schema_from_csv(
     // This is different from dynamic evolution during writes, where fields start as non-indexed
     // When explicitly creating a schema from CSV/TSV, all fields should be indexed by default
     // IMPORTANT: Only 'id' field is stored in Tantivy; all other data comes from redb
+    // CRITICAL: Preserve shadow field status - shadow fields should remain non-indexed and non-stored
     for (name, field_def) in schema.fields.iter_mut() {
-        field_def.indexed = true;
-        // Only 'id' field should be stored in Tantivy (architecture rule)
-        field_def.stored = name == "id";
+        // Don't modify shadow fields - they have special requirements
+        if !field_def.is_shadow {
+            field_def.indexed = true;
+            // Only 'id' field should be stored in Tantivy (architecture rule)
+            field_def.stored = name == "id";
+        }
     }
 
     // Apply type hints where provided
     for (name, hint) in &headers {
         if let Some(t) = hint.clone() {
-            // FieldDef::new already sets correct stored/fast flags per architecture
-            let mut field_def = FieldDef::new(name.clone(), t);
-            field_def.indexed = true;
-            // stored flag already set correctly by FieldDef::new (only 'id' = true)
-            schema.fields.insert(name.clone(), field_def);
+            // Don't overwrite shadow fields - preserve their special status
+            if !schema.fields.get(name).is_some_and(|f| f.is_shadow) {
+                // FieldDef::new already sets correct stored/fast flags per architecture
+                let mut field_def = FieldDef::new(name.clone(), t);
+                field_def.indexed = true;
+                // stored flag already set correctly by FieldDef::new (only 'id' = true)
+                schema.fields.insert(name.clone(), field_def);
+            }
         }
     }
 
@@ -1026,6 +1137,7 @@ async fn detect_schema_from_csv(
             indexed: true,
             stored: true,
             fast: false,
+            is_shadow: false, // The canonical 'id' field is not a shadow field
             tokenizer: Some("raw".to_string()),
             index_record_option: Some("Basic".to_string()),
         };
@@ -1084,16 +1196,23 @@ async fn load_schema_from_source(
     source: &str,
     delimiter: Delimiter,
 ) -> Result<JsonValue> {
+    // OPTIMIZATION: Start spinner immediately - we know schema processing will happen
+    let mut spinner = ProgressSpinner::new();
+
     // Try to parse as JSON schema first
     let raw_bytes = fetch_bytes_source(client, source).await?;
+
     if let Ok(json) = serde_json::from_slice::<JsonValue>(&raw_bytes)
         && json.get("fields").is_some()
     {
+        spinner.stop();
         return Ok(json);
     }
 
     // Fallback: treat as CSV and detect
-    detect_schema_from_csv(client, source, delimiter).await
+    let result = detect_schema_from_csv(client, source, delimiter).await;
+    spinner.stop();
+    result
 }
 
 async fn load_data_from_csv(
@@ -1119,6 +1238,9 @@ async fn load_data_from_csv(
         );
     }
 
+    // OPTIMIZATION: Start spinner immediately after schema check, before any file processing
+    let mut spinner = ProgressSpinner::new();
+
     let mut reader = open_csv_reader(client, source, delimiter).await?;
     let raw_headers = reader
         .headers()
@@ -1128,12 +1250,9 @@ async fn load_data_from_csv(
     let headers: Vec<(String, Option<TantivyFieldType>)> =
         raw_headers.iter().map(parse_header_with_hint).collect();
 
-    let id_idx = detect_id_field_index(&headers);
+    let id_detection = detect_id_field(&headers);
 
-    let id_header = headers
-        .get(id_idx)
-        .map(|(h, _)| h.to_string())
-        .unwrap_or_else(|| "id".to_string());
+    let id_header = id_detection.original_field_name.clone();
 
     let mut batch: Vec<JsonValue> = Vec::with_capacity(batch_size);
     let mut total_sent = 0usize;
@@ -1142,7 +1261,7 @@ async fn load_data_from_csv(
         let record = record.context("Failed to read CSV record")?;
         let mut doc_obj: JsonMap<String, JsonValue> = JsonMap::new();
 
-        let id_value_raw = record.get(id_idx).unwrap_or_default();
+        let id_value_raw = record.get(id_detection.index).unwrap_or_default();
         if id_value_raw.trim().is_empty() {
             // Skip rows without an id; CameoDB requires an id field
             continue;
@@ -1183,6 +1302,9 @@ async fn load_data_from_csv(
         client.bulk_index(index, &batch).await?;
         total_sent += batch.len();
     }
+
+    // Stop the progress spinner
+    spinner.stop();
 
     println!(
         "Loaded {} documents into index '{}' (batch size {})",

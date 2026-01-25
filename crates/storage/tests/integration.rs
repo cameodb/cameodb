@@ -162,3 +162,126 @@ fn test_storage_configuration() {
 
     println!("✅ Storage configuration works correctly!");
 }
+
+#[test]
+fn test_shadow_field_preservation_during_evolution() {
+    use serde_json::json;
+    use storage::{IndexSchema, TantivyFieldType};
+
+    println!("Testing shadow field preservation during schema evolution...");
+
+    // Simulate the CSV import scenario
+    let mut schema = IndexSchema::default();
+
+    // Step 1: Add shadow field (as done in CSV import)
+    println!("1. Adding shadow field 'book_id'...");
+    let added = schema.add_shadow_field("book_id".to_string(), TantivyFieldType::Text);
+    assert!(added, "Shadow field should be added");
+
+    // Verify shadow field properties
+    let book_id_field = schema.fields.get("book_id").unwrap();
+    assert!(
+        book_id_field.is_shadow,
+        "book_id should be marked as shadow"
+    );
+    assert!(
+        !book_id_field.indexed,
+        "Shadow fields should not be indexed"
+    );
+    assert!(!book_id_field.stored, "Shadow fields should not be stored");
+    println!("   ✅ Shadow field added with correct properties");
+
+    // Step 2: Simulate document processing during CSV import
+    println!("2. Simulating document with book_id field...");
+    let document = json!({
+        "book_id": "12345",
+        "title": "Test Book",
+        "author": "Test Author"
+    });
+
+    // This is what happens during CSV import - evolve_from_document is called
+    let _evolved_fields = schema.evolve_from_document(&document);
+
+    // Step 3: Verify shadow field is preserved
+    println!("3. Verifying shadow field preservation...");
+    let book_id_field_after = schema.fields.get("book_id").unwrap();
+    assert!(
+        book_id_field_after.is_shadow,
+        "book_id should still be shadow after evolution"
+    );
+    assert!(
+        !book_id_field_after.indexed,
+        "Shadow fields should remain non-indexed"
+    );
+    assert!(
+        !book_id_field_after.stored,
+        "Shadow fields should remain non-stored"
+    );
+
+    // Verify other fields were added normally
+    assert!(
+        schema.fields.contains_key("title"),
+        "title field should be added"
+    );
+    assert!(
+        schema.fields.contains_key("author"),
+        "author field should be added"
+    );
+
+    println!("   ✅ Shadow field preserved during evolution");
+    println!("   ✅ Other fields added normally");
+
+    // Step 4: Verify shadow mapping works
+    println!("4. Testing shadow mapping...");
+    let shadow_mapping = schema.get_shadow_mapping();
+    assert!(
+        shadow_mapping.contains_key("book_id"),
+        "book_id should be in shadow mapping"
+    );
+    assert_eq!(
+        shadow_mapping.get("book_id").unwrap(),
+        "id",
+        "book_id should map to 'id'"
+    );
+    println!("   ✅ Shadow mapping works correctly");
+
+    // Step 5: Simulate the CSV import finalization process (like in detect_schema_from_csv)
+    println!("5. Testing CSV import finalization process...");
+
+    // This simulates the critical part of detect_schema_from_csv that was overwriting shadow fields
+    for (name, field_def) in schema.fields.iter_mut() {
+        // Don't modify shadow fields - they have special requirements
+        if !field_def.is_shadow {
+            field_def.indexed = true;
+            // Only 'id' field should be stored in Tantivy (architecture rule)
+            field_def.stored = name == "id";
+        }
+    }
+
+    // Verify shadow field is still preserved after finalization
+    let book_id_field_final = schema.fields.get("book_id").unwrap();
+    assert!(
+        book_id_field_final.is_shadow,
+        "book_id should still be shadow after finalization"
+    );
+    assert!(
+        !book_id_field_final.indexed,
+        "Shadow fields should remain non-indexed after finalization"
+    );
+    assert!(
+        !book_id_field_final.stored,
+        "Shadow fields should remain non-stored after finalization"
+    );
+    println!("   ✅ Shadow field preserved during CSV import finalization");
+
+    println!("\n🎉 All tests passed! Shadow field preservation fix is working correctly.");
+
+    // Print final schema for verification
+    println!("\nFinal schema:");
+    for (name, field) in &schema.fields {
+        println!(
+            "  {}: indexed={}, stored={}, is_shadow={}",
+            name, field.indexed, field.stored, field.is_shadow
+        );
+    }
+}

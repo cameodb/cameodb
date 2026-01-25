@@ -56,6 +56,78 @@ use storage::{
 /// Type alias for routing results to reduce complexity
 type RoutingResult = Result<(DocPayload, Option<String>, Option<Uuid>), OrchestratorError>;
 
+/// Transform search query to map shadow fields to canonical "id" field
+///
+/// This function replaces shadow field references in queries with "id" field references
+/// to enable searching by original field names while using the efficient canonical ID index.
+///
+/// Example transformations:
+/// - {"term": {"book_id": "book_123"}} → {"term": {"id": "book_123"}}
+/// - {"term": {"sha256": "abc123"}} → {"term": {"id": "abc123"}}
+///
+/// The transformation preserves the query structure while ensuring all shadow field searches
+/// use the optimized "id" field index in Tantivy.
+fn transform_shadow_query(query: &str, schema: &IndexSchema) -> String {
+    let shadow_mapping = schema.get_shadow_mapping();
+
+    if shadow_mapping.is_empty() {
+        // No shadow fields, return original query
+        return query.to_string();
+    }
+
+    // Parse the query as JSON to transform field names
+    if let Ok(mut query_json) = serde_json::from_str::<JsonValue>(query) {
+        transform_shadow_fields_recursive(&mut query_json, &shadow_mapping);
+        serde_json::to_string(&query_json).unwrap_or_else(|_| query.to_string())
+    } else {
+        // If parsing fails, return original query
+        query.to_string()
+    }
+}
+
+/// Recursively transform shadow field names in JSON query structure
+fn transform_shadow_fields_recursive(
+    value: &mut JsonValue,
+    shadow_mapping: &std::collections::HashMap<String, String>,
+) {
+    match value {
+        JsonValue::Object(map) => {
+            // Check if this is a field reference that needs transformation
+            if let Some((field_name, field_value)) = map.iter_mut().next() {
+                // Handle common query patterns: {"term": {"field": "value"}}
+                if (field_name == "term" || field_name == "terms" || field_name == "exists")
+                    && let JsonValue::Object(field_map) = field_value
+                {
+                    for shadow_field in shadow_mapping.keys() {
+                        if let Some(shadow_value) = field_map.remove(shadow_field) {
+                            // Replace shadow field with canonical "id" field
+                            field_map.insert("id".to_string(), shadow_value);
+                            break; // Only one field per term query
+                        }
+                    }
+                }
+
+                // Recursively process nested objects
+                transform_shadow_fields_recursive(field_value, shadow_mapping);
+            }
+
+            // Process all key-value pairs in the object
+            for (_, v) in map.iter_mut() {
+                transform_shadow_fields_recursive(v, shadow_mapping);
+            }
+        }
+        JsonValue::Array(arr) => {
+            // Process array elements
+            for item in arr.iter_mut() {
+                transform_shadow_fields_recursive(item, shadow_mapping);
+            }
+        }
+        _ => {
+            // Primitive values, no transformation needed
+        }
+    }
+}
+
 /// Helper function to detect if an operation is a write operation
 fn is_write_operation(op: &ClientOp) -> bool {
     matches!(
@@ -609,9 +681,11 @@ impl MicroshardActor {
         })?;
 
         let store = Arc::clone(store);
-        let doc = request.doc.clone();
 
-        // Extract ID from document
+        // OPTIMIZATION: Take ownership of doc from request immediately
+        let doc = request.doc;
+
+        // Extract ID (borrowing from doc before move)
         let id = doc
             .get("id")
             .and_then(|v| v.as_str())
@@ -623,8 +697,8 @@ impl MicroshardActor {
             })?
             .to_string();
 
-        // Do not synthesize or transform a body; preserve the document as json_blob only.
-        let json_blob = Some(doc.clone());
+        // OPTIMIZATION: Move doc into Option, no clone
+        let json_blob = Some(doc);
 
         let op = WalOp::Put { id, json_blob };
 
@@ -1279,7 +1353,7 @@ impl RouterActor {
 
             // Helper to push hits from a result up to the remaining limit
             fn push_hits(
-                value: &JsonValue,
+                value: &mut JsonValue,
                 merged_hits: &mut Vec<JsonValue>,
                 limit: usize,
                 total_shards_queried: &mut usize,
@@ -1290,12 +1364,16 @@ impl RouterActor {
                 if merged_hits.len() >= limit {
                     return;
                 }
-                if let Some(hits) = value.get("hits").and_then(|h| h.as_array()) {
-                    for hit in hits {
-                        if merged_hits.len() >= limit {
-                            break;
+                // OPTIMIZATION: Use mutable reference to drain hits instead of cloning
+                if let Some(hits) = value.get_mut("hits").and_then(|h| h.as_array_mut()) {
+                    let remaining = limit - merged_hits.len();
+                    let to_take = hits.len().min(remaining);
+
+                    // Move hits from source to merged_hits
+                    for _ in 0..to_take {
+                        if let Some(hit) = hits.pop() {
+                            merged_hits.push(hit);
                         }
-                        merged_hits.push(hit.clone());
                     }
                 }
                 // Extract shard statistics from the response
@@ -1319,9 +1397,9 @@ impl RouterActor {
             }
 
             // Process local result first
-            match &local_result {
-                Ok(val) => push_hits(
-                    val,
+            match local_result {
+                Ok(mut val) => push_hits(
+                    &mut val,
                     &mut merged_hits,
                     limit,
                     &mut total_shards_queried,
@@ -1341,8 +1419,8 @@ impl RouterActor {
                     break;
                 }
                 match result {
-                    Ok(Ok(val)) => push_hits(
-                        &val,
+                    Ok(Ok(mut val)) => push_hits(
+                        &mut val,
                         &mut merged_hits,
                         limit,
                         &mut total_shards_queried,
@@ -1856,11 +1934,16 @@ impl RouterActor {
                         StreamingSearchResult::Remote { node_id, result } => {
                             nodes_contacted += 1;
                             match result {
-                                Ok(val) => {
-                                    if let Some(hits) = val.get("hits").and_then(|h| h.as_array()) {
-                                        for hit in hits {
+                                Ok(mut val) => {
+                                    // Note: mut val
+                                    // OPTIMIZATION: Take mutable reference to array to move items
+                                    if let Some(hits) =
+                                        val.get_mut("hits").and_then(|h| h.as_array_mut())
+                                    {
+                                        // Drain the hits vector to move ownership
+                                        for hit in hits.drain(..) {
                                             if all_hits.len() < limit {
-                                                all_hits.push(hit.clone());
+                                                all_hits.push(hit);
                                             }
                                         }
                                     }
@@ -3760,11 +3843,21 @@ impl NodeOrchestrator {
                 serde_json::json!({"hits": [], "hits_returned": 0, "total_hits": 0, "took_ms": 0}),
             );
         }
+
+        // Get schema for shadow field transformation
+        let schema = {
+            let cache = self.schema_cache.read().await;
+            cache.get(index).cloned().unwrap_or_default()
+        };
+
+        // Transform query to map shadow fields to canonical "id" field
+        let transformed_query = transform_shadow_query(query, &schema);
+
         let mut handles = Vec::new();
         for (&shard_id, shard) in self.shards.iter() {
             let req = SearchRequest {
                 index: index.to_string(),
-                query: query.to_string(),
+                query: transformed_query.clone(),
                 limit: Some(limit),
             };
             let s = shard.clone();

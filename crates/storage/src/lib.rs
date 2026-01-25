@@ -36,6 +36,7 @@ use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use tantivy::query::QueryParserError;
 use tantivy::schema::{Document, FAST, Field, INDEXED, STORED, STRING, Schema, TEXT};
@@ -321,6 +322,11 @@ pub struct FieldDef {
     pub indexed: bool,
     pub stored: bool,
     pub fast: bool,
+    /// Shadow field flag: true if this field preserves original field name when ID is copied to canonical "id" field
+    /// Shadow fields are NOT indexed and NOT stored in Tantivy, but preserved in schema for query mapping
+    /// Default is false for backward compatibility with existing schemas
+    #[serde(default)]
+    pub is_shadow: bool,
     // Additional options for Text fields
     pub tokenizer: Option<String>,
     pub index_record_option: Option<String>, // "Basic", "WithFreqs", "WithFreqsAndPositions"
@@ -346,7 +352,8 @@ impl FieldDef {
             indexed: true,
             stored,
             fast,
-            tokenizer: None, // Will be set when creating from actual Tantivy schema
+            is_shadow: false,          // Default: not a shadow field
+            tokenizer: None,           // Will be set when creating from actual Tantivy schema
             index_record_option: None, // Will be set when creating from actual Tantivy schema
         }
     }
@@ -379,6 +386,22 @@ impl FieldDef {
             indexed: false, // Non-indexed by default for background evolution
             stored,
             fast,
+            is_shadow: false, // Default: not a shadow field
+            tokenizer: None,
+            index_record_option: None,
+        }
+    }
+
+    /// Create a shadow field definition for preserving original field names
+    /// Shadow fields are NOT indexed and NOT stored in Tantivy, but preserved in schema
+    pub fn new_shadow(name: String, field_type: TantivyFieldType) -> Self {
+        Self {
+            name,
+            field_type,
+            indexed: false,  // Shadow fields are never indexed
+            stored: false,   // Shadow fields are never stored
+            fast: false,     // Shadow fields don't need fast access
+            is_shadow: true, // This is a shadow field
             tokenizer: None,
             index_record_option: None,
         }
@@ -523,6 +546,13 @@ impl IndexSchema {
             return false; // id field is mandatory and should never evolve
         }
 
+        // CRITICAL: Never evolve shadow fields - they preserve their special status
+        if let Some(field_def) = self.fields.get(&name)
+            && field_def.is_shadow
+        {
+            return false; // shadow fields should never evolve
+        }
+
         let inferred_type = FieldDef::infer_type_from_value(value);
 
         match self.fields.entry(name.clone()) {
@@ -549,6 +579,38 @@ impl IndexSchema {
                 }
             }
         }
+    }
+
+    /// Add a shadow field to the schema
+    /// Shadow fields preserve original field names when ID is copied to canonical "id" field
+    /// They are NOT indexed and NOT stored in Tantivy
+    pub fn add_shadow_field(&mut self, name: String, field_type: TantivyFieldType) -> bool {
+        // Don't add shadow field if it already exists
+        if self.fields.contains_key(&name) {
+            return false;
+        }
+
+        let field_def = FieldDef::new_shadow(name.clone(), field_type);
+        self.fields.insert(name, field_def);
+        true
+    }
+
+    /// Check if a field is a shadow field
+    pub fn is_shadow_field(&self, field_name: &str) -> bool {
+        self.fields
+            .get(field_name)
+            .map(|def| def.is_shadow)
+            .unwrap_or(false)
+    }
+
+    /// Get mapping of shadow field names to canonical "id" field
+    /// All shadow fields map to "id" for query transformation
+    pub fn get_shadow_mapping(&self) -> HashMap<String, String> {
+        self.fields
+            .iter()
+            .filter(|(_, def)| def.is_shadow)
+            .map(|(name, _)| (name.clone(), "id".to_string()))
+            .collect()
     }
 
     /// Determine if a field should evolve to a new type (static version to avoid borrowing issues)
@@ -719,9 +781,157 @@ struct StoredDoc<'a> {
 }
 
 /// Owned version for deserialization from redb
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct StoredDocOwned {
     json_blob: Option<JsonValue>,
+}
+
+/// Filter shadow fields from JSON blob for efficient storage
+///
+/// This function removes shadow fields from the JSON blob before storing it in redb,
+/// since shadow fields are only used for query mapping and don't need to be stored.
+/// The canonical "id" field is always preserved.
+///
+/// Example:
+/// Input: {"id": "123", "book_id": "123", "title": "Book"}
+/// Output: {"id": "123", "title": "Book"}  // book_id (shadow) removed
+fn filter_shadow_fields_from_json(json_blob: &JsonValue, schema: &IndexSchema) -> JsonValue {
+    if let Some(obj) = json_blob.as_object() {
+        let mut filtered_obj = serde_json::Map::new();
+
+        for (key, value) in obj {
+            // Keep the field if it's not a shadow field
+            if !schema.is_shadow_field(key) {
+                filtered_obj.insert(key.clone(), value.clone());
+            }
+        }
+
+        JsonValue::Object(filtered_obj)
+    } else {
+        // Not an object, return as-is
+        json_blob.clone()
+    }
+}
+
+/// Reconstruct shadow fields in JSON blob for document retrieval
+///
+/// This function reconstructs shadow fields by copying the canonical "id" value
+/// to shadow field names, restoring the original document structure.
+///
+/// Performance Note: This takes a reference (&JsonValue) and creates a new map
+/// to guarantee field ordering (id → shadow → rest). For zero-copy performance,
+/// consider an owned version if ordering requirements are flexible.
+///
+/// Example:
+/// Input: {"id": "123", "title": "Book"} with shadow mapping {"book_id": "id"}
+/// Output: {"id": "123", "book_id": "123", "title": "Book"}  // book_id reconstructed
+pub fn reconstruct_shadow_fields_in_json(json_blob: &JsonValue, schema: &IndexSchema) -> JsonValue {
+    if let Some(obj) = json_blob.as_object() {
+        let shadow_mapping = schema.get_shadow_mapping();
+
+        // Capacity optimization: pre-allocate for shadow + original fields
+        let mut out = JsonMap::with_capacity(obj.len() + shadow_mapping.len());
+
+        // OPTIMIZATION 1: Use get() instead of get().cloned() to avoid temporary allocation
+        if let Some(id_val) = obj.get("id") {
+            // Insert canonical id first (Enforces Order)
+            out.insert("id".to_string(), id_val.clone());
+
+            // Then shadow fields
+            for (shadow_field, canonical_field) in shadow_mapping.iter() {
+                // Check if mapping targets "id" and field doesn't already exist
+                if canonical_field == "id" && !obj.contains_key(shadow_field) {
+                    out.insert(shadow_field.clone(), id_val.clone());
+                }
+            }
+        }
+
+        // Then remaining original fields (skip id since we added it)
+        for (k, v) in obj {
+            if k != "id" {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+
+        JsonValue::Object(out)
+    } else {
+        json_blob.clone()
+    }
+}
+
+/// Optimized: Reconstruct shadow fields by consuming the input (Ownership Transfer).
+///
+/// This avoids cloning the bulk of the document (original fields).
+/// It creates a new map container to ensure "id" and shadow fields appear first,
+/// but uses `append` to MOVE the heavy data from the old map to the new one.
+pub fn reconstruct_shadow_fields_owned(json_blob: JsonValue, schema: &IndexSchema) -> JsonValue {
+    // fast fail if not an object
+    let mut obj = match json_blob {
+        JsonValue::Object(map) => map,
+        _ => return json_blob,
+    };
+
+    let shadow_mapping = schema.get_shadow_mapping();
+
+    // Even with no shadow mappings, ensure 'id' appears first for consistent ordering
+    if shadow_mapping.is_empty() {
+        // 1. Fast Path: Check if 'id' is already first (O(1) check)
+        // If it is, we don't need to do any work.
+        if let Some(first_key) = obj.keys().next()
+            && first_key == "id"
+        {
+            return JsonValue::Object(obj);
+        }
+
+        // 2. Optimization: Reorder using Move semantics (No cloning)
+        // 'remove' extracts the value owned, 'append' moves the rest.
+        if let Some(id_val) = obj.remove("id") {
+            let mut out = JsonMap::with_capacity(obj.len() + 1);
+            out.insert("id".to_string(), id_val);
+            out.append(&mut obj); // Moves pointers only, very fast
+            return JsonValue::Object(out);
+        }
+
+        // No 'id' field found (edge case), return as is
+        return JsonValue::Object(obj);
+    }
+
+    // Capacity optimization: Existing len + Shadow len
+    let mut out = JsonMap::with_capacity(obj.len() + shadow_mapping.len());
+
+    // 1. Extract or clone ID for shadow population
+    // We try to get ID from the object.
+    let id_val = obj.get("id").cloned();
+
+    // 2. Insert ID first (Preserve Order)
+    if let Some(ref id) = id_val {
+        out.insert("id".to_string(), id.clone());
+
+        // 3. Insert Shadow Fields
+        for (shadow_field, canonical_field) in shadow_mapping {
+            if canonical_field == "id" && !obj.contains_key(&shadow_field) {
+                out.insert(shadow_field, id.clone());
+            }
+        }
+    }
+
+    // 4. MOVE remaining original fields
+    // This is the performance win: `append` moves internal pointers.
+    // No string or value cloning happens here for the actual data.
+    out.append(&mut obj);
+
+    JsonValue::Object(out)
+}
+
+/// Optimized: Filter shadow fields in-place using retain.
+///
+/// This avoids allocating a new map and cloning keys/values.
+fn filter_shadow_fields_owned(mut json_blob: JsonValue, schema: &IndexSchema) -> JsonValue {
+    if let JsonValue::Object(ref mut map) = json_blob {
+        // retain is O(n) scan but O(0) allocation
+        map.retain(|key, _| !schema.is_shadow_field(key));
+    }
+    json_blob
 }
 
 /// Internal schema field mappings for Tantivy.
@@ -931,7 +1141,7 @@ impl HybridStore {
         let mut indexed_fields = HashMap::new();
 
         for (name, field_def) in &index_schema.fields {
-            if name == "id" || !field_def.indexed {
+            if name == "id" || !field_def.indexed || field_def.is_shadow {
                 continue;
             }
 
@@ -1113,6 +1323,7 @@ impl HybridStore {
                     indexed,
                     stored,
                     fast,
+                    is_shadow: false, // Fields derived from Tantivy schema are not shadow fields
                     tokenizer,
                     index_record_option,
                 },
@@ -1178,6 +1389,7 @@ impl HybridStore {
                     indexed: true,
                     stored: true,
                     fast: false,
+                    is_shadow: false, // The canonical 'id' field is not a shadow field
                     tokenizer: Some("raw".to_string()),
                     index_record_option: Some("Basic".to_string()),
                 },
@@ -1456,9 +1668,12 @@ impl HybridStore {
                         }
                     }
 
-                    // Step 2: Serialize complete document for redb (all fields)
+                    // OPTIMIZATION: Clone once (required for WAL/serialization), then filter in-place without new allocations
+                    let filtered_json_blob = json_blob
+                        .clone()
+                        .map(|blob| filter_shadow_fields_owned(blob, &schema));
                     let doc_data = StoredDoc {
-                        json_blob: json_blob.as_ref(),
+                        json_blob: filtered_json_blob.as_ref(),
                     };
                     let doc_bytes = serde_json::to_vec(&doc_data)
                         .map_err(|e| StoreError::Serialization(e.to_string()))?;
@@ -2183,22 +2398,32 @@ impl HybridStore {
                 let stored_doc: StoredDocOwned = serde_json::from_slice(doc_bytes)
                     .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-                // Build complete JSON document with all fields
-                let mut complete_doc = serde_json::json!({
-                    "id": doc_id,
-                });
+                // Get schema for shadow field reconstruction
+                let schema = if let Some(schema) = self.get_schema_cached(index)? {
+                    schema
+                } else {
+                    self.get_schema(index)?
+                        .map(Arc::new)
+                        .unwrap_or_else(|| Arc::new(IndexSchema::default()))
+                };
 
-                // Merge json_blob fields into root document
-                if let Some(json_blob) = stored_doc.json_blob
-                    && let (Some(obj), Some(blob_obj)) =
-                        (complete_doc.as_object_mut(), json_blob.as_object())
-                {
-                    for (k, v) in blob_obj {
-                        obj.insert(k.clone(), v.clone());
+                // OPTIMIZATION: Pass ownership to avoid cloning all fields
+                let final_doc = if let Some(json_blob) = stored_doc.json_blob {
+                    let mut doc = reconstruct_shadow_fields_owned(json_blob, &schema);
+
+                    // Safety check: Ensure top-level ID matches the requested doc_id
+                    if let Some(obj) = doc.as_object_mut()
+                        && !obj.contains_key("id")
+                    {
+                        obj.insert("id".to_string(), serde_json::Value::String(doc_id.clone()));
                     }
-                }
+                    doc
+                } else {
+                    // Fallback if blob was empty
+                    serde_json::json!({ "id": doc_id })
+                };
 
-                results.push((score, complete_doc));
+                results.push((score, final_doc));
             } else {
                 trace!(index = %index, doc_id = %doc_id, "Document not found in redb lookup map");
             }
@@ -2234,6 +2459,15 @@ impl HybridStore {
 
         // Get or create the index
         let (writer_arc, fields) = self.get_or_create_index(index)?;
+
+        // Get schema for shadow field filtering
+        let schema = if let Some(schema) = self.get_schema_cached(index)? {
+            schema
+        } else {
+            self.get_schema(index)?
+                .map(Arc::new)
+                .unwrap_or_else(|| Arc::new(IndexSchema::default()))
+        };
 
         // Generate sequence IDs for all operations in one atomic operation
         let start_seq = {
@@ -2272,14 +2506,19 @@ impl HybridStore {
         for op in ops {
             match op {
                 WalOp::Put { id, json_blob } => {
+                    // OPTIMIZATION: Clone once for WAL, then filter in-place for storage
+                    let filtered_json_blob = json_blob
+                        .clone()
+                        .map(|blob| filter_shadow_fields_owned(blob, &schema));
+
                     let wal_bytes = serde_json::to_vec(&WalOp::Put {
                         id: id.clone(),
-                        json_blob: json_blob.clone(),
+                        json_blob: filtered_json_blob.clone(),
                     })
                     .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
                     let doc_bytes = serde_json::to_vec(&StoredDoc {
-                        json_blob: json_blob.as_ref(),
+                        json_blob: filtered_json_blob.as_ref(),
                     })
                     .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
@@ -2287,7 +2526,9 @@ impl HybridStore {
                         wal_bytes,
                         doc_bytes: Some(doc_bytes),
                         id,
-                        kind: PreparedKind::Put { json_blob },
+                        kind: PreparedKind::Put {
+                            json_blob: filtered_json_blob,
+                        },
                     });
                 }
                 WalOp::Delete { id } => {
@@ -2349,10 +2590,29 @@ impl HybridStore {
                                 .unwrap_or_else(|| Arc::new(IndexSchema::default()))
                         };
 
-                        if let Some(doc_bytes) = &prepared.doc_bytes {
+                        if let Some(original_doc_bytes) = &prepared.doc_bytes {
+                            // Filter shadow fields from document for storage efficiency
+                            let filtered_doc_bytes = if let Ok(stored_doc) =
+                                serde_json::from_slice::<StoredDocOwned>(original_doc_bytes)
+                            {
+                                if let Some(json_blob) = stored_doc.json_blob {
+                                    let filtered_json =
+                                        filter_shadow_fields_from_json(&json_blob, &schema);
+                                    let filtered_stored_doc = StoredDocOwned {
+                                        json_blob: Some(filtered_json),
+                                    };
+                                    serde_json::to_vec(&filtered_stored_doc)
+                                        .map_err(|e| StoreError::Serialization(e.to_string()))?
+                                } else {
+                                    original_doc_bytes.clone()
+                                }
+                            } else {
+                                original_doc_bytes.clone()
+                            };
+
                             // Check if document is new or updated by examining insert return value
-                            let old_value =
-                                data_table.insert(prepared.id.as_str(), doc_bytes.as_slice())?;
+                            let old_value = data_table
+                                .insert(prepared.id.as_str(), filtered_doc_bytes.as_slice())?;
                             let is_new_document = old_value.is_none();
 
                             if is_new_document {
