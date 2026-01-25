@@ -1809,7 +1809,7 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
             ))
         };
 
-        // 2. Forward delete request to all remote nodes
+        // 2. Forward delete request to all remote nodes in parallel
         let known_peers: Vec<KnownPeer> = self
             .cluster
             .peer_nodes
@@ -1820,58 +1820,79 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                 address: info.address.clone(),
             })
             .collect();
-        let mut remote_results = Vec::new();
 
-        for peer in known_peers {
-            let remote_orchestrator_name =
-                crate::node_orchestrator::orchestrator_remote_name(&peer.node_id);
+        let remote_delete_futures: Vec<_> = known_peers
+            .into_iter()
+            .map(|peer| {
+                let index = msg.index.clone();
+                let delete_schema = msg.delete_schema;
+                async move {
+                    let remote_orchestrator_name =
+                        crate::node_orchestrator::orchestrator_remote_name(&peer.node_id);
 
-            match kameo::actor::RemoteActorRef::<crate::node_orchestrator::NodeOrchestrator>::lookup(remote_orchestrator_name.as_str()).await {
-                Ok(Some(remote_orchestrator)) => {
-                    let delete_msg = crate::node_orchestrator::ClientOp::DeleteIndex {
-                        index: msg.index.clone(),
-                        delete_schema: msg.delete_schema,
-                    };
+                    let result =
+                        match kameo::actor::RemoteActorRef::<
+                            crate::node_orchestrator::NodeOrchestrator,
+                        >::lookup(remote_orchestrator_name.as_str())
+                        .await
+                        {
+                            Ok(Some(remote_orchestrator)) => {
+                                let delete_msg = crate::node_orchestrator::ClientOp::DeleteIndex {
+                                    index: index.clone(),
+                                    delete_schema,
+                                };
 
-                    match remote_orchestrator.ask(&delete_msg).await {
-                        Ok(result) => {
-                            info!(
-                                node_id = %peer.node_id,
-                                address = %peer.address,
-                                "Successfully deleted index from remote node"
-                            );
-                            remote_results.push(Ok(result));
-                        }
-                        Err(e) => {
-                            warn!(
-                                node_id = %peer.node_id,
-                                address = %peer.address,
-                                error = %e,
-                                "Failed to delete index from remote node"
-                            );
-                            remote_results.push(Err(format!("Remote node {} failed: {}", peer.node_id, e)));
-                        }
-                    }
+                                match remote_orchestrator.ask(&delete_msg).await {
+                                    Ok(result) => {
+                                        info!(
+                                            node_id = %peer.node_id,
+                                            address = %peer.address,
+                                            "Successfully deleted index from remote node"
+                                        );
+                                        Ok(result)
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            node_id = %peer.node_id,
+                                            address = %peer.address,
+                                            error = %e,
+                                            "Failed to delete index from remote node"
+                                        );
+                                        Err(format!("Remote node {} failed: {}", peer.node_id, e))
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                warn!(
+                                    node_id = %peer.node_id,
+                                    address = %peer.address,
+                                    "Remote orchestrator not found for index deletion"
+                                );
+                                Err(format!(
+                                    "Remote orchestrator not found for node {}",
+                                    peer.node_id
+                                ))
+                            }
+                            Err(e) => {
+                                warn!(
+                                    node_id = %peer.node_id,
+                                    address = %peer.address,
+                                    error = %e,
+                                    "Failed to lookup remote orchestrator for index deletion"
+                                );
+                                Err(format!("Lookup failed for node {}: {}", peer.node_id, e))
+                            }
+                        };
+                    (peer, result)
                 }
-                Ok(None) => {
-                    warn!(
-                        node_id = %peer.node_id,
-                        address = %peer.address,
-                        "Remote orchestrator not found for index deletion"
-                    );
-                    remote_results.push(Err(format!("Remote orchestrator not found for node {}", peer.node_id)));
-                }
-                Err(e) => {
-                    warn!(
-                        node_id = %peer.node_id,
-                        address = %peer.address,
-                        error = %e,
-                        "Failed to lookup remote orchestrator for index deletion"
-                    );
-                    remote_results.push(Err(format!("Lookup failed for node {}: {}", peer.node_id, e)));
-                }
-            }
-        }
+            })
+            .collect();
+
+        let remote_results: Vec<_> = futures::future::join_all(remote_delete_futures)
+            .await
+            .into_iter()
+            .map(|(_peer, result)| result)
+            .collect();
 
         // Combine local and remote results
         let mut all_errors = Vec::new();

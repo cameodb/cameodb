@@ -3369,7 +3369,7 @@ impl NodeOrchestrator {
         }
     }
 
-    /// Delete an index and all its data from all local shards
+    /// Delete an index and all its data from all local shards (parallel)
     async fn orch_delete_index(
         &self,
         index: &str,
@@ -3382,12 +3382,27 @@ impl NodeOrchestrator {
             )));
         }
 
+        // Delete index data from all local shards in parallel
+        let delete_futures: Vec<_> = self
+            .shards
+            .iter()
+            .map(|(shard_id, shard)| {
+                let shard_id = *shard_id;
+                let index = index.to_string();
+                async move {
+                    let result = shard.delete_index(&index, delete_schema).await;
+                    (shard_id, result)
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(delete_futures).await;
+
         let mut deleted_from_shards = 0;
         let mut errors = Vec::new();
 
-        // Delete index data from all local shards
-        for (shard_id, shard) in &self.shards {
-            match shard.delete_index(index, delete_schema).await {
+        for (shard_id, result) in results {
+            match result {
                 Ok(_) => {
                     deleted_from_shards += 1;
                     tracing::info!(
@@ -3398,7 +3413,6 @@ impl NodeOrchestrator {
                     );
                 }
                 Err(e) => {
-                    // Log but continue - index might not exist on this shard
                     tracing::warn!(
                         shard_id = %shard_id,
                         index = %index,
@@ -3421,7 +3435,7 @@ impl NodeOrchestrator {
             "index": index,
             "deleted_from_shards": deleted_from_shards,
             "total_shards": self.shards.len(),
-            "errors": errors  // Always return array, empty if no errors
+            "errors": errors
         }))
     }
 
