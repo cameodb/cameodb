@@ -916,6 +916,40 @@ fn parse_batch_size_arg<'a>(args: &'a [&'a str], default: usize) -> Result<(usiz
     Ok((batch_size, remaining))
 }
 
+/// Detect the index of the ID field from CSV headers.
+///
+/// Priority order:
+/// 1. Exact match: field named "id" (case-insensitive)
+/// 2. Hash algorithms: "sha256", "sha1", "md5" (in order of complexity)
+/// 3. Substring match: any field containing "id" (case-insensitive)
+/// 4. Fallback: first column (index 0)
+fn detect_id_field_index(headers: &[(String, Option<TantivyFieldType>)]) -> usize {
+    // Hash algorithms ordered by complexity (most complex first for better distribution)
+    let hash_algorithms = ["sha256", "sha1", "md5"];
+
+    headers
+        .iter()
+        .position(|(h, _)| h.to_lowercase() == "id")
+        .or_else(|| {
+            // Look for hash algorithm fields in priority order
+            for hash_name in &hash_algorithms {
+                if let Some(pos) = headers
+                    .iter()
+                    .position(|(h, _)| h.to_lowercase() == *hash_name)
+                {
+                    return Some(pos);
+                }
+            }
+            None
+        })
+        .or_else(|| {
+            headers
+                .iter()
+                .position(|(h, _)| h.to_lowercase().contains("id"))
+        })
+        .unwrap_or(0) // Use first column if no 'id' found
+}
+
 async fn detect_schema_from_csv(
     client: &CameoClient,
     source: &str,
@@ -930,16 +964,7 @@ async fn detect_schema_from_csv(
     let headers: Vec<(String, Option<TantivyFieldType>)> =
         raw_headers.iter().map(parse_header_with_hint).collect();
 
-    // Detect ID field with priority: exact match 'id' > substring match > first column
-    let id_idx = headers
-        .iter()
-        .position(|(h, _)| h.to_lowercase() == "id")
-        .or_else(|| {
-            headers
-                .iter()
-                .position(|(h, _)| h.to_lowercase().contains("id"))
-        })
-        .unwrap_or(0); // Use first column if no 'id' found
+    let id_idx = detect_id_field_index(&headers);
 
     let mut schema = IndexSchema::default();
     let mut sampled = 0usize;
@@ -1103,16 +1128,7 @@ async fn load_data_from_csv(
     let headers: Vec<(String, Option<TantivyFieldType>)> =
         raw_headers.iter().map(parse_header_with_hint).collect();
 
-    // Detect ID field with priority: exact match 'id' > substring match > first column
-    let id_idx = headers
-        .iter()
-        .position(|(h, _)| h.to_lowercase() == "id")
-        .or_else(|| {
-            headers
-                .iter()
-                .position(|(h, _)| h.to_lowercase().contains("id"))
-        })
-        .unwrap_or(0); // Use first column if no 'id' found
+    let id_idx = detect_id_field_index(&headers);
 
     let id_header = headers
         .get(id_idx)
