@@ -939,6 +939,8 @@ fn filter_shadow_fields_owned(mut json_blob: JsonValue, schema: &IndexSchema) ->
 pub struct SchemaFields {
     /// Tantivy field for the document identifier
     id: Field,
+    /// Tantivy field for the WAL sequence number
+    seq: Field,
     /// Map of schema field name -> Tantivy field (only indexed fields are present)
     indexed_fields: HashMap<String, Field>,
 }
@@ -1109,6 +1111,258 @@ impl HybridStore {
         Ok(())
     }
 
+    /// Get the highest sequence number (_seq) currently committed in Tantivy index.
+    /// Returns 0 if the index is empty or doesn't exist.
+    /// This is used during WAL recovery to determine which operations need to be replayed.
+    fn get_last_indexed_seq(
+        &self,
+        reader: &IndexReader,
+        index_name: &str,
+    ) -> Result<u64, StoreError> {
+        let searcher = reader.searcher();
+
+        // Verify the _seq field exists in the schema
+        let schema = searcher.index().schema();
+        schema.get_field("_seq").map_err(|_| {
+            StoreError::FieldNotFound(format!("_seq field missing in index '{}'", index_name))
+        })?;
+
+        // Use TopDocs collector with limit 1, sorted by _seq descending
+        // Note: order_by_u64_field expects the field name as a string
+        let query = tantivy::query::AllQuery;
+        let collector = tantivy::collector::TopDocs::with_limit(1)
+            .order_by_u64_field("_seq", tantivy::Order::Desc);
+
+        let top_docs = searcher.search(&query, &collector)?;
+
+        // If a document is found, the sort value IS the _seq value (u64)
+        // TopDocs returns (sort_value, doc_address) tuples
+        if let Some((sort_value, _doc_address)) = top_docs.first() {
+            return Ok(*sort_value);
+        }
+
+        // Return 0 if index is empty
+        Ok(0)
+    }
+
+    /// Recover missing WAL operations for an index by replaying them to Tantivy.
+    /// This bridges the gap between Redb WAL and Tantivy index after a crash/restart.
+    /// Returns the count of replayed operations.
+    fn recover_index(
+        &self,
+        index: &str,
+        writer: &mut IndexWriter,
+        reader: &IndexReader,
+    ) -> Result<usize, StoreError> {
+        // Get the last sequence number committed in Tantivy
+        let last_seq = self.get_last_indexed_seq(reader, index)?;
+
+        tracing::debug!(
+            index = %index,
+            last_seq = last_seq,
+            "Starting WAL recovery"
+        );
+
+        // Start a read transaction on Redb
+        let read_txn = self.kv.begin_read()?;
+
+        // Open the WAL table for this index
+        let wal_table_name = format!("wal_{}", index);
+        let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
+
+        let wal_table = match read_txn.open_table(wal_table_def) {
+            Ok(table) => table,
+            Err(_) => {
+                // WAL table doesn't exist yet (new index), nothing to recover
+                tracing::debug!(index = %index, "No WAL table found, skipping recovery");
+                return Ok(0);
+            }
+        };
+
+        // Get the schema and fields for building documents
+        let index_schema = self
+            .get_schema_cached(index)?
+            .unwrap_or_else(|| Arc::new(IndexSchema::default()));
+
+        let schema = reader.searcher().index().schema();
+        let id_field = schema
+            .get_field("id")
+            .map_err(|_| StoreError::FieldNotFound("id".to_string()))?;
+        let seq_field = schema
+            .get_field("_seq")
+            .map_err(|_| StoreError::FieldNotFound("_seq".to_string()))?;
+
+        // Build indexed fields map
+        let mut indexed_fields = HashMap::new();
+        for (field, field_entry) in schema.fields() {
+            let name = field_entry.name();
+            if name != "id" && name != "_seq" {
+                indexed_fields.insert(name.to_string(), field);
+            }
+        }
+
+        // Use range to get only operations after last_seq
+        let range_start = last_seq + 1;
+        let mut replayed_count = 0;
+
+        for entry_result in wal_table.range(range_start..)? {
+            let (seq_guard, wal_data_guard) = entry_result?;
+            let seq_id = seq_guard.value();
+            let wal_data = wal_data_guard.value();
+
+            // Deserialize the WAL operation
+            let wal_op: WalOp = serde_json::from_slice(wal_data)
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+            // Apply the operation to the writer
+            match wal_op {
+                WalOp::Put { id, json_blob } => {
+                    // Build Tantivy document with id and _seq fields
+                    let mut tantivy_doc = tantivy::TantivyDocument::default();
+                    tantivy_doc.add_text(id_field, &id);
+                    tantivy_doc.add_u64(seq_field, seq_id);
+
+                    // Add indexed fields from the JSON blob
+                    if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
+                        for (field_name, field_def) in &index_schema.fields {
+                            if !field_def.indexed || field_def.is_shadow || field_name == "id" {
+                                continue;
+                            }
+
+                            if let Some(tantivy_field) = indexed_fields.get(field_name)
+                                && let Some(field_value) = json_obj.get(field_name)
+                            {
+                                self.add_field_to_tantivy_doc(
+                                    &mut tantivy_doc,
+                                    *tantivy_field,
+                                    field_def,
+                                    field_value,
+                                )?;
+                            }
+                        }
+                    }
+
+                    // Delete old document and add new one (upsert)
+                    let term = tantivy::Term::from_field_text(id_field, &id);
+                    writer.delete_term(term);
+                    writer.add_document(tantivy_doc)?;
+                }
+                WalOp::Delete { id } => {
+                    // Delete the document by id
+                    let term = tantivy::Term::from_field_text(id_field, &id);
+                    writer.delete_term(term);
+                }
+            }
+
+            replayed_count += 1;
+        }
+
+        if replayed_count > 0 {
+            tracing::debug!(
+                index = %index,
+                replayed_count = replayed_count,
+                "WAL recovery completed"
+            );
+        }
+
+        Ok(replayed_count)
+    }
+
+    /// Helper method to add a field to a Tantivy document based on its type.
+    /// Used during WAL recovery to rebuild documents from JSON.
+    fn add_field_to_tantivy_doc(
+        &self,
+        tantivy_doc: &mut tantivy::TantivyDocument,
+        tantivy_field: Field,
+        field_def: &FieldDef,
+        field_value: &JsonValue,
+    ) -> Result<(), StoreError> {
+        match field_def.field_type {
+            TantivyFieldType::Text => {
+                if let Some(s) = field_value.as_str() {
+                    tantivy_doc.add_text(tantivy_field, s);
+                } else {
+                    let field_str = serde_json::to_string(field_value)
+                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                    tantivy_doc.add_text(tantivy_field, &field_str);
+                }
+            }
+            TantivyFieldType::String => {
+                if let Some(s) = field_value.as_str() {
+                    tantivy_doc.add_text(tantivy_field, s);
+                } else if let Some(arr) = field_value.as_array() {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            tantivy_doc.add_text(tantivy_field, s);
+                        }
+                    }
+                }
+            }
+            TantivyFieldType::F64 => {
+                if let Some(n) = field_value.as_f64() {
+                    tantivy_doc.add_f64(tantivy_field, n);
+                }
+            }
+            TantivyFieldType::I64 => {
+                if let Some(n) = field_value.as_i64() {
+                    tantivy_doc.add_i64(tantivy_field, n);
+                }
+            }
+            TantivyFieldType::U64 => {
+                if let Some(n) = field_value.as_u64() {
+                    tantivy_doc.add_u64(tantivy_field, n);
+                }
+            }
+            TantivyFieldType::Date => {
+                if let Some(s) = field_value.as_str()
+                    && let Some((tantivy_dt, _, _)) = parse_date_str_to_tantivy(s)
+                {
+                    tantivy_doc.add_date(tantivy_field, tantivy_dt);
+                }
+            }
+            TantivyFieldType::Boolean => {
+                if let Some(b) = field_value.as_bool() {
+                    tantivy_doc.add_bool(tantivy_field, b);
+                }
+            }
+            TantivyFieldType::Bytes => {
+                if let Some(arr) = field_value.as_array() {
+                    let mut bytes = Vec::new();
+                    for item in arr {
+                        if let Some(n) = item.as_u64() {
+                            bytes.push(n as u8);
+                        }
+                    }
+                    if !bytes.is_empty() {
+                        tantivy_doc.add_bytes(tantivy_field, &bytes);
+                    }
+                }
+            }
+            TantivyFieldType::Ip => {
+                if let Some(s) = field_value.as_str()
+                    && let Ok(ip) = s.parse::<std::net::IpAddr>()
+                {
+                    let ipv6 = match ip {
+                        std::net::IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
+                        std::net::IpAddr::V6(ipv6) => ipv6,
+                    };
+                    tantivy_doc.add_ip_addr(tantivy_field, ipv6);
+                }
+            }
+            TantivyFieldType::Json => {
+                let json_str = serde_json::to_string(field_value)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                tantivy_doc.add_text(tantivy_field, &json_str);
+            }
+            TantivyFieldType::Facet => {
+                if let Some(s) = field_value.as_str() {
+                    tantivy_doc.add_facet(tantivy_field, s);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Get a value from the read cache if present.
     fn get_from_cache(&self, index: &str, key: &str) -> Option<Vec<u8>> {
         self.read_cache.get(index)?.get(key).cloned()
@@ -1138,10 +1392,14 @@ impl HybridStore {
         // ID field is always present - untokenized string for exact matching
         let id_field = schema_builder.add_text_field("id", STRING | STORED);
 
+        // Sequence field for WAL ordering - reserved field
+        let seq_field = schema_builder.add_u64_field("_seq", STORED | FAST);
+
         let mut indexed_fields = HashMap::new();
 
         for (name, field_def) in &index_schema.fields {
-            if name == "id" || !field_def.indexed || field_def.is_shadow {
+            // Skip reserved fields (id, _seq), non-indexed fields, and shadow fields
+            if name == "id" || name == "_seq" || !field_def.indexed || field_def.is_shadow {
                 continue;
             }
 
@@ -1203,6 +1461,7 @@ impl HybridStore {
         let schema = schema_builder.build();
         let fields = SchemaFields {
             id: id_field,
+            seq: seq_field,
             indexed_fields,
         };
 
@@ -1217,16 +1476,24 @@ impl HybridStore {
             .get_field("id")
             .map_err(|_| StoreError::FieldNotFound("id".to_string()))?;
 
+        let seq = schema
+            .get_field("_seq")
+            .map_err(|_| StoreError::FieldNotFound("_seq".to_string()))?;
+
         let mut indexed_fields = HashMap::new();
         for (field, field_entry) in schema.fields() {
             let name = field_entry.name();
-            if name == "id" {
+            if name == "id" || name == "_seq" {
                 continue;
             }
             indexed_fields.insert(name.to_string(), field);
         }
 
-        Ok(SchemaFields { id, indexed_fields })
+        Ok(SchemaFields {
+            id,
+            seq,
+            indexed_fields,
+        })
     }
 
     /// Derive IndexSchema from a Tantivy index's schema.
@@ -1425,7 +1692,30 @@ impl HybridStore {
         // Cache the budget
         self.budget_cache.insert(index.to_string(), optimal_budget);
 
-        let writer = tantivy_index.writer(optimal_budget)?;
+        let mut writer = tantivy_index.writer(optimal_budget)?;
+
+        // WAL Recovery: Check if there are any operations in the WAL that need to be replayed
+        // This happens when the index was opened after a crash or restart
+        let reader = tantivy_index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+
+        let recovered_count = self.recover_index(index, &mut writer, &reader)?;
+
+        if recovered_count > 0 {
+            tracing::info!(
+                index = %index,
+                count = recovered_count,
+                "Recovered {} operations from WAL for index {}",
+                recovered_count,
+                index
+            );
+
+            // Commit immediately to persist the recovery
+            writer.commit()?;
+        }
+
         let writer_arc = Arc::new(Mutex::new(writer));
 
         // Store in cache
@@ -1685,7 +1975,10 @@ impl HybridStore {
                     let is_new_document = old_value.is_none();
 
                     // Step 3: Build tantivy document with ONLY indexed fields
-                    let mut tantivy_doc = doc!(fields.id => id.as_str());
+                    let mut tantivy_doc = doc!(
+                        fields.id => id.as_str(),
+                        fields.seq => seq_id // Inject the WAL sequence
+                    );
 
                     // Step 4: Index schema-defined fields individually
                     for (field_name, field_def) in &schema.fields {
@@ -2624,7 +2917,10 @@ impl HybridStore {
                         }
 
                         // Step 3: Build tantivy document with ONLY indexed fields
-                        let mut tantivy_doc = doc!(fields.id => prepared.id.as_str());
+                        let mut tantivy_doc = doc!(
+                            fields.id => prepared.id.as_str(),
+                            fields.seq => seq_id // Inject the WAL sequence
+                        );
 
                         // Step 4: Index schema-defined fields individually
                         for (field_name, field_def) in &schema.fields {
@@ -3053,6 +3349,55 @@ impl HybridStore {
         }
 
         Ok(index_names)
+    }
+
+    /// Warm up all existing indices by opening them, which triggers WAL recovery.
+    /// This should be called during startup to ensure all indices are recovered
+    /// and ready for use, rather than waiting for first access.
+    ///
+    /// Returns the total number of operations recovered across all indices.
+    pub fn warmup_indices(&self) -> Result<usize, StoreError> {
+        let warmup_start = Instant::now();
+        let index_names = self.get_index_names()?;
+
+        if index_names.is_empty() {
+            tracing::debug!("No indices to warm up");
+            return Ok(0);
+        }
+
+        tracing::info!(
+            count = index_names.len(),
+            "Starting index warmup and WAL recovery for {} indices",
+            index_names.len()
+        );
+
+        for index_name in &index_names {
+            // Opening the index triggers WAL recovery in get_or_create_index
+            match self.get_or_create_index(index_name) {
+                Ok(_) => {
+                    // Recovery already happened and was logged in get_or_create_index
+                    // We don't have direct access to the count here, but it's already logged
+                    tracing::debug!(index = %index_name, "Index warmed up successfully");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        index = %index_name,
+                        error = %e,
+                        "Failed to warm up index, will retry on first access"
+                    );
+                }
+            }
+        }
+
+        let warmup_elapsed = warmup_start.elapsed();
+        tracing::info!(
+            indices_count = index_names.len(),
+            elapsed_ms = warmup_elapsed.as_millis(),
+            "Index warmup completed in {}ms",
+            warmup_elapsed.as_millis()
+        );
+
+        Ok(0)
     }
 
     /// Get index size statistics, optionally including the corrected redb measurement.

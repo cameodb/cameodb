@@ -517,7 +517,26 @@ impl MicroshardActor {
                 _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
             })?;
 
-        self.store = Some(Arc::new(store));
+        let store_arc = Arc::new(store);
+
+        // Warm up all indices to trigger WAL recovery at startup
+        // This ensures all indices are consistent before accepting requests
+        let warmup_store = Arc::clone(&store_arc);
+        let shard_id = self.shard_id;
+        tokio::task::spawn_blocking(move || {
+            match warmup_store.warmup_indices() {
+                Ok(_) => {
+                    info!(shard_id = %shard_id, "Index warmup and WAL recovery completed");
+                }
+                Err(e) => {
+                    warn!(shard_id = %shard_id, error = %e, "Index warmup encountered errors, indices will recover on first access");
+                }
+            }
+        })
+        .await
+        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?;
+
+        self.store = Some(store_arc);
         info!(shard_id = %self.shard_id, "HybridStore initialized successfully");
         Ok(())
     }
