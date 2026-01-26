@@ -155,9 +155,8 @@ def build_document(line: str) -> Optional[Dict[str, Any]]:
     first_analysis_iso = parse_datetime_to_rfc3339(first_analysis)
     last_analysis_iso = parse_datetime_to_rfc3339(last_analysis)
     
-    # Build the document content
+    # Build the document content - sha1 will be automatically created as shadow field
     doc_content: Dict[str, Any] = {
-        "sha1": sha1,
         "first_analysis": first_analysis_iso,
         "last_analysis": last_analysis_iso,
         "platform": platform,
@@ -169,7 +168,7 @@ def build_document(line: str) -> Optional[Dict[str, Any]]:
         "urls": urls,
     }
     
-    # Add id to doc content like TED and Books loaders
+    # Add id to doc content like TED and Books loaders - shadow field system will preserve sha1
     doc_content["id"] = sha1
     
     return {
@@ -177,6 +176,35 @@ def build_document(line: str) -> Optional[Dict[str, Any]]:
         "doc": {k: v for k, v in doc_content.items() if v is not None},
         "routing_key": sha1,  # Add routing_key like TED and Books loaders
     }
+
+
+def ensure_schema(base_url: str, index: str) -> bool:
+    """Ensure the index schema is created with correct field types before ingestion."""
+    schema = {
+        "fields": {
+            "id": {"field_type": "text", "indexed": True, "stored": True},
+            "sha1": {"field_type": "text", "indexed": False, "stored": False, "is_shadow": True},
+            "first_analysis": {"field_type": "date", "indexed": True, "stored": False},
+            "last_analysis": {"field_type": "date", "indexed": True, "stored": False},
+            "platform": {"field_type": "text", "indexed": True, "stored": False},
+            "classification": {"field_type": "text", "indexed": True, "stored": False},
+            "risk_score": {"field_type": "float", "indexed": True, "stored": False},
+            "threat_names": {"field_type": "text", "indexed": True, "stored": False},
+            "file_types": {"field_type": "text", "indexed": True, "stored": False},
+            "signatures": {"field_type": "text", "indexed": True, "stored": False},
+            "urls": {"field_type": "text", "indexed": True, "stored": False},
+        }
+    }
+    
+    url = f"{base_url.rstrip('/')}/api/{index}/_config"
+    try:
+        response = requests.put(url, json=schema, timeout=10)
+        response.raise_for_status()
+        print(f"Schema created/updated for index '{index}'")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: Could not create schema: {e}")
+        return False
 
 
 def get_cluster_health(base_url: str) -> Optional[Dict[str, Any]]:
@@ -211,6 +239,10 @@ def ingest(
     """Ingest URL data using batch processing for optimal performance."""
     if not data_path.exists():
         raise SystemExit(f"Data file not found: {data_path}")
+
+    # Optional: Pre-create schema with explicit field types before ingestion
+    # Uncomment to define schema upfront instead of relying on automatic evolution
+    ensure_schema(base_url, index)
 
     # Get cluster health to show actual shard count
     health = get_cluster_health(base_url)

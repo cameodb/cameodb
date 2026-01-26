@@ -84,7 +84,7 @@ def build_document(row: Dict[str, str]) -> Optional[Dict[str, Any]]:
     tags: List[str] = [t.strip() for t in row.get("tags", "").split(",") if t.strip()]
     topic_categories = [t.strip() for t in row.get("topicCategories", "").split(",") if t.strip()]
     
-    # Build the document content
+    # Build the document content - video_id will be automatically created as shadow field
     doc_content: Dict[str, Any] = {
         "title": (row.get("title") or "").strip(),
         "speaker": (row.get("speaker") or "").strip(),
@@ -103,7 +103,7 @@ def build_document(row: Dict[str, str]) -> Optional[Dict[str, Any]]:
         "duration_seconds": parse_duration_to_seconds(row.get("duration", "")),
     }
     
-    # Build the DocPayload format for bulk API
+    # Build the DocPayload format for bulk API - shadow field system will preserve video_id
     doc_content["id"] = video_id
 
     payload = {
@@ -127,6 +127,40 @@ def safe_int(raw: Optional[str], default: Optional[int] = None) -> Optional[int]
         return int(raw)
     except ValueError:
         return default
+
+
+def ensure_schema(base_url: str, index: str) -> bool:
+    """Ensure the index schema is created with correct field types before ingestion."""
+    schema = {
+        "fields": {
+            "id": {"field_type": "text", "indexed": True, "stored": True},
+            "video_id": {"field_type": "text", "indexed": False, "stored": False, "is_shadow": True},
+            "title": {"field_type": "text", "indexed": True, "stored": False},
+            "speaker": {"field_type": "text", "indexed": True, "stored": False},
+            "channel": {"field_type": "text", "indexed": True, "stored": False},
+            "description": {"field_type": "text", "indexed": True, "stored": False},
+            "tags": {"field_type": "text", "indexed": True, "stored": False},
+            "topic_categories": {"field_type": "text", "indexed": True, "stored": False},
+            "category_id": {"field_type": "integer", "indexed": True, "stored": False},
+            "category_label": {"field_type": "text", "indexed": True, "stored": False},
+            "view_count": {"field_type": "integer", "indexed": True, "stored": False},
+            "like_count": {"field_type": "integer", "indexed": True, "stored": False},
+            "comment_count": {"field_type": "integer", "indexed": True, "stored": False},
+            "caption": {"field_type": "boolean", "indexed": True, "stored": False},
+            "published_at": {"field_type": "date", "indexed": True, "stored": False},
+            "duration_seconds": {"field_type": "integer", "indexed": True, "stored": False},
+        }
+    }
+    
+    url = f"{base_url.rstrip('/')}/api/{index}/_config"
+    try:
+        response = requests.put(url, json=schema, timeout=10)
+        response.raise_for_status()
+        print(f"Schema created/updated for index '{index}'")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: Could not create schema: {e}")
+        return False
 
 
 def get_cluster_health(base_url: str) -> Optional[Dict[str, Any]]:
@@ -163,6 +197,10 @@ def ingest(
     """Ingest TED talks data using batch processing for optimal performance."""
     if not data_path.exists():
         raise SystemExit(f"Data file not found: {data_path}")
+
+    # Optional: Pre-create schema with explicit field types before ingestion
+    # Uncomment to define schema upfront instead of relying on automatic evolution
+    ensure_schema(base_url, index)
 
     # Get cluster health to show actual shard count
     health = get_cluster_health(base_url)

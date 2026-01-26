@@ -95,7 +95,7 @@ def build_document(line: str) -> Optional[Dict[str, Any]]:
     # Parse genres from JSON
     genres = parse_genres(genres_json)
     
-    # Build the document content
+    # Build the document content - include book_id for auto shadow field detection
     doc_content: Dict[str, Any] = {
         "book_id": book_id.strip(),
         "freebase_id": freebase_id.strip() if freebase_id else None,
@@ -106,7 +106,7 @@ def build_document(line: str) -> Optional[Dict[str, Any]]:
         "summary": summary.strip() if summary else "",
     }
     
-    # Use book_id as the document ID
+    # Use book_id as the document ID - auto schema will create book_id as shadow field
     doc_content["id"] = book_id
     
     # Build the DocPayload format for bulk API
@@ -136,7 +136,8 @@ def ensure_schema(base_url: str, index: str) -> bool:
     """Ensure the index schema is created with correct field types before ingestion."""
     schema = {
         "fields": {
-            "book_id": {"field_type": "text", "indexed": True, "stored": False},
+            "id": {"field_type": "text", "indexed": True, "stored": True},
+            "book_id": {"field_type": "text", "indexed": False, "stored": False, "is_shadow": True},
             "freebase_id": {"field_type": "text", "indexed": True, "stored": False},
             "title": {"field_type": "text", "indexed": True, "stored": False},
             "author": {"field_type": "text", "indexed": True, "stored": False},
