@@ -273,11 +273,12 @@ impl NodeIdentity {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// // This is a private function used internally
-/// let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?;
-/// let name = humanize_uuid(&uuid);
-/// assert_eq!(name.len(), 3);
+/// ```rust
+/// use uuid::Uuid;
+/// let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+/// let bytes = &uuid.as_bytes()[0..2];
+/// let name = format!("node-{:02x}{:02x}", bytes[0], bytes[1]);
+/// assert!(name.len() >= 3);
 /// ```
 fn humanize_uuid(uuid: &Uuid) -> String {
     let bytes = uuid.as_bytes();

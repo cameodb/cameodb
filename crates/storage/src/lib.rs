@@ -861,11 +861,13 @@ pub fn reconstruct_shadow_fields_in_json(json_blob: &JsonValue, schema: &IndexSc
 
 /// Optimized: Reconstruct shadow fields by consuming the input (Ownership Transfer).
 ///
-/// This avoids cloning the bulk of the document (original fields).
-/// It creates a new map container to ensure "id" and shadow fields appear first,
-/// but uses `append` to MOVE the heavy data from the old map to the new one.
+/// Behavior:
+/// 1. If NO shadow fields exist: Ensures 'id' is the first field in the JSON object.
+/// 2. If shadow fields EXIST: Replaces 'id' with the shadow field(s) (e.g., returns 'book_id' instead of 'id').
+///
+/// This avoids cloning the bulk of the document (original fields) by using `append`.
 pub fn reconstruct_shadow_fields_owned(json_blob: JsonValue, schema: &IndexSchema) -> JsonValue {
-    // fast fail if not an object
+    // Fast fail if not an object
     let mut obj = match json_blob {
         JsonValue::Object(map) => map,
         _ => return json_blob,
@@ -873,51 +875,45 @@ pub fn reconstruct_shadow_fields_owned(json_blob: JsonValue, schema: &IndexSchem
 
     let shadow_mapping = schema.get_shadow_mapping();
 
-    // Even with no shadow mappings, ensure 'id' appears first for consistent ordering
+    // CASE 1: No Shadow Fields -> Strict ID Ordering
     if shadow_mapping.is_empty() {
-        // 1. Fast Path: Check if 'id' is already first (O(1) check)
-        // If it is, we don't need to do any work.
+        // Fast Path: Check if 'id' is already first (O(1) check)
         if let Some(first_key) = obj.keys().next()
             && first_key == "id"
         {
             return JsonValue::Object(obj);
         }
 
-        // 2. Optimization: Reorder using Move semantics (No cloning)
-        // 'remove' extracts the value owned, 'append' moves the rest.
+        // Optimization: Reorder using Move semantics (No cloning)
         if let Some(id_val) = obj.remove("id") {
             let mut out = JsonMap::with_capacity(obj.len() + 1);
             out.insert("id".to_string(), id_val);
-            out.append(&mut obj); // Moves pointers only, very fast
+            out.append(&mut obj); // Moves pointers only
             return JsonValue::Object(out);
         }
 
-        // No 'id' field found (edge case), return as is
+        // Edge case: No 'id' field found, return as is
         return JsonValue::Object(obj);
     }
 
-    // Capacity optimization: Existing len + Shadow len
+    // CASE 2: Shadow Fields Exist -> Replace ID with Shadow Field(s)
     let mut out = JsonMap::with_capacity(obj.len() + shadow_mapping.len());
 
-    // 1. Extract or clone ID for shadow population
-    // We try to get ID from the object.
-    let id_val = obj.get("id").cloned();
-
-    // 2. Insert ID first (Preserve Order)
-    if let Some(ref id) = id_val {
-        out.insert("id".to_string(), id.clone());
-
-        // 3. Insert Shadow Fields
+    // Extract ID (Move ownership out of obj)
+    if let Some(id_val) = obj.remove("id") {
+        // Insert Shadow Fields FIRST
         for (shadow_field, canonical_field) in shadow_mapping {
-            if canonical_field == "id" && !obj.contains_key(&shadow_field) {
-                out.insert(shadow_field, id.clone());
+            if canonical_field == "id" {
+                // Insert the shadow field with the ID's value
+                // We clone the value here to support multiple shadow aliases if necessary
+                out.insert(shadow_field, id_val.clone());
             }
         }
+        // Note: We deliberately SKIP inserting "id" here.
+        // The shadow field replaces it in the presentation layer.
     }
 
-    // 4. MOVE remaining original fields
-    // This is the performance win: `append` moves internal pointers.
-    // No string or value cloning happens here for the actual data.
+    // Move remaining original fields (bulk data)
     out.append(&mut obj);
 
     JsonValue::Object(out)
