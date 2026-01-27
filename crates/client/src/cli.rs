@@ -1023,6 +1023,19 @@ fn detect_id_field(headers: &[(String, Option<TantivyFieldType>)]) -> IdFieldDet
         }
     }
 
+    // Prefer suffix-based matches (common for camelCase/PascalCase like videoId, userID)
+    if let Some(pos) = headers.iter().position(|(h, _)| {
+        let lower = h.to_lowercase();
+        lower.ends_with("id") || lower.ends_with("_id")
+    }) {
+        let field_name = &headers[pos].0;
+        return IdFieldDetection {
+            index: pos,
+            original_field_name: field_name.clone(),
+            is_shadow: field_name.to_lowercase() != "id",
+        };
+    }
+
     // Look for substring match
     if let Some(pos) = headers
         .iter()
@@ -1064,7 +1077,7 @@ async fn detect_schema_from_csv(
     let mut schema = IndexSchema::default();
     let mut sampled = 0usize;
 
-    // Add shadow field if needed (before processing records)
+    // Add a single shadow field for the detected id source when its name is not "id"
     if id_detection.is_shadow {
         let field_type = headers[id_detection.index]
             .1
@@ -1073,9 +1086,53 @@ async fn detect_schema_from_csv(
         schema.add_shadow_field(id_detection.original_field_name.clone(), field_type);
     }
 
+    // Collect id-like candidates (excluding primary) ordered by priority for equality promotion
+    // Tuple: (priority, idx, name, hint, all_match, seen_any)
+    let mut id_like_candidates: Vec<(u8, usize, String, Option<TantivyFieldType>, bool, bool)> =
+        headers
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, (name, hint))| {
+                if idx == id_detection.index {
+                    return None;
+                }
+
+                let lower = name.to_lowercase();
+                let (priority, looks_like_id) =
+                    if ["sha256", "sha1", "md5"].contains(&lower.as_str()) {
+                        (0u8, true)
+                    } else if lower.ends_with("_id") || lower.ends_with("id") {
+                        (1u8, true)
+                    } else if lower.contains("id") {
+                        (2u8, true)
+                    } else {
+                        (u8::MAX, false)
+                    };
+
+                if looks_like_id {
+                    Some((priority, idx, name.clone(), hint.clone(), true, false))
+                } else {
+                    None
+                }
+            })
+            .collect();
+    id_like_candidates.sort_by_key(|(priority, _, _, _, _, _)| *priority);
+
     for record in reader.records() {
         let record = record.context("Failed to read CSV record")?;
         let mut obj: JsonMap<String, JsonValue> = JsonMap::new();
+
+        let canonical_id_raw = record.get(id_detection.index).unwrap_or("");
+
+        // Update equality flags for candidates
+        for (_, idx, _, _, all_match, seen_any) in id_like_candidates.iter_mut() {
+            if let Some(val) = record.get(*idx) {
+                *seen_any = true;
+                if *all_match && val.trim() != canonical_id_raw.trim() {
+                    *all_match = false;
+                }
+            }
+        }
 
         // Process all fields in CSV column order
         for (idx, value) in record.iter().enumerate() {
@@ -1099,6 +1156,16 @@ async fn detect_schema_from_csv(
         if sampled >= SCHEMA_SAMPLE_LIMIT {
             break;
         }
+    }
+
+    // If canonical name was "id", promote the first candidate whose values always matched
+    if !id_detection.is_shadow
+        && let Some((_, _, name, hint, _all_match, _seen_any)) = id_like_candidates
+            .into_iter()
+            .find(|(_, _, _, _, all_match, seen_any)| *seen_any && *all_match)
+    {
+        let field_type = hint.unwrap_or(TantivyFieldType::Text);
+        schema.add_shadow_field(name, field_type);
     }
 
     // CRITICAL: Mark all fields as indexed when loading schema from CSV/TSV file
@@ -1256,6 +1323,7 @@ async fn load_data_from_csv(
 
     let mut batch: Vec<JsonValue> = Vec::with_capacity(batch_size);
     let mut total_sent = 0usize;
+    let mut total_failed = 0usize;
 
     for record in reader.records() {
         let record = record.context("Failed to read CSV record")?;
@@ -1274,7 +1342,8 @@ async fn load_data_from_csv(
             }
         }
 
-        // Ensure the canonical id field is present in the document body as well
+        // Always ensure the canonical id field is present in the document body
+        // The server's storage layer will handle shadow field filtering and reconstruction
         doc_obj.insert("id".to_string(), JsonValue::String(id_value.clone()));
 
         let routing_key = doc_obj
@@ -1292,23 +1361,72 @@ async fn load_data_from_csv(
         batch.push(payload);
 
         if batch.len() >= batch_size {
-            client.bulk_index(index, &batch).await?;
-            total_sent += batch.len();
+            let response = client.bulk_index(index, &batch).await?;
+
+            let written = response
+                .get("items_written")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let errors_json = response.get("errors").and_then(|v| v.as_array());
+            let error_count = errors_json.map(|e| e.len()).unwrap_or(0);
+
+            total_sent += written;
+            total_failed += error_count;
+
+            if error_count > 0 {
+                eprintln!(
+                    "⚠️  Batch warning: {} items failed validation.",
+                    error_count
+                );
+                if let Some(errs) = errors_json {
+                    for err in errs.iter().take(3) {
+                        eprintln!("   - {}", err.as_str().unwrap_or("Unknown error"));
+                    }
+                    if errs.len() > 3 {
+                        eprintln!("   ... and {} more", errs.len() - 3);
+                    }
+                }
+            }
+
             batch.clear();
         }
     }
 
     if !batch.is_empty() {
-        client.bulk_index(index, &batch).await?;
-        total_sent += batch.len();
+        let response = client.bulk_index(index, &batch).await?;
+
+        let written = response
+            .get("items_written")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        total_sent += written;
+        let errors_json = response.get("errors").and_then(|v| v.as_array());
+        let error_count = errors_json.map(|e| e.len()).unwrap_or(0);
+
+        total_failed += error_count;
+
+        if error_count > 0 {
+            eprintln!(
+                "⚠️  Batch warning: {} items failed validation.",
+                error_count
+            );
+            if let Some(errs) = errors_json {
+                for err in errs.iter().take(3) {
+                    eprintln!("   - {}", err.as_str().unwrap_or("Unknown error"));
+                }
+                if errs.len() > 3 {
+                    eprintln!("   ... and {} more", errs.len() - 3);
+                }
+            }
+        }
     }
 
     // Stop the progress spinner
     spinner.stop();
 
     println!(
-        "Loaded {} documents into index '{}' (batch size {})",
-        total_sent, index, batch_size
+        "Ingestion complete for index '{}': loaded={} failed={} (batch size {})",
+        index, total_sent, total_failed, batch_size
     );
 
     Ok(())

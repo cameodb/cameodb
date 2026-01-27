@@ -134,7 +134,7 @@ impl CameoClient {
             .context("Failed to parse delete index response")
     }
 
-    pub async fn bulk_index(&self, index: &str, batch: &[JsonValue]) -> Result<()> {
+    pub async fn bulk_index(&self, index: &str, batch: &[JsonValue]) -> Result<JsonValue> {
         let url = self
             .base_url
             .join(&format!("api/{}/_bulk", index))
@@ -145,7 +145,9 @@ impl CameoClient {
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("Bulk ingest failed: {} - {}", status, text);
         }
-        Ok(())
+        resp.json()
+            .await
+            .context("Failed to parse bulk ingest response")
     }
 
     /// Expose underlying HTTP client for auxiliary requests (e.g., fetching CSV schema samples)

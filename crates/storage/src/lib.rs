@@ -2700,11 +2700,13 @@ impl HybridStore {
                 let final_doc = if let Some(json_blob) = stored_doc.json_blob {
                     let mut doc = reconstruct_shadow_fields_owned(json_blob, &schema);
 
-                    // Safety check: Ensure top-level ID matches the requested doc_id
-                    if let Some(obj) = doc.as_object_mut()
-                        && !obj.contains_key("id")
-                    {
-                        obj.insert("id".to_string(), serde_json::Value::String(doc_id.clone()));
+                    // Safety check: Only add id if it's not already present and no shadow fields exist
+                    // When shadow fields exist, reconstruct_shadow_fields_owned already handles the mapping
+                    if let Some(obj) = doc.as_object_mut() {
+                        let shadow_mapping = schema.get_shadow_mapping();
+                        if shadow_mapping.is_empty() && !obj.contains_key("id") {
+                            obj.insert("id".to_string(), serde_json::Value::String(doc_id.clone()));
+                        }
                     }
                     doc
                 } else {
