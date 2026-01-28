@@ -736,11 +736,15 @@ cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-re
 **Option 2: Cross-compilation with cargo-zigbuild (supports hardening)**
 ```bash
 # Build hardened binary for Linux x86_64 musl target (flags in .cargo/config.toml)
-cargo zigbuild --release --target x86_64-unknown-linux-musl
+cargo zigbuild --release --target x86_64-unknown-linux-musl \
+    --no-default-features \
+    --features client/native-tls-vendored
 
 # OR override with explicit RUSTFLAGS:
-RUSTFLAGS="-C relocation-model=pie -C relro-level=full -C link-arg=-Wl,-z,now -C link-arg=-fstack-protector -C link-arg=-D_FORTIFY_SOURCE=2" \
-cargo zigbuild --release --target x86_64-unknown-linux-musl
+RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=pie -C relro-level=full -C link-arg=-pie -C link-arg=-static -C link-arg=-Wl,-z,now -C link-arg=-Wl,-z,relro -C link-arg=-fstack-protector-strong -C link-arg=-D_FORTIFY_SOURCE=2" \
+cargo zigbuild --release --target x86_64-unknown-linux-musl \
+    --no-default-features \
+    --features client/native-tls-vendored
 
 # Generate RPM package with standard naming (run from project root directory)
 cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
@@ -788,13 +792,23 @@ If you need legacy `.sig`/`.cert` files instead, add `--legacy-signatures` (or s
 2. **Explicit override**: Use `RUSTFLAGS="..."` to override or customize flags as shown above
 
 Hardening flags explained:
+- `-C target-feature=+crt-static` enables static C runtime linking
 - `-C relocation-model=pie` enables Position Independent Executable for ASLR support
 - `-C relro-level=full` enables Full RELRO (Relocation Read-Only) 
+- `-C link-arg=-pie` + `-C link-arg=-static` creates static PIE executable (separated flags)
 - `-C link-arg=-Wl,-z,now` enables immediate symbol binding
-- `-C link-arg=-fstack-protector` enables stack protection against buffer overflows
+- `-C link-arg=-Wl,-z,relro` enables RELRO protection
+- `-C link-arg=-fstack-protector-strong` enables strong stack protection against buffer overflows
 - `-C link-arg=-D_FORTIFY_SOURCE=2` enables fortified memory functions for additional safety
 - `opt-level = 3` (release profile) required for fortified functions to work properly
 - Both cargo build and cargo-zigbuild support these rustc-native flags
+
+**Windows Hardening** (when building for Windows targets):
+- `/SDL` enables Security Development Lifecycle checks (equivalent to VS /SDL)
+- `/DYNAMICBASE` enables ASLR (Address Space Layout Randomization)
+- `/HIGHENTROPYVA` enables 64-bit ASLR with high entropy
+- `/NXCOMPAT` enables DEP (Data Execution Prevention)
+- `/GUARD:CF` enables Control Flow Guard
 
 **Verification**: 
 - For dynamic binaries (gnu): `file` shows "pie executable"

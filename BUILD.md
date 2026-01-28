@@ -412,7 +412,17 @@ USER nonroot:nonroot
 # 3. Proper musl-gcc configuration for arm64
 [target.aarch64-unknown-linux-musl]
 linker = "musl-gcc"
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "relocation-model=pie",
+    "-C", "relro-level=full", 
+    "-C", "link-arg=-pie",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-Wl,-z,now",
+    "-C", "link-arg=-Wl,-z,relro",
+    "-C", "link-arg=-fstack-protector-strong",
+    "-C", "link-arg=-D_FORTIFY_SOURCE=2"
+]
 ```
 
 **Result**: Both architectures now consistently run as non-root user with secure, static binaries.
