@@ -19,18 +19,31 @@ A high-performance, distributed, shared-nothing hybrid-search database built in 
 ### Option 1: Run from Docker Hub (Recommended)
 
 ```bash
+# Create data directory with proper permissions
+# (Required: prevents Docker from creating it with root ownership)
+mkdir -p $(pwd)/data/cameodb
+
 # Pull and run CameoDB from Docker Hub
 docker run -d \
   --name cameodb-server \
+  --user $(id -u):$(id -g) \
   -p 9480:9480 \
   -p 9580:9580 \
   -v $(pwd)/data/cameodb:/data/cameodb \
   -e RUST_LOG=error \
-  --restart unless-stopped \
   goranc/cameodb:latest
 
 # CameoDB starts on http://localhost:9480 by default
 ```
+
+**Note:** The image is configured to run as non-root user (65532:65532). Pre-creating the directory ensures proper ownership when mounting volumes.
+
+**Or use Docker Compose (recommended for production):**
+```bash
+cd docker
+docker-compose up -d
+```
+The docker-compose.yml already includes proper user configuration.
 
 ### Test the Server
 

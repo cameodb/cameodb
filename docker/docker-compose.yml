@@ -30,8 +30,7 @@ services:
       # 2. Data: Project Root/data/cameodb -> Container
       - ../data/cameodb:/data/cameodb
 
-    restart: unless-stopped
-    
+        
     healthcheck:
       test: ["CMD", "/usr/local/bin/cameodb", "--version"]
       interval: 30s

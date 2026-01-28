@@ -305,36 +305,117 @@ The `client` crate supports the following TLS backends:
 
 ## Docker Build
 
-The Dockerfile is configured to build with `native-tls-vendored` using Zig as the C compiler, matching the local zigbuild approach:
+### Multi-Architecture Non-Root Docker Images
+
+The Dockerfile builds secure, non-root Docker images for both `amd64` and `arm64` platforms using distroless base images.
+
+#### Key Features:
+- **✅ Non-root execution**: Runs as `nonroot:nonroot` (UID/GID 65532)
+- **✅ Multi-architecture**: Supports `linux/amd64` and `linux/arm64`
+- **✅ Static musl builds**: Fully static binaries for portability
+- **✅ Distroless runtime**: Minimal attack surface, no shell
+- **✅ OpenSSL vendoring**: No external TLS dependencies
+
+#### Build Configuration:
 
 ```dockerfile
-# Install Zig for cross-compilation
-ARG ZIG_VERSION=0.13.0
-RUN wget -q https://ziglang.org/download/${ZIG_VERSION}/zig-linux-$(uname -m)-${ZIG_VERSION}.tar.xz && \
-    tar -xf zig-linux-$(uname -m)-${ZIG_VERSION}.tar.xz && \
-    mv zig-linux-$(uname -m)-${ZIG_VERSION} /usr/local/zig && \
-    ln -s /usr/local/zig/zig /usr/local/bin/zig
+# Default to musl for static linking
+ARG TARGET_ABI=musl
+ARG USE_ZIG=false
 
-# Configure Zig as C compiler for OpenSSL vendored build
-ENV CC_x86_64_unknown_linux_musl="zig cc -target x86_64-linux-musl"
-ENV CC_aarch64_unknown_linux_musl="zig cc -target aarch64-linux-musl"
+# Use distroless nonroot base images
+FROM gcr.io/distroless/static:nonroot AS runtime-musl
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime-gnu
 
-# Build with native-tls-vendored
-cargo build --release --target "${TARGET_TRIPLE}" --bin cameodb \
-    --no-default-features \
-    --features client/native-tls-vendored
+# Explicit non-root user
+USER nonroot:nonroot
+
+# Copy with proper ownership
+COPY --from=builder --chown=nonroot:nonroot /src/cameodb /usr/local/bin/cameodb
 ```
 
-Build the Docker image:
+#### Build Commands:
+
+**Multi-arch build (recommended):**
 ```bash
-docker build -t cameodb:latest .
+docker buildx build \
+  --builder cameo-builder \
+  --platform linux/amd64,linux/arm64 \
+  --build-arg TARGET_ABI=musl \
+  -t goranc/cameodb:latest \
+  --secret id=zscaler,src=/tmp/buildkit-ca/zscaler.crt \
+  --push \
+  .
 ```
 
-**Why Zig + native-tls-vendored?**
-- ✅ Same approach as local zigbuild (consistency)
-- ✅ Zig provides complete C toolchain compatible with musl
-- ✅ Works with all HTTPS sites (maximum compatibility)
-- ✅ No glibc/musl symbol conflicts
+**Single architecture build:**
+```bash
+docker build \
+  --build-arg TARGET_ABI=musl \
+  -t goranc/cameodb:latest \
+  --secret id=zscaler,src=/tmp/buildkit-ca/zscaler.crt \
+  .
+```
+
+#### Build Options:
+
+| TARGET_ABI | USE_ZIG | Result |
+|------------|---------|--------|
+| `musl` | `false` (default) | Static musl with musl-gcc |
+| `musl` | `true` | Static musl with Zig toolchain |
+| `gnu` | `false` | Dynamic glibc build |
+
+#### Why This Configuration:
+
+- **Non-root by default**: All images run as non-root user for security
+- **Distroless base**: Minimal runtime, no package manager or shell
+- **Static linking**: No runtime dependencies, works across Linux distributions
+- **Multi-arch**: Single image supports both Intel and ARM platforms
+- **OpenSSL vendored**: No external TLS library dependencies
+
+#### Verification:
+
+```bash
+# Verify non-root execution
+docker run --rm --entrypoint id goranc/cameodb:latest
+# Expected: uid=65532(nonroot) gid=65532(nonroot)
+
+# Test binary functionality
+docker run --rm goranc/cameodb:latest --version
+
+# Test specific architectures
+docker run --rm --platform linux/amd64 goranc/cameodb:latest --version
+docker run --rm --platform linux/arm64 goranc/cameodb:latest --version
+```
+
+#### Recent Fixes (Non-Root Issue Resolution):
+
+**Problem**: Previously, `amd64` images were running as root while `arm64` correctly ran as non-root.
+
+**Root Causes Fixed**:
+1. **Ring crate Zig dependency**: Environment variables for Zig were being set unconditionally, forcing `ring` crate to use non-existent `zig` compiler
+2. **Missing USER instruction**: When using variable `FROM runtime-${TARGET_ABI}`, the USER from base distroless images wasn't being inherited
+3. **Cross-compilation linker**: `arm64` musl builds needed proper `musl-gcc` configuration
+
+**Solutions Applied**:
+```dockerfile
+# 1. Conditional Zig environment variables (only when USE_ZIG=true)
+if [ "${USE_ZIG}" = "true" ] && [ "${TARGETARCH}" = "amd64" ]; then
+    export CC_x86_64_unknown_linux_musl="zig cc -target x86_64-linux-musl"
+    export AR_x86_64_unknown_linux_musl="zig ar"
+    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="zig"
+fi
+
+# 2. Explicit USER instruction for non-root execution
+USER nonroot:nonroot
+
+# 3. Proper musl-gcc configuration for arm64
+[target.aarch64-unknown-linux-musl]
+linker = "musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+```
+
+**Result**: Both architectures now consistently run as non-root user with secure, static binaries.
 
 ## Troubleshooting
 

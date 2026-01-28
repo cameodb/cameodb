@@ -4,7 +4,7 @@
 # STAGE 1: Builder (Needs Internet & Certs)
 ################################################################################
 ARG RUST_VERSION=1.90
-ARG TARGET_ABI=gnu
+ARG TARGET_ABI=musl
 ARG USE_ZIG=false
 FROM rust:${RUST_VERSION}-slim AS builder
 
@@ -18,6 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     musl-tools \
     gcc-aarch64-linux-gnu \
+    perl \
+    make \
     pkg-config \
     wget \
     xz-utils \
@@ -65,16 +67,12 @@ RUN mkdir -p .cargo && \
         echo 'linker = "musl-gcc"' >> .cargo/config.toml; \
     elif [ "$TARGET_ABI" = "musl" ] && [ "$TARGETARCH" = "arm64" ]; then \
         echo '[target.aarch64-unknown-linux-musl]' >> .cargo/config.toml && \
-        echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml; \
+        echo 'linker = "musl-gcc"' >> .cargo/config.toml && \
+        echo 'rustflags = ["-C", "target-feature=+crt-static"]' >> .cargo/config.toml; \
     elif [ "$TARGET_ABI" = "gnu" ] && [ "$TARGETARCH" = "arm64" ]; then \
         echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml && \
         echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml; \
     fi
-
-# 5. Set environment variables for OpenSSL vendored build when using Zig (only for x86_64)
-ENV CC_x86_64_unknown_linux_musl="zig cc -target x86_64-linux-musl" \
-    AR_x86_64_unknown_linux_musl="zig ar" \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="zig"
 
 # 5. Prepare Data Directory (Permission Fix)
 RUN mkdir -p /build-data/cameodb
@@ -91,6 +89,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     TARGET_TRIPLE=""; \
     if [ "${TARGET_ABI}" = "musl" ]; then \
         export OPENSSL_STATIC=1; \
+        if [ "${USE_ZIG}" = "true" ] && [ "${TARGETARCH}" = "amd64" ]; then \
+            export CC_x86_64_unknown_linux_musl="zig cc -target x86_64-linux-musl"; \
+            export AR_x86_64_unknown_linux_musl="zig ar"; \
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="zig"; \
+        fi; \
         case "${TARGETARCH}" in \
             "amd64") TARGET_TRIPLE="x86_64-unknown-linux-musl";; \
             "arm64") TARGET_TRIPLE="aarch64-unknown-linux-musl";; \
@@ -116,8 +119,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 ################################################################################
 # Use static distroless for musl (fully static), cc-debian12 for gnu (needs glibc + libgcc)
 ARG TARGET_ABI
-FROM gcr.io/distroless/static:latest AS runtime-musl
-FROM gcr.io/distroless/cc-debian12:latest AS runtime-gnu
+FROM gcr.io/distroless/static:nonroot AS runtime-musl
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime-gnu
 FROM runtime-${TARGET_ABI} AS runtime
 
 # We COPY the binary and the config.
@@ -129,14 +132,15 @@ COPY --from=builder --chown=nonroot:nonroot /build-data/cameodb /data/cameodb
 ENV CAMEODB_CONFIG=/etc/cameodb/cameodb.toml
 ENV CAMEODB_DATA_DIR=/data/cameodb
 
+# Set user before VOLUME to ensure proper ownership
+USER nonroot:nonroot
+
 VOLUME ["/data/cameodb"]
 
 EXPOSE 9480 9580
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/cameodb", "--version"]
-
-USER nonroot:nonroot
 
 ENTRYPOINT ["/usr/local/bin/cameodb"]
 CMD ["--config", "/etc/cameodb/cameodb.toml"]
