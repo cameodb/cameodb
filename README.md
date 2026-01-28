@@ -16,11 +16,84 @@ A high-performance, distributed, shared-nothing hybrid-search database built in 
 
 ## 🚀 Quick Start
 
+### Option 1: Run from Docker Hub (Recommended)
+
+```bash
+# Pull and run CameoDB from Docker Hub
+docker run -d \
+  --name cameodb \
+  -p 9480:9480 \
+  -p 9580:9580 \
+  -v $(pwd)/data/cameodb:/data/cameodb \
+  -e RUST_LOG=info \
+  --restart unless-stopped \
+  goranc/cameodb:latest
+
+# CameoDB starts on http://localhost:9480 by default
+```
+
+### Test the Server
+
+```bash
+# Check server health/version
+curl http://localhost:9480/_cluster/health
+
+# List all indexes
+curl "http://localhost:9480/_indexes"
+```
+
+### Load and Search Sample Data
+
+```bash
+# Run client in interactive mode and load sample books data
+docker run --rm -it \
+  --network host \
+  goranc/cameodb:latest \
+  client --interactive
+
+# Then inside the interactive shell, run:
+data load books https://dl.cameodb.com/examples/data/booksummaries.tsv
+
+# After data load completes, verify the index:
+list indexes
+
+# Run your first search query:
+search books title:"Harry Potter" limit 5
+```
+
+### Option 2: Build from Source
+
 ```bash
 # Start CameoDB
 cargo run --bin cameodb
 
 # CameoDB starts on http://localhost:9480 by default
+```
+
+### Docker Run vs Docker Compose
+
+The `docker run` command above is equivalent to the `docker-compose.yml` configuration:
+
+| Docker Run Flag | Docker Compose Equivalent |
+|----------------|---------------------------|
+| `-p 9480:9480 -p 9580:9580` | `ports: ["9480:9480", "9580:9580"]` |
+| `-v $(pwd)/data/cameodb:/data/cameodb` | `volumes: ["../data/cameodb:/data/cameodb"]` |
+| `-e RUST_LOG=info` | `environment: ["RUST_LOG=info"]` |
+| `--restart unless-stopped` | `restart: unless-stopped` |
+| `--user 65532:65532` | `user: "65532:65532"` (handled by image) |
+
+**Note**: The Docker image includes a built-in configuration file. For custom configurations, mount your own `cameodb.toml`:
+
+```bash
+docker run -d \
+  --name cameodb \
+  -p 9480:9480 \
+  -p 9580:9580 \
+  -v $(pwd)/data/cameodb:/data/cameodb \
+  -v $(pwd)/cameodb.toml:/etc/cameodb/cameodb.toml:ro \
+  -e RUST_LOG=info \
+  --restart unless-stopped \
+  goranc/cameodb:latest
 ```
 
 ## 🧠 Distributed Architecture Overview

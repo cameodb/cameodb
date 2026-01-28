@@ -27,6 +27,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN --mount=type=secret,id=zscaler,dst=/usr/local/share/ca-certificates/Zscaler.crt \
     update-ca-certificates
 
+# 2.1. Also ensure Cargo trusts the cert bundle
+RUN --mount=type=secret,id=zscaler,dst=/usr/local/share/ca-certificates/Zscaler.crt \
+    mkdir -p /etc/ssl/certs && \
+    cat /usr/local/share/ca-certificates/Zscaler.crt >> /etc/ssl/certs/ca-certificates.crt
+
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
 # 3. Install Zig (provides complete C toolchain for musl cross-compilation). Skip when TARGET_ABI=gnu.
 ARG ZIG_VERSION=0.13.0
 RUN if [ "$USE_ZIG" = "true" ] && [ "$TARGET_ABI" = "musl" ]; then \
