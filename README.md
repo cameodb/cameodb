@@ -21,11 +21,11 @@ A high-performance, distributed, shared-nothing hybrid-search database built in 
 ```bash
 # Pull and run CameoDB from Docker Hub
 docker run -d \
-  --name cameodb \
+  --name cameodb-server \
   -p 9480:9480 \
   -p 9580:9580 \
   -v $(pwd)/data/cameodb:/data/cameodb \
-  -e RUST_LOG=info \
+  -e RUST_LOG=error \
   --restart unless-stopped \
   goranc/cameodb:latest
 
@@ -36,10 +36,10 @@ docker run -d \
 
 ```bash
 # Check server health/version
-curl http://localhost:9480/_cluster/health
+curl -s http://localhost:9480/_cluster/health | jq
 
 # List all indexes
-curl "http://localhost:9480/_indexes"
+curl -s "http://localhost:9480/_indexes" | jq
 ```
 
 ### Load and Search Sample Data
@@ -47,6 +47,7 @@ curl "http://localhost:9480/_indexes"
 ```bash
 # Run client in interactive mode and load sample books data
 docker run --rm -it \
+  --name cameodb-client \
   --network host \
   goranc/cameodb:latest \
   client --interactive
@@ -86,7 +87,7 @@ The `docker run` command above is equivalent to the `docker-compose.yml` configu
 
 ```bash
 docker run -d \
-  --name cameodb \
+  --name cameodb-server \
   -p 9480:9480 \
   -p 9580:9580 \
   -v $(pwd)/data/cameodb:/data/cameodb \
