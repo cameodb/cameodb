@@ -1,0 +1,33 @@
+#!/bin/sh
+set -e
+
+# Create data directory if it doesn't exist
+if [ ! -d /var/lib/cameodb ]; then
+    mkdir -p /var/lib/cameodb
+fi
+
+# Set proper ownership and permissions
+chown cameodb:cameodb /var/lib/cameodb
+chmod 700 /var/lib/cameodb
+
+# Enable and start service on fresh install
+if [ "$1" = "configure" ]; then
+    # Reload systemd daemon
+    systemctl daemon-reload
+    
+    # Enable service
+    systemctl enable cameodb.service
+    
+    # Check if this is a fresh install (package was never installed before)
+    if [ -z "$2" ]; then
+        # Fresh install - start the service
+        systemctl start cameodb.service
+    else
+        # Upgrade - restart the service if it was running
+        if systemctl is-active --quiet cameodb.service; then
+            systemctl restart cameodb.service
+        fi
+    fi
+fi
+
+exit 0

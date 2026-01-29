@@ -27,3 +27,7 @@ uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 bytes = "1.6"
 http-body-util = "0.1"
+
+[profile.release]
+opt-level = 3  # Required for _FORTIFY_SOURCE=2 to work properly
+debug = false  # No debug symbols in production builds

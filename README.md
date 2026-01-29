@@ -755,6 +755,44 @@ cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-re
 # target/x86_64-unknown-linux-musl/release/cameodb-0.2.1-1.x86_64.rpm
 ```
 
+**Option 3: DEB Package Generation (Ubuntu/Debian)**
+```bash
+# Install cargo-deb
+cargo install cargo-deb
+
+# Build hardened binary using Docker (native musl toolchain)
+# This avoids Zig cross-compilation issues with C dependencies
+# IMPORTANT: Use --platform linux/amd64 to get x86_64 container (not ARM64)
+docker run --rm --platform linux/amd64 \
+  -v "$PWD":/workspace -w /workspace \
+  -v /tmp/buildkit-ca/zscaler.crt:/usr/local/share/ca-certificates/zscaler.crt:ro \
+  -e CC_x86_64_unknown_linux_musl=musl-gcc \
+  -e AR_x86_64_unknown_linux_musl=ar \
+  -e RANLIB_x86_64_unknown_linux_musl=ranlib \
+  rust:latest bash -c "
+    apt-get update && \
+    apt-get install -y ca-certificates musl-tools && \
+    update-ca-certificates && \
+    rustup target add x86_64-unknown-linux-musl && \
+    cargo build --release --target x86_64-unknown-linux-musl \
+      --no-default-features \
+      --features client/native-tls-vendored
+  "
+
+# Generate DEB package (run on host after Docker build)
+# Use --no-build to package the existing binary without rebuilding
+# Use --no-strip on macOS (macOS strip doesn't support Linux flags)
+cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl -p server
+
+# With custom output path (follows DEB naming standards)
+cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl -p server \
+  --output target/x86_64-unknown-linux-musl/release/cameodb_0.2.1_amd64.deb
+
+# The DEB package will be available at:
+# target/x86_64-unknown-linux-musl/debian/cameodb_0.2.1_amd64.deb
+# OR with custom output: target/x86_64-unknown-linux-musl/release/cameodb_0.2.1_amd64.deb
+```
+
 ### Signing Release Artifacts
 
 Cosign 2.x defaults to the new bundle format. Generate one `.bundle` file per artifact and ship it together with the binary and `cosign.pub` so downstream users can verify releases.
@@ -824,8 +862,17 @@ Hardening flags explained:
 - **User/Group**: `cameodb` (created automatically during install)
 - **Data Directory**: `/var/lib/cameodb` (created with proper permissions)
 
+### DEB Package Contents
+
+- **Binary**: `/usr/local/bin/cameodb` (statically linked, no external dependencies)
+- **Config**: `/etc/cameodb/cameodb.toml` (marked as config file, preserved on upgrades)
+- **Service**: `/lib/systemd/system/cameodb.service`
+- **User/Group**: `cameodb` (created automatically during install)
+- **Data Directory**: `/var/lib/cameodb` (created with proper permissions)
+
 ### Installation on Target System
 
+**For RPM-based systems (RHEL, CentOS, Fedora):**
 ```bash
 # Verify RPM package before installation
 rpm -qpi cameodb-0.2.1-1.x86_64.rpm
@@ -840,10 +887,26 @@ sudo rpm -i cameodb-0.2.1-1.x86_64.rpm
 sudo systemctl daemon-reload
 sudo systemctl enable cameodb
 sudo systemctl start cameodb
+```
 
+**For DEB-based systems (Ubuntu, Debian):**
+```bash
+# Verify DEB package before installation
+dpkg -I cameodb_0.2.1_amd64.deb
+
+# Check package contents
+dpkg -c cameodb_0.2.1_amd64.deb
+
+# Install the DEB package
+sudo dpkg -i cameodb_0.2.1_amd64.deb
+
+# Start and enable the service
+sudo systemctl daemon-reload
+sudo systemctl enable cameodb
+sudo systemctl start cameodb
+```
 # Check status
 sudo systemctl status cameodb
-```
 
 ### Custom Data Directory Setup
 

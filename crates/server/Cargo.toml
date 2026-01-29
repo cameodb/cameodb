@@ -86,3 +86,21 @@ post_trans_script = """
 systemctl daemon-reload
 systemctl try-restart cameodb.service
 """
+
+[package.metadata.deb]
+maintainer = "CameoDB Team <team@cameodb.com>"
+copyright = "2026, CameoDB Team"
+license-file = ["../../LICENSE", "4"]
+extended-description = """\
+A high-performance distributed hybrid-search database with built-in clustering,
+search capabilities, and modern Rust performance optimizations."""
+depends = ""
+section = "database"
+priority = "optional"
+assets = [
+    ["target/release/cameodb", "usr/local/bin/", "755"],
+    ["cameodb.toml", "etc/cameodb/", "644"],
+    ["cameodb.service", "lib/systemd/system/", "644"]
+]
+conf-files = ["etc/cameodb/cameodb.toml"]
+maintainer-scripts = "debian/"

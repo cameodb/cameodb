@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+# Stop and disable service before removal
+if [ "$1" = "remove" ] || [ "$1" = "upgrade" ]; then
+    if systemctl is-active --quiet cameodb.service; then
+        systemctl stop cameodb.service
+    fi
+    
+    if systemctl is-enabled --quiet cameodb.service; then
+        systemctl disable cameodb.service
+    fi
+fi
+
+exit 0
