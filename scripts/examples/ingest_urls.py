@@ -240,8 +240,8 @@ def ingest(
     if not data_path.exists():
         raise SystemExit(f"Data file not found: {data_path}")
 
-    # Optional: Pre-create schema with explicit field types before ingestion
-    # Uncomment to define schema upfront instead of relying on automatic evolution
+    # Pre-create schema with explicit field types before ingestion
+    # This ensures sha1 is properly configured as shadow field, not just as first field
     ensure_schema(base_url, index)
 
     # Get cluster health to show actual shard count
