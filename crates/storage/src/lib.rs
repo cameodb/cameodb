@@ -44,6 +44,7 @@ use tantivy::{DateTime, Index, IndexReader, IndexWriter, doc};
 use thiserror::Error;
 use tracing::{debug, trace, warn};
 use walkdir::WalkDir;
+use xxhash_rust::xxh3::xxh3_64;
 
 const TANTIVY_DATA_FILE_EXTENSIONS: &[&str] = &["store", "fast", "idx", "doc", "pos", "term"];
 
@@ -529,12 +530,117 @@ fn parse_date_str_to_tantivy(s: &str) -> Option<(DateTime, i64, i64)> {
 }
 
 /// Index schema definition for validation and evolution.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSchema {
     pub fields: HashMap<String, FieldDef>,
+    pub version: u64,
+    pub fingerprint: u64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// Field name to use for routing/sharding (default: "id")
+    pub routing_field_name: String,
+    /// Pre-computed set of shadow field names for O(1) lookup.
+    /// Eliminates per-document HashMap scan in get_shadow_mapping().
+    /// Rebuilt from fields on deserialization via rebuild_shadow_fields_cache().
+    #[serde(skip)]
+    pub shadow_fields: HashSet<String>,
+}
+
+impl Default for IndexSchema {
+    fn default() -> Self {
+        let now = chrono::Utc::now().timestamp();
+        Self {
+            fields: HashMap::new(),
+            version: 1,
+            fingerprint: 0,
+            created_at: now,
+            updated_at: now,
+            routing_field_name: "id".to_string(),
+            shadow_fields: HashSet::new(),
+        }
+    }
 }
 
 impl IndexSchema {
+    /// Calculate deterministic fingerprint from sorted field names
+    pub fn calculate_fingerprint(&self) -> u64 {
+        let mut sorted_names: Vec<&String> = self.fields.keys().collect();
+        sorted_names.sort();
+        let mut combined = Vec::new();
+        for name in sorted_names {
+            combined.extend_from_slice(name.as_bytes());
+        }
+        xxh3_64(&combined)
+    }
+
+    /// Rebuild shadow_fields cache from fields HashMap.
+    /// Must be called after deserialization (shadow_fields is #[serde(skip)]).
+    pub fn rebuild_shadow_fields_cache(&mut self) {
+        self.shadow_fields = self
+            .fields
+            .iter()
+            .filter(|(_, def)| def.is_shadow)
+            .map(|(name, _)| name.clone())
+            .collect();
+    }
+
+    /// Check if there are any shadow fields — zero-cost early exit
+    pub fn has_shadow_fields(&self) -> bool {
+        !self.shadow_fields.is_empty()
+    }
+
+    /// Get the routing field name (defaults to "id")
+    pub fn get_routing_field(&self) -> &str {
+        if self.routing_field_name.is_empty() {
+            "id"
+        } else {
+            &self.routing_field_name
+        }
+    }
+
+    /// Set the routing field (validates field exists in schema)
+    pub fn set_routing_field(&mut self, field_name: String) -> Result<(), String> {
+        if !self.fields.contains_key(&field_name) {
+            return Err(format!("Field '{}' does not exist in schema", field_name));
+        }
+        self.routing_field_name = field_name;
+        Ok(())
+    }
+
+    /// Auto-detect and set routing field using priority algorithm
+    /// Priority: id → hash fields (sha256/sha1/md5) → *_id suffix → *id* substring → first sorted field
+    pub fn auto_detect_routing_field(&mut self) {
+        if self.fields.contains_key("id") {
+            self.routing_field_name = "id".to_string();
+            return;
+        }
+        for hash in &["sha256", "sha1", "md5"] {
+            if self.fields.contains_key(*hash) {
+                self.routing_field_name = hash.to_string();
+                return;
+            }
+        }
+        for name in self.fields.keys() {
+            let lower = name.to_lowercase();
+            if lower.ends_with("id") || lower.ends_with("_id") {
+                self.routing_field_name = name.clone();
+                return;
+            }
+        }
+        for name in self.fields.keys() {
+            if name.to_lowercase().contains("id") {
+                self.routing_field_name = name.clone();
+                return;
+            }
+        }
+        let mut sorted: Vec<&String> = self.fields.keys().collect();
+        sorted.sort();
+        self.routing_field_name = sorted
+            .first()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "id".to_string());
+    }
+
     /// Add or evolve a field based on JSON value (schema evolution)
     /// New fields are added as non-indexed to avoid Tantivy schema rebuilds.
     /// Existing fields can have their types evolved if compatible.
@@ -555,7 +661,7 @@ impl IndexSchema {
 
         let inferred_type = FieldDef::infer_type_from_value(value);
 
-        match self.fields.entry(name.clone()) {
+        let changed = match self.fields.entry(name.clone()) {
             Entry::Vacant(entry) => {
                 // New field - create as non-indexed for background evolution
                 // This allows the field to be stored in redb without requiring
@@ -578,7 +684,14 @@ impl IndexSchema {
                     false
                 }
             }
+        };
+
+        if changed {
+            self.fingerprint = self.calculate_fingerprint();
+            self.updated_at = chrono::Utc::now().timestamp();
         }
+
+        changed
     }
 
     /// Add a shadow field to the schema
@@ -591,16 +704,14 @@ impl IndexSchema {
         }
 
         let field_def = FieldDef::new_shadow(name.clone(), field_type);
+        self.shadow_fields.insert(name.clone());
         self.fields.insert(name, field_def);
         true
     }
 
-    /// Check if a field is a shadow field
+    /// Check if a field is a shadow field — O(1) via pre-computed set
     pub fn is_shadow_field(&self, field_name: &str) -> bool {
-        self.fields
-            .get(field_name)
-            .map(|def| def.is_shadow)
-            .unwrap_or(false)
+        self.shadow_fields.contains(field_name)
     }
 
     /// Get mapping of shadow field names to canonical "id" field
@@ -1593,7 +1704,16 @@ impl HybridStore {
             );
         }
 
-        IndexSchema { fields }
+        let now = chrono::Utc::now().timestamp();
+        IndexSchema {
+            fields,
+            version: 1,
+            fingerprint: 0,
+            created_at: now,
+            updated_at: now,
+            routing_field_name: "id".to_string(),
+            shadow_fields: HashSet::new(),
+        }
     }
 
     /// Helper method: get_or_create_index
@@ -1954,10 +2074,14 @@ impl HybridStore {
                         }
                     }
 
-                    // OPTIMIZATION: Clone once (required for WAL/serialization), then filter in-place without new allocations
-                    let filtered_json_blob = json_blob
-                        .clone()
-                        .map(|blob| filter_shadow_fields_owned(blob, &schema));
+                    // OPTIMIZATION: Skip shadow filtering when no shadow fields exist (common case)
+                    let filtered_json_blob = if schema.has_shadow_fields() {
+                        json_blob
+                            .clone()
+                            .map(|blob| filter_shadow_fields_owned(blob, &schema))
+                    } else {
+                        json_blob.clone()
+                    };
                     let doc_data = StoredDoc {
                         json_blob: filtered_json_blob.as_ref(),
                     };
@@ -1976,16 +2100,24 @@ impl HybridStore {
                         fields.seq => seq_id // Inject the WAL sequence
                     );
 
-                    // Step 4: Index schema-defined fields individually
-                    for (field_name, field_def) in &schema.fields {
-                        if !field_def.indexed {
-                            continue;
-                        }
+                    // Step 4: Single-pass JSON traversal — skip shadows + extract Tantivy fields
+                    if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
+                        for (field_name, field_value) in json_obj {
+                            // O(1) shadow field skip via pre-computed HashSet
+                            if schema.shadow_fields.contains(field_name) {
+                                continue;
+                            }
 
-                        if let Some(tantivy_field) = fields.indexed_fields.get(field_name)
-                            && let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object())
-                            && let Some(field_value) = json_obj.get(field_name)
-                        {
+                            // Look up schema field def + Tantivy field in one go
+                            let field_def = match schema.fields.get(field_name) {
+                                Some(fd) if fd.indexed => fd,
+                                _ => continue,
+                            };
+                            let tantivy_field = match fields.indexed_fields.get(field_name) {
+                                Some(tf) => tf,
+                                None => continue,
+                            };
+
                             match field_def.field_type {
                                 TantivyFieldType::Text => {
                                     if let Some(s) = field_value.as_str() {
@@ -2063,7 +2195,6 @@ impl HybridStore {
                                     if let Some(s) = field_value.as_str()
                                         && let Ok(ip) = s.parse::<std::net::IpAddr>()
                                     {
-                                        // Convert any IP address to IPv6 for Tantivy compatibility
                                         let ipv6 = match ip {
                                             std::net::IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
                                             std::net::IpAddr::V6(ipv6) => ipv6,
@@ -2314,8 +2445,9 @@ impl HybridStore {
         match read_txn.open_table(TABLE_SCHEMA) {
             Ok(schema_table) => match schema_table.get(index_name)? {
                 Some(value) => {
-                    let schema: IndexSchema = serde_json::from_slice(value.value())
+                    let mut schema: IndexSchema = serde_json::from_slice(value.value())
                         .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                    schema.rebuild_shadow_fields_cache();
                     Ok(Some(schema))
                 }
                 None => Ok(None),
@@ -2797,10 +2929,14 @@ impl HybridStore {
         for op in ops {
             match op {
                 WalOp::Put { id, json_blob } => {
-                    // OPTIMIZATION: Clone once for WAL, then filter in-place for storage
-                    let filtered_json_blob = json_blob
-                        .clone()
-                        .map(|blob| filter_shadow_fields_owned(blob, &schema));
+                    // OPTIMIZATION: Skip shadow filtering when no shadow fields exist (common case)
+                    let filtered_json_blob = if schema.has_shadow_fields() {
+                        json_blob
+                            .clone()
+                            .map(|blob| filter_shadow_fields_owned(blob, &schema))
+                    } else {
+                        json_blob.clone()
+                    };
 
                     let wal_bytes = serde_json::to_vec(&WalOp::Put {
                         id: id.clone(),
@@ -2882,18 +3018,22 @@ impl HybridStore {
                         };
 
                         if let Some(original_doc_bytes) = &prepared.doc_bytes {
-                            // Filter shadow fields from document for storage efficiency
-                            let filtered_doc_bytes = if let Ok(stored_doc) =
-                                serde_json::from_slice::<StoredDocOwned>(original_doc_bytes)
-                            {
-                                if let Some(json_blob) = stored_doc.json_blob {
-                                    let filtered_json =
-                                        filter_shadow_fields_from_json(&json_blob, &schema);
-                                    let filtered_stored_doc = StoredDocOwned {
-                                        json_blob: Some(filtered_json),
-                                    };
-                                    serde_json::to_vec(&filtered_stored_doc)
-                                        .map_err(|e| StoreError::Serialization(e.to_string()))?
+                            // OPTIMIZATION: Skip shadow filtering when no shadow fields exist
+                            let filtered_doc_bytes = if schema.has_shadow_fields() {
+                                if let Ok(stored_doc) =
+                                    serde_json::from_slice::<StoredDocOwned>(original_doc_bytes)
+                                {
+                                    if let Some(json_blob) = stored_doc.json_blob {
+                                        let filtered_json =
+                                            filter_shadow_fields_from_json(&json_blob, &schema);
+                                        let filtered_stored_doc = StoredDocOwned {
+                                            json_blob: Some(filtered_json),
+                                        };
+                                        serde_json::to_vec(&filtered_stored_doc)
+                                            .map_err(|e| StoreError::Serialization(e.to_string()))?
+                                    } else {
+                                        original_doc_bytes.clone()
+                                    }
                                 } else {
                                     original_doc_bytes.clone()
                                 }
@@ -2920,17 +3060,24 @@ impl HybridStore {
                             fields.seq => seq_id // Inject the WAL sequence
                         );
 
-                        // Step 4: Index schema-defined fields individually
-                        for (field_name, field_def) in &schema.fields {
-                            if !field_def.indexed {
-                                continue;
-                            }
+                        // Step 4: Single-pass JSON traversal — skip shadows + extract Tantivy fields
+                        if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
+                            for (field_name, field_value) in json_obj {
+                                // O(1) shadow field skip via pre-computed HashSet
+                                if schema.shadow_fields.contains(field_name) {
+                                    continue;
+                                }
 
-                            if let Some(tantivy_field) = fields.indexed_fields.get(field_name)
-                                && let Some(json_obj) =
-                                    json_blob.as_ref().and_then(|v| v.as_object())
-                                && let Some(field_value) = json_obj.get(field_name)
-                            {
+                                // Look up schema field def + Tantivy field in one go
+                                let field_def = match schema.fields.get(field_name) {
+                                    Some(fd) if fd.indexed => fd,
+                                    _ => continue,
+                                };
+                                let tantivy_field = match fields.indexed_fields.get(field_name) {
+                                    Some(tf) => tf,
+                                    None => continue,
+                                };
+
                                 match field_def.field_type {
                                     TantivyFieldType::Text => {
                                         if let Some(s) = field_value.as_str() {
@@ -3009,7 +3156,6 @@ impl HybridStore {
                                         if let Some(s) = field_value.as_str()
                                             && let Ok(ip) = s.parse::<std::net::IpAddr>()
                                         {
-                                            // Convert any IP address to IPv6 for Tantivy compatibility
                                             let ipv6 = match ip {
                                                 std::net::IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
                                                 std::net::IpAddr::V6(ipv6) => ipv6,

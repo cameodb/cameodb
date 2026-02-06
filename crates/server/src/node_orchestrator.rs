@@ -53,12 +53,46 @@ use storage::{
     FieldDef, HybridStore, IndexSchema, ShardStatsTimings, StorageConfig, StoreError,
     TantivyFieldType, WalOp,
 };
+use xxhash_rust::xxh3::xxh3_64;
 
 /// Sample limit for enhanced schema detection during initial creation
 const SCHEMA_SAMPLE_LIMIT: usize = 200;
 
 /// Type alias for routing results to reduce complexity
 type RoutingResult = Result<(DocPayload, Option<String>, Option<Uuid>), OrchestratorError>;
+
+/// Extract routing key value from JSON document using field name
+pub fn extract_routing_value(doc: &JsonValue, field_name: &str) -> Option<String> {
+    let obj = doc.as_object()?;
+    match obj.get(field_name)? {
+        JsonValue::String(s) => Some(s.clone()),
+        JsonValue::Number(n) => Some(n.to_string()),
+        JsonValue::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Extract unique field names from a batch of documents (lightweight operation)
+fn extract_field_names(docs: &[DocPayload]) -> HashSet<String> {
+    let mut field_names = HashSet::new();
+    for doc in docs {
+        if let Some(obj) = doc.doc.as_object() {
+            field_names.extend(obj.keys().cloned());
+        }
+    }
+    field_names
+}
+
+/// Calculate fingerprint from sorted field names using xxh3_64 one-shot API
+fn calculate_batch_fingerprint(field_names: &HashSet<String>) -> u64 {
+    let mut sorted_names: Vec<&String> = field_names.iter().collect();
+    sorted_names.sort();
+    let mut combined = Vec::new();
+    for name in &sorted_names {
+        combined.extend_from_slice(name.as_bytes());
+    }
+    xxh3_64(&combined)
+}
 
 /// Transform search query to map shadow fields to canonical "id" field
 ///
@@ -957,206 +991,6 @@ impl MicroshardActor {
 
         Ok(())
     }
-}
-
-/// Validates and evolves schema for a document.
-///
-/// This function implements schema validation and evolution logic:
-/// 1. Ensures the document has an "id" field (mandatory)
-/// 2. Checks type compatibility for existing fields
-/// 3. Adds new fields to the schema (append-only evolution)
-/// 4. Persists schema updates to storage
-///
-/// Schema Creation vs Evolution:
-/// - **Initial Creation** (empty schema): All fields set to `indexed = true`
-/// - **Evolution** (existing schema): New fields set to `indexed = false`
-///
-/// # Arguments
-///
-/// * `index` - The index name
-/// * `doc` - The document to validate
-/// * `schema_cache` - Mutable reference to the cached schema
-/// * `shards` - Map of local shards to persist schema updates to
-///
-/// # Returns
-///
-/// `Ok(bool)` - true if schema was updated/persisted, false otherwise
-async fn validate_and_evolve_schema(
-    index: &str,
-    doc: &JsonValue,
-    schema_cache: &mut IndexSchema,
-    shards: &HashMap<Uuid, MicroshardActor>,
-) -> Result<bool, OrchestratorError> {
-    // Check 1 (Mandatory): Ensure doc["id"] exists
-    if !doc.is_object() || !doc.as_object().unwrap().contains_key("id") {
-        return Err(OrchestratorError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Document must contain an 'id' field",
-        )));
-    }
-
-    let mut schema_updated = false;
-
-    // Determine if this is initial schema creation (no fields defined yet)
-    let is_initial_creation = schema_cache.fields.is_empty();
-
-    // Check 2 (Evolution): Iterate keys in doc
-    if let Some(obj) = doc.as_object() {
-        for (key, value) in obj {
-            let inferred_type = if key == "id" {
-                TantivyFieldType::Text
-            } else {
-                match value {
-                    JsonValue::String(s) => {
-                        // Try to infer date from string
-                        if chrono::DateTime::parse_from_rfc3339(s).is_ok()
-                            || is_naive_datetime(s)
-                            || is_naive_date(s)
-                        {
-                            TantivyFieldType::Date
-                        } else if s.parse::<std::net::IpAddr>().is_ok() {
-                            TantivyFieldType::Ip
-                        } else {
-                            TantivyFieldType::Text
-                        }
-                    }
-                    JsonValue::Number(n) => {
-                        if n.is_i64() {
-                            TantivyFieldType::I64
-                        } else if n.is_u64() {
-                            TantivyFieldType::U64
-                        } else {
-                            TantivyFieldType::F64
-                        }
-                    }
-                    JsonValue::Bool(_) => TantivyFieldType::Boolean,
-                    JsonValue::Array(_) => TantivyFieldType::Text, // Arrays as text
-                    JsonValue::Object(_) => TantivyFieldType::Json, // Objects as JSON
-                    JsonValue::Null => TantivyFieldType::Text,
-                }
-            };
-
-            if let Some(existing_field) = schema_cache.fields.get(key) {
-                // Check type compatibility
-                // 1. Exact match is always allowed
-                let mut is_compatible = existing_field.field_type == inferred_type;
-
-                // 2. Allow Text to match String (for backward compatibility with exact fields)
-                if !is_compatible
-                    && inferred_type == TantivyFieldType::Text
-                    && existing_field.field_type == TantivyFieldType::String
-                {
-                    is_compatible = true;
-                }
-
-                // 3. Allow Text to evolve to more specific types
-                if !is_compatible && existing_field.field_type == TantivyFieldType::Text {
-                    match inferred_type {
-                        TantivyFieldType::Date
-                        | TantivyFieldType::Ip
-                        | TantivyFieldType::I64
-                        | TantivyFieldType::U64
-                        | TantivyFieldType::F64
-                        | TantivyFieldType::Boolean
-                        | TantivyFieldType::Json => {
-                            is_compatible = true;
-                        }
-                        _ => {}
-                    }
-                }
-
-                // 4. Allow numeric upgrades
-                if !is_compatible {
-                    match (&existing_field.field_type, inferred_type.clone()) {
-                        (TantivyFieldType::I64, TantivyFieldType::F64)
-                        | (TantivyFieldType::U64, TantivyFieldType::F64) => {
-                            is_compatible = true;
-                        }
-                        _ => {}
-                    }
-                }
-
-                if !is_compatible {
-                    return Err(OrchestratorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "Type mismatch for field '{}': expected {:?}, got {:?}",
-                            key, existing_field.field_type, inferred_type
-                        ),
-                    )));
-                }
-            } else {
-                // New field: Update schema_cache (Append-Only)
-                // Mark new fields indexed by default so they become searchable on arrival
-                let new_field = FieldDef::new(key.clone(), inferred_type);
-                schema_cache.fields.insert(key.clone(), new_field);
-                schema_updated = true;
-            }
-        }
-    }
-
-    // Persist updated schema to storage if changed
-    if schema_updated {
-        let index_name = index.to_string();
-        let schema_clone = schema_cache.clone();
-
-        // Collect all stores from local shards
-        let stores: Vec<Arc<HybridStore>> = shards
-            .values()
-            .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
-            .collect();
-
-        if stores.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No local stores available to persist schema",
-            )));
-        }
-
-        // Persist to all stores concurrently
-        let handles: Vec<_> = stores
-            .into_iter()
-            .map(|store| {
-                let idx = index_name.clone();
-                let sch = schema_clone.clone();
-                tokio::task::spawn_blocking(move || store.store_schema_and_cache(&idx, &sch))
-            })
-            .collect();
-
-        // Await all results
-        for handle in handles {
-            handle
-                .await
-                .map_err(|e| {
-                    OrchestratorError::Io(std::io::Error::other(format!(
-                        "Failed to spawn schema update task: {}",
-                        e
-                    )))
-                })?
-                .map_err(|e| {
-                    OrchestratorError::Io(std::io::Error::other(format!(
-                        "Failed to store schema: {}",
-                        e
-                    )))
-                })?;
-        }
-
-        if is_initial_creation {
-            info!(
-                index = %index,
-                field_count = schema_cache.fields.len(),
-                "Initial schema created with all fields indexed=true"
-            );
-        } else {
-            info!(
-                index = %index,
-                total_fields = schema_cache.fields.len(),
-                "Schema evolved with new fields (indexed=false by default)"
-            );
-        }
-    }
-
-    Ok(schema_updated)
 }
 
 // ============================================================================
@@ -2255,6 +2089,8 @@ pub struct NodeOrchestrator {
     coordinator: Option<ActorRef<ClusterCoordinator>>,
     /// Per-index schema cache to avoid repeated metadata reads
     schema_cache: AsyncRwLock<HashMap<String, IndexSchema>>,
+    /// Fingerprint → index_name reverse lookup for instant cache hits
+    fingerprint_index: AsyncRwLock<HashMap<u64, String>>,
     /// Default search result limit when not specified in request
     default_search_limit: usize,
 }
@@ -2407,7 +2243,9 @@ impl NodeOrchestrator {
         };
 
         for result in validation_results {
-            if result.validation_error.is_none() {
+            if let Some(err) = result.validation_error {
+                summary.errors.push(err);
+            } else {
                 summary.valid_docs += 1;
                 if result.needs_evolution {
                     summary.evolution_needed = true;
@@ -2415,8 +2253,6 @@ impl NodeOrchestrator {
                         summary.all_new_fields.insert(new_field);
                     }
                 }
-            } else {
-                summary.errors.push(result.validation_error.unwrap());
             }
         }
 
@@ -3051,6 +2887,22 @@ impl NodeOrchestrator {
     async fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
         let mut map = self.schema_cache.write().await;
         map.insert(index.to_string(), schema.clone());
+
+        // Maintain fingerprint reverse lookup
+        if schema.fingerprint != 0 {
+            let mut fp_map = self.fingerprint_index.write().await;
+            fp_map.insert(schema.fingerprint, index.to_string());
+        }
+    }
+
+    /// Get schema by fingerprint (instant cache hit).
+    async fn get_schema_by_fingerprint(&self, fingerprint: u64) -> Option<IndexSchema> {
+        let fp_map = self.fingerprint_index.read().await;
+        if let Some(index_name) = fp_map.get(&fingerprint) {
+            let cache = self.schema_cache.read().await;
+            return cache.get(index_name).cloned();
+        }
+        None
     }
 
     /// Produce sorted field names with "id" first (if present), others alphabetical.
@@ -3107,6 +2959,7 @@ impl NodeOrchestrator {
             routing_ring: ConsistentRing::new(),
             coordinator: None,
             schema_cache: AsyncRwLock::new(HashMap::new()),
+            fingerprint_index: AsyncRwLock::new(HashMap::new()),
             default_search_limit,
         };
 
@@ -3647,10 +3500,15 @@ impl NodeOrchestrator {
             }
         }
 
-        // Clear schema cache for this index
+        // Clear schema cache and fingerprint index for this index
         {
             let mut cache = self.schema_cache.write().await;
-            cache.remove(index);
+            if let Some(schema) = cache.remove(index)
+                && schema.fingerprint != 0
+            {
+                let mut fp_map = self.fingerprint_index.write().await;
+                fp_map.remove(&schema.fingerprint);
+            }
         }
 
         Ok(serde_json::json!({
@@ -3675,21 +3533,47 @@ impl NodeOrchestrator {
                 "No shards",
             )));
         }
-        let mut schema_cache = self.load_schema(index).await?;
 
-        // Evolve schema and persist to ALL local shards
-        let updated =
-            validate_and_evolve_schema(index, &doc, &mut schema_cache, &self.shards).await?;
-        if updated {
+        // Wrap single doc as DocPayload for unified validation path
+        let doc_payload = DocPayload {
+            id: id.clone(),
+            routing_key: routing_key.clone(),
+            doc: doc.clone(),
+        };
+        let docs_slice = [doc_payload];
+
+        // Fingerprint-based schema lookup (same as bulk write)
+        let batch_field_names = extract_field_names(&docs_slice);
+        let batch_fingerprint = calculate_batch_fingerprint(&batch_field_names);
+
+        let mut schema_cache =
+            if let Some(cached) = self.get_schema_by_fingerprint(batch_fingerprint).await {
+                cached
+            } else {
+                self.load_schema(index).await?
+            };
+
+        // Unified validation path (same as bulk write)
+        let validation_summary = self
+            .staged_schema_validation(index, &docs_slice, &mut schema_cache)
+            .await?;
+
+        // Always populate cache (also populates fingerprint_index)
+        if validation_summary.evolution_needed || self.get_cached_schema(index).await.is_none() {
             self.put_cached_schema(index, &schema_cache).await;
         }
 
-        // Derive effective routing key (deterministic priority):
-        // 1) Explicit routing_key from payload
-        // 2) Document id argument
-        // 3) Fallback to deterministic key derived from document bytes
-        let effective_routing_key = routing_key
-            .clone()
+        if !validation_summary.errors.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                validation_summary.errors.join("; "),
+            )));
+        }
+
+        // Schema-based routing (same as bulk write)
+        let routing_field = schema_cache.get_routing_field().to_string();
+        let effective_routing_key = extract_routing_value(&doc, &routing_field)
+            .or(routing_key)
             .or_else(|| (!id.is_empty()).then(|| id.clone()))
             .or_else(|| derive_routing_key_from_doc(&doc));
 
@@ -3727,16 +3611,24 @@ impl NodeOrchestrator {
             )));
         }
 
-        // Load schema and perform staged validation for all documents before writing
-        let mut schema_cache = self.load_schema(index).await?;
+        // Fingerprint-based schema lookup: check cache before loading from shard
+        let batch_field_names = extract_field_names(&docs);
+        let batch_fingerprint = calculate_batch_fingerprint(&batch_field_names);
+
+        let mut schema_cache =
+            if let Some(cached) = self.get_schema_by_fingerprint(batch_fingerprint).await {
+                cached
+            } else {
+                self.load_schema(index).await?
+            };
 
         // Use staged schema validation: parallel validation + sequential evolution
         let validation_summary = self
             .staged_schema_validation(index, &docs, &mut schema_cache)
             .await?;
 
-        // Update cache only if schema evolved AND wasn't already cached during load
-        if validation_summary.evolution_needed && self.get_cached_schema(index).await.is_none() {
+        // Update cache (also populates fingerprint_index for future lookups)
+        if validation_summary.evolution_needed || self.get_cached_schema(index).await.is_none() {
             self.put_cached_schema(index, &schema_cache).await;
         }
 
@@ -3768,14 +3660,16 @@ impl NodeOrchestrator {
             HashMap::new()
         };
 
+        // Schema-based routing: use routing field from schema instead of per-document routing_key
+        let routing_field = schema_cache.get_routing_field().to_string();
+
         // Route documents in parallel
         let routing_results: Vec<RoutingResult> =
             docs.into_par_iter()
                 .map(|doc| {
-                    // Calculate effective routing key
-                    let effective_routing_key = doc
-                        .routing_key
-                        .clone()
+                    // Calculate effective routing key using schema's routing field
+                    let effective_routing_key = extract_routing_value(&doc.doc, &routing_field)
+                        .or_else(|| doc.routing_key.clone())
                         .or_else(|| (!doc.id.is_empty()).then(|| doc.id.clone()))
                         .or_else(|| derive_routing_key_from_doc(&doc.doc));
 
@@ -4390,9 +4284,7 @@ impl NodeOrchestrator {
                 return Ok(schema);
             }
         }
-        Ok(IndexSchema {
-            fields: HashMap::new(),
-        })
+        Ok(IndexSchema::default())
     }
 
     /// Helper: Route write to shard using deterministic key (no round-robin).

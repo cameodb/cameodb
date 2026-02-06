@@ -4172,6 +4172,7 @@ dependencies = [
  "tracing",
  "uuid",
  "walkdir",
+ "xxhash-rust",
 ]
 
 [[package]]

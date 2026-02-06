@@ -1211,6 +1211,10 @@ async fn detect_schema_from_csv(
         schema.fields.insert("id".to_string(), id_field);
     }
 
+    // Set routing field and fingerprint from the fully-built schema
+    schema.auto_detect_routing_field();
+    schema.fingerprint = schema.calculate_fingerprint();
+
     let mut schema_json = serde_json::to_value(schema).context("Failed to serialize schema")?;
 
     // Reorder fields map: id first, then preserve CSV column order
