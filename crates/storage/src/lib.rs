@@ -35,7 +35,7 @@ use dashmap::DashMap;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as DeserializeError};
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use tantivy::query::QueryParserError;
@@ -269,7 +269,7 @@ impl StorageConfig {
 }
 
 /// Native Tantivy field types with proper enum for type safety.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash, Default)]
 pub enum TantivyFieldType {
     /// Tokenized text for full-text search
     #[default]
@@ -315,13 +315,77 @@ impl TantivyFieldType {
     }
 }
 
+// Custom deserialization to support common type aliases from Python and other languages
+impl<'de> Deserialize<'de> for TantivyFieldType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let normalized = s.to_lowercase();
+
+        match normalized.as_str() {
+            // Primary canonical names
+            "text" => Ok(TantivyFieldType::Text),
+            "string" => Ok(TantivyFieldType::String),
+            "i64" => Ok(TantivyFieldType::I64),
+            "u64" => Ok(TantivyFieldType::U64),
+            "f64" => Ok(TantivyFieldType::F64),
+            "date" => Ok(TantivyFieldType::Date),
+            "boolean" => Ok(TantivyFieldType::Boolean),
+            "bytes" => Ok(TantivyFieldType::Bytes),
+            "ip" => Ok(TantivyFieldType::Ip),
+            "json" => Ok(TantivyFieldType::Json),
+            "facet" => Ok(TantivyFieldType::Facet),
+
+            // Common aliases for Python/JavaScript/SQL compatibility
+            "float" | "double" | "decimal" => Ok(TantivyFieldType::F64),
+            "integer" | "int" | "number" | "signed" => Ok(TantivyFieldType::I64),
+            "unsigned" | "uint" => Ok(TantivyFieldType::U64),
+            "bool" => Ok(TantivyFieldType::Boolean),
+            "datetime" | "timestamp" => Ok(TantivyFieldType::Date),
+            "binary" | "blob" => Ok(TantivyFieldType::Bytes),
+            "object" | "document" => Ok(TantivyFieldType::Json),
+            "category" | "tag" => Ok(TantivyFieldType::Facet),
+
+            // Fallback with helpful error
+            _ => Err(D::Error::custom(format!(
+                "Unknown field type: '{}'. Supported types: text, string, i64, u64, f64, date, boolean, bytes, ip, json, facet. Aliases: float, double, integer, int, number, bool, datetime, timestamp, binary, blob, object, document, category, tag",
+                s
+            ))),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_version() -> u64 {
+    1
+}
+
+fn default_timestamp() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn default_routing_field() -> String {
+    "id".to_string()
+}
+
 /// Field definition for schema evolution and validation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FieldDef {
+    /// Field name — populated from the map key if not present in JSON
+    #[serde(default)]
     pub name: String,
     pub field_type: TantivyFieldType,
+    /// Whether this field is indexed in Tantivy (default: true for user-defined schemas)
+    #[serde(default = "default_true")]
     pub indexed: bool,
+    #[serde(default)]
     pub stored: bool,
+    #[serde(default)]
     pub fast: bool,
     /// Shadow field flag: true if this field preserves original field name when ID is copied to canonical "id" field
     /// Shadow fields are NOT indexed and NOT stored in Tantivy, but preserved in schema for query mapping
@@ -533,11 +597,16 @@ fn parse_date_str_to_tantivy(s: &str) -> Option<(DateTime, i64, i64)> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSchema {
     pub fields: HashMap<String, FieldDef>,
+    #[serde(default = "default_version")]
     pub version: u64,
+    #[serde(default)]
     pub fingerprint: u64,
+    #[serde(default = "default_timestamp")]
     pub created_at: i64,
+    #[serde(default = "default_timestamp")]
     pub updated_at: i64,
     /// Field name to use for routing/sharding (default: "id")
+    #[serde(default = "default_routing_field")]
     pub routing_field_name: String,
     /// Pre-computed set of shadow field names for O(1) lookup.
     /// Eliminates per-document HashMap scan in get_shadow_mapping().
@@ -562,6 +631,81 @@ impl Default for IndexSchema {
 }
 
 impl IndexSchema {
+    /// Normalize schema after deserialization from external sources (e.g. Python scripts).
+    /// - Populates field `name` from the map key if empty
+    /// - Enriches indexed fields with proper Tantivy defaults (tokenizer, fast, etc.)
+    /// - Rebuilds shadow fields cache
+    pub fn normalize_after_deserialization(&mut self) {
+        for (key, field_def) in &mut self.fields {
+            // Populate name from map key if not provided in JSON
+            if field_def.name.is_empty() {
+                field_def.name = key.clone();
+            }
+
+            // The 'id' field has fixed Tantivy attributes regardless of user input
+            if key == "id" {
+                field_def.indexed = true;
+                field_def.stored = true;
+                field_def.tokenizer = Some("raw".to_string());
+                field_def.index_record_option = Some("Basic".to_string());
+                continue;
+            }
+
+            // Skip enrichment for shadow fields and non-indexed fields
+            if field_def.is_shadow || !field_def.indexed {
+                continue;
+            }
+
+            // Enrich with Tantivy defaults based on field type
+            match field_def.field_type {
+                TantivyFieldType::Text => {
+                    // Set default tokenizer if not specified
+                    if field_def.tokenizer.is_none() {
+                        field_def.tokenizer = Some("default".to_string());
+                    }
+                    // Set default index record option if not specified
+                    if field_def.index_record_option.is_none() {
+                        field_def.index_record_option = Some("WithFreqsAndPositions".to_string());
+                    }
+                }
+                TantivyFieldType::String => {
+                    // STRING uses raw tokenizer with Basic index option
+                    if field_def.tokenizer.is_none() {
+                        field_def.tokenizer = Some("raw".to_string());
+                    }
+                    if field_def.index_record_option.is_none() {
+                        field_def.index_record_option = Some("Basic".to_string());
+                    }
+                }
+                TantivyFieldType::I64
+                | TantivyFieldType::U64
+                | TantivyFieldType::F64
+                | TantivyFieldType::Date => {
+                    // Numeric and date types should be fast by default for range queries
+                    if !field_def.fast {
+                        field_def.fast = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Ensure reserved '_seq' field is always present (WAL sequence tracking)
+        self.fields
+            .entry("_seq".to_string())
+            .or_insert_with(|| FieldDef {
+                name: "_seq".to_string(),
+                field_type: TantivyFieldType::U64,
+                indexed: false,
+                stored: true,
+                fast: true,
+                is_shadow: false,
+                tokenizer: None,
+                index_record_option: None,
+            });
+
+        self.rebuild_shadow_fields_cache();
+    }
+
     /// Calculate deterministic fingerprint from sorted field names
     pub fn calculate_fingerprint(&self) -> u64 {
         let mut sorted_names: Vec<&String> = self.fields.keys().collect();
@@ -1759,34 +1903,27 @@ impl HybridStore {
         // IMPORTANT: Only sync schema when we actually created a new index
         // This ensures we don't overwrite persisted schema when index was deleted
         if sync_schema {
-            // Derive schema from Tantivy (indexed fields only, excludes 'id')
-            let mut tantivy_schema = Self::derive_index_schema_from_tantivy(&tantivy_index);
+            // Use the original schema as the source of truth
+            // The index_schema contains the complete field definitions including indexed=false fields
+            let mut tantivy_schema = (*index_schema).clone();
 
-            // CRITICAL: Always add the mandatory 'id' field to our schema cache
-            // The 'id' field is implicit in Tantivy but required for our validation
-            tantivy_schema.fields.insert(
-                "id".to_string(),
-                FieldDef {
-                    name: "id".to_string(),
-                    field_type: TantivyFieldType::Text,
-                    indexed: true,
-                    stored: true,
-                    fast: false,
-                    is_shadow: false, // The canonical 'id' field is not a shadow field
-                    tokenizer: Some("raw".to_string()),
-                    index_record_option: Some("Basic".to_string()),
-                },
-            );
-
-            // Merge with stored schema to preserve non-indexed fields
-            // The stored schema (index_schema) contains the full field definitions
-            // including fields that may not be indexed but are part of the schema
-            for (name, field_def) in &index_schema.fields {
-                tantivy_schema
-                    .fields
-                    .entry(name.clone())
-                    .or_insert_with(|| field_def.clone());
-            }
+            // Ensure 'id' field exists with correct Tantivy-derived attributes
+            // This handles cases where the original schema didn't specify 'id' field
+            tantivy_schema
+                .fields
+                .entry("id".to_string())
+                .or_insert_with(|| {
+                    FieldDef {
+                        name: "id".to_string(),
+                        field_type: TantivyFieldType::Text,
+                        indexed: true,
+                        stored: true,
+                        fast: false,
+                        is_shadow: false, // The canonical 'id' field is not a shadow field
+                        tokenizer: Some("raw".to_string()),
+                        index_record_option: Some("Basic".to_string()),
+                    }
+                });
 
             // IMPORTANT: Cache should reflect merged schema (Tantivy + stored metadata)
             self.schema_cache
@@ -1985,8 +2122,9 @@ impl HybridStore {
         self.commit_index(index)
     }
 
-    /// Perform smart commit based on operation count
-    fn maybe_commit_writer(&self, index: &str) -> Result<bool, StoreError> {
+    /// Perform smart commit based on operation count.
+    /// Returns Ok(true) if a commit was performed, Ok(false) if threshold not yet reached.
+    pub fn maybe_commit_writer(&self, index: &str) -> Result<bool, StoreError> {
         let ops_count = self.get_operations_count(index);
 
         if self.should_commit_writer(index, ops_count) {
@@ -1994,6 +2132,31 @@ impl HybridStore {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Apply a single write and commit if the cumulative operations threshold is met.
+    /// Returns (seq_id, committed) where committed indicates if a Tantivy commit was performed.
+    pub fn apply_write_and_maybe_commit(
+        &self,
+        index: &str,
+        op: WalOp,
+    ) -> Result<(u64, bool), StoreError> {
+        let seq_id = self.apply_write(index, op)?;
+        let committed = self.maybe_commit_writer(index)?;
+        Ok((seq_id, committed))
+    }
+
+    /// Apply a batch of writes and commit if the cumulative operations threshold is met.
+    /// Returns ((seq_ids, new_docs_count), committed) where committed indicates
+    /// if a Tantivy commit was performed.
+    pub fn apply_batch_and_maybe_commit(
+        &self,
+        index: &str,
+        ops: Vec<WalOp>,
+    ) -> Result<((Vec<u64>, usize), bool), StoreError> {
+        let result = self.apply_batch(index, ops)?;
+        let committed = self.maybe_commit_writer(index)?;
+        Ok((result, committed))
     }
 
     /// Multi-tenant apply_write method
@@ -2027,7 +2190,7 @@ impl HybridStore {
 
         let mut write_txn = self.kv.begin_write()?;
         {
-            // Set durability based on config (except for schema changes which always use Immediate)
+            // Set durability based on config (wal_sync flag is an intentional configuration decision)
             let durability = if self.config.wal_sync {
                 Durability::Immediate
             } else {
@@ -2267,9 +2430,10 @@ impl HybridStore {
             }
         }
 
-        // Increment operation counter and perform smart commit if needed
+        // Increment operation counter for threshold tracking.
+        // The actual commit decision is made by the writer thread loop
+        // after this function returns, via maybe_commit_writer().
         self.increment_operations(index);
-        self.maybe_commit_writer(index)?;
 
         Ok(seq_id)
     }
@@ -2487,12 +2651,13 @@ impl HybridStore {
                 return Ok(Some(Arc::new(stored)));
             }
 
-            // Merge stored fields into Tantivy schema to preserve non-indexed fields
-            let mut merged_schema = tantivy_schema;
-            if let Some(mut stored) = stored_schema {
-                for (name, field_def) in stored.fields.drain() {
-                    merged_schema.fields.entry(name).or_insert(field_def);
-                }
+            // Use stored schema as base, then add indexed fields from Tantivy
+            // This preserves all field definitions including non-indexed ones
+            let mut merged_schema = stored_schema.unwrap_or_default();
+
+            // Add indexed fields from Tantivy that might be missing
+            for (name, field_def) in tantivy_schema.fields {
+                merged_schema.fields.entry(name).or_insert(field_def);
             }
 
             // Cache the merged schema
@@ -3194,7 +3359,7 @@ impl HybridStore {
         // Apply all tantivy operations with optimized selective deletes
         {
             // Try to acquire writer lock, with retry logic for lock contention
-            let mut writer = {
+            let writer = {
                 let mut attempts = 0;
                 let max_attempts = 3;
                 loop {
@@ -3254,95 +3419,21 @@ impl HybridStore {
                 }
             }
 
-            // Apply smart commit logic for batch operations (same as individual writes)
-            // Increment operations counter by batch size
+            // Increment operations counter by batch size for threshold tracking.
+            // The actual commit decision is made by apply_batch_and_maybe_commit()
+            // which calls maybe_commit_writer() after this function returns.
             self.operations_counter
                 .entry(index.to_string())
                 .or_insert_with(|| AtomicU64::new(0))
                 .value()
                 .fetch_add(batch_size, Ordering::SeqCst);
 
-            // Adaptive commit strategy: use configuration-based thresholds for intermediate commits
-            // Calculate the current commit threshold for this index based on memory budget
-            let current_threshold = {
-                let budget = if let Some(b) = self.budget_cache.get(index) {
-                    *b.value()
-                } else {
-                    // Fallback: calculate and cache
-                    let index_path = self.config.shard_path.join("indices").join(index);
-                    let b = self.config.get_optimal_memory_budget(&index_path);
-                    self.budget_cache.insert(index.to_string(), b);
-                    b
-                };
-
-                let min_budget = self.config.indexer_memory_min_mb * 1024 * 1024;
-                let max_budget = self.config.indexer_memory_max_mb * 1024 * 1024;
-                let budget_ratio = (budget - min_budget) as f64 / (max_budget - min_budget) as f64;
-                let default_batch = self.config.default_batch_size as f64;
-
-                // Same calculation as should_commit_writer for consistency
-                (default_batch * (0.5 + budget_ratio * 7.5)) as u64
-            };
-
-            // Intermediate commit if batch size exceeds 3x the normal commit threshold
-            // This allows large batches to commit periodically without waiting for full threshold
-            let committed = if batch_size > current_threshold * 3 {
-                tracing::debug!(
-                    index = %index,
-                    batch_size = batch_size,
-                    threshold = current_threshold,
-                    "Large batch exceeds 3x threshold, performing intermediate commit"
-                );
-                // Commit and reset counter to threshold value to allow supervisor to continue working
-                writer.commit()?;
-                // Reset to threshold instead of 0 to keep supervisor active
-                self.reset_operations_counter_to(index, current_threshold);
-                true
-            } else {
-                // Skip commits for normal batches to prevent Tantivy contention
-                false
-            };
-
-            // Optimize memory budget for batch processing to reduce segment creation
-            // Use the same threshold calculation for consistency
-            if batch_size > current_threshold * 2 {
-                // Increase memory budget temporarily for large batches to create fewer segments
-                let current_budget = self
-                    .budget_cache
-                    .get(index)
-                    .map(|b| *b.value())
-                    .unwrap_or_else(|| {
-                        // Fallback if not cached
-                        let index_path = self.config.shard_path.join("indices").join(index);
-                        self.config.get_optimal_memory_budget(&index_path)
-                    });
-
-                let increased_budget = (current_budget as f64 * 1.5) as usize;
-                let max_budget = self.config.indexer_memory_max_mb * 1024 * 1024;
-
-                if increased_budget <= max_budget {
-                    tracing::debug!(
-                        index = %index,
-                        batch_size = batch_size,
-                        old_budget_mb = current_budget / 1024 / 1024,
-                        new_budget_mb = increased_budget / 1024 / 1024,
-                        "Increasing memory budget for batch processing (2x threshold exceeded)"
-                    );
-
-                    // Update cached budget for this batch
-                    self.budget_cache
-                        .insert(index.to_string(), increased_budget);
-                }
-            }
-
             tracing::debug!(
                 index = %index,
                 batch_size = batch_size,
                 new_docs = new_documents_count,
                 updated_docs = updated_document_ids.len(),
-                skipped_deletes = new_documents_count,
-                committed = committed,
-                "Bulk write completed with selective Tantivy optimization and smart commits"
+                "Bulk write completed"
             );
 
             // Explicit drop of writer to ensure lock release before leaving scope
@@ -4066,5 +4157,305 @@ mod tests {
         assert!(!promoted_again, "Should not promote already indexed field");
 
         println!("✅ Background schema evolution works correctly!");
+    }
+
+    #[test]
+    fn test_type_aliases_deserialization() {
+        use serde_json;
+
+        // Test various type aliases deserialize correctly
+        let test_cases = vec![
+            ("float", TantivyFieldType::F64),
+            ("double", TantivyFieldType::F64),
+            ("decimal", TantivyFieldType::F64),
+            ("integer", TantivyFieldType::I64),
+            ("int", TantivyFieldType::I64),
+            ("number", TantivyFieldType::I64),
+            ("signed", TantivyFieldType::I64),
+            ("unsigned", TantivyFieldType::U64),
+            ("uint", TantivyFieldType::U64),
+            ("bool", TantivyFieldType::Boolean),
+            ("datetime", TantivyFieldType::Date),
+            ("timestamp", TantivyFieldType::Date),
+            ("binary", TantivyFieldType::Bytes),
+            ("blob", TantivyFieldType::Bytes),
+            ("object", TantivyFieldType::Json),
+            ("document", TantivyFieldType::Json),
+            ("category", TantivyFieldType::Facet),
+            ("tag", TantivyFieldType::Facet),
+            // Test canonical names still work
+            ("text", TantivyFieldType::Text),
+            ("string", TantivyFieldType::String),
+            ("i64", TantivyFieldType::I64),
+            ("u64", TantivyFieldType::U64),
+            ("f64", TantivyFieldType::F64),
+            ("date", TantivyFieldType::Date),
+            ("boolean", TantivyFieldType::Boolean),
+            ("bytes", TantivyFieldType::Bytes),
+            ("ip", TantivyFieldType::Ip),
+            ("json", TantivyFieldType::Json),
+            ("facet", TantivyFieldType::Facet),
+        ];
+
+        for (alias, expected) in test_cases {
+            let json = format!(r#"{{"field_type": "{}"}}"#, alias);
+            let field_def: FieldDef = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("Failed to deserialize '{}': {}", alias, e));
+
+            assert_eq!(
+                field_def.field_type, expected,
+                "Alias '{}' should map to {:?}, got {:?}",
+                alias, expected, field_def.field_type
+            );
+        }
+
+        // Test case-insensitive
+        let json = r#"{"field_type": "FLOAT"}"#;
+        let field_def: FieldDef = serde_json::from_str(json).unwrap();
+        assert_eq!(field_def.field_type, TantivyFieldType::F64);
+
+        // Test invalid type gives helpful error
+        let json = r#"{"field_type": "invalid_type"}"#;
+        let result: Result<FieldDef, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Unknown field type: 'invalid_type'")
+        );
+        assert!(error.to_string().contains("Supported types:"));
+
+        println!("✅ Type alias deserialization works correctly!");
+    }
+
+    #[test]
+    fn test_python_schema_compatibility() {
+        use serde_json;
+
+        // Test the exact schema from ingest_urls.py
+        let python_schema = serde_json::json!({
+            "fields": {
+                "id": {"field_type": "text", "indexed": true, "stored": true},
+                "sha1": {"field_type": "text", "indexed": false, "stored": false, "is_shadow": true},
+                "first_analysis": {"field_type": "date", "indexed": true, "stored": false},
+                "last_analysis": {"field_type": "date", "indexed": true, "stored": false},
+                "platform": {"field_type": "text", "indexed": true, "stored": false},
+                "classification": {"field_type": "text", "indexed": true, "stored": false},
+                "risk_score": {"field_type": "float", "indexed": true, "stored": false},
+                "threat_names": {"field_type": "text", "indexed": true, "stored": false},
+                "file_types": {"field_type": "text", "indexed": true, "stored": false},
+                "signatures": {"field_type": "text", "indexed": true, "stored": false},
+                "urls": {"field_type": "text", "indexed": true, "stored": false}
+            }
+        });
+
+        let schema: IndexSchema = serde_json::from_value(python_schema).unwrap();
+
+        // Verify the float field was correctly mapped to F64
+        let risk_field = schema.fields.get("risk_score").unwrap();
+        assert_eq!(risk_field.field_type, TantivyFieldType::F64);
+        assert!(risk_field.indexed);
+        assert!(!risk_field.stored);
+
+        // Verify other fields are correct
+        let id_field = schema.fields.get("id").unwrap();
+        assert_eq!(id_field.field_type, TantivyFieldType::Text);
+        assert!(id_field.indexed);
+        assert!(id_field.stored);
+
+        let date_field = schema.fields.get("first_analysis").unwrap();
+        assert_eq!(date_field.field_type, TantivyFieldType::Date);
+        assert!(date_field.indexed);
+        assert!(!date_field.stored);
+
+        println!("✅ Python schema compatibility works correctly!");
+    }
+
+    #[test]
+    fn test_ted_schema_compatibility() {
+        use serde_json;
+
+        // Test the exact schema from ingest_ted.py with integer type
+        let ted_schema = serde_json::json!({
+            "fields": {
+                "id": {"field_type": "text", "indexed": true, "stored": true},
+                "video_id": {"field_type": "text", "indexed": false, "stored": false, "is_shadow": true},
+                "title": {"field_type": "text", "indexed": true, "stored": false},
+                "speaker": {"field_type": "text", "indexed": true, "stored": false},
+                "channel": {"field_type": "text", "indexed": true, "stored": false},
+                "description": {"field_type": "text", "indexed": true, "stored": false},
+                "tags": {"field_type": "text", "indexed": true, "stored": false},
+                "topic_categories": {"field_type": "text", "indexed": true, "stored": false},
+                "category_id": {"field_type": "integer", "indexed": true, "stored": false},
+                "category_label": {"field_type": "text", "indexed": true, "stored": false},
+                "view_count": {"field_type": "integer", "indexed": true, "stored": false},
+                "like_count": {"field_type": "integer", "indexed": true, "stored": false},
+                "comment_count": {"field_type": "integer", "indexed": true, "stored": false},
+                "caption": {"field_type": "boolean", "indexed": true, "stored": false},
+                "published_at": {"field_type": "date", "indexed": true, "stored": false},
+                "duration_seconds": {"field_type": "integer", "indexed": true, "stored": false}
+            }
+        });
+
+        let schema: IndexSchema = serde_json::from_value(ted_schema).unwrap();
+
+        // Verify the integer fields were correctly mapped to I64
+        for field_name in [
+            "category_id",
+            "view_count",
+            "like_count",
+            "comment_count",
+            "duration_seconds",
+        ] {
+            let field = schema.fields.get(field_name).unwrap();
+            assert_eq!(field.field_type, TantivyFieldType::I64);
+            assert!(field.indexed);
+            assert!(!field.stored);
+        }
+
+        // Verify boolean field
+        let caption_field = schema.fields.get("caption").unwrap();
+        assert_eq!(caption_field.field_type, TantivyFieldType::Boolean);
+        assert!(caption_field.indexed);
+        assert!(!caption_field.stored);
+
+        println!("✅ TED schema compatibility works correctly!");
+    }
+
+    #[test]
+    fn test_schema_enrichment_preserves_explicit_values() {
+        use serde_json;
+
+        // Schema with a mix of minimal and explicit field definitions
+        let schema_json = serde_json::json!({
+            "fields": {
+                "id": {"field_type": "text"},
+                "title": {"field_type": "text", "indexed": true},
+                "body": {"field_type": "text", "indexed": true, "tokenizer": "en_stem", "index_record_option": "Basic"},
+                "score": {"field_type": "float", "indexed": true},
+                "created_at": {"field_type": "date"},
+                "tag": {"field_type": "string", "indexed": true, "tokenizer": "raw"},
+                "sha1": {"field_type": "text", "is_shadow": true},
+                "notes": {"field_type": "text", "indexed": false}
+            }
+        });
+
+        let mut schema: IndexSchema = serde_json::from_value(schema_json).unwrap();
+        schema.normalize_after_deserialization();
+
+        // --- id field: always forced to specific Tantivy attributes ---
+        let id = schema.fields.get("id").unwrap();
+        assert_eq!(id.name, "id");
+        assert!(id.indexed, "id must always be indexed");
+        assert!(id.stored, "id must always be stored");
+        assert_eq!(
+            id.tokenizer.as_deref(),
+            Some("raw"),
+            "id must use raw tokenizer"
+        );
+        assert_eq!(
+            id.index_record_option.as_deref(),
+            Some("Basic"),
+            "id must use Basic index option"
+        );
+
+        // --- title: minimal Text field gets enriched with defaults ---
+        let title = schema.fields.get("title").unwrap();
+        assert_eq!(title.name, "title");
+        assert!(title.indexed);
+        assert_eq!(
+            title.tokenizer.as_deref(),
+            Some("default"),
+            "Text field should get default tokenizer"
+        );
+        assert_eq!(
+            title.index_record_option.as_deref(),
+            Some("WithFreqsAndPositions"),
+            "Text field should get WithFreqsAndPositions"
+        );
+
+        // --- body: explicit tokenizer and index_record_option are PRESERVED ---
+        let body = schema.fields.get("body").unwrap();
+        assert_eq!(body.name, "body");
+        assert!(body.indexed);
+        assert_eq!(
+            body.tokenizer.as_deref(),
+            Some("en_stem"),
+            "Explicit tokenizer must be preserved"
+        );
+        assert_eq!(
+            body.index_record_option.as_deref(),
+            Some("Basic"),
+            "Explicit index_record_option must be preserved"
+        );
+
+        // --- score: F64 gets fast=true enrichment ---
+        let score = schema.fields.get("score").unwrap();
+        assert_eq!(score.name, "score");
+        assert_eq!(score.field_type, TantivyFieldType::F64);
+        assert!(score.indexed);
+        assert!(
+            score.fast,
+            "Numeric fields should be enriched with fast=true"
+        );
+        assert!(
+            score.tokenizer.is_none(),
+            "Numeric fields should not have tokenizer"
+        );
+
+        // --- created_at: Date gets fast=true, indexed defaults to true ---
+        let created = schema.fields.get("created_at").unwrap();
+        assert_eq!(created.name, "created_at");
+        assert_eq!(created.field_type, TantivyFieldType::Date);
+        assert!(created.indexed, "indexed defaults to true");
+        assert!(
+            created.fast,
+            "Date fields should be enriched with fast=true"
+        );
+
+        // --- tag: String field with explicit tokenizer preserved ---
+        let tag = schema.fields.get("tag").unwrap();
+        assert_eq!(tag.name, "tag");
+        assert_eq!(tag.field_type, TantivyFieldType::String);
+        assert_eq!(
+            tag.tokenizer.as_deref(),
+            Some("raw"),
+            "Explicit tokenizer preserved for String"
+        );
+        assert_eq!(
+            tag.index_record_option.as_deref(),
+            Some("Basic"),
+            "String gets Basic index option"
+        );
+
+        // --- sha1: shadow field is NOT enriched ---
+        let sha1 = schema.fields.get("sha1").unwrap();
+        assert!(sha1.is_shadow);
+        assert!(
+            sha1.tokenizer.is_none(),
+            "Shadow fields should not be enriched"
+        );
+
+        // --- notes: non-indexed field is NOT enriched ---
+        let notes = schema.fields.get("notes").unwrap();
+        assert!(!notes.indexed);
+        assert!(
+            notes.tokenizer.is_none(),
+            "Non-indexed fields should not be enriched"
+        );
+
+        // --- _seq: reserved WAL sequence field is always injected ---
+        let seq = schema.fields.get("_seq").unwrap();
+        assert_eq!(seq.name, "_seq");
+        assert_eq!(seq.field_type, TantivyFieldType::U64);
+        assert!(!seq.indexed, "_seq must not be indexed");
+        assert!(seq.stored, "_seq must be stored");
+        assert!(seq.fast, "_seq must be fast");
+        assert!(!seq.is_shadow);
+        assert!(seq.tokenizer.is_none());
+        assert!(seq.index_record_option.is_none());
+
+        println!("✅ Schema enrichment correctly preserves explicit values and fills defaults!");
     }
 }

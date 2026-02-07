@@ -723,12 +723,22 @@ impl MicroshardActor {
                 while let Some(cmd) = rx.blocking_recv() {
                     match cmd {
                         StorageCommand::Write { index, op, reply } => {
-                            let res = writer_store.apply_write(&index, op);
-                            let _ = reply.send(res);
+                            let res = writer_store.apply_write_and_maybe_commit(&index, op);
+                            match &res {
+                                Ok((_, true)) => tracing::info!(index = %index, "Writer thread: threshold commit after write"),
+                                Ok((_, false)) => {}
+                                Err(e) => tracing::error!(index = %index, error = %e, "Writer thread: write failed"),
+                            }
+                            let _ = reply.send(res.map(|(seq_id, _)| seq_id));
                         }
                         StorageCommand::BatchWrite { index, ops, reply } => {
-                            let res = writer_store.apply_batch(&index, ops);
-                            let _ = reply.send(res);
+                            let res = writer_store.apply_batch_and_maybe_commit(&index, ops);
+                            match &res {
+                                Ok((_, true)) => tracing::info!(index = %index, "Writer thread: threshold commit after batch write"),
+                                Ok((_, false)) => {}
+                                Err(e) => tracing::error!(index = %index, error = %e, "Writer thread: batch write failed"),
+                            }
+                            let _ = reply.send(res.map(|(result, _)| result));
                         }
                         StorageCommand::Commit { index, reply } => {
                             let res = writer_store.commit_index(&index);
@@ -897,24 +907,13 @@ impl MicroshardActor {
 
     /// Signal the supervisor for a specific index that a write has occurred.
     /// Spawns a new supervisor if one doesn't exist.
+    /// The supervisor's role is idle-timeout commit: if no writes arrive for N seconds,
+    /// it sends a Commit to the writer thread to flush any remaining uncommitted data.
     async fn signal_supervisor(&self, index: String) {
-        let store = match self.store.as_ref() {
-            Some(s) => s.clone(),
-            None => return,
-        };
-
         let writer_tx = match self.writer_tx.as_ref() {
             Some(tx) => tx.clone(),
             None => return,
         };
-
-        // Check if data is actually pending
-        // This is a fast read-only operation on AtomicU64, safe to call directly
-        let ops_count = store.get_operations_count(&index);
-
-        if ops_count == 0 {
-            return;
-        }
 
         let mut supervisors = self.supervisors.write().await;
         if let Some(tx) = supervisors.get(&index) {
@@ -1062,11 +1061,6 @@ impl MicroshardActor {
                 .push(wal_op);
         }
 
-        // Signal supervisor for each index BEFORE processing batch
-        for index in ops_by_index.keys() {
-            self.signal_supervisor(index.clone()).await;
-        }
-
         tracing::debug!(
             shard_id = %self.shard_id,
             unique_indices = ops_by_index.len(),
@@ -1075,6 +1069,7 @@ impl MicroshardActor {
 
         // Dispatch each index batch to the dedicated writer thread
         let mut all_seq_ids = Vec::new();
+        let mut written_indices = Vec::new();
         for (index, wal_ops) in ops_by_index {
             tracing::debug!(
                 shard_id = %self.shard_id,
@@ -1083,8 +1078,19 @@ impl MicroshardActor {
                 "MicroshardActor: Sending batch to writer thread"
             );
 
-            let (seq_ids, _new_docs) = self.handle_batch_write_via_channel(index, wal_ops).await?;
+            let (seq_ids, _new_docs) = self
+                .handle_batch_write_via_channel(index.clone(), wal_ops)
+                .await?;
             all_seq_ids.extend(seq_ids);
+            written_indices.push(index);
+        }
+
+        // Signal supervisor AFTER batch completes on the writer thread.
+        // At this point counters are already incremented and the writer thread
+        // may have already committed via maybe_commit_writer. The supervisor
+        // starts its idle-timeout timer from here.
+        for index in written_indices {
+            self.signal_supervisor(index).await;
         }
 
         tracing::info!(
@@ -4145,6 +4151,9 @@ impl NodeOrchestrator {
         index: &str,
         mut schema: IndexSchema,
     ) -> Result<JsonValue, OrchestratorError> {
+        // Normalize schema from external sources (populate field names from map keys, etc.)
+        schema.normalize_after_deserialization();
+
         // Ensure 'id' field is explicitly in the schema for visibility
         if !schema.fields.contains_key("id") {
             schema.fields.insert(
