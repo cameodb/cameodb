@@ -31,6 +31,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use kameo::actor::ActorRef;
 use kameo::message::{Context, Message};
 use kameo::{Actor, RemoteActor, remote_message};
@@ -90,6 +91,23 @@ fn calculate_batch_fingerprint(field_names: &HashSet<String>) -> u64 {
     let mut combined = Vec::new();
     for name in &sorted_names {
         combined.extend_from_slice(name.as_bytes());
+    }
+    xxh3_64(&combined)
+}
+
+/// Calculate fingerprint directly from a JSON document's keys.
+/// Avoids the intermediate `HashSet<String>` allocation used by
+/// `extract_field_names` + `calculate_batch_fingerprint`.
+fn calculate_doc_fingerprint(doc: &JsonValue) -> u64 {
+    let obj = match doc.as_object() {
+        Some(o) => o,
+        None => return 0,
+    };
+    let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+    keys.sort_unstable();
+    let mut combined = Vec::with_capacity(keys.len() * 8);
+    for key in keys {
+        combined.extend_from_slice(key.as_bytes());
     }
     xxh3_64(&combined)
 }
@@ -585,6 +603,10 @@ pub enum StorageCommand {
         ops: Vec<WalOp>,
         reply: tokio::sync::oneshot::Sender<Result<(Vec<u64>, usize), StoreError>>,
     },
+    Commit {
+        index: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), StoreError>>,
+    },
     Shutdown,
 }
 
@@ -708,6 +730,10 @@ impl MicroshardActor {
                             let res = writer_store.apply_batch(&index, ops);
                             let _ = reply.send(res);
                         }
+                        StorageCommand::Commit { index, reply } => {
+                            let res = writer_store.commit_index(&index);
+                            let _ = reply.send(res);
+                        }
                         StorageCommand::Shutdown => {
                             info!(shard_id = %writer_shard_id, "Writer thread shutting down");
                             break;
@@ -767,6 +793,21 @@ impl MicroshardActor {
         self.send_write_command(StorageCommand::BatchWrite {
             index,
             ops,
+            reply: reply_tx,
+        })
+        .await?;
+        reply_rx
+            .await
+            .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer dropped reply")))?
+            .map_err(OrchestratorError::Storage)
+    }
+
+    /// Commit a specific index via the dedicated writer thread.
+    /// Ensures commits are serialized with writes on the same thread.
+    pub async fn handle_commit_via_channel(&self, index: String) -> Result<(), OrchestratorError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_write_command(StorageCommand::Commit {
+            index,
             reply: reply_tx,
         })
         .await?;
@@ -862,6 +903,11 @@ impl MicroshardActor {
             None => return,
         };
 
+        let writer_tx = match self.writer_tx.as_ref() {
+            Some(tx) => tx.clone(),
+            None => return,
+        };
+
         // Check if data is actually pending
         // This is a fast read-only operation on AtomicU64, safe to call directly
         let ops_count = store.get_operations_count(&index);
@@ -895,18 +941,33 @@ impl MicroshardActor {
                             continue;
                         }
                         _ = tokio::time::sleep(timeout_dur) => {
-                            // Timer expired without a signal, trigger commit
+                            // Timer expired without a signal, trigger commit via writer thread
                             let index_inner = index_clone.clone();
-                            let store_inner = store.clone();
-                            let commit_ok = tokio::task::spawn_blocking(move || {
-                                if let Err(e) = store_inner.commit_index(&index_inner) {
-                                    tracing::error!(index = %index_inner, error = %e, "Supervisor failed to commit index");
-                                    false
-                                } else {
-                                    tracing::info!(index = %index_inner, "Supervisor successfully committed index after idle timeout");
-                                    true
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let send_ok = writer_tx.send(StorageCommand::Commit {
+                                index: index_inner.clone(),
+                                reply: reply_tx,
+                            }).await.is_ok();
+
+                            let commit_ok = if send_ok {
+                                match reply_rx.await {
+                                    Ok(Ok(())) => {
+                                        tracing::info!(index = %index_inner, "Supervisor committed index via writer thread after idle timeout");
+                                        true
+                                    }
+                                    Ok(Err(e)) => {
+                                        tracing::error!(index = %index_inner, error = %e, "Supervisor commit failed via writer thread");
+                                        false
+                                    }
+                                    Err(_) => {
+                                        tracing::error!(index = %index_inner, "Supervisor commit reply channel dropped");
+                                        false
+                                    }
                                 }
-                            }).await.unwrap_or(false);
+                            } else {
+                                tracing::error!(index = %index_inner, "Supervisor failed to send commit to writer thread");
+                                false
+                            };
 
                             if commit_ok {
                                 // Self-cleanup from the supervisors map
@@ -2161,10 +2222,10 @@ pub struct NodeOrchestrator {
     routing_ring: ConsistentRing,
     /// Optional coordinator reference for shard registration
     coordinator: Option<ActorRef<ClusterCoordinator>>,
-    /// Per-index schema cache to avoid repeated metadata reads
-    schema_cache: AsyncRwLock<HashMap<String, IndexSchema>>,
-    /// Fingerprint → index_name reverse lookup for instant cache hits
-    fingerprint_index: AsyncRwLock<HashMap<u64, String>>,
+    /// Per-index schema cache to avoid repeated metadata reads (lock-free via ArcSwap)
+    schema_cache: ArcSwap<HashMap<String, Arc<IndexSchema>>>,
+    /// Fingerprint → index_name reverse lookup for instant cache hits (lock-free via ArcSwap)
+    fingerprint_index: ArcSwap<HashMap<u64, String>>,
     /// Default search result limit when not specified in request
     default_search_limit: usize,
 }
@@ -2841,49 +2902,22 @@ impl NodeOrchestrator {
                 }
             }
 
-            // Commit from all shards that were processed in parallel for better performance
-            let commit_tasks: Vec<_> = shard_ids
-                .iter()
-                .filter_map(|shard_id| {
-                    if let Some(shard) = self.shards.get(shard_id) {
-                        if let Some(store) = &shard.store {
-                            let store = store.clone();
-                            let index = index.to_string();
-                            let shard_id = *shard_id;
-                            Some(tokio::task::spawn_blocking(move || {
-                                let result = store.commit_index(&index);
-                                (shard_id, result)
-                            }))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Execute all commits in parallel and collect results
-            let commit_results = join_all(commit_tasks).await;
-
+            // Commit via dedicated writer threads to avoid lock contention.
+            // Each shard's commit is serialized with its writes on the same thread.
             let mut successful_commits = 0;
             let mut failed_commits = 0;
 
-            for result in commit_results {
-                match result {
-                    Ok((shard_id, commit_result)) => match commit_result {
+            for shard_id in &shard_ids {
+                if let Some(shard) = self.shards.get(shard_id) {
+                    match shard.handle_commit_via_channel(index.to_string()).await {
                         Ok(()) => {
                             successful_commits += 1;
-                            tracing::debug!(shard_id = %shard_id, "Commit successful");
+                            tracing::debug!(shard_id = %shard_id, "Commit successful via writer thread");
                         }
                         Err(e) => {
                             failed_commits += 1;
-                            tracing::warn!(shard_id = %shard_id, error = %e, "Failed to commit index after batch processing");
+                            tracing::warn!(shard_id = %shard_id, error = %e, "Failed to commit index via writer thread");
                         }
-                    },
-                    Err(e) => {
-                        failed_commits += 1;
-                        tracing::warn!(error = %e, "Commit task failed");
                     }
                 }
             }
@@ -2891,7 +2925,7 @@ impl NodeOrchestrator {
             tracing::info!(
                 successful_commits = successful_commits,
                 failed_commits = failed_commits,
-                "Parallel batch commits completed"
+                "Batch commits completed via writer threads"
             );
         }
 
@@ -2951,29 +2985,40 @@ impl NodeOrchestrator {
         }
     }
 
-    /// Fetch a schema from cache if present.
-    async fn get_cached_schema(&self, index: &str) -> Option<IndexSchema> {
-        let map = self.schema_cache.read().await;
+    /// Fetch a schema from cache if present (lock-free).
+    fn get_cached_schema(&self, index: &str) -> Option<Arc<IndexSchema>> {
+        let map = self.schema_cache.load();
         map.get(index).cloned()
     }
 
-    /// Insert or replace a schema in the cache.
-    async fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
-        let mut map = self.schema_cache.write().await;
-        map.insert(index.to_string(), schema.clone());
+    /// Insert or replace a schema in the cache (copy-on-write).
+    fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
+        let schema_arc = Arc::new(schema.clone());
+        let index_str = index.to_string();
+        let fingerprint = schema.fingerprint;
+
+        self.schema_cache.rcu(|old| {
+            let mut new = (**old).clone();
+            new.insert(index_str.clone(), schema_arc.clone());
+            new
+        });
 
         // Maintain fingerprint reverse lookup
-        if schema.fingerprint != 0 {
-            let mut fp_map = self.fingerprint_index.write().await;
-            fp_map.insert(schema.fingerprint, index.to_string());
+        if fingerprint != 0 {
+            let idx = index_str;
+            self.fingerprint_index.rcu(|old| {
+                let mut new = (**old).clone();
+                new.insert(fingerprint, idx.clone());
+                new
+            });
         }
     }
 
-    /// Get schema by fingerprint (instant cache hit).
-    async fn get_schema_by_fingerprint(&self, fingerprint: u64) -> Option<IndexSchema> {
-        let fp_map = self.fingerprint_index.read().await;
+    /// Get schema by fingerprint (lock-free instant cache hit).
+    fn get_schema_by_fingerprint(&self, fingerprint: u64) -> Option<Arc<IndexSchema>> {
+        let fp_map = self.fingerprint_index.load();
         if let Some(index_name) = fp_map.get(&fingerprint) {
-            let cache = self.schema_cache.read().await;
+            let cache = self.schema_cache.load();
             return cache.get(index_name).cloned();
         }
         None
@@ -3032,8 +3077,8 @@ impl NodeOrchestrator {
             config,
             routing_ring: ConsistentRing::new(),
             coordinator: None,
-            schema_cache: AsyncRwLock::new(HashMap::new()),
-            fingerprint_index: AsyncRwLock::new(HashMap::new()),
+            schema_cache: ArcSwap::from_pointee(HashMap::new()),
+            fingerprint_index: ArcSwap::from_pointee(HashMap::new()),
             default_search_limit,
         };
 
@@ -3574,14 +3619,24 @@ impl NodeOrchestrator {
             }
         }
 
-        // Clear schema cache and fingerprint index for this index
+        // Clear schema cache and fingerprint index for this index (lock-free)
         {
-            let mut cache = self.schema_cache.write().await;
-            if let Some(schema) = cache.remove(index)
-                && schema.fingerprint != 0
-            {
-                let mut fp_map = self.fingerprint_index.write().await;
-                fp_map.remove(&schema.fingerprint);
+            let old_cache = self.schema_cache.load();
+            if let Some(schema) = old_cache.get(index) {
+                let fingerprint = schema.fingerprint;
+                let idx = index.to_string();
+                self.schema_cache.rcu(|old| {
+                    let mut new = (**old).clone();
+                    new.remove(&idx);
+                    new
+                });
+                if fingerprint != 0 {
+                    self.fingerprint_index.rcu(|old| {
+                        let mut new = (**old).clone();
+                        new.remove(&fingerprint);
+                        new
+                    });
+                }
             }
         }
 
@@ -3608,7 +3663,67 @@ impl NodeOrchestrator {
             )));
         }
 
-        // Wrap single doc as DocPayload for unified validation path
+        // Inline fingerprint from doc keys — no HashSet<String> allocation
+        let doc_fingerprint = calculate_doc_fingerprint(&doc);
+
+        // Lock-free schema lookup by fingerprint, then by index name
+        let schema = if let Some(cached) = self.get_schema_by_fingerprint(doc_fingerprint) {
+            cached
+        } else if let Some(cached) = self.get_cached_schema(index) {
+            cached
+        } else {
+            Arc::new(self.load_schema(index).await?)
+        };
+
+        // Fast path: mature schema — validate inline without spawn_blocking/Rayon
+        if !schema.fields.is_empty() {
+            let result = Self::validate_single_document_readonly_fast(&doc, &schema, false);
+            if let Some(err) = result.validation_error {
+                return Err(OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    err,
+                )));
+            }
+
+            // If new fields detected, fall through to full validation for schema evolution
+            if !result.needs_evolution {
+                // Schema is stable — populate cache if not yet present
+                if self.get_cached_schema(index).is_none() {
+                    self.put_cached_schema(index, &schema);
+                }
+
+                // Schema-based routing
+                let routing_field = schema.get_routing_field().to_string();
+                let effective_routing_key = extract_routing_value(&doc, &routing_field)
+                    .or(routing_key)
+                    .or_else(|| (!id.is_empty()).then(|| id.clone()))
+                    .or_else(|| derive_routing_key_from_doc(&doc));
+
+                let target = self.route_write(&effective_routing_key)?;
+                let shard = self.shards.get(&target).ok_or_else(|| {
+                    OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Shard not found",
+                    ))
+                })?;
+                let req = WriteRequest {
+                    index: index.to_string(),
+                    routing_key: effective_routing_key.unwrap_or_default(),
+                    doc,
+                };
+
+                return match shard.handle_write(req).await {
+                    Ok(seq) => Ok(
+                        serde_json::json!({"id": id, "result": "created", "version": seq, "shard_id": target.to_string()}),
+                    ),
+                    Err(e) => Err(e),
+                };
+            }
+            // needs_evolution == true: fall through to slow path below
+        }
+
+        // Slow path: initial schema creation or schema evolution needed
+        // Must use full staged_schema_validation with DocPayload wrapping
         let doc_payload = DocPayload {
             id: id.clone(),
             routing_key: routing_key.clone(),
@@ -3616,25 +3731,14 @@ impl NodeOrchestrator {
         };
         let docs_slice = [doc_payload];
 
-        // Fingerprint-based schema lookup (same as bulk write)
-        let batch_field_names = extract_field_names(&docs_slice);
-        let batch_fingerprint = calculate_batch_fingerprint(&batch_field_names);
+        let mut schema_mut = (*schema).clone();
 
-        let mut schema_cache =
-            if let Some(cached) = self.get_schema_by_fingerprint(batch_fingerprint).await {
-                cached
-            } else {
-                self.load_schema(index).await?
-            };
-
-        // Unified validation path (same as bulk write)
         let validation_summary = self
-            .staged_schema_validation(index, &docs_slice, &mut schema_cache)
+            .staged_schema_validation(index, &docs_slice, &mut schema_mut)
             .await?;
 
-        // Always populate cache (also populates fingerprint_index)
-        if validation_summary.evolution_needed || self.get_cached_schema(index).await.is_none() {
-            self.put_cached_schema(index, &schema_cache).await;
+        if validation_summary.evolution_needed || self.get_cached_schema(index).is_none() {
+            self.put_cached_schema(index, &schema_mut);
         }
 
         if !validation_summary.errors.is_empty() {
@@ -3644,8 +3748,8 @@ impl NodeOrchestrator {
             )));
         }
 
-        // Schema-based routing (same as bulk write)
-        let routing_field = schema_cache.get_routing_field().to_string();
+        // Schema-based routing
+        let routing_field = schema_mut.get_routing_field().to_string();
         let effective_routing_key = extract_routing_value(&doc, &routing_field)
             .or(routing_key)
             .or_else(|| (!id.is_empty()).then(|| id.clone()))
@@ -3690,8 +3794,8 @@ impl NodeOrchestrator {
         let batch_fingerprint = calculate_batch_fingerprint(&batch_field_names);
 
         let mut schema_cache =
-            if let Some(cached) = self.get_schema_by_fingerprint(batch_fingerprint).await {
-                cached
+            if let Some(cached) = self.get_schema_by_fingerprint(batch_fingerprint) {
+                (*cached).clone()
             } else {
                 self.load_schema(index).await?
             };
@@ -3702,8 +3806,8 @@ impl NodeOrchestrator {
             .await?;
 
         // Update cache (also populates fingerprint_index for future lookups)
-        if validation_summary.evolution_needed || self.get_cached_schema(index).await.is_none() {
-            self.put_cached_schema(index, &schema_cache).await;
+        if validation_summary.evolution_needed || self.get_cached_schema(index).is_none() {
+            self.put_cached_schema(index, &schema_cache);
         }
 
         // Check for validation errors
@@ -3952,11 +4056,11 @@ impl NodeOrchestrator {
             );
         }
 
-        // Get schema for shadow field transformation
-        let schema = {
-            let cache = self.schema_cache.read().await;
-            cache.get(index).cloned().unwrap_or_default()
-        };
+        // Get schema for shadow field transformation (lock-free)
+        let schema = self
+            .get_cached_schema(index)
+            .map(|arc| (*arc).clone())
+            .unwrap_or_default();
 
         // Transform query to map shadow fields to canonical "id" field
         let transformed_query = transform_shadow_query(query, &schema);
@@ -4101,7 +4205,7 @@ impl NodeOrchestrator {
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
         }
 
-        self.put_cached_schema(index, &schema).await;
+        self.put_cached_schema(index, &schema);
 
         tracing::info!(
             index = %index,
@@ -4336,8 +4440,8 @@ impl NodeOrchestrator {
 
     /// Helper: Load schema from first shard
     async fn load_schema(&self, index: &str) -> Result<IndexSchema, OrchestratorError> {
-        if let Some(cached) = self.get_cached_schema(index).await {
-            return Ok(cached);
+        if let Some(cached) = self.get_cached_schema(index) {
+            return Ok((*cached).clone());
         }
 
         if let Some(shard) = self.shards.values().next()
@@ -4354,7 +4458,7 @@ impl NodeOrchestrator {
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
             if let Some(schema_arc) = schema {
                 let schema = (*schema_arc).clone();
-                self.put_cached_schema(index, &schema).await;
+                self.put_cached_schema(index, &schema);
                 return Ok(schema);
             }
         }

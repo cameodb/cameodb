@@ -4,6 +4,7 @@ members = ["crates/*"]
 
 [workspace.dependencies]
 anyhow = "1.0"
+arc-swap = "1"
 axum = "0.8"
 bincode = "1.3"
 futures = "0.3.30"

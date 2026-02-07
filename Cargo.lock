@@ -3993,6 +3993,7 @@ name = "server"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "axum 0.8.8",
  "axum-test",
  "bincode",
