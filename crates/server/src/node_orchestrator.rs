@@ -571,6 +571,23 @@ pub struct UpdateTopology {
 #[derive(Debug, Clone)]
 pub struct ShutdownAllShards;
 
+/// Commands sent to the dedicated writer thread via `tokio::sync::mpsc` channel.
+/// The writer thread calls blocking storage methods (`apply_write`, `apply_batch`)
+/// and sends results back via oneshot reply channels.
+pub enum StorageCommand {
+    Write {
+        index: String,
+        op: WalOp,
+        reply: tokio::sync::oneshot::Sender<Result<u64, StoreError>>,
+    },
+    BatchWrite {
+        index: String,
+        ops: Vec<WalOp>,
+        reply: tokio::sync::oneshot::Sender<Result<(Vec<u64>, usize), StoreError>>,
+    },
+    Shutdown,
+}
+
 /// Response containing node identity info for actor replies.
 #[derive(Debug, Clone, kameo::Reply)]
 #[allow(dead_code)] // Fields will be used when RouterActor migrates to ActorRef
@@ -596,11 +613,15 @@ struct IndexStats {
 pub struct MicroshardActor {
     shard_id: Uuid,
     store: Option<Arc<HybridStore>>,
+    /// Channel sender for dispatching write commands to the dedicated writer thread.
+    writer_tx: Option<mpsc::Sender<StorageCommand>>,
     storage_config: StorageConfig,
     /// Default search limit for this shard
     default_search_limit: usize,
     /// Track active supervision tasks per index
     supervisors: Arc<AsyncRwLock<HashMap<String, mpsc::Sender<()>>>>,
+    /// Notified when the writer thread has fully stopped.
+    shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for MicroshardActor {
@@ -608,6 +629,7 @@ impl std::fmt::Debug for MicroshardActor {
         f.debug_struct("MicroshardActor")
             .field("shard_id", &self.shard_id)
             .field("store_initialized", &self.store.is_some())
+            .field("writer_initialized", &self.writer_tx.is_some())
             .field("storage_config", &self.storage_config)
             .finish()
     }
@@ -618,9 +640,11 @@ impl MicroshardActor {
         Self {
             shard_id,
             store: None,
+            writer_tx: None,
             storage_config,
             default_search_limit,
             supervisors: Arc::new(AsyncRwLock::new(HashMap::new())),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -660,9 +684,110 @@ impl MicroshardActor {
         .await
         .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?;
 
-        self.store = Some(store_arc);
-        info!(shard_id = %self.shard_id, "HybridStore initialized successfully");
+        self.store = Some(store_arc.clone());
+
+        // Spawn dedicated writer thread for serialized I/O
+        let (tx, mut rx) = mpsc::channel::<StorageCommand>(1024);
+        self.writer_tx = Some(tx);
+
+        let writer_store = store_arc;
+        let shutdown = self.shutdown_notify.clone();
+        let writer_shard_id = self.shard_id;
+
+        std::thread::Builder::new()
+            .name(format!("writer-shard-{}", writer_shard_id))
+            .spawn(move || {
+                info!(shard_id = %writer_shard_id, "Writer thread started");
+                while let Some(cmd) = rx.blocking_recv() {
+                    match cmd {
+                        StorageCommand::Write { index, op, reply } => {
+                            let res = writer_store.apply_write(&index, op);
+                            let _ = reply.send(res);
+                        }
+                        StorageCommand::BatchWrite { index, ops, reply } => {
+                            let res = writer_store.apply_batch(&index, ops);
+                            let _ = reply.send(res);
+                        }
+                        StorageCommand::Shutdown => {
+                            info!(shard_id = %writer_shard_id, "Writer thread shutting down");
+                            break;
+                        }
+                    }
+                }
+                shutdown.notify_one();
+                info!(shard_id = %writer_shard_id, "Writer thread stopped");
+            })
+            .map_err(OrchestratorError::Io)?;
+
+        info!(shard_id = %self.shard_id, "MicroshardActor initialized with dedicated writer thread");
         Ok(())
+    }
+
+    /// Send a command to the dedicated writer thread.
+    async fn send_write_command(&self, cmd: StorageCommand) -> Result<(), OrchestratorError> {
+        self.writer_tx
+            .as_ref()
+            .ok_or_else(|| {
+                OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Writer channel not initialized",
+                ))
+            })?
+            .send(cmd)
+            .await
+            .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer thread closed")))
+    }
+
+    /// Write a single document via the dedicated writer thread.
+    pub async fn handle_write_via_channel(
+        &self,
+        index: String,
+        op: WalOp,
+    ) -> Result<u64, OrchestratorError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_write_command(StorageCommand::Write {
+            index,
+            op,
+            reply: reply_tx,
+        })
+        .await?;
+        reply_rx
+            .await
+            .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer dropped reply")))?
+            .map_err(OrchestratorError::Storage)
+    }
+
+    /// Write a batch of documents via the dedicated writer thread.
+    pub async fn handle_batch_write_via_channel(
+        &self,
+        index: String,
+        ops: Vec<WalOp>,
+    ) -> Result<(Vec<u64>, usize), OrchestratorError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_write_command(StorageCommand::BatchWrite {
+            index,
+            ops,
+            reply: reply_tx,
+        })
+        .await?;
+        reply_rx
+            .await
+            .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer dropped reply")))?
+            .map_err(OrchestratorError::Storage)
+    }
+
+    /// Gracefully stop the dedicated writer thread.
+    /// Sends `Shutdown` command, then waits for the thread to finish draining queued commands.
+    async fn shutdown_writer(&mut self) {
+        if let Some(tx) = self.writer_tx.take() {
+            if tx.send(StorageCommand::Shutdown).await.is_ok() {
+                // Wait for the writer thread to acknowledge shutdown
+                self.shutdown_notify.notified().await;
+                tracing::info!(shard_id = %self.shard_id, "Writer thread shutdown complete");
+            } else {
+                tracing::warn!(shard_id = %self.shard_id, "Writer thread already closed");
+            }
+        }
     }
 
     /// Handles search requests with spawn_blocking to avoid blocking the actor thread.
@@ -813,18 +938,9 @@ impl MicroshardActor {
         }
     }
 
-    /// Handles write requests with spawn_blocking to avoid blocking the actor thread.
+    /// Handles write requests via the dedicated writer thread.
     #[allow(dead_code)]
     pub async fn handle_write(&self, request: WriteRequest) -> Result<u64, OrchestratorError> {
-        let store = self.store.as_ref().ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "HybridStore not initialized",
-            ))
-        })?;
-
-        let store = Arc::clone(store);
-
         // OPTIMIZATION: Take ownership of doc from request immediately
         let doc = request.doc;
 
@@ -845,15 +961,10 @@ impl MicroshardActor {
 
         let op = WalOp::Put { id, json_blob };
 
-        // Use spawn_blocking to execute write on blocking thread pool
-        let index = request.index.clone();
-        let seq_id = tokio::task::spawn_blocking(move || store.apply_write(&index, op))
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
-            .map_err(|e: StoreError| match e {
-                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
-                _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
-            })?;
+        // Dispatch to dedicated writer thread via channel
+        let seq_id = self
+            .handle_write_via_channel(request.index.clone(), op)
+            .await?;
 
         // Signal supervisor for this index
         self.signal_supervisor(request.index).await;
@@ -861,7 +972,7 @@ impl MicroshardActor {
         Ok(seq_id)
     }
 
-    /// Handles batch write requests with spawn_blocking to avoid blocking the actor thread.
+    /// Handles batch write requests via the dedicated writer thread.
     pub async fn handle_batch_write(
         &self,
         request: BatchWriteRequest,
@@ -872,21 +983,11 @@ impl MicroshardActor {
             "MicroshardActor: Starting batch write"
         );
 
-        let store = self.store.as_ref().ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "HybridStore not initialized",
-            ))
-        })?;
-
-        let store = Arc::clone(store);
         let docs = request.docs;
-        let shard_id = self.shard_id;
-        let index_name = request.index; // Use the actual index name from request
+        let index_name = request.index;
 
         // Group operations by index
-        let mut ops_by_index: std::collections::HashMap<String, Vec<WalOp>> =
-            std::collections::HashMap::new();
+        let mut ops_by_index: HashMap<String, Vec<WalOp>> = HashMap::new();
 
         for doc_payload in docs {
             let wal_op = WalOp::Put {
@@ -895,73 +996,43 @@ impl MicroshardActor {
             };
 
             ops_by_index
-                .entry(index_name.clone()) // Use the actual index name, not routing_key
+                .entry(index_name.clone())
                 .or_default()
                 .push(wal_op);
         }
 
-        // Collect unique indices from grouped ops
-        let unique_indices: std::collections::HashSet<String> =
-            ops_by_index.keys().cloned().collect();
-
         // Signal supervisor for each index BEFORE processing batch
-        // This ensures supervisor exists for batch-only scenarios (no individual writes)
-        for index in &unique_indices {
+        for index in ops_by_index.keys() {
             self.signal_supervisor(index.clone()).await;
         }
 
         tracing::debug!(
-            shard_id = %shard_id,
-            unique_indices = unique_indices.len(),
-            "MicroshardActor: Executing batch write on blocking thread"
+            shard_id = %self.shard_id,
+            unique_indices = ops_by_index.len(),
+            "MicroshardActor: Dispatching batch write to writer thread"
         );
 
-        // Use spawn_blocking to execute batch write on blocking thread pool
-        let all_seq_ids = tokio::task::spawn_blocking(move || {
+        // Dispatch each index batch to the dedicated writer thread
+        let mut all_seq_ids = Vec::new();
+        for (index, wal_ops) in ops_by_index {
             tracing::debug!(
-                shard_id = %shard_id,
-                "MicroshardActor: Inside blocking thread, executing storage operations"
+                shard_id = %self.shard_id,
+                index = %index,
+                ops_count = wal_ops.len(),
+                "MicroshardActor: Sending batch to writer thread"
             );
 
-            let mut all_results = Vec::new();
-            let mut total_new_docs = 0usize;
-            for (index, wal_ops) in ops_by_index {
-                tracing::debug!(
-                    shard_id = %shard_id,
-                    index = %index,
-                    ops_count = wal_ops.len(),
-                    "MicroshardActor: Processing index in blocking thread"
-                );
-
-                let (seq_ids, new_docs) = store.apply_batch(&index, wal_ops)?;
-                all_results.extend(seq_ids);
-                total_new_docs += new_docs;
-            }
-
-            tracing::debug!(
-                shard_id = %shard_id,
-                total_ops = all_results.len(),
-                "MicroshardActor: Storage operations completed, returning from blocking thread"
-            );
-
-            Ok::<(Vec<u64>, usize), StoreError>((all_results, total_new_docs))
-        })
-        .await
-        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
-        .map_err(|e: StoreError| match e {
-            StoreError::Io(io_err) => OrchestratorError::Io(io_err),
-            _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
-        })?;
+            let (seq_ids, _new_docs) = self.handle_batch_write_via_channel(index, wal_ops).await?;
+            all_seq_ids.extend(seq_ids);
+        }
 
         tracing::info!(
-            shard_id = %shard_id,
-            seq_count = all_seq_ids.0.len(),
-            "MicroshardActor: Batch write fully completed, returning result"
+            shard_id = %self.shard_id,
+            seq_count = all_seq_ids.len(),
+            "MicroshardActor: Batch write fully completed"
         );
 
-        // Extract just the sequence IDs to match expected return type
-        let (seq_ids, _new_docs) = all_seq_ids;
-        Ok(seq_ids)
+        Ok(all_seq_ids)
     }
 
     /// Deletes all data for an index from this shard's storage
@@ -1081,9 +1152,12 @@ impl Message<ShutdownShard> for MicroshardActor {
     ) -> Self::Reply {
         tracing::info!(shard_id = %self.shard_id, "MicroshardActor: Shutting down shard");
 
+        // Step 1: Stop the dedicated writer thread (drains queued commands first)
+        self.shutdown_writer().await;
+
+        // Step 2: Shutdown storage (commit pending tantivy writers, etc.)
         if let Some(store) = self.store.as_ref() {
             let store_clone = store.clone();
-            // Call shutdown in spawn_blocking since it's a blocking operation
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = store_clone.shutdown() {
                     tracing::error!(error = %e, "Failed to shutdown storage");
