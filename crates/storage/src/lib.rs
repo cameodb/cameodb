@@ -201,6 +201,37 @@ fn normalize_date_literals(input: &str, field: &str) -> String {
     out
 }
 
+/// Parse exact ID queries (id:value or shadow_field:value) that can bypass Tantivy.
+/// Returns Some((id_value, true)) for exact ID queries, None otherwise.
+fn parse_exact_id_query(query: &str, schema: &IndexSchema) -> Option<(String, bool)> {
+    let query = query.trim();
+
+    // Check for simple id:value pattern (no AND/OR operators)
+    if let Some(colon_pos) = query.find(':') {
+        let field_part = &query[..colon_pos].trim();
+        let value_part = &query[colon_pos + 1..].trim();
+
+        // Must be a simple query with no operators
+        if value_part.contains(&[' ', '"', '(', ')'][..]) {
+            return None;
+        }
+
+        // Check if it's the id field or a shadow field
+        if *field_part == "id" {
+            return Some((value_part.to_string(), true));
+        }
+
+        // Check shadow fields
+        if let Some(field_def) = schema.fields.get(*field_part)
+            && field_def.is_shadow
+        {
+            return Some((value_part.to_string(), true));
+        }
+    }
+
+    None
+}
+
 /// Normalize date literals in a Tantivy query string based on schema field types.
 /// Supports common forms:
 /// - field:value (single literal)
@@ -2848,34 +2879,89 @@ impl HybridStore {
             .get_schema_cached(index)?
             .unwrap_or_else(|| Arc::new(IndexSchema::default()));
 
-        debug!(
-            index = %index,
-            schema_fields = schema.fields.len(),
-            "Retrieved schema for search"
-        );
+        // Check if this is an exact ID lookup (id:field or shadow field) that can bypass Tantivy
+        if let Some((id_value, _is_exact_id_query)) = parse_exact_id_query(query, &schema) {
+            debug!(
+                index = %index,
+                id_value = %id_value,
+                "Exact ID query detected, bypassing Tantivy search"
+            );
 
-        // Build query parser with only indexed fields
-        let query_fields: Vec<Field> = fields.indexed_fields.values().cloned().collect();
+            // Simulate Tantivy result with score 1.0
+            let doc_ids_with_scores = vec![(1.0, id_value)];
 
-        if query_fields.is_empty() {
-            warn!(index = %index, "No indexed fields available for search");
-            return Ok((Vec::new(), 0));
+            // Skip to Step 2: Batch retrieve from redb (reuse existing logic)
+            let doc_ids: Vec<String> = doc_ids_with_scores
+                .iter()
+                .map(|(_, id)| id.clone())
+                .collect();
+
+            let redb_docs = self.get_batch_by_keys(index, &doc_ids)?;
+
+            debug!(
+                index = %index,
+                requested_ids = doc_ids.len(),
+                retrieved_docs = redb_docs.len(),
+                "Retrieved documents from redb (direct ID lookup)"
+            );
+
+            // Create lookup map for O(1) access
+            let doc_map: std::collections::HashMap<String, Vec<u8>> =
+                redb_docs.into_iter().collect();
+
+            // Step 3: Combine scores with complete documents (reuse existing logic)
+            let mut results = Vec::new();
+            for (score, doc_id) in doc_ids_with_scores {
+                if let Some(doc_bytes) = doc_map.get(&doc_id) {
+                    // Deserialize complete document from redb
+                    let stored_doc: StoredDocOwned = serde_json::from_slice(doc_bytes)
+                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+                    // Get schema for shadow field reconstruction
+                    let schema = if let Some(schema) = self.get_schema_cached(index)? {
+                        schema
+                    } else {
+                        self.get_schema(index)?
+                            .map(Arc::new)
+                            .unwrap_or_else(|| Arc::new(IndexSchema::default()))
+                    };
+
+                    // OPTIMIZATION: Pass ownership to avoid cloning all fields
+                    let final_doc = if let Some(json_blob) = stored_doc.json_blob {
+                        let mut doc = reconstruct_shadow_fields_owned(json_blob, &schema);
+
+                        // Safety check: Only add id if it's not already present and no shadow fields exist
+                        // When shadow fields exist, reconstruct_shadow_fields_owned already handles the mapping
+                        if let Some(obj) = doc.as_object_mut() {
+                            let shadow_mapping = schema.get_shadow_mapping();
+                            if shadow_mapping.is_empty() && !obj.contains_key("id") {
+                                obj.insert(
+                                    "id".to_string(),
+                                    serde_json::Value::String(doc_id.clone()),
+                                );
+                            }
+                        }
+                        doc
+                    } else {
+                        // Fallback if blob was empty
+                        serde_json::json!({ "id": doc_id })
+                    };
+
+                    results.push((score, final_doc));
+                } else {
+                    trace!(index = %index, doc_id = %doc_id, "Document not found in redb lookup map");
+                }
+            }
+
+            let total_hits = if results.is_empty() { 0 } else { 1 };
+            return Ok((results, total_hits));
         }
-
-        // Log indexed field names for debugging
-        let field_names: Vec<&str> = fields.indexed_fields.keys().map(|s| s.as_str()).collect();
-        debug!(
-            index = %index,
-            query = %query,
-            query_fields_count = query_fields.len(),
-            indexed_field_names = ?field_names,
-            "Executing tantivy search"
-        );
 
         // Normalize date literals based on schema so naive inputs match indexed Date fields
         let normalized_query = normalize_date_query(query, &schema);
 
         // Create query parser and execute search
+        let query_fields: Vec<Field> = fields.indexed_fields.values().cloned().collect();
         let query_parser = tantivy::query::QueryParser::for_index(tantivy_index, query_fields);
         let parsed_query = query_parser.parse_query(&normalized_query)?;
 
