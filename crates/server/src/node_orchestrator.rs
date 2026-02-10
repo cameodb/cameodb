@@ -2841,15 +2841,25 @@ impl NodeOrchestrator {
         // Collect shard_ids before consuming local_batches in the loop
         let shard_ids: Vec<Uuid> = local_batches.keys().copied().collect();
 
-        // Process each shard sequentially to avoid concurrent access to shared storage
+        // Process each shard concurrently to maximize per-shard writer throughput
+        let mut local_futures = Vec::with_capacity(local_batches.len());
         for (shard_id, batch) in local_batches {
-            tracing::debug!(
-                shard_id = %shard_id,
-                count = batch.len(),
-                "Processing bulk write batch for local shard"
-            );
+            let shard = self.shards.get(&shard_id).cloned();
+            let index_name = index.to_string();
+            local_futures.push(async move {
+                tracing::debug!(
+                    shard_id = %shard_id,
+                    count = batch.len(),
+                    "Processing bulk write batch for local shard"
+                );
 
-            if let Some(shard) = self.shards.get(&shard_id) {
+                let shard = shard.ok_or_else(|| {
+                    OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Local shard {} not found", shard_id),
+                    ))
+                })?;
+
                 let docs: Vec<DocPayload> = batch
                     .into_iter()
                     .map(|(d, effective_routing_key)| DocPayload {
@@ -2859,31 +2869,32 @@ impl NodeOrchestrator {
                     })
                     .collect();
 
-                match shard
+                shard
                     .handle_batch_write(BatchWriteRequest {
-                        index: index.to_string(),
+                        index: index_name,
                         docs,
                     })
                     .await
-                {
-                    Ok(seq_ids) => {
-                        tracing::info!(
-                            shard_id = %shard_id,
-                            written_count = seq_ids.len(),
-                            "Local shard batch completed successfully"
-                        );
-                        total_written += seq_ids.len();
-                    }
-                    Err(e) => {
-                        let error_msg = format!("Shard {}: {}", shard_id, e);
-                        tracing::warn!(error = %error_msg, "Local shard batch processing failed");
-                        all_errors.push(error_msg);
-                    }
+                    .map(|seq_ids| (shard_id, seq_ids))
+            });
+        }
+
+        let local_results = futures::future::join_all(local_futures).await;
+        for result in local_results {
+            match result {
+                Ok((shard_id, seq_ids)) => {
+                    tracing::info!(
+                        shard_id = %shard_id,
+                        written_count = seq_ids.len(),
+                        "Local shard batch completed successfully"
+                    );
+                    total_written += seq_ids.len();
                 }
-            } else {
-                let error_msg = format!("Local shard {} not found", shard_id);
-                tracing::error!(error = %error_msg, "Shard not found during processing");
-                all_errors.push(error_msg);
+                Err(e) => {
+                    let error_msg = format!("{}", e);
+                    tracing::warn!(error = %error_msg, "Local shard batch processing failed");
+                    all_errors.push(error_msg);
+                }
             }
         }
 
@@ -2902,28 +2913,39 @@ impl NodeOrchestrator {
         } else {
             // Reset supervisor timers to prevent race condition with final commits
             // This keeps supervisors alive but gives them fresh timers
-            for shard_id in &shard_ids {
-                if let Some(shard) = self.shards.get(shard_id) {
-                    shard.reset_supervisor_before_commit(index).await;
-                }
-            }
+            let reset_futures: Vec<_> = shard_ids
+                .iter()
+                .filter_map(|shard_id| self.shards.get(shard_id).cloned())
+                .map(|shard| {
+                    let index_name = index.to_string();
+                    async move { shard.reset_supervisor_before_commit(&index_name).await }
+                })
+                .collect();
+            futures::future::join_all(reset_futures).await;
 
             // Commit via dedicated writer threads to avoid lock contention.
             // Each shard's commit is serialized with its writes on the same thread.
+            let commit_futures: Vec<_> = shard_ids
+                .iter()
+                .filter_map(|shard_id| self.shards.get(shard_id).cloned())
+                .map(|shard| {
+                    let index_name = index.to_string();
+                    async move { shard.handle_commit_via_channel(index_name).await }
+                })
+                .collect();
+
+            let commit_results = futures::future::join_all(commit_futures).await;
             let mut successful_commits = 0;
             let mut failed_commits = 0;
-
-            for shard_id in &shard_ids {
-                if let Some(shard) = self.shards.get(shard_id) {
-                    match shard.handle_commit_via_channel(index.to_string()).await {
-                        Ok(()) => {
-                            successful_commits += 1;
-                            tracing::debug!(shard_id = %shard_id, "Commit successful via writer thread");
-                        }
-                        Err(e) => {
-                            failed_commits += 1;
-                            tracing::warn!(shard_id = %shard_id, error = %e, "Failed to commit index via writer thread");
-                        }
+            for (shard_id, result) in shard_ids.iter().zip(commit_results.into_iter()) {
+                match result {
+                    Ok(()) => {
+                        successful_commits += 1;
+                        tracing::debug!(shard_id = %shard_id, "Commit successful via writer thread");
+                    }
+                    Err(e) => {
+                        failed_commits += 1;
+                        tracing::warn!(shard_id = %shard_id, error = %e, "Failed to commit index via writer thread");
                     }
                 }
             }
