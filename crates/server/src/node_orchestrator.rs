@@ -59,6 +59,15 @@ use xxhash_rust::xxh3::xxh3_64;
 /// Sample limit for enhanced schema detection during initial creation
 const SCHEMA_SAMPLE_LIMIT: usize = 200;
 
+/// Channel capacity for per-shard dedicated writer threads.
+/// Each MicroshardActor sends StorageCommands through this bounded channel.
+const SHARD_WRITER_CHANNEL_CAPACITY: usize = 1024;
+
+/// Channel capacity for the orchestrator worker pool job queue.
+/// Double the shard writer capacity to allow buffering of incoming requests
+/// while workers are dispatching to shard writer threads.
+const ORCHESTRATOR_WORKER_QUEUE_CAPACITY: usize = SHARD_WRITER_CHANNEL_CAPACITY * 2;
+
 /// Type alias for routing results to reduce complexity
 type RoutingResult = Result<(DocPayload, Option<String>, Option<Uuid>), OrchestratorError>;
 
@@ -610,6 +619,391 @@ pub enum StorageCommand {
     Shutdown,
 }
 
+/// A job dispatched to the orchestrator worker pool.
+/// Workers execute the operation on shared state and send the result
+/// back via the oneshot channel, bypassing the actor mailbox.
+pub struct OrchestratorJob {
+    pub op: ClientOp,
+    pub reply: tokio::sync::oneshot::Sender<Result<JsonValue, OrchestratorError>>,
+}
+
+/// Shared state for the orchestrator worker pool.
+///
+/// This struct is wrapped in `Arc` and shared across all worker tasks.
+/// All fields are either immutable after construction, lock-free (`ArcSwap`),
+/// or inherently thread-safe (`ActorRef`, `mpsc::Sender`).
+///
+/// The `shards` and `routing_ring` fields use `ArcSwap` so that topology
+/// updates from the actor can be published without locking, and workers
+/// always read the latest snapshot.
+pub struct OrchestratorEngine {
+    /// Shard map — updated atomically on topology changes via ArcSwap.
+    pub shards: ArcSwap<HashMap<Uuid, MicroshardActor>>,
+    /// Consistent hash ring — updated atomically on topology changes via ArcSwap.
+    pub routing_ring: ArcSwap<ConsistentRing>,
+    /// Per-index schema cache (lock-free via ArcSwap).
+    pub schema_cache: Arc<ArcSwap<HashMap<String, Arc<IndexSchema>>>>,
+    /// Fingerprint → index_name reverse lookup (lock-free via ArcSwap).
+    pub fingerprint_index: Arc<ArcSwap<HashMap<u64, String>>>,
+    /// Coordinator actor reference for shard assignments and peer lookups.
+    #[allow(dead_code)] // Used when bulk write is moved to engine
+    pub coordinator: Option<ActorRef<ClusterCoordinator>>,
+    /// Node identity for response metadata.
+    #[allow(dead_code)] // Used when bulk write is moved to engine
+    pub identity: NodeIdentity,
+    /// Default search result limit.
+    pub default_search_limit: usize,
+}
+
+impl std::fmt::Debug for OrchestratorEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrchestratorEngine")
+            .field("default_search_limit", &self.default_search_limit)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OrchestratorEngine {
+    /// Fetch a schema from cache if present (lock-free).
+    fn get_cached_schema(&self, index: &str) -> Option<Arc<IndexSchema>> {
+        let map = self.schema_cache.load();
+        map.get(index).cloned()
+    }
+
+    /// Insert or replace a schema in the cache (copy-on-write).
+    fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
+        let schema_arc = Arc::new(schema.clone());
+        let index_str = index.to_string();
+        let fingerprint = schema.fingerprint;
+
+        self.schema_cache.rcu(|old| {
+            let mut new = (**old).clone();
+            new.insert(index_str.clone(), schema_arc.clone());
+            new
+        });
+
+        if fingerprint != 0 {
+            let idx = index_str;
+            self.fingerprint_index.rcu(|old| {
+                let mut new = (**old).clone();
+                new.insert(fingerprint, idx.clone());
+                new
+            });
+        }
+    }
+
+    /// Get schema by fingerprint (lock-free instant cache hit).
+    fn get_schema_by_fingerprint(&self, fingerprint: u64) -> Option<Arc<IndexSchema>> {
+        let fp_map = self.fingerprint_index.load();
+        if let Some(index_name) = fp_map.get(&fingerprint) {
+            let cache = self.schema_cache.load();
+            return cache.get(index_name).cloned();
+        }
+        None
+    }
+
+    /// Load schema from first shard's storage.
+    async fn load_schema(&self, index: &str) -> Result<IndexSchema, OrchestratorError> {
+        if let Some(cached) = self.get_cached_schema(index) {
+            return Ok((*cached).clone());
+        }
+
+        let shards = self.shards.load();
+        if let Some(shard) = shards.values().next()
+            && let Some(store) = &shard.store
+        {
+            let sc = Arc::clone(store);
+            let idx = index.to_string();
+            let schema = tokio::task::spawn_blocking(move || sc.get_schema_cached(&idx))
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+            if let Some(schema_arc) = schema {
+                let schema = (*schema_arc).clone();
+                self.put_cached_schema(index, &schema);
+                return Ok(schema);
+            }
+        }
+        Ok(IndexSchema::default())
+    }
+
+    /// Route write to shard using deterministic key (no round-robin).
+    fn route_write(&self, routing_key: &Option<String>) -> Result<Uuid, OrchestratorError> {
+        let key = routing_key.as_ref().ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Missing routing key for write",
+            ))
+        })?;
+
+        let ring = self.routing_ring.load();
+        let target = ring.get_owner(key).or_else(|| self.first_shard_id());
+
+        target.ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shard selected",
+            ))
+        })
+    }
+
+    /// Returns the first shard id if any exist (fallback for empty ring).
+    fn first_shard_id(&self) -> Option<Uuid> {
+        let shards = self.shards.load();
+        shards.keys().copied().next()
+    }
+
+    /// Determines the shard that should handle a routing key.
+    #[allow(dead_code)] // Reserved for future engine-level routing
+    fn select_shard_for_key(&self, key: &str) -> Option<Uuid> {
+        let ring = self.routing_ring.load();
+        ring.get_owner(key)
+    }
+
+    /// Execute a ClientOp on the shared engine state.
+    /// Returns `Ok(result)` for ops handled by the engine, or an error
+    /// with `ErrorKind::Unsupported` for ops that must go through the actor mailbox.
+    pub async fn execute(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
+        match op {
+            ClientOp::Write {
+                index,
+                id,
+                routing_key,
+                doc,
+            } => self.engine_write(&index, id, routing_key, doc).await,
+            ClientOp::BulkWrite { index, docs } => self.engine_bulk_write(&index, docs).await,
+            ClientOp::Search {
+                index,
+                query,
+                limit,
+            } => {
+                self.engine_search(&index, &query, limit.unwrap_or(self.default_search_limit))
+                    .await
+            }
+            ClientOp::Stream {
+                index,
+                query,
+                limit,
+            } => {
+                let search_limit = limit.unwrap_or(self.default_search_limit);
+                self.engine_search(&index, &query, search_limit).await
+            }
+            // Config/metadata ops are lightweight — route through actor mailbox
+            _ => Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Operation not supported by worker pool; use actor mailbox",
+            ))),
+        }
+    }
+
+    /// Fast-path single document write.
+    ///
+    /// Handles the common case where the schema is mature (no evolution needed):
+    /// validates the document, routes to the correct shard, and dispatches the write.
+    /// For schema evolution (rare), returns `ErrorKind::Unsupported` so the caller
+    /// can fall back to the actor mailbox which has access to `staged_schema_validation`.
+    async fn engine_write(
+        &self,
+        index: &str,
+        id: String,
+        routing_key: Option<String>,
+        doc: JsonValue,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let shards = self.shards.load();
+        if shards.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards",
+            )));
+        }
+
+        // Inline fingerprint from doc keys
+        let doc_fingerprint = calculate_doc_fingerprint(&doc);
+
+        // Lock-free schema lookup by fingerprint, then by index name
+        let schema = if let Some(cached) = self.get_schema_by_fingerprint(doc_fingerprint) {
+            cached
+        } else if let Some(cached) = self.get_cached_schema(index) {
+            cached
+        } else {
+            Arc::new(self.load_schema(index).await?)
+        };
+
+        // Fast path: mature schema — validate inline
+        if !schema.fields.is_empty() {
+            let result =
+                NodeOrchestrator::validate_single_document_readonly_fast(&doc, &schema, false);
+            if let Some(err) = result.validation_error {
+                return Err(OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    err,
+                )));
+            }
+
+            if !result.needs_evolution {
+                // Schema is stable — populate cache if not yet present
+                if self.get_cached_schema(index).is_none() {
+                    self.put_cached_schema(index, &schema);
+                }
+
+                // Schema-based routing
+                let routing_field = schema.get_routing_field().to_string();
+                let effective_routing_key = extract_routing_value(&doc, &routing_field)
+                    .or(routing_key)
+                    .or_else(|| (!id.is_empty()).then(|| id.clone()))
+                    .or_else(|| derive_routing_key_from_doc(&doc));
+
+                let target = self.route_write(&effective_routing_key)?;
+                let shard = shards.get(&target).ok_or_else(|| {
+                    OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Shard not found",
+                    ))
+                })?;
+                let req = WriteRequest {
+                    index: index.to_string(),
+                    routing_key: effective_routing_key.unwrap_or_default(),
+                    doc,
+                };
+
+                return match shard.handle_write(req).await {
+                    Ok(seq) => Ok(serde_json::json!({
+                        "id": id, "result": "created", "version": seq,
+                        "shard_id": target.to_string()
+                    })),
+                    Err(e) => Err(e),
+                };
+            }
+            // needs_evolution == true: fall back to actor mailbox
+        }
+
+        // Slow path: schema evolution needed — signal caller to use actor mailbox
+        Err(OrchestratorError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "SCHEMA_EVOLUTION_NEEDED",
+        )))
+    }
+
+    /// Bulk write via the engine.
+    ///
+    /// Bulk writes involve complex schema validation, parallel routing, remote forwarding,
+    /// and parallel shard processing. These are delegated to the actor mailbox which has
+    /// access to the full `NodeOrchestrator` state.
+    async fn engine_bulk_write(
+        &self,
+        _index: &str,
+        _docs: Vec<DocPayload>,
+    ) -> Result<JsonValue, OrchestratorError> {
+        // Bulk writes require staged_schema_validation, parallel_local_shard_processing,
+        // and remote forwarding — all of which need full NodeOrchestrator access.
+        // Signal caller to route through actor mailbox.
+        Err(OrchestratorError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "BULK_WRITE_USE_ACTOR",
+        )))
+    }
+
+    /// Parallel scatter-gather search across all local shards.
+    async fn engine_search(
+        &self,
+        index: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let shards = self.shards.load();
+        let start = std::time::Instant::now();
+        if shards.is_empty() {
+            return Ok(
+                serde_json::json!({"hits": [], "hits_returned": 0, "total_hits": 0, "took_ms": 0}),
+            );
+        }
+
+        // Get schema for shadow field transformation (lock-free)
+        let schema = self
+            .get_cached_schema(index)
+            .map(|arc| (*arc).clone())
+            .unwrap_or_default();
+
+        // Transform query to map shadow fields to canonical "id" field
+        let transformed_query = transform_shadow_query(query, &schema);
+
+        let mut handles = Vec::new();
+        for (&shard_id, shard) in shards.iter() {
+            let req = SearchRequest {
+                index: index.to_string(),
+                query: transformed_query.clone(),
+                limit: Some(limit),
+            };
+            let s = shard.clone();
+            handles.push(tokio::spawn(async move {
+                (shard_id, s.handle_search(req).await)
+            }));
+        }
+
+        let mut results: Vec<(Uuid, f32, JsonValue)> = Vec::new();
+        let mut errors = Vec::new();
+        let mut shard_success = 0usize;
+        let mut total_hits_sum = 0usize;
+        for h in handles {
+            match h.await {
+                Ok((shard_id, Ok(r))) => {
+                    total_hits_sum += r.total_hits;
+                    for hit in r.hits {
+                        results.push((shard_id, hit.score, hit.doc));
+                    }
+                    shard_success += 1;
+                }
+                Ok((shard_id, Err(err))) => {
+                    warn!(%shard_id, error = %err, "Engine scatter search shard failed");
+                    errors.push(format!("Shard {}: {}", shard_id, err));
+                }
+                Err(join_err) => {
+                    warn!(error = %join_err, "Engine scatter search task join failed");
+                    errors.push(format!("Join error: {}", join_err));
+                }
+            }
+        }
+
+        // Sort by score descending
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+        let total_shards = shards.len();
+        let hits: Vec<JsonValue> = results
+            .into_iter()
+            .map(|(shard_id, score, mut doc)| {
+                if let JsonValue::Object(ref mut o) = doc {
+                    o.insert(
+                        "_score".to_string(),
+                        serde_json::Number::from_f64(score as f64)
+                            .map(JsonValue::Number)
+                            .unwrap_or(JsonValue::Null),
+                    );
+                    o.insert(
+                        "shard_id".to_string(),
+                        JsonValue::String(shard_id.to_string()),
+                    );
+                }
+                doc
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "hits": hits,
+            "hits_returned": hits.len(),
+            "total_hits": total_hits_sum,
+            "limit": limit,
+            "took_ms": start.elapsed().as_millis(),
+            "stats": {
+                "shards": {
+                    "total": total_shards,
+                    "responded": shard_success,
+                    "failed": errors.len()
+                }
+            },
+            "errors": errors
+        }))
+    }
+}
+
 /// Response containing node identity info for actor replies.
 #[derive(Debug, Clone, kameo::Reply)]
 #[allow(dead_code)] // Fields will be used when RouterActor migrates to ActorRef
@@ -709,7 +1103,7 @@ impl MicroshardActor {
         self.store = Some(store_arc.clone());
 
         // Spawn dedicated writer thread for serialized I/O
-        let (tx, mut rx) = mpsc::channel::<StorageCommand>(1024);
+        let (tx, mut rx) = mpsc::channel::<StorageCommand>(SHARD_WRITER_CHANNEL_CAPACITY);
         self.writer_tx = Some(tx);
 
         let writer_store = store_arc;
@@ -814,6 +1208,7 @@ impl MicroshardActor {
 
     /// Commit a specific index via the dedicated writer thread.
     /// Ensures commits are serialized with writes on the same thread.
+    #[allow(dead_code)]
     pub async fn handle_commit_via_channel(&self, index: String) -> Result<(), OrchestratorError> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_write_command(StorageCommand::Commit {
@@ -828,8 +1223,22 @@ impl MicroshardActor {
     }
 
     /// Gracefully stop the dedicated writer thread.
-    /// Sends `Shutdown` command, then waits for the thread to finish draining queued commands.
+    /// First drains all supervisor tasks (they hold cloned writer_tx senders),
+    /// then sends `Shutdown` command and waits for the thread to finish.
     async fn shutdown_writer(&mut self) {
+        // Step 1: Drop all supervisor senders so their tasks terminate.
+        // Supervisors hold cloned writer_tx and would otherwise keep running
+        // (and failing to send) after the writer thread exits.
+        {
+            let mut supervisors = self.supervisors.write().await;
+            let count = supervisors.len();
+            supervisors.clear(); // Dropping senders causes supervisor rx.recv() to return None
+            if count > 0 {
+                tracing::debug!(shard_id = %self.shard_id, count, "Cleared supervisor tasks before writer shutdown");
+            }
+        }
+
+        // Step 2: Send Shutdown to writer thread and wait for acknowledgement
         if let Some(tx) = self.writer_tx.take() {
             if tx.send(StorageCommand::Shutdown).await.is_ok() {
                 // Wait for the writer thread to acknowledge shutdown
@@ -935,9 +1344,19 @@ impl MicroshardActor {
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        _ = rx.recv() => {
-                            // Signal received, timer implicitly resets by continuing loop
-                            continue;
+                        result = rx.recv() => {
+                            match result {
+                                Some(()) => {
+                                    // Signal received, timer implicitly resets by continuing loop
+                                    continue;
+                                }
+                                None => {
+                                    // Channel closed (shutdown or supervisor map cleared).
+                                    // Exit cleanly without attempting commit.
+                                    tracing::debug!(index = %index_clone, "Supervisor channel closed, exiting");
+                                    break;
+                                }
+                            }
                         }
                         _ = tokio::time::sleep(timeout_dur) => {
                             // Timer expired without a signal, trigger commit via writer thread
@@ -948,34 +1367,31 @@ impl MicroshardActor {
                                 reply: reply_tx,
                             }).await.is_ok();
 
-                            let commit_ok = if send_ok {
-                                match reply_rx.await {
-                                    Ok(Ok(())) => {
-                                        tracing::info!(index = %index_inner, "Supervisor committed index via writer thread after idle timeout");
-                                        true
-                                    }
-                                    Ok(Err(e)) => {
-                                        tracing::error!(index = %index_inner, error = %e, "Supervisor commit failed via writer thread");
-                                        false
-                                    }
-                                    Err(_) => {
-                                        tracing::error!(index = %index_inner, "Supervisor commit reply channel dropped");
-                                        false
-                                    }
-                                }
-                            } else {
-                                tracing::error!(index = %index_inner, "Supervisor failed to send commit to writer thread");
-                                false
-                            };
-
-                            if commit_ok {
-                                // Self-cleanup from the supervisors map
-                                let mut supervisors = supervisors_arc.write().await;
-                                supervisors.remove(&index_clone);
+                            if !send_ok {
+                                // Writer thread channel closed (shutdown in progress).
+                                // Exit cleanly — no point retrying.
+                                tracing::debug!(index = %index_inner, "Supervisor: writer channel closed, exiting");
                                 break;
-                            } else {
-                                // Keep supervisor alive; next signal resets timer, next timeout retries
-                                continue;
+                            }
+
+                            match reply_rx.await {
+                                Ok(Ok(())) => {
+                                    tracing::info!(index = %index_inner, "Supervisor committed index via writer thread after idle timeout");
+                                    // Self-cleanup from the supervisors map
+                                    let mut supervisors = supervisors_arc.write().await;
+                                    supervisors.remove(&index_clone);
+                                    break;
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::error!(index = %index_inner, error = %e, "Supervisor commit failed via writer thread");
+                                    // Keep supervisor alive; next signal resets timer, next timeout retries
+                                    continue;
+                                }
+                                Err(_) => {
+                                    // Reply channel dropped — writer thread shut down mid-commit.
+                                    tracing::debug!(index = %index_inner, "Supervisor: reply dropped (writer shutdown), exiting");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -983,18 +1399,6 @@ impl MicroshardActor {
             });
 
             supervisors.insert(index, tx);
-        }
-    }
-
-    /// Reset supervisor for a specific index before final commits
-    /// This prevents race condition while keeping supervisor alive for future writes
-    async fn reset_supervisor_before_commit(&self, index: &str) {
-        let supervisors = self.supervisors.write().await;
-        if let Some(tx) = supervisors.get(index) {
-            // Send reset signal to restart the timer
-            if tx.try_send(()).is_ok() {
-                tracing::debug!(index = %index, "Reset supervisor timer before final commits");
-            }
         }
     }
 
@@ -1261,6 +1665,9 @@ pub struct RouterActor {
     max_concurrent_shard_searches: usize,
     #[allow(dead_code)] // Planned feature not yet implemented
     max_concurrent_remote_searches: usize,
+    /// Worker pool channel for dispatching hot-path ops (Write, Search)
+    /// bypassing the actor mailbox for concurrent processing.
+    worker_tx: Option<mpsc::Sender<OrchestratorJob>>,
 }
 
 impl RouterActor {
@@ -1270,6 +1677,7 @@ impl RouterActor {
         messaging: &MessagingConfig,
         search_config: &SearchConfig,
         default_search_limit: usize,
+        worker_tx: Option<mpsc::Sender<OrchestratorJob>>,
     ) -> Self {
         Self {
             orchestrator,
@@ -1286,12 +1694,73 @@ impl RouterActor {
             max_concurrent_shard_searches: search_config.max_concurrent_shard_searches,
             max_concurrent_remote_searches: search_config.max_concurrent_remote_searches,
             enable_early_termination: search_config.enable_early_termination,
+            worker_tx,
         }
     }
 
-    /// Handles client operations by forwarding to NodeOrchestrator actor.
+    /// Handles client operations.
+    ///
+    /// Hot-path ops (Write, Search, Stream) are dispatched to the worker pool
+    /// for concurrent processing, bypassing the actor mailbox.
+    /// Other ops (BulkWrite, config, metadata) go through the actor mailbox.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn handle_client_op(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
+        // Try worker pool for hot-path ops
+        if let Some(tx) = &self.worker_tx {
+            let is_worker_eligible = matches!(
+                op,
+                ClientOp::Write { .. } | ClientOp::Search { .. } | ClientOp::Stream { .. }
+            );
+            if is_worker_eligible {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                match tx.try_send(OrchestratorJob {
+                    op,
+                    reply: reply_tx,
+                }) {
+                    Ok(()) => {
+                        // Await worker result
+                        return match reply_rx.await {
+                            Ok(result) => {
+                                // Check if engine signaled fallback to actor
+                                if let Err(OrchestratorError::Io(io_err)) = &result
+                                    && io_err.kind() == std::io::ErrorKind::Unsupported
+                                {
+                                    let msg = io_err.to_string();
+                                    if msg == "SCHEMA_EVOLUTION_NEEDED"
+                                        || msg == "BULK_WRITE_USE_ACTOR"
+                                    {
+                                        return Err(OrchestratorError::Io(std::io::Error::other(
+                                            "Schema evolution required; retry via actor",
+                                        )));
+                                    }
+                                }
+                                result
+                            }
+                            Err(_) => Err(OrchestratorError::Io(std::io::Error::other(
+                                "Worker dropped reply channel",
+                            ))),
+                        };
+                    }
+                    Err(mpsc::error::TrySendError::Full(job)) => {
+                        // Queue full — fall through to actor mailbox
+                        debug!("Worker pool queue full, falling back to actor mailbox");
+                        // Recover the op from the job
+                        return self.ask_orchestrator(job.op).await;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(job)) => {
+                        warn!("Worker pool channel closed, falling back to actor mailbox");
+                        return self.ask_orchestrator(job.op).await;
+                    }
+                }
+            }
+        }
+
+        // Fallback: route through actor mailbox
+        self.ask_orchestrator(op).await
+    }
+
+    /// Forward an operation through the actor mailbox (serialized path).
+    async fn ask_orchestrator(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
         match self.orchestrator.ask(op).await {
             Ok(result) => Ok(result),
             Err(e) => Err(OrchestratorError::Io(std::io::Error::other(format!(
@@ -2228,12 +2697,20 @@ pub struct NodeOrchestrator {
     routing_ring: ConsistentRing,
     /// Optional coordinator reference for shard registration
     coordinator: Option<ActorRef<ClusterCoordinator>>,
-    /// Per-index schema cache to avoid repeated metadata reads (lock-free via ArcSwap)
-    schema_cache: ArcSwap<HashMap<String, Arc<IndexSchema>>>,
-    /// Fingerprint → index_name reverse lookup for instant cache hits (lock-free via ArcSwap)
-    fingerprint_index: ArcSwap<HashMap<u64, String>>,
+    /// Per-index schema cache to avoid repeated metadata reads (lock-free via ArcSwap).
+    /// Wrapped in Arc so it can be shared with the OrchestratorEngine worker pool.
+    schema_cache: Arc<ArcSwap<HashMap<String, Arc<IndexSchema>>>>,
+    /// Fingerprint → index_name reverse lookup for instant cache hits (lock-free via ArcSwap).
+    /// Wrapped in Arc so it can be shared with the OrchestratorEngine worker pool.
+    fingerprint_index: Arc<ArcSwap<HashMap<u64, String>>>,
     /// Default search result limit when not specified in request
     default_search_limit: usize,
+    /// Shared engine state for the worker pool (Arc-wrapped, lock-free).
+    /// Workers operate on this concurrently without going through the actor mailbox.
+    engine: Option<Arc<OrchestratorEngine>>,
+    /// Channel sender for dispatching jobs to the worker pool.
+    /// Workers pull jobs from the receiver and execute on the shared engine.
+    worker_tx: Option<mpsc::Sender<OrchestratorJob>>,
 }
 
 impl NodeOrchestrator {
@@ -2838,14 +3315,13 @@ impl NodeOrchestrator {
         let mut total_written = 0usize;
         let mut all_errors = Vec::new();
 
-        // Collect shard_ids before consuming local_batches in the loop
-        let shard_ids: Vec<Uuid> = local_batches.keys().copied().collect();
-
-        // Process each shard concurrently to maximize per-shard writer throughput
+        // Process shards in parallel, but ensure serial access per shard
+        // Each shard has its own Tantivy/Redb instance, so cross-shard parallelism is safe
         let mut local_futures = Vec::with_capacity(local_batches.len());
         for (shard_id, batch) in local_batches {
             let shard = self.shards.get(&shard_id).cloned();
             let index_name = index.to_string();
+
             local_futures.push(async move {
                 tracing::debug!(
                     shard_id = %shard_id,
@@ -2869,6 +3345,8 @@ impl NodeOrchestrator {
                     })
                     .collect();
 
+                // Each shard handles its own writes serially via its dedicated writer thread
+                // This prevents IndexWriter lock contention within the same shard
                 shard
                     .handle_batch_write(BatchWriteRequest {
                         index: index_name,
@@ -2904,58 +3382,15 @@ impl NodeOrchestrator {
             all_errors.len()
         );
 
-        // Optimized commit strategy: parallel commits with adaptive timing
-        if !all_errors.is_empty() {
-            tracing::warn!(
-                "Skipping commit due to {} errors during batch processing",
-                all_errors.len()
-            );
-        } else {
-            // Reset supervisor timers to prevent race condition with final commits
-            // This keeps supervisors alive but gives them fresh timers
-            let reset_futures: Vec<_> = shard_ids
-                .iter()
-                .filter_map(|shard_id| self.shards.get(shard_id).cloned())
-                .map(|shard| {
-                    let index_name = index.to_string();
-                    async move { shard.reset_supervisor_before_commit(&index_name).await }
-                })
-                .collect();
-            futures::future::join_all(reset_futures).await;
-
-            // Commit via dedicated writer threads to avoid lock contention.
-            // Each shard's commit is serialized with its writes on the same thread.
-            let commit_futures: Vec<_> = shard_ids
-                .iter()
-                .filter_map(|shard_id| self.shards.get(shard_id).cloned())
-                .map(|shard| {
-                    let index_name = index.to_string();
-                    async move { shard.handle_commit_via_channel(index_name).await }
-                })
-                .collect();
-
-            let commit_results = futures::future::join_all(commit_futures).await;
-            let mut successful_commits = 0;
-            let mut failed_commits = 0;
-            for (shard_id, result) in shard_ids.iter().zip(commit_results.into_iter()) {
-                match result {
-                    Ok(()) => {
-                        successful_commits += 1;
-                        tracing::debug!(shard_id = %shard_id, "Commit successful via writer thread");
-                    }
-                    Err(e) => {
-                        failed_commits += 1;
-                        tracing::warn!(shard_id = %shard_id, error = %e, "Failed to commit index via writer thread");
-                    }
-                }
-            }
-
-            tracing::info!(
-                successful_commits = successful_commits,
-                failed_commits = failed_commits,
-                "Batch commits completed via writer threads"
-            );
-        }
+        // Commit strategy: rely on the two existing commit mechanisms:
+        //   1. Threshold-based commit inside apply_batch_and_maybe_commit (writer thread)
+        //      — fires during the batch if enough ops accumulate.
+        //   2. Supervisor idle-timeout commit (signal_supervisor called by handle_batch_write)
+        //      — fires after the batch completes and no more writes arrive.
+        //
+        // No explicit commit here: it would be redundant with #1 (if threshold fired)
+        // or premature (if the caller is about to send more batches). The supervisor
+        // guarantees data is committed within the idle timeout window.
 
         Ok((total_written, all_errors))
     }
@@ -3105,9 +3540,11 @@ impl NodeOrchestrator {
             config,
             routing_ring: ConsistentRing::new(),
             coordinator: None,
-            schema_cache: ArcSwap::from_pointee(HashMap::new()),
-            fingerprint_index: ArcSwap::from_pointee(HashMap::new()),
+            schema_cache: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            fingerprint_index: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             default_search_limit,
+            engine: None,
+            worker_tx: None,
         };
 
         // Discover and hydrate existing shards
@@ -3119,6 +3556,101 @@ impl NodeOrchestrator {
     /// Set the coordinator ActorRef after it is spawned (used for shard registration).
     pub fn set_coordinator(&mut self, coordinator: ActorRef<ClusterCoordinator>) {
         self.coordinator = Some(coordinator);
+    }
+
+    /// Returns a clone of the worker pool sender, if the pool has been spawned.
+    pub fn worker_tx(&self) -> Option<mpsc::Sender<OrchestratorJob>> {
+        self.worker_tx.clone()
+    }
+
+    /// Returns a clone of the shared engine, if it has been created.
+    #[allow(dead_code)] // Public API for future direct engine access
+    pub fn engine(&self) -> Option<Arc<OrchestratorEngine>> {
+        self.engine.clone()
+    }
+
+    /// Build the shared `OrchestratorEngine` and spawn the worker pool.
+    ///
+    /// Must be called **after** `hydrate_existing_shards` and `set_coordinator`
+    /// so that shards, routing ring, and coordinator are fully initialized.
+    ///
+    /// Worker count formula: `min(local_shards * 2, cpu_cores * 2)`, minimum 1.
+    pub fn spawn_worker_pool(&mut self) {
+        // Share the same ArcSwap instances so cache writes from the actor
+        // are immediately visible to workers (no duplication).
+        let engine = Arc::new(OrchestratorEngine {
+            shards: ArcSwap::from_pointee(self.shards.clone()),
+            routing_ring: ArcSwap::from_pointee(self.routing_ring.clone()),
+            schema_cache: Arc::clone(&self.schema_cache),
+            fingerprint_index: Arc::clone(&self.fingerprint_index),
+            coordinator: self.coordinator.clone(),
+            identity: self.identity.clone(),
+            default_search_limit: self.default_search_limit,
+        });
+
+        // Worker count: min(local_shards * 2, cpu_cores * 2), minimum 1
+        let cpu_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let local_shards = self.shards.len();
+        let worker_count = std::cmp::max(1, std::cmp::min(local_shards * 2, cpu_cores * 2));
+
+        let (tx, rx) = mpsc::channel::<OrchestratorJob>(ORCHESTRATOR_WORKER_QUEUE_CAPACITY);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+
+        info!(
+            worker_count = worker_count,
+            local_shards = local_shards,
+            cpu_cores = cpu_cores,
+            queue_capacity = ORCHESTRATOR_WORKER_QUEUE_CAPACITY,
+            "Spawning orchestrator worker pool"
+        );
+
+        for worker_id in 0..worker_count {
+            let engine = Arc::clone(&engine);
+            let rx = Arc::clone(&rx);
+            tokio::spawn(async move {
+                loop {
+                    // Acquire lock only to dequeue — released immediately
+                    let job = {
+                        let mut guard = rx.lock().await;
+                        guard.recv().await
+                    };
+                    match job {
+                        Some(job) => {
+                            let result = engine.execute(job.op).await;
+                            // Send result back; ignore error if caller dropped the receiver
+                            let _ = job.reply.send(result);
+                        }
+                        None => {
+                            // Channel closed — worker pool shutting down
+                            debug!(worker_id = worker_id, "Orchestrator worker exiting");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
+        self.engine = Some(engine);
+        self.worker_tx = Some(tx);
+
+        info!(
+            worker_count = worker_count,
+            "Orchestrator worker pool started"
+        );
+    }
+
+    /// Publish updated shard map and routing ring to the engine's ArcSwap fields.
+    /// Called after topology changes (new shards, topology updates) so workers
+    /// see the latest state without restart.
+    fn publish_engine_state(&self) {
+        if let Some(engine) = &self.engine {
+            engine.shards.store(Arc::new(self.shards.clone()));
+            engine
+                .routing_ring
+                .store(Arc::new(self.routing_ring.clone()));
+        }
     }
 
     /// Scans the storage directory for existing shard folders and hydrates them in parallel.
@@ -3526,6 +4058,7 @@ impl NodeOrchestrator {
             keypair: None,
         };
         self.routing_ring.add_node(&identity);
+        self.publish_engine_state();
     }
 
     /// Determines the shard that should handle a routing key.
@@ -4592,6 +5125,7 @@ impl Message<UpdateTopology> for NodeOrchestrator {
             "NodeOrchestrator: received global topology update"
         );
         self.routing_ring = msg.ring;
+        self.publish_engine_state();
     }
 }
 

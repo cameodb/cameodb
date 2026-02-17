@@ -197,6 +197,10 @@ async fn main() -> Result<()> {
     }
     println!("Active shards: {}", orchestrator.shard_count());
 
+    // Spawn the worker pool BEFORE spawning the actor (we need &mut access)
+    orchestrator.spawn_worker_pool();
+    let worker_tx = orchestrator.worker_tx();
+
     // NOW spawn the NodeOrchestrator as an actor (after all setup is done)
     let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
     let remote_name = orchestrator_remote_name(&node_id);
@@ -305,6 +309,7 @@ async fn main() -> Result<()> {
         &cameodb_config.network.cluster.messaging,
         &cameodb_config.search,
         cameodb_config.search.default_search_limit,
+        worker_tx,
     );
 
     let app_state = AppState {

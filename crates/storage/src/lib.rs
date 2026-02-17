@@ -23,6 +23,8 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
+use tantivy::schema::Value as TantivyValue;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -1402,66 +1404,187 @@ impl HybridStore {
         index_name: &str,
     ) -> Result<u64, StoreError> {
         let searcher = reader.searcher();
+        let doc_count = searcher.num_docs();
 
         // Verify the _seq field exists in the schema
         let schema = searcher.index().schema();
-        schema.get_field("_seq").map_err(|_| {
+        let seq_field = schema.get_field("_seq").map_err(|_| {
             StoreError::FieldNotFound(format!("_seq field missing in index '{}'", index_name))
         })?;
 
-        // Use TopDocs collector with limit 1, sorted by _seq descending
-        // Note: order_by_u64_field expects the field name as a string
+        // Log schema info for _seq field
+        let field_entry = schema.get_field_entry(seq_field);
+        tracing::info!(
+            index = %index_name,
+            doc_count = doc_count,
+            is_indexed = field_entry.is_indexed(),
+            is_stored = field_entry.is_stored(),
+            is_fast = field_entry.is_fast(),
+            "Checking _seq field in Tantivy schema"
+        );
+
+        // Use TopDocs collector with limit 1, sorted by _seq descending.
         let query = tantivy::query::AllQuery;
         let collector = tantivy::collector::TopDocs::with_limit(1)
             .order_by_u64_field("_seq", tantivy::Order::Desc);
 
         let top_docs = searcher.search(&query, &collector)?;
 
-        // If a document is found, the sort value IS the _seq value (u64)
-        // TopDocs returns (sort_value, doc_address) tuples
-        if let Some((sort_value, _doc_address)) = top_docs.first() {
-            return Ok(*sort_value);
+        tracing::info!(
+            index = %index_name,
+            top_docs_len = top_docs.len(),
+            "TopDocs search completed"
+        );
+
+        if let Some((_sort_key, doc_address)) = top_docs.first() {
+            // Retrieve the actual _seq value from the stored document
+            let doc: tantivy::TantivyDocument = searcher.doc(*doc_address)?;
+
+            // Debug: log all stored fields in the document
+            let json_debug = doc.to_json(&schema);
+            tracing::info!(
+                index = %index_name,
+                doc_addr = ?doc_address,
+                doc_json = %json_debug,
+                "Retrieved document for _seq extraction"
+            );
+
+            if let Some(value) = doc.get_first(seq_field)
+                && let Some(seq) = value.as_u64()
+            {
+                tracing::info!(
+                    index = %index_name,
+                    last_seq = seq,
+                    "Successfully retrieved last indexed _seq from Tantivy"
+                );
+                return Ok(seq);
+            }
+            // _seq field exists but couldn't extract value — treat as empty
+            tracing::warn!(
+                index = %index_name,
+                "Found document but could not extract _seq value from stored fields"
+            );
+        } else {
+            tracing::info!(
+                index = %index_name,
+                "No documents found in Tantivy index (empty index)"
+            );
         }
 
-        // Return 0 if index is empty
+        // Return 0 if index is empty or couldn't extract _seq
         Ok(0)
     }
 
-    /// Recover missing WAL operations for an index by replaying them to Tantivy.
-    /// This bridges the gap between Redb WAL and Tantivy index after a crash/restart.
-    /// Returns the count of replayed operations.
+    /// Verify if a specific sequence number exists in the Tantivy index.
+    /// Iterates through documents checking stored _seq values (does not require INDEXED).
+    fn verify_seq_exists(&self, reader: &IndexReader, target_seq: u64) -> Result<bool, StoreError> {
+        let searcher = reader.searcher();
+        let schema = searcher.index().schema();
+
+        let seq_field = schema
+            .get_field("_seq")
+            .map_err(|_| StoreError::FieldNotFound("_seq".to_string()))?;
+
+        // Use AllQuery and check documents manually (slower but doesn't require INDEXED)
+        let total_docs = searcher.num_docs();
+        let mut processed = 0;
+
+        while processed < total_docs {
+            let batch_limit = std::cmp::min(1000, total_docs - processed);
+            let top_docs = tantivy::collector::TopDocs::with_limit(batch_limit as usize)
+                .and_offset(processed as usize);
+
+            let results = searcher.search(&tantivy::query::AllQuery, &top_docs)?;
+
+            for (_score, doc_address) in results {
+                let doc: tantivy::TantivyDocument = searcher.doc(doc_address)?;
+                if let Some(value) = doc.get_first(seq_field) {
+                    if let Some(val) = value.as_u64() {
+                        if val == target_seq {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+
+            processed += batch_limit;
+
+            // Early exit if we've checked many docs without finding - likely seq doesn't exist
+            if processed >= 10000 && target_seq > 0 {
+                tracing::debug!(
+                    target_seq = target_seq,
+                    checked = processed,
+                    "Seq not found in first 10k docs, assuming non-existent"
+                );
+                break;
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Recover missing WAL operations using verification-based approach.
+    /// 1. Get max seq from redb WAL
+    /// 2. Verify backwards until finding last committed seq in Tantivy
+    /// 3. Replay all missing operations from that point
     fn recover_index(
         &self,
         index: &str,
         writer: &mut IndexWriter,
         reader: &IndexReader,
     ) -> Result<usize, StoreError> {
-        // Get the last sequence number committed in Tantivy
-        let last_seq = self.get_last_indexed_seq(reader, index)?;
+        // Get max WAL sequence from redb
+        let max_wal_seq = self.get_max_wal_id_for_index(index)?;
 
-        tracing::debug!(
+        if max_wal_seq == 0 {
+            tracing::debug!(index = %index, "No WAL entries found, skipping recovery");
+            return Ok(0);
+        }
+
+        // Find the last committed sequence in Tantivy by verifying backwards
+        let mut last_committed_seq = 0u64;
+        let mut verified_count = 0u64;
+
+        // Start from max_wal_seq and go backwards to find last committed
+        for seq in (1..=max_wal_seq).rev() {
+            if self.verify_seq_exists(reader, seq)? {
+                last_committed_seq = seq;
+                verified_count = max_wal_seq - seq;
+                break;
+            }
+        }
+
+        tracing::info!(
             index = %index,
-            last_seq = last_seq,
-            "Starting WAL recovery"
+            max_wal_seq = max_wal_seq,
+            last_committed_seq = last_committed_seq,
+            missing_count = verified_count,
+            "WAL recovery verification complete"
         );
+
+        // If all sequences are committed, nothing to recover
+        if last_committed_seq >= max_wal_seq {
+            tracing::info!(index = %index, "All WAL sequences already committed to Tantivy");
+            return Ok(0);
+        }
+
+        // Start recovery from the first missing sequence
+        let range_start = last_committed_seq + 1;
 
         // Start a read transaction on Redb
         let read_txn = self.kv.begin_read()?;
-
-        // Open the WAL table for this index
         let wal_table_name = format!("wal_{}", index);
         let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
 
         let wal_table = match read_txn.open_table(wal_table_def) {
             Ok(table) => table,
             Err(_) => {
-                // WAL table doesn't exist yet (new index), nothing to recover
-                tracing::debug!(index = %index, "No WAL table found, skipping recovery");
+                tracing::debug!(index = %index, "No WAL table found");
                 return Ok(0);
             }
         };
 
-        // Get the schema and fields for building documents
+        // Get schema for building documents
         let index_schema = self
             .get_schema_cached(index)?
             .unwrap_or_else(|| Arc::new(IndexSchema::default()));
@@ -1483,28 +1606,22 @@ impl HybridStore {
             }
         }
 
-        // Use range to get only operations after last_seq
-        let range_start = last_seq + 1;
+        // Replay missing operations
         let mut replayed_count = 0;
-
         for entry_result in wal_table.range(range_start..)? {
             let (seq_guard, wal_data_guard) = entry_result?;
             let seq_id = seq_guard.value();
             let wal_data = wal_data_guard.value();
 
-            // Deserialize the WAL operation
             let wal_op: WalOp = serde_json::from_slice(wal_data)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-            // Apply the operation to the writer
             match wal_op {
                 WalOp::Put { id, json_blob } => {
-                    // Build Tantivy document with id and _seq fields
                     let mut tantivy_doc = tantivy::TantivyDocument::default();
                     tantivy_doc.add_text(id_field, &id);
                     tantivy_doc.add_u64(seq_field, seq_id);
 
-                    // Add indexed fields from the JSON blob
                     if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
                         for (field_name, field_def) in &index_schema.fields {
                             if !field_def.indexed || field_def.is_shadow || field_name == "id" {
@@ -1524,28 +1641,34 @@ impl HybridStore {
                         }
                     }
 
-                    // Delete old document and add new one (upsert)
                     let term = tantivy::Term::from_field_text(id_field, &id);
                     writer.delete_term(term);
                     writer.add_document(tantivy_doc)?;
                 }
                 WalOp::Delete { id } => {
-                    // Delete the document by id
                     let term = tantivy::Term::from_field_text(id_field, &id);
                     writer.delete_term(term);
                 }
             }
 
             replayed_count += 1;
+
+            // Log progress every 1000 documents
+            if replayed_count % 1000 == 0 {
+                tracing::info!(
+                    index = %index,
+                    replayed = replayed_count,
+                    total_missing = verified_count,
+                    "Recovery progress"
+                );
+            }
         }
 
-        if replayed_count > 0 {
-            tracing::debug!(
-                index = %index,
-                replayed_count = replayed_count,
-                "WAL recovery completed"
-            );
-        }
+        tracing::info!(
+            index = %index,
+            replayed_count = replayed_count,
+            "WAL recovery completed - replayed missing operations"
+        );
 
         Ok(replayed_count)
     }
@@ -1675,6 +1798,7 @@ impl HybridStore {
         let id_field = schema_builder.add_text_field("id", STRING | STORED);
 
         // Sequence field for WAL ordering - reserved field
+        // FAST is required for order_by_u64_field sorting
         let seq_field = schema_builder.add_u64_field("_seq", STORED | FAST);
 
         let mut indexed_fields = HashMap::new();
@@ -1996,8 +2120,15 @@ impl HybridStore {
                 index
             );
 
-            // Commit immediately to persist the recovery
+            // Commit immediately to persist the recovery with proper meta.json update
+            // This ensures all segments created during recovery are properly tracked
             writer.commit()?;
+
+            tracing::info!(
+                index = %index,
+                "Recovery commit completed - {} operations now stable",
+                recovered_count
+            );
         }
 
         let writer_arc = Arc::new(Mutex::new(writer));
@@ -2104,15 +2235,25 @@ impl HybridStore {
         Ok(())
     }
 
-    /// Force a commit for a specific index
+    /// Force a commit for a specific index.
+    /// Skips the commit if there are no pending operations (no-op guard).
+    /// After commit, truncates WAL entries that are now safely persisted in Tantivy.
     pub fn commit_index(&self, index: &str) -> Result<(), StoreError> {
+        // No-op guard: skip commit if no operations pending since last commit.
+        let ops_pending = self.get_operations_count(index);
+        if ops_pending == 0 {
+            tracing::debug!(index = %index, "commit_index: skipping, no pending operations");
+            return Ok(());
+        }
+
         if let Some(writer_arc) = self.writers.get(index) {
             let mut writer = writer_arc.value().lock().unwrap();
             writer.commit()?;
             self.reset_operations_counter(index);
 
+            tracing::debug!(index = %index, ops_committed = ops_pending, "commit_index: committed");
+
             // CRITICAL: Smart refresh reader cache after commit to ensure search sees latest data
-            // This tries fast reload first, falls back to cache clearing if needed
             self.smart_refresh_reader(index)?;
 
             // Refresh budget cache after commit since index size likely changed
@@ -2120,6 +2261,70 @@ impl HybridStore {
             let new_budget = self.config.get_optimal_memory_budget(&index_path);
             self.budget_cache.insert(index.to_string(), new_budget);
         }
+
+        // AFTER Tantivy commit succeeds: Truncate WAL entries that are now safely persisted.
+        // This prevents the WAL from growing indefinitely and ensures that on restart,
+        // we only replay operations that were NOT committed to Tantivy.
+        self.truncate_wal_up_to_committed(index)?;
+
+        Ok(())
+    }
+
+    /// Truncate WAL entries up to the last committed sequence in Tantivy.
+    /// This is called after a successful Tantivy commit to clean up the Redb WAL.
+    fn truncate_wal_up_to_committed(&self, index: &str) -> Result<(), StoreError> {
+        // Get the last committed sequence from Tantivy by opening a fresh reader
+        let index_path = self.config.shard_path.join("indices").join(index);
+        let last_committed_seq = if index_path.join("meta.json").exists() {
+            let tantivy_index = Index::open_in_dir(&index_path)?;
+            let reader = tantivy_index
+                .reader_builder()
+                .reload_policy(tantivy::ReloadPolicy::Manual)
+                .try_into()?;
+            self.get_last_indexed_seq(&reader, index)?
+        } else {
+            0
+        };
+
+        if last_committed_seq == 0 {
+            // Nothing committed yet, nothing to truncate
+            return Ok(());
+        }
+
+        // Truncate WAL entries up to and including last_committed_seq
+        let wal_table_name = format!("wal_{}", index);
+        let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
+
+        let mut write_txn = self.kv.begin_write()?;
+        {
+            // Use Immediate durability for WAL truncation - this is cleanup, must be reliable
+            write_txn.set_durability(Durability::Immediate)?;
+
+            let mut wal_table = write_txn.open_table(wal_table_def)?;
+
+            // Delete all entries from 0 up to and including last_committed_seq
+            // We use a range iterator to find them efficiently
+            let keys_to_delete: Vec<u64> = wal_table
+                .range(0..=last_committed_seq)?
+                .map(|result| result.map(|(k, _)| k.value()))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let deleted_count = keys_to_delete.len();
+            for key in keys_to_delete {
+                wal_table.remove(key)?;
+            }
+
+            if deleted_count > 0 {
+                tracing::info!(
+                    index = %index,
+                    deleted = deleted_count,
+                    up_to_seq = last_committed_seq,
+                    "Truncated WAL entries - {} operations now stable in Tantivy",
+                    deleted_count
+                );
+            }
+        }
+        write_txn.commit()?;
 
         Ok(())
     }
