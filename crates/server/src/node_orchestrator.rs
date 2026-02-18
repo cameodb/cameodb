@@ -622,9 +622,12 @@ pub enum StorageCommand {
 /// A job dispatched to the orchestrator worker pool.
 /// Workers execute the operation on shared state and send the result
 /// back via the oneshot channel, bypassing the actor mailbox.
-pub struct OrchestratorJob {
-    pub op: ClientOp,
-    pub reply: tokio::sync::oneshot::Sender<Result<JsonValue, OrchestratorError>>,
+pub enum OrchestratorJob {
+    Execute {
+        op: ClientOp,
+        reply: tokio::sync::oneshot::Sender<Result<JsonValue, OrchestratorError>>,
+    },
+    Shutdown,
 }
 
 /// Shared state for the orchestrator worker pool.
@@ -1713,7 +1716,7 @@ impl RouterActor {
             );
             if is_worker_eligible {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                match tx.try_send(OrchestratorJob {
+                match tx.try_send(OrchestratorJob::Execute {
                     op,
                     reply: reply_tx,
                 }) {
@@ -1744,12 +1747,21 @@ impl RouterActor {
                     Err(mpsc::error::TrySendError::Full(job)) => {
                         // Queue full — fall through to actor mailbox
                         debug!("Worker pool queue full, falling back to actor mailbox");
-                        // Recover the op from the job
-                        return self.ask_orchestrator(job.op).await;
+                        if let OrchestratorJob::Execute { op, .. } = job {
+                            return self.ask_orchestrator(op).await;
+                        }
+                        return Err(OrchestratorError::Io(std::io::Error::other(
+                            "Worker queue full while shutting down",
+                        )));
                     }
                     Err(mpsc::error::TrySendError::Closed(job)) => {
                         warn!("Worker pool channel closed, falling back to actor mailbox");
-                        return self.ask_orchestrator(job.op).await;
+                        if let OrchestratorJob::Execute { op, .. } = job {
+                            return self.ask_orchestrator(op).await;
+                        }
+                        return Err(OrchestratorError::Io(std::io::Error::other(
+                            "Worker channel closed during shutdown",
+                        )));
                     }
                 }
             }
@@ -2711,6 +2723,9 @@ pub struct NodeOrchestrator {
     /// Channel sender for dispatching jobs to the worker pool.
     /// Workers pull jobs from the receiver and execute on the shared engine.
     worker_tx: Option<mpsc::Sender<OrchestratorJob>>,
+    /// Number of worker tasks spawned in the pool.
+    /// Used to signal explicit worker shutdown.
+    worker_count: usize,
 }
 
 impl NodeOrchestrator {
@@ -3545,6 +3560,7 @@ impl NodeOrchestrator {
             default_search_limit,
             engine: None,
             worker_tx: None,
+            worker_count: 0,
         };
 
         // Discover and hydrate existing shards
@@ -3617,10 +3633,17 @@ impl NodeOrchestrator {
                         guard.recv().await
                     };
                     match job {
-                        Some(job) => {
-                            let result = engine.execute(job.op).await;
+                        Some(OrchestratorJob::Execute { op, reply }) => {
+                            let result = engine.execute(op).await;
                             // Send result back; ignore error if caller dropped the receiver
-                            let _ = job.reply.send(result);
+                            let _ = reply.send(result);
+                        }
+                        Some(OrchestratorJob::Shutdown) => {
+                            debug!(
+                                worker_id = worker_id,
+                                "Orchestrator worker received shutdown signal"
+                            );
+                            break;
                         }
                         None => {
                             // Channel closed — worker pool shutting down
@@ -3634,11 +3657,35 @@ impl NodeOrchestrator {
 
         self.engine = Some(engine);
         self.worker_tx = Some(tx);
+        self.worker_count = worker_count;
 
         info!(
             worker_count = worker_count,
             "Orchestrator worker pool started"
         );
+    }
+
+    /// Explicitly signal all worker tasks to exit.
+    /// Uses one shutdown message per worker for deterministic teardown.
+    async fn shutdown_worker_pool(&self) {
+        let Some(tx) = &self.worker_tx else {
+            return;
+        };
+
+        if self.worker_count == 0 {
+            return;
+        }
+
+        tracing::info!(
+            worker_count = self.worker_count,
+            "Shutting down orchestrator worker pool"
+        );
+        for _ in 0..self.worker_count {
+            if tx.send(OrchestratorJob::Shutdown).await.is_err() {
+                // Channel is already closed; workers are already stopping.
+                break;
+            }
+        }
     }
 
     /// Publish updated shard map and routing ring to the engine's ArcSwap fields.
@@ -4000,6 +4047,9 @@ impl NodeOrchestrator {
     /// Shutdown all shards gracefully, committing pending writes and releasing resources.
     pub async fn shutdown_all_shards(&self) -> Result<(), OrchestratorError> {
         tracing::info!("NodeOrchestrator: Shutting down all shards");
+
+        // Stop worker pool first so no new work is queued during shard shutdown.
+        self.shutdown_worker_pool().await;
 
         let mut errors = Vec::new();
 
@@ -4403,7 +4453,7 @@ impl NodeOrchestrator {
         let routing_field = schema_cache.get_routing_field().to_string();
 
         // Route documents in parallel
-        let routing_results: Vec<RoutingResult> =
+        let routing_results: Vec<RoutingResult> = tokio::task::spawn_blocking(move || {
             docs.into_par_iter()
                 .map(|doc| {
                     // Calculate effective routing key using schema's routing field
@@ -4434,7 +4484,10 @@ impl NodeOrchestrator {
 
                     Ok((doc, effective_routing_key, Some(target_shard)))
                 })
-                .collect();
+                .collect::<Vec<RoutingResult>>()
+        })
+        .await
+        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
 
         // Separate local and remote documents
         for result in routing_results {

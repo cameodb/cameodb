@@ -31,4 +31,5 @@ http-body-util = "0.1"
 
 [profile.release]
 opt-level = 3  # Required for _FORTIFY_SOURCE=2 to work properly
-debug = false  # No debug symbols in production builds
+debug = true   # Keep debug symbols for profiling
+lto = "thin"   # Faster link time, still good optimization
