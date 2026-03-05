@@ -98,11 +98,11 @@ fn test_storage_configuration() {
     // Test different configurations
     let config = StorageConfig {
         shard_path: temp_dir.path().to_path_buf(),
-        indexer_memory_budget: 64 * 1024 * 1024, // 64MB per index
-        indexer_memory_min_mb: 32,               // 32MB minimum
-        indexer_memory_max_mb: 512,              // 512MB maximum
-        default_batch_size: 2000,                // 2000 operations default
-        wal_sync: false,                         // No sync for testing
+        indexer_memory_budget: 64 * 1024 * 1024,
+        indexer_memory_min_mb: 32,
+        indexer_memory_max_mb: 512,
+        default_batch_size: 2000,
+        wal_sync: false,
     };
 
     // Test store creation with custom config

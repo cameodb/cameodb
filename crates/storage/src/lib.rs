@@ -23,8 +23,6 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
-use tantivy::schema::Value as TantivyValue;
-
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -40,9 +38,12 @@ use redb::{
 use serde::{Deserialize, Serialize, de::Error as DeserializeError};
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
-use tantivy::query::QueryParserError;
-use tantivy::schema::{Document, FAST, Field, INDEXED, STORED, STRING, Schema, TEXT};
-use tantivy::{DateTime, Index, IndexReader, IndexWriter, doc};
+use tantivy::collector::TopDocs;
+use tantivy::query::{AllQuery, QueryParserError};
+use tantivy::schema::{
+    Document, FAST, Field, INDEXED, STORED, STRING, Schema, TEXT, Value as TantivyValue,
+};
+use tantivy::{DateTime, Index, IndexReader, IndexWriter, Order, doc};
 use thiserror::Error;
 use tracing::{debug, trace, warn};
 use walkdir::WalkDir;
@@ -265,17 +266,24 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             shard_path: PathBuf::from("/var/tmp/cameodb"),
-            indexer_memory_min_mb: 32, // 32MB minimum (increased from 16MB)
-            indexer_memory_max_mb: 512, // 512MB maximum (increased from 256MB)
-            indexer_memory_budget: 64 * 1024 * 1024, // start at 64MB (increased from 16MB)
-            default_batch_size: 1000,  // 1000 operations default (matches Python scripts)
+            indexer_memory_min_mb: 32,
+            indexer_memory_max_mb: 512,
+            indexer_memory_budget: 64 * 1024 * 1024,
+            default_batch_size: 1000,
             wal_sync: true,
         }
     }
 }
 
 impl StorageConfig {
-    /// Calculate optimal memory budget based on index size and configurable range
+    /// Calculate optimal memory budget based on index size with consistent linear scaling.
+    ///
+    /// Scaling algorithm:
+    /// - 0-100MB index    → 32MB (min)
+    /// - 101-500MB index  → 64MB (default)
+    /// - 501-2000MB index → 128MB (4x min)
+    /// - 2001-8000MB index → 256MB (8x min)
+    /// - >8000MB index    → 512MB (max)
     pub fn get_optimal_memory_budget(&self, index_path: &PathBuf) -> usize {
         let min_budget_bytes = self.indexer_memory_min_mb * 1024 * 1024;
         let max_budget_bytes = self.indexer_memory_max_mb * 1024 * 1024;
@@ -285,11 +293,11 @@ impl StorageConfig {
         if let Ok(metadata) = std::fs::metadata(index_path) {
             let size_mb = metadata.len() / (1024 * 1024);
             let optimal_budget = match size_mb {
-                0..=100 => min_budget_bytes, // Very small indices: min budget (32MB)
-                101..=500 => default_budget_bytes, // Small indices: start budget (64MB)
-                501..=2000 => (min_budget_bytes + max_budget_bytes) / 2, // Medium indices: mid-range (272MB)
-                2001..=8000 => max_budget_bytes / 2, // Large indices: 50% of max (256MB)
-                _ => max_budget_bytes,               // Very large indices: max budget (512MB)
+                0..=100 => min_budget_bytes,         // 32MB - very small
+                101..=500 => default_budget_bytes,   // 64MB - small
+                501..=2000 => min_budget_bytes * 4,  // 128MB - medium
+                2001..=8000 => min_budget_bytes * 8, // 256MB - large
+                _ => max_budget_bytes,               // 512MB - very large
             };
 
             // Ensure result is within configured bounds
@@ -298,6 +306,27 @@ impl StorageConfig {
             // New index, use minimum budget (starting point will scale as data is written)
             min_budget_bytes
         }
+    }
+
+    /// Calculate memory budget for bulk operations with size-based scaling.
+    ///
+    /// Increases budget for large bulk operations to reduce segment flushing:
+    /// - batch_size > 5000: 2x base budget
+    /// - batch_size > 1000: 1.5x base budget
+    /// - otherwise: base budget
+    pub fn get_bulk_operation_budget(&self, index_path: &PathBuf, batch_size: usize) -> usize {
+        let base_budget = self.get_optimal_memory_budget(index_path);
+
+        // Scale budget based on batch size to optimize indexing throughput
+        let scaled_budget = match batch_size {
+            0..=1000 => base_budget,
+            1001..=5000 => base_budget * 3 / 2, // 1.5x for medium batches
+            _ => base_budget * 2,               // 2x for large batches (>5000)
+        };
+
+        // Cap at maximum budget
+        let max_budget = self.indexer_memory_max_mb * 1024 * 1024;
+        scaled_budget.min(max_budget)
     }
 }
 
@@ -1289,7 +1318,6 @@ impl HybridStore {
             "HybridStore: ensured directory structure"
         );
 
-        // Create or open shared redb database
         let db_file_exists = kv_path.exists();
         let db_start = Instant::now();
         let kv = Database::create(&kv_path)?;
@@ -1475,57 +1503,27 @@ impl HybridStore {
         Ok(0)
     }
 
-    /// Verify if a specific sequence number exists in the Tantivy index.
-    /// Iterates through documents checking stored _seq values (does not require INDEXED).
-    fn verify_seq_exists(&self, reader: &IndexReader, target_seq: u64) -> Result<bool, StoreError> {
+    /// Get the highest indexed sequence number using FAST field ordering.
+    /// Leverages columnar FAST field storage for O(1) access instead of O(n) scanning.
+    fn get_highest_indexed_seq(&self, reader: &IndexReader) -> Result<u64, StoreError> {
         let searcher = reader.searcher();
-        let schema = searcher.index().schema();
 
-        let seq_field = schema
-            .get_field("_seq")
-            .map_err(|_| StoreError::FieldNotFound("_seq".to_string()))?;
+        // Get one document sorted by _seq descending to find the highest value
+        let top_collector = TopDocs::with_limit(1).order_by_u64_field("_seq", Order::Desc);
+        let top_docs = searcher.search(&AllQuery, &top_collector)?;
 
-        // Use AllQuery and check documents manually (slower but doesn't require INDEXED)
-        let total_docs = searcher.num_docs();
-        let mut processed = 0;
-
-        while processed < total_docs {
-            let batch_limit = std::cmp::min(1000, total_docs - processed);
-            let top_docs = tantivy::collector::TopDocs::with_limit(batch_limit as usize)
-                .and_offset(processed as usize);
-
-            let results = searcher.search(&tantivy::query::AllQuery, &top_docs)?;
-
-            for (_score, doc_address) in results {
-                let doc: tantivy::TantivyDocument = searcher.doc(doc_address)?;
-                if let Some(value) = doc.get_first(seq_field) {
-                    if let Some(val) = value.as_u64() {
-                        if val == target_seq {
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-
-            processed += batch_limit;
-
-            // Early exit if we've checked many docs without finding - likely seq doesn't exist
-            if processed >= 10000 && target_seq > 0 {
-                tracing::debug!(
-                    target_seq = target_seq,
-                    checked = processed,
-                    "Seq not found in first 10k docs, assuming non-existent"
-                );
-                break;
-            }
+        // The result is (field_value, doc_address) where field_value is the _seq value
+        if let Some((seq_value, _doc_address)) = top_docs.first() {
+            return Ok(*seq_value);
         }
 
-        Ok(false)
+        // No documents found, return 0
+        Ok(0)
     }
 
-    /// Recover missing WAL operations using verification-based approach.
+    /// Recover missing WAL operations using FAST field optimization.
     /// 1. Get max seq from redb WAL
-    /// 2. Verify backwards until finding last committed seq in Tantivy
+    /// 2. Use FAST field ordering to find highest committed seq in O(1)
     /// 3. Replay all missing operations from that point
     fn recover_index(
         &self,
@@ -1541,18 +1539,10 @@ impl HybridStore {
             return Ok(0);
         }
 
-        // Find the last committed sequence in Tantivy by verifying backwards
-        let mut last_committed_seq = 0u64;
-        let mut verified_count = 0u64;
-
-        // Start from max_wal_seq and go backwards to find last committed
-        for seq in (1..=max_wal_seq).rev() {
-            if self.verify_seq_exists(reader, seq)? {
-                last_committed_seq = seq;
-                verified_count = max_wal_seq - seq;
-                break;
-            }
-        }
+        // Use FAST field ordering to get the highest indexed sequence in O(1)
+        // This leverages columnar storage instead of O(n) backward scanning
+        let last_committed_seq = self.get_highest_indexed_seq(reader)?;
+        let verified_count = max_wal_seq.saturating_sub(last_committed_seq);
 
         tracing::info!(
             index = %index,
@@ -1606,14 +1596,26 @@ impl HybridStore {
             }
         }
 
-        // Replay missing operations
-        let mut replayed_count = 0;
-        for entry_result in wal_table.range(range_start..)? {
-            let (seq_guard, wal_data_guard) = entry_result?;
-            let seq_id = seq_guard.value();
-            let wal_data = wal_data_guard.value();
+        // Collect all WAL entries first for better cache locality during processing
+        let wal_entries: Vec<(u64, Vec<u8>)> = wal_table
+            .range(range_start..)?
+            .map(|result| {
+                let (seq_guard, wal_data_guard) = result?;
+                Ok((seq_guard.value(), wal_data_guard.value().to_vec()))
+            })
+            .collect::<Result<Vec<_>, redb::Error>>()?;
 
-            let wal_op: WalOp = serde_json::from_slice(wal_data)
+        let total_entries = wal_entries.len();
+        tracing::info!(
+            index = %index,
+            total_entries = total_entries,
+            "Collected WAL entries for recovery"
+        );
+
+        // Replay missing operations with pre-collected data for better cache locality
+        let mut replayed_count = 0;
+        for (seq_id, wal_data) in wal_entries {
+            let wal_op: WalOp = serde_json::from_slice(&wal_data)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
             match wal_op {
@@ -2149,7 +2151,8 @@ impl HybridStore {
         Ok((writer_arc, fields))
     }
 
-    /// Track document count and perform smart commits based on operation thresholds
+    /// ACID-compliant commit threshold with optimized batching to reduce transaction overhead.
+    /// Larger batches mean fewer commits and less fsync overhead while maintaining Durability::Immediate.
     fn should_commit_writer(&self, index: &str, operations_since_commit: u64) -> bool {
         // Get dynamic memory budget for this specific index
         // Use cached budget if available to avoid syscalls on every write
@@ -2163,20 +2166,31 @@ impl HybridStore {
             b
         };
 
-        // Commit strategy based on document count and configurable memory budget range
-        // Scale commit frequency with memory budget: more memory = fewer commits
+        // ACID-safe optimization: Scale commit frequency with memory budget
+        // More memory = larger batches = fewer commits = less transaction overhead
         let min_budget = self.config.indexer_memory_min_mb * 1024 * 1024;
         let max_budget = self.config.indexer_memory_max_mb * 1024 * 1024;
 
-        // Calculate adaptive threshold based on default_batch_size and memory budget ratio
+        // Enhanced adaptive threshold for ACID-compliant commit optimization
         let budget_ratio = (budget - min_budget) as f64 / (max_budget - min_budget) as f64;
         let default_batch = self.config.default_batch_size as f64;
 
-        // Scale from 50% of default (min memory) to 800% of default (max memory)
-        // e.g., default=2000: 1000 ops (16MB) -> 16000 ops (256MB)
-        let base_ops = (default_batch * (0.5 + budget_ratio * 7.5)) as u64;
+        // Optimized scaling: 1x default (min) to 20x default (max)
+        // e.g., default=1000: 1000 ops (32MB) -> 20000 ops (512MB)
+        // This reduces commit frequency while maintaining ACID via Durability::Immediate
+        let base_ops = (default_batch * (1.0 + budget_ratio * 19.0)) as u64;
 
-        operations_since_commit >= base_ops
+        // Additional optimization: larger thresholds for indices with high operation counts
+        // This detects bulk operation patterns and adjusts accordingly
+        let threshold = if operations_since_commit > default_batch as u64 * 5 {
+            // For very large batches, allow up to 50% more accumulation
+            // This reduces fsync overhead during bulk imports
+            (base_ops as f64 * 1.5) as u64
+        } else {
+            base_ops
+        };
+
+        operations_since_commit >= threshold
     }
 
     /// Get operation count for an index since last commit
@@ -2421,7 +2435,7 @@ impl HybridStore {
         let wal_data =
             serde_json::to_vec(&op).map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-        // Step 1.5: Evolve schema if new fields are present (declare outside transaction scope)
+        // Evolve schema if new fields are present (declare outside transaction scope)
         let mut evolved_schema = None;
 
         let mut write_txn = self.kv.begin_write()?;

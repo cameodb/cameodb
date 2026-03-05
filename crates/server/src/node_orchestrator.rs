@@ -71,6 +71,21 @@ const ORCHESTRATOR_WORKER_QUEUE_CAPACITY: usize = SHARD_WRITER_CHANNEL_CAPACITY 
 /// Type alias for routing results to reduce complexity
 type RoutingResult = Result<(DocPayload, Option<String>, Option<Uuid>), OrchestratorError>;
 
+/// Type alias for single write commands enqueued in the writer thread
+type WriteCommand = (WalOp, tokio::sync::oneshot::Sender<Result<u64, StoreError>>);
+
+/// Type alias for batch write commands enqueued in the writer thread
+type BatchCommand = (
+    Vec<WalOp>,
+    tokio::sync::oneshot::Sender<Result<(Vec<u64>, usize), StoreError>>,
+);
+
+/// Type alias for tracking reply slices when coalescing batch writes
+type BatchReplySegment = (
+    usize,
+    tokio::sync::oneshot::Sender<Result<(Vec<u64>, usize), StoreError>>,
+);
+
 /// Extract routing key value from JSON document using field name
 pub fn extract_routing_value(doc: &JsonValue, field_name: &str) -> Option<String> {
     let obj = doc.as_object()?;
@@ -1041,6 +1056,9 @@ pub struct MicroshardActor {
     supervisors: Arc<AsyncRwLock<HashMap<String, mpsc::Sender<()>>>>,
     /// Notified when the writer thread has fully stopped.
     shutdown_notify: Arc<tokio::sync::Notify>,
+    /// Dedicated read thread pool handle for isolated search/stats operations.
+    /// Separates read I/O from the writer thread and tokio's generic blocking pool.
+    read_pool_handle: Option<tokio::runtime::Handle>,
 }
 
 impl std::fmt::Debug for MicroshardActor {
@@ -1055,7 +1073,12 @@ impl std::fmt::Debug for MicroshardActor {
 }
 
 impl MicroshardActor {
-    pub fn new(shard_id: Uuid, storage_config: StorageConfig, default_search_limit: usize) -> Self {
+    pub fn new(
+        shard_id: Uuid,
+        storage_config: StorageConfig,
+        default_search_limit: usize,
+        read_pool_handle: Option<tokio::runtime::Handle>,
+    ) -> Self {
         Self {
             shard_id,
             store: None,
@@ -1064,6 +1087,7 @@ impl MicroshardActor {
             default_search_limit,
             supervisors: Arc::new(AsyncRwLock::new(HashMap::new())),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            read_pool_handle,
         }
     }
 
@@ -1116,35 +1140,192 @@ impl MicroshardActor {
         std::thread::Builder::new()
             .name(format!("writer-shard-{}", writer_shard_id))
             .spawn(move || {
-                info!(shard_id = %writer_shard_id, "Writer thread started");
-                while let Some(cmd) = rx.blocking_recv() {
-                    match cmd {
-                        StorageCommand::Write { index, op, reply } => {
-                            let res = writer_store.apply_write_and_maybe_commit(&index, op);
+                info!(shard_id = %writer_shard_id, "Writer thread started (write coalescing enabled)");
+
+                // Reusable buffers to avoid per-iteration allocations
+                let mut pending_cmds: Vec<StorageCommand> = Vec::with_capacity(64);
+
+                while let Some(first_cmd) = rx.blocking_recv() {
+                    // Phase 1: Drain all pending commands from the channel.
+                    // The first command blocks until available; subsequent commands
+                    // are non-blocking to coalesce as many writes as possible.
+                    pending_cmds.clear();
+                    pending_cmds.push(first_cmd);
+                    while let Ok(cmd) = rx.try_recv() {
+                        pending_cmds.push(cmd);
+                    }
+
+                    // Phase 2: Group commands by type and index for coalescing.
+                    // Both single Write and BatchWrite commands for the same index
+                    // are merged to reduce redb transactions and fsyncs.
+                    let mut write_groups: HashMap<String, Vec<WriteCommand>> = HashMap::new();
+                    let mut batch_groups: HashMap<String, Vec<BatchCommand>> = HashMap::new();
+                    let mut commits: Vec<(String, tokio::sync::oneshot::Sender<Result<(), StoreError>>)> = Vec::new();
+                    let mut should_shutdown = false;
+
+                    for cmd in pending_cmds.drain(..) {
+                        match cmd {
+                            StorageCommand::Write { index, op, reply } => {
+                                write_groups.entry(index).or_default().push((op, reply));
+                            }
+                            StorageCommand::BatchWrite { index, ops, reply } => {
+                                batch_groups.entry(index).or_default().push((ops, reply));
+                            }
+                            StorageCommand::Commit { index, reply } => {
+                                commits.push((index, reply));
+                            }
+                            StorageCommand::Shutdown => {
+                                should_shutdown = true;
+                            }
+                        }
+                    }
+
+                    // Phase 3: Process coalesced single writes (biggest optimization).
+                    // Multiple single writes to the same index become one apply_batch call
+                    // with a single redb transaction instead of N separate transactions.
+                    for (index, writes) in &mut write_groups {
+                        if writes.len() == 1 {
+                            // Single write — no coalescing overhead needed
+                            let (op, reply) = writes.pop().unwrap();
+                            let res = writer_store.apply_write_and_maybe_commit(index, op);
                             match &res {
-                                Ok((_, true)) => tracing::info!(index = %index, "Writer thread: threshold commit after write"),
+                                Ok((_, true)) => tracing::info!(index = %index, "Writer: threshold commit after write"),
                                 Ok((_, false)) => {}
-                                Err(e) => tracing::error!(index = %index, error = %e, "Writer thread: write failed"),
+                                Err(e) => tracing::error!(index = %index, error = %e, "Writer: write failed"),
                             }
                             let _ = reply.send(res.map(|(seq_id, _)| seq_id));
+                        } else {
+                            // Coalesced writes — merge N single writes into one batch
+                            let coalesced_count = writes.len();
+                            let (ops, replies): (Vec<WalOp>, Vec<_>) = writes.drain(..).unzip();
+
+                            let res = writer_store.apply_batch_and_maybe_commit(index, ops);
+                            match res {
+                                Ok(((seq_ids, _new_docs), committed)) => {
+                                    if committed {
+                                        tracing::info!(
+                                            index = %index,
+                                            coalesced = coalesced_count,
+                                            "Writer: threshold commit after coalesced writes"
+                                        );
+                                    }
+                                    tracing::debug!(
+                                        index = %index,
+                                        coalesced = coalesced_count,
+                                        "Writer: coalesced {} single writes into one batch",
+                                        coalesced_count
+                                    );
+                                    // Distribute individual seq_ids back to each caller
+                                    for (reply, seq_id) in replies.into_iter().zip(seq_ids) {
+                                        let _ = reply.send(Ok(seq_id));
+                                    }
+                                }
+                                Err(e) => {
+                                    // Broadcast error to all callers in this coalesced group
+                                    let err_msg = e.to_string();
+                                    tracing::error!(
+                                        index = %index,
+                                        coalesced = coalesced_count,
+                                        error = %err_msg,
+                                        "Writer: coalesced batch write failed"
+                                    );
+                                    for reply in replies {
+                                        let _ = reply.send(Err(StoreError::Serialization(err_msg.clone())));
+                                    }
+                                }
+                            }
                         }
-                        StorageCommand::BatchWrite { index, ops, reply } => {
+                    }
+
+                    // Phase 4: Process coalesced batch writes.
+                    // Multiple BatchWrite commands for the same index are merged into
+                    // a single apply_batch call, then results are split back to callers.
+                    for (index, batches) in batch_groups {
+                        if batches.len() == 1 {
+                            // Single batch — no coalescing overhead needed
+                            let (ops, reply) = batches.into_iter().next().unwrap();
                             let res = writer_store.apply_batch_and_maybe_commit(&index, ops);
                             match &res {
-                                Ok((_, true)) => tracing::info!(index = %index, "Writer thread: threshold commit after batch write"),
+                                Ok((_, true)) => tracing::info!(index = %index, "Writer: threshold commit after batch write"),
                                 Ok((_, false)) => {}
-                                Err(e) => tracing::error!(index = %index, error = %e, "Writer thread: batch write failed"),
+                                Err(e) => tracing::error!(index = %index, error = %e, "Writer: batch write failed"),
                             }
                             let _ = reply.send(res.map(|(result, _)| result));
+                        } else {
+                            // Coalesced batches — merge N batch writes into one
+                            let coalesced_count = batches.len();
+                            let mut merged_ops: Vec<WalOp> = Vec::new();
+                            let mut reply_segments: Vec<BatchReplySegment> = Vec::new();
+
+                            for (ops, reply) in batches {
+                                let op_count = ops.len();
+                                merged_ops.extend(ops);
+                                reply_segments.push((op_count, reply));
+                            }
+
+                            let total_ops = merged_ops.len();
+                            let res = writer_store.apply_batch_and_maybe_commit(&index, merged_ops);
+                            match res {
+                                Ok(((seq_ids, new_docs), committed)) => {
+                                    if committed {
+                                        tracing::info!(
+                                            index = %index,
+                                            coalesced_batches = coalesced_count,
+                                            total_ops = total_ops,
+                                            "Writer: threshold commit after coalesced batch writes"
+                                        );
+                                    }
+                                    tracing::debug!(
+                                        index = %index,
+                                        coalesced_batches = coalesced_count,
+                                        total_ops = total_ops,
+                                        "Writer: coalesced {} batch writes ({} ops) into one transaction",
+                                        coalesced_count, total_ops
+                                    );
+
+                                    // Split merged seq_ids back to each caller by their original op count
+                                    let mut offset = 0usize;
+                                    let mut remaining_new_docs = new_docs;
+                                    for (op_count, reply) in reply_segments {
+                                        let segment: Vec<u64> = seq_ids[offset..offset + op_count].to_vec();
+                                        // Approximate new_docs per segment proportionally
+                                        let segment_new_docs = if total_ops > 0 {
+                                            (new_docs as f64 * op_count as f64 / total_ops as f64).round() as usize
+                                        } else {
+                                            0
+                                        };
+                                        let segment_new_docs = segment_new_docs.min(remaining_new_docs);
+                                        remaining_new_docs = remaining_new_docs.saturating_sub(segment_new_docs);
+                                        let _ = reply.send(Ok((segment, segment_new_docs)));
+                                        offset += op_count;
+                                    }
+                                }
+                                Err(e) => {
+                                    let err_msg = e.to_string();
+                                    tracing::error!(
+                                        index = %index,
+                                        coalesced_batches = coalesced_count,
+                                        error = %err_msg,
+                                        "Writer: coalesced batch write failed"
+                                    );
+                                    for (_op_count, reply) in reply_segments {
+                                        let _ = reply.send(Err(StoreError::Serialization(err_msg.clone())));
+                                    }
+                                }
+                            }
                         }
-                        StorageCommand::Commit { index, reply } => {
-                            let res = writer_store.commit_index(&index);
-                            let _ = reply.send(res);
-                        }
-                        StorageCommand::Shutdown => {
-                            info!(shard_id = %writer_shard_id, "Writer thread shutting down");
-                            break;
-                        }
+                    }
+
+                    // Phase 5: Process commits after all writes are applied
+                    for (index, reply) in commits {
+                        let res = writer_store.commit_index(&index);
+                        let _ = reply.send(res);
+                    }
+
+                    // Phase 6: Handle shutdown after draining all pending work
+                    if should_shutdown {
+                        info!(shard_id = %writer_shard_id, "Writer thread shutting down");
+                        break;
                     }
                 }
                 shutdown.notify_one();
@@ -1253,7 +1434,26 @@ impl MicroshardActor {
         }
     }
 
-    /// Handles search requests with spawn_blocking to avoid blocking the actor thread.
+    /// Dispatch a blocking closure to the dedicated read pool if available,
+    /// falling back to tokio's generic blocking pool otherwise.
+    async fn spawn_on_read_pool<F, R>(&self, f: F) -> Result<R, OrchestratorError>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        if let Some(handle) = &self.read_pool_handle {
+            handle
+                .spawn_blocking(f)
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
+        } else {
+            tokio::task::spawn_blocking(f)
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
+        }
+    }
+
+    /// Handles search requests on the dedicated read thread pool.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn handle_search(
         &self,
@@ -1269,17 +1469,15 @@ impl MicroshardActor {
         let store = Arc::clone(store);
         let query = request.query;
         let limit = request.limit.unwrap_or(self.default_search_limit);
-
-        // Use spawn_blocking to execute search on blocking thread pool
         let index = request.index.clone();
-        let (results, total_hits) =
-            tokio::task::spawn_blocking(move || store.search_documents(&index, &query, limit))
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
-                .map_err(|e: StoreError| match e {
-                    StoreError::Io(io_err) => OrchestratorError::Io(io_err),
-                    _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
-                })?;
+
+        let (results, total_hits) = self
+            .spawn_on_read_pool(move || store.search_documents(&index, &query, limit))
+            .await?
+            .map_err(|e: StoreError| match e {
+                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
+                _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
+            })?;
 
         let search_hits: Vec<SearchHit> = results
             .into_iter()
@@ -1292,7 +1490,7 @@ impl MicroshardActor {
         })
     }
 
-    /// Handles shard statistics requests with spawn_blocking to avoid blocking the actor thread.
+    /// Handles shard statistics requests on the dedicated read thread pool.
     pub async fn handle_get_stats(
         &self,
         msg: GetShardStats,
@@ -1307,10 +1505,8 @@ impl MicroshardActor {
         let store = Arc::clone(store);
         let include_data_size = msg.include_data_size;
 
-        // Use spawn_blocking to execute stats gathering on blocking thread pool
-        tokio::task::spawn_blocking(move || store.gather_index_stats(include_data_size))
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
+        self.spawn_on_read_pool(move || store.gather_index_stats(include_data_size))
+            .await?
             .map_err(|e: StoreError| match e {
                 StoreError::Io(io_err) => OrchestratorError::Io(io_err),
                 _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
@@ -2726,6 +2922,10 @@ pub struct NodeOrchestrator {
     /// Number of worker tasks spawned in the pool.
     /// Used to signal explicit worker shutdown.
     worker_count: usize,
+    /// Dedicated tokio runtime for read operations (search, stats).
+    /// Isolates read I/O from the writer threads and tokio's generic blocking pool.
+    /// Arc-wrapped so the runtime outlives shard clones that hold its Handle.
+    read_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl NodeOrchestrator {
@@ -3549,6 +3749,26 @@ impl NodeOrchestrator {
 
         info!("Node identity: {} ({})", identity.name, identity.uuid);
 
+        // Create dedicated read thread pool for isolated search/stats operations.
+        // Thread count: max(2, cpu_cores / 2) — reserves half the cores for reads.
+        let cpu_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let read_threads = std::cmp::max(2, cpu_cores / 2);
+        let read_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(read_threads)
+            .thread_name("cameodb-read")
+            .enable_all()
+            .build()
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?;
+        let read_runtime = Arc::new(read_runtime);
+
+        info!(
+            read_threads = read_threads,
+            cpu_cores = cpu_cores,
+            "Dedicated read thread pool created"
+        );
+
         let mut orchestrator = Self {
             shards: HashMap::new(),
             identity,
@@ -3561,6 +3781,7 @@ impl NodeOrchestrator {
             engine: None,
             worker_tx: None,
             worker_count: 0,
+            read_runtime: Some(read_runtime),
         };
 
         // Discover and hydrate existing shards
@@ -3715,10 +3936,15 @@ impl NodeOrchestrator {
             let shard_path = self.deterministic_shard_directory(shard_id);
             let storage_config = self.create_shard_storage_config(shard_id, shard_path);
             let default_search_limit = self.default_search_limit;
+            let read_handle = self.read_runtime.as_ref().map(|rt| rt.handle().clone());
 
             let task = tokio::spawn(async move {
-                let mut microshard =
-                    MicroshardActor::new(shard_id, storage_config, default_search_limit);
+                let mut microshard = MicroshardActor::new(
+                    shard_id,
+                    storage_config,
+                    default_search_limit,
+                    read_handle,
+                );
 
                 match microshard.start().await {
                     Ok(()) => {
@@ -3926,7 +4152,7 @@ impl NodeOrchestrator {
 
         StorageConfig {
             shard_path,
-            indexer_memory_budget: indexer_memory_mb * 1024 * 1024, // Convert to bytes
+            indexer_memory_budget: indexer_memory_mb * 1024 * 1024,
             indexer_memory_min_mb: self.config.indexer_memory_min_mb,
             indexer_memory_max_mb: self.config.indexer_memory_max_mb,
             default_batch_size: self.config.default_batch_size,
@@ -3964,8 +4190,13 @@ impl NodeOrchestrator {
 
         // Create and start microshard actor
         let storage_config = self.create_shard_storage_config(shard_id, shard_path.clone());
-        let mut microshard =
-            MicroshardActor::new(shard_id, storage_config, self.default_search_limit);
+        let read_handle = self.read_runtime.as_ref().map(|rt| rt.handle().clone());
+        let mut microshard = MicroshardActor::new(
+            shard_id,
+            storage_config,
+            self.default_search_limit,
+            read_handle,
+        );
         microshard.start().await?;
 
         // Add to shards map
