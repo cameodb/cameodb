@@ -80,12 +80,22 @@ const TABLE_SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("schema"
 pub struct StorageConfig {
     /// The root folder for this shard's data files.
     pub shard_path: PathBuf,
+
+    // Memory Budget Configuration
     /// Default memory budget for each tantivy IndexWriter in bytes.
     pub indexer_memory_budget: usize,
     /// Minimum memory budget for IndexWriter in MB.
     pub indexer_memory_min_mb: usize,
     /// Maximum memory budget for IndexWriter in MB.
     pub indexer_memory_max_mb: usize,
+
+    // Cache Configuration
+    /// Redb read cache size in bytes (default: 64MB).
+    pub redb_read_cache_bytes: usize,
+    /// Redb write cache size in bytes (default: 32MB).
+    pub redb_write_cache_bytes: usize,
+
+    // Other Configuration
     /// Default batch size for smart commit calculations.
     pub default_batch_size: usize,
     /// Whether to call fsync() on every redb commit.
@@ -266,9 +276,17 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             shard_path: PathBuf::from("/var/tmp/cameodb"),
+
+            // Memory Budget Configuration
+            indexer_memory_budget: 64 * 1024 * 1024,
             indexer_memory_min_mb: 32,
             indexer_memory_max_mb: 512,
-            indexer_memory_budget: 64 * 1024 * 1024,
+
+            // Cache Configuration
+            redb_read_cache_bytes: 64 * 1024 * 1024,  // 64MB
+            redb_write_cache_bytes: 32 * 1024 * 1024, // 32MB
+
+            // Other Configuration
             default_batch_size: 1000,
             wal_sync: true,
         }
@@ -1320,14 +1338,21 @@ impl HybridStore {
 
         let db_file_exists = kv_path.exists();
         let db_start = Instant::now();
-        let kv = Database::create(&kv_path)?;
+
+        // Use Builder pattern to configure redb cache sizes
+        let kv = redb::Builder::new()
+            .set_cache_size(config.redb_read_cache_bytes)
+            .create(&kv_path)?;
+
         let db_elapsed = db_start.elapsed();
         tracing::info!(
             shard_path = %config.shard_path.display(),
             db_path = %kv_path.display(),
             existed = db_file_exists,
+            read_cache_mb = config.redb_read_cache_bytes / (1024 * 1024),
+            write_cache_mb = config.redb_write_cache_bytes / (1024 * 1024),
             elapsed_ms = db_elapsed.as_millis(),
-            "HybridStore: redb database opened"
+            "HybridStore: redb database opened with cache configuration"
         );
 
         Ok(HybridStore {
@@ -4195,9 +4220,17 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = StorageConfig {
             shard_path: temp_dir.path().to_path_buf(),
+
+            // Memory Budget Configuration
             indexer_memory_budget: 32 * 1024 * 1024,
             indexer_memory_min_mb: 16,
             indexer_memory_max_mb: 256,
+
+            // Cache Configuration
+            redb_read_cache_bytes: 64 * 1024 * 1024,
+            redb_write_cache_bytes: 32 * 1024 * 1024,
+
+            // Other Configuration
             default_batch_size: 1000,
             wal_sync: true,
         };

@@ -1149,10 +1149,19 @@ impl MicroshardActor {
                     // Phase 1: Drain all pending commands from the channel.
                     // The first command blocks until available; subsequent commands
                     // are non-blocking to coalesce as many writes as possible.
+                    // Limit drain to prevent starvation - max 64 additional commands per iteration.
+                    const MAX_DRAIN_PER_ITERATION: usize = 64;
                     pending_cmds.clear();
                     pending_cmds.push(first_cmd);
-                    while let Ok(cmd) = rx.try_recv() {
-                        pending_cmds.push(cmd);
+                    let mut drained = 0;
+                    while drained < MAX_DRAIN_PER_ITERATION {
+                        match rx.try_recv() {
+                            Ok(cmd) => {
+                                pending_cmds.push(cmd);
+                                drained += 1;
+                            }
+                            Err(_) => break, // Channel empty or disconnected
+                        }
                     }
 
                     // Phase 2: Group commands by type and index for coalescing.
@@ -1286,15 +1295,22 @@ impl MicroshardActor {
                                     // Split merged seq_ids back to each caller by their original op count
                                     let mut offset = 0usize;
                                     let mut remaining_new_docs = new_docs;
-                                    for (op_count, reply) in reply_segments {
+                                    let total_segments = reply_segments.len();
+                                    for (idx, (op_count, reply)) in reply_segments.into_iter().enumerate() {
                                         let segment: Vec<u64> = seq_ids[offset..offset + op_count].to_vec();
-                                        // Approximate new_docs per segment proportionally
-                                        let segment_new_docs = if total_ops > 0 {
-                                            (new_docs as f64 * op_count as f64 / total_ops as f64).round() as usize
+                                        // Use integer arithmetic with remainder distribution to avoid rounding errors
+                                        // Each segment gets: (new_docs * op_count) / total_ops
+                                        // Last segment gets any remainder to ensure exact sum
+                                        let segment_new_docs = if idx == total_segments - 1 {
+                                            // Last segment gets all remaining to ensure exact total
+                                            remaining_new_docs
+                                        } else if total_ops > 0 {
+                                            // Integer division with proper distribution
+                                            let proportional = (new_docs * op_count) / total_ops;
+                                            proportional.min(remaining_new_docs)
                                         } else {
                                             0
                                         };
-                                        let segment_new_docs = segment_new_docs.min(remaining_new_docs);
                                         remaining_new_docs = remaining_new_docs.saturating_sub(segment_new_docs);
                                         let _ = reply.send(Ok((segment, segment_new_docs)));
                                         offset += op_count;
@@ -4152,9 +4168,17 @@ impl NodeOrchestrator {
 
         StorageConfig {
             shard_path,
+
+            // Memory Budget Configuration
             indexer_memory_budget: indexer_memory_mb * 1024 * 1024,
             indexer_memory_min_mb: self.config.indexer_memory_min_mb,
             indexer_memory_max_mb: self.config.indexer_memory_max_mb,
+
+            // Cache Configuration
+            redb_read_cache_bytes: 64 * 1024 * 1024, // 64MB default
+            redb_write_cache_bytes: 32 * 1024 * 1024, // 32MB default
+
+            // Other Configuration
             default_batch_size: self.config.default_batch_size,
             wal_sync: self.config.wal_sync,
         }
@@ -5422,6 +5446,36 @@ impl Message<ShutdownAllShards> for NodeOrchestrator {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.shutdown_all_shards().await
+    }
+}
+
+// Implement Drop to ensure read_runtime is properly shut down when NodeOrchestrator is destroyed.
+// This prevents resource leaks by cleaning up the dedicated read thread pool.
+impl Drop for NodeOrchestrator {
+    fn drop(&mut self) {
+        if let Some(read_runtime) = self.read_runtime.take() {
+            tracing::info!("NodeOrchestrator: Shutting down dedicated read runtime");
+            // Try to unwrap the Arc to get exclusive ownership.
+            // If there are other Arc clones (held by shards), we can't force shutdown.
+            // In that case, the runtime will be cleaned up when the last Arc is dropped.
+            match Arc::try_unwrap(read_runtime) {
+                Ok(runtime) => {
+                    // We have exclusive ownership - shut down the runtime
+                    runtime.shutdown_background();
+                    tracing::debug!("NodeOrchestrator: Read runtime shutdown initiated");
+                }
+                Err(arc) => {
+                    // Other references exist (shards still hold handles)
+                    let strong_count = Arc::strong_count(&arc);
+                    tracing::warn!(
+                        strong_count = strong_count,
+                        "NodeOrchestrator: Cannot shutdown read runtime - {} other references exist",
+                        strong_count
+                    );
+                    // The runtime will be cleaned up when the last Arc is dropped
+                }
+            }
+        }
     }
 }
 
