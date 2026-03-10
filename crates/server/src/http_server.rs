@@ -80,6 +80,8 @@ where
 pub struct SearchPayload {
     pub query: String,
     pub limit: Option<usize>,
+    /// Optional list of fields to return (field projection)
+    pub fields: Option<Vec<String>>,
 }
 
 /// Schema update request payload for maintenance API
@@ -174,21 +176,98 @@ pub fn create_router(state: AppState, max_body_size_mb: usize) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
+/// Parse query string for 'limit <n>' and 'return <field1,field2,...>' keywords.
+/// Returns (cleaned_query, extracted_limit, extracted_fields).
+fn parse_query_keywords(query: &str) -> (String, Option<usize>, Option<Vec<String>>) {
+    let parts: Vec<&str> = query.split_whitespace().collect();
+    let mut limit = None;
+    let mut fields = None;
+    let mut query_end_idx = parts.len();
+
+    // Find positions of both keywords
+    let return_idx = parts.iter().position(|&p| p == "return");
+    let limit_idx = parts.iter().position(|&p| p == "limit");
+
+    // Track which keywords were successfully parsed
+    let mut return_parsed = false;
+    let mut limit_parsed = false;
+
+    // Parse 'return' keyword - collects all tokens after it until 'limit' or end
+    if let Some(return_idx) = return_idx {
+        if return_idx + 1 < parts.len() {
+            // Determine where the field list ends (either at 'limit' or end of parts)
+            let field_end_idx = limit_idx.filter(|&l| l > return_idx).unwrap_or(parts.len());
+
+            // Collect tokens between 'return' and the end position
+            let field_tokens = &parts[return_idx + 1..field_end_idx];
+            let field_str = field_tokens.join(" ");
+
+            // Parse comma-separated field list
+            let field_list: Vec<String> = field_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !field_list.is_empty() {
+                fields = Some(field_list);
+                return_parsed = true;
+            }
+        }
+    }
+
+    // Parse 'limit' keyword
+    if let Some(limit_idx) = limit_idx {
+        // Check if there's a token after 'limit'
+        let limit_value_idx = limit_idx + 1;
+        if limit_value_idx < parts.len() {
+            // Parse the limit value regardless of position relative to 'return'
+            if let Ok(n) = parts[limit_value_idx].parse::<usize>() {
+                limit = Some(n);
+                limit_parsed = true;
+            }
+        }
+    }
+
+    // Determine where the query ends based on successfully parsed keywords
+    if return_parsed && limit_parsed {
+        // Both parsed - query ends at the first keyword
+        query_end_idx = return_idx.unwrap().min(limit_idx.unwrap());
+    } else if return_parsed {
+        // Only return parsed
+        query_end_idx = return_idx.unwrap();
+    } else if limit_parsed {
+        // Only limit parsed
+        query_end_idx = limit_idx.unwrap();
+    }
+    // If neither parsed, query_end_idx remains at parts.len()
+
+    let cleaned_query = parts[..query_end_idx].join(" ");
+    (cleaned_query, limit, fields)
+}
+
 /// Handler for standard search operations
 async fn search_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
     Json(payload): Json<SearchPayload>,
 ) -> Result<Json<JsonValue>, AppError> {
+    // Parse query string for embedded limit/return keywords
+    let (cleaned_query, parsed_limit, parsed_fields) = parse_query_keywords(&payload.query);
+
+    // Explicit payload fields override parsed values
+    let final_limit = payload.limit.or(parsed_limit);
+    let final_fields = payload.fields.or(parsed_fields);
+
     info!(
-        "Search request - index: {}, query: {}, limit: {:?}",
-        index, payload.query, payload.limit
+        "Search request - index: {}, query: {}, limit: {:?}, fields: {:?}",
+        index, cleaned_query, final_limit, final_fields
     );
 
     let client_op = ClientOp::Search {
         index,
-        query: payload.query,
-        limit: payload.limit,
+        query: cleaned_query,
+        limit: final_limit,
+        fields: final_fields,
     };
 
     let result = state
@@ -222,16 +301,24 @@ async fn search_stream_handler(
     State(state): State<AppState>,
     Json(payload): Json<SearchPayload>,
 ) -> Result<Response, AppError> {
+    // Parse query string for embedded limit/return keywords
+    let (cleaned_query, parsed_limit, parsed_fields) = parse_query_keywords(&payload.query);
+
+    // Explicit payload fields override parsed values
+    let final_limit = payload.limit.or(parsed_limit);
+    let final_fields = payload.fields.or(parsed_fields);
+
     info!(
-        "Stream request - index: {}, query: {}, limit: {:?}",
-        index, payload.query, payload.limit
+        "Stream request - index: {}, query: {}, limit: {:?}, fields: {:?}",
+        index, cleaned_query, final_limit, final_fields
     );
 
     // Use streaming search with our new streaming infrastructure
     let client_op = ClientOp::Stream {
         index,
-        query: payload.query,
-        limit: payload.limit,
+        query: cleaned_query,
+        limit: final_limit,
+        fields: final_fields,
     };
 
     let result = state
@@ -687,4 +774,141 @@ async fn fallback_handler(uri: axum::http::Uri) -> impl IntoResponse {
     )
 }
 
-// TODO: Add HTTP endpoint tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_query_keywords_no_keywords() {
+        let query = "title:rust";
+        let (cleaned, limit, fields) = parse_query_keywords(query);
+        assert_eq!(cleaned, "title:rust");
+        assert_eq!(limit, None);
+        assert_eq!(fields, None);
+    }
+
+    #[test]
+    fn test_parse_query_keywords_limit_only() {
+        let query = "title:rust limit 10";
+        let (cleaned, limit, fields) = parse_query_keywords(query);
+        assert_eq!(cleaned, "title:rust");
+        assert_eq!(limit, Some(10));
+        assert_eq!(fields, None);
+    }
+
+    #[test]
+    fn test_parse_query_keywords_return_only() {
+        let query = "title:rust return title,author,year";
+        let (cleaned, limit, fields) = parse_query_keywords(query);
+        assert_eq!(cleaned, "title:rust");
+        assert_eq!(limit, None);
+        assert_eq!(
+            fields,
+            Some(vec![
+                "title".to_string(),
+                "author".to_string(),
+                "year".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_query_keywords_both() {
+        let query = "title:rust limit 5 return title,author";
+        let (cleaned, limit, fields) = parse_query_keywords(query);
+        assert_eq!(cleaned, "title:rust");
+        assert_eq!(limit, Some(5));
+        assert_eq!(
+            fields,
+            Some(vec!["title".to_string(), "author".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_parse_query_keywords_reverse_order() {
+        let query = "title:rust return title,author limit 5";
+        let (cleaned, limit, fields) = parse_query_keywords(query);
+        assert_eq!(cleaned, "title:rust");
+        assert_eq!(limit, Some(5));
+        assert_eq!(
+            fields,
+            Some(vec!["title".to_string(), "author".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_parse_query_keywords_single_field() {
+        let query = "title:rust return title";
+        let (cleaned, limit, fields) = parse_query_keywords(query);
+        assert_eq!(cleaned, "title:rust");
+        assert_eq!(limit, None);
+        assert_eq!(fields, Some(vec!["title".to_string()]));
+    }
+
+    #[test]
+    fn test_parse_query_keywords_with_spaces() {
+        // Test space-separated field list: "return title, author, year"
+        let query = "title:rust return title, author, year";
+        let (cleaned, limit, fields) = parse_query_keywords(query);
+        assert_eq!(cleaned, "title:rust");
+        assert_eq!(limit, None);
+        assert_eq!(
+            fields,
+            Some(vec![
+                "title".to_string(),
+                "author".to_string(),
+                "year".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_query_keywords_complex_query() {
+        let query = "title:rust AND author:smith limit 20 return title,author,year,isbn";
+        let (cleaned, limit, fields) = parse_query_keywords(query);
+        assert_eq!(cleaned, "title:rust AND author:smith");
+        assert_eq!(limit, Some(20));
+        assert_eq!(
+            fields,
+            Some(vec![
+                "title".to_string(),
+                "author".to_string(),
+                "year".to_string(),
+                "isbn".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_query_keywords_invalid_limit() {
+        let query = "title:rust limit abc";
+        let (cleaned, limit, fields) = parse_query_keywords(query);
+        // Invalid limit should not be parsed, query remains unchanged
+        assert_eq!(cleaned, "title:rust limit abc");
+        assert_eq!(limit, None);
+        assert_eq!(fields, None);
+    }
+
+    #[test]
+    fn test_parse_query_keywords_empty_field_list() {
+        let query = "title:rust return ";
+        let (cleaned, limit, fields) = parse_query_keywords(query);
+        // Empty field list should not be parsed
+        assert_eq!(cleaned, "title:rust return");
+        assert_eq!(limit, None);
+        assert_eq!(fields, None);
+    }
+
+    #[test]
+    fn test_parse_query_keywords_trailing_comma() {
+        let query = "title:rust return title,author,";
+        let (cleaned, limit, fields) = parse_query_keywords(query);
+        assert_eq!(cleaned, "title:rust");
+        assert_eq!(limit, None);
+        // Trailing comma should be filtered out
+        assert_eq!(
+            fields,
+            Some(vec!["title".to_string(), "author".to_string()])
+        );
+    }
+}

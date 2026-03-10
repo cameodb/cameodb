@@ -356,6 +356,13 @@ curl -s -X POST http://localhost:9480/api/books/search \
   }'
 ```
 
+> **Return fields list:** You can ask CameoDB to return only a subset of document fields by either:
+>
+> 1. Supplying an explicit list in the payload: `"fields": ["title", "author", "year"]`
+> 2. Embedding a `return` clause at the end of the Tantivy query: `"query": "space opera return title,author"`
+>
+> The JSON payload always wins over inline `return` clauses. Metadata keys (those starting with `_`, e.g. `_score`, `_id`, `shard_id`) are preserved automatically.
+
 **Response:**
 ```json
 {

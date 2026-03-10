@@ -165,6 +165,32 @@ fn transform_shadow_query(query: &str, schema: &IndexSchema) -> String {
     }
 }
 
+/// Apply field projection to a JSON document, keeping only specified fields.
+/// Always preserves metadata fields (_score, shard_id, etc.) that start with underscore.
+fn apply_field_projection(doc: JsonValue, fields: &[String]) -> JsonValue {
+    if let JsonValue::Object(mut map) = doc {
+        let mut filtered = serde_json::Map::new();
+
+        // Always keep metadata fields (those starting with _)
+        for (key, value) in map.iter() {
+            if key.starts_with('_') {
+                filtered.insert(key.clone(), value.clone());
+            }
+        }
+
+        // Add requested fields
+        for field in fields {
+            if let Some(value) = map.remove(field) {
+                filtered.insert(field.clone(), value);
+            }
+        }
+
+        JsonValue::Object(filtered)
+    } else {
+        doc
+    }
+}
+
 /// Recursively transform shadow field names in JSON query structure
 fn transform_shadow_fields_recursive(
     value: &mut JsonValue,
@@ -565,12 +591,16 @@ pub enum ClientOp {
         index: String,
         query: String,
         limit: Option<usize>,
+        /// Optional field projection (return only specified fields)
+        fields: Option<Vec<String>>,
     },
     /// Streaming search operation across shards of an index
     Stream {
         index: String,
         query: String,
         limit: Option<usize>,
+        /// Optional field projection (return only specified fields)
+        fields: Option<Vec<String>>,
     },
     /// Write operation to insert/update a document
     Write {
@@ -785,17 +815,25 @@ impl OrchestratorEngine {
                 index,
                 query,
                 limit,
+                fields,
             } => {
-                self.engine_search(&index, &query, limit.unwrap_or(self.default_search_limit))
-                    .await
+                self.engine_search(
+                    &index,
+                    &query,
+                    limit.unwrap_or(self.default_search_limit),
+                    fields.as_deref(),
+                )
+                .await
             }
             ClientOp::Stream {
                 index,
                 query,
                 limit,
+                fields,
             } => {
                 let search_limit = limit.unwrap_or(self.default_search_limit);
-                self.engine_search(&index, &query, search_limit).await
+                self.engine_search(&index, &query, search_limit, fields.as_deref())
+                    .await
             }
             // Config/metadata ops are lightweight — route through actor mailbox
             _ => Err(OrchestratorError::Io(std::io::Error::new(
@@ -918,6 +956,7 @@ impl OrchestratorEngine {
         index: &str,
         query: &str,
         limit: usize,
+        fields: Option<&[String]>,
     ) -> Result<JsonValue, OrchestratorError> {
         let shards = self.shards.load();
         let start = std::time::Instant::now();
@@ -980,6 +1019,7 @@ impl OrchestratorEngine {
         let hits: Vec<JsonValue> = results
             .into_iter()
             .map(|(shard_id, score, mut doc)| {
+                // Add metadata fields
                 if let JsonValue::Object(ref mut o) = doc {
                     o.insert(
                         "_score".to_string(),
@@ -992,7 +1032,13 @@ impl OrchestratorEngine {
                         JsonValue::String(shard_id.to_string()),
                     );
                 }
-                doc
+
+                // Apply field projection if specified
+                if let Some(field_list) = fields {
+                    apply_field_projection(doc, field_list)
+                } else {
+                    doc
+                }
             })
             .collect();
         Ok(serde_json::json!({
@@ -2548,11 +2594,13 @@ impl RouterActor {
                 index,
                 query,
                 limit,
+                fields,
             }
             | ClientOp::Stream {
                 index,
                 query,
                 limit,
+                fields,
             } => {
                 let limit = limit.unwrap_or(self.default_search_limit);
 
@@ -2564,6 +2612,7 @@ impl RouterActor {
                             index: index.clone(),
                             query: query.clone(),
                             limit: Some(limit),
+                            fields: fields.clone(),
                         })
                         .await
                     {
@@ -2605,6 +2654,7 @@ impl RouterActor {
                             index: index.clone(),
                             query: query.clone(),
                             limit: Some(limit),
+                            fields: fields.clone(),
                         };
                         let node_id = peer.node_id;
                         let peer_addr = peer.address;
@@ -4364,18 +4414,26 @@ impl NodeOrchestrator {
                 index,
                 query,
                 limit,
+                fields,
             } => {
-                self.orch_search(&index, &query, limit.unwrap_or(self.default_search_limit))
-                    .await
+                self.orch_search(
+                    &index,
+                    &query,
+                    limit.unwrap_or(self.default_search_limit),
+                    fields.as_deref(),
+                )
+                .await
             }
             ClientOp::Stream {
                 index,
                 query,
                 limit,
+                fields,
             } => {
                 // Use streaming search with the same logic as Search but optimized for HTTP streaming
                 let search_limit = limit.unwrap_or(self.default_search_limit);
-                self.orch_search(&index, &query, search_limit).await
+                self.orch_search(&index, &query, search_limit, fields.as_deref())
+                    .await
             }
             ClientOp::Write {
                 index,
@@ -4889,6 +4947,7 @@ impl NodeOrchestrator {
         index: &str,
         query: &str,
         limit: usize,
+        fields: Option<&[String]>,
     ) -> Result<JsonValue, OrchestratorError> {
         let start = std::time::Instant::now();
         if self.shards.is_empty() {
@@ -4949,6 +5008,7 @@ impl NodeOrchestrator {
         let hits: Vec<JsonValue> = results
             .into_iter()
             .map(|(shard_id, score, mut doc)| {
+                // Add metadata fields
                 if let JsonValue::Object(ref mut o) = doc {
                     o.insert(
                         "_score".to_string(),
@@ -4961,7 +5021,13 @@ impl NodeOrchestrator {
                         JsonValue::String(shard_id.to_string()),
                     );
                 }
-                doc
+
+                // Apply field projection if specified
+                if let Some(field_list) = fields {
+                    apply_field_projection(doc, field_list)
+                } else {
+                    doc
+                }
             })
             .collect();
         Ok(serde_json::json!({
@@ -5453,9 +5519,142 @@ impl Drop for NodeOrchestrator {
 
 #[cfg(test)]
 mod tests {
-    /*
     use super::*;
+    use serde_json::json;
 
-    // Tests disabled during refactoring
-    */
+    #[test]
+    fn test_apply_field_projection_single_field() {
+        let doc = json!({
+            "title": "Rust Programming",
+            "author": "John Doe",
+            "year": 2024,
+            "_score": 0.95,
+            "_id": "abc123"
+        });
+
+        let fields = vec!["title".to_string()];
+        let result = apply_field_projection(doc, &fields);
+
+        // Should only have title and metadata fields (those starting with _)
+        assert_eq!(result.get("title").unwrap(), "Rust Programming");
+        assert_eq!(result.get("_score").unwrap(), 0.95);
+        assert_eq!(result.get("_id").unwrap(), "abc123");
+        assert!(result.get("author").is_none());
+        assert!(result.get("year").is_none());
+    }
+
+    #[test]
+    fn test_apply_field_projection_multiple_fields() {
+        let doc = json!({
+            "title": "Rust Programming",
+            "author": "John Doe",
+            "year": 2024,
+            "isbn": "123-456",
+            "_score": 0.95
+        });
+
+        let fields = vec!["title".to_string(), "author".to_string()];
+        let result = apply_field_projection(doc, &fields);
+
+        assert_eq!(result.get("title").unwrap(), "Rust Programming");
+        assert_eq!(result.get("author").unwrap(), "John Doe");
+        assert_eq!(result.get("_score").unwrap(), 0.95);
+        assert!(result.get("year").is_none());
+        assert!(result.get("isbn").is_none());
+    }
+
+    #[test]
+    fn test_apply_field_projection_preserves_all_metadata() {
+        let doc = json!({
+            "title": "Rust Programming",
+            "author": "John Doe",
+            "_score": 0.95,
+            "_id": "doc123",
+            "_timestamp": 1234567890,
+            "_shard_id": "abc123"
+        });
+
+        let fields = vec!["title".to_string()];
+        let result = apply_field_projection(doc, &fields);
+
+        // All metadata fields (starting with _) should be preserved
+        assert_eq!(result.get("title").unwrap(), "Rust Programming");
+        assert_eq!(result.get("_score").unwrap(), 0.95);
+        assert_eq!(result.get("_id").unwrap(), "doc123");
+        assert_eq!(result.get("_timestamp").unwrap(), 1234567890);
+        assert_eq!(result.get("_shard_id").unwrap(), "abc123");
+        assert!(result.get("author").is_none());
+    }
+
+    #[test]
+    fn test_apply_field_projection_nonexistent_field() {
+        let doc = json!({
+            "title": "Rust Programming",
+            "author": "John Doe",
+            "_score": 0.95
+        });
+
+        let fields = vec!["title".to_string(), "nonexistent".to_string()];
+        let result = apply_field_projection(doc, &fields);
+
+        // Should have title and metadata, but not nonexistent field
+        assert_eq!(result.get("title").unwrap(), "Rust Programming");
+        assert_eq!(result.get("_score").unwrap(), 0.95);
+        assert!(result.get("nonexistent").is_none());
+        assert!(result.get("author").is_none());
+    }
+
+    #[test]
+    fn test_apply_field_projection_empty_fields() {
+        let doc = json!({
+            "title": "Rust Programming",
+            "author": "John Doe",
+            "_score": 0.95
+        });
+
+        let fields: Vec<String> = vec![];
+        let result = apply_field_projection(doc, &fields);
+
+        // Should only have metadata fields
+        assert_eq!(result.get("_score").unwrap(), 0.95);
+        assert!(result.get("title").is_none());
+        assert!(result.get("author").is_none());
+    }
+
+    #[test]
+    fn test_apply_field_projection_non_object() {
+        let doc = json!("not an object");
+        let fields = vec!["title".to_string()];
+        let result = apply_field_projection(doc, &fields);
+
+        // Should return the original value unchanged
+        assert_eq!(result, json!("not an object"));
+    }
+
+    #[test]
+    fn test_apply_field_projection_nested_fields() {
+        let doc = json!({
+            "title": "Rust Programming",
+            "author": {
+                "name": "John Doe",
+                "email": "john@example.com"
+            },
+            "_score": 0.95
+        });
+
+        let fields = vec!["author".to_string()];
+        let result = apply_field_projection(doc, &fields);
+
+        // Should preserve the entire nested object
+        assert_eq!(
+            result.get("author").unwrap().get("name").unwrap(),
+            "John Doe"
+        );
+        assert_eq!(
+            result.get("author").unwrap().get("email").unwrap(),
+            "john@example.com"
+        );
+        assert_eq!(result.get("_score").unwrap(), 0.95);
+        assert!(result.get("title").is_none());
+    }
 }
