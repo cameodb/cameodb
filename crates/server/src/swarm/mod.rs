@@ -153,19 +153,6 @@ impl SwarmRuntimeHandle {
         }
         Ok(())
     }
-
-    /// Query a specific shard from the DHT
-    #[allow(dead_code)]
-    pub fn query_shard(&self, node_uuid: Uuid, shard_id: Uuid) -> Result<()> {
-        if let Some(tx) = &self.cmd_tx {
-            tx.send(SwarmCommand::QueryShard {
-                node_uuid,
-                shard_id,
-            })
-            .map_err(|_| anyhow::anyhow!("Swarm runtime channel closed"))?;
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -728,11 +715,6 @@ pub enum SwarmCommand {
     QueryNodeMetadata {
         node_uuid: Uuid,
     },
-    #[allow(dead_code)]
-    QueryShard {
-        node_uuid: Uuid,
-        shard_id: Uuid,
-    },
 }
 
 fn handle_swarm_command(cmd: SwarmCommand, swarm: &mut libp2p::Swarm<DhtBehaviour>) {
@@ -753,14 +735,6 @@ fn handle_swarm_command(cmd: SwarmCommand, swarm: &mut libp2p::Swarm<DhtBehaviou
         }
         SwarmCommand::QueryNodeMetadata { node_uuid } => {
             swarm.behaviour_mut().query_node_metadata(node_uuid);
-        }
-        SwarmCommand::QueryShard {
-            node_uuid,
-            shard_id,
-        } => {
-            swarm
-                .behaviour_mut()
-                .query_shard_metadata(node_uuid, shard_id);
         }
     }
 }

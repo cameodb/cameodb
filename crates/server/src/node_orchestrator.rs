@@ -222,13 +222,14 @@ fn is_write_operation(op: &ClientOp) -> bool {
 
 /// Represents a single search result from a shard or remote node
 #[derive(Debug)]
-#[allow(dead_code)] // Streaming infrastructure - will be fully utilized in production
 pub enum StreamingSearchResult {
     /// Result from a local microshard
     Local {
+        #[allow(dead_code)] // Constructed for completeness; matched with wildcard
         shard_id: Uuid,
         hits: Vec<(f32, serde_json::Value)>,
         total_hits: usize,
+        #[allow(dead_code)] // Constructed for completeness; matched with wildcard
         took_ms: u64,
     },
     /// Result from a remote node
@@ -245,12 +246,6 @@ pub enum StreamingSearchResult {
 /// Generate the remote actor name for a NodeOrchestrator.
 pub fn orchestrator_remote_name(node_id: &Uuid) -> String {
     format!("orchestrator-{}", node_id)
-}
-
-/// Generate the remote actor name for a MicroshardActor.
-#[allow(dead_code)] // Will be used for direct shard-to-shard remote calls
-pub fn shard_remote_name(shard_id: &Uuid) -> String {
-    format!("shard-{}", shard_id)
 }
 
 // ============================================================================
@@ -774,13 +769,6 @@ impl OrchestratorEngine {
         shards.keys().copied().next()
     }
 
-    /// Determines the shard that should handle a routing key.
-    #[allow(dead_code)] // Reserved for future engine-level routing
-    fn select_shard_for_key(&self, key: &str) -> Option<Uuid> {
-        let ring = self.routing_ring.load();
-        ring.get_owner(key)
-    }
-
     /// Execute a ClientOp on the shared engine state.
     /// Returns `Ok(result)` for ops handled by the engine, or an error
     /// with `ErrorKind::Unsupported` for ops that must go through the actor mailbox.
@@ -1023,14 +1011,6 @@ impl OrchestratorEngine {
             "errors": errors
         }))
     }
-}
-
-/// Response containing node identity info for actor replies.
-#[derive(Debug, Clone, kameo::Reply)]
-#[allow(dead_code)] // Fields will be used when RouterActor migrates to ActorRef
-pub struct NodeIdentityInfo {
-    pub uuid: Uuid,
-    pub name: String,
 }
 
 /// Helper struct for aggregating index statistics across cluster nodes.
@@ -1409,22 +1389,6 @@ impl MicroshardActor {
             .map_err(OrchestratorError::Storage)
     }
 
-    /// Commit a specific index via the dedicated writer thread.
-    /// Ensures commits are serialized with writes on the same thread.
-    #[allow(dead_code)]
-    pub async fn handle_commit_via_channel(&self, index: String) -> Result<(), OrchestratorError> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.send_write_command(StorageCommand::Commit {
-            index,
-            reply: reply_tx,
-        })
-        .await?;
-        reply_rx
-            .await
-            .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer dropped reply")))?
-            .map_err(OrchestratorError::Storage)
-    }
-
     /// Gracefully stop the dedicated writer thread.
     /// First drains all supervisor tasks (they hold cloned writer_tx senders),
     /// then sends `Shutdown` command and waits for the thread to finish.
@@ -1473,7 +1437,6 @@ impl MicroshardActor {
     }
 
     /// Handles search requests on the dedicated read thread pool.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn handle_search(
         &self,
         request: SearchRequest,
@@ -1621,7 +1584,6 @@ impl MicroshardActor {
     }
 
     /// Handles write requests via the dedicated writer thread.
-    #[allow(dead_code)]
     pub async fn handle_write(&self, request: WriteRequest) -> Result<u64, OrchestratorError> {
         // OPTIMIZATION: Take ownership of doc from request immediately
         let doc = request.doc;
@@ -3825,12 +3787,6 @@ impl NodeOrchestrator {
         self.worker_tx.clone()
     }
 
-    /// Returns a clone of the shared engine, if it has been created.
-    #[allow(dead_code)] // Public API for future direct engine access
-    pub fn engine(&self) -> Option<Arc<OrchestratorEngine>> {
-        self.engine.clone()
-    }
-
     /// Build the shared `OrchestratorEngine` and spawn the worker pool.
     ///
     /// Must be called **after** `hydrate_existing_shards` and `set_coordinator`
@@ -4202,7 +4158,6 @@ impl NodeOrchestrator {
     }
 
     /// Handles a ProposeShard message to create a new shard.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn handle_propose_shard(
         &mut self,
         msg: ProposeShard,

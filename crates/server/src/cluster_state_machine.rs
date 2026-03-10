@@ -26,24 +26,9 @@ pub enum ClusterState {
 }
 
 impl ClusterState {
-    /// Check if the cluster can accept write operations
-    #[allow(dead_code)] // Reserved for future operation validation and health checks
-    pub fn can_accept_writes(&self) -> bool {
-        matches!(
-            self,
-            ClusterState::Active { .. } | ClusterState::Degraded { .. }
-        )
-    }
-
     /// Check if the cluster is healthy (Active state)
     pub fn is_healthy(&self) -> bool {
         matches!(self, ClusterState::Active { .. })
-    }
-
-    /// Check if the cluster has failed
-    #[allow(dead_code)] // Reserved for future health check endpoints
-    pub fn is_failed(&self) -> bool {
-        matches!(self, ClusterState::Failed { .. })
     }
 }
 

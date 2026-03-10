@@ -6,7 +6,7 @@
 use anyhow;
 use kameo::remote;
 use libp2p::{
-    Multiaddr, PeerId, identify,
+    PeerId, identify,
     kad::{self, Mode as KadMode, store::MemoryStore},
     swarm::NetworkBehaviour,
 };
@@ -310,19 +310,6 @@ impl DhtBehaviour {
         self.kademlia.get_record(key)
     }
 
-    /// Query a specific shard's metadata from the DHT
-    /// TODO: Implement logic to query individual shards when node metadata changes
-    #[allow(dead_code)]
-    pub fn query_shard_metadata(
-        &mut self,
-        node_uuid: uuid::Uuid,
-        shard_id: uuid::Uuid,
-    ) -> kad::QueryId {
-        let key_str = format!("cameodb-shard-{}-{}", node_uuid, shard_id);
-        let key = kad::RecordKey::new(&key_str);
-        self.kademlia.get_record(key)
-    }
-
     /// Bootstrap the Kademlia DHT
     pub fn bootstrap_kademlia(&mut self) -> Result<(), anyhow::Error> {
         // Skip bootstrap if we have no peers; prevents noisy "No known peers" warnings in standalone mode
@@ -341,27 +328,4 @@ impl DhtBehaviour {
             }
         }
     }
-
-    #[allow(dead_code)]
-    /// Add a peer address to Kademlia routing table
-    pub fn add_peer_address(&mut self, peer_id: &PeerId, addr: Multiaddr) {
-        self.kademlia.add_address(peer_id, addr);
-    }
-
-    #[allow(dead_code)]
-    /// Get basic Kademlia statistics
-    pub fn kademlia_stats(&mut self) -> KademliaStats {
-        KademliaStats {
-            bucket_count: self.kademlia.kbuckets().count(),
-            peer_count: 0, // Simplified for now
-        }
-    }
-}
-
-/// Basic Kademlia statistics
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct KademliaStats {
-    pub bucket_count: usize,
-    pub peer_count: usize,
 }

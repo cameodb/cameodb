@@ -123,7 +123,6 @@ pub struct RouteOperation {
 
 /// Type of operation for routing decisions.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Used in future phases for routing logic
 pub enum OperationType {
     Read,
     Write,
@@ -242,14 +241,11 @@ pub struct MarkBootstrapComplete;
 
 /// Snapshot of cluster topology for persistence
 #[derive(Debug, Clone, Reply)]
+#[allow(dead_code)] // Reply struct for GetClusterSnapshot; no external consumer yet
 pub struct ClusterSnapshot {
-    #[allow(dead_code)] // Used by GetClusterSnapshot responses and future HTTP exposure
     pub config: PersistedClusterConfig,
-    #[allow(dead_code)] // Used by GetClusterSnapshot responses and future HTTP exposure
     pub shards: HashMap<Uuid, ShardMetadata>,
-    #[allow(dead_code)] // Used by GetClusterSnapshot responses and future HTTP exposure
     pub nodes: HashMap<Uuid, NodeInfo>,
-    #[allow(dead_code)] // Used by GetClusterSnapshot responses and future HTTP exposure
     pub ring: ConsistentRing,
 }
 
