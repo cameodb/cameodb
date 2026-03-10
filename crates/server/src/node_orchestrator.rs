@@ -46,9 +46,9 @@ use crate::cluster_coordinator::{
     RequestBootstrapRedial, RouteOperation, RoutingDecision, ShardMetadata,
 };
 use crate::config::{MessagingConfig, SearchConfig};
+use crate::remote_peer_pool::{ConnectionChannel, RemotePeerPool};
 use chrono::{NaiveDate, NaiveDateTime};
 use cluster::{ConsistentRing, IdentityError, NodeIdentity, generate_tokens};
-use kameo::actor::RemoteActorRef;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use storage::{
     FieldDef, HybridStore, IndexSchema, ShardStatsTimings, StorageConfig, StoreError,
@@ -671,6 +671,9 @@ pub struct OrchestratorEngine {
     pub identity: NodeIdentity,
     /// Default search result limit.
     pub default_search_limit: usize,
+    /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups.
+    #[allow(dead_code)] // Used when bulk write is moved to engine
+    pub remote_peer_pool: Arc<RemotePeerPool>,
 }
 
 impl std::fmt::Debug for OrchestratorEngine {
@@ -1883,6 +1886,8 @@ pub struct RouterActor {
     /// Worker pool channel for dispatching hot-path ops (Write, Search)
     /// bypassing the actor mailbox for concurrent processing.
     worker_tx: Option<mpsc::Sender<OrchestratorJob>>,
+    /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups.
+    remote_peer_pool: Arc<RemotePeerPool>,
 }
 
 impl RouterActor {
@@ -1893,6 +1898,7 @@ impl RouterActor {
         search_config: &SearchConfig,
         default_search_limit: usize,
         worker_tx: Option<mpsc::Sender<OrchestratorJob>>,
+        remote_peer_pool: Arc<RemotePeerPool>,
     ) -> Self {
         Self {
             orchestrator,
@@ -1910,6 +1916,7 @@ impl RouterActor {
             max_concurrent_remote_searches: search_config.max_concurrent_remote_searches,
             enable_early_termination: search_config.enable_early_termination,
             worker_tx,
+            remote_peer_pool,
         }
     }
 
@@ -2865,46 +2872,38 @@ impl RouterActor {
 
 impl RouterActor {
     /// Attempt a remote call to a microshard on another node.
-    /// Looks up the remote NodeOrchestrator by name and forwards the ClientOp.
+    /// Uses the cached RemotePeerPool to avoid repeated swarm registry lookups.
     async fn try_remote(
         &self,
         _op: ClientOp,
         node_id: Uuid,
         peer_addr: &str,
     ) -> Result<JsonValue, OrchestratorError> {
-        let orchestrator_name = orchestrator_remote_name(&node_id);
         info!(
-            "🔎 Attempting remote actor lookup: name='{}', node_id={}, addr={}",
-            orchestrator_name, node_id, peer_addr
+            "🔎 Attempting remote call: node_id={}, addr={}",
+            node_id, peer_addr
         );
 
-        let remote_ref: Option<RemoteActorRef<NodeOrchestrator>> =
-            RemoteActorRef::lookup(orchestrator_name.clone())
-                .await
-                .map_err(|e| {
-                    warn!("❌ Remote actor lookup error: {}", e);
-                    OrchestratorError::Io(std::io::Error::other(e.to_string()))
-                })?;
+        let remote = self
+            .remote_peer_pool
+            .get_orchestrator(node_id, ConnectionChannel::Operations)
+            .await
+            .map_err(|e| {
+                warn!("❌ Remote actor lookup error: {}", e);
+                OrchestratorError::Io(std::io::Error::other(e.to_string()))
+            })?
+            .ok_or_else(|| {
+                warn!("❌ Remote orchestrator not found: node_id={}", node_id);
+                OrchestratorError::Io(std::io::Error::other(format!(
+                    "remote orchestrator for node {} not found",
+                    node_id
+                )))
+            })?;
 
-        let res = match remote_ref {
-            Some(remote) => {
-                info!("✅ Remote actor found: {}", orchestrator_name);
-                remote
-                    .ask(&_op)
-                    .await
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-            }
-            None => {
-                warn!(
-                    "❌ Remote orchestrator not found: name='{}', node_id={}",
-                    orchestrator_name, node_id
-                );
-                Err(OrchestratorError::Io(std::io::Error::other(format!(
-                    "remote orchestrator {} not found",
-                    orchestrator_name
-                ))))?
-            }
-        };
+        let res = remote
+            .ask(&_op)
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
         Ok(res)
     }
 }
@@ -2942,6 +2941,8 @@ pub struct NodeOrchestrator {
     /// Isolates read I/O from the writer threads and tokio's generic blocking pool.
     /// Arc-wrapped so the runtime outlives shard clones that hold its Handle.
     read_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups.
+    remote_peer_pool: Option<Arc<RemotePeerPool>>,
 }
 
 impl NodeOrchestrator {
@@ -3627,6 +3628,7 @@ impl NodeOrchestrator {
     }
 
     /// Forward a bulk batch to a remote node's orchestrator.
+    /// Uses the cached RemotePeerPool to avoid repeated swarm registry lookups.
     async fn forward_bulk_to_remote(
         &self,
         node_id: Uuid,
@@ -3634,38 +3636,39 @@ impl NodeOrchestrator {
         index: &str,
         docs: Vec<DocPayload>,
     ) -> Result<usize, OrchestratorError> {
-        let orchestrator_name = orchestrator_remote_name(&node_id);
         info!(
-            "🔎 Forwarding bulk batch to remote orchestrator: name='{}', node_id={}, addr={}, docs={}",
-            orchestrator_name,
+            "🔎 Forwarding bulk batch to remote: node_id={}, addr={}, docs={}",
             node_id,
             peer_addr,
             docs.len()
         );
 
-        let remote_ref: Option<RemoteActorRef<NodeOrchestrator>> =
-            RemoteActorRef::lookup(orchestrator_name.clone())
-                .await
-                .map_err(|e| {
-                    warn!("❌ Remote actor lookup error: {}", e);
-                    OrchestratorError::Io(std::io::Error::other(e.to_string()))
-                })?;
-
-        let remote = remote_ref.ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::other(format!(
-                "Remote orchestrator {} not found",
-                orchestrator_name
-            )))
+        let pool = self.remote_peer_pool.as_ref().ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::other("Remote peer pool not initialized"))
         })?;
 
+        let remote = pool
+            .get_orchestrator(node_id, ConnectionChannel::Operations)
+            .await
+            .map_err(|e| {
+                warn!("❌ Remote actor lookup error: {}", e);
+                OrchestratorError::Io(std::io::Error::other(e.to_string()))
+            })?
+            .ok_or_else(|| {
+                OrchestratorError::Io(std::io::Error::other(format!(
+                    "Remote orchestrator for node {} not found",
+                    node_id
+                )))
+            })?;
+
         // Send bulk write operation to remote node
-        let _op = ClientOp::BulkWrite {
+        let op = ClientOp::BulkWrite {
             index: index.to_string(),
             docs,
         };
 
-        let res = remote
-            .ask(&_op)
+        let res: serde_json::Value = remote
+            .ask(&op)
             .await
             .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
 
@@ -3798,6 +3801,7 @@ impl NodeOrchestrator {
             worker_tx: None,
             worker_count: 0,
             read_runtime: Some(read_runtime),
+            remote_peer_pool: None,
         };
 
         // Discover and hydrate existing shards
@@ -3809,6 +3813,11 @@ impl NodeOrchestrator {
     /// Set the coordinator ActorRef after it is spawned (used for shard registration).
     pub fn set_coordinator(&mut self, coordinator: ActorRef<ClusterCoordinator>) {
         self.coordinator = Some(coordinator);
+    }
+
+    /// Set the shared remote peer pool for cached actor ref lookups.
+    pub fn set_remote_peer_pool(&mut self, pool: Arc<RemotePeerPool>) {
+        self.remote_peer_pool = Some(pool);
     }
 
     /// Returns a clone of the worker pool sender, if the pool has been spawned.
@@ -3831,6 +3840,13 @@ impl NodeOrchestrator {
     pub fn spawn_worker_pool(&mut self) {
         // Share the same ArcSwap instances so cache writes from the actor
         // are immediately visible to workers (no duplication).
+        // Ensure remote_peer_pool is set before spawning workers.
+        // If not explicitly set, create a default empty pool.
+        let pool = self
+            .remote_peer_pool
+            .clone()
+            .unwrap_or_else(|| Arc::new(RemotePeerPool::new()));
+
         let engine = Arc::new(OrchestratorEngine {
             shards: ArcSwap::from_pointee(self.shards.clone()),
             routing_ring: ArcSwap::from_pointee(self.routing_ring.clone()),
@@ -3839,6 +3855,7 @@ impl NodeOrchestrator {
             coordinator: self.coordinator.clone(),
             identity: self.identity.clone(),
             default_search_limit: self.default_search_limit,
+            remote_peer_pool: pool,
         });
 
         // Worker count: min(local_shards * 2, cpu_cores * 2), minimum 1

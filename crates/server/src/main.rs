@@ -8,6 +8,7 @@ mod config;
 mod distributed;
 mod http_server;
 mod node_orchestrator;
+mod remote_peer_pool;
 mod swarm;
 
 use cluster_coordinator::{
@@ -21,6 +22,7 @@ use node_orchestrator::{
     NodeConfig, NodeOrchestrator, ProposeShard, RouterActor, UpdateTopology,
     orchestrator_remote_name,
 };
+use remote_peer_pool::RemotePeerPool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -140,6 +142,9 @@ async fn main() -> Result<()> {
         primary_path.clone(),
     );
 
+    // Create shared remote peer pool for cached actor ref lookups
+    let remote_peer_pool = Arc::new(RemotePeerPool::new());
+
     // Create ClusterCoordinator but DON'T start swarm yet
     let coordinator = if let Some(persisted) = persisted_cluster {
         tracing::info!(
@@ -147,15 +152,18 @@ async fn main() -> Result<()> {
             persisted.nodes.len(),
             persisted.shards.len()
         );
-        ClusterCoordinator::new_with_persisted_state(
+        let mut c = ClusterCoordinator::new_with_persisted_state(
             distributed_cluster,
             persisted,
             state_store.clone(),
-        )
+        );
+        c.set_remote_peer_pool(Arc::clone(&remote_peer_pool));
+        c
     } else {
         tracing::info!("Fresh cluster boot, no persisted state");
         let mut coordinator = ClusterCoordinator::new(distributed_cluster);
         coordinator.set_state_store(state_store.clone());
+        coordinator.set_remote_peer_pool(Arc::clone(&remote_peer_pool));
         coordinator
     };
 
@@ -164,6 +172,7 @@ async fn main() -> Result<()> {
 
     // Set coordinator reference on orchestrator FIRST
     orchestrator.set_coordinator(coordinator_actor.clone());
+    orchestrator.set_remote_peer_pool(Arc::clone(&remote_peer_pool));
 
     // NOW initialize default shards (after coordinator is set)
     let init_shards = cameodb_config.storage.num_shards_init;
@@ -310,6 +319,7 @@ async fn main() -> Result<()> {
         &cameodb_config.search,
         cameodb_config.search.default_search_limit,
         worker_tx,
+        Arc::clone(&remote_peer_pool),
     );
 
     let app_state = AppState {

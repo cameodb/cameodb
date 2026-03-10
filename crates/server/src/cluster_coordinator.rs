@@ -16,6 +16,8 @@ use tokio::task;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::remote_peer_pool::RemotePeerPool;
+
 use crate::cluster_state::{
     ClusterStateStore, PersistedClusterConfig, PersistedClusterTopology, current_timestamp,
 };
@@ -289,6 +291,9 @@ pub struct ClusterCoordinator {
 
     // Track last seen generation and checksum per node for deduplication
     last_seen_state: HashMap<Uuid, (u64, u64)>,
+
+    /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups
+    pub(crate) remote_peer_pool: Option<Arc<RemotePeerPool>>,
 }
 
 impl ClusterCoordinator {
@@ -347,6 +352,7 @@ impl ClusterCoordinator {
             last_persisted_generation: 0,
             push_failure_count: HashMap::new(),
             last_seen_state: HashMap::new(),
+            remote_peer_pool: None,
         }
     }
 
@@ -481,7 +487,13 @@ impl ClusterCoordinator {
             last_persisted_generation: generation,
             push_failure_count: HashMap::new(),
             last_seen_state: HashMap::new(),
+            remote_peer_pool: None,
         }
+    }
+
+    /// Set the shared remote peer pool for cached actor ref lookups.
+    pub fn set_remote_peer_pool(&mut self, pool: Arc<RemotePeerPool>) {
+        self.remote_peer_pool = Some(pool);
     }
 
     /// Set the state store (used when creating without persisted state)
@@ -598,12 +610,22 @@ impl ClusterCoordinator {
         local_checksum: u64,
         all_shards: HashMap<Uuid, ShardMetadata>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let remote_coord_name = format!("coordinator-{}", peer_id);
-
-        // First, query remote node's state
-        let remote_coord = RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name.clone())
-            .await?
-            .ok_or("Remote coordinator not found")?;
+        // First, query remote node's state — use pool if available, fallback to direct lookup
+        let remote_coord = if let Some(pool) = &self.remote_peer_pool {
+            pool.get_coordinator(peer_id)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                .ok_or::<Box<dyn std::error::Error + Send + Sync>>(
+                    "Remote coordinator not found".into(),
+                )?
+        } else {
+            let remote_coord_name = format!("coordinator-{}", peer_id);
+            RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name)
+                .await?
+                .ok_or::<Box<dyn std::error::Error + Send + Sync>>(
+                    "Remote coordinator not found".into(),
+                )?
+        };
 
         let query_msg = QueryClusterState {
             node_id: self.cluster.local_node_id,
@@ -774,8 +796,8 @@ impl ClusterCoordinator {
                         shard_count = all_shards.len(),
                         "ClusterCoordinator: Triggering stability-induced shard sync to all peers"
                     );
+                    let pool = self.remote_peer_pool.clone();
                     for (peer_id, _) in peers {
-                        let remote_coord_name = format!("coordinator-{}", peer_id);
                         let (local_generation, local_checksum) = self.get_cluster_state_info();
                         let msg = MergeRemoteShards {
                             node_id: local_node_id,
@@ -784,11 +806,18 @@ impl ClusterCoordinator {
                             generation: local_generation,
                             shard_checksum: local_checksum,
                         };
+                        let pool_clone = pool.clone();
                         task::spawn(async move {
-                            if let Ok(Some(remote_coord)) =
-                                RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name)
+                            let coord_opt = if let Some(pool) = &pool_clone {
+                                pool.get_coordinator(peer_id).await.ok().flatten()
+                            } else {
+                                let name = format!("coordinator-{}", peer_id);
+                                RemoteActorRef::<ClusterCoordinator>::lookup(name)
                                     .await
-                            {
+                                    .ok()
+                                    .flatten()
+                            };
+                            if let Some(remote_coord) = coord_opt {
                                 let _ = remote_coord.tell(&msg).send();
                             }
                         });
@@ -1534,17 +1563,24 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
             let remote_coord_name = format!("coordinator-{}", msg.node_id);
             let self_weak = ctx.actor_ref().downgrade();
             let node_id = msg.node_id;
+            let pool = self.remote_peer_pool.clone();
 
             task::spawn(async move {
                 if let Some(self_ref) = self_weak.upgrade() {
                     // Retry loop with exponential backoff for coordinator lookup
                     let mut remote_coord_opt = None;
                     for attempt in 0..5 {
-                        match RemoteActorRef::<ClusterCoordinator>::lookup(
-                            remote_coord_name.clone(),
-                        )
-                        .await
-                        {
+                        let lookup_result = if let Some(pool) = &pool {
+                            pool.get_coordinator(node_id)
+                                .await
+                                .map_err(|e| e.to_string())
+                        } else {
+                            RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name.clone())
+                                .await
+                                .map_err(|e| e.to_string())
+                        };
+
+                        match lookup_result {
                             Ok(Some(coord)) => {
                                 remote_coord_opt = Some(coord);
                                 break;
@@ -1821,68 +1857,78 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
             })
             .collect();
 
+        let pool = self.remote_peer_pool.clone();
         let remote_delete_futures: Vec<_> = known_peers
             .into_iter()
             .map(|peer| {
                 let index = msg.index.clone();
                 let delete_schema = msg.delete_schema;
+                let pool = pool.clone();
                 async move {
-                    let remote_orchestrator_name =
-                        crate::node_orchestrator::orchestrator_remote_name(&peer.node_id);
-
-                    let result =
-                        match kameo::actor::RemoteActorRef::<
+                    // Lookup via pool if available, fallback to direct lookup
+                    let lookup_result = if let Some(pool) = &pool {
+                        use crate::remote_peer_pool::ConnectionChannel;
+                        pool.get_orchestrator(peer.node_id, ConnectionChannel::Operations)
+                            .await
+                            .map_err(|e| format!("Lookup failed for node {}: {}", peer.node_id, e))
+                    } else {
+                        let remote_orchestrator_name =
+                            crate::node_orchestrator::orchestrator_remote_name(&peer.node_id);
+                        kameo::actor::RemoteActorRef::<
                             crate::node_orchestrator::NodeOrchestrator,
                         >::lookup(remote_orchestrator_name.as_str())
                         .await
-                        {
-                            Ok(Some(remote_orchestrator)) => {
-                                let delete_msg = crate::node_orchestrator::ClientOp::DeleteIndex {
-                                    index: index.clone(),
-                                    delete_schema,
-                                };
+                        .map_err(|e| format!("Lookup failed for node {}: {}", peer.node_id, e))
+                    };
 
-                                match remote_orchestrator.ask(&delete_msg).await {
-                                    Ok(result) => {
-                                        info!(
-                                            node_id = %peer.node_id,
-                                            address = %peer.address,
-                                            "Successfully deleted index from remote node"
-                                        );
-                                        Ok(result)
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            node_id = %peer.node_id,
-                                            address = %peer.address,
-                                            error = %e,
-                                            "Failed to delete index from remote node"
-                                        );
-                                        Err(format!("Remote node {} failed: {}", peer.node_id, e))
-                                    }
+                    let result = match lookup_result {
+                        Ok(Some(remote_orchestrator)) => {
+                            let delete_msg = crate::node_orchestrator::ClientOp::DeleteIndex {
+                                index: index.clone(),
+                                delete_schema,
+                            };
+
+                            match remote_orchestrator.ask(&delete_msg).await {
+                                Ok(result) => {
+                                    info!(
+                                        node_id = %peer.node_id,
+                                        address = %peer.address,
+                                        "Successfully deleted index from remote node"
+                                    );
+                                    Ok(result)
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        node_id = %peer.node_id,
+                                        address = %peer.address,
+                                        error = %e,
+                                        "Failed to delete index from remote node"
+                                    );
+                                    Err(format!("Remote node {} failed: {}", peer.node_id, e))
                                 }
                             }
-                            Ok(None) => {
-                                warn!(
-                                    node_id = %peer.node_id,
-                                    address = %peer.address,
-                                    "Remote orchestrator not found for index deletion"
-                                );
-                                Err(format!(
-                                    "Remote orchestrator not found for node {}",
-                                    peer.node_id
-                                ))
-                            }
-                            Err(e) => {
-                                warn!(
-                                    node_id = %peer.node_id,
-                                    address = %peer.address,
-                                    error = %e,
-                                    "Failed to lookup remote orchestrator for index deletion"
-                                );
-                                Err(format!("Lookup failed for node {}: {}", peer.node_id, e))
-                            }
-                        };
+                        }
+                        Ok(None) => {
+                            warn!(
+                                node_id = %peer.node_id,
+                                address = %peer.address,
+                                "Remote orchestrator not found for index deletion"
+                            );
+                            Err(format!(
+                                "Remote orchestrator not found for node {}",
+                                peer.node_id
+                            ))
+                        }
+                        Err(e) => {
+                            warn!(
+                                node_id = %peer.node_id,
+                                address = %peer.address,
+                                error = %e,
+                                "Failed to lookup remote orchestrator for index deletion"
+                            );
+                            Err(e)
+                        }
+                    };
                     (peer, result)
                 }
             })
@@ -1999,6 +2045,11 @@ impl Message<PeerLost> for ClusterCoordinator {
         self.cluster.peer_lost(msg.node_id);
         let node_identity = self.format_node_identity(msg.node_id);
         warn!(node = %node_identity, "ClusterCoordinator: peer lost");
+
+        // Invalidate cached remote actor refs for this peer
+        if let Some(pool) = &self.remote_peer_pool {
+            pool.invalidate_peer(msg.node_id);
+        }
 
         // Persist snapshot after peer loss
         self.evaluate_and_transition_state();
@@ -2325,10 +2376,16 @@ impl Message<ExchangeShardsWithPeer> for ClusterCoordinator {
             Err(e) => {
                 warn!(peer = %msg.peer_id, error = %e, "Failed to exchange shards with peer");
                 // Fall back to traditional push for reliability
-                let remote_coord_name = format!("coordinator-{}", msg.peer_id);
-                if let Ok(Some(remote_coord)) =
-                    RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name.clone()).await
-                {
+                let fallback_coord = if let Some(pool) = &self.remote_peer_pool {
+                    pool.get_coordinator(msg.peer_id).await.ok().flatten()
+                } else {
+                    let remote_coord_name = format!("coordinator-{}", msg.peer_id);
+                    RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name)
+                        .await
+                        .ok()
+                        .flatten()
+                };
+                if let Some(remote_coord) = fallback_coord {
                     let fallback_msg = MergeRemoteShards {
                         node_id: self.cluster.local_node_id,
                         node_name: self.cluster.local_node_name.clone(),
