@@ -85,6 +85,72 @@ impl ProgressSpinner {
     }
 }
 
+fn parse_query_modifiers(query: &str) -> (String, Option<usize>, Option<Vec<String>>) {
+    let parts: Vec<&str> = query.split_whitespace().collect();
+    if parts.is_empty() {
+        return (String::new(), None, None);
+    }
+
+    let mut cleaned_end = parts.len();
+    let mut inline_limit = None;
+    let mut inline_fields = None;
+    let mut return_idx = None;
+    let mut limit_idx = None;
+
+    for (idx, token) in parts.iter().enumerate() {
+        if token.eq_ignore_ascii_case("return") && return_idx.is_none() {
+            return_idx = Some(idx);
+        } else if token.eq_ignore_ascii_case("limit") && limit_idx.is_none() {
+            limit_idx = Some(idx);
+        }
+    }
+
+    if let Some(idx) = return_idx
+        && idx + 1 < parts.len()
+    {
+        let field_end = match limit_idx {
+            Some(l_idx) if l_idx > idx => l_idx,
+            _ => parts.len(),
+        };
+        let field_slice = &parts[idx + 1..field_end];
+        let field_str = field_slice.join(" ");
+        let fields: Vec<String> = field_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if !fields.is_empty() {
+            inline_fields = Some(fields);
+            cleaned_end = idx.min(cleaned_end);
+        }
+    }
+
+    if let Some(idx) = limit_idx {
+        let value_idx = idx + 1;
+        if value_idx < parts.len()
+            && let Ok(n) = parts[value_idx].parse::<usize>()
+        {
+            inline_limit = Some(n);
+            cleaned_end = cleaned_end.min(idx);
+        }
+    }
+
+    let cleaned_query = if cleaned_end == 0 {
+        "".to_string()
+    } else if cleaned_end >= parts.len() {
+        query.to_string()
+    } else {
+        parts[..cleaned_end].join(" ")
+    };
+
+    (
+        cleaned_query.trim().to_string(),
+        inline_limit,
+        inline_fields,
+    )
+}
+
 impl Drop for ProgressSpinner {
     fn drop(&mut self) {
         self.stop();
@@ -594,6 +660,67 @@ impl IndexCompleter {
             // Complete field names in search query
             "search" if tokens.len() >= 3 => {
                 let index = tokens[1];
+
+                // Check if we're after a 'return' keyword to suggest fields
+                let query_tokens = &tokens[2..];
+                let after_return = query_tokens
+                    .iter()
+                    .rposition(|t| t.eq_ignore_ascii_case("return"));
+
+                if let Some(return_pos) = after_return {
+                    // We're after 'return', suggest fields (comma-separated)
+                    let after_return_tokens = &query_tokens[return_pos + 1..];
+
+                    // Check if current token is after 'limit' keyword
+                    let after_limit = after_return_tokens
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case("limit"));
+
+                    if !after_limit {
+                        // Strip trailing comma from current if present
+                        let clean_current = current.trim_end_matches(',');
+                        let suggestions = self.field_suggestions(index, clean_current);
+                        let start = current_start(tokens, current);
+                        return Some((start, suggestions));
+                    }
+                }
+
+                // Check if we should suggest 'return' or 'limit' keywords
+                if current.is_empty()
+                    || "return".starts_with(current)
+                    || "limit".starts_with(current)
+                {
+                    let mut suggestions = Vec::new();
+
+                    // Only suggest 'return' if not already in query
+                    if !query_tokens
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case("return"))
+                        && "return".starts_with(current)
+                    {
+                        suggestions.push(Pair {
+                            display: "return <fields>".to_string(),
+                            replacement: "return ".to_string(),
+                        });
+                    }
+
+                    // Only suggest 'limit' if not already in query
+                    if !query_tokens.iter().any(|t| t.eq_ignore_ascii_case("limit"))
+                        && "limit".starts_with(current)
+                    {
+                        suggestions.push(Pair {
+                            display: "limit <n>".to_string(),
+                            replacement: "limit ".to_string(),
+                        });
+                    }
+
+                    if !suggestions.is_empty() {
+                        let start = current_start(tokens, current);
+                        return Some((start, suggestions));
+                    }
+                }
+
+                // Default: suggest field names for query construction
                 let suggestions = self.field_suggestions(index, current);
                 let start = current_start(tokens, current);
                 Some((start, suggestions))
@@ -662,17 +789,51 @@ impl Hinter for IndexCompleter {
             "search" => {
                 let index = parts.next()?;
                 let tail = parts.collect::<Vec<_>>();
-                let current = tail.last()?;
-                if let Some((field, value_prefix)) = current.split_once(':') {
-                    let trimmed_value = value_prefix
-                        .trim_start_matches(&['>', '<', '=', '!'][..])
-                        .trim();
-                    if trimmed_value.is_empty() {
-                        return self
-                            .field_type_hint(index, field)
-                            .map(|hint| format!(" {}", hint));
+
+                // Check if user is typing a field value
+                if let Some(current) = tail.last() {
+                    if let Some((field, value_prefix)) = current.split_once(':') {
+                        let trimmed_value = value_prefix
+                            .trim_start_matches(&['>', '<', '=', '!'][..])
+                            .trim();
+                        if trimmed_value.is_empty() {
+                            return self
+                                .field_type_hint(index, field)
+                                .map(|hint| format!(" {}", hint));
+                        }
+                    }
+
+                    // Provide hints for 'return' and 'limit' keywords
+                    let has_return = tail.iter().any(|t| t.eq_ignore_ascii_case("return"));
+                    let has_limit = tail.iter().any(|t| t.eq_ignore_ascii_case("limit"));
+
+                    // If typing 'r', hint 'return'
+                    if current.eq_ignore_ascii_case("r") && !has_return {
+                        return Some("eturn <fields>".to_string());
+                    }
+
+                    // If typing 'l', hint 'limit'
+                    if current.eq_ignore_ascii_case("l") && !has_limit {
+                        return Some("imit <n>".to_string());
+                    }
+
+                    // If typing 'ret', hint 'return'
+                    if "return".starts_with(&current.to_lowercase())
+                        && current.len() < "return".len()
+                        && !has_return
+                    {
+                        return Some(format!("{} <fields>", &"return"[current.len()..]));
+                    }
+
+                    // If typing 'lim', hint 'limit'
+                    if "limit".starts_with(&current.to_lowercase())
+                        && current.len() < "limit".len()
+                        && !has_limit
+                    {
+                        return Some(format!("{} <n>", &"limit"[current.len()..]));
                     }
                 }
+
                 None
             }
             _ => None,
@@ -880,7 +1041,14 @@ pub async fn run_cli() -> Result<()> {
             query,
             limit,
         } => {
-            let results = client.search(&index, &query, limit).await?;
+            let (clean_query, parsed_limit, parsed_fields) = parse_query_modifiers(&query);
+            if clean_query.is_empty() {
+                anyhow::bail!("Query cannot be empty after removing modifiers");
+            }
+            let final_limit = limit.or(parsed_limit);
+            let results = client
+                .search(&index, &clean_query, final_limit, parsed_fields)
+                .await?;
             print_json(&results)?;
         }
         ClientCommand::Schema {
@@ -1720,11 +1888,11 @@ async fn dispatch_interactive_command(
                 .next()
                 .ok_or_else(|| anyhow!("Usage: search <index> <query> [limit N]"))?;
             let mut query_parts: Vec<&str> = parts.collect();
-            // Parse optional limit: either "limit N" or just "N" at the end
-            let limit = if let Some(last) = query_parts.last() {
+
+            // Preserve legacy behavior: detect trailing numeric limit with optional "limit" keyword
+            let trailing_limit = if let Some(last) = query_parts.last().copied() {
                 if let Ok(num) = last.parse::<usize>() {
                     query_parts.pop();
-                    // Also strip "limit" keyword if present before the number
                     if query_parts.last().map(|s| s.eq_ignore_ascii_case("limit")) == Some(true) {
                         query_parts.pop();
                     }
@@ -1735,11 +1903,22 @@ async fn dispatch_interactive_command(
             } else {
                 None
             };
-            let query = query_parts.join(" ");
-            if query.is_empty() {
+
+            let raw_query = query_parts.join(" ");
+            if raw_query.trim().is_empty() {
                 return Err(anyhow!("Usage: search <index> <query> [limit N]"));
             }
-            let results = session.client().search(index, &query, limit).await?;
+
+            let (clean_query, keyword_limit, keyword_fields) = parse_query_modifiers(&raw_query);
+            if clean_query.is_empty() {
+                return Err(anyhow!("Search query cannot be empty"));
+            }
+
+            let final_limit = trailing_limit.or(keyword_limit);
+            let results = session
+                .client()
+                .search(index, &clean_query, final_limit, keyword_fields)
+                .await?;
             print_json(&results)?;
         }
         "schema" => {

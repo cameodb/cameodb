@@ -193,25 +193,25 @@ fn parse_query_keywords(query: &str) -> (String, Option<usize>, Option<Vec<Strin
     let mut limit_parsed = false;
 
     // Parse 'return' keyword - collects all tokens after it until 'limit' or end
-    if let Some(return_idx) = return_idx {
-        if return_idx + 1 < parts.len() {
-            // Determine where the field list ends (either at 'limit' or end of parts)
-            let field_end_idx = limit_idx.filter(|&l| l > return_idx).unwrap_or(parts.len());
+    if let Some(return_idx) = return_idx
+        && return_idx + 1 < parts.len()
+    {
+        // Determine where the field list ends (either at 'limit' or end of parts)
+        let field_end_idx = limit_idx.filter(|&l| l > return_idx).unwrap_or(parts.len());
 
-            // Collect tokens between 'return' and the end position
-            let field_tokens = &parts[return_idx + 1..field_end_idx];
-            let field_str = field_tokens.join(" ");
+        // Collect tokens between 'return' and the end position
+        let field_tokens = &parts[return_idx + 1..field_end_idx];
+        let field_str = field_tokens.join(" ");
 
-            // Parse comma-separated field list
-            let field_list: Vec<String> = field_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !field_list.is_empty() {
-                fields = Some(field_list);
-                return_parsed = true;
-            }
+        // Parse comma-separated field list
+        let field_list: Vec<String> = field_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !field_list.is_empty() {
+            fields = Some(field_list);
+            return_parsed = true;
         }
     }
 
