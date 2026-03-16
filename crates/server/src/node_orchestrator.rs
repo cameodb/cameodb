@@ -696,6 +696,7 @@ pub struct OrchestratorEngine {
     pub identity: NodeIdentity,
     /// Default search result limit.
     pub default_search_limit: usize,
+    pub max_concurrent_shard_searches: usize,
     /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups.
     #[allow(dead_code)] // Used when bulk write is moved to engine
     pub remote_peer_pool: Arc<RemotePeerPool>,
@@ -975,39 +976,39 @@ impl OrchestratorEngine {
         // Transform query to map shadow fields to canonical "id" field
         let transformed_query = transform_shadow_query(query, &schema);
 
-        let mut handles = Vec::new();
-        for (&shard_id, shard) in shards.iter() {
-            let req = SearchRequest {
-                index: index.to_string(),
-                query: transformed_query.clone(),
-                limit: Some(limit),
-            };
-            let s = shard.clone();
-            handles.push(tokio::spawn(async move {
-                (shard_id, s.handle_search(req).await)
-            }));
-        }
+        let shard_targets: Vec<(Uuid, MicroshardActor)> = shards
+            .iter()
+            .map(|(&shard_id, shard)| (shard_id, shard.clone()))
+            .collect();
+        let shard_results: Vec<_> =
+            futures::stream::iter(shard_targets.into_iter().map(|(shard_id, shard)| {
+                let req = SearchRequest {
+                    index: index.to_string(),
+                    query: transformed_query.clone(),
+                    limit: Some(limit),
+                };
+                async move { (shard_id, shard.handle_search(req).await) }
+            }))
+            .buffer_unordered(self.max_concurrent_shard_searches.max(1))
+            .collect()
+            .await;
 
         let mut results: Vec<(Uuid, f32, JsonValue)> = Vec::new();
         let mut errors = Vec::new();
         let mut shard_success = 0usize;
         let mut total_hits_sum = 0usize;
-        for h in handles {
-            match h.await {
-                Ok((shard_id, Ok(r))) => {
+        for (shard_id, result) in shard_results {
+            match result {
+                Ok(r) => {
                     total_hits_sum += r.total_hits;
                     for hit in r.hits {
                         results.push((shard_id, hit.score, hit.doc));
                     }
                     shard_success += 1;
                 }
-                Ok((shard_id, Err(err))) => {
+                Err(err) => {
                     warn!(%shard_id, error = %err, "Engine scatter search shard failed");
                     errors.push(format!("Shard {}: {}", shard_id, err));
-                }
-                Err(join_err) => {
-                    warn!(error = %join_err, "Engine scatter search task join failed");
-                    errors.push(format!("Join error: {}", join_err));
                 }
             }
         }
@@ -1886,10 +1887,7 @@ pub struct RouterActor {
     // Streaming search configuration
     enable_streaming_search: bool,
     enable_early_termination: bool,
-    // TODO: Implement concurrency limits for streaming search
-    #[allow(dead_code)] // Planned feature not yet implemented
     max_concurrent_shard_searches: usize,
-    #[allow(dead_code)] // Planned feature not yet implemented
     max_concurrent_remote_searches: usize,
     /// Worker pool channel for dispatching hot-path ops (Write, Search)
     /// bypassing the actor mailbox for concurrent processing.
@@ -2082,7 +2080,6 @@ impl RouterActor {
 
     async fn handle_broadcast(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
         use crate::cluster_coordinator::{GetKnownPeers, KnownPeer};
-        use futures::future::join_all;
 
         self.broadcasts_total.fetch_add(1, AtomicOrdering::Relaxed);
 
@@ -2105,6 +2102,8 @@ impl RouterActor {
         info!(
             timeout_ms = self.broadcast_timeout.as_millis(),
             fanout_limit = self.broadcast_fanout_limit,
+            local_shard_concurrency_limit = self.max_concurrent_shard_searches,
+            remote_concurrency_limit = self.max_concurrent_remote_searches.max(1),
             known_peers = peers.len(),
             target_peers = peer_count,
             "RouterActor: broadcast routing with remote fan-out"
@@ -2115,26 +2114,32 @@ impl RouterActor {
         let local_future = self.handle_client_op(local_op);
 
         // Fan out to remote peers (up to fanout_limit)
-        let remote_futures: Vec<_> = peers
-            .into_iter()
-            .take(self.broadcast_fanout_limit)
-            .map(|peer| {
-                let op_clone = op.clone();
-                let node_id = peer.node_id;
-                let peer_addr = peer.address;
-                async move {
-                    timeout(
-                        self.broadcast_timeout,
-                        self.try_remote(op_clone, node_id, &peer_addr),
-                    )
-                    .await
-                }
-            })
-            .collect();
+        let remote_limit = self.max_concurrent_remote_searches.max(1);
+        let remote_timeout = self.broadcast_timeout;
+        let remote_router = self.clone();
+        let remote_op = op.clone();
+        let remote_results_future =
+            futures::stream::iter(peers.into_iter().take(self.broadcast_fanout_limit).map(
+                move |peer| {
+                    let op_clone = remote_op.clone();
+                    let remote_router = remote_router.clone();
+                    let node_id = peer.node_id;
+                    let peer_addr = peer.address;
+                    async move {
+                        timeout(
+                            remote_timeout,
+                            remote_router.try_remote(op_clone, node_id, &peer_addr),
+                        )
+                        .await
+                    }
+                },
+            ))
+            .buffer_unordered(remote_limit)
+            .collect::<Vec<_>>();
 
         // Execute local + remote concurrently
         let t_start = Instant::now();
-        let (local_result, remote_results) = tokio::join!(local_future, join_all(remote_futures));
+        let (local_result, remote_results) = tokio::join!(local_future, remote_results_future);
 
         // If this is a search, prefer fastest/local results and stop after hitting the limit.
         if let ClientOp::Search { limit, .. } = &op {
@@ -2573,7 +2578,11 @@ impl RouterActor {
         &self,
         op: ClientOp,
     ) -> Result<JsonValue, OrchestratorError> {
-        tracing::info!("🚀 Using STREAMING search for improved performance");
+        tracing::info!(
+            max_concurrent_shard_searches = self.max_concurrent_shard_searches,
+            max_concurrent_remote_searches = self.max_concurrent_remote_searches.max(1),
+            "🚀 Using STREAMING search for improved performance"
+        );
 
         use crate::cluster_coordinator::{GetKnownPeers, KnownPeer};
 
@@ -2645,41 +2654,53 @@ impl RouterActor {
                     }
                 };
 
-                // Create remote search streams
-                let remote_futures: Vec<_> = peers
-                    .into_iter()
-                    .take(self.broadcast_fanout_limit)
-                    .map(|peer| {
-                        let op_clone = ClientOp::Search {
-                            index: index.clone(),
-                            query: query.clone(),
-                            limit: Some(limit),
-                            fields: fields.clone(),
-                        };
-                        let node_id = peer.node_id;
-                        let peer_addr = peer.address;
-                        async move {
-                            let result = timeout(
-                                self.broadcast_timeout,
-                                self.try_remote(op_clone, node_id, &peer_addr),
-                            )
-                            .await
-                            .unwrap_or(Err(OrchestratorError::Io(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "Remote operation timed out",
-                            ))));
-                            StreamingSearchResult::Remote { node_id, result }
-                        }
-                    })
-                    .collect();
+                let remote_limit = self.max_concurrent_remote_searches.max(1);
+                let remote_timeout = self.broadcast_timeout;
+                let mut peer_iter = peers.into_iter().take(self.broadcast_fanout_limit);
+                let remote_router = self.clone();
 
-                // Combine local and remote into a single stream using boxed futures
                 let mut search_futures = FuturesUnordered::new();
                 search_futures.push(Box::pin(local_future)
                     as Pin<Box<dyn Future<Output = StreamingSearchResult> + Send>>);
-                for future in remote_futures {
-                    search_futures.push(Box::pin(future)
+
+                let push_remote_future = |peer: KnownPeer,
+                                          search_futures: &mut FuturesUnordered<
+                    Pin<Box<dyn Future<Output = StreamingSearchResult> + Send>>,
+                >| {
+                    let remote_router = remote_router.clone();
+                    let index = index.clone();
+                    let query = query.clone();
+                    let fields = fields.clone();
+                    let node_id = peer.node_id;
+                    let peer_addr = peer.address;
+                    search_futures.push(Box::pin(async move {
+                        let result = timeout(
+                            remote_timeout,
+                            remote_router.try_remote(
+                                ClientOp::Search {
+                                    index,
+                                    query,
+                                    limit: Some(limit),
+                                    fields,
+                                },
+                                node_id,
+                                &peer_addr,
+                            ),
+                        )
+                        .await
+                        .unwrap_or(Err(OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Remote operation timed out",
+                        ))));
+                        StreamingSearchResult::Remote { node_id, result }
+                    })
                         as Pin<Box<dyn Future<Output = StreamingSearchResult> + Send>>);
+                };
+
+                for _ in 0..remote_limit {
+                    if let Some(peer) = peer_iter.next() {
+                        push_remote_future(peer, &mut search_futures);
+                    }
                 }
 
                 // Process results as they arrive with early termination
@@ -2691,6 +2712,12 @@ impl RouterActor {
                 let mut errors = Vec::new();
 
                 while let Some(search_result) = search_futures.next().await {
+                    let refill_remote =
+                        matches!(&search_result, StreamingSearchResult::Remote { .. });
+                    if refill_remote && let Some(peer) = peer_iter.next() {
+                        push_remote_future(peer, &mut search_futures);
+                    }
+
                     // Early termination if limit reached and enabled
                     if self.enable_early_termination && all_hits.len() >= limit {
                         break;
@@ -2940,6 +2967,7 @@ pub struct NodeOrchestrator {
     fingerprint_index: Arc<ArcSwap<HashMap<u64, String>>>,
     /// Default search result limit when not specified in request
     default_search_limit: usize,
+    max_concurrent_shard_searches: usize,
     /// Shared engine state for the worker pool (Arc-wrapped, lock-free).
     /// Workers operate on this concurrently without going through the actor mailbox.
     engine: Option<Arc<OrchestratorEngine>>,
@@ -3774,6 +3802,7 @@ impl NodeOrchestrator {
         config: NodeConfig,
         identity: NodeIdentity,
         default_search_limit: usize,
+        max_concurrent_shard_searches: usize,
     ) -> Result<Self, OrchestratorError> {
         // Ensure storage directory exists
         fs::create_dir_all(&config.storage_path)?;
@@ -3809,6 +3838,7 @@ impl NodeOrchestrator {
             schema_cache: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             fingerprint_index: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             default_search_limit,
+            max_concurrent_shard_searches,
             engine: None,
             worker_tx: None,
             worker_count: 0,
@@ -3861,6 +3891,7 @@ impl NodeOrchestrator {
             coordinator: self.coordinator.clone(),
             identity: self.identity.clone(),
             default_search_limit: self.default_search_limit,
+            max_concurrent_shard_searches: self.max_concurrent_shard_searches,
             remote_peer_pool: pool,
         });
 
@@ -4965,39 +4996,40 @@ impl NodeOrchestrator {
         // Transform query to map shadow fields to canonical "id" field
         let transformed_query = transform_shadow_query(query, &schema);
 
-        let mut handles = Vec::new();
-        for (&shard_id, shard) in self.shards.iter() {
+        let shard_targets: Vec<(Uuid, MicroshardActor)> = self
+            .shards
+            .iter()
+            .map(|(&shard_id, shard)| (shard_id, shard.clone()))
+            .collect();
+        let shard_searches = shard_targets.into_iter().map(|(shard_id, shard)| {
             let req = SearchRequest {
                 index: index.to_string(),
                 query: transformed_query.clone(),
                 limit: Some(limit),
             };
-            let s = shard.clone();
-            handles.push(tokio::spawn(async move {
-                (shard_id, s.handle_search(req).await)
-            }));
-        }
+            async move { (shard_id, shard.handle_search(req).await) }
+        });
+        let shard_results: Vec<_> = futures::stream::iter(shard_searches)
+            .buffer_unordered(self.max_concurrent_shard_searches.max(1))
+            .collect::<Vec<_>>()
+            .await;
 
         let mut results: Vec<(Uuid, f32, JsonValue)> = Vec::new();
         let mut errors = Vec::new();
         let mut shard_success = 0usize;
         let mut total_hits_sum = 0usize;
-        for h in handles {
-            match h.await {
-                Ok((shard_id, Ok(r))) => {
+        for (shard_id, result) in shard_results {
+            match result {
+                Ok(r) => {
                     total_hits_sum += r.total_hits;
                     for hit in r.hits {
                         results.push((shard_id, hit.score, hit.doc));
                     }
                     shard_success += 1;
                 }
-                Ok((shard_id, Err(err))) => {
+                Err(err) => {
                     warn!(%shard_id, error = %err, "Scatter search shard failed");
                     errors.push(format!("Shard {}: {}", shard_id, err));
-                }
-                Err(join_err) => {
-                    warn!(error = %join_err, "Scatter search task join failed");
-                    errors.push(format!("Join error: {}", join_err));
                 }
             }
         }

@@ -1121,33 +1121,6 @@ struct StoredDocOwned {
     json_blob: Option<JsonValue>,
 }
 
-/// Filter shadow fields from JSON blob for efficient storage
-///
-/// This function removes shadow fields from the JSON blob before storing it in redb,
-/// since shadow fields are only used for query mapping and don't need to be stored.
-/// The canonical "id" field is always preserved.
-///
-/// Example:
-/// Input: {"id": "123", "book_id": "123", "title": "Book"}
-/// Output: {"id": "123", "title": "Book"}  // book_id (shadow) removed
-fn filter_shadow_fields_from_json(json_blob: &JsonValue, schema: &IndexSchema) -> JsonValue {
-    if let Some(obj) = json_blob.as_object() {
-        let mut filtered_obj = serde_json::Map::new();
-
-        for (key, value) in obj {
-            // Keep the field if it's not a shadow field
-            if !schema.is_shadow_field(key) {
-                filtered_obj.insert(key.clone(), value.clone());
-            }
-        }
-
-        JsonValue::Object(filtered_obj)
-    } else {
-        // Not an object, return as-is
-        json_blob.clone()
-    }
-}
-
 /// Reconstruct shadow fields in JSON blob for document retrieval
 ///
 /// This function reconstructs shadow fields by copying the canonical "id" value
@@ -3238,46 +3211,28 @@ impl HybridStore {
             return Ok((Vec::new(), total_hits));
         }
 
-        // Step 1: Extract document IDs from tantivy results
+        // Step 1: Extract document IDs from Tantivy results using direct stored-field access
         let mut doc_ids_with_scores = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let doc: tantivy::TantivyDocument = searcher.doc(doc_address)?;
 
-            // Extract ID field - use to_json to get the document and parse ID
-            let json_str = doc.to_json(&tantivy_index.schema());
-            if let Ok(json_val) = serde_json::from_str::<JsonValue>(&json_str) {
-                // Tantivy stores text fields as arrays, so we need to handle both cases
-                let id_opt = json_val.get("id").and_then(|v| {
-                    // Try as array first (Tantivy's default for text fields)
-                    if let Some(arr) = v.as_array() {
-                        arr.first().and_then(|item| item.as_str())
-                    } else {
-                        // Fallback to direct string
-                        v.as_str()
-                    }
-                });
-
-                if let Some(id_str) = id_opt {
-                    // Debug: log Tantivy's indexed values for this document
-                    debug!(
-                        index = %index,
-                        doc_id = %id_str,
-                        tantivy_doc = %json_str,
-                        "Tantivy document matched"
-                    );
-                    doc_ids_with_scores.push((score, id_str.to_string()));
-                } else {
-                    warn!(
-                        index = %index,
-                        tantivy_doc = %json_str,
-                        "Tantivy document missing or invalid 'id' field"
-                    );
-                }
+            if let Some(value) = doc.get_first(fields.id)
+                && let Some(id_str) = value.as_str()
+            {
+                debug!(
+                    index = %index,
+                    doc_id = %id_str,
+                    doc_addr = ?doc_address,
+                    "Tantivy document matched"
+                );
+                doc_ids_with_scores.push((score, id_str.to_string()));
             } else {
+                let tantivy_doc = doc.to_json(&tantivy_index.schema());
                 warn!(
                     index = %index,
-                    json_str = %json_str,
-                    "Failed to parse tantivy document JSON"
+                    doc_addr = ?doc_address,
+                    tantivy_doc = %tantivy_doc,
+                    "Tantivy document missing or invalid 'id' field"
                 );
             }
         }
@@ -3419,18 +3374,17 @@ impl HybridStore {
             kind: PreparedKind,
         }
 
+        let has_shadow_fields = schema.has_shadow_fields();
+
         // Step 1: Serialize outside of lock (CPU work)
         let mut prepared_ops = Vec::with_capacity(ops_len);
         for op in ops {
             match op {
                 WalOp::Put { id, json_blob } => {
-                    // OPTIMIZATION: Skip shadow filtering when no shadow fields exist (common case)
-                    let filtered_json_blob = if schema.has_shadow_fields() {
-                        json_blob
-                            .clone()
-                            .map(|blob| filter_shadow_fields_owned(blob, &schema))
+                    let filtered_json_blob = if has_shadow_fields {
+                        json_blob.map(|blob| filter_shadow_fields_owned(blob, &schema))
                     } else {
-                        json_blob.clone()
+                        json_blob
                     };
 
                     let wal_bytes = serde_json::to_vec(&WalOp::Put {
@@ -3492,66 +3446,37 @@ impl HybridStore {
 
             // Process operations and collect sequence IDs
             for (prepared, seq_id) in prepared_ops.into_iter().zip(seq_ids_iter) {
+                let PreparedOp {
+                    wal_bytes,
+                    doc_bytes,
+                    id,
+                    kind,
+                } = prepared;
+
                 // Write to WAL
-                wal_table.insert(seq_id, prepared.wal_bytes.as_slice())?;
+                wal_table.insert(seq_id, wal_bytes.as_slice())?;
 
                 // Collect sequence ID for final result
                 seq_ids.push(seq_id);
 
-                match prepared.kind {
+                match kind {
                     PreparedKind::Put { json_blob } => {
-                        // Step 1: Get cached schema for field filtering
-                        // If not in cache, load from persisted metadata
-                        let schema = if let Some(schema) = self.get_schema_cached(index)? {
-                            schema
-                        } else {
-                            // Load from metadata if not in cache
-                            tracing::debug!(index = %index, "Loading schema from metadata store for batch");
-                            self.get_schema(index)?
-                                .map(Arc::new)
-                                .unwrap_or_else(|| Arc::new(IndexSchema::default()))
-                        };
-
-                        if let Some(original_doc_bytes) = &prepared.doc_bytes {
-                            // OPTIMIZATION: Skip shadow filtering when no shadow fields exist
-                            let filtered_doc_bytes = if schema.has_shadow_fields() {
-                                if let Ok(stored_doc) =
-                                    serde_json::from_slice::<StoredDocOwned>(original_doc_bytes)
-                                {
-                                    if let Some(json_blob) = stored_doc.json_blob {
-                                        let filtered_json =
-                                            filter_shadow_fields_from_json(&json_blob, &schema);
-                                        let filtered_stored_doc = StoredDocOwned {
-                                            json_blob: Some(filtered_json),
-                                        };
-                                        serde_json::to_vec(&filtered_stored_doc)
-                                            .map_err(|e| StoreError::Serialization(e.to_string()))?
-                                    } else {
-                                        original_doc_bytes.clone()
-                                    }
-                                } else {
-                                    original_doc_bytes.clone()
-                                }
-                            } else {
-                                original_doc_bytes.clone()
-                            };
-
+                        if let Some(doc_bytes) = doc_bytes {
                             // Check if document is new or updated by examining insert return value
-                            let old_value = data_table
-                                .insert(prepared.id.as_str(), filtered_doc_bytes.as_slice())?;
+                            let old_value = data_table.insert(id.as_str(), doc_bytes.as_slice())?;
                             let is_new_document = old_value.is_none();
 
                             if is_new_document {
                                 new_documents_count += 1;
                             } else {
                                 // Track updated documents for selective Tantivy deletes
-                                updated_document_ids.push(prepared.id.clone());
+                                updated_document_ids.push(id.clone());
                             }
                         }
 
                         // Step 3: Build tantivy document with ONLY indexed fields
                         let mut tantivy_doc = doc!(
-                            fields.id => prepared.id.as_str(),
+                            fields.id => id.as_str(),
                             fields.seq => seq_id // Inject the WAL sequence
                         );
 
@@ -3559,7 +3484,7 @@ impl HybridStore {
                         if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
                             for (field_name, field_value) in json_obj {
                                 // O(1) shadow field skip via pre-computed HashSet
-                                if schema.shadow_fields.contains(field_name) {
+                                if has_shadow_fields && schema.shadow_fields.contains(field_name) {
                                     continue;
                                 }
 
@@ -3674,11 +3599,11 @@ impl HybridStore {
                             }
                         }
 
-                        tantivy_ops.push(("add", tantivy_doc, prepared.id));
+                        tantivy_ops.push(("add", tantivy_doc, id));
                     }
                     PreparedKind::Delete => {
-                        data_table.remove(prepared.id.as_str())?;
-                        tantivy_ops.push(("delete", doc!(), prepared.id));
+                        data_table.remove(id.as_str())?;
+                        tantivy_ops.push(("delete", doc!(), id));
                     }
                 }
             }

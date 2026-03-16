@@ -117,6 +117,7 @@ async fn main() -> Result<()> {
         node_config,
         identity,
         cameodb_config.search.default_search_limit,
+        cameodb_config.search.max_concurrent_shard_searches,
     )
     .await?;
 
