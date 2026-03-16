@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering as AtomicOrdering},
+    atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
 };
 use std::time::{Duration, Instant};
 
@@ -189,6 +189,40 @@ fn apply_field_projection(doc: JsonValue, fields: &[String]) -> JsonValue {
     } else {
         doc
     }
+}
+
+fn hit_score(hit: &JsonValue) -> f64 {
+    hit.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0)
+}
+
+fn push_hit_into_top_k(top_hits: &mut Vec<JsonValue>, hit: JsonValue, limit: usize) {
+    if limit == 0 {
+        return;
+    }
+
+    let new_score = hit_score(&hit);
+    if top_hits.len() < limit {
+        top_hits.push(hit);
+        top_hits.sort_by(|a, b| {
+            hit_score(b)
+                .partial_cmp(&hit_score(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        return;
+    }
+
+    let worst_score = top_hits.last().map(hit_score).unwrap_or(f64::NEG_INFINITY);
+    if new_score <= worst_score {
+        return;
+    }
+
+    top_hits.push(hit);
+    top_hits.sort_by(|a, b| {
+        hit_score(b)
+            .partial_cmp(&hit_score(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    top_hits.truncate(limit);
 }
 
 /// Recursively transform shadow field names in JSON query structure
@@ -668,6 +702,65 @@ pub enum OrchestratorJob {
         reply: tokio::sync::oneshot::Sender<Result<JsonValue, OrchestratorError>>,
     },
     Shutdown,
+}
+
+#[derive(Clone, Debug)]
+pub struct OrchestratorWorkerTx {
+    workers: Arc<Vec<mpsc::Sender<OrchestratorJob>>>,
+    next_worker: Arc<AtomicUsize>,
+}
+
+impl OrchestratorWorkerTx {
+    fn new(workers: Vec<mpsc::Sender<OrchestratorJob>>) -> Self {
+        Self {
+            workers: Arc::new(workers),
+            next_worker: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    fn try_send(
+        &self,
+        mut job: OrchestratorJob,
+    ) -> Result<(), Box<mpsc::error::TrySendError<OrchestratorJob>>> {
+        if self.workers.is_empty() {
+            return Err(Box::new(mpsc::error::TrySendError::Closed(job)));
+        }
+
+        let start = self.next_worker.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut saw_full = false;
+
+        for offset in 0..self.workers.len() {
+            let idx = (start + offset) % self.workers.len();
+            match self.workers[idx].try_send(job) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Full(returned_job)) => {
+                    saw_full = true;
+                    job = returned_job;
+                }
+                Err(mpsc::error::TrySendError::Closed(returned_job)) => {
+                    job = returned_job;
+                }
+            }
+        }
+
+        if saw_full {
+            Err(Box::new(mpsc::error::TrySendError::Full(job)))
+        } else {
+            Err(Box::new(mpsc::error::TrySendError::Closed(job)))
+        }
+    }
+
+    async fn send_shutdown(&self) {
+        for worker in self.workers.iter() {
+            if worker.send(OrchestratorJob::Shutdown).await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 /// Shared state for the orchestrator worker pool.
@@ -1891,7 +1984,7 @@ pub struct RouterActor {
     max_concurrent_remote_searches: usize,
     /// Worker pool channel for dispatching hot-path ops (Write, Search)
     /// bypassing the actor mailbox for concurrent processing.
-    worker_tx: Option<mpsc::Sender<OrchestratorJob>>,
+    worker_tx: Option<OrchestratorWorkerTx>,
     /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups.
     remote_peer_pool: Arc<RemotePeerPool>,
 }
@@ -1903,7 +1996,7 @@ impl RouterActor {
         messaging: &MessagingConfig,
         search_config: &SearchConfig,
         default_search_limit: usize,
-        worker_tx: Option<mpsc::Sender<OrchestratorJob>>,
+        worker_tx: Option<OrchestratorWorkerTx>,
         remote_peer_pool: Arc<RemotePeerPool>,
     ) -> Self {
         Self {
@@ -1969,25 +2062,27 @@ impl RouterActor {
                             ))),
                         };
                     }
-                    Err(mpsc::error::TrySendError::Full(job)) => {
-                        // Queue full — fall through to actor mailbox
-                        debug!("Worker pool queue full, falling back to actor mailbox");
-                        if let OrchestratorJob::Execute { op, .. } = job {
-                            return self.ask_orchestrator(op).await;
+                    Err(err) => match *err {
+                        mpsc::error::TrySendError::Full(job) => {
+                            // Queue full — fall through to actor mailbox
+                            debug!("Worker pool queue full, falling back to actor mailbox");
+                            if let OrchestratorJob::Execute { op, .. } = job {
+                                return self.ask_orchestrator(op).await;
+                            }
+                            return Err(OrchestratorError::Io(std::io::Error::other(
+                                "Worker queue full while shutting down",
+                            )));
                         }
-                        return Err(OrchestratorError::Io(std::io::Error::other(
-                            "Worker queue full while shutting down",
-                        )));
-                    }
-                    Err(mpsc::error::TrySendError::Closed(job)) => {
-                        warn!("Worker pool channel closed, falling back to actor mailbox");
-                        if let OrchestratorJob::Execute { op, .. } = job {
-                            return self.ask_orchestrator(op).await;
+                        mpsc::error::TrySendError::Closed(job) => {
+                            warn!("Worker pool channel closed, falling back to actor mailbox");
+                            if let OrchestratorJob::Execute { op, .. } = job {
+                                return self.ask_orchestrator(op).await;
+                            }
+                            return Err(OrchestratorError::Io(std::io::Error::other(
+                                "Worker pool channel closed during shutdown",
+                            )));
                         }
-                        return Err(OrchestratorError::Io(std::io::Error::other(
-                            "Worker channel closed during shutdown",
-                        )));
-                    }
+                    },
                 }
             }
         }
@@ -2161,19 +2256,9 @@ impl RouterActor {
                 max_took_ms: &mut Option<u64>,
                 total_hits_sum: &mut usize,
             ) {
-                if merged_hits.len() >= limit {
-                    return;
-                }
-                // OPTIMIZATION: Use mutable reference to drain hits instead of cloning
                 if let Some(hits) = value.get_mut("hits").and_then(|h| h.as_array_mut()) {
-                    let remaining = limit - merged_hits.len();
-                    let to_take = hits.len().min(remaining);
-
-                    // Move hits from source to merged_hits
-                    for _ in 0..to_take {
-                        if let Some(hit) = hits.pop() {
-                            merged_hits.push(hit);
-                        }
+                    for hit in hits.drain(..) {
+                        push_hit_into_top_k(merged_hits, hit, limit);
                     }
                 }
                 // Extract shard statistics from the response
@@ -2215,9 +2300,6 @@ impl RouterActor {
 
             // Then process remote results in completion order until limit is reached
             for result in remote_results {
-                if merged_hits.len() >= limit {
-                    break;
-                }
                 match result {
                     Ok(Ok(mut val)) => push_hits(
                         &mut val,
@@ -2313,6 +2395,7 @@ impl RouterActor {
                 // Enforce a global limit across merged results to avoid returning
                 // (limit * nodes) hits when broadcasting.
                 let limit = limit.unwrap_or(self.default_search_limit);
+                let nodes_contacted = all_results.len();
 
                 // For search operations, if we only have local results (no remote peers),
                 // return the local response directly to preserve shard-level details
@@ -2323,23 +2406,33 @@ impl RouterActor {
                 // Merge search results from multiple nodes: combine all hits arrays
                 let mut merged_hits: Vec<JsonValue> = Vec::new();
                 let mut total_shards_queried = 0usize;
+                let mut total_hits_sum = 0usize;
 
-                for result in &all_results {
-                    if let Some(hits) = result.get("hits").and_then(|h| h.as_array()) {
-                        merged_hits.extend(hits.iter().cloned());
+                for mut result in all_results {
+                    if let Some(hits) = result.get_mut("hits").and_then(|h| h.as_array_mut()) {
+                        for hit in hits.drain(..) {
+                            push_hit_into_top_k(&mut merged_hits, hit, limit);
+                        }
                     }
-                    // Sum up shards_responded from each node
-                    if let Some(shards) = result.get("shards_responded").and_then(|s| s.as_u64()) {
+                    if let Some(stats) = result.get("stats").and_then(|s| s.as_object())
+                        && let Some(shards) = stats.get("shards").and_then(|s| s.as_object())
+                        && let Some(responded) = shards.get("responded").and_then(|r| r.as_u64())
+                    {
+                        total_shards_queried += responded as usize;
+                    } else if let Some(shards) =
+                        result.get("shards_responded").and_then(|s| s.as_u64())
+                    {
                         total_shards_queried += shards as usize;
+                    }
+                    if let Some(total) = result.get("total_hits").and_then(|t| t.as_u64()) {
+                        total_hits_sum += total as usize;
                     }
                 }
 
                 // Sort by score descending and deduplicate by _id if present
                 merged_hits.sort_by(|a, b| {
-                    let score_a = a.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-                    let score_b = b.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-                    score_b
-                        .partial_cmp(&score_a)
+                    hit_score(b)
+                        .partial_cmp(&hit_score(a))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 merged_hits.truncate(limit);
@@ -2347,10 +2440,7 @@ impl RouterActor {
                 Ok(serde_json::json!({
                     "hits": merged_hits,
                     "hits_returned": merged_hits.len(),
-                    "total_hits": merged_hits.iter()
-                        .filter_map(|h| h.get("total_hits"))
-                        .filter_map(|t| t.as_u64())
-                        .sum::<u64>() as usize,
+                    "total_hits": total_hits_sum,
                     "limit": limit,
                     "stats": {
                         "shards": {
@@ -2359,7 +2449,7 @@ impl RouterActor {
                             "failed": error_count as usize
                         },
                         "nodes": {
-                            "contacted": all_results.len()
+                            "contacted": nodes_contacted
                         }
                     }
                 }))
@@ -2719,7 +2809,11 @@ impl RouterActor {
                     }
 
                     // Early termination if limit reached and enabled
-                    if self.enable_early_termination && all_hits.len() >= limit {
+                    if self.enable_early_termination
+                        && all_hits.len() >= limit
+                        && search_futures.is_empty()
+                        && peer_iter.size_hint().0 == 0
+                    {
                         break;
                     }
 
@@ -2732,26 +2826,24 @@ impl RouterActor {
                         } => {
                             // Process streaming local search results
                             for (score, doc) in hits {
-                                if all_hits.len() < limit {
-                                    let mut hit_doc = doc;
-                                    if let JsonValue::Object(ref mut o) = hit_doc {
-                                        o.insert(
-                                            "_score".to_string(),
-                                            JsonValue::Number(
-                                                serde_json::Number::from_f64(score as f64)
-                                                    .unwrap_or(serde_json::Number::from(0)),
-                                            ),
-                                        );
-                                        // Track unique shard IDs from individual documents
-                                        if let Some(shard_id) =
-                                            hit_doc.get("shard_id").and_then(|s| s.as_str())
-                                            && let Ok(uuid) = Uuid::parse_str(shard_id)
-                                        {
-                                            unique_shard_ids.insert(uuid);
-                                        }
+                                let mut hit_doc = doc;
+                                if let JsonValue::Object(ref mut o) = hit_doc {
+                                    o.insert(
+                                        "_score".to_string(),
+                                        JsonValue::Number(
+                                            serde_json::Number::from_f64(score as f64)
+                                                .unwrap_or(serde_json::Number::from(0)),
+                                        ),
+                                    );
+                                    // Track unique shard IDs from individual documents
+                                    if let Some(shard_id) =
+                                        hit_doc.get("shard_id").and_then(|s| s.as_str())
+                                        && let Ok(uuid) = Uuid::parse_str(shard_id)
+                                    {
+                                        unique_shard_ids.insert(uuid);
                                     }
-                                    all_hits.push(hit_doc);
                                 }
+                                push_hit_into_top_k(&mut all_hits, hit_doc, limit);
                             }
                             total_hits_sum += total_hits;
                             shards_queried = unique_shard_ids.len();
@@ -2766,11 +2858,8 @@ impl RouterActor {
                                     if let Some(hits) =
                                         val.get_mut("hits").and_then(|h| h.as_array_mut())
                                     {
-                                        // Drain the hits vector to move ownership
                                         for hit in hits.drain(..) {
-                                            if all_hits.len() < limit {
-                                                all_hits.push(hit);
-                                            }
+                                            push_hit_into_top_k(&mut all_hits, hit, limit);
                                         }
                                     }
                                     if let Some(total) =
@@ -2973,7 +3062,7 @@ pub struct NodeOrchestrator {
     engine: Option<Arc<OrchestratorEngine>>,
     /// Channel sender for dispatching jobs to the worker pool.
     /// Workers pull jobs from the receiver and execute on the shared engine.
-    worker_tx: Option<mpsc::Sender<OrchestratorJob>>,
+    worker_tx: Option<OrchestratorWorkerTx>,
     /// Number of worker tasks spawned in the pool.
     /// Used to signal explicit worker shutdown.
     worker_count: usize,
@@ -3863,7 +3952,7 @@ impl NodeOrchestrator {
     }
 
     /// Returns a clone of the worker pool sender, if the pool has been spawned.
-    pub fn worker_tx(&self) -> Option<mpsc::Sender<OrchestratorJob>> {
+    pub fn worker_tx(&self) -> Option<OrchestratorWorkerTx> {
         self.worker_tx.clone()
     }
 
@@ -3902,27 +3991,26 @@ impl NodeOrchestrator {
         let local_shards = self.shards.len();
         let worker_count = std::cmp::max(1, std::cmp::min(local_shards * 2, cpu_cores * 2));
 
-        let (tx, rx) = mpsc::channel::<OrchestratorJob>(ORCHESTRATOR_WORKER_QUEUE_CAPACITY);
-        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let per_worker_queue_capacity =
+            std::cmp::max(1, ORCHESTRATOR_WORKER_QUEUE_CAPACITY / worker_count);
+        let mut worker_txs = Vec::with_capacity(worker_count);
 
         info!(
             worker_count = worker_count,
             local_shards = local_shards,
             cpu_cores = cpu_cores,
             queue_capacity = ORCHESTRATOR_WORKER_QUEUE_CAPACITY,
+            per_worker_queue_capacity = per_worker_queue_capacity,
             "Spawning orchestrator worker pool"
         );
 
         for worker_id in 0..worker_count {
+            let (tx, mut rx) = mpsc::channel::<OrchestratorJob>(per_worker_queue_capacity);
+            worker_txs.push(tx);
             let engine = Arc::clone(&engine);
-            let rx = Arc::clone(&rx);
             tokio::spawn(async move {
                 loop {
-                    // Acquire lock only to dequeue — released immediately
-                    let job = {
-                        let mut guard = rx.lock().await;
-                        guard.recv().await
-                    };
+                    let job = rx.recv().await;
                     match job {
                         Some(OrchestratorJob::Execute { op, reply }) => {
                             let result = engine.execute(op).await;
@@ -3946,12 +4034,13 @@ impl NodeOrchestrator {
             });
         }
 
+        let tx = OrchestratorWorkerTx::new(worker_txs);
         self.engine = Some(engine);
+        self.worker_count = tx.len();
         self.worker_tx = Some(tx);
-        self.worker_count = worker_count;
 
         info!(
-            worker_count = worker_count,
+            worker_count = self.worker_count,
             "Orchestrator worker pool started"
         );
     }
@@ -3971,12 +4060,7 @@ impl NodeOrchestrator {
             worker_count = self.worker_count,
             "Shutting down orchestrator worker pool"
         );
-        for _ in 0..self.worker_count {
-            if tx.send(OrchestratorJob::Shutdown).await.is_err() {
-                // Channel is already closed; workers are already stopping.
-                break;
-            }
-        }
+        tx.send_shutdown().await;
     }
 
     /// Publish updated shard map and routing ring to the engine's ArcSwap fields.

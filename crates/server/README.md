@@ -44,9 +44,9 @@ The `RouterActor` is the primary ingress for database operations on a node.
     - `RoutingDecision::Remote { node_id, peer_addr }`
     - `RoutingDecision::Broadcast`
   - Execute the chosen path:
-    - Local → delegate to `NodeOrchestrator` on this node.
+    - Local → delegate to `NodeOrchestrator` on this node via the hot-path worker pool when eligible.
     - Remote → call `handle_remote` / `try_remote` with retries + timeouts.
-    - Broadcast → fan out to local + remote nodes and aggregate results.
+    - Broadcast → fan out to local + remote nodes with bounded concurrency and aggregate results using score-aware top-K merging.
 - Telemetry:
   - Tracks broadcast attempts and failures via `AtomicU64` counters.
 
@@ -202,13 +202,13 @@ When there is **no routing_key**, or the coordinator chooses `Broadcast` because
 1. Ask `ClusterCoordinator` for known peers via `GetKnownPeers`.
 2. Select up to `broadcast_fanout_limit` peers.
 3. Execute in parallel:
-   - Local `handle_client_op` over local microshards.
-   - Remote `try_remote` calls to selected peers, each wrapped in `timeout(broadcast_timeout, ...)`.
+   - Local `handle_client_op` over local microshards, with shard-level concurrency bounded by `max_concurrent_shard_searches`.
+   - Remote `try_remote` calls to selected peers, each wrapped in `timeout(broadcast_timeout, ...)` and bounded by `max_concurrent_remote_searches`.
 4. Aggregate results:
     - **Search**:
-      - Collect `hits` arrays from all successful responses.
-      - Merge into a single `hits` list capped by the configured `default_search_limit`.
-      - Sort by `_score` descending.
+      - Collect `hits` arrays from successful responses.
+      - Merge into a bounded score-aware top-K set capped by the requested limit.
+      - Allow later higher-scoring remote hits to displace weaker early hits.
       - Report `hits_returned`, `total_hits`, `limit`, plus `total_shards` and `failed_shards`.
    - **Write/BulkWrite**:
      - Report number of nodes contacted, succeeded, and failed.
@@ -216,7 +216,7 @@ When there is **no routing_key**, or the coordinator chooses `Broadcast` because
      - Return first successful result or an aggregated failure.
 5. Update `broadcasts_total` and `broadcast_failures` telemetry counters.
 
-This implements a distributed search/read path suitable for fan-out queries across nodes while preserving timeouts and backpressure.
+This implements a distributed search/read path suitable for fan-out queries across nodes while preserving timeouts, bounded concurrency, and bounded in-memory result merging.
 
 ---
 
@@ -476,7 +476,7 @@ sequenceDiagram
 
     loop up to remote_retry_attempts
         Router->>Router: handle_remote (timeout + retry)
-        Router->>RemoteOrch: Kameo remote ask(ClientOp)\n(via libp2p + kameo::remote::Behaviour)
+        Router->>RemoteOrch: Kameo remote ask(ClientOp) via libp2p and kameo::remote::Behaviour
         RemoteOrch->>RemoteShards: per-shard ops
         RemoteShards->>RemoteShards: redb + Tantivy via spawn_blocking
         RemoteShards-->>RemoteOrch: shard-level replies
@@ -518,7 +518,7 @@ sequenceDiagram
         LocalOrch-->>Router: local JSON result { hits, ... }
     and Remote fan-out
         loop for each selected peer
-            Router->>RemoteOrchN: Kameo remote ask(ClientOp::Search)\n(timeout = broadcast_timeout)
+            Router->>RemoteOrchN: Kameo remote ask(ClientOp::Search) with broadcast_timeout
             RemoteOrchN->>RemoteShardsN: shard-level search
             RemoteShardsN->>RemoteShardsN: Tantivy search via spawn_blocking
             RemoteShardsN-->>RemoteOrchN: hits per shard
@@ -526,7 +526,7 @@ sequenceDiagram
         end
     end
 
-    Router->>Router: merge hits, sort by _score,\ntrack failed_shards
+    Router->>Router: bounded top-K merge by _score and track failed_shards
     Router-->>HTTP: aggregated JSON { hits, total_shards, failed_shards }
     HTTP-->>Client: HTTP response
 ```

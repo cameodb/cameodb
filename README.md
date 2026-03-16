@@ -185,15 +185,16 @@ RouterActor::route_and_handle(routing_key=None)
       Remote node executes same local search path
         │
         ▼
-  ┌─────────────────────────────────┐
-  │  Merge: sort by _score desc,    │
-  │  deduplicate, truncate to limit │
-  └─────────────────────────────────┘
+  ┌──────────────────────────────────────────────┐
+  │  Merge: bounded score-aware top-K merge,     │
+  │  then truncate to the requested limit        │
+  └──────────────────────────────────────────────┘
 ```
 
 **Key characteristics:**
 - Concurrent local + remote execution via `tokio::join!`
-- Early termination: stops collecting remote results once `limit` is reached
+- Bounded shard and remote fan-out using configured concurrency limits
+- Score-aware top-K merge keeps the strongest hits even when better remote results arrive later
 - Configurable `broadcast_timeout` and `broadcast_fanout_limit`
 - Streaming search variant available (`/search/stream`) returning NDJSON
 
@@ -701,7 +702,7 @@ python3 scripts/examples/ingest_books.py --dry-run
 - **Batch Processing**: Atomic bulk operations across shards
 - **Supervised Smart Commits**: Memory-aware commit strategies with eventual durability guarantees
 - **Consistent Hashing**: Optimal data distribution
-- **Streaming Search**: Real-time result streaming for large queries
+- **Streaming Search**: NDJSON search responses with bounded internal fan-out and score-aware top-K merging
 - **Schema Evolution**: Dynamic field addition and validation
 - **Query Timing**: Detailed performance metrics like Lucene/Solr (QTime, component timing)
 
@@ -811,7 +812,7 @@ default_search_limit = 10
 - `node` provides human-friendly identity fields (`label`, `zone`).
 - `network` separates HTTP and cluster transport while clarifying `bind_address`.
 - `storage` centralizes shard configuration plus disk thresholds.
-- `search` exposes indexer memory budgets, streaming search settings, supervisor timeout for auto-commits, and `default_search_limit` for response pagination.
+- `search` exposes indexer memory budgets, streaming search settings, shard/remote search concurrency caps, supervisor timeout for auto-commits, and `default_search_limit` for response pagination.
 
 ## � System Requirements
 
