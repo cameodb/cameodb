@@ -3134,6 +3134,8 @@ async fn load_data_from_csv_single_pass(
                         .unwrap_or(TantivyFieldType::Text);
                     schema.add_shadow_field(id_detection.original_field_name.clone(), field_type);
                 }
+                // Use the same schema detection logic as detect_schema_from_csv
+                // This ensures all fields are marked as indexed (not just evolved as non-indexed)
                 for row in &sample_rows {
                     let mut obj: JsonMap<String, JsonValue> = JsonMap::new();
                     for (idx, value) in row.iter().enumerate() {
@@ -3148,6 +3150,31 @@ async fn load_data_from_csv_single_pass(
                         }
                     }
                     schema.evolve_from_document(&JsonValue::Object(obj));
+                }
+
+                // CRITICAL: Apply the same field indexing logic as detect_schema_from_csv
+                // This ensures all fields are marked as indexed when loading data, not just during schema detection
+                for (name, field_def) in schema.fields.iter_mut() {
+                    // Don't modify shadow fields - they have special requirements
+                    if !field_def.is_shadow {
+                        field_def.indexed = true;
+                        // Only 'id' field should be stored in Tantivy (architecture rule)
+                        field_def.stored = name == "id";
+                    }
+                }
+
+                // Apply type hints where provided
+                for (name, hint) in &headers {
+                    if let Some(t) = hint.clone() {
+                        // Don't overwrite shadow fields - preserve their special status
+                        if !schema.fields.get(name).is_some_and(|f| f.is_shadow) {
+                            // FieldDef::new already sets correct stored/fast flags per architecture
+                            let mut field_def = FieldDef::new(name.clone(), t);
+                            field_def.indexed = true;
+                            // stored flag already set correctly by FieldDef::new (only 'id' = true)
+                            schema.fields.insert(name.clone(), field_def);
+                        }
+                    }
                 }
                 let schema_json =
                     serde_json::to_value(&schema).context("Failed to serialize schema")?;
