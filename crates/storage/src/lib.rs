@@ -1485,11 +1485,14 @@ impl HybridStore {
                 );
                 return Ok(seq);
             }
-            // _seq field exists but couldn't extract value — treat as empty
-            tracing::warn!(
+            // _seq field exists but couldn't extract value from stored fields
+            // CRITICAL: The sort key is u64::MAX - actual_value, so invert it to get the real sequence
+            tracing::error!(
                 index = %index_name,
-                "Found document but could not extract _seq value from stored fields"
+                sort_key = _sort_key,
+                "_seq field not found in stored document - inverting sort key to recover actual value"
             );
+            return Ok(u64::MAX - _sort_key);
         } else {
             tracing::info!(
                 index = %index_name,
@@ -1505,14 +1508,50 @@ impl HybridStore {
     /// Leverages columnar FAST field storage for O(1) access instead of O(n) scanning.
     fn get_highest_indexed_seq(&self, reader: &IndexReader) -> Result<u64, StoreError> {
         let searcher = reader.searcher();
+        let schema = searcher.index().schema();
+        let doc_count = searcher.num_docs();
+
+        // Get the _seq field from schema
+        let seq_field = schema
+            .get_field("_seq")
+            .map_err(|_| StoreError::FieldNotFound("_seq field missing".to_string()))?;
 
         // Get one document sorted by _seq descending to find the highest value
         let top_collector = TopDocs::with_limit(1).order_by_u64_field("_seq", Order::Desc);
         let top_docs = searcher.search(&AllQuery, &top_collector)?;
 
-        // The result is (field_value, doc_address) where field_value is the _seq value
-        if let Some((seq_value, _doc_address)) = top_docs.first() {
-            return Ok(*seq_value);
+        tracing::debug!(
+            doc_count = doc_count,
+            top_docs_len = top_docs.len(),
+            "get_highest_indexed_seq: Tantivy search completed"
+        );
+
+        // CRITICAL: The sort key returned by order_by_u64_field is u64::MAX - actual_value
+        // We must retrieve the actual _seq value from the document's stored fields
+        if let Some((inverted_sort_key, doc_address)) = top_docs.first() {
+            let doc: tantivy::TantivyDocument = searcher.doc(*doc_address)?;
+            if let Some(value) = doc.get_first(seq_field)
+                && let Some(seq) = value.as_u64()
+            {
+                tracing::debug!(
+                    inverted_sort_key = inverted_sort_key,
+                    actual_seq = seq,
+                    doc_address = ?doc_address,
+                    "get_highest_indexed_seq: Retrieved actual _seq from stored fields"
+                );
+                return Ok(seq);
+            } else {
+                tracing::error!(
+                    inverted_sort_key = inverted_sort_key,
+                    doc_address = ?doc_address,
+                    "_seq field not found in stored document - this should never happen! Returning inverted_sort_key which is WRONG"
+                );
+                // CRITICAL BUG: We should NOT return the inverted sort key here
+                // Return u64::MAX - inverted_sort_key to get the actual value
+                return Ok(u64::MAX - inverted_sort_key);
+            }
+        } else {
+            tracing::debug!("get_highest_indexed_seq: No documents found in index");
         }
 
         // No documents found, return 0
@@ -2139,10 +2178,20 @@ impl HybridStore {
         self.fields_cache.insert(index.to_string(), fields.clone());
 
         // Initialize sequence counter for this index if needed
+        // Use the maximum of WAL seq and indexed seq to avoid collisions
         self.current_seq
             .entry(index.to_string())
             .or_insert_with(|| {
-                let max_seq = self.get_max_wal_id_for_index(index).unwrap_or(0);
+                let max_wal_seq = self.get_max_wal_id_for_index(index).unwrap_or(0);
+                let max_indexed_seq = self.get_highest_indexed_seq(&reader).unwrap_or(0);
+                let max_seq = max_wal_seq.max(max_indexed_seq);
+                tracing::debug!(
+                    index = %index,
+                    max_wal_seq = max_wal_seq,
+                    max_indexed_seq = max_indexed_seq,
+                    initialized_seq = max_seq,
+                    "Initialized sequence counter"
+                );
                 AtomicU64::new(max_seq)
             });
 
@@ -2994,16 +3043,27 @@ impl HybridStore {
         match read_txn.open_table(wal_table_def) {
             Ok(wal_table) => {
                 let mut max_id = 0u64;
+                let mut entry_count = 0usize;
                 for result in wal_table.iter()? {
                     let (key, _) = result?;
                     let id = key.value();
+                    entry_count += 1;
                     if id > max_id {
                         max_id = id;
                     }
                 }
+                tracing::debug!(
+                    index = %index,
+                    max_wal_id = max_id,
+                    wal_entries = entry_count,
+                    "Retrieved max WAL ID from redb"
+                );
                 Ok(max_id)
             }
-            Err(_) => Ok(0), // Table doesn't exist yet
+            Err(_) => {
+                tracing::debug!(index = %index, "WAL table does not exist, returning 0");
+                Ok(0) // Table doesn't exist yet
+            }
         }
     }
 
