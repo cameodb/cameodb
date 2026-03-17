@@ -2163,6 +2163,101 @@ impl RouterActor {
         }
     }
 
+    /// Streaming variant of `route_and_handle` for NDJSON search responses.
+    ///
+    /// Returns a bounded `mpsc::Receiver` that yields `Result<Bytes, io::Error>` items.
+    /// Each item is a single NDJSON line: individual hit objects followed by a
+    /// `_footer` metadata line. A background task performs the actual search and
+    /// streams results into the channel, providing:
+    /// - Incremental flushing (each hit serialized and sent individually)
+    /// - Bounded backpressure via channel capacity
+    /// - Early client disconnect detection
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn route_and_handle_stream(
+        &self,
+        op: ClientOp,
+        routing_key: Option<String>,
+        operation_type: OperationType,
+    ) -> mpsc::Receiver<Result<bytes::Bytes, std::io::Error>> {
+        const STREAM_CHANNEL_CAPACITY: usize = 64;
+
+        let (tx, rx) =
+            mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(STREAM_CHANNEL_CAPACITY);
+        let router = self.clone();
+
+        tokio::spawn(async move {
+            let result = router
+                .route_and_handle(op, routing_key, operation_type)
+                .await;
+
+            match result {
+                Ok(val) => {
+                    Self::stream_search_result_as_ndjson(&tx, val).await;
+                }
+                Err(e) => {
+                    let error_line = serde_json::json!({
+                        "_error": true,
+                        "message": e.to_string(),
+                    });
+                    if let Ok(mut bytes) = serde_json::to_vec(&error_line) {
+                        bytes.push(b'\n');
+                        let _ = tx.send(Ok(bytes::Bytes::from(bytes))).await;
+                    }
+                }
+            }
+            // tx dropped here → channel closes → stream ends
+        });
+
+        rx
+    }
+
+    /// Serialize a search result as incremental NDJSON lines into a channel.
+    ///
+    /// Sends each hit as a separate NDJSON line, followed by a footer line
+    /// containing aggregated metadata (total_hits, took_ms, stats, errors).
+    async fn stream_search_result_as_ndjson(
+        tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+        mut val: JsonValue,
+    ) {
+        // Extract the hits array, leaving metadata fields in `val`
+        let hits = val
+            .as_object_mut()
+            .and_then(|o| o.remove("hits"))
+            .and_then(|v| match v {
+                JsonValue::Array(arr) => Some(arr),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        // Stream each hit as an individual NDJSON line
+        for hit in &hits {
+            let mut bytes = match serde_json::to_vec(hit) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            bytes.push(b'\n');
+            if tx.send(Ok(bytes::Bytes::from(bytes))).await.is_err() {
+                return; // Client disconnected
+            }
+        }
+
+        // Build and send the footer line with metadata
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert("_footer".to_string(), JsonValue::Bool(true));
+            // Preserve hits_returned count even though we removed the array
+            if !obj.contains_key("hits_returned") {
+                obj.insert(
+                    "hits_returned".to_string(),
+                    JsonValue::Number(serde_json::Number::from(hits.len())),
+                );
+            }
+        }
+        if let Ok(mut footer_bytes) = serde_json::to_vec(&val) {
+            footer_bytes.push(b'\n');
+            let _ = tx.send(Ok(bytes::Bytes::from(footer_bytes))).await;
+        }
+    }
+
     /// Get the number of active shards (for health check).
     pub async fn shard_count(&self) -> usize {
         // Forward to orchestrator actor

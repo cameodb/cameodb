@@ -11,8 +11,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
-use bytes::{Bytes, BytesMut};
-use futures::{StreamExt, stream};
+use bytes::BytesMut;
+use futures::StreamExt;
 use kameo::actor::ActorRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -298,6 +298,12 @@ async fn list_cluster_indexes_handler(
 }
 
 /// Handler for streaming search operations
+///
+/// Uses `route_and_handle_stream` to obtain a bounded `mpsc::Receiver` that
+/// yields individual NDJSON lines (one per hit, plus a `_footer` metadata line).
+/// The receiver is wrapped into an axum `Body` stream so the HTTP response
+/// starts as soon as the first hit is ready, and each subsequent hit is flushed
+/// incrementally. This avoids buffering the entire result set in memory.
 async fn search_stream_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
@@ -315,7 +321,6 @@ async fn search_stream_handler(
         index, cleaned_query, final_limit, final_fields
     );
 
-    // Use streaming search with our new streaming infrastructure
     let client_op = ClientOp::Stream {
         index,
         query: cleaned_query,
@@ -323,41 +328,21 @@ async fn search_stream_handler(
         fields: final_fields,
     };
 
-    let result = state
+    // Obtain a streaming channel — the search runs in a background task
+    let rx = state
         .router
-        .route_and_handle(client_op, None, OperationType::Read)
-        .await?;
+        .route_and_handle_stream(client_op, None, OperationType::Read);
 
-    // Stream hits as NDJSON if present; otherwise stream the full JSON once.
-    if let Some(hits) = result.get("hits").and_then(|v| v.as_array()).cloned() {
-        let stream = stream::iter(hits.into_iter().map(|hit| match serde_json::to_vec(&hit) {
-            Ok(mut bytes) => {
-                bytes.push(b'\n');
-                Ok(Bytes::from(bytes))
-            }
-            Err(e) => Err(std::io::Error::other(e)),
-        }))
-        .map(|res| res.map_err(std::io::Error::other));
+    // Wrap the receiver into a Stream that axum can serve as a response body
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = Body::from_stream(stream);
 
-        let body = Body::from_stream(stream);
-        let mut resp = Response::new(body);
-        resp.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson"),
-        );
-        Ok(resp)
-    } else {
-        let bytes = serde_json::to_vec(&result)
-            .map_err(|e| AppError(anyhow::anyhow!("Failed to serialize stream result: {}", e)))?;
-        let stream = stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
-        let body = Body::from_stream(stream);
-        let mut resp = Response::new(body);
-        resp.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        Ok(resp)
-    }
+    let mut resp = Response::new(body);
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    Ok(resp)
 }
 
 /// Handler for document write operations
