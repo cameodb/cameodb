@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use reqwest::{Client, Url};
+use reqwest::{Client, Url, header};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -150,6 +150,28 @@ impl CameoClient {
         resp.json()
             .await
             .context("Failed to parse bulk ingest response")
+    }
+
+    pub async fn stream_index_ndjson(&self, index: &str, body: Vec<u8>) -> Result<JsonValue> {
+        let url = self
+            .base_url
+            .join(&format!("api/{}/document/stream", index))
+            .context("Invalid streaming ingest URL")?;
+        let resp = self
+            .http
+            .post(url)
+            .header(header::CONTENT_TYPE, "application/x-ndjson")
+            .body(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Streaming ingest failed: {} - {}", status, text);
+        }
+        resp.json()
+            .await
+            .context("Failed to parse streaming ingest response")
     }
 
     /// Expose underlying HTTP client for auxiliary requests (e.g., fetching CSV schema samples)
