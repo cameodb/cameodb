@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, stream};
 use kameo::actor::ActorRef;
 use serde::{Deserialize, Serialize};
@@ -139,6 +139,8 @@ pub struct HealthResponse {
 pub struct AppState {
     pub router: RouterActor,
     pub coordinator: ActorRef<ClusterCoordinator>,
+    /// Number of documents per micro-batch for NDJSON write-stream ingestion
+    pub stream_batch_size: usize,
 }
 
 /// Creates the main HTTP router with all endpoints and middleware
@@ -445,67 +447,118 @@ async fn bulk_write_handler(
 }
 
 /// Handler for streaming document write operations (NDJSON input)
+///
+/// Reads the request body incrementally, splitting on newlines to decode
+/// `DocPayload` items one at a time. Documents are accumulated into
+/// micro-batches of `stream_batch_size` and each batch is dispatched
+/// through the normal routing path as a `BulkWrite`. This keeps peak
+/// memory bounded regardless of total import size.
 async fn write_stream_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, AppError> {
     info!("Write stream request - index: {}", index);
 
-    // Parse NDJSON body into individual documents
-    let mut docs = Vec::new();
-    let mut line_count = 0;
+    let batch_size = state.stream_batch_size.max(1);
 
-    for line in body.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
+    // Aggregate counters across all micro-batches
+    let mut total_items_written: u64 = 0;
+    let mut total_errors: Vec<String> = Vec::new();
+    let mut total_line_count: usize = 0;
+    let mut batches_dispatched: usize = 0;
+
+    // Buffer for incomplete trailing line across body chunks
+    let mut buf = BytesMut::new();
+    // Current micro-batch accumulator
+    let mut batch: Vec<DocPayload> = Vec::with_capacity(batch_size);
+
+    let mut body_stream = body.into_data_stream();
+
+    while let Some(chunk_result) = body_stream.next().await {
+        let chunk = chunk_result
+            .map_err(|e| AppError(anyhow::anyhow!("Failed to read request body chunk: {}", e)))?;
+
+        buf.extend_from_slice(&chunk);
+
+        // Process all complete lines in the buffer
+        while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
+            let line = buf.split_to(newline_pos + 1);
+            let line = &line[..line.len() - 1]; // trim trailing newline
+            if line.is_empty() {
+                continue;
+            }
+
+            total_line_count += 1;
+            let doc_payload: DocPayload = serde_json::from_slice(line).map_err(|e| {
+                AppError(anyhow::anyhow!(
+                    "Failed to parse document on line {}: {}",
+                    total_line_count,
+                    e
+                ))
+            })?;
+            batch.push(doc_payload);
+
+            // Flush the micro-batch when it reaches the configured size
+            if batch.len() >= batch_size {
+                let flush_result = flush_write_batch(
+                    &state,
+                    &index,
+                    std::mem::replace(&mut batch, Vec::with_capacity(batch_size)),
+                )
+                .await;
+                batches_dispatched += 1;
+                accumulate_batch_result(flush_result, &mut total_items_written, &mut total_errors);
+            }
         }
-
-        line_count += 1;
-        let doc_payload: DocPayload = serde_json::from_slice(line).map_err(|e| {
-            AppError(anyhow::anyhow!(
-                "Failed to parse document on line {}: {}",
-                line_count,
-                e
-            ))
-        })?;
-        docs.push(doc_payload);
     }
 
-    if docs.is_empty() {
+    // Handle any remaining data after the last newline (trailing line without \n)
+    if !buf.is_empty() {
+        let line = buf.freeze();
+        if !line.is_empty() {
+            total_line_count += 1;
+            let doc_payload: DocPayload = serde_json::from_slice(&line).map_err(|e| {
+                AppError(anyhow::anyhow!(
+                    "Failed to parse document on line {}: {}",
+                    total_line_count,
+                    e
+                ))
+            })?;
+            batch.push(doc_payload);
+        }
+    }
+
+    // Flush any remaining documents in the final micro-batch
+    if !batch.is_empty() {
+        let flush_result = flush_write_batch(&state, &index, batch).await;
+        batches_dispatched += 1;
+        accumulate_batch_result(flush_result, &mut total_items_written, &mut total_errors);
+    }
+
+    if total_line_count == 0 {
         return Err(AppError(anyhow::anyhow!(
             "No documents found in request body"
         )));
     }
 
     info!(
-        "Write stream processing - index: {}, docs: {}",
+        "Write stream completed - index: {}, lines: {}, batches: {}, written: {}, errors: {}",
         index,
-        docs.len()
+        total_line_count,
+        batches_dispatched,
+        total_items_written,
+        total_errors.len()
     );
 
-    // Derive a routing hint from the first document to avoid cluster-wide broadcast
-    let routing_hint = docs.first().and_then(|doc| {
-        doc.routing_key.clone().or_else(|| {
-            if !doc.id.is_empty() {
-                Some(doc.id.clone())
-            } else {
-                // Fallback: hash the document bytes to keep routing stable
-                serde_json::to_vec(&doc.doc)
-                    .ok()
-                    .map(|bytes| format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes)))
-            }
-        })
+    let result = serde_json::json!({
+        "status": if total_errors.is_empty() { "ok" } else { "partial" },
+        "items_written": total_items_written,
+        "lines_received": total_line_count,
+        "batches": batches_dispatched,
+        "errors": total_errors,
     });
 
-    let client_op = ClientOp::BulkWrite { index, docs };
-
-    let result = state
-        .router
-        .route_and_handle(client_op, routing_hint, OperationType::Write)
-        .await?;
-
-    // Return result as JSON
     let bytes = serde_json::to_vec(&result).map_err(|e| {
         AppError(anyhow::anyhow!(
             "Failed to serialize write stream result: {}",
@@ -519,6 +572,63 @@ async fn write_stream_handler(
         HeaderValue::from_static("application/json"),
     );
     Ok(resp)
+}
+
+/// Derive a routing hint from the first document in a batch.
+fn derive_routing_hint(docs: &[DocPayload]) -> Option<String> {
+    docs.first().and_then(|doc| {
+        doc.routing_key.clone().or_else(|| {
+            if !doc.id.is_empty() {
+                Some(doc.id.clone())
+            } else {
+                serde_json::to_vec(&doc.doc)
+                    .ok()
+                    .map(|bytes| format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes)))
+            }
+        })
+    })
+}
+
+/// Dispatch a single micro-batch of documents through the routing layer.
+async fn flush_write_batch(
+    state: &AppState,
+    index: &str,
+    docs: Vec<DocPayload>,
+) -> Result<JsonValue, crate::node_orchestrator::OrchestratorError> {
+    let routing_hint = derive_routing_hint(&docs);
+    let client_op = ClientOp::BulkWrite {
+        index: index.to_string(),
+        docs,
+    };
+    state
+        .router
+        .route_and_handle(client_op, routing_hint, OperationType::Write)
+        .await
+}
+
+/// Accumulate items_written and errors from a micro-batch result into totals.
+fn accumulate_batch_result(
+    result: Result<JsonValue, crate::node_orchestrator::OrchestratorError>,
+    total_items_written: &mut u64,
+    total_errors: &mut Vec<String>,
+) {
+    match result {
+        Ok(val) => {
+            if let Some(written) = val.get("items_written").and_then(|v| v.as_u64()) {
+                *total_items_written += written;
+            }
+            if let Some(errs) = val.get("errors").and_then(|v| v.as_array()) {
+                for err in errs {
+                    if let Some(msg) = err.as_str() {
+                        total_errors.push(msg.to_string());
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            total_errors.push(format!("Batch dispatch failed: {}", e));
+        }
+    }
 }
 
 /// Handler for creating/updating index configuration/schema

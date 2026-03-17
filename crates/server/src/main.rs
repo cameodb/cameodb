@@ -326,6 +326,7 @@ async fn main() -> Result<()> {
     let app_state = AppState {
         router: router_actor,
         coordinator: coordinator_actor.clone(),
+        stream_batch_size: cameodb_config.search.stream_batch_size,
     };
 
     // Create the HTTP router with shared state and configured body limit

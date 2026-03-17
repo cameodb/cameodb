@@ -273,6 +273,10 @@ pub struct SearchConfig {
     /// Supervisor idle timeout in seconds before auto-commit (default: 10)
     #[serde(default = "default_supervisor_timeout_secs")]
     pub supervisor_timeout_secs: u64,
+
+    /// Number of documents per micro-batch when ingesting NDJSON write streams (default: 500)
+    #[serde(default = "default_stream_batch_size")]
+    pub stream_batch_size: usize,
 }
 
 impl CameoDbConfig {
@@ -619,6 +623,7 @@ impl Default for SearchConfig {
             enable_early_termination: default_enable_early_termination(),
             default_search_limit: default_search_limit(),
             supervisor_timeout_secs: default_supervisor_timeout_secs(),
+            stream_batch_size: default_stream_batch_size(),
         }
     }
 }
@@ -778,6 +783,10 @@ fn default_max_concurrent_remote_searches() -> usize {
 
 fn default_enable_early_termination() -> bool {
     true
+}
+
+fn default_stream_batch_size() -> usize {
+    400
 }
 
 #[cfg(test)]

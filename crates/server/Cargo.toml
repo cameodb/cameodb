@@ -38,6 +38,7 @@ num_cpus = { workspace = true }
 rayon = "1.10"
 libp2p = { workspace = true, features = ["tokio", "tcp", "noise", "yamux", "quic", "macros", "identify", "dns"] }
 xxhash-rust = { workspace = true }
+tokio-util = { workspace = true }
 chrono = { version = "0.4.42", features = ["serde"] }
 
 [dev-dependencies]
