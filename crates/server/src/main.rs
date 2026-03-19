@@ -351,6 +351,8 @@ async fn main() -> Result<()> {
     println!("  GET  /_indexes - List all indexes with statistics");
     println!("  GET  /_cluster/_indexes - List cluster indexes");
     println!("  GET  /_cluster/health - Health check");
+    println!("  GET  /mcp/sse - MCP SSE transport endpoint");
+    println!("  POST /mcp/messages?session_id=... - MCP JSON-RPC message endpoint");
     println!();
     println!("⚙️  Configuration:");
     println!("  Data Paths: {:?}", cameodb_config.storage.data_paths);

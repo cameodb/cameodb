@@ -12,7 +12,8 @@ use axum::{
     routing::{delete, get, patch, post, put},
 };
 use bytes::BytesMut;
-use futures::StreamExt;
+use cameodb_mcp::{McpBackend, McpIndexSearchRequest, mcp_router};
+use futures::{StreamExt, future::BoxFuture};
 use kameo::actor::ActorRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -143,6 +144,731 @@ pub struct AppState {
     pub stream_batch_size: usize,
 }
 
+impl McpBackend for AppState {
+    fn search_index(
+        &self,
+        index: McpIndexSearchRequest,
+        query: String,
+        limit: Option<usize>,
+    ) -> BoxFuture<'_, Result<JsonValue, String>> {
+        let state = self.clone();
+        Box::pin(async move {
+            state
+                .router
+                .route_and_handle(
+                    ClientOp::Search {
+                        index: index.index,
+                        query,
+                        limit,
+                        fields: index.fields,
+                    },
+                    None,
+                    OperationType::Read,
+                )
+                .await
+                .map_err(|err| err.to_string())
+        })
+    }
+
+    fn search_indexes(
+        &self,
+        indexes: Vec<McpIndexSearchRequest>,
+        query: String,
+        limit: Option<usize>,
+    ) -> BoxFuture<'_, Result<JsonValue, String>> {
+        let state = self.clone();
+        Box::pin(async move {
+            let requested_limit = limit.unwrap_or(10);
+            let mut merged_hits = Vec::new();
+            let mut per_index = Vec::new();
+            let mut total_hits = 0u64;
+
+            for index_request in indexes {
+                let McpIndexSearchRequest { index, fields } = index_request;
+                let index_name = index.clone();
+                let result = state
+                    .router
+                    .route_and_handle(
+                        ClientOp::Search {
+                            index,
+                            query: query.clone(),
+                            limit,
+                            fields,
+                        },
+                        None,
+                        OperationType::Read,
+                    )
+                    .await
+                    .map_err(|err| err.to_string())?;
+
+                total_hits += result
+                    .get("total_hits")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+
+                if let Some(hits) = result.get("hits").and_then(|value| value.as_array()) {
+                    for hit in hits {
+                        let mut hit_value = hit.clone();
+                        if let Some(hit_obj) = hit_value.as_object_mut() {
+                            hit_obj.insert(
+                                "_index_source".to_string(),
+                                JsonValue::String(index_name.clone()),
+                            );
+                        }
+                        merged_hits.push(hit_value);
+                    }
+                }
+
+                per_index.push(serde_json::json!({
+                    "index": index_name,
+                    "result": result,
+                }));
+            }
+
+            merged_hits.sort_by(|left, right| {
+                let left_score = left
+                    .get("score")
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(0.0);
+                let right_score = right
+                    .get("score")
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(0.0);
+                right_score
+                    .partial_cmp(&left_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            merged_hits.truncate(requested_limit);
+            let hits_returned = merged_hits.len();
+
+            Ok(serde_json::json!({
+                "hits": merged_hits,
+                "hits_returned": hits_returned,
+                "total_hits": total_hits,
+                "limit": requested_limit,
+                "results_by_index": per_index,
+            }))
+        })
+    }
+
+    fn get_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, String>> {
+        let state = self.clone();
+        Box::pin(async move {
+            let schema = state
+                .router
+                .handle_client_op(ClientOp::GetConfig {
+                    index: index.clone(),
+                })
+                .await
+                .map_err(|err| err.to_string())?;
+
+            let listing = state
+                .router
+                .handle_client_op(ClientOp::ListIndexes {
+                    include_data_size: true,
+                })
+                .await
+                .map_err(|err| err.to_string())?;
+
+            let stats = listing
+                .get("indexes")
+                .and_then(|value| value.as_array())
+                .and_then(|indexes| {
+                    indexes.iter().find(|item| {
+                        item.get("name")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|name| name == index)
+                    })
+                })
+                .cloned()
+                .ok_or_else(|| format!("Index '{}' not found", index))?;
+
+            Ok(serde_json::json!({
+                "index": index,
+                "stats": stats,
+                "schema": schema,
+            }))
+        })
+    }
+
+    fn list_indexes(&self) -> BoxFuture<'_, Result<JsonValue, String>> {
+        let state = self.clone();
+        Box::pin(async move {
+            let listing = state
+                .router
+                .handle_client_op(ClientOp::ListIndexes {
+                    include_data_size: true,
+                })
+                .await
+                .map_err(|err| err.to_string())?;
+
+            let indexes = listing
+                .get("indexes")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let mut enriched = Vec::with_capacity(indexes.len());
+            for stats in indexes {
+                let index_name = stats
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| "Index entry missing name".to_string())?
+                    .to_string();
+
+                let schema = state
+                    .router
+                    .handle_client_op(ClientOp::GetConfig {
+                        index: index_name.clone(),
+                    })
+                    .await
+                    .map_err(|err| err.to_string())?;
+
+                enriched.push(serde_json::json!({
+                    "index": index_name,
+                    "stats": stats,
+                    "schema": schema,
+                }));
+            }
+
+            let total_indexes = enriched.len();
+
+            Ok(serde_json::json!({
+                "indexes": enriched,
+                "total_indexes": total_indexes,
+                "node_id": listing.get("node_id").cloned().unwrap_or(JsonValue::Null),
+                "node_name": listing.get("node_name").cloned().unwrap_or(JsonValue::Null),
+                "total_shards": listing.get("total_shards").cloned().unwrap_or(JsonValue::Null),
+                "took_ms": listing.get("took_ms").cloned().unwrap_or(JsonValue::Null),
+            }))
+        })
+    }
+
+    fn validate_query(
+        &self,
+        index: Option<String>,
+        partial_field: Option<String>,
+        query: Option<String>,
+    ) -> BoxFuture<'_, Result<JsonValue, String>> {
+        let state = self.clone();
+        Box::pin(async move {
+            let index_details = if let Some(index_name) = index.clone() {
+                Some(state.get_index(index_name).await?)
+            } else {
+                None
+            };
+
+            let field_infos = index_details
+                .as_ref()
+                .map(extract_field_info)
+                .unwrap_or_default();
+
+            let field_names: Vec<String> =
+                field_infos.iter().map(|info| info.name.clone()).collect();
+
+            // Field suggestions from partial input
+            let field_suggestions = partial_field
+                .as_ref()
+                .map(|partial| {
+                    let partial_lower = partial.to_lowercase();
+                    field_infos
+                        .iter()
+                        .filter(|info| {
+                            let name_lower = info.name.to_lowercase();
+                            name_lower.starts_with(&partial_lower)
+                                || name_lower.contains(&partial_lower)
+                        })
+                        .map(|info| {
+                            serde_json::json!({
+                                "field": info.name,
+                                "type": info.field_type,
+                                "indexed": info.indexed,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            // Field-type-aware schema summary
+            let fields_with_types: Vec<JsonValue> = field_infos
+                .iter()
+                .filter(|info| !info.is_shadow && info.name != "_seq")
+                .map(|info| {
+                    let hint = field_type_query_hint(&info.field_type);
+                    serde_json::json!({
+                        "field": info.name,
+                        "type": info.field_type,
+                        "indexed": info.indexed,
+                        "queryable": info.indexed && !info.is_shadow,
+                        "query_hint": hint,
+                    })
+                })
+                .collect();
+
+            // Query analysis with structural validation
+            let query_analysis = query
+                .as_ref()
+                .map(|query_text| analyze_query(query_text, &field_infos));
+
+            Ok(serde_json::json!({
+                "index": index,
+                "field_suggestions": field_suggestions,
+                "query_analysis": query_analysis,
+                "syntax_reference": cameodb_syntax_reference(),
+                "available_fields": fields_with_types,
+                "searchable_field_names": field_names,
+            }))
+        })
+    }
+
+    fn get_index_stats(&self, index: Option<String>) -> BoxFuture<'_, Result<JsonValue, String>> {
+        let state = self.clone();
+        Box::pin(async move {
+            if let Some(index_name) = index {
+                let details = state.get_index(index_name.clone()).await?;
+                let stats = details.get("stats").cloned().unwrap_or(JsonValue::Null);
+                let field_names = extract_field_names(&details);
+                let field_count = field_names.len();
+
+                return Ok(serde_json::json!({
+                    "scope": "single_index",
+                    "index": index_name,
+                    "field_count": field_count,
+                    "field_names": field_names,
+                    "stats": stats,
+                }));
+            }
+
+            let listing = state.list_indexes().await?;
+            let indexes = listing
+                .get("indexes")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let mut total_documents = 0u64;
+            let mut total_size_bytes = 0u64;
+            let mut total_fields = 0usize;
+
+            for item in &indexes {
+                if let Some(stats) = item.get("stats") {
+                    total_documents += stats
+                        .get("document_count")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    total_size_bytes += stats
+                        .get("total_size_bytes")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                }
+
+                total_fields += extract_field_names(item).len();
+            }
+
+            Ok(serde_json::json!({
+                "scope": "all_indexes",
+                "total_indexes": indexes.len(),
+                "total_documents": total_documents,
+                "total_size_bytes": total_size_bytes,
+                "total_fields": total_fields,
+                "indexes": indexes,
+            }))
+        })
+    }
+
+    fn list_resources(&self) -> BoxFuture<'_, Result<JsonValue, String>> {
+        let state = self.clone();
+        Box::pin(async move {
+            let listing = state.list_indexes().await?;
+            let indexes = listing
+                .get("indexes")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let mut resources = vec![resource_descriptor(
+                "cameodb://indexes".to_string(),
+                "CameoDB Index Catalog".to_string(),
+                "All available CameoDB indexes with schema and metadata.".to_string(),
+            )];
+
+            for item in indexes {
+                let index_name = item
+                    .get("index")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| "Index entry missing index name".to_string())?
+                    .to_string();
+
+                resources.push(resource_descriptor(
+                    format!("cameodb://indexes/{index_name}"),
+                    format!("Index {index_name}"),
+                    format!("Metadata resource for CameoDB index '{index_name}'."),
+                ));
+                resources.push(resource_descriptor(
+                    format!("cameodb://indexes/{index_name}/schema"),
+                    format!("Index {index_name} Schema"),
+                    format!("Schema resource for CameoDB index '{index_name}'."),
+                ));
+                resources.push(resource_descriptor(
+                    format!("cameodb://indexes/{index_name}/stats"),
+                    format!("Index {index_name} Statistics"),
+                    format!("Statistics resource for CameoDB index '{index_name}'."),
+                ));
+            }
+
+            Ok(JsonValue::Array(resources))
+        })
+    }
+
+    fn read_resource(&self, uri: String) -> BoxFuture<'_, Result<JsonValue, String>> {
+        let state = self.clone();
+        Box::pin(async move {
+            if uri == "cameodb://indexes" {
+                return state.list_indexes().await;
+            }
+
+            let resource = uri
+                .strip_prefix("cameodb://indexes/")
+                .ok_or_else(|| format!("Unsupported resource URI: {uri}"))?;
+
+            if let Some(index_name) = resource.strip_suffix("/schema") {
+                let details = state.get_index(index_name.to_string()).await?;
+                return Ok(details.get("schema").cloned().unwrap_or(JsonValue::Null));
+            }
+
+            if let Some(index_name) = resource.strip_suffix("/stats") {
+                return state.get_index_stats(Some(index_name.to_string())).await;
+            }
+
+            state.get_index(resource.to_string()).await
+        })
+    }
+}
+
+fn resource_descriptor(uri: String, name: String, description: String) -> JsonValue {
+    serde_json::json!({
+        "uri": uri,
+        "name": name,
+        "description": description,
+        "mimeType": "application/json",
+    })
+}
+
+#[derive(Debug, Clone)]
+struct FieldInfo {
+    name: String,
+    field_type: String,
+    indexed: bool,
+    is_shadow: bool,
+}
+
+fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
+    let fields_obj = value
+        .get("schema")
+        .and_then(|schema| schema.get("fields"))
+        .and_then(|fields| fields.as_object())
+        .or_else(|| value.get("fields").and_then(|fields| fields.as_object()));
+
+    let Some(fields_obj) = fields_obj else {
+        return Vec::new();
+    };
+
+    let mut infos: Vec<FieldInfo> = fields_obj
+        .iter()
+        .map(|(name, def)| FieldInfo {
+            name: name.clone(),
+            field_type: def
+                .get("field_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("text")
+                .to_string(),
+            indexed: def.get("indexed").and_then(|v| v.as_bool()).unwrap_or(true),
+            is_shadow: def
+                .get("is_shadow")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        })
+        .collect();
+
+    infos.sort_by(
+        |left, right| match (left.name.as_str(), right.name.as_str()) {
+            ("id", "id") => std::cmp::Ordering::Equal,
+            ("id", _) => std::cmp::Ordering::Less,
+            (_, "id") => std::cmp::Ordering::Greater,
+            _ => left.name.cmp(&right.name),
+        },
+    );
+
+    infos
+}
+
+fn extract_field_names(value: &JsonValue) -> Vec<String> {
+    extract_field_info(value)
+        .into_iter()
+        .map(|info| info.name)
+        .collect()
+}
+
+fn field_type_query_hint(field_type: &str) -> &'static str {
+    match field_type {
+        "text" => "Full-text search with tokenization. Use field:value or field:\"phrase query\".",
+        "string" | "exact" => "Exact match only (no tokenization). Use field:exact_value.",
+        "i64" | "u64" | "f64" => {
+            "Numeric field. Use field:value or range field:[low TO high]. Supports * for open bounds."
+        }
+        "date" => {
+            "Date field. Use field:2024-01-15, field:>2024-01-01, or field:[2024-01-01 TO 2024-12-31]. Accepts YYYY-MM-DD or RFC3339."
+        }
+        "boolean" => "Boolean field. Use field:true or field:false.",
+        "ip" => "IP address field. Use field:192.168.1.1.",
+        "json" => "JSON object field. Use field.subfield:value for nested access.",
+        "facet" => "Facet/category field. Use field:/path/to/category.",
+        _ => "Use field:value syntax.",
+    }
+}
+
+fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> JsonValue {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut suggestions: Vec<String> = Vec::new();
+
+    // Structural checks
+    let quote_count = query_text.chars().filter(|ch| *ch == '"').count();
+    if quote_count % 2 != 0 {
+        warnings.push(
+            "Unbalanced quotes detected. Phrase queries require matching double quotes."
+                .to_string(),
+        );
+    }
+
+    let open_parens = query_text.chars().filter(|ch| *ch == '(').count();
+    let close_parens = query_text.chars().filter(|ch| *ch == ')').count();
+    if open_parens != close_parens {
+        warnings.push(format!(
+            "Unbalanced parentheses: {} opening vs {} closing.",
+            open_parens, close_parens
+        ));
+    }
+
+    // Check for inline modifiers (return/limit)
+    let parts: Vec<&str> = query_text.split_whitespace().collect();
+    let has_return = parts
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("return"));
+    let has_limit = parts
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("limit"));
+
+    if has_return {
+        suggestions.push("Query uses inline 'return' for field projection. You can also pass fields via the tool's 'fields' parameter.".to_string());
+    }
+    if has_limit {
+        suggestions.push(
+            "Query uses inline 'limit'. You can also pass limit via the tool's 'limit' parameter."
+                .to_string(),
+        );
+    }
+
+    // Extract field references (handle phrases and parens gracefully)
+    let referenced_fields = extract_query_fields(query_text);
+
+    let indexed_names: Vec<&str> = field_infos
+        .iter()
+        .filter(|info| info.indexed && !info.is_shadow)
+        .map(|info| info.name.as_str())
+        .collect();
+
+    let all_names: Vec<&str> = field_infos.iter().map(|info| info.name.as_str()).collect();
+
+    let mut recognized = Vec::new();
+    let mut unknown = Vec::new();
+    let mut not_indexed = Vec::new();
+    let mut field_hints = Vec::new();
+
+    for field_name in &referenced_fields {
+        if indexed_names.contains(&field_name.as_str()) {
+            recognized.push(field_name.clone());
+            if let Some(info) = field_infos.iter().find(|i| i.name == *field_name) {
+                field_hints.push(serde_json::json!({
+                    "field": field_name,
+                    "type": info.field_type,
+                    "hint": field_type_query_hint(&info.field_type),
+                }));
+            }
+        } else if all_names.contains(&field_name.as_str()) {
+            not_indexed.push(field_name.clone());
+            warnings.push(format!(
+                "Field '{}' exists but is not indexed. Queries against it will not match.",
+                field_name
+            ));
+        } else {
+            unknown.push(field_name.clone());
+        }
+    }
+
+    if !unknown.is_empty() && !all_names.is_empty() {
+        for unk in &unknown {
+            let unk_lower = unk.to_lowercase();
+            let close_matches: Vec<&str> = indexed_names
+                .iter()
+                .filter(|known| {
+                    let known_lower = known.to_lowercase();
+                    known_lower.starts_with(&unk_lower)
+                        || unk_lower.starts_with(&known_lower)
+                        || known_lower.contains(&unk_lower)
+                        || unk_lower.contains(&known_lower)
+                })
+                .copied()
+                .collect();
+            if !close_matches.is_empty() {
+                suggestions.push(format!(
+                    "Unknown field '{}'. Did you mean: {}?",
+                    unk,
+                    close_matches.join(", ")
+                ));
+            } else {
+                warnings.push(format!(
+                    "Unknown field '{}'. Available indexed fields: {}.",
+                    unk,
+                    indexed_names.join(", ")
+                ));
+            }
+        }
+    }
+
+    serde_json::json!({
+        "query": query_text,
+        "recognized_fields": recognized,
+        "unknown_fields": unknown,
+        "not_indexed_fields": not_indexed,
+        "field_hints": field_hints,
+        "warnings": warnings,
+        "suggestions": suggestions,
+    })
+}
+
+fn extract_query_fields(query: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let reserved = ["AND", "OR", "NOT", "TO", "return", "limit"];
+    let chars: Vec<char> = query.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        match chars[i] {
+            '"' => {
+                // Skip quoted strings
+                i += 1;
+                while i < len && chars[i] != '"' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '(' | ')' | '[' | ']' => {
+                i += 1;
+            }
+            _ if chars[i].is_alphanumeric() || chars[i] == '_' => {
+                let start = i;
+                while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.')
+                {
+                    i += 1;
+                }
+                let token = &query[start..i];
+
+                // Check if followed by ':' (field reference)
+                if i < len && chars[i] == ':' {
+                    if !reserved.iter().any(|kw| kw.eq_ignore_ascii_case(token))
+                        && !fields.contains(&token.to_string())
+                    {
+                        fields.push(token.to_string());
+                    }
+                    i += 1; // skip the colon
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    fields
+}
+
+fn cameodb_syntax_reference() -> JsonValue {
+    serde_json::json!({
+        "basic_search": {
+            "description": "Search across all indexed text fields",
+            "examples": ["rust database", "machine learning"]
+        },
+        "field_targeted": {
+            "description": "Search a specific field",
+            "examples": ["title:rust", "author:doe"]
+        },
+        "phrase_query": {
+            "description": "Match an exact phrase (in order)",
+            "examples": ["title:\"rust programming\"", "description:\"machine learning\""]
+        },
+        "boolean_operators": {
+            "description": "Combine conditions with AND, OR, NOT (must be uppercase)",
+            "examples": [
+                "title:rust AND author:doe",
+                "title:rust OR title:go",
+                "title:rust NOT author:smith",
+                "(title:rust OR title:go) AND year:[2020 TO 2024]"
+            ]
+        },
+        "range_queries": {
+            "description": "Match values in a range. Use * for open bounds",
+            "examples": [
+                "year:[2020 TO 2024]",
+                "price:[10.0 TO *]",
+                "age:[* TO 30]"
+            ]
+        },
+        "date_queries": {
+            "description": "Query date fields with YYYY-MM-DD or RFC3339 format. Supports comparisons and ranges",
+            "examples": [
+                "created_at:2024-01-15",
+                "created_at:>2024-01-01",
+                "created_at:<2024-12-31",
+                "created_at:[2024-01-01 TO 2024-12-31]"
+            ]
+        },
+        "exact_id_lookup": {
+            "description": "Direct document lookup by ID (bypasses full-text search for speed)",
+            "examples": ["id:my-document-id"]
+        },
+        "inline_modifiers": {
+            "description": "CameoDB-specific query modifiers appended to the query string",
+            "return_fields": {
+                "syntax": "return field1,field2",
+                "description": "Project only specific fields in results",
+                "example": "title:rust return title,author,year"
+            },
+            "limit_results": {
+                "syntax": "limit N",
+                "description": "Limit the number of results returned",
+                "example": "title:rust limit 5"
+            },
+            "combined": {
+                "example": "title:rust AND author:doe return title,author limit 10"
+            }
+        },
+        "field_types": {
+            "text": "Tokenized full-text search. Supports phrases and boolean queries.",
+            "string": "Exact match only (raw tokenizer, no splitting).",
+            "exact": "Exact match with multi-value support (raw tokenizer).",
+            "i64": "Signed 64-bit integer. Supports range queries.",
+            "u64": "Unsigned 64-bit integer. Supports range queries.",
+            "f64": "64-bit floating point. Supports range queries.",
+            "date": "Date/datetime. Auto-normalizes common formats to RFC3339.",
+            "boolean": "Boolean true/false.",
+            "ip": "IP address.",
+            "json": "Nested JSON object. Query with dot notation (field.subfield:value).",
+            "facet": "Hierarchical category. Query with /path/syntax."
+        }
+    })
+}
+
 /// Creates the main HTTP router with all endpoints and middleware
 ///
 /// # Arguments
@@ -151,6 +877,7 @@ pub struct AppState {
 pub fn create_router(state: AppState, max_body_size_mb: usize) -> Router {
     let body_limit_bytes = max_body_size_mb * 1024 * 1024;
     Router::new()
+        .nest("/mcp", mcp_router::<AppState>())
         // API routes
         .route("/api/{index}/search", post(search_handler))
         .route("/api/{index}/search/stream", post(search_stream_handler))
