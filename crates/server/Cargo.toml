@@ -1,6 +1,6 @@
 [package]
 name = "server"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "FSL-1.1-Apache-2.0"
 description = "A high-performance distributed hybrid-search database"
@@ -20,7 +20,7 @@ redb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = "0.1"
+tokio-stream = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 http-body-util = { workspace = true }
@@ -40,11 +40,11 @@ rayon = "1.10"
 libp2p = { workspace = true, features = ["tokio", "tcp", "noise", "yamux", "quic", "macros", "identify", "dns"] }
 xxhash-rust = { workspace = true }
 tokio-util = { workspace = true }
-chrono = { version = "0.4.42", features = ["serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 
 [dev-dependencies]
-tempfile = "3.8"
-axum-test = "15.0"
+tempfile = "3.27.0"
+axum-test = "19.1.1"
 
 [package.metadata.generate-rpm]
 release = "1"
