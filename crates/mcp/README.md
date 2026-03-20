@@ -10,9 +10,10 @@ The `cameodb_mcp` crate provides a standards-compliant MCP server that exposes C
 
 - **Shared-Port Design**: MCP endpoints are nested under `/mcp` in the main CameoDB HTTP server
 - **No Separate Process**: Runs in the same binary as CameoDB, sharing the same `AppState` and actor system
-- **Transport**: HTTP/SSE for real-time bidirectional communication
-- **Protocol**: JSON-RPC 2.0 over SSE
-- **Session Management**: Automatic session registry with cleanup
+- **Transport**: HTTP/SSE with strict MCP spec compliance (2024-11-05)
+- **Protocol**: JSON-RPC 2.0 over SSE with proper event types
+- **Session Management**: Automatic session registry with 5-minute timeout cleanup
+- **Asynchronous Processing**: Non-blocking POST requests with background task execution
 
 ### Key Features
 
@@ -22,6 +23,9 @@ The `cameodb_mcp` crate provides a standards-compliant MCP server that exposes C
 - ✅ **Federated Search** across multiple indexes
 - ✅ **Per-Index Field Projection** for efficient data retrieval
 - ✅ **Read-Only Operations** (all tools are annotated as `readOnlyHint: true`)
+- ✅ **MCP Spec Compliant** (2024-11-05) with proper SSE event handling
+- ✅ **Asynchronous Processing** - non-blocking POST with 202 Accepted response
+- ✅ **Automatic Session Cleanup** with configurable timeout (5 minutes)
 
 ## MCP Tools
 
@@ -335,17 +339,32 @@ npx @modelcontextprotocol/inspector http://localhost:9480/mcp/sse
 
 ### Transport Layer
 
-The MCP server uses HTTP/SSE transport:
+The MCP server uses HTTP/SSE transport with strict MCP specification compliance:
 
-- **SSE Endpoint**: `GET /mcp/sse` — Establishes SSE connection and returns session ID
-- **Message Endpoint**: `POST /mcp/messages?session_id={id}` — Receives JSON-RPC messages
+- **SSE Endpoint**: `GET /mcp/sse` — Establishes SSE connection and emits `endpoint` event
+- **Message Endpoint**: `POST /mcp/messages?session_id={id}` — Receives JSON-RPC messages (returns 202 Accepted)
+
+### MCP Specification Compliance
+
+The implementation follows the official MCP HTTP/SSE transport specification (version 2024-11-05):
+
+#### SSE Handshake
+1. Client connects to `/mcp/sse`
+2. Server emits `endpoint` event with POST endpoint URL: `event: endpoint\ndata: /mcp/messages?session_id=xxx`
+3. Client uses this URL for message posting
+
+#### Asynchronous Message Processing
+1. Client POSTs JSON-RPC message to `/mcp/messages?session_id=xxx`
+2. Server immediately returns `202 Accepted` (non-blocking)
+3. Server processes message in background task
+4. Server sends response as `message` event: `event: message\ndata: {json-rpc-response}`
 
 ### Session Management
 
-- Sessions are created on SSE connection
-- Each session gets a unique ID: `mcp-session-{counter}`
-- Sessions are automatically cleaned up when the SSE connection closes
-- Keepalive messages sent every 15 seconds
+- Sessions are created on SSE connection with unique ID: `mcp-session-{counter}`
+- Server emits structured `Event` objects (not raw strings) for proper MCP compliance
+- Sessions are automatically cleaned up after 5 minutes of inactivity
+- Keepalive messages sent every 15 seconds to maintain connection
 
 ### JSON-RPC Methods
 
@@ -455,6 +474,22 @@ cargo test -p cameodb_mcp
 ```bash
 cargo clippy -p cameodb_mcp -- -D warnings
 ```
+
+### Recent Changes (v0.1.0)
+
+#### MCP Specification Compliance
+- **Fixed SSE Handshake**: Now emits proper `endpoint` event per MCP spec
+- **Asynchronous POST Processing**: Returns `202 Accepted` immediately, processes in background
+- **Structured Events**: Uses Axum SSE `Event` objects instead of raw strings
+- **Session Cleanup**: 5-minute timeout with automatic cleanup
+- **Error Handling**: Graceful handling of dropped receivers in async tasks
+
+#### Technical Improvements
+- Removed unused `MessageAck` struct
+- Updated channel types from `String` to `Event`
+- Added proper event type mapping (`endpoint`, `message`)
+- Non-blocking message processing with `tokio::spawn`
+- Improved logging for debug scenarios
 
 ### Integration with Main Server
 

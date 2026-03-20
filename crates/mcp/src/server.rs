@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, warn};
+use tracing::debug;
 
 #[derive(Clone, Default)]
 struct McpTransportState {
@@ -24,17 +24,19 @@ struct McpTransportState {
 #[derive(Default)]
 struct McpTransportInner {
     next_session_id: u64,
-    sessions: HashMap<String, mpsc::UnboundedSender<String>>,
+    sessions: HashMap<String, McpSession>,
+}
+
+#[derive(Clone)]
+struct McpSession {
+    sender: mpsc::UnboundedSender<Event>,
+    #[allow(dead_code)] // Used for future session analytics and debugging
+    created_at: std::time::Instant,
+    last_activity: std::time::Instant,
 }
 
 #[derive(Debug, Deserialize)]
 struct MessageQuery {
-    session_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct MessageAck {
-    ok: bool,
     session_id: String,
 }
 
@@ -145,6 +147,27 @@ where
 {
     let transport_state = McpTransportState::default();
 
+    // Start global session cleanup task
+    let cleanup_state = transport_state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let mut inner = cleanup_state.inner.lock().await;
+            let now = std::time::Instant::now();
+            let timeout = Duration::from_secs(300); // 5 minutes timeout
+
+            // Remove inactive sessions
+            inner.sessions.retain(|session_id, session| {
+                let is_active = now.duration_since(session.last_activity) < timeout;
+                if !is_active {
+                    debug!(session_id = %session_id, "Cleaning up inactive MCP session");
+                }
+                is_active
+            });
+        }
+    });
+
     Router::new()
         .route("/sse", get(mcp_sse_handler))
         .route(
@@ -169,27 +192,32 @@ async fn mcp_sse_handler(
         inner.next_session_id += 1;
         let session_id = format!("mcp-session-{}", inner.next_session_id);
         let (tx, rx) = mpsc::unbounded_channel();
-        inner.sessions.insert(session_id.clone(), tx.clone());
+        let now = std::time::Instant::now();
 
-        let ready = json!({
-            "session_id": session_id,
-            "message_endpoint": "/mcp/messages",
-        })
-        .to_string();
+        let session = McpSession {
+            sender: tx.clone(),
+            created_at: now,
+            last_activity: now,
+        };
 
-        let _ = tx.send(ready);
+        inner.sessions.insert(session_id.clone(), session);
+
+        // Emit "endpoint" event per MCP spec
+        let endpoint_url = format!("/mcp/messages?session_id={}", session_id);
+        let endpoint_event = Event::default().event("endpoint").data(endpoint_url);
+
+        let _ = tx.send(endpoint_event);
         (session_id, rx)
     };
 
     debug!(session_id = %session_id, "MCP SSE session opened");
 
-    let stream = UnboundedReceiverStream::new(rx)
-        .map(|payload| Ok(Event::default().event("message").data(payload)));
+    let stream = UnboundedReceiverStream::new(rx).map(Ok);
 
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
-            .text("keepalive"),
+            .text("keepalive"), // Axum handles SSE formatting automatically
     )
 }
 
@@ -199,46 +227,42 @@ async fn process_mcp_message<B: McpBackend>(
     state: McpTransportState,
     payload: JsonValue,
 ) -> impl IntoResponse {
-    let sender = {
-        let inner = state.inner.lock().await;
-        inner.sessions.get(&query.session_id).cloned()
+    let session = {
+        let mut inner = state.inner.lock().await;
+        if let Some(session) = inner.sessions.get_mut(&query.session_id) {
+            session.last_activity = std::time::Instant::now();
+            Some(session.clone())
+        } else {
+            None
+        }
     };
 
-    match sender {
-        Some(tx) => {
-            let maybe_response = match serde_json::from_value::<JsonRpcRequest>(payload) {
-                Ok(request) => handle_rpc_request(app_state, request).await,
-                Err(err) => Some(error_response(
-                    None,
-                    -32600,
-                    format!("Invalid JSON-RPC request: {err}"),
-                )),
-            };
+    match session {
+        Some(mcp_session) => {
+            let sender = mcp_session.sender.clone();
+            let session_id = query.session_id.clone();
 
-            if let Some(envelope) = maybe_response
-                && tx.send(envelope.to_string()).is_err()
-            {
-                warn!(session_id = %query.session_id, "MCP session receiver dropped before message delivery");
-                let mut inner = state.inner.lock().await;
-                inner.sessions.remove(&query.session_id);
-                return (
-                    axum::http::StatusCode::GONE,
-                    Json(json!({
-                        "error": "MCP session is no longer active",
-                        "session_id": query.session_id,
-                    })),
-                )
-                    .into_response();
-            }
+            // Spawn background task to process message asynchronously
+            tokio::spawn(async move {
+                let maybe_response = match serde_json::from_value::<JsonRpcRequest>(payload) {
+                    Ok(request) => handle_rpc_request(app_state, request).await,
+                    Err(err) => Some(error_response(
+                        None,
+                        -32600,
+                        format!("Invalid JSON-RPC request: {err}"),
+                    )),
+                };
 
-            (
-                axum::http::StatusCode::ACCEPTED,
-                Json(json!(MessageAck {
-                    ok: true,
-                    session_id: query.session_id,
-                })),
-            )
-                .into_response()
+                if let Some(envelope) = maybe_response {
+                    let event = Event::default().event("message").data(envelope.to_string());
+                    if sender.send(event).is_err() {
+                        debug!(session_id = %session_id, "MCP session receiver dropped during async processing");
+                    }
+                }
+            });
+
+            // Return 202 Accepted immediately per MCP spec
+            axum::http::StatusCode::ACCEPTED.into_response()
         }
         None => (
             axum::http::StatusCode::NOT_FOUND,
@@ -299,6 +323,7 @@ where
         // --- Notifications (no response per JSON-RPC spec) ---
         "notifications/initialized" | "notifications/cancelled" => {
             debug!(method = %request.method, "MCP notification received");
+            // Don't send response for notifications per JSON-RPC spec
             None
         }
 
@@ -428,7 +453,7 @@ fn mcp_tools() -> Vec<JsonValue> {
         json!({
             "name": "search_index",
             "title": "Search Index",
-            "description": "Execute full-text search on a single CameoDB index. Query syntax supports field:value targeting, phrase queries (field:\"words\"), boolean operators (AND, OR, NOT), grouping with parentheses, range queries (field:[low TO high]), and date comparisons (field:>2024-01-01). The query string also supports inline 'return field1,field2' for field projection and 'limit N' for result count.",
+            "description": "Execute full-text search on a single CameoDB index. Query syntax supports field:value targeting, phrase queries (field:\"words\"), boolean operators (AND, OR, NOT), grouping with parentheses, range queries (field:[low TO high]), and date comparisons (field:>2024-01-01). \n\nPRO TIPS FOR AGENTS:\n1. Use Tantivy boosting to improve relevance (e.g., 'title:rust^3 OR body:rust').\n2. The query string supports inline 'return field1,field2' for field projection, and 'limit N' for result count.\n3. If you receive a field error or do not know the available fields, run the 'get_index' tool first to view the schema.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -153,20 +153,70 @@ impl McpBackend for AppState {
     ) -> BoxFuture<'_, Result<JsonValue, String>> {
         let state = self.clone();
         Box::pin(async move {
-            state
+            let index_name = index.index.clone();
+            let result = state
                 .router
                 .route_and_handle(
                     ClientOp::Search {
                         index: index.index,
-                        query,
+                        query: query.clone(),
                         limit,
                         fields: index.fields,
                     },
                     None,
                     OperationType::Read,
                 )
-                .await
-                .map_err(|err| err.to_string())
+                .await;
+
+            match result {
+                Ok(mut response) => {
+                    // Add zero-results warning if applicable
+                    let hits_returned = response
+                        .get("hits_returned")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+
+                    if hits_returned == 0
+                        && (query.contains('\"') || query.contains("AND"))
+                        && let Some(obj) = response.as_object_mut()
+                    {
+                        obj.insert(
+                            "_warning".to_string(),
+                            JsonValue::String(
+                                "No exact matches found. Consider removing exact phrase quotes or using broader boolean OR logic.".to_string()
+                            ),
+                        );
+                    }
+                    Ok(response)
+                }
+                Err(err) => {
+                    let err_str = err.to_string();
+
+                    // Schema-aware error interceptor for field errors
+                    if (err_str.contains("does not exist")
+                        || err_str.contains("FieldDoesNotExist")
+                        || err_str.contains("field")
+                        || err_str.contains("unknown field"))
+                        && let Ok(schema_result) = state
+                            .router
+                            .handle_client_op(ClientOp::GetConfig {
+                                index: index_name.clone(),
+                            })
+                            .await
+                        && let Some(fields_obj) =
+                            schema_result.get("fields").and_then(|v| v.as_object())
+                    {
+                        let field_names: Vec<String> = fields_obj.keys().cloned().collect();
+                        return Err(format!(
+                            "Query failed: The query references a field that does not exist in the '{}' index. Valid fields are: [{}]. Please correct your query and try again.",
+                            index_name,
+                            field_names.join(", ")
+                        ));
+                    }
+
+                    Err(err_str)
+                }
+            }
         })
     }
 
@@ -190,7 +240,7 @@ impl McpBackend for AppState {
                     .router
                     .route_and_handle(
                         ClientOp::Search {
-                            index,
+                            index: index.clone(),
                             query: query.clone(),
                             limit,
                             fields,
@@ -198,8 +248,38 @@ impl McpBackend for AppState {
                         None,
                         OperationType::Read,
                     )
-                    .await
-                    .map_err(|err| err.to_string())?;
+                    .await;
+
+                // Schema-aware error handling
+                let result = match result {
+                    Ok(r) => r,
+                    Err(err) => {
+                        let err_str = err.to_string();
+
+                        if (err_str.contains("does not exist")
+                            || err_str.contains("FieldDoesNotExist")
+                            || err_str.contains("field")
+                            || err_str.contains("unknown field"))
+                            && let Ok(schema_result) = state
+                                .router
+                                .handle_client_op(ClientOp::GetConfig {
+                                    index: index.clone(),
+                                })
+                                .await
+                            && let Some(fields_obj) =
+                                schema_result.get("fields").and_then(|v| v.as_object())
+                        {
+                            let field_names: Vec<String> = fields_obj.keys().cloned().collect();
+                            return Err(format!(
+                                "Query failed in index '{}': The query references a field that does not exist. Valid fields are: [{}]. Please correct your query and try again.",
+                                index_name,
+                                field_names.join(", ")
+                            ));
+                        }
+
+                        return Err(err_str);
+                    }
+                };
 
                 total_hits += result
                     .get("total_hits")
@@ -241,13 +321,28 @@ impl McpBackend for AppState {
             merged_hits.truncate(requested_limit);
             let hits_returned = merged_hits.len();
 
-            Ok(serde_json::json!({
+            let mut response = serde_json::json!({
                 "hits": merged_hits,
                 "hits_returned": hits_returned,
                 "total_hits": total_hits,
                 "limit": requested_limit,
                 "results_by_index": per_index,
-            }))
+            });
+
+            // Add zero-results warning if applicable
+            if hits_returned == 0
+                && (query.contains('\"') || query.contains("AND"))
+                && let Some(obj) = response.as_object_mut()
+            {
+                obj.insert(
+                    "_warning".to_string(),
+                    JsonValue::String(
+                        "No exact matches found. Consider removing exact phrase quotes or using broader boolean OR logic.".to_string()
+                    ),
+                );
+            }
+
+            Ok(response)
         })
     }
 
