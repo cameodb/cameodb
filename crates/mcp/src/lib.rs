@@ -1,3 +1,3 @@
 pub mod server;
 
-pub use server::{McpBackend, McpIndexSearchRequest, mcp_router};
+pub use server::{McpBackend, McpIndexSearchRequest, McpShutdownHandle, mcp_router};

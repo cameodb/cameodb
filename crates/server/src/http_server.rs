@@ -12,7 +12,7 @@ use axum::{
     routing::{delete, get, patch, post, put},
 };
 use bytes::BytesMut;
-use cameodb_mcp::{McpBackend, McpIndexSearchRequest, mcp_router};
+use cameodb_mcp::{McpBackend, McpIndexSearchRequest, McpShutdownHandle, mcp_router};
 use futures::{StreamExt, future::BoxFuture};
 use kameo::actor::ActorRef;
 use serde::{Deserialize, Serialize};
@@ -969,10 +969,11 @@ fn cameodb_syntax_reference() -> JsonValue {
 /// # Arguments
 /// * `state` - Application state with actor references
 /// * `max_body_size_mb` - Maximum request body size in MB (from config)
-pub fn create_router(state: AppState, max_body_size_mb: usize) -> Router {
+pub fn create_router(state: AppState, max_body_size_mb: usize) -> (Router, McpShutdownHandle) {
     let body_limit_bytes = max_body_size_mb * 1024 * 1024;
-    Router::new()
-        .nest("/mcp", mcp_router::<AppState>())
+    let (mcp_routes, mcp_handle) = mcp_router::<AppState>();
+    let router = Router::new()
+        .nest("/mcp", mcp_routes)
         // API routes
         .route("/api/{index}/search", post(search_handler))
         .route("/api/{index}/search/stream", post(search_stream_handler))
@@ -997,7 +998,9 @@ pub fn create_router(state: AppState, max_body_size_mb: usize) -> Router {
         .layer(DecompressionLayer::new())
         .layer(DefaultBodyLimit::max(body_limit_bytes))
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http());
+
+    (router, mcp_handle)
 }
 
 /// Parse query string for 'limit <n>' and 'return <field1,field2,...>' keywords.

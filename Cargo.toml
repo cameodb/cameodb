@@ -33,6 +33,18 @@ tokio-stream = "0.1.18"
 tokio-util = { version = "0.7.17", features = ["codec", "io"] }
 
 [profile.release]
-opt-level = 3  # Required for _FORTIFY_SOURCE=2 to work properly
-debug = true   # Keep debug symbols for profiling
-lto = "thin"   # Faster link time, still good optimization
+opt-level = 3       # Required for _FORTIFY_SOURCE=2 to work properly
+lto = true          # Link Time Optimization for smaller/faster binaries
+codegen-units = 1   # Better optimization, slightly slower build
+strip = "symbols"   # Automatically strips debug symbols
+panic = "abort"     # Reduces binary size
+
+# Optimized profile for package builds (RPM/DEB)
+[profile.release-lto]
+inherits = "release"
+opt-level = 3
+debug = false
+strip = true
+lto = "thin"
+codegen-units = 1
+panic = "abort"

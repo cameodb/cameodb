@@ -14,11 +14,54 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::debug;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info};
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct McpTransportState {
     inner: Arc<Mutex<McpTransportInner>>,
+    cancel: CancellationToken,
+}
+
+impl Default for McpTransportState {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(McpTransportInner::default())),
+            cancel: CancellationToken::new(),
+        }
+    }
+}
+
+impl McpTransportState {
+    /// Gracefully shut down all MCP sessions.
+    /// Drops every sender so SSE streams terminate, then clears the session map.
+    async fn shutdown(&self) {
+        self.cancel.cancel();
+        let mut inner = self.inner.lock().await;
+        let count = inner.sessions.len();
+        inner.sessions.clear();
+        if count > 0 {
+            info!(
+                sessions = count,
+                "MCP transport: all sessions closed on shutdown"
+            );
+        }
+    }
+}
+
+/// Opaque handle returned by [`mcp_router`] to trigger graceful MCP shutdown.
+#[derive(Clone)]
+pub struct McpShutdownHandle {
+    state: McpTransportState,
+}
+
+impl McpShutdownHandle {
+    /// Gracefully shut down the MCP transport.
+    /// Cancels the cleanup task and drops all active SSE session senders.
+    pub async fn shutdown(&self) {
+        info!("MCP shutdown: draining sessions");
+        self.state.shutdown().await;
+    }
 }
 
 #[derive(Default)]
@@ -141,34 +184,46 @@ struct ReadResourceArgs {
     uri: String,
 }
 
-pub fn mcp_router<S>() -> Router<S>
+pub fn mcp_router<S>() -> (Router<S>, McpShutdownHandle)
 where
     S: McpBackend,
 {
     let transport_state = McpTransportState::default();
 
-    // Start global session cleanup task
+    // Start global session cleanup task (respects cancellation token)
     let cleanup_state = transport_state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
-            interval.tick().await;
-            let mut inner = cleanup_state.inner.lock().await;
-            let now = std::time::Instant::now();
-            let timeout = Duration::from_secs(300); // 5 minutes timeout
-
-            // Remove inactive sessions
-            inner.sessions.retain(|session_id, session| {
-                let is_active = now.duration_since(session.last_activity) < timeout;
-                if !is_active {
-                    debug!(session_id = %session_id, "Cleaning up inactive MCP session");
+            tokio::select! {
+                _ = cleanup_state.cancel.cancelled() => {
+                    debug!("MCP cleanup task: shutdown signal received");
+                    break;
                 }
-                is_active
-            });
+                _ = interval.tick() => {
+                    let mut inner = cleanup_state.inner.lock().await;
+                    let now = std::time::Instant::now();
+                    let timeout = Duration::from_secs(300); // 5 minutes timeout
+
+                    // Remove inactive sessions
+                    inner.sessions.retain(|session_id, session| {
+                        let is_active = now.duration_since(session.last_activity) < timeout;
+                        if !is_active {
+                            debug!(session_id = %session_id, "Cleaning up inactive MCP session");
+                        }
+                        is_active
+                    });
+                }
+            }
         }
+        debug!("MCP cleanup task: exited");
     });
 
-    Router::new()
+    let handle = McpShutdownHandle {
+        state: transport_state.clone(),
+    };
+
+    let router = Router::new()
         .route("/sse", get(mcp_sse_handler))
         .route(
             "/messages",
@@ -181,7 +236,9 @@ where
                 },
             ),
         )
-        .layer(Extension(transport_state))
+        .layer(Extension(transport_state));
+
+    (router, handle)
 }
 
 async fn mcp_sse_handler(

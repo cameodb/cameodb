@@ -58,21 +58,37 @@ curl -s "http://localhost:9480/_indexes" | jq
 ### Load and Search Sample Data
 
 ```bash
-# Run client in interactive mode and load sample books data
+# Run client in interactive mode and load sample data
 docker run --rm -it \
   --name cameodb-client \
   --network host \
   goranc/cameodb:latest \
   client --interactive
 
+# Option 1: Load Books Dataset
 # Then inside the interactive shell, run:
 data load books https://dl.cameodb.com/examples/data/booksummaries.tsv
 
 # After data load completes, verify the index:
 list indexes
 
-# Run your first search query:
+# Search examples for books:
 search books title:"Harry Potter" limit 5
+search books author:"J.K. Rowling" limit 3
+search books categories:"Fantasy" limit 10
+
+# Option 2: Load TED Talks Dataset
+# Inside the interactive shell, run:
+data load ted https://dl.cameodb.com/examples/data/youtube_ted_2024.csv
+
+# After data load completes, verify the index:
+list indexes
+
+# Search examples for TED talks:
+search ted title:"artificial intelligence" limit 5
+search ted speaker:"Simon Sinek" limit 3
+search ted tags:"technology" limit 10
+search ted description:"climate change" limit 5
 ```
 
 ### Option 2: Build from Source
@@ -133,19 +149,19 @@ Every client request follows the same top-level path: **HTTP handler → RouterA
 
 ```
                          ┌──────────────────────┐
-                         │   ClusterCoordinator │
-                         │   RouteOperation msg │
-                         └──────────┬───────────┘
+                         │  ClusterCoordinator  │
+                         │  RouteOperation msg  │
+                         └─────────┬────────────┘
                                     │
                          routing_key present?
                            ┌────────┴────────┐
-                          YES               NO
+                          YES                NO
                            │                 │
                     Hash ring lookup    RoutingDecision::
                            │              Broadcast
                     owner == local?
                      ┌─────┴─────┐
-                    YES         NO
+                    YES          NO
                      │           │
               RoutingDecision  RoutingDecision::Remote
                 ::Local        { node_id, peer_addr }
@@ -176,7 +192,7 @@ RouterActor::route_and_handle(routing_key=None)
         │
         ▼
       RemotePeerPool::get_orchestrator(node_id)    ◄── cache hit: O(1)
-        ├── RwLock read → HashMap lookup            ◄── cache miss: swarm lookup, then cached
+        ├── RwLock read → HashMap lookup           ◄── cache miss: swarm lookup, then cached
         │
         ▼
       remote_ref.ask(&ClientOp::Search)
@@ -185,10 +201,10 @@ RouterActor::route_and_handle(routing_key=None)
       Remote node executes same local search path
         │
         ▼
-  ┌──────────────────────────────────────────────┐
-  │  Merge: bounded score-aware top-K merge,     │
-  │  then truncate to the requested limit        │
-  └──────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────┐
+  │  Merge: bounded score-aware top-K merge,   │
+  │  then truncate to the requested limit      │
+  └────────────────────────────────────────────┘
 ```
 
 **Key characteristics:**
@@ -934,7 +950,7 @@ cargo install cargo-generate-rpm
 
 ### Build RPM Package
 
-**Option 1: Standard Cargo Build (Recommended for hardened executables)**
+**Option 1: Native x86_64 Linux Build (Recommended for hardened executables)**
 ```bash
 # Build hardened executable with security mitigations (flags in .cargo/config.toml)
 cargo build --release --target x86_64-unknown-linux-musl
@@ -945,7 +961,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 # Generate RPM package (run from project root directory)
 cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
-  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.1-1.x86_64.rpm \
+  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm \
   --set-metadata 'package.name="cameodb"'
 ```
 
@@ -964,11 +980,11 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl \
 
 # Generate RPM package with standard naming (run from project root directory)
 cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
-  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.1-1.x86_64.rpm \
+  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm \
   --set-metadata 'package.name="cameodb"'
 
 # The RPM package will be available at:
-# target/x86_64-unknown-linux-musl/release/cameodb-0.2.1-1.x86_64.rpm
+# target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm
 ```
 
 **Option 3: DEB Package Generation (Ubuntu/Debian)**
@@ -979,17 +995,23 @@ cargo install cargo-deb
 # Build hardened binary using Docker (native musl toolchain)
 # This avoids Zig cross-compilation issues with C dependencies
 # IMPORTANT: Use --platform linux/amd64 to get x86_64 container (not ARM64)
+# Use pre-built builder image (dependencies pre-installed)
+# Build the builder image once:
+docker buildx build --platform linux/amd64 \
+  --builder cameo-builder \
+  --load \
+  -t cameo-builder -f builder.Dockerfile .
+
+# Then use it for fast builds:
 docker run --rm --platform linux/amd64 \
   -v "$PWD":/workspace -w /workspace \
   -v /tmp/buildkit-ca/zscaler.crt:/usr/local/share/ca-certificates/zscaler.crt:ro \
   -e CC_x86_64_unknown_linux_musl=musl-gcc \
   -e AR_x86_64_unknown_linux_musl=ar \
   -e RANLIB_x86_64_unknown_linux_musl=ranlib \
-  rust:latest bash -c "
-    apt-get update && \
-    apt-get install -y ca-certificates musl-tools && \
-    update-ca-certificates && \
-    rustup target add x86_64-unknown-linux-musl && \
+  cameo-builder bash -c "
+    cat /usr/local/share/ca-certificates/zscaler.crt >> /etc/ssl/certs/ca-certificates.crt && \
+    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt && \
     cargo build --release --target x86_64-unknown-linux-musl \
       --no-default-features \
       --features client/native-tls-vendored
@@ -997,16 +1019,41 @@ docker run --rm --platform linux/amd64 \
 
 # Generate DEB package (run on host after Docker build)
 # Use --no-build to package the existing binary without rebuilding
-# Use --no-strip on macOS (macOS strip doesn't support Linux flags)
+# Use --no-strip on macOS (macOS strip/objcopy don't support Linux binaries)
+# Note: Binary is automatically stripped by Cargo's [profile.release] strip = "symbols"
+# The debug symbols warning from cargo-deb is cosmetic and can be ignored.
 cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl -p server
 
 # With custom output path (follows DEB naming standards)
 cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl -p server \
-  --output target/x86_64-unknown-linux-musl/release/cameodb_0.2.1_amd64.deb
+  --output target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb
 
 # The DEB package will be available at:
-# target/x86_64-unknown-linux-musl/debian/cameodb_0.2.1_amd64.deb
-# OR with custom output: target/x86_64-unknown-linux-musl/release/cameodb_0.2.1_amd64.deb
+# target/x86_64-unknown-linux-musl/debian/cameodb_0.2.2_amd64.deb
+# OR with custom output: target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb
+```
+
+**Option 4: Automated Build Script (Recommended for CI/CD)**
+```bash
+# Use the optimized build script with persistent caching
+# This script handles both RPM and DEB package generation in one run
+./build-dist.sh
+```
+
+The `build-dist.sh` script provides:
+- **Persistent Docker volumes** for cargo registry and target cache (dramatic speed improvements on subsequent builds)
+- **Corporate CA certificate handling** for network trust
+- **Automatic binary stripping** via Cargo profile optimization
+- **Both RPM and DEB package generation** in a single run
+- **Colored output and progress indicators**
+
+**Prerequisites for build-dist.sh:**
+```bash
+# Make the script executable
+chmod +x build-dist.sh
+
+# Ensure Docker buildx builder is running
+docker buildx ls
 ```
 
 ### Signing Release Artifacts
@@ -1026,8 +1073,13 @@ cosign sign-blob \
 
 cosign sign-blob \
   --key /usr/local/share/ca-certificates/cosign.key \
-  --bundle target/x86_64-unknown-linux-musl/release/cameodb-0.2.1-1.x86_64.rpm.bundle \
-  target/x86_64-unknown-linux-musl/release/cameodb-0.2.1-1.x86_64.rpm
+  --bundle target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm.bundle \
+  target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm
+
+cosign sign-blob \
+  --key /usr/local/share/ca-certificates/cosign.key \
+  --bundle target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb.bundle \
+  target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb
 ```
 
 **Verification example:**
@@ -1091,13 +1143,13 @@ Hardening flags explained:
 **For RPM-based systems (RHEL, CentOS, Fedora):**
 ```bash
 # Verify RPM package before installation
-rpm -qpi cameodb-0.2.1-1.x86_64.rpm
+rpm -qpi cameodb-0.2.2-1.x86_64.rpm
 
 # Check package contents
-rpm -qpl cameodb-0.2.1-1.x86_64.rpm
+rpm -qpl cameodb-0.2.2-1.x86_64.rpm
 
 # Install the RPM package
-sudo rpm -i cameodb-0.2.1-1.x86_64.rpm
+sudo rpm -i cameodb-0.2.2-1.x86_64.rpm
 
 # Start and enable the service
 sudo systemctl daemon-reload
@@ -1108,13 +1160,13 @@ sudo systemctl start cameodb
 **For DEB-based systems (Ubuntu, Debian):**
 ```bash
 # Verify DEB package before installation
-dpkg -I cameodb_0.2.1_amd64.deb
+dpkg -I cameodb_0.2.2_amd64.deb
 
 # Check package contents
-dpkg -c cameodb_0.2.1_amd64.deb
+dpkg -c cameodb_0.2.2_amd64.deb
 
 # Install the DEB package
-sudo dpkg -i cameodb_0.2.1_amd64.deb
+sudo dpkg -i cameodb_0.2.2_amd64.deb
 
 # Start and enable the service
 sudo systemctl daemon-reload

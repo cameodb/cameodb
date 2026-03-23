@@ -330,7 +330,7 @@ async fn main() -> Result<()> {
     };
 
     // Create the HTTP router with shared state and configured body limit
-    let app = create_router(app_state, cameodb_config.network.http.max_body_size_mb);
+    let (app, mcp_handle) = create_router(app_state, cameodb_config.network.http.max_body_size_mb);
 
     // Extract HTTP configuration
     let http_config = &cameodb_config.network.http;
@@ -439,6 +439,9 @@ async fn main() -> Result<()> {
         }
     }
     println!("Shutting down...");
+
+    // Shutdown MCP sessions first (closes SSE streams cleanly)
+    mcp_handle.shutdown().await;
 
     // Signal HTTP server to drain gracefully
     let _ = shutdown_tx.send(());
