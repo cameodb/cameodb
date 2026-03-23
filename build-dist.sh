@@ -60,10 +60,10 @@ docker run --rm --platform linux/amd64 \
     update-ca-certificates
     
     # Build the binary with automatic stripping
-    # Use CARGO_PROFILE_RELEASE_LTO=false to avoid OOM during linking in Docker
+    # Use thin LTO for better size without excessive memory usage
     echo '🏗️  Building CameoDB binary...'
-    CARGO_PROFILE_RELEASE_LTO=false \
-    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    CARGO_PROFILE_RELEASE_LTO=thin \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4 \
     cargo build --release --target ${TARGET} \
       --no-default-features \
       --features client/native-tls-vendored
