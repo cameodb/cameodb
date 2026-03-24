@@ -1,4 +1,11 @@
-use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
@@ -10,7 +17,7 @@ use axum::{
     routing::{get, post},
 };
 use futures::{Stream, StreamExt, future::BoxFuture};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -73,8 +80,6 @@ struct McpTransportInner {
 #[derive(Clone)]
 struct McpSession {
     sender: mpsc::UnboundedSender<Event>,
-    #[allow(dead_code)] // Used for future session analytics and debugging
-    created_at: std::time::Instant,
     last_activity: std::time::Instant,
 }
 
@@ -83,7 +88,7 @@ struct MessageQuery {
     session_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct McpIndexSearchRequest {
     pub index: String,
     #[serde(default)]
@@ -125,8 +130,6 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
-    #[allow(dead_code)]
-    jsonrpc: Option<String>,
     id: Option<JsonValue>,
     method: String,
     #[serde(default)]
@@ -205,11 +208,16 @@ where
                     let now = std::time::Instant::now();
                     let timeout = Duration::from_secs(300); // 5 minutes timeout
 
-                    // Remove inactive sessions
+                    // Remove sessions: only clean up if SSE connection is closed AND inactive
                     inner.sessions.retain(|session_id, session| {
+                        if !session.sender.is_closed() {
+                            // SSE connection still alive — keep regardless of last POST activity
+                            return true;
+                        }
+                        // SSE disconnected — apply inactivity timeout
                         let is_active = now.duration_since(session.last_activity) < timeout;
                         if !is_active {
-                            debug!(session_id = %session_id, "Cleaning up inactive MCP session");
+                            info!(session_id = %session_id, "Cleaning up disconnected MCP session");
                         }
                         is_active
                     });
@@ -253,7 +261,6 @@ async fn mcp_sse_handler(
 
         let session = McpSession {
             sender: tx.clone(),
-            created_at: now,
             last_activity: now,
         };
 
@@ -267,15 +274,55 @@ async fn mcp_sse_handler(
         (session_id, rx)
     };
 
-    debug!(session_id = %session_id, "MCP SSE session opened");
+    info!(session_id = %session_id, "MCP SSE session opened");
 
-    let stream = UnboundedReceiverStream::new(rx).map(Ok);
+    let inner_stream = UnboundedReceiverStream::new(rx).map(Ok);
+
+    // Wrap stream with a guard that removes the session when SSE connection drops
+    let stream = SessionStream {
+        inner: inner_stream,
+        guard: SessionDropGuard { session_id, state },
+    };
 
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
-            .text("keepalive"), // Axum handles SSE formatting automatically
+            .text("keepalive"),
     )
+}
+
+/// Guard that removes the session from the registry when the SSE stream is dropped.
+struct SessionDropGuard {
+    session_id: String,
+    state: McpTransportState,
+}
+
+impl Drop for SessionDropGuard {
+    fn drop(&mut self) {
+        let session_id = self.session_id.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let mut inner = state.inner.lock().await;
+            if inner.sessions.remove(&session_id).is_some() {
+                info!(session_id = %session_id, "MCP SSE session closed");
+            }
+        });
+    }
+}
+
+/// Stream wrapper that holds a [`SessionDropGuard`] for automatic cleanup.
+struct SessionStream<S> {
+    inner: S,
+    #[allow(dead_code)] // Held for its Drop impl
+    guard: SessionDropGuard,
+}
+
+impl<S: Stream + Unpin> Stream for SessionStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
 }
 
 async fn process_mcp_message<B: McpBackend>(
