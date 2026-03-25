@@ -183,14 +183,12 @@ echo ""
 echo -e "${GREEN}SBOMs generated successfully!${NC}"
 
 if [[ -f "$SPDX_FILE" ]]; then
-    local size pkgs
     size=$(du -h "$SPDX_FILE" | cut -f1)
     pkgs=$(jq '.packages | length' "$SPDX_FILE" 2>/dev/null || echo "N/A")
     echo -e "  SPDX:      ${size}  (~${pkgs} packages)"
 fi
 
 if [[ -f "$CYCLONEDX_FILE" ]]; then
-    local size comps
     size=$(du -h "$CYCLONEDX_FILE" | cut -f1)
     comps=$(jq '.components | length' "$CYCLONEDX_FILE" 2>/dev/null || echo "N/A")
     echo -e "  CycloneDX: ${size}  (~${comps} components)"
