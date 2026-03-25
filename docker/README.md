@@ -47,76 +47,68 @@ docker-compose -f docker-compose-cluster.yml up -d
 - **Data Persistence**: Each node's data is stored in a separate subdirectory within `data/cameodb/`.
 - **Swarm Configuration**: Update the `CAMEODB_CLUSTER_NAME`, `CAMEODB_CLUSTER_PORT`, `CAMEODB_SEED_NODES`, and `CAMEODB_CLUSTER_ENABLED` environment variables to reflect your deployment topology.
 
-## Building Multi-Platform Images
+## Building Docker Images
 
-To build and push multi-platform Docker images (amd64 and arm64) with custom CA certificates for corporate firewalls:
+### Quick Build (Local Development)
 
-### Prerequisites
+Use the `docker-push.sh` script for easy building:
 
-1. Ensure your corporate CA certificate is installed at:
 ```bash
-/usr/local/share/ca-certificates/zscaler.crt
+# Build and load local image (single platform, for testing)
+../scripts/build/docker-push.sh --no-push
+
+# Test the local build
+docker run --rm cameodb:latest --version
 ```
 
-### Step 1: Create Custom BuildKit Image
+### Build and Push to DockerHub (Multi-Platform)
 
-Create a custom BuildKit image that trusts your CA certificate:
+Build for multiple platforms (amd64 + arm64) and push to DockerHub:
 
 ```bash
-# Create build context directory
-mkdir -p /tmp/buildkit-ca
+# Build + push with latest tag
+../scripts/build/docker-push.sh
 
-# Copy certificate to build context
-cp /usr/local/share/ca-certificates/zscaler.crt /tmp/buildkit-ca/
+# Build + push with specific version
+../scripts/build/docker-push.sh 0.2.2
 
-# Create custom BuildKit Dockerfile
-cat > /tmp/buildkit-ca/Dockerfile.buildkit <<'EOF'
-FROM moby/buildkit:latest
-COPY zscaler.crt /usr/local/share/ca-certificates/zscaler.crt
-RUN mkdir -p /etc/ssl/certs && \
-    cat /usr/local/share/ca-certificates/zscaler.crt >> /etc/ssl/certs/ca-certificates.crt
-EOF
-
-# Build the custom BuildKit image
-docker build -f /tmp/buildkit-ca/Dockerfile.buildkit -t buildkit-with-ca /tmp/buildkit-ca --progress=plain
+# Build only (no push) for testing multi-platform builds
+../scripts/build/docker-push.sh 0.2.2 --no-push
 ```
 
-### Step 2: Configure Buildx Builder
+**Prerequisites:**
+- Docker Desktop with buildx enabled
+- Logged in to DockerHub:
+  ```bash
+  docker login -u <user_name_on_github>
+  # Enter your DockerHub username and password/personal access token when prompted
+  ```
 
-Create a buildx builder using the custom BuildKit image:
+**Behind Corporate Firewall:**
+If you need a custom BuildKit image with CA certificates, place your certificate at:
+```bash
+/tmp/buildkit-ca/zscaler.crt
+```
+The script will automatically use it if present.
+
+### Manual Build (Advanced)
+
+If you prefer manual control over the build process:
 
 ```bash
-# Remove existing builder (if any)
-docker buildx rm cameo-builder || true
-
-# Create new builder with custom image and host network
+# Create buildx builder
 docker buildx create --name cameo-builder --use \
-  --driver docker-container \
-  --driver-opt image=buildkit-with-ca \
-  --driver-opt network=host
-```
+  --driver docker-container
 
-### Step 3: Build and Push Multi-Platform Images
-
-Build and push the multi-platform image to Docker Hub:
-
-```bash
-# Build and push for multiple platforms
+# Build and push multi-platform
 docker buildx build \
   --builder cameo-builder \
   --platform linux/amd64,linux/arm64 \
   -t goranc/cameodb:latest \
-  --secret id=zscaler,src=/usr/local/share/ca-certificates/zscaler.crt \
+  -t goranc/cameodb:0.2.2 \
   --push \
-  .
+  ..
 ```
-
-### Notes
-
-- The `--secret id=zscaler` mounts your certificate during the build process
-- The custom BuildKit image ensures base image pulls work through corporate firewalls
-- The Dockerfile is configured to trust the certificate for Cargo crate downloads
-- Replace `goranc/cameodb:latest` with your desired repository and tag
 
 ## Common Commands
 

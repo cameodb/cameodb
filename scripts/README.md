@@ -12,7 +12,58 @@ For a quick overview of all available scripts and project status:
 
 ## Directory Structure & Scripts
 
-### 🛠️ `setup/` - Development Environment Setup
+### � `build/` - Build and Distribution
+
+#### `docker-push.sh`
+**Purpose**: Build and push multi-platform Docker images to DockerHub
+- **Features**:
+  - Multi-platform builds (amd64 + arm64)
+  - Automatic buildx builder management
+  - Corporate CA certificate support
+  - Local testing with `--no-push` flag
+- **Usage**:
+  ```bash
+  ./scripts/build/docker-push.sh               # Build + push latest
+  ./scripts/build/docker-push.sh 0.2.2         # Build + push version tag
+  ./scripts/build/docker-push.sh --no-push     # Local build only
+  ```
+- **Audience**: DevOps, release engineers, CI/CD
+
+#### `build-dist.sh`
+**Purpose**: Cross-compilation build script for binaries and packages
+- **Features**:
+  - Persistent Docker caching for fast rebuilds
+  - DEB and RPM package generation
+  - Multi-architecture support (amd64, arm64)
+  - Corporate CA certificate handling
+- **Usage**:
+  ```bash
+  ./scripts/build/build-dist.sh              # Build amd64
+  ./scripts/build/build-dist.sh arm64        # Build arm64
+  ./scripts/build/build-dist.sh amd64 arm64  # Build both
+  ```
+- **Outputs**: Binary, DEB package, RPM package
+- **Audience**: DevOps, release engineers
+
+### 🔒 `security/` - Security and Compliance
+
+#### `generate-sbom.sh`
+**Purpose**: Generate Software Bill of Materials (SBOM) for supply chain security
+- **Features**:
+  - SPDX 2.3 and CycloneDX 1.5 formats
+  - Scan from Docker image, native binary, or source code
+  - Configurable output directory
+- **Usage**:
+  ```bash
+  ./scripts/security/generate-sbom.sh            # From Docker image
+  ./scripts/security/generate-sbom.sh --native   # From native binary
+  ./scripts/security/generate-sbom.sh --source   # From source code
+  ./scripts/security/generate-sbom.sh --output ./sboms
+  ```
+- **Prerequisites**: syft 1.42.3+ (`brew install syft`)
+- **Audience**: Security engineers, compliance teams
+
+###  �️ `setup/` - Development Environment Setup
 
 #### `install-deps.sh`
 **Purpose**: Automated setup of CameoDB development environment
@@ -132,11 +183,21 @@ For a quick overview of all available scripts and project status:
 ## Usage Guidelines
 
 ### Running Scripts
-All scripts must be run from the **workspace root directory**:
+
+**Scripts in `build/` and `security/`** can be run from any directory (auto-detect project root):
+
+```bash
+# ✅ Works from anywhere
+./scripts/build/docker-push.sh
+./scripts/security/generate-sbom.sh
+```
+
+**All other scripts** must be run from the **workspace root directory**:
 
 ```bash
 # ✅ Correct - from workspace root
 ./scripts/testing/test-api.sh
+./scripts/setup/install-deps.sh
 
 # ❌ Wrong - from scripts directory
 cd scripts && ./testing/test-api.sh
