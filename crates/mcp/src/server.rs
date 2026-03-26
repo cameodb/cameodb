@@ -557,7 +557,7 @@ fn mcp_tools() -> Vec<JsonValue> {
         json!({
             "name": "search_index",
             "title": "Search Index",
-            "description": "Execute full-text search on a single CameoDB index. Query syntax supports field:value targeting, phrase queries (field:\"words\"), boolean operators (AND, OR, NOT), grouping with parentheses, range queries (field:[low TO high]), and date comparisons (field:>2024-01-01). \n\nPRO TIPS FOR AGENTS:\n1. Use Tantivy boosting to improve relevance (e.g., 'title:rust^3 OR body:rust').\n2. The query string supports inline 'return field1,field2' for field projection, and 'limit N' for result count.\n3. If you receive a field error or do not know the available fields, run the 'get_index' tool first to view the schema.",
+            "description": "Execute full-text search on a single CameoDB index. Query syntax supports field:value targeting, phrase queries (field:\"words\"), boolean operators (AND, OR, NOT), grouping with parentheses, range queries (field:[low TO high]), and date comparisons (field:>2024-01-01). \n\nPRO TIPS FOR AGENTS:\n1. Use Tantivy boosting to improve relevance (e.g., 'title:rust^3 OR body:rust').\n2. The query string supports inline 'return field1,field2' for field projection, and 'limit N' for result count.\n3. If you receive a field error or do not know the available fields, run the 'get_index' tool first to view the schema.\n\nQUERY SYNTAX QUICK REFERENCE:\n- Terms: rust database (AND by default)\n- Field targeting: title:rust (only applies to next term)\n- Phrases: title:\"rust programming\"\n- Phrase slop (proximity): body:\"small bike\"~2\n- Phrase prefix: \"big bad wo\"* (matches 'big bad wolf')\n- Boolean: title:rust AND author:doe | OR | NOT (UPPERCASE required, AND binds tighter than OR)\n- Must/must-not: +title:rust -author:smith\n- Grouping: (title:rust OR title:go) AND year:[2020 TO 2024]\n- Range (inclusive []): year:[2020 TO 2024]\n- Range (exclusive {}): score:{0 TO 100}\n- Unbounded range: price:[10.0 TO *] or age:[* TO 30]\n- Set operator: status: IN [active pending review] (more efficient than OR-ing)\n- Boosting: title:rust^3 OR body:rust (no negative boosts)\n- All docs: *\n- Date: created_at:>2024-01-01, created_at:[2024-01-01 TO 2024-12-31]\n- Escape specials: title:C\\+\\+ (reserved: + ^ ` : { } \" [ ] ( ) ~ ! \\\\ * SPACE)\n\nFIELD TYPE IMPACT ON OPERATORS:\n- text: all operators (phrases, slop, prefix, IN set, boost, range)\n- string/exact: exact match, IN set only (no phrases/slop)\n- numeric (i64/u64/f64): exact, range [], {}, boost (no phrases/IN)\n- date: exact, comparisons (>/</>=/<=), range (no phrases/IN)\n- boolean: true/false only (no range/boost)\n- ip: exact, range (no phrases)\n- json: dot notation field.sub:value\n- facet: path /category/sub",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -589,7 +589,7 @@ fn mcp_tools() -> Vec<JsonValue> {
         json!({
             "name": "search_indexes",
             "title": "Federated Search",
-            "description": "Execute federated search across multiple CameoDB indexes with optional per-index field projection. Results are merged by relevance score. Each hit includes an '_index_source' field indicating its origin index.",
+            "description": "Execute federated search across multiple CameoDB indexes with optional per-index field projection. Results are merged by relevance score. Each hit includes an '_index_source' field indicating its origin index.\n\nUses the same query syntax as search_index (field:value, phrases, boolean operators, ranges, boosting, set IN, slop ~, prefix *, must +/-, grouping). If indexes have different schemas, the query applies to matching fields in each index.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -631,7 +631,7 @@ fn mcp_tools() -> Vec<JsonValue> {
         json!({
             "name": "get_index",
             "title": "Get Index",
-            "description": "Retrieve schema and statistics for a single CameoDB index.",
+            "description": "Retrieve schema and statistics for a single CameoDB index. Returns field definitions with types and a 'queryable_fields' array containing per-field 'query_hint' showing exactly which operators (phrases, ranges, IN set, boost, slop, etc.) work with each field's data type. Use this to understand an index's structure before constructing queries.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -650,7 +650,7 @@ fn mcp_tools() -> Vec<JsonValue> {
         json!({
             "name": "list_indexes",
             "title": "List Indexes",
-            "description": "List all available CameoDB indexes with their schemas and metadata.",
+            "description": "List all available CameoDB indexes with their schemas and metadata. Each index includes a 'queryable_fields' array with per-field type and 'query_hint' showing supported operators. Use this as the first discovery step — new indexes are automatically available here with full schema details.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -663,7 +663,7 @@ fn mcp_tools() -> Vec<JsonValue> {
         json!({
             "name": "validate_query",
             "title": "Validate Query",
-            "description": "Validate and get guidance on CameoDB search query syntax. Provides field-type-aware suggestions, detects unknown or non-indexed fields, checks query structure (unbalanced quotes/parens, inline modifiers), and returns the full CameoDB query syntax reference. Supply an index name for schema-aware validation.",
+            "description": "Validate and get guidance on CameoDB search query syntax. Provides field-type-aware suggestions, detects unknown or non-indexed fields, checks query structure (unbalanced quotes/parens, inline modifiers), and returns the full CameoDB query syntax reference. Supply an index name for schema-aware validation.\n\nPRO TIPS FOR AGENTS:\n1. Call with no arguments to get the complete query syntax reference and operator-by-field-type compatibility matrix.\n2. Supply an index name to get schema-aware field validation with type-specific operator hints per field.\n3. Supply a partial_field to get autocomplete suggestions matching available fields.\n4. Supply a query to get structural validation, field recognition, typo detection ('did you mean?'), and per-field operator guidance.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

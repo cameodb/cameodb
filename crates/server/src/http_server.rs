@@ -378,11 +378,13 @@ impl McpBackend for AppState {
                 .cloned()
                 .ok_or_else(|| format!("Index '{}' not found", index))?;
 
-            Ok(serde_json::json!({
+            let entry = serde_json::json!({
                 "index": index,
                 "stats": stats,
                 "schema": schema,
-            }))
+            });
+
+            Ok(enrich_index_entry(entry))
         })
     }
 
@@ -419,11 +421,12 @@ impl McpBackend for AppState {
                     .await
                     .map_err(|err| err.to_string())?;
 
-                enriched.push(serde_json::json!({
+                let entry = serde_json::json!({
                     "index": index_name,
                     "stats": stats,
                     "schema": schema,
-                }));
+                });
+                enriched.push(enrich_index_entry(entry));
             }
 
             let total_indexes = enriched.len();
@@ -704,21 +707,58 @@ fn extract_field_names(value: &JsonValue) -> Vec<String> {
         .collect()
 }
 
+/// Enrich a raw index entry (with schema) by adding per-field query hints and
+/// a top-level `queryable_fields` summary so agents can self-adjust queries
+/// without a separate `validate_query` call.
+fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
+    let field_infos = extract_field_info(&entry);
+
+    let queryable: Vec<JsonValue> = field_infos
+        .iter()
+        .filter(|info| info.indexed && !info.is_shadow && info.name != "_seq")
+        .map(|info| {
+            serde_json::json!({
+                "field": info.name,
+                "type": info.field_type,
+                "query_hint": field_type_query_hint(&info.field_type),
+            })
+        })
+        .collect();
+
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert("queryable_fields".to_string(), JsonValue::Array(queryable));
+    }
+
+    entry
+}
+
 fn field_type_query_hint(field_type: &str) -> &'static str {
     match field_type {
-        "text" => "Full-text search with tokenization. Use field:value or field:\"phrase query\".",
-        "string" | "exact" => "Exact match only (no tokenization). Use field:exact_value.",
+        "text" => {
+            "Tokenized full-text. Supports: field:term, field:\"phrase\", field:\"phrase\"~N (slop/proximity), \"prefix phr\"* (prefix match), field: IN [a b c] (set), field:term^2.0 (boost), field:[a TO z] (lexicographic range), +field:term (must), -field:term (must-not)."
+        }
+        "string" | "exact" => {
+            "Exact match (no tokenization). Supports: field:exact_value, field: IN [val1 val2] (set), +/- (must/must-not). No phrase or slop queries."
+        }
         "i64" | "u64" | "f64" => {
-            "Numeric field. Use field:value or range field:[low TO high]. Supports * for open bounds."
+            "Numeric field. Supports: field:value (exact), field:[low TO high] (inclusive range), field:{low TO high} (exclusive range), field:[low TO *] or field:[* TO high] (unbounded), field:value^2.0 (boost), +/- (must/must-not). No phrase or IN set queries."
         }
         "date" => {
-            "Date field. Use field:2024-01-15, field:>2024-01-01, or field:[2024-01-01 TO 2024-12-31]. Accepts YYYY-MM-DD or RFC3339."
+            "Date field (YYYY-MM-DD or RFC3339). Supports: field:2024-01-15, field:>2024-01-01, field:<2024-12-31, field:>=date, field:<=date, field:[start TO end] (inclusive), field:{start TO end} (exclusive), +/- (must/must-not). No phrase or IN set queries."
         }
-        "boolean" => "Boolean field. Use field:true or field:false.",
-        "ip" => "IP address field. Use field:192.168.1.1.",
-        "json" => "JSON object field. Use field.subfield:value for nested access.",
-        "facet" => "Facet/category field. Use field:/path/to/category.",
-        _ => "Use field:value syntax.",
+        "boolean" => {
+            "Boolean field. Supports: field:true, field:false, +/- (must/must-not). No range, phrase, or boost queries."
+        }
+        "ip" => {
+            "IP address field (IPv4/IPv6). Supports: field:192.168.1.1 (exact), field:[192.168.0.0 TO 192.168.255.255] (range), +/- (must/must-not). No phrase or text queries."
+        }
+        "json" => {
+            "Nested JSON object. Use dot notation: field.subfield:value, field.nested.deep:value. Escape literal dots in keys: field\\.name:value. Supports +/- (must/must-not)."
+        }
+        "facet" => {
+            "Hierarchical category. Use path syntax: field:/path/to/category. Supports +/- (must/must-not). No range or phrase queries."
+        }
+        _ => "Use field:value syntax. Check field type for supported operators.",
     }
 }
 
@@ -891,75 +931,198 @@ fn extract_query_fields(query: &str) -> Vec<String> {
 fn cameodb_syntax_reference() -> JsonValue {
     serde_json::json!({
         "basic_search": {
-            "description": "Search across all indexed text fields",
-            "examples": ["rust database", "machine learning"]
+            "description": "Search across all default indexed text fields. Multiple terms are combined with AND by default.",
+            "syntax": "<term> [<term> ...]",
+            "examples": ["rust database", "machine learning"],
+            "note": "Terms are tokenized. 'rust database' matches documents containing both 'rust' AND 'database' in any default text field."
         },
         "field_targeted": {
-            "description": "Search a specific field",
-            "examples": ["title:rust", "author:doe"]
+            "description": "Target a specific field. Only applies to the term immediately following the colon.",
+            "syntax": "field:term",
+            "examples": ["title:rust", "author:doe", "body:rust programming"],
+            "note": "In 'body:rust programming', only 'rust' targets body; 'programming' searches default fields."
         },
         "phrase_query": {
-            "description": "Match an exact phrase (in order)",
-            "examples": ["title:\"rust programming\"", "description:\"machine learning\""]
+            "description": "Match an exact phrase (terms in order). Requires field to have positional indexing.",
+            "syntax": "field:\"term1 term2\"",
+            "examples": [
+                "title:\"rust programming\"",
+                "description:\"machine learning\"",
+                "title:\"Barack Obama\""
+            ]
+        },
+        "phrase_slop": {
+            "description": "Phrase query with slop (proximity). Allows up to N extra words between phrase terms. Transposition costs 2.",
+            "syntax": "field:\"term1 term2\"~N",
+            "examples": [
+                "body:\"small bike\"~1",
+                "body:\"small bike\"~3",
+                "title:\"big wolf\"~1"
+            ],
+            "note": "\"small bike\"~1 matches 'small blue bike'. \"A B\"~1 does NOT match 'B A' (transposition costs 2, use ~2)."
+        },
+        "phrase_prefix": {
+            "description": "Phrase query where the last term is treated as a prefix. Useful for autocomplete-style matching.",
+            "syntax": "\"term1 partial\"*",
+            "examples": [
+                "\"big bad wo\"*",
+                "\"rust prog\"*"
+            ],
+            "note": "\"big bad wo\"* matches 'big bad wolf'. The * prefix operator only applies to the last term in the phrase."
         },
         "boolean_operators": {
-            "description": "Combine conditions with AND, OR, NOT (must be uppercase)",
+            "description": "Combine conditions with AND, OR, NOT (must be UPPERCASE). AND takes precedence over OR.",
+            "syntax": "expr AND expr | expr OR expr | NOT expr",
             "examples": [
                 "title:rust AND author:doe",
                 "title:rust OR title:go",
                 "title:rust NOT author:smith",
-                "(title:rust OR title:go) AND year:[2020 TO 2024]"
+                "a AND b OR c  (parsed as: (a AND b) OR c)"
+            ]
+        },
+        "must_must_not": {
+            "description": "Prefix a term with + (required) or - (excluded). Equivalent to boolean operators but more concise.",
+            "syntax": "+term (must match) | -term (must not match)",
+            "examples": [
+                "+rust +database",
+                "apple -fruit",
+                "+title:rust -author:smith",
+                "(+title:rust +year:[2020 TO 2024]) author:doe"
+            ],
+            "note": "'+x +y' is equivalent to 'x AND y'. '(+x y)' means x is required, y is optional but boosts score."
+        },
+        "grouping": {
+            "description": "Use parentheses to group sub-expressions and control operator precedence.",
+            "syntax": "(expr)",
+            "examples": [
+                "(title:rust OR title:go) AND year:[2020 TO 2024]",
+                "(color:red OR color:green) AND size:large",
+                "(+title:rust +author:doe) OR title:\"systems programming\""
             ]
         },
         "range_queries": {
-            "description": "Match values in a range. Use * for open bounds",
+            "description": "Match values in a range. [] = inclusive, {} = exclusive. Use * for unbounded side.",
+            "syntax": "field:[low TO high] | field:{low TO high} | field:[low TO high} (mixed)",
             "examples": [
                 "year:[2020 TO 2024]",
                 "price:[10.0 TO *]",
-                "age:[* TO 30]"
-            ]
+                "age:[* TO 30]",
+                "title:[a TO c}",
+                "score:{0 TO 100}"
+            ],
+            "note": "[] is inclusive, {} is exclusive. 'title:[a TO c}' matches a,b but not c. Works on numeric, date, and text fields."
+        },
+        "set_operator": {
+            "description": "Match a field against a set of literal values. More CPU-efficient than chaining OR for many terms.",
+            "syntax": "field: IN [val1 val2 val3]",
+            "examples": [
+                "status: IN [active pending review]",
+                "color: IN [red green blue]",
+                "category: IN [rust go python]"
+            ],
+            "note": "Must specify field. 'title: IN [a b c]' is more efficient than 'title:a OR title:b OR title:c'."
+        },
+        "boosting": {
+            "description": "Boost a term's relevance weight with ^factor. Higher boost = more influence on ranking. No negative boosts.",
+            "syntax": "term^factor | field:term^factor | \"phrase\"^factor",
+            "examples": [
+                "\"SRE\"^2.0 OR devops^0.4",
+                "title:rust^3 OR body:rust",
+                "title:\"machine learning\"^2.5 OR description:\"deep learning\""
+            ],
+            "note": "Default boost is 1.0. Boost only affects ranking, not filtering."
+        },
+        "all_docs_query": {
+            "description": "Match all documents in the index. Useful as a base for filtering or as a wildcard query.",
+            "syntax": "*",
+            "examples": ["*", "* limit 10"],
+            "note": "Returns all documents. Combine with inline modifiers for controlled result sets."
         },
         "date_queries": {
-            "description": "Query date fields with YYYY-MM-DD or RFC3339 format. Supports comparisons and ranges",
+            "description": "Query date fields. Accepts YYYY-MM-DD or full RFC3339 (e.g. 2024-01-15T10:30:00Z). Supports comparisons and ranges.",
+            "syntax": "field:YYYY-MM-DD | field:>YYYY-MM-DD | field:[start TO end]",
             "examples": [
                 "created_at:2024-01-15",
                 "created_at:>2024-01-01",
                 "created_at:<2024-12-31",
-                "created_at:[2024-01-01 TO 2024-12-31]"
-            ]
+                "created_at:[2024-01-01 TO 2024-12-31]",
+                "timestamp:[2024-01-01T00:00:00Z TO 2024-01-02T00:00:00Z}"
+            ],
+            "note": "Dates are internally stored as RFC3339. YYYY-MM-DD is auto-normalized. Exclusive bound {} works on dates too."
         },
         "exact_id_lookup": {
-            "description": "Direct document lookup by ID (bypasses full-text search for speed)",
-            "examples": ["id:my-document-id"]
+            "description": "Direct document lookup by ID field (exact match, no tokenization).",
+            "syntax": "id:value",
+            "examples": ["id:my-document-id", "id:doc-12345"]
+        },
+        "escape_characters": {
+            "description": "Special characters must be escaped with backslash (\\) when used literally in query terms.",
+            "reserved_characters": "+ ^ ` : { } \" [ ] ( ) ~ ! \\ * SPACE",
+            "examples": [
+                "title:C\\+\\+",
+                "name:O\\'Brien",
+                "field:hello\\ world"
+            ],
+            "note": "Backslash escapes a single special character. Inside phrase queries (double quotes), only \\\" needs escaping."
         },
         "inline_modifiers": {
-            "description": "CameoDB-specific query modifiers appended to the query string",
+            "description": "CameoDB-specific query modifiers appended to the query string.",
             "return_fields": {
                 "syntax": "return field1,field2",
-                "description": "Project only specific fields in results",
+                "description": "Project only specific fields in results.",
                 "example": "title:rust return title,author,year"
             },
             "limit_results": {
                 "syntax": "limit N",
-                "description": "Limit the number of results returned",
+                "description": "Limit the number of results returned.",
                 "example": "title:rust limit 5"
             },
             "combined": {
                 "example": "title:rust AND author:doe return title,author limit 10"
             }
         },
-        "field_types": {
-            "text": "Tokenized full-text search. Supports phrases and boolean queries.",
-            "string": "Exact match only (raw tokenizer, no splitting).",
-            "exact": "Exact match with multi-value support (raw tokenizer).",
-            "i64": "Signed 64-bit integer. Supports range queries.",
-            "u64": "Unsigned 64-bit integer. Supports range queries.",
-            "f64": "64-bit floating point. Supports range queries.",
-            "date": "Date/datetime. Auto-normalizes common formats to RFC3339.",
-            "boolean": "Boolean true/false.",
-            "ip": "IP address.",
-            "json": "Nested JSON object. Query with dot notation (field.subfield:value).",
-            "facet": "Hierarchical category. Query with /path/syntax."
+        "field_types_and_operators": {
+            "description": "Operator compatibility depends on field type. This matrix shows which operators work with which types.",
+            "text": {
+                "type_description": "Tokenized full-text. Terms are split and lowercased.",
+                "supported_operators": ["field:term", "field:\"phrase\"", "field:\"phrase\"~N (slop)", "\"phrase\"* (prefix)", "AND/OR/NOT", "+/- (must/must-not)", "field: IN [a b c]", "field:term^boost", "field:[a TO z] (lexicographic range)"],
+                "not_supported": ["Numeric comparisons (>, <)"]
+            },
+            "string_exact": {
+                "type_description": "Raw exact match, no tokenization. Value must match exactly as stored.",
+                "supported_operators": ["field:exact_value", "field: IN [val1 val2]", "AND/OR/NOT", "+/-"],
+                "not_supported": ["Phrase queries (no tokenization)", "Slop (~)", "Prefix (*)"]
+            },
+            "numeric_i64_u64_f64": {
+                "type_description": "Numeric values. Stored as 64-bit integers or floats.",
+                "supported_operators": ["field:value (exact)", "field:[low TO high] (range, inclusive)", "field:{low TO high} (range, exclusive)", "field:[low TO *] (unbounded)", "field:[* TO high]", "AND/OR/NOT", "+/-", "field:value^boost"],
+                "not_supported": ["Phrase queries", "Slop (~)", "IN set operator"]
+            },
+            "date": {
+                "type_description": "Date/datetime. Accepts YYYY-MM-DD or RFC3339. Auto-normalized internally.",
+                "supported_operators": ["field:2024-01-15 (exact date)", "field:>2024-01-01 (after)", "field:<2024-12-31 (before)", "field:>=2024-01-01", "field:<=2024-12-31", "field:[2024-01-01 TO 2024-12-31] (inclusive range)", "field:{2024-01-01 TO 2024-12-31} (exclusive range)", "AND/OR/NOT", "+/-"],
+                "not_supported": ["Phrase queries", "IN set operator", "Slop (~)"]
+            },
+            "boolean": {
+                "type_description": "Boolean true/false values.",
+                "supported_operators": ["field:true", "field:false", "AND/OR/NOT", "+/-"],
+                "not_supported": ["Range queries", "Phrase queries", "Boosting"]
+            },
+            "ip": {
+                "type_description": "IPv4 or IPv6 address. Use same format as indexed.",
+                "supported_operators": ["field:192.168.1.1 (exact)", "field:[192.168.0.0 TO 192.168.255.255] (range)", "AND/OR/NOT", "+/-"],
+                "not_supported": ["Phrase queries", "Slop (~)", "Text search"]
+            },
+            "json": {
+                "type_description": "Nested JSON object. Access subfields with dot notation.",
+                "supported_operators": ["field.subfield:value", "field.nested.deep:value", "AND/OR/NOT", "+/-"],
+                "note": "If keys contain dots, escape with backslash: field\\.name:value"
+            },
+            "facet": {
+                "type_description": "Hierarchical categories with path-based structure.",
+                "supported_operators": ["field:/path/to/category", "AND/OR/NOT", "+/-"],
+                "not_supported": ["Range queries", "Phrase queries"]
+            }
         }
     })
 }

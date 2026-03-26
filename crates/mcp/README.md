@@ -26,6 +26,26 @@ The `cameodb_mcp` crate provides a standards-compliant MCP server that exposes C
 - ✅ **MCP Spec Compliant** (2024-11-05) with proper SSE event handling
 - ✅ **Asynchronous Processing** - non-blocking POST with 202 Accepted response
 - ✅ **Automatic Session Cleanup** with configurable timeout (5 minutes)
+- ✅ **Self-Contained Schema Discovery** — every index response includes per-field query hints
+
+### Self-Contained Discovery
+
+CameoDB is designed as a self-contained document store where indexed fields, schemas, and data types drive automatic agent adaptation. When new indexes are created or fields evolve, the MCP tools **automatically reflect the changes** — no configuration or manual updates needed.
+
+**Agent workflow (no prior knowledge required):**
+
+1. **`list_indexes`** → Discover all indexes with schemas and per-field `query_hint` (what operators work with each field type)
+2. **`get_index`** → Deep-dive into a specific index: field definitions, types, stats, and `queryable_fields` with operator guidance
+3. **`search_index`** → Construct queries using the field names and operators learned from the schema
+4. **`validate_query`** *(optional)* → Get structural validation, typo detection ("did you mean?"), and the full syntax reference with operator-by-field-type matrix
+
+Each `queryable_fields` entry tells the agent exactly what it can do:
+- A `text` field → phrases, slop, prefix, IN set, boost, range
+- A `date` field → exact date, comparisons (>/<), ranges
+- A `numeric` field → exact, ranges (inclusive/exclusive), boost
+- A `boolean` field → true/false only
+
+This means an agent can go from zero knowledge to well-formed queries in **two tool calls** (`list_indexes` → `search_index`), with the schema metadata providing all the guidance needed for operator selection.
 
 ## MCP Tools
 
@@ -40,9 +60,16 @@ Execute full-text search on a single CameoDB index.
 - `query` (string, required): Search query string. Supports:
   - Field targeting: `title:rust`
   - Phrase queries: `title:"rust programming"`
-  - Boolean operators: `title:rust AND author:doe`
-  - Range queries: `year:[2020 TO 2024]`
+  - Phrase slop (proximity): `body:"small bike"~2`
+  - Phrase prefix: `"big bad wo"*`
+  - Boolean operators: `title:rust AND author:doe` (AND, OR, NOT — UPPERCASE)
+  - Must/must-not: `+title:rust -author:smith`
+  - Grouping: `(title:rust OR title:go) AND year:[2020 TO 2024]`
+  - Range queries: `year:[2020 TO 2024]` (inclusive `[]`, exclusive `{}`)
+  - Set operator: `status: IN [active pending review]`
+  - Boosting: `title:rust^3 OR body:rust`
   - Date comparisons: `created_at:>2024-01-01`
+  - All docs: `*`
   - Inline modifiers: `title:rust return title,author limit 5`
 - `limit` (integer, optional): Maximum number of results to return
 - `fields` (array of strings, optional): Field names to include in results (field projection)
@@ -97,7 +124,7 @@ Retrieve schema and statistics for a single CameoDB index.
 **Parameters:**
 - `index` (string, required): Name of the CameoDB index
 
-**Returns:** Complete field definitions, types, document count, size, and metadata.
+**Returns:** Complete field definitions, types, document count, size, metadata, and a `queryable_fields` array with per-field `query_hint` showing exactly which operators work with each field's data type.
 
 **Example:**
 ```json
@@ -109,13 +136,34 @@ Retrieve schema and statistics for a single CameoDB index.
 }
 ```
 
+**Response includes `queryable_fields`:**
+```json
+"queryable_fields": [
+  {
+    "field": "id",
+    "type": "text",
+    "query_hint": "Exact match (no tokenization). Supports: field:exact_value, field: IN [val1 val2]..."
+  },
+  {
+    "field": "title",
+    "type": "text",
+    "query_hint": "Tokenized full-text. Supports: field:term, field:\"phrase\", field:\"phrase\"~N (slop)..."
+  },
+  {
+    "field": "year",
+    "type": "i64",
+    "query_hint": "Numeric field. Supports: field:value, field:[low TO high], field:{low TO high}..."
+  }
+]
+```
+
 ### 4. `list_indexes`
 
-List all available CameoDB indexes with their schemas and metadata.
+List all available CameoDB indexes with their schemas and metadata. **New indexes are automatically available here** — no configuration needed.
 
 **Parameters:** None
 
-**Returns:** All index schemas with metadata (document counts, field definitions, sizes).
+**Returns:** All index schemas with metadata (document counts, field definitions, sizes). Each index includes a `queryable_fields` array with per-field type and `query_hint`.
 
 **Example:**
 ```json
@@ -127,20 +175,25 @@ List all available CameoDB indexes with their schemas and metadata.
 
 ### 5. `validate_query`
 
-Validate and get guidance on CameoDB search query syntax.
+Validate and get guidance on CameoDB search query syntax. This is the **primary syntax guide** for agents.
 
 **Parameters:**
 - `index` (string, optional): Index name for schema-aware field validation
 - `partial_field` (string, optional): Partial field name for autocomplete suggestions
 - `query` (string, optional): Query string to validate and analyze
 
+**Usage patterns for agents:**
+1. **No arguments**: Returns complete query syntax reference with operator-by-field-type compatibility matrix
+2. **Index only**: Returns schema-aware field list with type-specific operator hints per field
+3. **Index + partial_field**: Returns autocomplete suggestions matching available fields
+4. **Index + query**: Returns structural validation, field recognition, typo detection, and per-field operator guidance
+
 **Returns:**
-- Field suggestions based on partial input
-- Query analysis with recognized/unknown/non-indexed fields
-- Structural validation (unbalanced quotes/parens)
-- Field-type-aware hints for recognized fields
-- Fuzzy "did you mean" suggestions for unknown fields
-- Complete CameoDB query syntax reference
+- `syntax_reference`: Full query syntax documentation with all operators, examples, and field-type compatibility
+- `available_fields`: Schema fields with types, indexed status, and per-field query hints
+- `field_suggestions`: Autocomplete matches for partial field names
+- `query_analysis`: Structural validation, recognized/unknown fields, warnings, and suggestions
+- `searchable_field_names`: List of all queryable field names
 
 **Example:**
 ```json
@@ -154,10 +207,10 @@ Validate and get guidance on CameoDB search query syntax.
 ```
 
 **Response includes:**
-- `warnings`: ["Unknown field 'titel'. Did you mean: title?"]
+- `warnings`: `["Unknown field 'titel'. Did you mean: title?"]`
 - `suggestions`: Field corrections and syntax tips
-- `field_hints`: Type-specific query guidance for each recognized field
-- `syntax_reference`: Full CameoDB query syntax documentation
+- `field_hints`: Type-specific query guidance (e.g., "text supports phrases, slop, prefix, IN set, boost, range")
+- `syntax_reference`: Complete query syntax with operator-by-field-type matrix
 
 ### 6. `get_index_stats`
 
@@ -203,73 +256,150 @@ CameoDB exposes indexes as MCP resources for exploration via `resources/list` an
 
 ## CameoDB Query Syntax Reference
 
-The `validate_query` tool returns a comprehensive syntax reference, but here's a quick overview:
+The `validate_query` tool returns a comprehensive syntax reference with an operator-by-field-type compatibility matrix. Below is the full reference.
 
 ### Basic Search
 ```
-rust database
-machine learning
+rust database              # AND by default: matches docs with both terms
+machine learning           # searches all default indexed text fields
 ```
+
+> **Note**: `field:term` only applies to the term immediately after the colon. `body:rust programming` searches `rust` in body, `programming` in default fields.
 
 ### Field-Targeted Search
 ```
 title:rust
 author:doe
+body:rust programming      # only 'rust' targets body
 ```
 
 ### Phrase Queries
 ```
-title:"rust programming"
+title:"rust programming"         # exact phrase (terms in order)
 description:"machine learning"
+title:"Barack Obama"
+```
+
+### Phrase Slop (Proximity)
+```
+body:"small bike"~1        # matches 'small blue bike' (1 word between)
+body:"small bike"~3        # matches 'small, rusty, and yellow bike'
+title:"big wolf"~1         # transposition costs 2: "A B"~1 does NOT match "B A"
+```
+
+### Phrase Prefix
+```
+"big bad wo"*              # matches 'big bad wolf' (* applies to last term)
+"rust prog"*               # matches 'rust programming'
 ```
 
 ### Boolean Operators
 ```
-title:rust AND author:doe
-title:rust OR title:go
-title:rust NOT author:smith
+title:rust AND author:doe           # both required
+title:rust OR title:go              # either matches
+title:rust NOT author:smith         # exclude
+a AND b OR c                        # parsed as: (a AND b) OR c
+```
+
+> **Note**: AND, OR, NOT must be UPPERCASE. AND takes precedence over OR.
+
+### Must / Must-Not Operators
+```
++rust +database                     # equivalent to rust AND database
+apple -fruit                        # apple required, fruit excluded
++title:rust -author:smith
+(+title:rust +year:[2020 TO 2024]) author:doe   # author optional, boosts score
+```
+
+### Grouping
+```
 (title:rust OR title:go) AND year:[2020 TO 2024]
+(color:red OR color:green) AND size:large
+(+title:rust +author:doe) OR title:"systems programming"
 ```
 
 ### Range Queries
 ```
-year:[2020 TO 2024]
-price:[10.0 TO *]
-age:[* TO 30]
+year:[2020 TO 2024]        # inclusive both bounds []
+score:{0 TO 100}           # exclusive both bounds {}
+title:[a TO c}             # mixed: inclusive lower, exclusive upper
+price:[10.0 TO *]          # unbounded upper
+age:[* TO 30]              # unbounded lower
+```
+
+### Set Operator (IN)
+```
+status: IN [active pending review]   # more CPU-efficient than OR-ing
+color: IN [red green blue]
+category: IN [rust go python]
+```
+
+> **Note**: Must specify field. `title: IN [a b c]` is more efficient than `title:a OR title:b OR title:c`.
+
+### Boosting
+```
+"SRE"^2.0 OR devops^0.4                        # boost SRE over devops
+title:rust^3 OR body:rust                       # boost title matches
+title:"machine learning"^2.5 OR description:"deep learning"
+```
+
+> Default boost is 1.0. No negative boosts allowed. Boost affects ranking, not filtering.
+
+### All-Docs Query
+```
+*                          # matches every document
+* limit 10                 # all docs, limited to 10 results
 ```
 
 ### Date Queries
 ```
-created_at:2024-01-15
-created_at:>2024-01-01
-created_at:<2024-12-31
-created_at:[2024-01-01 TO 2024-12-31]
+created_at:2024-01-15                              # exact date
+created_at:>2024-01-01                             # after
+created_at:<2024-12-31                             # before
+created_at:>=2024-06-01                            # on or after
+created_at:<=2024-06-30                            # on or before
+created_at:[2024-01-01 TO 2024-12-31]              # inclusive range
+timestamp:[2024-01-01T00:00:00Z TO 2024-01-02T00:00:00Z}  # exclusive upper
 ```
+
+> Accepts YYYY-MM-DD or full RFC3339 (e.g. `2024-01-15T10:30:00Z`). Dates are auto-normalized internally.
 
 ### Exact ID Lookup
 ```
 id:my-document-id
+id:doc-12345
 ```
+
+### Escape Characters
+```
+title:C\+\+               # escape special characters with backslash
+name:O\'Brien
+field:hello\ world         # escape space
+```
+
+Reserved characters: `+ ^ ` `: { } " [ ] ( ) ~ ! \ * SPACE`
 
 ### Inline Modifiers (CameoDB-specific)
 ```
-title:rust return title,author,year
-title:rust limit 5
-title:rust AND author:doe return title,author limit 10
+title:rust return title,author,year               # field projection
+title:rust limit 5                                 # result limit
+title:rust AND author:doe return title,author limit 10  # combined
 ```
 
-### Field Types
+### Field Type ↔ Operator Compatibility
 
-CameoDB supports 11 field types with type-specific query syntax:
-
-- **text**: Tokenized full-text search. Use `field:value` or `field:"phrase query"`
-- **string/exact**: Exact match only (no tokenization). Use `field:exact_value`
-- **i64/u64/f64**: Numeric fields. Use `field:value` or `field:[low TO high]`
-- **date**: Date/datetime. Use `field:2024-01-15` or `field:>2024-01-01`
-- **boolean**: Boolean. Use `field:true` or `field:false`
-- **ip**: IP address. Use `field:192.168.1.1`
-- **json**: Nested JSON. Use `field.subfield:value` for nested access
-- **facet**: Hierarchical category. Use `field:/path/to/category`
+| Operator | text | string/exact | numeric | date | boolean | ip | json | facet |
+|---|---|---|---|---|---|---|---|---|
+| `field:term` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `field:"phrase"` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | — | ❌ |
+| `"phrase"~N` (slop) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | — | ❌ |
+| `"phrase"*` (prefix) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | — | ❌ |
+| `field:[a TO z]` (range) | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ | — | ❌ |
+| `field:>val` (comparison) | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | — | ❌ |
+| `field: IN [a b]` (set) | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | — | ❌ |
+| `term^boost` | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | — | ❌ |
+| `AND/OR/NOT` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `+/-` (must/must-not) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ## Client Configuration
 
