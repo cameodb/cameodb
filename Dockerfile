@@ -3,7 +3,7 @@
 ################################################################################
 # STAGE 1: Builder
 ################################################################################
-ARG RUST_VERSION=1.90
+ARG RUST_VERSION=1.94
 ARG TARGET_ABI=musl
 FROM rust:${RUST_VERSION}-slim AS builder
 
@@ -23,11 +23,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # 2. Trust corporate CA certificate (if provided)
 RUN --mount=type=secret,id=zscaler,dst=/usr/local/share/ca-certificates/Zscaler.crt \
-    update-ca-certificates
-RUN --mount=type=secret,id=zscaler,dst=/usr/local/share/ca-certificates/Zscaler.crt \
-    mkdir -p /etc/ssl/certs && \
-    cat /usr/local/share/ca-certificates/Zscaler.crt >> /etc/ssl/certs/ca-certificates.crt
+    if [ -f /usr/local/share/ca-certificates/Zscaler.crt ]; then \
+        echo "Zscaler certificate detected, adding to CA bundle..." && \
+        mkdir -p /etc/ssl/certs && \
+        cat /usr/local/share/ca-certificates/Zscaler.crt >> /etc/ssl/certs/ca-certificates.crt && \
+        cp /usr/local/share/ca-certificates/Zscaler.crt /usr/local/share/ca-certificates/zscaler.crt && \
+        update-ca-certificates && \
+        echo "CA certificates updated successfully"; \
+    else \
+        echo "No Zscaler certificate provided, using system defaults"; \
+    fi
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+# Use curl for rustup downloads to better handle system CA certificates
+ENV RUSTUP_USE_CURL=1
 
 # 3. Configure Cargo to use system CA store
 RUN mkdir -p /usr/local/cargo && \

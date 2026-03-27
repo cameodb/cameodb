@@ -1,6 +1,6 @@
 # Builder image for cross-compilation distribution builds
 # This image bakes in all heavy dependencies so they aren't downloaded every build
-FROM rust:1.90-slim
+FROM rust:1.94-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
