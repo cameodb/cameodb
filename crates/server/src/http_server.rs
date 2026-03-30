@@ -962,13 +962,22 @@ fn cameodb_syntax_reference() -> JsonValue {
             "note": "\"small bike\"~1 matches 'small blue bike'. \"A B\"~1 does NOT match 'B A' (transposition costs 2, use ~2)."
         },
         "phrase_prefix": {
-            "description": "Phrase query where the last term is treated as a prefix. Useful for autocomplete-style matching.",
+            "description": "Phrase query where the last term is treated as a prefix. Useful for autocomplete-style matching. No slop allowed.",
             "syntax": "\"term1 partial\"*",
             "examples": [
                 "\"big bad wo\"*",
                 "\"rust prog\"*"
             ],
             "note": "\"big bad wo\"* matches 'big bad wolf'. The * prefix operator only applies to the last term in the phrase."
+        },
+        "term_prefix": {
+            "description": "Matches documents where the targeted field contains a token that starts with the provided value.",
+            "syntax": "field:prefix*",
+            "examples": [
+                "title:quick*",
+                "author:smi*"
+            ],
+            "note": "title:quick* matches 'quickwit' or 'quickstart', but not 'qui'."
         },
         "boolean_operators": {
             "description": "Combine conditions with AND, OR, NOT (must be UPPERCASE). AND takes precedence over OR.",
@@ -1000,15 +1009,24 @@ fn cameodb_syntax_reference() -> JsonValue {
                 "(+title:rust +author:doe) OR title:\"systems programming\""
             ]
         },
+        "exists_query": {
+            "description": "Matches documents where the specified field is set (has any value).",
+            "syntax": "field:*",
+            "examples": [
+                "author:*",
+                "published_date:*"
+            ],
+            "note": "You must specify a field. '*' alone is the match-all query, not an exists query."
+        },
         "range_queries": {
-            "description": "Match values in a range. [] = inclusive, {} = exclusive. Use * for unbounded side.",
-            "syntax": "field:[low TO high] | field:{low TO high} | field:[low TO high} (mixed)",
+            "description": "Match values in a range or use comparison operators (>, <, >=, <=). [] = inclusive, {} = exclusive. Use * for unbounded side.",
+            "syntax": "field:[low TO high] | field:{low TO high} | field:>value",
             "examples": [
                 "year:[2020 TO 2024]",
                 "price:[10.0 TO *]",
-                "age:[* TO 30]",
-                "title:[a TO c}",
-                "score:{0 TO 100}"
+                "age:>=18",
+                "score:<100",
+                "title:[a TO c}"
             ],
             "note": "[] is inclusive, {} is exclusive. 'title:[a TO c}' matches a,b but not c. Works on numeric, date, and text fields."
         },
@@ -1065,6 +1083,20 @@ fn cameodb_syntax_reference() -> JsonValue {
             ],
             "note": "Backslash escapes a single special character. Inside phrase queries (double quotes), only \\\" needs escaping."
         },
+        "field_name_rules": {
+            "description": "Rules for valid field names and how to handle special characters in them.",
+            "rules": [
+                "Must be 1-255 characters long",
+                "Cannot start with a dot or digit",
+                "Allowed characters: a-z, A-Z, 0-9, ., -, _, /, @, $",
+                "Reserved names (_source, _dynamic, _field_presence) cannot be used"
+            ],
+            "dot_escaping": "If a field name literally contains a dot (e.g., 'k8s.node'), you MUST escape it (k8s\\.node) so it isn't treated as JSON nested object access.",
+            "examples": [
+                "k8s\\.component\\.name:quickwit",
+                "@timestamp:>2024-01-01"
+            ]
+        },
         "inline_modifiers": {
             "description": "CameoDB-specific query modifiers appended to the query string.",
             "return_fields": {
@@ -1085,38 +1117,38 @@ fn cameodb_syntax_reference() -> JsonValue {
             "description": "Operator compatibility depends on field type. This matrix shows which operators work with which types.",
             "text": {
                 "type_description": "Tokenized full-text. Terms are split and lowercased.",
-                "supported_operators": ["field:term", "field:\"phrase\"", "field:\"phrase\"~N (slop)", "\"phrase\"* (prefix)", "AND/OR/NOT", "+/- (must/must-not)", "field: IN [a b c]", "field:term^boost", "field:[a TO z] (lexicographic range)"],
+                "supported_operators": ["field:term", "field:prefix*", "field:\"phrase\"", "field:\"phrase\"~N (slop)", "\"phrase\"* (prefix)", "field:* (exists)", "AND/OR/NOT", "+/- (must/must-not)", "field: IN [a b c]", "field:term^boost", "field:[a TO z] (lexicographic range)"],
                 "not_supported": ["Numeric comparisons (>, <)"]
             },
             "string_exact": {
                 "type_description": "Raw exact match, no tokenization. Value must match exactly as stored.",
-                "supported_operators": ["field:exact_value", "field: IN [val1 val2]", "AND/OR/NOT", "+/-"],
-                "not_supported": ["Phrase queries (no tokenization)", "Slop (~)", "Prefix (*)"]
+                "supported_operators": ["field:exact_value", "field:prefix*", "field:* (exists)", "field: IN [val1 val2]", "AND/OR/NOT", "+/-"],
+                "not_supported": ["Phrase queries (no tokenization)", "Slop (~)"]
             },
             "numeric_i64_u64_f64": {
                 "type_description": "Numeric values. Stored as 64-bit integers or floats.",
-                "supported_operators": ["field:value (exact)", "field:[low TO high] (range, inclusive)", "field:{low TO high} (range, exclusive)", "field:[low TO *] (unbounded)", "field:[* TO high]", "AND/OR/NOT", "+/-", "field:value^boost"],
+                "supported_operators": ["field:value (exact)", "field:>value (comparisons)", "field:[low TO high] (range, inclusive)", "field:{low TO high} (range, exclusive)", "field:[low TO *] (unbounded)", "field:* (exists)", "AND/OR/NOT", "+/-", "field:value^boost"],
                 "not_supported": ["Phrase queries", "Slop (~)", "IN set operator"]
             },
             "date": {
                 "type_description": "Date/datetime. Accepts YYYY-MM-DD or RFC3339. Auto-normalized internally.",
-                "supported_operators": ["field:2024-01-15 (exact date)", "field:>2024-01-01 (after)", "field:<2024-12-31 (before)", "field:>=2024-01-01", "field:<=2024-12-31", "field:[2024-01-01 TO 2024-12-31] (inclusive range)", "field:{2024-01-01 TO 2024-12-31} (exclusive range)", "AND/OR/NOT", "+/-"],
+                "supported_operators": ["field:2024-01-15 (exact date)", "field:>2024-01-01 (after)", "field:<2024-12-31 (before)", "field:>=2024-01-01", "field:<=2024-12-31", "field:[2024-01-01 TO 2024-12-31] (inclusive range)", "field:{2024-01-01 TO 2024-12-31} (exclusive range)", "field:* (exists)", "AND/OR/NOT", "+/-"],
                 "not_supported": ["Phrase queries", "IN set operator", "Slop (~)"]
             },
             "boolean": {
                 "type_description": "Boolean true/false values.",
-                "supported_operators": ["field:true", "field:false", "AND/OR/NOT", "+/-"],
+                "supported_operators": ["field:true", "field:false", "field:* (exists)", "AND/OR/NOT", "+/-"],
                 "not_supported": ["Range queries", "Phrase queries", "Boosting"]
             },
             "ip": {
                 "type_description": "IPv4 or IPv6 address. Use same format as indexed.",
-                "supported_operators": ["field:192.168.1.1 (exact)", "field:[192.168.0.0 TO 192.168.255.255] (range)", "AND/OR/NOT", "+/-"],
-                "not_supported": ["Phrase queries", "Slop (~)", "Text search"]
+                "supported_operators": ["field:192.168.1.1 (exact)", "field:[192.168.0.0 TO 192.168.255.255] (range)", "field:* (exists)", "AND/OR/NOT", "+/-"],
+                "not_supported": ["Phrase queries", "Slop (~)", "Text search", "CIDR notation (use ranges instead)"]
             },
             "json": {
                 "type_description": "Nested JSON object. Access subfields with dot notation.",
-                "supported_operators": ["field.subfield:value", "field.nested.deep:value", "AND/OR/NOT", "+/-"],
-                "note": "If keys contain dots, escape with backslash: field\\.name:value"
+                "supported_operators": ["field.subfield:value", "field.nested.deep:value", "field.nested:* (exists)", "AND/OR/NOT", "+/-"],
+                "note": "If keys contain dots, escape them with backslash to avoid ambiguity: k8s\\.component\\.name:value"
             },
             "facet": {
                 "type_description": "Hierarchical categories with path-based structure.",

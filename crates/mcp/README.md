@@ -55,6 +55,9 @@ All tools follow MCP naming conventions (verb-first `snake_case`) and include `t
 
 Execute full-text search on a single CameoDB index.
 
+> **CRITICAL ANTI-HALLUCINATION RULE FOR AGENTS:**
+> When answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.
+
 **Parameters:**
 - `index` (string, required): Name of the CameoDB index to search
 - `query` (string, required): Search query string. Supports:
@@ -92,6 +95,9 @@ Execute full-text search on a single CameoDB index.
 ### 2. `search_indexes`
 
 Execute federated search across multiple CameoDB indexes with optional per-index field projection.
+
+> **CRITICAL ANTI-HALLUCINATION RULE FOR AGENTS:**
+> When answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.
 
 **Parameters:**
 - `indexes` (array, required): List of indexes to search, each with:
@@ -379,7 +385,28 @@ field:hello\ world         # escape space
 
 Reserved characters: `+ ^ ` `: { } " [ ] ( ) ~ ! \ * SPACE`
 
+### Field Name Rules
+
+Field names must follow these validation rules:
+
+- **Length**: 1-255 characters
+- **First character**: Cannot start with a dot (`.`) or digit (`0-9`)
+- **Allowed characters**: `a-z`, `A-Z`, `0-9`, `.`, `-`, `_`, `/`, `@`, `$`
+- **Reserved names**: Cannot use `_source`, `_dynamic`, `_field_presence`
+
+**Dot Escaping for JSON Fields:**
+
+When a field name literally contains a dot (e.g., `k8s.node`), you MUST escape it with backslash to avoid it being interpreted as JSON nested object access:
+
+```
+k8s\.component\.name:quickwit    # matches field named "k8s.component.name"
+@timestamp:>2024-01-01           # @ is allowed in field names
+```
+
+> **Recommendation**: Avoid using dots in field names when possible, as it requires escaping in queries.
+
 ### Inline Modifiers (CameoDB-specific)
+
 ```
 title:rust return title,author,year               # field projection
 title:rust limit 5                                 # result limit
