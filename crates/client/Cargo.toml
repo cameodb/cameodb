@@ -24,3 +24,5 @@ csv = "1.3"
 storage = { path = "../storage" }
 colored_json = "5.0.0"
 colored = "3.1.1"
+flate2 = "1.1.9"
+zip = "8.4"

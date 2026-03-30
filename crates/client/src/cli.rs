@@ -2,6 +2,7 @@ use crate::sdk::{CameoClient, ListIndexesResponse};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use csv::ReaderBuilder;
+use flate2::read::GzDecoder;
 use reqwest::Url;
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
@@ -1462,14 +1463,97 @@ struct JsonSourceAnalysis {
     id_field: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compression {
+    None,
+    Gzip,
+    Zip,
+}
+
+fn detect_compression(source: &str) -> Compression {
+    let path_lower = if is_http_source(source) {
+        Url::parse(source)
+            .ok()
+            .map(|url| url.path().to_lowercase())
+            .unwrap_or_default()
+    } else {
+        source.to_lowercase()
+    };
+
+    if path_lower.ends_with(".gz") || path_lower.ends_with(".gzip") {
+        Compression::Gzip
+    } else if path_lower.ends_with(".zip") {
+        Compression::Zip
+    } else {
+        Compression::None
+    }
+}
+
+fn zip_first_entry_bytes(data: &[u8]) -> Result<(Vec<u8>, Option<String>)> {
+    let cursor = Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ZIP archive")?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .with_context(|| format!("Failed to read ZIP entry {}", i))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let entry_name = entry.name().to_string();
+        let mut buf = Vec::new();
+        entry
+            .read_to_end(&mut buf)
+            .with_context(|| format!("Failed to decompress ZIP entry '{}'", entry_name))?;
+        return Ok((buf, Some(entry_name)));
+    }
+
+    Err(anyhow!("ZIP archive does not contain any files"))
+}
+
+fn decompress_bytes(bytes: Vec<u8>, compression: Compression) -> Result<Vec<u8>> {
+    match compression {
+        Compression::None => Ok(bytes),
+        Compression::Gzip => {
+            let mut decoder = GzDecoder::new(Cursor::new(bytes));
+            let mut decompressed = Vec::new();
+            decoder
+                .read_to_end(&mut decompressed)
+                .context("Failed to decompress gzip data")?;
+            Ok(decompressed)
+        }
+        Compression::Zip => {
+            let (data, _name) = zip_first_entry_bytes(&bytes)?;
+            Ok(data)
+        }
+    }
+}
+
+fn open_local_reader(path: &Path, compression: Compression) -> Result<Box<dyn Read + Send>> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("Failed to open source file: {}", path.display()))?;
+    match compression {
+        Compression::None => Ok(Box::new(file)),
+        Compression::Gzip => Ok(Box::new(GzDecoder::new(file))),
+        Compression::Zip => {
+            let mut buf = Vec::new();
+            BufReader::new(file)
+                .read_to_end(&mut buf)
+                .with_context(|| format!("Failed to read ZIP file: {}", path.display()))?;
+            let (data, _name) = zip_first_entry_bytes(&buf)?;
+            Ok(Box::new(Cursor::new(data)))
+        }
+    }
+}
+
 fn is_http_source(source: &str) -> bool {
     source.starts_with("http://") || source.starts_with("https://")
 }
 
 fn read_local_prefix_bytes(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
-    let file = fs::File::open(path)
-        .with_context(|| format!("Failed to open source file: {}", path.display()))?;
-    let mut reader = BufReader::new(file);
+    let compression = detect_compression(path.to_str().unwrap_or(""));
+    let reader = open_local_reader(path, compression)?;
+    let mut reader = BufReader::new(reader);
     let mut buffer = vec![0u8; max_bytes];
     let bytes_read = reader
         .read(&mut buffer)
@@ -1479,21 +1563,30 @@ fn read_local_prefix_bytes(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
 }
 
 fn source_extension(source: &str) -> Option<String> {
+    let compression = detect_compression(source);
+
+    let extract_ext = |path: &Path| -> Option<String> {
+        if compression != Compression::None {
+            // Strip compression extension to get inner format extension
+            // e.g. "data.csv.gz" -> stem "data.csv" -> extension "csv"
+            let stem = path.file_stem()?.to_str()?;
+            Path::new(stem)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase())
+        } else {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase())
+        }
+    };
+
     if is_http_source(source) {
         Url::parse(source)
             .ok()
-            .and_then(|url| {
-                Path::new(url.path())
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(str::to_string)
-            })
-            .map(|ext| ext.to_ascii_lowercase())
+            .and_then(|url| extract_ext(Path::new(url.path())))
     } else {
-        Path::new(source)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase())
+        extract_ext(Path::new(source))
     }
 }
 
@@ -2089,9 +2182,9 @@ impl JsonChunkParser {
 }
 
 fn read_json_value_from_path(path: &Path) -> Result<JsonValue> {
-    let file = fs::File::open(path)
-        .with_context(|| format!("Failed to open JSON source file: {}", path.display()))?;
-    serde_json::from_reader(BufReader::new(file))
+    let compression = detect_compression(path.to_str().unwrap_or(""));
+    let reader = open_local_reader(path, compression)?;
+    serde_json::from_reader(BufReader::new(reader))
         .with_context(|| format!("Failed to parse JSON source file: {}", path.display()))
 }
 
@@ -2169,31 +2262,23 @@ where
     Ok(count)
 }
 
-fn for_each_json_document_in_local_source<F>(
-    source: &str,
+fn for_each_json_document_in_reader<R, F>(
+    reader: R,
     format: SourceFormat,
     mut on_doc: F,
 ) -> Result<usize>
 where
+    R: Read,
     F: FnMut(JsonValue) -> Result<()>,
 {
-    let path = Path::new(source);
-
     match format {
         SourceFormat::JsonLines => {
-            let file = fs::File::open(path)
-                .with_context(|| format!("Failed to open JSONL source file: {}", path.display()))?;
-            let reader = BufReader::new(file);
+            let buf_reader = BufReader::new(reader);
             let mut count = 0usize;
 
-            for (line_no, line_result) in reader.lines().enumerate() {
-                let line = line_result.with_context(|| {
-                    format!(
-                        "Failed to read JSONL source line {} from {}",
-                        line_no + 1,
-                        path.display()
-                    )
-                })?;
+            for (line_no, line_result) in buf_reader.lines().enumerate() {
+                let line = line_result
+                    .with_context(|| format!("Failed to read JSONL source line {}", line_no + 1))?;
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -2214,14 +2299,10 @@ where
 
             Ok(count)
         }
-        SourceFormat::JsonArray => {
-            let file = fs::File::open(path).with_context(|| {
-                format!("Failed to open JSON array source file: {}", path.display())
-            })?;
-            process_json_array_reader(BufReader::new(file), &mut on_doc)
-        }
+        SourceFormat::JsonArray => process_json_array_reader(BufReader::new(reader), &mut on_doc),
         SourceFormat::JsonDocument => {
-            let value = read_json_value_from_path(path)?;
+            let value: JsonValue = serde_json::from_reader(BufReader::new(reader))
+                .context("Failed to parse JSON source")?;
             if !value.is_object() {
                 anyhow::bail!("JSON document source must contain an object");
             }
@@ -2235,6 +2316,20 @@ where
     }
 }
 
+fn for_each_json_document_in_local_source<F>(
+    source: &str,
+    format: SourceFormat,
+    on_doc: F,
+) -> Result<usize>
+where
+    F: FnMut(JsonValue) -> Result<()>,
+{
+    let path = Path::new(source);
+    let compression = detect_compression(source);
+    let reader = open_local_reader(path, compression)?;
+    for_each_json_document_in_reader(reader, format, on_doc)
+}
+
 fn analyze_local_json_source_for_schema(
     source: &str,
     format: SourceFormat,
@@ -2244,6 +2339,46 @@ fn analyze_local_json_source_for_schema(
     let mut seen = HashSet::new();
 
     let count = for_each_json_document_in_local_source(source, format, |raw_doc| {
+        let effective_doc = effective_json_document(&raw_doc)?;
+        let obj = effective_doc
+            .as_object()
+            .ok_or_else(|| anyhow!("JSON source documents must be objects"))?;
+
+        if sample_docs.len() < SCHEMA_SAMPLE_LIMIT {
+            sample_docs.push(JsonValue::Object(obj.clone()));
+        }
+
+        for key in obj.keys() {
+            if seen.insert(key.clone()) {
+                field_names.push(key.clone());
+            }
+        }
+
+        Ok(())
+    })?;
+
+    if count == 0 || sample_docs.is_empty() {
+        anyhow::bail!("JSON source does not contain any valid object documents");
+    }
+
+    let id_field = detect_id_field_name(&field_names)
+        .ok_or_else(|| anyhow!("Unable to detect an id field from JSON documents"))?;
+
+    Ok(JsonSourceAnalysis {
+        sample_docs,
+        id_field,
+    })
+}
+
+fn analyze_reader_json_source_for_schema<R: Read>(
+    reader: R,
+    format: SourceFormat,
+) -> Result<JsonSourceAnalysis> {
+    let mut sample_docs = Vec::new();
+    let mut field_names = Vec::new();
+    let mut seen = HashSet::new();
+
+    let count = for_each_json_document_in_reader(reader, format, |raw_doc| {
         let effective_doc = effective_json_document(&raw_doc)?;
         let obj = effective_doc
             .as_object()
@@ -2344,6 +2479,14 @@ async fn fetch_source_prefix_bytes(
     max_bytes: usize,
 ) -> Result<Vec<u8>> {
     if is_http_source(source) {
+        let compression = detect_compression(source);
+        if compression != Compression::None {
+            // Compressed remote: download all bytes, decompress, return prefix
+            let all_bytes = fetch_bytes_source(client, source).await?;
+            let len = all_bytes.len().min(max_bytes);
+            return Ok(all_bytes[..len].to_vec());
+        }
+
         let url = Url::parse(source).context("Invalid URL for source")?;
         let mut response = client
             .http()
@@ -2493,8 +2636,18 @@ async fn analyze_json_source_for_schema(
             build_json_source_analysis_from_docs(&[value])
         }
         SourceFormat::JsonArray | SourceFormat::JsonLines => {
-            if is_http_source(source) {
+            let compression = detect_compression(source);
+            if is_http_source(source) && compression == Compression::None {
                 analyze_http_json_source_for_schema(client, source, format).await
+            } else if is_http_source(source) {
+                // Compressed remote: download all, decompress, analyze in memory
+                let bytes = fetch_bytes_source(client, source).await?;
+                tokio::task::spawn_blocking(move || {
+                    let reader = Cursor::new(bytes);
+                    analyze_reader_json_source_for_schema(reader, format)
+                })
+                .await
+                .map_err(|err| anyhow!("Compressed JSON source analysis failed: {}", err))?
             } else {
                 let source = source.to_string();
                 tokio::task::spawn_blocking(move || {
@@ -2779,10 +2932,10 @@ enum LocalJsonProducerMsg {
     DataBatch(Vec<u8>),
 }
 
-async fn load_data_from_local_json_source_single_pass(
+async fn load_data_from_reader_json_source_single_pass(
     client: &CameoClient,
     index: &str,
-    source: &str,
+    reader: Box<dyn Read + Send + 'static>,
     format: SourceFormat,
     batch_size: usize,
     schema_exists: bool,
@@ -2790,7 +2943,6 @@ async fn load_data_from_local_json_source_single_pass(
     let batch_size = batch_size.max(1);
     let mut spinner = ProgressSpinner::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<LocalJsonProducerMsg>(2);
-    let producer_source = source.to_string();
 
     let producer = tokio::task::spawn_blocking(move || -> Result<usize> {
         let mut sample_docs = Vec::new();
@@ -2805,7 +2957,7 @@ async fn load_data_from_local_json_source_single_pass(
 
         let send_err = || anyhow!("Failed to send message because receiver was dropped");
 
-        for_each_json_document_in_local_source(&producer_source, format, |raw_doc| {
+        for_each_json_document_in_reader(reader, format, |raw_doc| {
             let effective_doc = effective_json_document(&raw_doc)?;
             let obj = effective_doc
                 .as_object()
@@ -3034,8 +3186,9 @@ async fn load_data_from_source(
         }
         SourceFormat::JsonDocument | SourceFormat::JsonArray | SourceFormat::JsonLines => {
             let schema_exists = client.get_index_config(index).await.is_ok();
+            let compression = detect_compression(source);
 
-            if is_http_source(source) {
+            if is_http_source(source) && compression == Compression::None {
                 load_data_from_http_json_source_single_pass(
                     client,
                     index,
@@ -3045,11 +3198,26 @@ async fn load_data_from_source(
                     schema_exists,
                 )
                 .await
-            } else {
-                load_data_from_local_json_source_single_pass(
+            } else if is_http_source(source) {
+                // Compressed remote: download all, decompress, process via reader
+                let bytes = fetch_bytes_source(client, source).await?;
+                let reader: Box<dyn Read + Send> = Box::new(Cursor::new(bytes));
+                load_data_from_reader_json_source_single_pass(
                     client,
                     index,
-                    source,
+                    reader,
+                    format,
+                    batch_size,
+                    schema_exists,
+                )
+                .await
+            } else {
+                let path = Path::new(source);
+                let reader = open_local_reader(path, compression)?;
+                load_data_from_reader_json_source_single_pass(
+                    client,
+                    index,
+                    reader,
                     format,
                     batch_size,
                     schema_exists,
@@ -3333,11 +3501,12 @@ fn parse_csv_cell(raw: &str) -> JsonValue {
 }
 
 async fn open_csv_source(client: &CameoClient, source: &str) -> Result<Box<dyn Read + Send>> {
+    let compression = detect_compression(source);
     let is_http = source.starts_with("http://") || source.starts_with("https://");
 
     if is_http {
         let url = Url::parse(source).context("Invalid URL for CSV source")?;
-        let bytes = client
+        let raw_bytes = client
             .http()
             .get(url)
             .send()
@@ -3346,12 +3515,11 @@ async fn open_csv_source(client: &CameoClient, source: &str) -> Result<Box<dyn R
             .bytes()
             .await
             .context("Failed to read remote CSV body")?;
-        Ok(Box::new(Cursor::new(bytes.to_vec())) as Box<dyn Read + Send>)
+        let decompressed = decompress_bytes(raw_bytes.to_vec(), compression)?;
+        Ok(Box::new(Cursor::new(decompressed)) as Box<dyn Read + Send>)
     } else {
         let path = Path::new(source);
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("Failed to open CSV file: {}", path.display()))?;
-        Ok(Box::new(file) as Box<dyn Read + Send>)
+        open_local_reader(path, compression)
     }
 }
 
@@ -3403,9 +3571,10 @@ async fn open_csv_reader(
 }
 
 async fn fetch_bytes_source(client: &CameoClient, source: &str) -> Result<Vec<u8>> {
+    let compression = detect_compression(source);
     let is_http = source.starts_with("http://") || source.starts_with("https://");
 
-    if is_http {
+    let raw_bytes = if is_http {
         let url = Url::parse(source).context("Invalid URL for schema source")?;
         let bytes = client
             .http()
@@ -3416,11 +3585,13 @@ async fn fetch_bytes_source(client: &CameoClient, source: &str) -> Result<Vec<u8
             .bytes()
             .await
             .context("Failed to read remote schema body")?;
-        Ok(bytes.to_vec())
+        bytes.to_vec()
     } else {
         let path = Path::new(source);
-        fs::read(path).with_context(|| format!("Failed to read schema file: {}", path.display()))
-    }
+        fs::read(path).with_context(|| format!("Failed to read schema file: {}", path.display()))?
+    };
+
+    decompress_bytes(raw_bytes, compression)
 }
 
 async fn run_interactive_shell(initial_url: String) -> Result<()> {
