@@ -69,7 +69,7 @@ mkdir -p "$OUTPUT_DIR"
 SPDX_FILE="${OUTPUT_DIR}/cameodb.spdx.json"
 CYCLONEDX_FILE="${OUTPUT_DIR}/cameodb.cyclonedx.json"
 
-# syft 1.42.3 compatible - uses: syft <source> -o <format> --file <output>
+# syft 1.42.3 compatible - uses: syft <source> -o <format>=<output>
 check_syft() {
     if ! command -v syft &> /dev/null; then
         echo -e "${RED}syft not found. Please install syft 1.42.3+${NC}"
@@ -94,11 +94,11 @@ generate_docker_sbom() {
     
     # Generate SPDX format
     echo -e "${BLUE}  → Generating SPDX...${NC}"
-    syft "$full_image" -o spdx-json --file "$SPDX_FILE"
+    syft "$full_image" -o "spdx-json=$SPDX_FILE"
     
     # Generate CycloneDX format
     echo -e "${BLUE}  → Generating CycloneDX...${NC}"
-    syft "$full_image" -o cyclonedx-json --file "$CYCLONEDX_FILE"
+    syft "$full_image" -o "cyclonedx-json=$CYCLONEDX_FILE"
 }
 
 generate_native_sbom() {
@@ -140,11 +140,11 @@ generate_native_sbom() {
     
     # Generate SPDX format
     echo -e "${BLUE}  → Generating SPDX...${NC}"
-    syft "$binary_path" -o spdx-json --file "$SPDX_FILE"
+    syft "$binary_path" -o "spdx-json=$SPDX_FILE"
     
     # Generate CycloneDX format
     echo -e "${BLUE}  → Generating CycloneDX...${NC}"
-    syft "$binary_path" -o cyclonedx-json --file "$CYCLONEDX_FILE"
+    syft "$binary_path" -o "cyclonedx-json=$CYCLONEDX_FILE"
 }
 
 generate_source_sbom() {
@@ -152,11 +152,11 @@ generate_source_sbom() {
     
     # Generate SPDX format
     echo -e "${BLUE}  → Generating SPDX...${NC}"
-    syft "$PROJECT_ROOT" -o spdx-json --file "$SPDX_FILE"
+    syft dir:"$PROJECT_ROOT" -o "spdx-json=$SPDX_FILE"
     
     # Generate CycloneDX format
     echo -e "${BLUE}  → Generating CycloneDX...${NC}"
-    syft "$PROJECT_ROOT" -o cyclonedx-json --file "$CYCLONEDX_FILE"
+    syft dir:"$PROJECT_ROOT" -o "cyclonedx-json=$CYCLONEDX_FILE"
 }
 
 # Main execution
