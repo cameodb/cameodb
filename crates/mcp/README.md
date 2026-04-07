@@ -496,14 +496,16 @@ npx @modelcontextprotocol/inspector http://localhost:9480/mcp/sse
 
 ### Transport Layer
 
-The MCP server uses HTTP/SSE transport with strict MCP specification compliance:
+The MCP server supports two HTTP transport modes:
 
 - **SSE Endpoint**: `GET /mcp/sse` — Establishes SSE connection and emits `endpoint` event
-- **Message Endpoint**: `POST /mcp/messages?session_id={id}` — Receives JSON-RPC messages (returns 202 Accepted)
+- **Message Endpoint**: `POST /mcp/messages?session_id={id}` — Receives JSON-RPC messages for SSE sessions (returns `202 Accepted`)
+- **Direct HTTP Endpoint**: `POST /mcp` — Processes JSON-RPC requests directly and returns JSON-RPC responses inline
+- **Compatibility Endpoint**: `POST /mcp/sse` — Accepts direct JSON-RPC requests for clients that are hard-coded to post to the SSE path
 
 ### MCP Specification Compliance
 
-The implementation follows the official MCP HTTP/SSE transport specification (version 2024-11-05):
+The implementation follows the official MCP HTTP/SSE transport specification (version 2024-11-05) for SSE clients, while also exposing a compatibility-oriented direct HTTP JSON-RPC transport for clients that do not implement the split SSE handshake.
 
 #### SSE Handshake
 1. Client connects to `/mcp/sse`
@@ -515,6 +517,13 @@ The implementation follows the official MCP HTTP/SSE transport specification (ve
 2. Server immediately returns `202 Accepted` (non-blocking)
 3. Server processes message in background task
 4. Server sends response as `message` event: `event: message\ndata: {json-rpc-response}`
+
+#### Direct HTTP JSON-RPC Compatibility
+1. Client POSTs a JSON-RPC request to `/mcp`
+2. Server processes the request immediately
+3. Server returns the JSON-RPC response in the HTTP response body
+
+For compatibility with some MCP client integrations, `POST /mcp/sse` is also accepted and handled the same way as `POST /mcp`.
 
 ### Session Management
 

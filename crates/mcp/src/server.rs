@@ -10,6 +10,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{Extension, Query, State},
+    http::StatusCode,
     response::{
         IntoResponse, Sse,
         sse::{Event, KeepAlive},
@@ -232,7 +233,22 @@ where
     };
 
     let router = Router::new()
-        .route("/sse", get(mcp_sse_handler))
+        .route(
+            "/",
+            post(
+                |State(app_state): State<S>, Json(payload): Json<JsonValue>| async move {
+                    process_mcp_http_message(app_state, payload).await
+                },
+            ),
+        )
+        .route(
+            "/sse",
+            get(mcp_sse_handler).post(
+                |State(app_state): State<S>, Json(payload): Json<JsonValue>| async move {
+                    process_mcp_http_message(app_state, payload).await
+                },
+            ),
+        )
         .route(
             "/messages",
             post(
@@ -348,7 +364,7 @@ async fn process_mcp_message<B: McpBackend>(
 
             // Spawn background task to process message asynchronously
             tokio::spawn(async move {
-                let maybe_response = match serde_json::from_value::<JsonRpcRequest>(payload) {
+                let maybe_response = match parse_json_rpc_request(payload) {
                     Ok(request) => handle_rpc_request(app_state, request).await,
                     Err(err) => Some(error_response(
                         None,
@@ -377,6 +393,31 @@ async fn process_mcp_message<B: McpBackend>(
         )
             .into_response(),
     }
+}
+
+async fn process_mcp_http_message<B: McpBackend>(
+    app_state: B,
+    payload: JsonValue,
+) -> impl IntoResponse {
+    match parse_json_rpc_request(payload) {
+        Ok(request) => match handle_rpc_request(app_state, request).await {
+            Some(response) => (StatusCode::OK, Json(response)).into_response(),
+            None => StatusCode::NO_CONTENT.into_response(),
+        },
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(error_response(
+                None,
+                -32600,
+                format!("Invalid JSON-RPC request: {err}"),
+            )),
+        )
+            .into_response(),
+    }
+}
+
+fn parse_json_rpc_request(payload: JsonValue) -> Result<JsonRpcRequest, serde_json::Error> {
+    serde_json::from_value::<JsonRpcRequest>(payload)
 }
 
 fn success_response(id: Option<JsonValue>, result: JsonValue) -> JsonValue {
