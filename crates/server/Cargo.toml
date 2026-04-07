@@ -36,7 +36,7 @@ tracing-subscriber = { workspace = true }
 toml = { workspace = true }
 serde_yml = { workspace = true }
 num_cpus = { workspace = true }
-rayon = "1.10"
+rayon = "1.11"
 libp2p = { workspace = true, features = ["tokio", "tcp", "noise", "yamux", "quic", "macros", "identify", "dns"] }
 xxhash-rust = { workspace = true }
 tokio-util = { workspace = true }
