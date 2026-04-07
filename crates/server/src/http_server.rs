@@ -657,6 +657,7 @@ struct FieldInfo {
     name: String,
     field_type: String,
     indexed: bool,
+    fast: bool,
     is_shadow: bool,
 }
 
@@ -681,6 +682,7 @@ fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
                 .unwrap_or("text")
                 .to_string(),
             indexed: def.get("indexed").and_then(|v| v.as_bool()).unwrap_or(true),
+            fast: def.get("fast").and_then(|v| v.as_bool()).unwrap_or(false),
             is_shadow: def
                 .get("is_shadow")
                 .and_then(|v| v.as_bool())
@@ -707,26 +709,48 @@ fn extract_field_names(value: &JsonValue) -> Vec<String> {
         .collect()
 }
 
-/// Enrich a raw index entry (with schema) by adding per-field query hints and
-/// a top-level `queryable_fields` summary so agents can self-adjust queries
-/// without a separate `validate_query` call.
+/// Enrich a raw index entry (with schema) by adding compact field metadata
+/// and a top-level `query_hints` section with unique hints per field type.
+/// All indexed fields are searchable by default.
 fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
     let field_infos = extract_field_info(&entry);
 
-    let queryable: Vec<JsonValue> = field_infos
+    // Collect unique field types present in this index
+    let mut unique_types: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for info in &field_infos {
+        if info.name != "_seq" {
+            unique_types.insert(info.field_type.clone());
+        }
+    }
+
+    // Build query hints for each unique field type
+    let query_hints: Vec<JsonValue> = unique_types
         .iter()
-        .filter(|info| info.indexed && !info.is_shadow && info.name != "_seq")
+        .map(|field_type| {
+            serde_json::json!({
+                "type": field_type,
+                "query_hint": field_type_query_hint(field_type),
+            })
+        })
+        .collect();
+
+    // Build compact field list (field, type, indexed, fast)
+    let fields: Vec<JsonValue> = field_infos
+        .iter()
+        .filter(|info| info.name != "_seq")
         .map(|info| {
             serde_json::json!({
                 "field": info.name,
                 "type": info.field_type,
-                "query_hint": field_type_query_hint(&info.field_type),
+                "indexed": info.indexed,
+                "fast": info.fast,
             })
         })
         .collect();
 
     if let Some(obj) = entry.as_object_mut() {
-        obj.insert("queryable_fields".to_string(), JsonValue::Array(queryable));
+        obj.insert("fields".to_string(), JsonValue::Array(fields));
+        obj.insert("query_hints".to_string(), JsonValue::Array(query_hints));
     }
 
     entry
