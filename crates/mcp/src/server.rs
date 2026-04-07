@@ -89,11 +89,32 @@ struct MessageQuery {
     session_id: String,
 }
 
+/// Sort specification for search results
+#[derive(Debug, Clone, Deserialize)]
+pub struct SortSpec {
+    /// Field name to sort by
+    pub field: String,
+    /// Sort order (default: Desc)
+    #[serde(default)]
+    pub order: SortOrder,
+}
+
+/// Sort order direction
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    #[default]
+    Desc,
+    Asc,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpIndexSearchRequest {
     pub index: String,
     #[serde(default)]
     pub fields: Option<Vec<String>>,
+    #[serde(default)]
+    pub sort: Option<SortSpec>,
 }
 
 pub trait McpBackend: Clone + Send + Sync + 'static {
@@ -558,6 +579,7 @@ where
                     McpIndexSearchRequest {
                         index: args.index,
                         fields: args.fields,
+                        sort: None,
                     },
                     args.query,
                     args.limit,

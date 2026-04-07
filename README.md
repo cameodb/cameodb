@@ -380,6 +380,33 @@ curl -s -X POST http://localhost:9480/api/books/search \
 >
 > The JSON payload always wins over inline `return` clauses. Metadata keys (those starting with `_`, e.g. `_score`, `_id`, `shard_id`) are preserved automatically.
 
+> **Sort results:** You can sort search results by a FAST field (u64 or date type) by either:
+>
+> 1. Supplying a sort specification in the payload: `"sort": {"field": "year", "order": "desc"}`
+> 2. Embedding a `sort` clause at the end of the Tantivy query: `"query": "space opera sort year:desc"`
+>
+> Supported field types: `u64` and `date` (both must be marked as FAST). Order can be `asc` or `desc` (defaults to `desc`). The JSON payload always wins over inline `sort` clauses.
+
+**Example with sort:**
+```bash
+curl -s -X POST http://localhost:9480/api/books/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "science fiction space",
+    "sort": {"field": "publication_year", "order": "desc"},
+    "limit": 10
+  }'
+```
+
+**Example with inline sort:**
+```bash
+curl -s -X POST http://localhost:9480/api/books/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "science fiction space sort publication_year:desc limit 10"
+  }'
+```
+
 **Response:**
 ```json
 {

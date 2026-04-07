@@ -49,6 +49,31 @@ use tracing::{debug, trace, warn};
 use walkdir::WalkDir;
 use xxhash_rust::xxh3::xxh3_64;
 
+/// Sort specification for search results
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SortSpec {
+    /// Field name to sort by
+    pub field: String,
+    /// Sort order (default: Desc)
+    #[serde(default)]
+    pub order: SortOrder,
+}
+
+/// Sort order direction
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    #[default]
+    Desc,
+    Asc,
+}
+
+/// Wrapper to handle both sorted (u64) and unsorted (f32) search results
+enum SearchResult {
+    Unsorted(Vec<(f32, tantivy::DocAddress)>),
+    Sorted(Vec<(u64, tantivy::DocAddress)>),
+}
+
 const TANTIVY_DATA_FILE_EXTENSIONS: &[&str] = &["store", "fast", "idx", "doc", "pos", "term"];
 
 /// Number of records to sample for size estimation in large tables
@@ -1562,18 +1587,21 @@ impl HybridStore {
     /// 1. Get max seq from redb WAL
     /// 2. Use FAST field ordering to find highest committed seq in O(1)
     /// 3. Replay all missing operations from that point
+    ///
+    /// Returns (replayed_count, max_wal_seq, last_committed_seq) so callers
+    /// can reuse these values without redundant lookups.
     fn recover_index(
         &self,
         index: &str,
         writer: &mut IndexWriter,
         reader: &IndexReader,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<(usize, u64, u64), StoreError> {
         // Get max WAL sequence from redb
         let max_wal_seq = self.get_max_wal_id_for_index(index)?;
 
         if max_wal_seq == 0 {
             tracing::debug!(index = %index, "No WAL entries found, skipping recovery");
-            return Ok(0);
+            return Ok((0, 0, 0));
         }
 
         // Use FAST field ordering to get the highest indexed sequence in O(1)
@@ -1592,7 +1620,7 @@ impl HybridStore {
         // If all sequences are committed, nothing to recover
         if last_committed_seq >= max_wal_seq {
             tracing::info!(index = %index, "All WAL sequences already committed to Tantivy");
-            return Ok(0);
+            return Ok((0, max_wal_seq, last_committed_seq));
         }
 
         // Start recovery from the first missing sequence
@@ -1607,7 +1635,7 @@ impl HybridStore {
             Ok(table) => table,
             Err(_) => {
                 tracing::debug!(index = %index, "No WAL table found");
-                return Ok(0);
+                return Ok((0, max_wal_seq, last_committed_seq));
             }
         };
 
@@ -1709,7 +1737,7 @@ impl HybridStore {
             "WAL recovery completed - replayed missing operations"
         );
 
-        Ok(replayed_count)
+        Ok((replayed_count, max_wal_seq, last_committed_seq))
     }
 
     /// Helper method to add a field to a Tantivy document based on its type.
@@ -2148,14 +2176,15 @@ impl HybridStore {
             .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
 
-        let recovered_count = self.recover_index(index, &mut writer, &reader)?;
+        let (replayed_count, max_wal_seq, last_committed_seq) =
+            self.recover_index(index, &mut writer, &reader)?;
 
-        if recovered_count > 0 {
+        if replayed_count > 0 {
             tracing::info!(
                 index = %index,
-                count = recovered_count,
+                count = replayed_count,
                 "Recovered {} operations from WAL for index {}",
-                recovered_count,
+                replayed_count,
                 index
             );
 
@@ -2166,7 +2195,7 @@ impl HybridStore {
             tracing::info!(
                 index = %index,
                 "Recovery commit completed - {} operations now stable",
-                recovered_count
+                replayed_count
             );
         }
 
@@ -2177,20 +2206,18 @@ impl HybridStore {
             .insert(index.to_string(), Arc::clone(&writer_arc));
         self.fields_cache.insert(index.to_string(), fields.clone());
 
-        // Initialize sequence counter for this index if needed
-        // Use the maximum of WAL seq and indexed seq to avoid collisions
+        // Initialize sequence counter for this index using values already computed
+        // by recover_index — avoids redundant get_max_wal_id_for_index + get_highest_indexed_seq calls
         self.current_seq
             .entry(index.to_string())
             .or_insert_with(|| {
-                let max_wal_seq = self.get_max_wal_id_for_index(index).unwrap_or(0);
-                let max_indexed_seq = self.get_highest_indexed_seq(&reader).unwrap_or(0);
-                let max_seq = max_wal_seq.max(max_indexed_seq);
+                let max_seq = max_wal_seq.max(last_committed_seq);
                 tracing::debug!(
                     index = %index,
                     max_wal_seq = max_wal_seq,
-                    max_indexed_seq = max_indexed_seq,
+                    max_indexed_seq = last_committed_seq,
                     initialized_seq = max_seq,
-                    "Initialized sequence counter"
+                    "Initialized sequence counter (reused from recovery)"
                 );
                 AtomicU64::new(max_seq)
             });
@@ -3034,6 +3061,7 @@ impl HybridStore {
     }
 
     /// Get max WAL ID for a specific index
+    /// Uses B-tree last() for O(log n) access instead of O(n) full table scan
     fn get_max_wal_id_for_index(&self, index: &str) -> Result<u64, StoreError> {
         let wal_table_name = format!("wal_{}", index);
         let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
@@ -3042,23 +3070,19 @@ impl HybridStore {
 
         match read_txn.open_table(wal_table_def) {
             Ok(wal_table) => {
-                let mut max_id = 0u64;
-                let mut entry_count = 0usize;
-                for result in wal_table.iter()? {
-                    let (key, _) = result?;
-                    let id = key.value();
-                    entry_count += 1;
-                    if id > max_id {
-                        max_id = id;
-                    }
+                // redb B-tree stores keys in sorted order; last() is O(log n)
+                if let Some(result) = wal_table.last()? {
+                    let max_id = result.0.value();
+                    tracing::debug!(
+                        index = %index,
+                        max_wal_id = max_id,
+                        "Retrieved max WAL ID from redb (B-tree last)"
+                    );
+                    Ok(max_id)
+                } else {
+                    tracing::debug!(index = %index, "WAL table is empty, returning 0");
+                    Ok(0)
                 }
-                tracing::debug!(
-                    index = %index,
-                    max_wal_id = max_id,
-                    wal_entries = entry_count,
-                    "Retrieved max WAL ID from redb"
-                );
-                Ok(max_id)
             }
             Err(_) => {
                 tracing::debug!(index = %index, "WAL table does not exist, returning 0");
@@ -3138,6 +3162,7 @@ impl HybridStore {
         index: &str,
         query: &str,
         limit: usize,
+        _sort: Option<&SortSpec>,
     ) -> Result<(Vec<(f32, JsonValue)>, usize), StoreError> {
         // Get reader and field mapping from cache or disk
         let (reader, fields) = match self.get_reader(index)? {
@@ -3249,51 +3274,179 @@ impl HybridStore {
             "Parsed tantivy query"
         );
 
-        // Execute search with both TopDocs and Count collectors to get total hits
-        let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit);
-        let count_collector = tantivy::collector::Count;
-        let mut multi_collector = tantivy::collector::MultiCollector::new();
-        let top_docs_handle = multi_collector.add_collector(top_docs_collector);
-        let count_handle = multi_collector.add_collector(count_collector);
+        // Execute search with sorting if specified, otherwise use MultiCollector
+        // OPTIMIZATION: Use MultiCollector for both sorted and unsorted to get count in single pass
+        let (top_docs, total_hits) = if let Some(sort_spec) = _sort {
+            // Get field from schema to check type and FAST flag
+            let schema = tantivy_index.schema();
+            let field = schema
+                .get_field(&sort_spec.field)
+                .map_err(|_| StoreError::FieldNotFound(sort_spec.field.clone()))?;
 
-        let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
-        let top_docs = top_docs_handle.extract(&mut multi_fruit);
-        let total_hits = count_handle.extract(&mut multi_fruit);
+            let field_entry = schema.get_field_entry(field);
+
+            if !field_entry.is_fast() {
+                return Err(StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Field '{}' is not marked as FAST. Only FAST fields support sorting.",
+                        sort_spec.field
+                    ),
+                )));
+            }
+
+            // Support u64 and Date fields for sorting (Tantivy 0.25 limitation)
+            // Note: i64 and f64 sorting requires Tantivy >= 0.26 or custom collector
+            match field_entry.field_type() {
+                tantivy::schema::FieldType::U64(_) => {
+                    let order = match sort_spec.order {
+                        SortOrder::Asc => tantivy::Order::Asc,
+                        SortOrder::Desc => tantivy::Order::Desc,
+                    };
+
+                    let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit)
+                        .order_by_u64_field(&sort_spec.field, order);
+                    let count_collector = tantivy::collector::Count;
+
+                    // Use MultiCollector to get both results and count in single query execution
+                    let mut multi_collector = tantivy::collector::MultiCollector::new();
+                    let top_docs_handle = multi_collector.add_collector(top_docs_collector);
+                    let count_handle = multi_collector.add_collector(count_collector);
+
+                    let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
+                    let top_docs: Vec<(u64, tantivy::DocAddress)> =
+                        top_docs_handle.extract(&mut multi_fruit);
+                    let total_hits = count_handle.extract(&mut multi_fruit);
+
+                    (SearchResult::Sorted(top_docs), total_hits)
+                }
+                tantivy::schema::FieldType::Date(_) => {
+                    // Dates are stored as i64 internally, but we can sort them as u64
+                    // since the ordering is preserved (RFC3339 timestamps are monotonic)
+                    let order = match sort_spec.order {
+                        SortOrder::Asc => tantivy::Order::Asc,
+                        SortOrder::Desc => tantivy::Order::Desc,
+                    };
+
+                    let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit)
+                        .order_by_u64_field(&sort_spec.field, order);
+                    let count_collector = tantivy::collector::Count;
+
+                    let mut multi_collector = tantivy::collector::MultiCollector::new();
+                    let top_docs_handle = multi_collector.add_collector(top_docs_collector);
+                    let count_handle = multi_collector.add_collector(count_collector);
+
+                    let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
+                    let top_docs: Vec<(u64, tantivy::DocAddress)> =
+                        top_docs_handle.extract(&mut multi_fruit);
+                    let total_hits = count_handle.extract(&mut multi_fruit);
+
+                    (SearchResult::Sorted(top_docs), total_hits)
+                }
+                _ => {
+                    return Err(StoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "Field '{}' type {:?} is not sortable. Supported types: u64, date (both must be FAST). Note: i64/f64 sorting requires Tantivy >= 0.26.",
+                            sort_spec.field,
+                            field_entry.field_type()
+                        ),
+                    )));
+                }
+            }
+        } else {
+            // Default: sort by relevance score using MultiCollector
+            let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit);
+            let count_collector = tantivy::collector::Count;
+            let mut multi_collector = tantivy::collector::MultiCollector::new();
+            let top_docs_handle = multi_collector.add_collector(top_docs_collector);
+            let count_handle = multi_collector.add_collector(count_collector);
+
+            let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
+            let top_docs: Vec<(f32, tantivy::DocAddress)> =
+                top_docs_handle.extract(&mut multi_fruit);
+            let total_hits = count_handle.extract(&mut multi_fruit);
+
+            (SearchResult::Unsorted(top_docs), total_hits)
+        };
 
         debug!(
             index = %index,
-            hits_returned = top_docs.len(),
+            hits_returned = match &top_docs {
+                SearchResult::Sorted(docs) => docs.len(),
+                SearchResult::Unsorted(docs) => docs.len(),
+            },
             total_hits = total_hits,
             "Tantivy search completed"
         );
 
-        if top_docs.is_empty() {
+        let is_empty = match &top_docs {
+            SearchResult::Sorted(docs) => docs.is_empty(),
+            SearchResult::Unsorted(docs) => docs.is_empty(),
+        };
+
+        if is_empty {
             return Ok((Vec::new(), total_hits));
         }
 
         // Step 1: Extract document IDs from Tantivy results using direct stored-field access
-        let mut doc_ids_with_scores = Vec::with_capacity(top_docs.len());
-        for (score, doc_address) in top_docs {
-            let doc: tantivy::TantivyDocument = searcher.doc(doc_address)?;
+        let capacity = match &top_docs {
+            SearchResult::Sorted(docs) => docs.len(),
+            SearchResult::Unsorted(docs) => docs.len(),
+        };
+        let mut doc_ids_with_scores = Vec::with_capacity(capacity);
 
-            if let Some(value) = doc.get_first(fields.id)
-                && let Some(id_str) = value.as_str()
-            {
-                debug!(
-                    index = %index,
-                    doc_id = %id_str,
-                    doc_addr = ?doc_address,
-                    "Tantivy document matched"
-                );
-                doc_ids_with_scores.push((score, id_str.to_string()));
-            } else {
-                let tantivy_doc = doc.to_json(&tantivy_index.schema());
-                warn!(
-                    index = %index,
-                    doc_addr = ?doc_address,
-                    tantivy_doc = %tantivy_doc,
-                    "Tantivy document missing or invalid 'id' field"
-                );
+        match &top_docs {
+            SearchResult::Sorted(docs) => {
+                for (_sort_key, doc_address) in docs {
+                    let doc: tantivy::TantivyDocument = searcher.doc(*doc_address)?;
+
+                    if let Some(value) = doc.get_first(fields.id)
+                        && let Some(id_str) = value.as_str()
+                    {
+                        debug!(
+                            index = %index,
+                            doc_id = %id_str,
+                            doc_addr = ?doc_address,
+                            "Tantivy document matched"
+                        );
+                        // For sorted results, use 1.0 as placeholder score (sort order is what matters)
+                        doc_ids_with_scores.push((1.0, id_str.to_string()));
+                    } else {
+                        let tantivy_doc = doc.to_json(&tantivy_index.schema());
+                        warn!(
+                            index = %index,
+                            doc_addr = ?doc_address,
+                            tantivy_doc = %tantivy_doc,
+                            "Tantivy document missing or invalid 'id' field"
+                        );
+                    }
+                }
+            }
+            SearchResult::Unsorted(docs) => {
+                for (score, doc_address) in docs {
+                    let doc: tantivy::TantivyDocument = searcher.doc(*doc_address)?;
+
+                    if let Some(value) = doc.get_first(fields.id)
+                        && let Some(id_str) = value.as_str()
+                    {
+                        debug!(
+                            index = %index,
+                            doc_id = %id_str,
+                            doc_addr = ?doc_address,
+                            "Tantivy document matched"
+                        );
+                        doc_ids_with_scores.push((*score, id_str.to_string()));
+                    } else {
+                        let tantivy_doc = doc.to_json(&tantivy_index.schema());
+                        warn!(
+                            index = %index,
+                            doc_addr = ?doc_address,
+                            tantivy_doc = %tantivy_doc,
+                            "Tantivy document missing or invalid 'id' field"
+                        );
+                    }
+                }
             }
         }
 

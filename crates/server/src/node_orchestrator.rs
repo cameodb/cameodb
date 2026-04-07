@@ -47,9 +47,12 @@ use crate::cluster_coordinator::{
 };
 use crate::config::{MessagingConfig, SearchConfig};
 use crate::remote_peer_pool::{ConnectionChannel, RemotePeerPool};
+
+// Re-export SortSpec and SortOrder from storage crate
 use chrono::{NaiveDate, NaiveDateTime};
 use cluster::{ConsistentRing, IdentityError, NodeIdentity, generate_tokens};
 use serde_json::{Map as JsonMap, Value as JsonValue};
+pub use storage::SortSpec;
 use storage::{
     FieldDef, HybridStore, IndexSchema, ShardStatsTimings, StorageConfig, StoreError,
     TantivyFieldType, WalOp,
@@ -536,6 +539,7 @@ pub struct SearchRequest {
     pub index: String,
     pub query: String,
     pub limit: Option<usize>,
+    pub sort: Option<SortSpec>,
 }
 
 /// Message to get the current shard count.
@@ -627,6 +631,8 @@ pub enum ClientOp {
         limit: Option<usize>,
         /// Optional field projection (return only specified fields)
         fields: Option<Vec<String>>,
+        /// Optional sort specification
+        sort: Option<SortSpec>,
     },
     /// Streaming search operation across shards of an index
     Stream {
@@ -635,6 +641,8 @@ pub enum ClientOp {
         limit: Option<usize>,
         /// Optional field projection (return only specified fields)
         fields: Option<Vec<String>>,
+        /// Optional sort specification
+        sort: Option<SortSpec>,
     },
     /// Write operation to insert/update a document
     Write {
@@ -910,12 +918,14 @@ impl OrchestratorEngine {
                 query,
                 limit,
                 fields,
+                sort,
             } => {
                 self.engine_search(
                     &index,
                     &query,
                     limit.unwrap_or(self.default_search_limit),
                     fields.as_deref(),
+                    sort.as_ref(),
                 )
                 .await
             }
@@ -924,10 +934,17 @@ impl OrchestratorEngine {
                 query,
                 limit,
                 fields,
+                sort,
             } => {
                 let search_limit = limit.unwrap_or(self.default_search_limit);
-                self.engine_search(&index, &query, search_limit, fields.as_deref())
-                    .await
+                self.engine_search(
+                    &index,
+                    &query,
+                    search_limit,
+                    fields.as_deref(),
+                    sort.as_ref(),
+                )
+                .await
             }
             // Config/metadata ops are lightweight — route through actor mailbox
             _ => Err(OrchestratorError::Io(std::io::Error::new(
@@ -1051,6 +1068,7 @@ impl OrchestratorEngine {
         query: &str,
         limit: usize,
         fields: Option<&[String]>,
+        sort: Option<&SortSpec>,
     ) -> Result<JsonValue, OrchestratorError> {
         let shards = self.shards.load();
         let start = std::time::Instant::now();
@@ -1079,6 +1097,7 @@ impl OrchestratorEngine {
                     index: index.to_string(),
                     query: transformed_query.clone(),
                     limit: Some(limit),
+                    sort: sort.cloned(),
                 };
                 async move { (shard_id, shard.handle_search(req).await) }
             }))
@@ -1592,9 +1611,12 @@ impl MicroshardActor {
         let query = request.query;
         let limit = request.limit.unwrap_or(self.default_search_limit);
         let index = request.index.clone();
+        let sort = request.sort;
 
         let (results, total_hits) = self
-            .spawn_on_read_pool(move || store.search_documents(&index, &query, limit))
+            .spawn_on_read_pool(move || {
+                store.search_documents(&index, &query, limit, sort.as_ref())
+            })
             .await?
             .map_err(|e: StoreError| match e {
                 StoreError::Io(io_err) => OrchestratorError::Io(io_err),
@@ -2789,12 +2811,14 @@ impl RouterActor {
                 query,
                 limit,
                 fields,
+                sort,
             }
             | ClientOp::Stream {
                 index,
                 query,
                 limit,
                 fields,
+                sort,
             } => {
                 let limit = limit.unwrap_or(self.default_search_limit);
 
@@ -2807,6 +2831,7 @@ impl RouterActor {
                             query: query.clone(),
                             limit: Some(limit),
                             fields: fields.clone(),
+                            sort: sort.clone(),
                         })
                         .await
                     {
@@ -2856,6 +2881,7 @@ impl RouterActor {
                     let index = index.clone();
                     let query = query.clone();
                     let fields = fields.clone();
+                    let sort = sort.clone();
                     let node_id = peer.node_id;
                     let peer_addr = peer.address;
                     search_futures.push(Box::pin(async move {
@@ -2867,6 +2893,7 @@ impl RouterActor {
                                     query,
                                     limit: Some(limit),
                                     fields,
+                                    sort,
                                 },
                                 node_id,
                                 &peer_addr,
@@ -4305,7 +4332,7 @@ impl NodeOrchestrator {
                                 // Trigger reader creation/caching by performing a dummy search
                                 // This warms up the DashMap cache with IndexReaders AND
                                 // forces Tantivy to mmap segment files into memory
-                                let result = sc.search_documents(&index, "*", 1);
+                                let result = sc.search_documents(&index, "*", 1, None);
                                 (sid, index, result)
                             });
                             warmup_tasks.push(task);
@@ -4625,12 +4652,14 @@ impl NodeOrchestrator {
                 query,
                 limit,
                 fields,
+                sort,
             } => {
                 self.orch_search(
                     &index,
                     &query,
                     limit.unwrap_or(self.default_search_limit),
                     fields.as_deref(),
+                    sort.as_ref(),
                 )
                 .await
             }
@@ -4639,11 +4668,18 @@ impl NodeOrchestrator {
                 query,
                 limit,
                 fields,
+                sort,
             } => {
                 // Use streaming search with the same logic as Search but optimized for HTTP streaming
                 let search_limit = limit.unwrap_or(self.default_search_limit);
-                self.orch_search(&index, &query, search_limit, fields.as_deref())
-                    .await
+                self.orch_search(
+                    &index,
+                    &query,
+                    search_limit,
+                    fields.as_deref(),
+                    sort.as_ref(),
+                )
+                .await
             }
             ClientOp::Write {
                 index,
@@ -5158,6 +5194,7 @@ impl NodeOrchestrator {
         query: &str,
         limit: usize,
         fields: Option<&[String]>,
+        sort: Option<&SortSpec>,
     ) -> Result<JsonValue, OrchestratorError> {
         let start = std::time::Instant::now();
         if self.shards.is_empty() {
@@ -5185,6 +5222,7 @@ impl NodeOrchestrator {
                 index: index.to_string(),
                 query: transformed_query.clone(),
                 limit: Some(limit),
+                sort: sort.cloned(),
             };
             async move { (shard_id, shard.handle_search(req).await) }
         });

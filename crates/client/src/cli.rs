@@ -472,6 +472,67 @@ impl IndexCompleter {
         Vec::new()
     }
 
+    fn sort_field_suggestions(&self, index: &str, prefix: &str) -> Vec<Pair> {
+        if let Ok(cache) = self.cache.read()
+            && let Some(metadata) = cache.get(index)
+        {
+            // Extract field name if prefix contains ':'
+            let (field_prefix, has_colon) = if let Some(colon_pos) = prefix.find(':') {
+                (&prefix[..colon_pos], true)
+            } else {
+                (prefix, false)
+            };
+
+            // Filter for sortable fields (u64, date types)
+            // Note: We can't check FAST flag from client, so we suggest all u64/date fields
+            let sortable_fields: Vec<_> = metadata
+                .fields
+                .iter()
+                .filter(|field| {
+                    // Check if field name matches prefix
+                    field.name.starts_with(field_prefix)
+                        // Check if field is potentially sortable (u64 or date)
+                        && (field.field_type.to_lowercase().contains("u64")
+                            || field.field_type.to_lowercase().contains("date"))
+                })
+                .collect();
+
+            if has_colon {
+                // User typed "field:", suggest :asc and :desc
+                let field_name = field_prefix;
+                vec![
+                    Pair {
+                        display: format!("{}:desc", field_name),
+                        replacement: format!("{}:desc", field_name),
+                    },
+                    Pair {
+                        display: format!("{}:asc", field_name),
+                        replacement: format!("{}:asc", field_name),
+                    },
+                ]
+            } else {
+                // Suggest sortable field names with :desc suffix (default)
+                sortable_fields
+                    .iter()
+                    .flat_map(|field| {
+                        vec![
+                            Pair {
+                                display: format!("{}:desc (default)", field.name),
+                                replacement: format!("{}:desc", field.name),
+                            },
+                            Pair {
+                                display: format!("{}:asc", field.name),
+                                replacement: format!("{}:asc", field.name),
+                            },
+                        ]
+                    })
+                    .collect()
+            }
+        } else {
+            Vec::new()
+        }
+    }
+
     fn field_type_hint(&self, index: &str, field: &str) -> Option<String> {
         let (_, clean_field) = self.split_field_modifier(field);
         if let Ok(cache) = self.cache.read()
@@ -691,22 +752,50 @@ impl IndexCompleter {
                     // We're after 'return', suggest fields (comma-separated)
                     let after_return_tokens = &query_tokens[return_pos + 1..];
 
-                    // Check if current token is after 'limit' keyword
+                    // Check if current token is after 'limit' or 'sort' keyword
                     let after_limit = after_return_tokens
                         .iter()
                         .any(|t| t.eq_ignore_ascii_case("limit"));
+                    let after_sort = after_return_tokens
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case("sort"));
 
-                    if !after_limit {
+                    if !after_limit && !after_sort {
                         let suggestions = self.return_field_suggestions(index, current);
                         let start = current_start(tokens, current);
                         return Some((start, suggestions));
                     }
                 }
 
-                // Check if we should suggest 'return' or 'limit' keywords
+                // Check if we're after a 'sort' keyword to suggest sortable fields
+                let after_sort = query_tokens
+                    .iter()
+                    .rposition(|t| t.eq_ignore_ascii_case("sort"));
+
+                if let Some(sort_pos) = after_sort {
+                    // We're after 'sort', suggest sortable fields with :asc/:desc suffix
+                    let after_sort_tokens = &query_tokens[sort_pos + 1..];
+
+                    // Check if current token is after 'return' or 'limit' keyword
+                    let after_return_kw = after_sort_tokens
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case("return"));
+                    let after_limit_kw = after_sort_tokens
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case("limit"));
+
+                    if !after_return_kw && !after_limit_kw {
+                        let suggestions = self.sort_field_suggestions(index, current);
+                        let start = current_start(tokens, current);
+                        return Some((start, suggestions));
+                    }
+                }
+
+                // Check if we should suggest 'return', 'limit', or 'sort' keywords
                 if current.is_empty()
                     || "return".starts_with(current)
                     || "limit".starts_with(current)
+                    || "sort".starts_with(current)
                 {
                     let mut suggestions = Vec::new();
 
@@ -729,6 +818,16 @@ impl IndexCompleter {
                         suggestions.push(Pair {
                             display: "limit <n>".to_string(),
                             replacement: "limit ".to_string(),
+                        });
+                    }
+
+                    // Only suggest 'sort' if not already in query
+                    if !query_tokens.iter().any(|t| t.eq_ignore_ascii_case("sort"))
+                        && "sort".starts_with(current)
+                    {
+                        suggestions.push(Pair {
+                            display: "sort <field:order>".to_string(),
+                            replacement: "sort ".to_string(),
                         });
                     }
 
