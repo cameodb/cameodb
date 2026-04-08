@@ -183,24 +183,45 @@ pub fn apply_write(&self, index: &str, op: WalOp) -> Result<u64, StoreError> {
         wal_table.insert(seq_id, wal_data.as_slice())?;
 
         match &op {
-            WalOp::Put { id, body, json_blob } => {
-                let doc_data = serde_json::json!({
-                    "body": body,
-                    "json_blob": json_blob
-                });
+            WalOp::Put { id, json_blob } => {
+                let doc_data = StoredDoc {
+                    json_blob: json_blob.as_ref(),
+                };
                 let doc_bytes = serde_json::to_vec(&doc_data)
                     .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
                 let mut data_table = write_txn.open_table(data_table_def)?;
                 data_table.insert(id.as_str(), doc_bytes.as_slice())?;
 
-                // Prepare Tantivy document
-                let mut tantivy_doc =
-                    doc!(fields.id => id.as_str(), fields.body => body.as_str());
-                if let Some(json_data) = json_blob {
-                    let json_str = serde_json::to_string(json_data)
-                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                    tantivy_doc.add_text(fields.json_blob, &json_str);
+                // Prepare Tantivy document with indexed fields
+                let schema = if let Some(schema) = self.get_schema_cached(index)? {
+                    schema
+                } else {
+                    self.get_schema(index)?
+                        .map(Arc::new)
+                        .unwrap_or_else(|| Arc::new(IndexSchema::default()))
+                };
+
+                let mut tantivy_doc = doc!(
+                    fields.id => id.as_str(),
+                    fields.seq => seq_id
+                );
+
+                // Add indexed fields from json_blob
+                if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
+                    for (field_name, field_value) in json_obj {
+                        if let Some(field_def) = schema.fields.get(field_name)
+                            && field_def.indexed
+                            && let Some(tantivy_field) = fields.indexed_fields.get(field_name)
+                        {
+                            self.add_field_to_tantivy_doc(
+                                &mut tantivy_doc,
+                                *tantivy_field,
+                                field_def,
+                                field_value,
+                            )?;
+                        }
+                    }
                 }
 
                 let writer = writer_arc.lock().unwrap();
@@ -329,8 +350,10 @@ let store = HybridStore::new(config)?;
 // Multi-tenant write operations
 let put_op = WalOp::Put {
     id: "user:123".to_string(),
-    body: "John Doe software engineer at Acme Corp".to_string(),
     json_blob: Some(json!({
+        "name": "John Doe",
+        "role": "software engineer",
+        "company": "Acme Corp",
         "email": "john@acme.com",
         "department": "engineering",
         "hire_date": "2024-01-15"
@@ -406,23 +429,22 @@ async fn batch_insert(
         let index = index.to_string();
         move || store.apply_batch(&index, ops)
     }).await??;
-    
+
     Ok(sequence_ids)
 }
 
 // Alternative: Individual operations (less efficient)
 async fn individual_insert(
-    store: HybridStore, 
+    store: HybridStore,
     index: &str,
-    documents: Vec<(String, String)>
+    documents: Vec<(String, serde_json::Value)>
 ) -> Result<Vec<u64>, StoreError> {
     let mut sequence_ids = Vec::new();
-    
+
     for (id, content) in documents {
         let op = WalOp::Put {
             id,
-            body: content,
-            json_blob: None,
+            json_blob: Some(content),
         };
         
         let seq_id = tokio::task::spawn_blocking({
@@ -748,9 +770,19 @@ Status: Consistent (redb authoritative)
 #### Crash During Write
 ```
 Scenario: Process crashes mid-operation
-Recovery: WAL replay on restart (planned feature)
+Recovery: WAL replay on startup via recover_index()
 Status: Consistent (uncommitted operations lost)
 ```
+
+**WAL Recovery Implementation:**
+On startup, `recover_index()` performs deterministic recovery:
+1. Get max WAL sequence from redb B-tree (O(log n))
+2. Get highest committed _seq from Tantivy FAST field (O(1))
+3. Replay missing operations from (last_committed_seq+1) to max_wal_seq
+4. Commit replayed operations to Tantivy
+5. Initialize sequence counter to max(max_wal_seq, last_committed_seq)
+
+This standard approach ensures all committed redb data is indexed in Tantivy after recovery.
 
 #### Index Corruption
 ```

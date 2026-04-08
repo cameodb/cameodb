@@ -1337,10 +1337,16 @@ impl HybridStore {
         let db_file_exists = kv_path.exists();
         let db_start = Instant::now();
 
-        // Use Builder pattern to configure redb cache sizes
-        let kv = redb::Builder::new()
-            .set_cache_size(config.redb_read_cache_bytes)
-            .create(&kv_path)?;
+        // Use Builder pattern to configure redb cache sizes.
+        // Use open() for existing files (faster, prevents accidental creation),
+        // create() only when the database doesn't exist yet.
+        let mut builder = redb::Builder::new();
+        builder.set_cache_size(config.redb_read_cache_bytes);
+        let kv = if db_file_exists {
+            builder.open(&kv_path)?
+        } else {
+            builder.create(&kv_path)?
+        };
 
         let db_elapsed = db_start.elapsed();
         tracing::info!(
@@ -1446,89 +1452,6 @@ impl HybridStore {
         Ok(())
     }
 
-    /// Get the highest sequence number (_seq) currently committed in Tantivy index.
-    /// Returns 0 if the index is empty or doesn't exist.
-    /// This is used during WAL recovery to determine which operations need to be replayed.
-    fn get_last_indexed_seq(
-        &self,
-        reader: &IndexReader,
-        index_name: &str,
-    ) -> Result<u64, StoreError> {
-        let searcher = reader.searcher();
-        let doc_count = searcher.num_docs();
-
-        // Verify the _seq field exists in the schema
-        let schema = searcher.index().schema();
-        let seq_field = schema.get_field("_seq").map_err(|_| {
-            StoreError::FieldNotFound(format!("_seq field missing in index '{}'", index_name))
-        })?;
-
-        // Log schema info for _seq field
-        let field_entry = schema.get_field_entry(seq_field);
-        tracing::info!(
-            index = %index_name,
-            doc_count = doc_count,
-            is_indexed = field_entry.is_indexed(),
-            is_stored = field_entry.is_stored(),
-            is_fast = field_entry.is_fast(),
-            "Checking _seq field in Tantivy schema"
-        );
-
-        // Use TopDocs collector with limit 1, sorted by _seq descending.
-        let query = tantivy::query::AllQuery;
-        let collector = tantivy::collector::TopDocs::with_limit(1)
-            .order_by_u64_field("_seq", tantivy::Order::Desc);
-
-        let top_docs = searcher.search(&query, &collector)?;
-
-        tracing::info!(
-            index = %index_name,
-            top_docs_len = top_docs.len(),
-            "TopDocs search completed"
-        );
-
-        if let Some((_sort_key, doc_address)) = top_docs.first() {
-            // Retrieve the actual _seq value from the stored document
-            let doc: tantivy::TantivyDocument = searcher.doc(*doc_address)?;
-
-            // Debug: log all stored fields in the document
-            let json_debug = doc.to_json(&schema);
-            tracing::info!(
-                index = %index_name,
-                doc_addr = ?doc_address,
-                doc_json = %json_debug,
-                "Retrieved document for _seq extraction"
-            );
-
-            if let Some(value) = doc.get_first(seq_field)
-                && let Some(seq) = value.as_u64()
-            {
-                tracing::info!(
-                    index = %index_name,
-                    last_seq = seq,
-                    "Successfully retrieved last indexed _seq from Tantivy"
-                );
-                return Ok(seq);
-            }
-            // _seq field exists but couldn't extract value from stored fields
-            // CRITICAL: The sort key is u64::MAX - actual_value, so invert it to get the real sequence
-            tracing::error!(
-                index = %index_name,
-                sort_key = _sort_key,
-                "_seq field not found in stored document - inverting sort key to recover actual value"
-            );
-            return Ok(u64::MAX - _sort_key);
-        } else {
-            tracing::info!(
-                index = %index_name,
-                "No documents found in Tantivy index (empty index)"
-            );
-        }
-
-        // Return 0 if index is empty or couldn't extract _seq
-        Ok(0)
-    }
-
     /// Get the highest indexed sequence number using FAST field ordering.
     /// Leverages columnar FAST field storage for O(1) access instead of O(n) scanning.
     fn get_highest_indexed_seq(&self, reader: &IndexReader) -> Result<u64, StoreError> {
@@ -1583,10 +1506,10 @@ impl HybridStore {
         Ok(0)
     }
 
-    /// Recover missing WAL operations using FAST field optimization.
-    /// 1. Get max seq from redb WAL
-    /// 2. Use FAST field ordering to find highest committed seq in O(1)
-    /// 3. Replay all missing operations from that point
+    /// Recover missing WAL operations.
+    /// 1. Get max seq from redb WAL table
+    /// 2. Get highest committed seq from Tantivy _seq FAST field
+    /// 3. Replay missing operations from (last_committed_seq+1) to max_wal_seq
     ///
     /// Returns (replayed_count, max_wal_seq, last_committed_seq) so callers
     /// can reuse these values without redundant lookups.
@@ -1596,7 +1519,6 @@ impl HybridStore {
         writer: &mut IndexWriter,
         reader: &IndexReader,
     ) -> Result<(usize, u64, u64), StoreError> {
-        // Get max WAL sequence from redb
         let max_wal_seq = self.get_max_wal_id_for_index(index)?;
 
         if max_wal_seq == 0 {
@@ -1604,17 +1526,13 @@ impl HybridStore {
             return Ok((0, 0, 0));
         }
 
-        // Use FAST field ordering to get the highest indexed sequence in O(1)
-        // This leverages columnar storage instead of O(n) backward scanning
         let last_committed_seq = self.get_highest_indexed_seq(reader)?;
-        let verified_count = max_wal_seq.saturating_sub(last_committed_seq);
 
         tracing::info!(
             index = %index,
             max_wal_seq = max_wal_seq,
             last_committed_seq = last_committed_seq,
-            missing_count = verified_count,
-            "WAL recovery verification complete"
+            "WAL recovery check"
         );
 
         // If all sequences are committed, nothing to recover
@@ -1725,7 +1643,7 @@ impl HybridStore {
                 tracing::info!(
                     index = %index,
                     replayed = replayed_count,
-                    total_missing = verified_count,
+                    total = total_entries,
                     "Recovery progress"
                 );
             }
@@ -2097,6 +2015,7 @@ impl HybridStore {
 
         // Create index directory and Tantivy index if it doesn't exist
         let index_path = self.config.shard_path.join("indices").join(index);
+        let init_start = Instant::now();
 
         // Determine schema for this index
         let index_schema = self
@@ -2106,6 +2025,7 @@ impl HybridStore {
         let (schema, _) = Self::create_schema_from_definition(&index_schema);
 
         // Create or open tantivy index, and get the correct field handles
+        let open_start = Instant::now();
         let (tantivy_index, fields, sync_schema) = if index_path.join("meta.json").exists() {
             // Opening existing index: must use Field handles from the opened index's schema
             let opened_index = Index::open_in_dir(&index_path)?;
@@ -2161,16 +2081,21 @@ impl HybridStore {
             tracing::debug!(index = %index, "Schema synced: Tantivy schema merged with stored metadata, cached and persisted");
         }
 
+        let open_elapsed = open_start.elapsed();
+
         // Create writer with dynamic memory budget based on index size
+        let writer_start = Instant::now();
         let optimal_budget = self.config.get_optimal_memory_budget(&index_path);
 
         // Cache the budget
         self.budget_cache.insert(index.to_string(), optimal_budget);
 
         let mut writer = tantivy_index.writer(optimal_budget)?;
+        let writer_elapsed = writer_start.elapsed();
 
         // WAL Recovery: Check if there are any operations in the WAL that need to be replayed
         // This happens when the index was opened after a crash or restart
+        let recovery_start = Instant::now();
         let reader = tantivy_index
             .reader_builder()
             .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
@@ -2199,6 +2124,20 @@ impl HybridStore {
             );
         }
 
+        let recovery_elapsed = recovery_start.elapsed();
+        let total_elapsed = init_start.elapsed();
+
+        tracing::info!(
+            index = %index,
+            open_ms = open_elapsed.as_millis(),
+            writer_ms = writer_elapsed.as_millis(),
+            recovery_ms = recovery_elapsed.as_millis(),
+            total_ms = total_elapsed.as_millis(),
+            replayed = replayed_count,
+            budget_mb = optimal_budget / (1024 * 1024),
+            "Index initialization complete"
+        );
+
         let writer_arc = Arc::new(Mutex::new(writer));
 
         // Store in cache
@@ -2207,7 +2146,7 @@ impl HybridStore {
         self.fields_cache.insert(index.to_string(), fields.clone());
 
         // Initialize sequence counter for this index using values already computed
-        // by recover_index — avoids redundant get_max_wal_id_for_index + get_highest_indexed_seq calls
+        // by recover_index — avoids redundant lookups.
         self.current_seq
             .entry(index.to_string())
             .or_insert_with(|| {
@@ -2215,9 +2154,9 @@ impl HybridStore {
                 tracing::debug!(
                     index = %index,
                     max_wal_seq = max_wal_seq,
-                    max_indexed_seq = last_committed_seq,
+                    last_committed_seq = last_committed_seq,
                     initialized_seq = max_seq,
-                    "Initialized sequence counter (reused from recovery)"
+                    "Initialized sequence counter"
                 );
                 AtomicU64::new(max_seq)
             });
@@ -2358,40 +2297,27 @@ impl HybridStore {
         Ok(())
     }
 
-    /// Truncate WAL entries up to the last committed sequence in Tantivy.
-    /// This is called after a successful Tantivy commit to clean up the Redb WAL.
+    /// Truncate WAL entries up to the current sequence counter.
+    /// Called after a successful Tantivy commit — all WAL entries up to current_seq
+    /// are now safely persisted in Tantivy and can be removed from redb.
     fn truncate_wal_up_to_committed(&self, index: &str) -> Result<(), StoreError> {
-        // Get the last committed sequence from Tantivy by opening a fresh reader
-        let index_path = self.config.shard_path.join("indices").join(index);
-        let last_committed_seq = if index_path.join("meta.json").exists() {
-            let tantivy_index = Index::open_in_dir(&index_path)?;
-            let reader = tantivy_index
-                .reader_builder()
-                .reload_policy(tantivy::ReloadPolicy::Manual)
-                .try_into()?;
-            self.get_last_indexed_seq(&reader, index)?
-        } else {
-            0
+        let last_committed_seq = match self.current_seq.get(index) {
+            Some(counter) => counter.load(Ordering::SeqCst),
+            None => return Ok(()),
         };
 
         if last_committed_seq == 0 {
-            // Nothing committed yet, nothing to truncate
             return Ok(());
         }
 
-        // Truncate WAL entries up to and including last_committed_seq
         let wal_table_name = format!("wal_{}", index);
         let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
 
         let mut write_txn = self.kv.begin_write()?;
         {
-            // Use Immediate durability for WAL truncation - this is cleanup, must be reliable
             write_txn.set_durability(Durability::Immediate)?;
-
             let mut wal_table = write_txn.open_table(wal_table_def)?;
 
-            // Delete all entries from 0 up to and including last_committed_seq
-            // We use a range iterator to find them efficiently
             let keys_to_delete: Vec<u64> = wal_table
                 .range(0..=last_committed_seq)?
                 .map(|result| result.map(|(k, _)| k.value()))
@@ -2403,12 +2329,11 @@ impl HybridStore {
             }
 
             if deleted_count > 0 {
-                tracing::info!(
+                tracing::debug!(
                     index = %index,
                     deleted = deleted_count,
                     up_to_seq = last_committed_seq,
-                    "Truncated WAL entries - {} operations now stable in Tantivy",
-                    deleted_count
+                    "Truncated committed WAL entries"
                 );
             }
         }
@@ -3555,7 +3480,8 @@ impl HybridStore {
                 .unwrap_or_else(|| Arc::new(IndexSchema::default()))
         };
 
-        // Generate sequence IDs for all operations in one atomic operation
+        // Reserve a contiguous block of sequence IDs atomically.
+        // fetch_add returns the previous value; +1 gives the first usable seq.
         let start_seq = {
             let counter = self.current_seq.get(index).ok_or_else(|| {
                 StoreError::IndexNotFound(format!(
@@ -3563,11 +3489,10 @@ impl HybridStore {
                     index
                 ))
             })?;
-            counter.fetch_add(ops_len as u64, Ordering::SeqCst) + 1 - ops_len as u64
+            counter.fetch_add(ops_len as u64, Ordering::SeqCst) + 1
         };
-        let seq_ids_iter = (0..ops_len).map(|i| start_seq + i as u64);
+        let seq_ids_iter = (0..ops_len).map(move |i| start_seq + i as u64);
 
-        // Generate sequence IDs for all operations in one atomic operation
         let data_table_name = format!("data_{}", index);
         let wal_table_name = format!("wal_{}", index);
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
@@ -4058,6 +3983,7 @@ impl HybridStore {
     /// This should be called during startup to ensure all indices are recovered
     /// and ready for use, rather than waiting for first access.
     ///
+    /// Uses parallel threads to warm up indices concurrently for faster startup.
     /// Returns the total number of operations recovered across all indices.
     pub fn warmup_indices(&self) -> Result<usize, StoreError> {
         let warmup_start = Instant::now();
@@ -4070,31 +3996,58 @@ impl HybridStore {
 
         tracing::info!(
             count = index_names.len(),
-            "Starting index warmup and WAL recovery for {} indices",
+            "Starting parallel index warmup and WAL recovery for {} indices",
             index_names.len()
         );
 
-        for index_name in &index_names {
-            // Opening the index triggers WAL recovery in get_or_create_index
-            match self.get_or_create_index(index_name) {
-                Ok(_) => {
-                    // Recovery already happened and was logged in get_or_create_index
-                    // We don't have direct access to the count here, but it's already logged
-                    tracing::debug!(index = %index_name, "Index warmed up successfully");
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        index = %index_name,
-                        error = %e,
-                        "Failed to warm up index, will retry on first access"
-                    );
+        // Use scoped threads to warm up indices in parallel.
+        // get_or_create_index uses DashMap internally so concurrent access is safe.
+        // Cap parallelism to avoid excessive memory from many simultaneous Tantivy writers.
+        let max_parallel = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .min(index_names.len())
+            .max(1);
+        let errors = std::sync::Mutex::new(Vec::new());
+
+        std::thread::scope(|s| {
+            // Process indices in chunks to limit parallelism
+            for chunk in index_names.chunks(max_parallel) {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|index_name| {
+                        let errors = &errors;
+                        s.spawn(move || {
+                            match self.get_or_create_index(index_name) {
+                                Ok(_) => {
+                                    tracing::debug!(index = %index_name, "Index warmed up successfully");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        index = %index_name,
+                                        error = %e,
+                                        "Failed to warm up index, will retry on first access"
+                                    );
+                                    errors.lock().unwrap().push(index_name.clone());
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+
+                // Wait for this chunk to complete before starting next
+                for handle in handles {
+                    let _ = handle.join();
                 }
             }
-        }
+        });
 
+        let failed = errors.into_inner().unwrap();
         let warmup_elapsed = warmup_start.elapsed();
         tracing::info!(
             indices_count = index_names.len(),
+            failed_count = failed.len(),
+            parallel_threads = max_parallel,
             elapsed_ms = warmup_elapsed.as_millis(),
             "Index warmup completed in {}ms",
             warmup_elapsed.as_millis()

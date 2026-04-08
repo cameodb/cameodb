@@ -1251,25 +1251,22 @@ impl MicroshardActor {
             })?;
 
         let store_arc = Arc::new(store);
+        self.store = Some(store_arc.clone());
 
-        // Warm up all indices to trigger WAL recovery at startup
-        // This ensures all indices are consistent before accepting requests
+        // Warm up indices in the background to avoid blocking server startup.
+        // Indices have lazy initialization (get_or_create_index) so any request
+        // arriving before warmup completes will still work — it just triggers
+        // on-demand initialization for that specific index.
         let warmup_store = Arc::clone(&store_arc);
         let shard_id = self.shard_id;
-        tokio::task::spawn_blocking(move || {
-            match warmup_store.warmup_indices() {
-                Ok(_) => {
-                    info!(shard_id = %shard_id, "Index warmup and WAL recovery completed");
-                }
-                Err(e) => {
-                    warn!(shard_id = %shard_id, error = %e, "Index warmup encountered errors, indices will recover on first access");
-                }
+        tokio::task::spawn_blocking(move || match warmup_store.warmup_indices() {
+            Ok(_) => {
+                info!(shard_id = %shard_id, "Index warmup and WAL recovery completed");
             }
-        })
-        .await
-        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?;
-
-        self.store = Some(store_arc.clone());
+            Err(e) => {
+                warn!(shard_id = %shard_id, error = %e, "Index warmup encountered errors, indices will recover on first access");
+            }
+        });
 
         // Spawn dedicated writer thread for serialized I/O
         let (tx, mut rx) = mpsc::channel::<StorageCommand>(SHARD_WRITER_CHANNEL_CAPACITY);
@@ -4197,24 +4194,44 @@ impl NodeOrchestrator {
         }
     }
 
-    /// Scans the storage directory for existing shard folders and hydrates them in parallel.
-    /// Shards are registered immediately as they become available, and reader warmup happens
-    /// in a detached background task to avoid blocking node startup.
+    /// Scans the storage directory for existing shard folders and hydrates them with
+    /// bounded concurrency. The bottleneck is redb::Builder::create() which does heavy
+    /// disk I/O (WAL replay, compaction). Running all shards simultaneously causes I/O
+    /// contention that makes each open 10-100× slower. A semaphore limits how many shards
+    /// open their redb databases concurrently.
     async fn hydrate_existing_shards(&mut self) -> Result<(), OrchestratorError> {
         let existing_shards = self.discover_existing_shards()?;
         info!("Found {} existing shards", existing_shards.len());
 
-        // Process all shards in parallel for maximum startup speed
+        // Limit concurrent shard initialization to reduce disk I/O contention.
+        // redb::Builder::create() is the bottleneck — 8 concurrent opens on spinning
+        // disk can take 6+ minutes each due to I/O contention vs ~seconds sequentially.
+        // 2 concurrent is a good balance: allows pipelining while avoiding thrashing.
+        let max_concurrent = 2usize.min(existing_shards.len()).max(1);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+
+        info!(
+            max_concurrent = max_concurrent,
+            "Hydrating shards with bounded concurrency"
+        );
+
+        let hydrate_start = Instant::now();
         let mut shard_tasks: Vec<tokio::task::JoinHandle<ShardTaskResult>> = Vec::new();
 
-        // Create tasks for all shards
+        // Create tasks for all shards — semaphore gates actual execution
         for &shard_id in &existing_shards {
             let shard_path = self.deterministic_shard_directory(shard_id);
             let storage_config = self.create_shard_storage_config(shard_id, shard_path);
             let default_search_limit = self.default_search_limit;
             let read_handle = self.read_runtime.as_ref().map(|rt| rt.handle().clone());
+            let sem = Arc::clone(&semaphore);
 
             let task = tokio::spawn(async move {
+                // Acquire semaphore permit before starting heavy I/O
+                let _permit = sem.acquire().await.map_err(|e| {
+                    OrchestratorError::Io(std::io::Error::other(format!("Semaphore closed: {}", e)))
+                })?;
+
                 let mut microshard = MicroshardActor::new(
                     shard_id,
                     storage_config,
@@ -4232,6 +4249,7 @@ impl NodeOrchestrator {
                         Ok((shard_id, None))
                     }
                 }
+                // _permit dropped here, allowing next shard to start
             });
             shard_tasks.push(task);
         }
@@ -4256,6 +4274,12 @@ impl NodeOrchestrator {
                 }
             }
         }
+
+        let hydrate_elapsed = hydrate_start.elapsed();
+        info!(
+            elapsed_ms = hydrate_elapsed.as_millis(),
+            "All shard hydration tasks completed"
+        );
 
         info!(
             "NodeOrchestrator startup complete with {} active shards",
