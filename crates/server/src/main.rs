@@ -1,5 +1,9 @@
 use anyhow::Result;
 use kameo::actor::Spawn;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::time::timeout;
 
 mod cluster_coordinator;
 mod cluster_state;
@@ -23,8 +27,23 @@ use node_orchestrator::{
     orchestrator_remote_name,
 };
 use remote_peer_pool::RemotePeerPool;
-use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// Global shutdown flag to prevent double-shutdown issues.
+/// Set to true when shutdown begins, checked by signal handlers.
+static SHUTDOWN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Maximum time to wait for HTTP server to drain connections.
+const HTTP_DRAIN_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum time to wait for all shards to shutdown.
+const SHARD_SHUTDOWN_TIMEOUT_SECS: u64 = 60;
+
+/// Maximum time to wait for MCP sessions to close.
+const MCP_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+
+/// Maximum time to wait for coordinator swarm shutdown.
+const COORDINATOR_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -406,12 +425,21 @@ async fn main() -> Result<()> {
         use tokio::signal::unix;
         let mut sigterm_recv = unix::signal(unix::SignalKind::terminate())
             .map_err(|e| anyhow::anyhow!("Failed to setup SIGTERM handler: {}", e))?;
+        let sigint_recv = tokio::signal::ctrl_c();
 
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = sigint_recv => {
+                if SHUTDOWN_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+                    tracing::warn!("Second SIGINT received, forcing immediate exit");
+                    std::process::exit(1);
+                }
                 tracing::info!("Received SIGINT (Ctrl+C), shutting down...");
             }
             _ = sigterm_recv.recv() => {
+                if SHUTDOWN_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+                    tracing::warn!("Second SIGTERM received, forcing immediate exit");
+                    std::process::exit(1);
+                }
                 tracing::info!("Received SIGTERM (systemctl stop), shutting down...");
             }
         }
@@ -430,39 +458,101 @@ async fn main() -> Result<()> {
 
         tokio::select! {
             _ = sigint.recv() => {
+                if SHUTDOWN_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+                    tracing::warn!("Second CTRL+C received, forcing immediate exit");
+                    std::process::exit(1);
+                }
                 tracing::info!("Received CTRL+C, shutting down...");
             }
             _ = sigclose.recv() => {
+                if SHUTDOWN_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+                    tracing::warn!("Second CTRL_CLOSE received, forcing immediate exit");
+                    std::process::exit(1);
+                }
                 tracing::info!("Received CTRL_CLOSE (service stop/console close), shutting down...");
             }
             _ = sigshutdown.recv() => {
+                if SHUTDOWN_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+                    tracing::warn!("Second CTRL_SHUTDOWN received, forcing immediate exit");
+                    std::process::exit(1);
+                }
                 tracing::info!("Received CTRL_SHUTDOWN (service stop), shutting down...");
             }
         }
     }
-    println!("Shutting down...");
+    println!("Shutting down gracefully (press Ctrl+C again to force)...");
 
-    // Shutdown MCP sessions first (closes SSE streams cleanly)
-    mcp_handle.shutdown().await;
-
-    // Signal HTTP server to drain gracefully
-    let _ = shutdown_tx.send(());
-
-    // Shutdown all shards gracefully to commit pending writes
-    tracing::info!("Shutting down all shards...");
-    if let Err(e) = orchestrator_ref
-        .ask(crate::node_orchestrator::ShutdownAllShards)
-        .await
+    // Phase 1: Shutdown MCP sessions (non-critical, timeout after 5s)
+    tracing::info!(
+        "Phase 1/4: Closing MCP sessions (timeout: {}s)...",
+        MCP_SHUTDOWN_TIMEOUT_SECS
+    );
+    match timeout(
+        Duration::from_secs(MCP_SHUTDOWN_TIMEOUT_SECS),
+        mcp_handle.shutdown(),
+    )
+    .await
     {
-        tracing::error!(error = %e, "Failed to shutdown shards gracefully");
+        Ok(()) => tracing::info!("MCP sessions closed successfully"),
+        Err(_) => tracing::warn!(
+            "MCP shutdown timed out after {}s, continuing...",
+            MCP_SHUTDOWN_TIMEOUT_SECS
+        ),
     }
 
-    // Signal coordinator to shutdown swarm gracefully
-    let _ = coordinator_actor.ask(ShutdownSwarm).await;
-
-    if let Err(e) = server_handle.await {
-        tracing::warn!("HTTP server task ended with error: {}", e);
+    // Phase 2: Signal HTTP server to drain (with timeout)
+    tracing::info!(
+        "Phase 2/4: Draining HTTP connections (timeout: {}s)...",
+        HTTP_DRAIN_TIMEOUT_SECS
+    );
+    let _ = shutdown_tx.send(());
+    match timeout(Duration::from_secs(HTTP_DRAIN_TIMEOUT_SECS), server_handle).await {
+        Ok(Ok(())) => tracing::info!("HTTP server drained successfully"),
+        Ok(Err(e)) => tracing::warn!("HTTP server ended with error: {}", e),
+        Err(_) => tracing::warn!(
+            "HTTP drain timed out after {}s, forcing close...",
+            HTTP_DRAIN_TIMEOUT_SECS
+        ),
     }
 
+    // Phase 3: Shutdown all shards (critical, longer timeout)
+    tracing::info!(
+        "Phase 3/4: Shutting down all shards (timeout: {}s)...",
+        SHARD_SHUTDOWN_TIMEOUT_SECS
+    );
+    match timeout(
+        Duration::from_secs(SHARD_SHUTDOWN_TIMEOUT_SECS),
+        orchestrator_ref.ask(crate::node_orchestrator::ShutdownAllShards),
+    )
+    .await
+    {
+        Ok(Ok(())) => tracing::info!("All shards shut down successfully"),
+        Ok(Err(e)) => tracing::error!(error = %e, "Shard shutdown failed"),
+        Err(_) => tracing::error!(
+            "Shard shutdown timed out after {}s - some data may not be persisted!",
+            SHARD_SHUTDOWN_TIMEOUT_SECS
+        ),
+    }
+
+    // Phase 4: Shutdown coordinator swarm (non-critical)
+    tracing::info!(
+        "Phase 4/4: Shutting down coordinator (timeout: {}s)...",
+        COORDINATOR_SHUTDOWN_TIMEOUT_SECS
+    );
+    match timeout(
+        Duration::from_secs(COORDINATOR_SHUTDOWN_TIMEOUT_SECS),
+        coordinator_actor.ask(ShutdownSwarm),
+    )
+    .await
+    {
+        Ok(Ok(())) => tracing::info!("Coordinator shut down successfully"),
+        Ok(Err(e)) => tracing::warn!("Coordinator shutdown error: {}", e),
+        Err(_) => tracing::warn!(
+            "Coordinator shutdown timed out after {}s",
+            COORDINATOR_SHUTDOWN_TIMEOUT_SECS
+        ),
+    }
+
+    tracing::info!("Shutdown complete - process exiting");
     Ok(())
 }

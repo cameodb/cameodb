@@ -23,8 +23,8 @@ fn test_storage_engine_basics() {
         wal_sync: true,
     };
 
-    // Test store creation
-    let store = HybridStore::new(config).expect("Failed to create HybridStore");
+    // Test store creation (single shard for test)
+    let store = HybridStore::new(config, 1).expect("Failed to create HybridStore");
 
     // Test that directories are created
     assert!(
@@ -117,12 +117,12 @@ fn test_storage_configuration() {
         redb_write_cache_bytes: 32 * 1024 * 1024,
 
         // Other Configuration
-        default_batch_size: 2000,
+        default_batch_size: 500,
         wal_sync: false,
     };
 
-    // Test store creation with custom config
-    let store = HybridStore::new(config).expect("Failed to create HybridStore");
+    // Test store creation with custom config (single shard for test)
+    let store = HybridStore::new(config, 1).expect("Failed to create HybridStore");
 
     // Verify directories are created
     assert!(

@@ -1201,6 +1201,8 @@ pub struct MicroshardActor {
     /// Dedicated read thread pool handle for isolated search/stats operations.
     /// Separates read I/O from the writer thread and tokio's generic blocking pool.
     read_pool_handle: Option<tokio::runtime::Handle>,
+    /// Total number of shards on this node (for per-shard memory budgeting).
+    total_shards: usize,
 }
 
 impl std::fmt::Debug for MicroshardActor {
@@ -1220,6 +1222,7 @@ impl MicroshardActor {
         storage_config: StorageConfig,
         default_search_limit: usize,
         read_pool_handle: Option<tokio::runtime::Handle>,
+        total_shards: usize,
     ) -> Self {
         Self {
             shard_id,
@@ -1230,6 +1233,7 @@ impl MicroshardActor {
             supervisors: Arc::new(AsyncRwLock::new(HashMap::new())),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             read_pool_handle,
+            total_shards,
         }
     }
 
@@ -1242,7 +1246,8 @@ impl MicroshardActor {
 
         // Initialize HybridStore with spawn_blocking to avoid blocking async runtime
         let config = self.storage_config.clone();
-        let store = tokio::task::spawn_blocking(move || HybridStore::new(config))
+        let total_shards = self.total_shards;
+        let store = tokio::task::spawn_blocking(move || HybridStore::new(config, total_shards))
             .await
             .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
             .map_err(|e: StoreError| match e {
@@ -1548,7 +1553,10 @@ impl MicroshardActor {
     /// Gracefully stop the dedicated writer thread.
     /// First drains all supervisor tasks (they hold cloned writer_tx senders),
     /// then sends `Shutdown` command and waits for the thread to finish.
+    /// Includes timeout to prevent indefinite hangs if writer thread panics.
     async fn shutdown_writer(&mut self) {
+        use tokio::time::{Duration, timeout};
+
         // Step 1: Drop all supervisor senders so their tasks terminate.
         // Supervisors hold cloned writer_tx and would otherwise keep running
         // (and failing to send) after the writer thread exits.
@@ -1561,12 +1569,18 @@ impl MicroshardActor {
             }
         }
 
-        // Step 2: Send Shutdown to writer thread and wait for acknowledgement
+        // Step 2: Send Shutdown to writer thread and wait for acknowledgement (with timeout)
         if let Some(tx) = self.writer_tx.take() {
             if tx.send(StorageCommand::Shutdown).await.is_ok() {
-                // Wait for the writer thread to acknowledge shutdown
-                self.shutdown_notify.notified().await;
-                tracing::info!(shard_id = %self.shard_id, "Writer thread shutdown complete");
+                // Wait for the writer thread to acknowledge shutdown (max 10s)
+                match timeout(Duration::from_secs(10), self.shutdown_notify.notified()).await {
+                    Ok(()) => {
+                        tracing::info!(shard_id = %self.shard_id, "Writer thread shutdown complete")
+                    }
+                    Err(_) => {
+                        tracing::warn!(shard_id = %self.shard_id, "Writer thread shutdown timed out after 10s")
+                    }
+                }
             } else {
                 tracing::warn!(shard_id = %self.shard_id, "Writer thread already closed");
             }
@@ -1976,6 +1990,12 @@ impl Message<ShutdownShard> for MicroshardActor {
             .await
             .map_err(|e| RemoteError::Other(format!("Shutdown task failed: {}", e)))?;
         }
+
+        // Step 3: Explicitly drop store reference to ensure database file is closed
+        // This is critical for clean shutdown - ensures the redb Database is dropped
+        // and file handles released before the actor returns.
+        self.store = None;
+        tracing::info!(shard_id = %self.shard_id, "MicroshardActor: Store dropped, database closed");
 
         tracing::info!(shard_id = %self.shard_id, "MicroshardActor: Shutdown completed");
         Ok(())
@@ -4225,6 +4245,7 @@ impl NodeOrchestrator {
         let mut shard_tasks: Vec<tokio::task::JoinHandle<ShardTaskResult>> = Vec::new();
 
         // Create tasks for all shards — semaphore gates actual execution
+        let total_shards = existing_shards.len();
         for &shard_id in &existing_shards {
             let shard_path = self.deterministic_shard_directory(shard_id);
             let storage_config = self.create_shard_storage_config(shard_id, shard_path);
@@ -4243,6 +4264,7 @@ impl NodeOrchestrator {
                     storage_config,
                     default_search_limit,
                     read_handle,
+                    total_shards,
                 );
 
                 match microshard.start().await {
@@ -4504,11 +4526,13 @@ impl NodeOrchestrator {
         // Create and start microshard actor
         let storage_config = self.create_shard_storage_config(shard_id, shard_path.clone());
         let read_handle = self.read_runtime.as_ref().map(|rt| rt.handle().clone());
+        let total_shards = self.shards.len() + 1; // Current + new shard
         let mut microshard = MicroshardActor::new(
             shard_id,
             storage_config,
             self.default_search_limit,
             read_handle,
+            total_shards,
         );
         microshard.start().await?;
 

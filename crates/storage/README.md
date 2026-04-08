@@ -608,6 +608,51 @@ export CAMEODB_STORAGE_DEFAULT_BATCH_SIZE=2000
 
 This supervised strategy ensures optimal performance across all write patterns while maintaining strong data durability guarantees.
 
+## Tiered Cache Sizing for redb
+
+CameoDB implements intelligent cache sizing for the redb storage engine that optimizes both startup recovery time and steady-state memory usage.
+
+### Two-Phase Initialization
+
+For existing databases, redb is initialized in two phases:
+
+1. **Phase 1 - Init Boost**: Opens with a larger cache size calculated from database file size
+   - Enables faster WAL recovery and index metadata loading
+   - Cache size determined by database tier (see table below)
+
+2. **Phase 2 - Normal Operation**: Reopens with optimized standard cache
+   - Drops init cache to release memory for steady-state operations
+   - Balances performance with multi-shard deployments
+
+### Database Size Tiers
+
+| Database Size | Tier  | Standard Cache | Init Boost Cache | Multiplier |
+|---------------|-------|----------------|------------------|------------|
+| < 1MB         | New   | 32MB           | 32MB             | 1×         |
+| < 100MB       | Small | 64MB           | 128MB            | 2×         |
+| 100MB - 1GB   | Medium| 128MB          | 512MB            | 4×         |
+| > 1GB         | Large | 256MB          | 2GB              | 8×         |
+
+### Per-Shard Memory Budgeting
+
+When multiple shards run on a single node, memory is automatically divided to prevent overallocation:
+
+- **Available Memory Pool**: 25% of system available memory
+- **Per-Shard Budget**: Divided equally among all active shards
+- **Safety Caps**: Standard cache capped at 12.5% available, init cache at 25%
+- **Cross-Platform**: Uses system memory detection with macOS fallback (25% of total if unavailable)
+
+### Example Log Output
+
+```
+HybridStore: calculated tiered cache sizes (per-shard) \
+  file_size_mb=2078 available_memory_mb=4096 total_memory_mb=16384 \
+  max_shards=4 per_shard_available_mb=256 \
+  standard_cache_mb=256 init_cache_mb=512
+HybridStore: Phase 1/2 - Opening with init boost cache
+HybridStore: Phase 2/2 - Reopening with normal cache elapsed_ms=16
+```
+
 ## Performance Characteristics
 
 ### Write Performance (Rust 2024 Optimized)

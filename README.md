@@ -11,7 +11,7 @@ A high-performance, distributed, shared-nothing hybrid-search database built in 
 - 🌐 **Distributed Ready** - Actor-based architecture with consistent hashing
 - 🔁 **Event-Driven Persistence** - Zero-polling cluster metadata with state reconciliation
 - 🐳 **Docker Deployment** - Production-ready containerized setup
-- 📈 **Performance Optimized** - Supervised Smart Commits, memory budgets, and adaptive batching
+- 📈 **Performance Optimized** - Tiered redb cache sizing, Supervised Smart Commits, memory budgets, and adaptive batching
 - 🦀 **Modern Rust 2024** - Built with latest Rust standards and performance optimizations
 
 ## 🚀 Quick Start

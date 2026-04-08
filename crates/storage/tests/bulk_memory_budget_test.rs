@@ -26,6 +26,15 @@ fn test_bulk_memory_budget_scaling() {
     let index_path = temp_dir.path().join("test_index");
     std::fs::create_dir_all(&index_path).expect("Failed to create index directory");
 
+    // Create a larger fake index (> 500MB to trigger max budget)
+    let large_index_path = temp_dir.path().join("large_index");
+    std::fs::create_dir_all(&large_index_path).expect("Failed to create large index directory");
+
+    // Pre-populate with a large file to simulate big index
+    let large_file = large_index_path.join("large_file.bin");
+    let content = vec![0u8; 600 * 1024 * 1024]; // 600MB
+    std::fs::write(&large_file, &content).expect("Failed to create large test file");
+
     // Test base budget (small batch)
     let base_budget = config.get_bulk_operation_budget(&index_path, 500);
     let min_budget = config.indexer_memory_min_mb * 1024 * 1024;

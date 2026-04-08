@@ -234,6 +234,30 @@ This implements a distributed search/read path suitable for fan-out queries acro
     - Total broadcast attempts.
     - Broadcast failures (per failed shard/node).
 
+### Graceful Shutdown
+
+CameoDB implements a 4-phase graceful shutdown process with configurable timeouts:
+
+| Phase | Operation | Timeout | Critical |
+|-------|-----------|---------|----------|
+| 1 | Close MCP sessions | 5s | No |
+| 2 | Drain HTTP connections | 10s | No |
+| 3 | Shutdown all shards | 60s | **Yes** |
+| 4 | Shutdown coordinator | 10s | No |
+
+**Phase 3 (Shard Shutdown) includes:**
+- Commit any pending Tantivy writes with data durability
+- Flush redb WAL via `Durability::Immediate` transaction
+- Clear all in-memory caches
+- Stop writer threads
+
+**Signal Handling:**
+- First SIGINT/Ctrl+C initiates graceful shutdown
+- Second SIGINT forces immediate exit (may lose uncommitted data)
+- Windows: Handles CTRL_CLOSE and CTRL_SHUTDOWN for service stop events
+
+This ensures clean state for fast startup (zero WAL replay) on next boot.
+
 ---
 
 ## 6. Cluster Metadata Persistence & State Reconciliation

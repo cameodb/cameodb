@@ -1312,12 +1312,103 @@ pub struct HybridStore {
 }
 
 impl HybridStore {
-    /// Creates a new multi-tenant HybridStore.
-    pub fn new(config: StorageConfig) -> Result<Self, StoreError> {
+    /// Calculate tiered cache sizes based on database file size, system memory, and shard count.
+    /// Returns (init_cache_size, normal_cache_size) in bytes.
+    ///
+    /// Memory is divided by max_shards to ensure we don't exceed system limits
+    /// when multiple shards are initialized on the same node.
+    fn calculate_cache_sizes(db_file_size_bytes: u64, max_shards: usize) -> (usize, usize) {
+        use sysinfo::{MemoryRefreshKind, System};
+
+        // Get system memory info
+        let mut system = System::new();
+        system.refresh_memory_specifics(MemoryRefreshKind::everything());
+        let total_memory = system.total_memory();
+        // macOS sometimes reports 0 for available_memory, so use fallback
+        let available_memory = if system.available_memory() > 0 {
+            system.available_memory()
+        } else {
+            // Fallback: use 25% of total as "available working memory"
+            total_memory / 4
+        };
+
+        // Ensure at least 1 shard to avoid division by zero
+        let shard_count = max_shards.max(1);
+
+        // Calculate per-shard memory budget (divide available memory by shard count)
+        // Use 25% of available memory as the pool for all redb caches
+        let per_shard_available = (available_memory / 4) / shard_count as u64;
+        let per_shard_total = (total_memory / 2) / shard_count as u64;
+
+        // Base standard cache sizes by database tier (before per-shard limits)
+        let base_standard_cache = if db_file_size_bytes < 1024 * 1024 {
+            32 * 1024 * 1024
+        } else if db_file_size_bytes < 100 * 1024 * 1024 {
+            64 * 1024 * 1024
+        } else if db_file_size_bytes < 1024 * 1024 * 1024 {
+            128 * 1024 * 1024
+        } else {
+            256 * 1024 * 1024
+        };
+
+        // Apply per-shard memory caps
+        let standard_cache = (base_standard_cache as u64)
+            .min(per_shard_available)
+            .min(per_shard_total) as usize;
+
+        // Calculate INIT BOOST cache
+        let boost_multiplier = if db_file_size_bytes < 1024 * 1024 {
+            1
+        } else if db_file_size_bytes < 100 * 1024 * 1024 {
+            2
+        } else if db_file_size_bytes < 1024 * 1024 * 1024 {
+            4
+        } else {
+            8
+        };
+
+        let init_cache = if boost_multiplier == 1 {
+            standard_cache
+        } else {
+            let max_boost = if db_file_size_bytes < 100 * 1024 * 1024 {
+                128usize * 1024 * 1024
+            } else if db_file_size_bytes < 1024 * 1024 * 1024 {
+                512usize * 1024 * 1024
+            } else {
+                2usize * 1024 * 1024 * 1024
+            };
+            let boosted = (base_standard_cache * boost_multiplier).min(max_boost);
+            (boosted as u64)
+                .min(per_shard_available * 2)
+                .min(per_shard_total) as usize
+        };
+
+        tracing::info!(
+            file_size_mb = db_file_size_bytes / (1024 * 1024),
+            available_memory_mb = available_memory / (1024 * 1024),
+            total_memory_mb = total_memory / (1024 * 1024),
+            max_shards = shard_count,
+            per_shard_available_mb = per_shard_available / (1024 * 1024),
+            standard_cache_mb = standard_cache / (1024 * 1024),
+            init_cache_mb = init_cache / (1024 * 1024),
+            "HybridStore: calculated tiered cache sizes (per-shard)"
+        );
+
+        (init_cache, standard_cache)
+    }
+
+    /// Creates a new multi-tenant HybridStore with tiered cache sizing.
+    /// Uses a larger "init boost" cache for fast recovery on existing databases,
+    /// then reopens with normal cache size for standard operations.
+    ///
+    /// # Arguments
+    /// * `config` - Storage configuration
+    /// * `total_shards` - Total number of shards on this node (for per-shard memory budgeting)
+    pub fn new(config: StorageConfig, total_shards: usize) -> Result<Self, StoreError> {
         let init_start = Instant::now();
         tracing::info!(
             shard_path = %config.shard_path.display(),
-            "HybridStore: initializing shard storage"
+            "HybridStore: initializing shard storage with tiered cache"
         );
 
         // Create directory structure
@@ -1335,28 +1426,67 @@ impl HybridStore {
         );
 
         let db_file_exists = kv_path.exists();
-        let db_start = Instant::now();
+        let db_file_size = if db_file_exists {
+            fs::metadata(&kv_path)?.len()
+        } else {
+            0
+        };
 
-        // Use Builder pattern to configure redb cache sizes.
-        // Use open() for existing files (faster, prevents accidental creation),
-        // create() only when the database doesn't exist yet.
-        let mut builder = redb::Builder::new();
-        builder.set_cache_size(config.redb_read_cache_bytes);
+        // Calculate tiered cache sizes based on file size and shard count
+        let (init_cache_size, normal_cache_size) =
+            Self::calculate_cache_sizes(db_file_size, total_shards);
+
         let kv = if db_file_exists {
+            // EXISTING DATABASE: Two-phase open for fast recovery
+            // Phase 1: Open with init boost cache for fast recovery/metadata loading
+            let init_start_time = Instant::now();
+            tracing::info!(
+                db_path = %kv_path.display(),
+                init_cache_mb = init_cache_size / (1024 * 1024),
+                "HybridStore: Phase 1/2 - Opening with init boost cache"
+            );
+
+            let mut builder = redb::Builder::new();
+            builder.set_cache_size(init_cache_size);
+            let temp_db = builder.open(&kv_path)?;
+
+            // Phase 2: Close and reopen with normal cache
+            tracing::info!(
+                elapsed_ms = init_start_time.elapsed().as_millis(),
+                normal_cache_mb = normal_cache_size / (1024 * 1024),
+                "HybridStore: Phase 2/2 - Reopening with normal cache"
+            );
+
+            // Explicitly drop to close before reopening
+            drop(temp_db);
+
+            // Reopen with normal cache for standard operations
+            let mut builder = redb::Builder::new();
+            builder.set_cache_size(normal_cache_size);
             builder.open(&kv_path)?
         } else {
+            // NEW DATABASE: Just create with normal cache
+            tracing::info!(
+                db_path = %kv_path.display(),
+                cache_mb = normal_cache_size / (1024 * 1024),
+                "HybridStore: Creating new database with standard cache"
+            );
+
+            let mut builder = redb::Builder::new();
+            builder.set_cache_size(normal_cache_size);
             builder.create(&kv_path)?
         };
 
-        let db_elapsed = db_start.elapsed();
+        let total_elapsed = init_start.elapsed();
         tracing::info!(
             shard_path = %config.shard_path.display(),
             db_path = %kv_path.display(),
             existed = db_file_exists,
-            read_cache_mb = config.redb_read_cache_bytes / (1024 * 1024),
-            write_cache_mb = config.redb_write_cache_bytes / (1024 * 1024),
-            elapsed_ms = db_elapsed.as_millis(),
-            "HybridStore: redb database opened with cache configuration"
+            file_size_mb = db_file_size / (1024 * 1024),
+            normal_cache_mb = normal_cache_size / (1024 * 1024),
+            init_cache_mb = if db_file_exists { init_cache_size / (1024 * 1024) } else { 0 },
+            elapsed_ms = total_elapsed.as_millis(),
+            "HybridStore: initialization complete"
         );
 
         Ok(HybridStore {
@@ -1372,14 +1502,6 @@ impl HybridStore {
             index_size_cache: Arc::new(Mutex::new(HashMap::new())),
             index_cache_expiry: Duration::from_secs(600), // 10 minutes
             config: config.clone(),
-        })
-        .inspect(|store| {
-            let total_elapsed = init_start.elapsed();
-            tracing::info!(
-                shard_path = %store.config.shard_path.display(),
-                elapsed_ms = total_elapsed.as_millis(),
-                "HybridStore: initialization complete"
-            );
         })
     }
 
@@ -4351,7 +4473,7 @@ mod tests {
             wal_sync: true,
         };
 
-        let store = HybridStore::new(config).unwrap();
+        let store = HybridStore::new(config, 1).unwrap();
 
         // Write to index1
         let op1 = WalOp::Put {
