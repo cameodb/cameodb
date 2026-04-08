@@ -2163,6 +2163,19 @@ impl HybridStore {
             .entry(index.to_string())
             .or_insert_with(|| {
                 let max_seq = max_wal_seq.max(last_committed_seq);
+                // Guard against u64::MAX which indicates corruption or uninitialized state.
+                // u64::MAX is not a valid sequence number (would overflow on first write).
+                let max_seq = if max_seq == u64::MAX {
+                    tracing::warn!(
+                        index = %index,
+                        max_wal_seq = max_wal_seq,
+                        last_committed_seq = last_committed_seq,
+                        "Sequence counter detected u64::MAX (corrupted state), resetting to 0"
+                    );
+                    0
+                } else {
+                    max_seq
+                };
                 tracing::debug!(
                     index = %index,
                     max_wal_seq = max_wal_seq,
