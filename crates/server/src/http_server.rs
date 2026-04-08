@@ -159,15 +159,25 @@ impl McpBackend for AppState {
         let state = self.clone();
         Box::pin(async move {
             let index_name = index.index.clone();
+
+            // Preprocess query to extract return/limit/sort modifiers (same as HTTP server)
+            let (cleaned_query, parsed_limit, parsed_fields, parsed_sort) =
+                parse_query_keywords(&query);
+
+            // Merge MCP-provided values with parsed values (MCP takes precedence for limit/fields)
+            let final_limit = limit.or(parsed_limit);
+            let final_fields = index.fields.or(parsed_fields);
+            let final_sort = parsed_sort;
+
             let result = state
                 .router
                 .route_and_handle(
                     ClientOp::Search {
                         index: index.index,
-                        query: query.clone(),
-                        limit,
-                        fields: index.fields,
-                        sort: None,
+                        query: cleaned_query,
+                        limit: final_limit,
+                        fields: final_fields,
+                        sort: final_sort,
                     },
                     None,
                     OperationType::Read,
@@ -239,6 +249,13 @@ impl McpBackend for AppState {
             let mut per_index = Vec::new();
             let mut total_hits = 0u64;
 
+            // Preprocess query to extract return/limit/sort modifiers (same as HTTP server)
+            let (cleaned_query, parsed_limit, parsed_fields, parsed_sort) =
+                parse_query_keywords(&query);
+
+            // Merge MCP-provided limit with parsed limit
+            let final_limit = limit.or(parsed_limit);
+
             for index_request in indexes {
                 let McpIndexSearchRequest {
                     index,
@@ -247,8 +264,22 @@ impl McpBackend for AppState {
                 } = index_request;
                 let index_name = index.clone();
 
+                // Merge MCP-provided fields/sort with parsed values
+                let final_fields = fields.or(parsed_fields.clone());
+                let final_sort = sort.or_else(|| {
+                    parsed_sort
+                        .clone()
+                        .map(|storage_sort| cameodb_mcp::server::SortSpec {
+                            field: storage_sort.field,
+                            order: match storage_sort.order {
+                                storage::SortOrder::Desc => cameodb_mcp::server::SortOrder::Desc,
+                                storage::SortOrder::Asc => cameodb_mcp::server::SortOrder::Asc,
+                            },
+                        })
+                });
+
                 // Convert MCP SortSpec to storage SortSpec
-                let storage_sort = sort.map(|mcp_sort| storage::SortSpec {
+                let storage_sort = final_sort.map(|mcp_sort| storage::SortSpec {
                     field: mcp_sort.field,
                     order: match mcp_sort.order {
                         cameodb_mcp::server::SortOrder::Desc => storage::SortOrder::Desc,
@@ -261,9 +292,9 @@ impl McpBackend for AppState {
                     .route_and_handle(
                         ClientOp::Search {
                             index: index.clone(),
-                            query: query.clone(),
-                            limit,
-                            fields,
+                            query: cleaned_query.clone(),
+                            limit: final_limit,
+                            fields: final_fields,
                             sort: storage_sort,
                         },
                         None,
@@ -370,14 +401,6 @@ impl McpBackend for AppState {
     fn get_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, String>> {
         let state = self.clone();
         Box::pin(async move {
-            let schema = state
-                .router
-                .handle_client_op(ClientOp::GetConfig {
-                    index: index.clone(),
-                })
-                .await
-                .map_err(|err| err.to_string())?;
-
             let listing = state
                 .router
                 .handle_client_op(ClientOp::ListIndexes {
@@ -402,7 +425,6 @@ impl McpBackend for AppState {
             let entry = serde_json::json!({
                 "index": index,
                 "stats": stats,
-                "schema": schema,
             });
 
             Ok(enrich_index_entry(entry))
@@ -434,18 +456,9 @@ impl McpBackend for AppState {
                     .ok_or_else(|| "Index entry missing name".to_string())?
                     .to_string();
 
-                let schema = state
-                    .router
-                    .handle_client_op(ClientOp::GetConfig {
-                        index: index_name.clone(),
-                    })
-                    .await
-                    .map_err(|err| err.to_string())?;
-
                 let entry = serde_json::json!({
                     "index": index_name,
                     "stats": stats,
-                    "schema": schema,
                 });
                 enriched.push(enrich_index_entry(entry));
             }
