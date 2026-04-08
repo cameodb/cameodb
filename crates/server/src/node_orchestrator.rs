@@ -4204,14 +4204,20 @@ impl NodeOrchestrator {
         info!("Found {} existing shards", existing_shards.len());
 
         // Limit concurrent shard initialization to reduce disk I/O contention.
-        // redb::Builder::create() is the bottleneck — 8 concurrent opens on spinning
-        // disk can take 6+ minutes each due to I/O contention vs ~seconds sequentially.
-        // 2 concurrent is a good balance: allows pipelining while avoiding thrashing.
-        let max_concurrent = 2usize.min(existing_shards.len()).max(1);
+        // redb::Builder::create() is the bottleneck — too many concurrent opens
+        // cause I/O thrashing. Scale with available cores (NVMe can handle more
+        // concurrency than spinning disks): min(max(2, cpus/4), shard_count).
+        let cpu_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let max_concurrent =
+            std::cmp::min(std::cmp::max(2, cpu_cores / 4), existing_shards.len()).max(1);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
 
         info!(
             max_concurrent = max_concurrent,
+            cpu_cores = cpu_cores,
+            shard_count = existing_shards.len(),
             "Hydrating shards with bounded concurrency"
         );
 

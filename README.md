@@ -973,12 +973,13 @@ max_concurrent_remote_searches = 8
 enable_early_termination = true
 supervisor_timeout_secs = 5
 default_search_limit = 10
+stream_batch_size = 400
 ```
 
 - `node` provides human-friendly identity fields (`label`, `zone`).
 - `network` separates HTTP and cluster transport while clarifying `bind_address`.
 - `storage` centralizes shard configuration plus disk thresholds.
-- `search` exposes indexer memory budgets, streaming search settings, shard/remote search concurrency caps, supervisor timeout for auto-commits, and `default_search_limit` for response pagination.
+- `search` exposes indexer memory budgets, streaming search settings, shard/remote search concurrency caps, supervisor timeout for auto-commits, `default_search_limit` for response pagination, and `stream_batch_size` for NDJSON write micro-batching.
 
 ## � System Requirements
 

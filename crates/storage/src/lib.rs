@@ -1939,11 +1939,11 @@ impl HybridStore {
                 let tokenizer_name = match text_options.get_indexing_options() {
                     Some(opts) => {
                         let token_name = opts.tokenizer().to_string();
-                        tracing::debug!(field_name = %name, tokenizer = %token_name, "Extracted tokenizer from Tantivy");
+                        tracing::trace!(field_name = %name, tokenizer = %token_name, "Extracted tokenizer from Tantivy");
                         Some(token_name)
                     }
                     None => {
-                        tracing::debug!(field_name = %name, "No indexing options found, using default tokenizer");
+                        tracing::trace!(field_name = %name, "No indexing options found, using default tokenizer");
                         Some("default".to_string())
                     }
                 };
@@ -1959,17 +1959,17 @@ impl HybridStore {
                                 "WithFreqsAndPositions".to_string()
                             }
                         };
-                        tracing::debug!(field_name = %name, index_option = %opt_str, "Extracted index option from Tantivy");
+                        tracing::trace!(field_name = %name, index_option = %opt_str, "Extracted index option from Tantivy");
                         Some(opt_str)
                     }
                     None => {
-                        tracing::debug!(field_name = %name, "No indexing options found, using default index option");
+                        tracing::trace!(field_name = %name, "No indexing options found, using default index option");
                         Some("WithFreqsAndPositions".to_string())
                     }
                 };
                 (tokenizer_name, index_option)
             } else {
-                tracing::debug!(field_name = %name, field_type = ?field_entry.field_type(), "Non-text field, no tokenizer options");
+                tracing::trace!(field_name = %name, field_type = ?field_entry.field_type(), "Non-text field, no tokenizer options");
                 (None, None)
             };
 
@@ -1987,6 +1987,18 @@ impl HybridStore {
                 },
             );
         }
+
+        let text_count = fields
+            .values()
+            .filter(|f| matches!(f.field_type, TantivyFieldType::Text))
+            .count();
+        let fast_count = fields.values().filter(|f| f.fast).count();
+        tracing::debug!(
+            total_fields = fields.len(),
+            text_fields = text_count,
+            fast_fields = fast_count,
+            "Derived index schema from Tantivy"
+        );
 
         let now = chrono::Utc::now().timestamp();
         IndexSchema {
