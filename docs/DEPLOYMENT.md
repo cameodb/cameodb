@@ -162,17 +162,45 @@ docker-compose -f docker/docker-compose-cluster.yml up -d
 - **Data Persistence**: Each node's data is stored in a separate subdirectory within `data/cameodb/`.
 - **Swarm Configuration**: `CAMEODB_CLUSTER_NAME`, `CAMEODB_CLUSTER_PORT`, `CAMEODB_SEED_NODES`, and `CAMEODB_CLUSTER_ENABLED` environment variables drive the Kademlia swarm. Update them per deployment needs.
 
+### Custom Data Directory Setup
+
+For production deployments, you may want to store CameoDB data on a separate disk or partition. Create a custom data directory with proper permissions:
+
+```bash
+# Create custom data directory (example: /data01/cameodb)
+sudo mkdir -p /data01/cameodb
+
+# Set ownership to cameodb user and group
+sudo chown cameodb:cameodb /data01/cameodb
+
+# Set secure permissions (read/write only for cameodb user)
+sudo chmod 700 /data01/cameodb
+```
+
+After creating the custom directory, update the `data_paths` in your `cameodb-docker.toml` configuration file:
+
+```toml
+[storage]
+data_paths = ["/data01/cameodb"]
+```
+
+Then restart the CameoDB service to apply the new configuration:
+
+```bash
+docker-compose -f docker/docker-compose.yml restart
+```
+
 ### Common Docker Commands
 
 ```bash
 # Check status (use -f for the cluster file)
-docker-compose -f docker/docker-compose-cluster.yml ps
+docker-compose ps
 
 # View logs
-docker-compose -f docker/docker-compose.yml logs -f
+docker-compose logs -f
 
 # Stop and remove containers
-docker-compose -f docker/docker-compose-cluster.yml down
+docker-compose down -v
 ```
 
 For more details, see the [Docker README](docker/README.md), which includes the latest swarm environment variables and configuration guidance.

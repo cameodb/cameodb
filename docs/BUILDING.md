@@ -698,33 +698,5 @@ sudo systemctl start cameodb
 # Check status
 sudo systemctl status cameodb
 
-### Custom Data Directory Setup
-
-For production deployments, you may want to store CameoDB data on a separate disk or partition. Create a custom data directory with proper permissions:
-
-```bash
-# Create custom data directory (example: /data01/cameodb)
-sudo mkdir /data01/cameodb
-
-# Set ownership to cameodb user and group
-sudo chown cameodb:cameodb /data01/cameodb
-
-# Set secure permissions (read/write only for cameodb user)
-sudo chmod 700 /data01/cameodb
-```
-
-After creating the custom directory, update the `data_paths` in your `/etc/cameodb/cameodb.toml` configuration file:
-
-```toml
-[storage]
-data_paths = ["/data01/cameodb"]
-```
-
-Then restart the CameoDB service to apply the new configuration:
-
-```bash
-sudo systemctl restart cameodb
-```
-
 ---
 

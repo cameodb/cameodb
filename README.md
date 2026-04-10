@@ -61,15 +61,20 @@ CameoDB is distributed as a single, self-contained executable. It acts as the da
 ```bash
 # Start the database server (HTTP API available on port 9480)
 cameodb
+```
 
-# Detect schema from a remote JSONL dataset (supports .gz, .bz2, .zst)
-cameodb client schema detect https://huggingface.co/datasets/.../data.jsonl
+### 🦸 Zero to Hero (Interactive CLI)
+The easiest way to explore CameoDB is through its interactive REPL, which provides auto-completion, history, and colorized JSON outputs.
 
-# Load data directly into the cluster
-cameodb client data load books ./examples/data/booksummaries.tsv
+```bash
+# Launch the interactive client (connects to localhost:9480 by default)
+cameodb client --interactive
 
-# Search across the cluster from the terminal
-cameodb client search books "title:Hitchhiker" --limit 10
+# Inside the REPL, try:
+cameodb@localhost:9480 ▶ health
+cameodb@localhost:9480 ▶ schema detect ./examples/data/booksummaries.tsv
+cameodb@localhost:9480 ▶ data load books ./examples/data/booksummaries.tsv
+cameodb@localhost:9480 ▶ search books "title:Hitchhiker" --limit 10
 ```
 
 ### 🗜️ Supported Ingestion Formats
