@@ -1038,10 +1038,11 @@ pub enum ClientCommand {
         /// Operation to perform
         #[arg(value_enum)]
         operation: SchemaOperation,
-        /// Target index name (required for `load`, optional for `detect`)
-        index: Option<String>,
         /// Path or HTTP(S) URL to schema/data source
         file: String,
+        /// Target index name (required for `load`, optional for `detect`)
+        #[arg(long, short = 'n')]
+        index: Option<String>,
         /// Delimiter override (default: auto-detect first line)
         #[arg(long, value_enum, default_value_t = Delimiter::Detect)]
         delimiter: Delimiter,

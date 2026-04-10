@@ -18,7 +18,9 @@ By leveraging the **Kameo** actor framework and **Tokio**'s async runtime, Cameo
 * **Decentralized Topology:** Zero master nodes. Utilizes Consistent Hashing and a custom Kademlia DHT behavior for seamless peer discovery and routing.
 * **Supervised Smart Commits:** Intelligently batches writes with micro-second precision to optimize throughput while maintaining strict crash durability.
 * **Tiered Cache Sizing:** Dynamically budgets memory across active shards based on system RAM to ensure steady-state operational safety.
-* **Schema Detection:** Automatically infers and maps indices from raw data payloads (CSV, TSV, JSON, JSONL).
+* **Sophisticated Schema Detection:** Automatically infers and maps indices from raw data payloads via versatile columnar structural testing and verifiable format detections.
+* **Intelligent Data Loader:** Robust, zero-copy ingestion pipeline that transparently handles multiple formats (`CSV`, `TSV`, `JSON`, `JSONL`) and on-the-fly decompression (`Gzip`, `Bzip2`, `Zstd`, `XZ`, `LZ4`, `Deflate`). It supports loading from local disk, distributed network files, and directly streaming from HTTP(S) endpoints.
+* **Consistent Hybrid Recovery:** Guarantees data consistency during startup by automatically recovering and syncing uncommitted records from the ACID datastore (KV) into the search index.
 * **Graceful Shutdowns:** Multi-phase process ensuring zero WAL replay on clean reboots.
 
 ## 📦 Quick Start (Docker)
@@ -52,15 +54,15 @@ Dive deeper into CameoDB's architecture and APIs:
 - 📦 **[Building & Packaging](docs/BUILDING.md)**: Instructions for compiling cross-platform binaries and generating RPM/DEB packages.
 - 📊 **[Data Ingestion Examples](examples/README.md)**: Sample python scripts and datasets (TED Talks, Book Summaries) to try out right away.
 
-## �️ Single Binary Architecture
+## 🛠️ Single Binary Architecture
 
-CameoDB is distributed as a single, self-contained executable. It acts as the database server, a powerful CLI client, a schema operator, a bulk data loader, and an AI-enabling MCP server.
+CameoDB is distributed as a single, self-contained executable. It acts as the database server, a powerful CLI client, a schema operator, and a bulk data loader.
 
 ```bash
-# Start the database server (MCP server and HTTP API enabled by default)
+# Start the database server (HTTP API available on port 9480)
 cameodb
 
-# Detect schema from a remote JSONL dataset
+# Detect schema from a remote JSONL dataset (supports .gz, .bz2, .zst)
 cameodb client schema detect https://huggingface.co/datasets/.../data.jsonl
 
 # Load data directly into the cluster
@@ -69,6 +71,12 @@ cameodb client data load books ./examples/data/booksummaries.tsv
 # Search across the cluster from the terminal
 cameodb client search books "title:Hitchhiker" --limit 10
 ```
+
+### 🗜️ Supported Ingestion Formats
+The CLI client features a robust, zero-copy ingestion pipeline that transparently handles:
+- **Formats:** `CSV`, `TSV`, `JSON` (Documents/Arrays), and `JSONL/NDJSON`.
+- **Compression:** Automatically detects and decompresses `Gzip (.gz)`, `Bzip2 (.bz2)`, `Zstd (.zst)`, `XZ (.xz)`, `LZ4 (.lz4)`, and `Deflate` formats on the fly.
+- **Sources:** Ingest data from local disk files, mounted network paths, or by streaming directly from public `HTTP/HTTPS` URLs.
 
 ## 🤝 Contributing
 
