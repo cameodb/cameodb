@@ -15,7 +15,7 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl \
 Or use the convenience script:
 
 ```bash
-./scripts/build-musl.sh
+./scripts/build/build-musl.sh
 ```
 
 **Benefits:**

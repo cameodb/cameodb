@@ -1689,11 +1689,7 @@ fn source_extension(source: &str) -> Option<String> {
     }
 }
 
-fn detect_source_format_from_hint(extension: Option<&str>, bytes: &[u8]) -> Result<SourceFormat> {
-    if matches!(extension, Some("jsonl") | Some("ndjson")) {
-        return Ok(SourceFormat::JsonLines);
-    }
-
+fn detect_source_format_from_hint(_extension: Option<&str>, bytes: &[u8]) -> Result<SourceFormat> {
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Err(anyhow!("Source is empty"));
     }
@@ -1704,6 +1700,7 @@ fn detect_source_format_from_hint(extension: Option<&str>, bytes: &[u8]) -> Resu
         .find(|byte| !byte.is_ascii_whitespace())
         .ok_or_else(|| anyhow!("Source is empty"))?;
 
+    // Content-based detection takes precedence over extension
     match first_non_whitespace {
         b'[' => Ok(SourceFormat::JsonArray),
         b'{' => {

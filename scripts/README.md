@@ -7,7 +7,7 @@ This directory contains scripts and utilities for CameoDB development, testing, 
 For a quick overview of all available scripts and project status:
 
 ```bash
-./scripts/dev-info.sh
+./scripts/setup/dev-info.sh
 ```
 
 ## Directory Structure & Scripts
@@ -144,8 +144,8 @@ For a quick overview of all available scripts and project status:
   - Automatic search validation after data load
 - **Usage**:
   ```bash
-  ./scripts/data/sample-data.sh                     # 100 docs in 'sample' index
-  ./scripts/data/sample-data.sh 9480 mydata 500     # 500 docs in 'mydata' index
+  ./examples/data/sample-data.sh                     # 100 docs in 'sample' index
+  ./examples/data/sample-data.sh 9480 mydata 500     # 500 docs in 'mydata' index
   ```
 - **Data Types**: Technology, science, business, education, entertainment, sports, health, travel
 - **Audience**: Developers, QA, demo environments
@@ -170,14 +170,14 @@ For a quick overview of all available scripts and project status:
 
 ## Utility Scripts
 
-### `dev-info.sh`
+### `setup/dev-info.sh`
 **Purpose**: Quick project overview and script documentation
 - **Features**:
   - Lists all available scripts with descriptions
   - Shows current project build status
   - Displays CameoDB running status  
   - Quick start guide and documentation links
-- **Usage**: `./scripts/dev-info.sh`
+- **Usage**: `./scripts/setup/dev-info.sh`
 - **Audience**: All developers, new contributors
 
 ## Usage Guidelines
@@ -215,7 +215,7 @@ cargo build --release               # Build project
 
 #### Development Testing
 ```bash
-./scripts/data/sample-data.sh       # Load test data
+./examples/data/sample-data.sh       # Load test data
 ./scripts/testing/load-test.sh      # Performance testing
 ./scripts/ops/health-check.sh       # System health
 ```
@@ -312,7 +312,7 @@ Scripts respect these environment variables when available:
 - Check dependencies: `cargo check --workspace`
 
 ### Getting Help
-- Run `./scripts/dev-info.sh` for project overview
+- Run `./scripts/setup/dev-info.sh` for project overview
 - Check individual script headers for usage examples
 - See `./docs/` directory for detailed project documentation
 - Review `./ARCHITECTURE.md` for system design information

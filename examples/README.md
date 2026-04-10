@@ -16,22 +16,22 @@ This directory contains runnable examples for ingesting data into CameoDB using 
 # Install dependencies: pip install requests
 
 # Ingest TED talks
-python3 scripts/examples/ingest_ted.py
+python3 examples/ingest_ted.py
 
 # Ingest book summaries  
-python3 scripts/examples/ingest_books.py
+python3 examples/ingest_books.py
 
 # Test with dry run first
-python3 scripts/examples/ingest_ted.py --dry-run
-python3 scripts/examples/ingest_books.py --dry-run
+python3 examples/ingest_ted.py --dry-run
+python3 examples/ingest_books.py --dry-run
 
 # Custom data files
-python3 scripts/examples/ingest_ted.py --data /path/to/custom/ted.csv
-python3 scripts/examples/ingest_books.py --data /path/to/custom/books.txt
+python3 examples/ingest_ted.py --data /path/to/custom/ted.csv
+python3 examples/ingest_books.py --data /path/to/custom/books.txt
 
 # Size analysis (check memory usage and safety)
-python3 scripts/examples/size_analysis.py
-python3 scripts/examples/size_analysis.py 1500 books  # Test custom batch size
+python3 examples/size_analysis.py
+python3 examples/size_analysis.py 1500 books  # Test custom batch size
 ```
 
 ---
@@ -39,7 +39,7 @@ python3 scripts/examples/size_analysis.py 1500 books  # Test custom batch size
 ## 🎤 TED Talks CSV Ingestion
 
 The `ingest_ted.py` script loads TED Talks metadata from the CSV file shipped under
-`scripts/data/youtube_ted_2024.csv` and writes documents into a CameoDB index via
+`examples/data/youtube_ted_2024.csv` and writes documents into a CameoDB index via
 the HTTP API.
 
 ### Prerequisites
@@ -53,16 +53,16 @@ the HTTP API.
 
 ```bash
 # Dry run: inspect JSON payloads (shows target index + payload)
-python scripts/examples/ingest_ted.py --dry-run | head
+python examples/ingest_ted.py --dry-run | head
 
 # Ingest into default index "ted"
-python scripts/examples/ingest_ted.py
+python examples/ingest_ted.py
 
 # Specify a different index or CSV
-python scripts/examples/ingest_ted.py --index talks --csv path/to/file.csv
+python examples/ingest_ted.py --index talks --csv path/to/file.csv
 
 # Target a remote CameoDB node
-python scripts/examples/ingest_ted.py --base-url http://node1:9480
+python examples/ingest_ted.py --base-url http://node1:9480
 
 # Inspect recognized schema for an index
 curl -s http://localhost:9480/api/ted/_config | jq
@@ -117,28 +117,28 @@ The script processes the CMU Book Summaries dataset (`booksummaries.tsv`), which
 #### Basic Usage
 ```bash
 # Ingest all books into the 'books' index
-python3 scripts/examples/ingest_books.py
+python3 examples/ingest_books.py
 
 # Use custom index name
-python3 scripts/examples/ingest_books.py --index literature
+python3 examples/ingest_books.py --index literature
 
 # Use custom CameoDB node
-python3 scripts/examples/ingest_books.py --base-url http://localhost:8080
+python3 examples/ingest_books.py --base-url http://localhost:8080
 ```
 
 #### Dry Run (Testing)
 ```bash
 # Test parsing without sending data
-python3 scripts/examples/ingest_books.py --dry-run
+python3 examples/ingest_books.py --dry-run
 
 # Test with smaller batches
-python3 scripts/examples/ingest_books.py --dry-run --batch-size 200
+python3 examples/ingest_books.py --dry-run --batch-size 200
 ```
 
 #### Performance Tuning
 ```bash
 # Larger batches for faster ingestion (still routed via consistent hashing)
-python3 scripts/examples/ingest_books.py --batch-size 1000 --max-batch-mb 4
+python3 examples/ingest_books.py --batch-size 1000 --max-batch-mb 4
 ```
 
 ### Document Structure
@@ -176,7 +176,7 @@ Each book is indexed with the following fields:
 |--------|--------------|------------|--------------|-------------|
 | `--base-url` | `http://localhost:9480` | `http://localhost:9480` | `http://localhost:9480` | CameoDB HTTP base URL |
 | `--index` | `books` | `ted` | `urls` | Target index name |
-| `--data` | `scripts/data/booksummaries.tsv` | `scripts/data/youtube_ted_2024.csv` | `scripts/data/urls.csv` | Path to data file |
+| `--data` | `examples/data/booksummaries.tsv` | `examples/data/youtube_ted_2024.csv` | `examples/data/urls.csv` | Path to data file |
 | `--dry-run` | `false` | `false` | `false` | Print sample documents instead of sending |
 | `--batch-size` | **2000** | 4000 | 10000 | Maximum documents per batch |
 | `--max-batch-mb` | **16** | 16 | 16 | Maximum batch size in MB (50% safety margin under 64MB Kameo limit) |

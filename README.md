@@ -716,19 +716,19 @@ CameoDB includes optimized ingestion scripts for common datasets:
 ### TED Talks Dataset
 ```bash
 # Ingest TED talks (CSV format, ~4,600 documents)
-python3 scripts/examples/ingest_ted.py
+python3 examples/ingest_ted.py
 
 # Custom configuration
-python3 scripts/examples/ingest_ted.py --index talks --batch-size 200
+python3 examples/ingest_ted.py --index talks --batch-size 200
 ```
 
 ### Book Summaries Dataset
 ```bash
 # Ingest book summaries (TSV format, 16,559 documents)  
-python3 scripts/examples/ingest_books.py
+python3 examples/ingest_books.py
 
 # Test with dry run
-python3 scripts/examples/ingest_books.py --dry-run
+python3 examples/ingest_books.py --dry-run
 ```
 
 ## 🏗️ Architecture
@@ -1012,7 +1012,7 @@ stream_batch_size = 400
 - [Storage Engine Details](crates/storage/README.md) - Multi-tenant hybrid storage architecture
 - [Cluster Management](crates/cluster/README.md) - Distributed topology and consistent hashing  
 - [Development Scripts](scripts/README.md) - Testing, data generation, and operations
-- [Ingestion Examples](scripts/examples/README.md) - TED talks and book summaries datasets
+- [Ingestion Examples](examples/README.md) - TED talks and book summaries datasets
 - [Docker Deployment](docker/README.md) - Container deployment and cluster setup
 - [Website](docs/web/README.md) - Live documentation and feature showcase
 
@@ -1031,8 +1031,8 @@ stream_batch_size = 400
 
 3. **Ingest sample data**
    ```bash
-   python3 scripts/examples/ingest_books.py --dry-run
-   python3 scripts/examples/ingest_books.py
+   python3 examples/ingest_books.py --dry-run
+   python3 examples/ingest_books.py
    ```
 
 4. **Query your data**
@@ -1071,7 +1071,7 @@ cargo test --all
 cargo clippy --all-targets -- -D warnings
 
 # Test with sample data
-./scripts/data/sample-data.sh
+./examples/data/sample-data.sh
 ./scripts/testing/load-test.sh
 ```
 

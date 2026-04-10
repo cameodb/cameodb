@@ -21,7 +21,7 @@ echo "   ./scripts/testing/load-test.sh     - Load testing (default: 10 users, 5
 echo ""
 
 echo "📊 Data Scripts:"
-echo "   ./scripts/data/sample-data.sh      - Generate sample data (default: 100 documents)"
+echo "   ./examples/data/sample-data.sh      - Generate sample data (default: 100 documents)"
 echo ""
 
 echo "🔧 Operations Scripts:"
@@ -33,7 +33,7 @@ echo "   1. Setup:      ./scripts/setup/install-deps.sh"
 echo "   2. Build:      cargo build --release"
 echo "   3. Start:      cargo run --release --bin cameodb"
 echo "   4. Test:       ./scripts/testing/test-api.sh"
-echo "   5. Load data:  ./scripts/data/sample-data.sh"
+echo "   5. Load data:  ./examples/data/sample-data.sh"
 echo ""
 
 # Show current project status if possible

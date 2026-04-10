@@ -1,0 +1,2 @@
+# Ignore generated Software Bill of Materials (SBOMs)
+*.json
