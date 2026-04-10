@@ -32,13 +32,19 @@ Get a single-node CameoDB instance up and running instantly using Docker.
 mkdir -p $(pwd)/data/cameodb
 chown -R 65532:65532 $(pwd)/data/cameodb
 
-# Run CameoDB
+# 1. Run the CameoDB Server
 docker run -d \
   --name cameodb-server \
   -p 9480:9480 \
   -p 9580:9580 \
   -v $(pwd)/data/cameodb:/data/cameodb \
   goranc/cameodb:latest
+
+# 2. Launch the Interactive CLI (connects to the server)
+docker run -it --rm \
+  --network host \
+  goranc/cameodb:latest \
+  client --interactive --connect http://localhost:9480
 ```
 *(CameoDB's HTTP API is now available on `http://localhost:9480`)*
 
