@@ -455,3 +455,276 @@ Could not find directory of OpenSSL installation
 ```
 
 Either use `rustls-tls` (recommended) or install OpenSSL development packages for your target platform.
+## 📦 RPM Package Building
+
+CameoDB supports building RPM packages for x86_64 Linux distributions using cargo-zigbuild for cross-compilation.
+
+### Prerequisites
+
+Install the required cargo extensions for cross-compilation and RPM generation:
+```bash
+# Install cargo-zigbuild for cross-compilation
+cargo install cargo-zigbuild
+
+# Install cargo-generate-rpm for RPM package generation
+cargo install cargo-generate-rpm
+```
+
+### Build RPM Package
+
+**Option 1: Native x86_64 Linux Build (Recommended for hardened executables)**
+```bash
+# Build hardened executable with security mitigations (flags in .cargo/config.toml)
+cargo build --release --target x86_64-unknown-linux-musl
+
+# OR override with explicit RUSTFLAGS:
+RUSTFLAGS="-C relocation-model=pie -C relro-level=full -C link-arg=-Wl,-z,now -C link-arg=-fstack-protector -C link-arg=-D_FORTIFY_SOURCE=2" \
+cargo build --release --target x86_64-unknown-linux-musl
+
+# Generate RPM package (run from project root directory)
+cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
+  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm \
+  --set-metadata 'package.name="cameodb"'
+```
+
+**Option 2: Cross-compilation with cargo-zigbuild (supports hardening)**
+```bash
+# Build hardened binary for Linux x86_64 musl target (flags in .cargo/config.toml)
+cargo zigbuild --release --target x86_64-unknown-linux-musl \
+    --no-default-features \
+    --features client/native-tls-vendored
+
+# OR override with explicit RUSTFLAGS:
+RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=pie -C relro-level=full -C link-arg=-pie -C link-arg=-static -C link-arg=-Wl,-z,now -C link-arg=-Wl,-z,relro -C link-arg=-fstack-protector-strong -C link-arg=-D_FORTIFY_SOURCE=2" \
+cargo zigbuild --release --target x86_64-unknown-linux-musl \
+    --no-default-features \
+    --features client/native-tls-vendored
+
+# Generate RPM package with standard naming (run from project root directory)
+cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
+  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm \
+  --set-metadata 'package.name="cameodb"'
+
+# The RPM package will be available at:
+# target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm
+```
+
+**Option 3: DEB Package Generation (Ubuntu/Debian)**
+```bash
+# Install cargo-deb
+cargo install cargo-deb
+
+# Build hardened binary using Docker (native musl toolchain)
+# This avoids Zig cross-compilation issues with C dependencies
+# IMPORTANT: Use --platform linux/amd64 to get x86_64 container (not ARM64)
+# Use pre-built builder image (dependencies pre-installed)
+# Build the builder image once:
+docker buildx build --platform linux/amd64 \
+  --builder cameo-builder \
+  --load \
+  -t cameo-builder -f docker/Dockerfile.builder .
+
+# Then use it for fast builds:
+docker run --rm --platform linux/amd64 \
+  -v "$PWD":/workspace -w /workspace \
+  -v /tmp/buildkit-ca/zscaler.crt:/usr/local/share/ca-certificates/zscaler.crt:ro \
+  -e CC_x86_64_unknown_linux_musl=musl-gcc \
+  -e AR_x86_64_unknown_linux_musl=ar \
+  -e RANLIB_x86_64_unknown_linux_musl=ranlib \
+  cameo-builder bash -c "
+    cat /usr/local/share/ca-certificates/zscaler.crt >> /etc/ssl/certs/ca-certificates.crt && \
+    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt && \
+    cargo build --release --target x86_64-unknown-linux-musl \
+      --no-default-features \
+      --features client/native-tls-vendored
+  "
+
+# Generate DEB package (run on host after Docker build)
+# Use --no-build to package the existing binary without rebuilding
+# Use --no-strip on macOS (macOS strip/objcopy don't support Linux binaries)
+# Note: Binary is automatically stripped by Cargo's [profile.release] strip = "symbols"
+# The debug symbols warning from cargo-deb is cosmetic and can be ignored.
+cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl -p server
+
+# With custom output path (follows DEB naming standards)
+cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl -p server \
+  --output target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb
+
+# The DEB package will be available at:
+# target/x86_64-unknown-linux-musl/debian/cameodb_0.2.2_amd64.deb
+# OR with custom output: target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb
+```
+
+**Option 4: Automated Build Script (Recommended for CI/CD)**
+```bash
+# Use the optimized build script with persistent caching
+# This script handles both RPM and DEB package generation in one run
+./scripts/build/build-dist.sh
+```
+
+The `build-dist.sh` script provides:
+- **Persistent Docker volumes** for cargo registry and target cache (dramatic speed improvements on subsequent builds)
+- **Corporate CA certificate handling** for network trust
+- **Automatic binary stripping** via Cargo profile optimization
+- **Both RPM and DEB package generation** in a single run
+- **Colored output and progress indicators**
+
+**Prerequisites for build-dist.sh:**
+```bash
+# Make the script executable
+chmod +x build-dist.sh
+
+# Ensure Docker buildx builder is running
+docker buildx ls
+```
+
+### Signing Release Artifacts
+
+Cosign 2.x defaults to the new bundle format. Generate one `.bundle` file per artifact and ship it together with the binary and `cosign.pub` so downstream users can verify releases.
+
+```bash
+cosign sign-blob \
+  --key /usr/local/share/ca-certificates/cosign.key \
+  --bundle target/release/cameodb.bundle \
+  target/release/cameodb
+
+cosign sign-blob \
+  --key /usr/local/share/ca-certificates/cosign.key \
+  --bundle target/x86_64-unknown-linux-musl/release/cameodb.bundle \
+  target/x86_64-unknown-linux-musl/release/cameodb
+
+cosign sign-blob \
+  --key /usr/local/share/ca-certificates/cosign.key \
+  --bundle target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm.bundle \
+  target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm
+
+cosign sign-blob \
+  --key /usr/local/share/ca-certificates/cosign.key \
+  --bundle target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb.bundle \
+  target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb
+```
+
+**Verification example:**
+
+```bash
+cosign verify-blob \
+  --key cosign.pub \
+  --bundle cameodb.bundle \
+  cameodb
+```
+
+If you need legacy `.sig`/`.cert` files instead, add `--legacy-signatures` (or set `COSIGN_EXPERIMENTAL=0`) and keep the previous `--output-signature` / `--output-certificate` flags.
+
+**Note**: Two approaches for hardening flags:
+1. **Pre-configured**: Hardening flags are set in `.cargo/config.toml` and applied automatically
+2. **Explicit override**: Use `RUSTFLAGS="..."` to override or customize flags as shown above
+
+Hardening flags explained:
+- `-C target-feature=+crt-static` enables static C runtime linking
+- `-C relocation-model=pie` enables Position Independent Executable for ASLR support
+- `-C relro-level=full` enables Full RELRO (Relocation Read-Only) 
+- `-C link-arg=-pie` + `-C link-arg=-static` creates static PIE executable (separated flags)
+- `-C link-arg=-Wl,-z,now` enables immediate symbol binding
+- `-C link-arg=-Wl,-z,relro` enables RELRO protection
+- `-C link-arg=-fstack-protector-strong` enables strong stack protection against buffer overflows
+- `-C link-arg=-D_FORTIFY_SOURCE=2` enables fortified memory functions for additional safety
+- `opt-level = 3` (release profile) required for fortified functions to work properly
+- Both cargo build and cargo-zigbuild support these rustc-native flags
+
+**Windows Hardening** (when building for Windows targets):
+- `/SDL` enables Security Development Lifecycle checks (equivalent to VS /SDL)
+- `/DYNAMICBASE` enables ASLR (Address Space Layout Randomization)
+- `/HIGHENTROPYVA` enables 64-bit ASLR with high entropy
+- `/NXCOMPAT` enables DEP (Data Execution Prevention)
+- `/GUARD:CF` enables Control Flow Guard
+
+**Verification**: 
+- For dynamic binaries (gnu): `file` shows "pie executable"
+- For static binaries (musl): `file` shows "executable" but hardening is still applied
+- Use `greadelf -d` or check binary headers to verify PIE and RELRO on static binaries
+- Fortified functions replace unsafe C library calls with checked versions
+
+### RPM Package Contents
+
+- **Binary**: `/usr/local/bin/cameodb` (statically linked, no external dependencies)
+- **Config**: `/etc/cameodb/cameodb.toml`
+- **Service**: `/usr/lib/systemd/system/cameodb.service`
+- **User/Group**: `cameodb` (created automatically during install)
+- **Data Directory**: `/var/lib/cameodb` (created with proper permissions)
+
+### DEB Package Contents
+
+- **Binary**: `/usr/local/bin/cameodb` (statically linked, no external dependencies)
+- **Config**: `/etc/cameodb/cameodb.toml` (marked as config file, preserved on upgrades)
+- **Service**: `/lib/systemd/system/cameodb.service`
+- **User/Group**: `cameodb` (created automatically during install)
+- **Data Directory**: `/var/lib/cameodb` (created with proper permissions)
+
+### Installation on Target System
+
+**For RPM-based systems (RHEL, CentOS, Fedora):**
+```bash
+# Verify RPM package before installation
+rpm -qpi cameodb-0.2.2-1.x86_64.rpm
+
+# Check package contents
+rpm -qpl cameodb-0.2.2-1.x86_64.rpm
+
+# Install the RPM package
+sudo rpm -i cameodb-0.2.2-1.x86_64.rpm
+
+# Start and enable the service
+sudo systemctl daemon-reload
+sudo systemctl enable cameodb
+sudo systemctl start cameodb
+```
+
+**For DEB-based systems (Ubuntu, Debian):**
+```bash
+# Verify DEB package before installation
+dpkg -I cameodb_0.2.2_amd64.deb
+
+# Check package contents
+dpkg -c cameodb_0.2.2_amd64.deb
+
+# Install the DEB package
+sudo dpkg -i cameodb_0.2.2_amd64.deb
+
+# Start and enable the service
+sudo systemctl daemon-reload
+sudo systemctl enable cameodb
+sudo systemctl start cameodb
+```
+# Check status
+sudo systemctl status cameodb
+
+### Custom Data Directory Setup
+
+For production deployments, you may want to store CameoDB data on a separate disk or partition. Create a custom data directory with proper permissions:
+
+```bash
+# Create custom data directory (example: /data01/cameodb)
+sudo mkdir /data01/cameodb
+
+# Set ownership to cameodb user and group
+sudo chown cameodb:cameodb /data01/cameodb
+
+# Set secure permissions (read/write only for cameodb user)
+sudo chmod 700 /data01/cameodb
+```
+
+After creating the custom directory, update the `data_paths` in your `/etc/cameodb/cameodb.toml` configuration file:
+
+```toml
+[storage]
+data_paths = ["/data01/cameodb"]
+```
+
+Then restart the CameoDB service to apply the new configuration:
+
+```bash
+sudo systemctl restart cameodb
+```
+
+---
+

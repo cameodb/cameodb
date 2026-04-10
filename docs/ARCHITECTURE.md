@@ -327,3 +327,227 @@ flowchart TB
 4.  **Old Leader** switches to `Forwarding` state (updates internal pointer).
 5.  **New Leader** takes over.
 6.  **DHT** is updated.
+## 🧠 Distributed Architecture Overview
+
+CameoDB is designed as a **distributed, shared-nothing cluster**:
+
+- **Per-node storage** is handled by the `server` crate with actors (`NodeOrchestrator`, `MicroshardActor`) on top of redb + Tantivy.
+- **Routing & clustering** use a `ClusterCoordinator` actor with a consistent hash ring and libp2p Kademlia DHT.
+- **Remote execution** is powered by Kameo remote actors over a custom libp2p swarm (TCP/QUIC/Noise/Yamux, no mDNS).
+- **Scatter–gather** search and multi-node writes are implemented via a `RouterActor` that fans out to peers and aggregates results.
+- **Event-driven metadata** - Cluster state transitions and persistence triggered purely by actor messages (`PeerDiscovered`, `PeerLost`, `MergeRemoteShards`) with no background polling or timeouts.
+- **State reconciliation** - On boot, nodes compare expected cluster topology from snapshots vs actual peer reports, logging discrepancies and converging to distributed reality.
+
+For a detailed walkthrough of the node-side actors, routing decisions, remote flows, and metadata persistence, see:
+
+- [`crates/server/README.md`](crates/server/README.md)
+
+## � Operation Routing Workflows
+
+Every client request follows the same top-level path: **HTTP handler → RouterActor → ClusterCoordinator routing decision → execute**. The routing decision determines whether the operation runs locally, is forwarded to a single remote node (unicast), or is fanned out to all nodes (broadcast).
+
+### Routing Decision Logic
+
+```
+                         ┌──────────────────────┐
+                         │  ClusterCoordinator  │
+                         │  RouteOperation msg  │
+                         └─────────┬────────────┘
+                                    │
+                         routing_key present?
+                           ┌────────┴────────┐
+                          YES                NO
+                           │                 │
+                    Hash ring lookup    RoutingDecision::
+                           │              Broadcast
+                    owner == local?
+                     ┌─────┴─────┐
+                    YES          NO
+                     │           │
+              RoutingDecision  RoutingDecision::Remote
+                ::Local        { node_id, peer_addr }
+```
+
+- **Local**: The owning shard lives on this node. Execute directly.
+- **Remote**: The owning shard lives on another node. Forward via cached `RemoteActorRef`.
+- **Broadcast**: No routing key (e.g. search). Fan out to local + all known peers, merge results.
+
+### Read (Search) Workflow
+
+Searches have no routing key, so they always broadcast to gather results from all nodes.
+
+```
+HTTP POST /api/{index}/search
+  │
+  ▼
+RouterActor::route_and_handle(routing_key=None)
+  │
+  ▼ RoutingDecision::Broadcast
+  │
+  ├── LOCAL ──→ Worker Pool (or actor mailbox fallback)
+  │               └── OrchestratorEngine::orch_search()
+  │                     └── Fan out to all local MicroshardActors
+  │                           └── spawn_blocking { store.search() }
+  │
+  └── REMOTE (per peer, up to fanout_limit) ──→ try_remote()
+        │
+        ▼
+      RemotePeerPool::get_orchestrator(node_id)    ◄── cache hit: O(1)
+        ├── RwLock read → HashMap lookup           ◄── cache miss: swarm lookup, then cached
+        │
+        ▼
+      remote_ref.ask(&ClientOp::Search)
+        │
+        ▼
+      Remote node executes same local search path
+        │
+        ▼
+  ┌────────────────────────────────────────────┐
+  │  Merge: bounded score-aware top-K merge,   │
+  │  then truncate to the requested limit      │
+  └────────────────────────────────────────────┘
+```
+
+**Key characteristics:**
+- Concurrent local + remote execution via `tokio::join!`
+- Bounded shard and remote fan-out using configured concurrency limits
+- Score-aware top-K merge keeps the strongest hits even when better remote results arrive later
+- Configurable `broadcast_timeout` and `broadcast_fanout_limit`
+- Streaming search variant available (`/search/stream`) returning NDJSON
+
+### Write (Single Document) Workflow
+
+Single writes always have a routing key (defaults to `doc.id`), so they are unicast to the owning node.
+
+```
+HTTP PUT /api/{index}/document
+  │
+  ▼
+RouterActor::route_and_handle(routing_key=Some(doc.id))
+  │
+  ▼ Hash ring lookup → shard owner
+  │
+  ├── RoutingDecision::Local
+  │     │
+  │     ▼
+  │   Worker Pool (Write is hot-path eligible)
+  │     └── OrchestratorEngine::orch_write()
+  │           └── Route to specific MicroshardActor via hash ring
+  │                 └── writer_thread → redb WAL + Tantivy index
+  │
+  └── RoutingDecision::Remote { node_id, peer_addr }
+        │
+        ▼
+      RouterActor::handle_remote() ──→ retry loop (configurable attempts)
+        │
+        ▼
+      RouterActor::try_remote()
+        │
+        ▼
+      RemotePeerPool::get_orchestrator(node_id)    ◄── cached lookup
+        │
+        ▼
+      remote_ref.ask(&ClientOp::Write)
+        │
+        ▼
+      Remote node executes same local write path
+```
+
+**Key characteristics:**
+- Writes are **never broadcast** — the router rejects broadcast routing for writes
+- Retry with configurable `remote_retry_attempts` and `remote_timeout`
+- On repeated failure, triggers `RequestBootstrapRedial` to recover connectivity
+- Each shard has a dedicated writer thread (no lock contention)
+
+### Bulk Write Workflow
+
+Bulk writes are the most complex path: documents are routed individually, then grouped by owning node for batched forwarding.
+
+```
+HTTP POST /api/{index}/_bulk
+  │
+  ▼
+RouterActor::route_and_handle(routing_hint=first_doc.id)
+  │
+  ▼ Routed to one node (usually local for the first doc)
+  │
+  ▼
+NodeOrchestrator::orch_bulk_write(index, docs[])
+  │
+  ├── 1. Schema Resolution
+  │     └── Fingerprint cache → shard fallback
+  │
+  ├── 2. Staged Schema Validation
+  │     └── Parallel Rayon validation + sequential evolution
+  │
+  ├── 3. Per-Document Routing (spawn_blocking + Rayon par_iter)
+  │     └── For each doc: hash(routing_key) → ConsistentRing → target shard
+  │
+  ├── 4. Separate Local vs Remote
+  │     ├── shard in self.shards → local_docs
+  │     └── shard owned by other node → remote_docs (grouped by node_id)
+  │
+  ├── 5. Phase 3.1: Parallel Local Shard Processing
+  │     └── Per-shard MicroshardActor::write_batch()
+  │           └── writer_thread → redb WAL + Tantivy index
+  │
+  └── 6. Phase 3.2: Parallel Remote Forwarding (futures::join_all)
+        │
+        for each (node_id, docs_for_remote):
+          │
+          ▼
+        NodeOrchestrator::forward_bulk_to_remote()
+          │
+          ▼
+        RemotePeerPool::get_orchestrator(node_id)    ◄── cached lookup
+          │
+          ▼
+        remote_ref.ask(&ClientOp::BulkWrite)
+          │
+          ▼
+        Remote node runs orch_bulk_write() (recursive, same path)
+```
+
+**Key characteristics:**
+- Documents are individually routed then batched by destination node
+- Local and remote processing run in parallel
+- Schema validation happens once on the entry node before routing
+- Remote forwarding uses the same `RemotePeerPool` cache as other operations
+
+### Connection Pool & Cache Invalidation
+
+The `RemotePeerPool` eliminates repeated swarm registry/DHT lookups on every remote operation:
+
+```
+                    ┌───────────────────────────────────┐
+                    │         RemotePeerPool            │
+                    │  RwLock<HashMap<(Uuid, Channel),  │
+                    │         RemoteActorRef>>          │
+                    ├───────────────────────────────────┤
+                    │  get_orchestrator(node, channel)  │──→ cache hit: clone ref
+                    │  get_coordinator(node)            │──→ cache miss: lookup + cache
+                    │  invalidate_peer(node)            │──→ evict all refs for node
+                    │  invalidate_all()                 │──→ full cache clear
+                    └───────────────────────────────────┘
+                                    ▲
+                                    │ invalidate_peer()
+                    ┌───────────────┴───────────────┐
+                    │  ClusterCoordinator           │
+                    │  handle(PeerLost { node_id }) │
+                    └───────────────────────────────┘
+                                    ▲
+                                    │ swarm event
+                              Peer disconnected
+```
+
+**Integration points:**
+
+| Call Site | Lookup Type | Purpose |
+|---|---|---|
+| `RouterActor::try_remote` | Orchestrator | Routed single operations (search, write) |
+| `NodeOrchestrator::forward_bulk_to_remote` | Orchestrator | Bulk write forwarding |
+| `ClusterCoordinator::exchange_shards_with_peer` | Coordinator | Shard metadata exchange |
+| `ClusterCoordinator` stability sync | Coordinator | Post-bootstrap shard push |
+| `ClusterCoordinator` peer discovery | Coordinator | New peer shard fetch |
+| `ClusterCoordinator` delete forwarding | Orchestrator | Cross-cluster index deletion |
+
