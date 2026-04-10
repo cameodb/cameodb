@@ -168,3 +168,5 @@ docs/webpage
 # Local development overrides
 local.toml
 dev.toml
+cameodb.toml
+cameodb.yaml

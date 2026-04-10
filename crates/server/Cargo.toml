@@ -102,7 +102,7 @@ section = "database"
 priority = "optional"
 assets = [
     ["target/release/cameodb", "usr/local/bin/", "755"],
-    ["cameodb.toml", "etc/cameodb/", "644"],
+    ["../../cameodb.example.toml", "etc/cameodb/cameodb.toml", "644"],
     ["cameodb.service", "lib/systemd/system/", "644"]
 ]
 conf-files = ["etc/cameodb/cameodb.toml"]

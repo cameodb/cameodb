@@ -112,11 +112,12 @@ The `docker run` command above is equivalent to the `docker-compose.yml` configu
 | `--restart unless-stopped` | `restart: unless-stopped` |
 | `--user 65532:65532` | `user: "65532:65532"` (handled by image) |
 
-**Note**: The Docker image includes a built-in configuration file. For custom configurations, mount your own `cameodb.toml`:
+**Note**: The Docker image includes a built-in configuration file. For custom configurations, create a `cameodb.toml` from the example and mount it:
 
 ```bash
+cp cameodb.example.toml cameodb.toml
 docker run -d \
-  --name cameodb-server \
+  --name cameodb \
   -p 9480:9480 \
   -p 9580:9580 \
   -v $(pwd)/data/cameodb:/data/cameodb \
@@ -1142,7 +1143,7 @@ cargo install cargo-deb
 docker buildx build --platform linux/amd64 \
   --builder cameo-builder \
   --load \
-  -t cameo-builder -f builder.Dockerfile .
+  -t cameo-builder -f docker/Dockerfile.builder .
 
 # Then use it for fast builds:
 docker run --rm --platform linux/amd64 \
