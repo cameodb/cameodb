@@ -67,7 +67,7 @@ fi
 echo "📚 Documentation:"
 echo "   ./scripts/README.md         - Detailed script documentation"
 echo "   ./docs/                     - Project documentation"
-echo "   ./ARCHITECTURE.md           - System architecture"
+echo "   ./docs/ARCHITECTURE.md      - System architecture"
 echo ""
 
 echo "💡 Need help? Check the README files or run scripts with --help (if supported)"

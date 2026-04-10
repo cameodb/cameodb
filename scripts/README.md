@@ -315,4 +315,4 @@ Scripts respect these environment variables when available:
 - Run `./scripts/setup/dev-info.sh` for project overview
 - Check individual script headers for usage examples
 - See `./docs/` directory for detailed project documentation
-- Review `./ARCHITECTURE.md` for system design information
+- Review `./docs/ARCHITECTURE.md` for system design information
