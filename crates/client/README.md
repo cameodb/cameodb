@@ -38,10 +38,10 @@ Flags:
 | `health` | Fetch `_cluster/health` and pretty-print response |
 | `list indexes` | List all indexes with stats + cached field names |
 | `list index <name>` | Show detailed stats and schema for one index |
-| `search <index> <query> [limit]` | Run hybrid search with optional limit |
-| `schema detect <file> [--delimiter ...]` | Detect schema from CSV/TSV (auto or forced delimiter) |
-| `schema load <index> <file> [--delimiter ...]` | Detect schema and apply to an index |
-| `data load <index> <file> [--delimiter ...]` | Ingest CSV/TSV data in batches |
+| `search <index> <query> [limit]` | Run hybrid search with optional limit (inline `limit N` or `--limit N`) |
+| `schema detect <file> [--delimiter ...]` | Detect schema from CSV/TSV/JSON/JSONL/NDJSON (auto or forced delimiter, supports compression & HTTP(S)) |
+| `schema load <index> <file> [--delimiter ...]` | Detect schema from CSV/TSV/JSON/JSONL/NDJSON and apply to an index (supports compression & HTTP(S)) |
+| `data load <index> <file> [--delimiter ...] [--batch-size N]` | Ingest CSV/TSV/JSON/JSONL/NDJSON data in batches (supports compression & HTTP(S)) |
 | `delete <index> [--delete-schema]` | Delete an index; prompts `Delete index "<name>"? [yes/NO]:` and only proceeds on `yes` |
 | `connect <host[:port]>` | Switch target server and refresh cache |
 | `help` | Display built-in command reference |
@@ -49,8 +49,26 @@ Flags:
 
 ### Data & Schema helpers
 
-- `schema detect <file> [--delimiter detect|comma|tab|semicolon]` – auto-detect or force CSV/TSV delimiter (supports semicolon CSV, tab TSV).
-- `data load <index> <file> [--delimiter ...]` – ingests CSV/TSV with the same delimiter options; skips header row if present.
+- `schema detect <file> [--delimiter detect|comma|tab|semicolon]` – auto-detect schema from CSV, TSV, JSON, JSONL, or NDJSON. Supports local files and HTTP(S) URLs. Automatically decompresses Gzip (.gz/.gzip) and Zip archives.
+- `schema load <index> <file> [--delimiter ...]` – detect schema from CSV, TSV, JSON, JSONL, or NDJSON and apply it to an index. Supports local files and HTTP(S) URLs. Automatically decompresses Gzip (.gz/.gzip) and Zip archives.
+- `data load <index> <file> [--delimiter ...] [--batch-size N]` – ingest CSV, TSV, JSON, JSONL, or NDJSON data in batches. Supports local files and HTTP(S) URLs. Automatically decompresses Gzip (.gz/.gzip) and Zip archives. Default batch size is 4000 documents.
+
+### 🗜️ Compression & Remote Sources
+
+The CLI client features robust support for compressed data and remote HTTP(S) sources:
+
+- **Compression Formats:** Automatically detects and decompresses `Gzip (.gz/.gzip)` and `Zip` archives on the fly.
+- **HTTP(S) Streaming:** Load data directly from public URLs (e.g., Hugging Face datasets, S3 presigned URLs) without downloading locally first.
+- **Zero-Copy Processing:** Decompression happens in-memory for optimal performance.
+
+**Examples:**
+```bash
+# Load from a compressed remote JSONL dataset
+cameodb client data load hugdata https://huggingface.co/datasets/.../data.jsonl.gz
+
+# Load from a local Zip archive
+cameodb client schema detect ./data/archive.zip
+```
 
 ## ⌨️ Completion & History
 
@@ -78,7 +96,7 @@ This enables:
 
 ## 🔍 Search UX Enhancements
 
-- Commands accept optional numeric limit at the end (`search books author:doe 15`).
+- Commands accept optional numeric limit either as a flag (`--limit 10` or `-l 10`) or inline at the end of the query (`search books author:doe 15`).
 - Field completions insert `field_name:` so you can immediately type values.
 - Boolean fields display `[true/false]` hints to avoid mis-typed literals.
 - Field hints surface human-friendly labels (`[numeric]`, `[decimal]`, `[text]`, `[exact]`, `[true/false]`).
@@ -215,7 +233,7 @@ cargo test -p client
 
 - `crates/client/src/cli.rs` – REPL entry point & interactive session
 - `crates/client/src/sdk.rs` – HTTP client wrapper for CameoDB API
-- `crates/client/Cargo.toml` – dependencies (`rustyline`, `dirs`, `reqwest`, ...)
+- `crates/client/Cargo.toml` – dependencies (`rustyline`, `dirs`, `reqwest`, `flate2`, `zip`, ...)
 - `examples/ingest_books.py` – book summaries loader (defaults to `examples/data/booksummaries.tsv`, tab-delimited, skips header row)
 - `examples/ingest_ted.py` – TED YouTube loader (defaults to `examples/data/youtube_ted_2024.csv`, semicolon-delimited, skips header row)
 

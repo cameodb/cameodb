@@ -10,6 +10,7 @@ This document focuses on the *node-side* architecture and the distributed workfl
 
 - **HTTP API surface**
   - Routes: `/api/{index}/search` (JSON), `/api/{index}/search/stream` (NDJSON, JSON fallback), `/api/{index}/document` (PUT), `/api/{index}/document/stream` (NDJSON), `/api/{index}/_bulk` (POST), `/api/{index}/_config` (GET/PUT), `/api/{index}/_schema` (PATCH), `/api/{index}` (DELETE), `/_indexes`, `/_cluster/_indexes`, `/_cluster/health`.
+  - MCP Routes: `/mcp` (POST - direct HTTP JSON-RPC), `/mcp/sse` (GET - SSE transport, POST - compatibility), `/mcp/messages?session_id=...` (POST - SSE message endpoint).
   - Translates requests into strongly-typed operations (`ClientOp`) and hands them to `RouterActor`.
   - Middleware: compression/decompression, trace, permissive CORS, request body limit; ConnectInfo enabled at serve for client addr extraction.
 - **Local orchestration**
@@ -31,13 +32,14 @@ This document focuses on the *node-side* architecture and the distributed workfl
 The `RouterActor` is the primary ingress for database operations on a node.
 
 - Input: `ClientOp`, representing logical client operations:
-  - `Search { index, query, limit }`
-  - `Stream { index, query }`
-  - `Write { index, id, routing_key, doc }`
-  - `BulkWrite { index, docs }`
-  - `CreateConfig`, `GetConfig` (Schema management)
-  - `ListIndexes`, `ListClusterIndexes` (Metadata)
-  - `DeleteIndex { index }` (Index Management)
+  - `Search { index, query, limit, fields, sort }` - Search with optional field projection and sorting
+  - `Stream { index, query, limit, fields, sort }` - Streaming search with optional field projection and sorting
+  - `Write { index, id, routing_key, doc }` - Single document write
+  - `BulkWrite { index, docs }` - Batch document write
+  - `CreateConfig { index, schema }`, `GetConfig { index }` (Schema management)
+  - `ListIndexes { include_data_size }`, `ListClusterIndexes { include_data_size }` (Metadata)
+  - `GetIdentity` (Node identity information)
+  - `DeleteIndex { index, delete_schema }` (Index Management)
 - Responsibilities:
   - Ask the `ClusterCoordinator` for a routing decision:
     - `RoutingDecision::Local`
@@ -54,20 +56,30 @@ The `RouterActor` is the primary ingress for database operations on a node.
 
 `NodeOrchestrator` owns the node’s identity and all local shards.
 
-- Fields:
-  - `identity: NodeIdentity` (UUID, name, vnode tokens).
-  - `shards: HashMap<Uuid, MicroshardActor>`.
-  - `routing_ring: ConsistentRing` for shard placement.
-- Startup:
-  - Hydrates existing shards from disk.
-  - Registers shard assignments with `ClusterCoordinator`.
-- Message handling:
-  - `Message<ClientOp>` delegates to `handle_client_op`, which:
-    - Maps logical operations into local microshard operations.
-    - Uses `spawn_blocking` for all redb/tantivy calls.
-- Remote capability:
-  - `#[derive(Actor, RemoteActor)]`.
-  - `#[remote_message("cameo.orchestrator.client_op")] impl Message<ClientOp>` enables remote `ask`.
+- **Core Fields:**
+  - `identity: NodeIdentity` (UUID, name, vnode tokens)
+  - `shards: HashMap<Uuid, MicroshardActor>` (all local microshards)
+  - `routing_ring: ConsistentRing` (for shard placement)
+  - `config: NodeConfig` (node configuration)
+  - `coordinator: Option<ActorRef<ClusterCoordinator>>` (for shard registration)
+- **Performance Optimizations:**
+  - `schema_cache: Arc<ArcSwap<HashMap<String, Arc<IndexSchema>>>>` (lock-free schema cache)
+  - `fingerprint_index: Arc<ArcSwap<HashMap<u64, String>>>` (reverse lookup for cache hits)
+  - `engine: Option<Arc<OrchestratorEngine>>` (shared lock-free state for worker pool)
+  - `worker_tx: Option<OrchestratorWorkerTx>` (hot-path worker pool for Write/Search operations)
+  - `read_runtime: Option<Arc<tokio::runtime::Runtime>>` (dedicated runtime for read I/O isolation)
+  - `remote_peer_pool: Option<Arc<RemotePeerPool>>` (cached remote actor references)
+- **Startup:**
+  - Hydrates existing shards from disk
+  - Registers shard assignments with `ClusterCoordinator`
+  - Spawns worker pool for concurrent hot-path operations
+- **Message handling:**
+  - `Message<ClientOp>` delegates to `handle_client_op` or worker pool
+  - Hot-path operations (Write, Search) bypass actor mailbox via worker pool
+  - Uses `spawn_blocking` for all redb/tantivy calls
+- **Remote capability:**
+  - `#[derive(Actor, RemoteActor)]`
+  - `#[remote_message("cameo.orchestrator.client_op")] impl Message<ClientOp>` enables remote `ask`
 
 ### 2.3 MicroshardActor
 
@@ -87,12 +99,17 @@ Each `MicroshardActor` manages a single shard’s data and index.
 `ClusterCoordinator` owns a `DistributedCluster` and exposes cluster operations via actor messages.
 
 - **Core State**:
-  - `peer_nodes: HashMap<Uuid, NodeInfo>` - Remote node id, address, status, shard_count.
-  - `shard_assignments: HashMap<Uuid, ShardMetadata>` - Which shards live on which nodes.
-  - `ring: ConsistentRing` - Used for consistent hashing.
-  - `state: ClusterState` - Current cluster health (`Active`, `Degraded`, `Failed`).
-  - `expected_nodes: HashSet<Uuid>` - Nodes expected from persisted snapshot.
-  - `expected_shards: HashMap<Uuid, ShardMetadata>` - Shards expected from snapshot for reconciliation.
+  - `cluster: DistributedCluster` - The underlying distributed cluster instance
+  - `shard_assignments: HashMap<Uuid, ShardMetadata>` - Which shards live on which nodes
+  - `ring: ConsistentRing` - Used for consistent hashing
+  - `state: ClusterState` - Current cluster health (`Active`, `Degraded`, `Failed`)
+  - `expected_nodes: HashMap<Uuid, NodeInfo>` - Authoritative registry of all known cluster nodes (active or disconnected)
+  - `expected_shards: HashMap<Uuid, ShardMetadata>` - Shards expected from snapshot for reconciliation
+  - `generation: u64` - Cluster state generation number for versioning
+  - `state_store: Option<Arc<ClusterStateStore>>` - Persistent metadata storage (metadata.redb)
+  - `local_orchestrator: Option<ActorRef<NodeOrchestrator>>` - Reference to local orchestrator for coordinated operations
+  - `topology_subscribers: Vec<mpsc::Sender<ConsistentRing>>` - Subscribers for topology updates
+  - `remote_peer_pool: Option<Arc<RemotePeerPool>>` - Cached remote actor references
 
 - **Key Messages**:
   - `InitSwarm` / `ShutdownSwarm` - Swarm lifecycle.

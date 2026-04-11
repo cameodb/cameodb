@@ -78,9 +78,12 @@ All write operations follow a strict sequence to ensure atomicity across both st
    ├─ Optional fsync() based on wal_sync config
    └─ Durability checkpoint
 
-7. Commit tantivy Changes
-   ├─ IndexWriter.commit()
-   └─ Make search changes visible
+7. Increment Operations & Signal Supervisor
+   ├─ increment_operations(index) - Track operation count
+   ├─ Signal supervisor task to reset 5-second timer
+   └─ Tantivy commit deferred via Supervised Smart Commits:
+      ├─ Smart Commit: When operation count reaches adaptive threshold (500-8000 ops)
+      └─ Supervised Commit: After 5 seconds of write inactivity (durability guarantee)
 ```
 
 ### Storage Optimization: Index-Only Tantivy Strategy
@@ -325,6 +328,48 @@ Beyond raw storage, the engine tracks per-index metadata and stats:
   - Directory size cache: Cached Tantivy index directory sizes with TTL
   - Read cache: Optional bounded cache for frequently accessed documents
 
+### Schema Versioning and Fingerprints
+
+CameoDB tracks schema changes through versioning and deterministic fingerprinting:
+
+**Schema Version (`version: u64`)**
+- Incremented when fields are added, removed, or modified
+- Default: `1` for new schemas
+- Used for schema evolution tracking and compatibility checks
+
+**Schema Fingerprint (`fingerprint: u64`)**
+- Deterministic hash calculated from sorted field names using XXH3
+- Automatically updated when schema changes via `calculate_fingerprint()`
+- Algorithm:
+  ```rust
+  // Sort field names alphabetically
+  let mut sorted_names: Vec<&String> = fields.keys().collect();
+  sorted_names.sort();
+  
+  // Concatenate and hash
+  let combined = sorted_names.join("");
+  let fingerprint = xxh3_64(combined.as_bytes());
+  ```
+- Use cases:
+  - Quick schema change detection (O(1) comparison vs full field-by-field diff)
+  - Cache invalidation triggers
+  - Distributed schema synchronization
+
+**Timestamps**
+- `created_at: i64` - Unix timestamp when schema was first created
+- `updated_at: i64` - Unix timestamp of last schema modification
+
+**Example:**
+```rust
+let schema = store.get_schema("employees")?;
+if let Some(schema) = schema {
+    println!("Schema version: {}", schema.version);
+    println!("Fingerprint: {:016x}", schema.fingerprint);
+    println!("Created: {}", schema.created_at);
+    println!("Updated: {}", schema.updated_at);
+}
+```
+
 ## Usage Examples
 
 ### Basic Operations
@@ -340,8 +385,8 @@ let config = StorageConfig {
     indexer_memory_budget: 64 * 1024 * 1024, // 64MB default (increased from 32MB)
     indexer_memory_min_mb: 32,               // 32MB minimum (increased from 16MB)
     indexer_memory_max_mb: 512,              // 512MB maximum (increased from 256MB)
-    default_batch_size: 1000,               // Supervised Smart Commits threshold
-    wal_sync: true,                         // Maximum durability
+    default_batch_size: 1000,                // Supervised Smart Commits threshold
+    wal_sync: true,                          // Maximum durability
 };
 
 // Initialize store
@@ -367,9 +412,16 @@ println!("Document stored with sequence ID: {}", seq_id);
 // Read operations from specific index
 let data = store.get_by_key("employees", "user:123")?;
 if let Some(bytes) = data {
-    let doc: serde_json::Value = serde_json::from_slice(&bytes)?;
-    println!("Found: {}", doc["body"]);
-    println!("Email: {}", doc["json_blob"]["email"]);
+    // Stored documents are wrapped in { "json_blob": {...} }
+    #[derive(serde::Deserialize)]
+    struct StoredDoc {
+        json_blob: Option<serde_json::Value>,
+    }
+    let stored: StoredDoc = serde_json::from_slice(&bytes)?;
+    if let Some(json) = stored.json_blob {
+        println!("Name: {}", json["name"]);
+        println!("Email: {}", json["email"]);
+    }
 }
 
 // Search within specific index
@@ -378,8 +430,8 @@ for (score, doc) in results {
     println!("Score: {:.3}, ID: {}", score, doc["id"]);
 }
 
-// Delete all data for an index
-store.delete_index_data("employees")?;
+// Delete all data for an index (including schema)
+store.delete_index_data("employees", true)?;
 println!("Index 'employees' deleted successfully");
 ```
 
@@ -413,13 +465,12 @@ use storage::{HybridStore, WalOp};
 async fn batch_insert(
     store: HybridStore, 
     index: &str,
-    documents: Vec<(String, String)>
+    documents: Vec<(String, serde_json::Value)>
 ) -> Result<Vec<u64>, StoreError> {
     let ops: Vec<WalOp> = documents.into_iter().map(|(id, content)| {
         WalOp::Put {
             id,
-            body: content,
-            json_blob: None,
+            json_blob: Some(content),
         }
     }).collect();
     
@@ -469,7 +520,7 @@ use std::path::PathBuf;
 // High-performance configuration with Supervised Smart Commits
 let high_perf_config = StorageConfig {
     shard_path: PathBuf::from("/fast-ssd/shard1"),
-    indexer_memory_budget: 64 * 1024 * 1024,  // 64MB default
+    indexer_memory_budget: 64 * 1024 * 1024, // 64MB default
     indexer_memory_min_mb: 32,               // 32MB minimum (increased from 16MB)
     indexer_memory_max_mb: 512,              // 512MB maximum (increased from 256MB)
     default_batch_size: 2000,                // Higher commit threshold
@@ -479,7 +530,7 @@ let high_perf_config = StorageConfig {
 // High-durability configuration with frequent commits
 let high_durability_config = StorageConfig {
     shard_path: PathBuf::from("/redundant-storage/shard1"),
-    indexer_memory_budget: 32 * 1024 * 1024,  // 32MB default
+    indexer_memory_budget: 32 * 1024 * 1024, // 32MB default
     indexer_memory_min_mb: 32,               // 32MB minimum (increased from 16MB)
     indexer_memory_max_mb: 128,              // 128MB maximum
     default_batch_size: 500,                 // Lower commit threshold
@@ -489,8 +540,8 @@ let high_durability_config = StorageConfig {
 // Memory-constrained configuration
 let low_memory_config = StorageConfig {
     shard_path: PathBuf::from("./shard1"),
-    indexer_memory_budget: 32 * 1024 * 1024,  // 32MB default (increased from 16MB)
-    indexer_memory_min_mb: 32,                // 32MB minimum (increased from 8MB)
+    indexer_memory_budget: 32 * 1024 * 1024, // 32MB default (increased from 16MB)
+    indexer_memory_min_mb: 32,               // 32MB minimum (increased from 8MB)
     indexer_memory_max_mb: 64,               // 64MB maximum (increased from 32MB)
     default_batch_size: 250,                 // Very low commit threshold
     wal_sync: true,
@@ -944,15 +995,19 @@ CameoDB supports a rich set of field types for indexing and storage. These types
 | Type | Description | Tantivy Mapping |
 |------|-------------|-----------------|
 | **`text`** | Standard full-text search field. Tokenized and indexed. | `TEXT` |
-| **`exact`** | Exact match field. Not tokenized; punctuation preserved. Case-sensitive. | `STRING` |
-| **`boolean`** | Boolean value. Stored as "true"/"false" strings. | `STRING` |
+| **`exact`** / **`string`** | Exact match field. Not tokenized; punctuation preserved. Case-sensitive. | `STRING` |
+| **`boolean`** | Boolean value. Stored as true/false. | `bool` |
 | **`i64`** | 64-bit signed integer. Supports range queries and sorting. | `i64` (FAST) |
 | **`u64`** | 64-bit unsigned integer. Supports range queries and sorting. | `u64` (FAST) |
 | **`f64`** / **`number`** | 64-bit floating point. Supports range queries and sorting. | `f64` (FAST) |
 | **`date`** | DateTime field. Supports RFC3339, naive datetime, date-only, year-month, and year-only formats. | `date` (FAST) |
+| **`bytes`** | Binary data field. Stored as byte arrays. | `bytes` |
+| **`ip`** | IP address field (IPv4/IPv6). IPv4 addresses are mapped to IPv6. | `ip` (IPv6) |
+| **`json`** | Nested JSON object field. Stored as serialized JSON string. | `TEXT` (JSON string) |
+| **`facet`** | Categorical/hierarchical facet field for faceted search. | `facet` |
 | **`array`** | Multi-valued text field. Each element is tokenized. | `TEXT` (multi-valued) |
 
-> **Note:** All fields are `STORED` by default, meaning the original JSON value is retrievable.
+> **Note:** The `id` field is always indexed as an untokenized `STRING` (exact match) and stored for document retrieval.
 
 ### Date Field Support
 

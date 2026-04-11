@@ -38,19 +38,30 @@ cameodb/
 
 #### **Builder Stage Features**
 ```dockerfile
-# Rust 1.90 with musl static linking
-ARG RUST_VERSION=1.90
+# Rust 1.94 with musl/gnu static linking
+ARG RUST_VERSION=1.94
+ARG TARGET_ABI=musl
 FROM rust:${RUST_VERSION}-slim AS builder
 
 RUN rustup default ${RUST_VERSION}
 
-# Cross-compilation support
+# Cross-compilation support and SSL dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libssl-dev \
     musl-tools \
     gcc-aarch64-linux-gnu \
+    perl \
+    make \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
+# Corporate CA certificate support (Zscaler)
+RUN --mount=type=secret,id=zscaler,dst=/usr/local/share/ca-certificates/Zscaler.crt \
+    if [ -f /usr/local/share/ca-certificates/Zscaler.crt ]; then \
+        cat /usr/local/share/ca-certificates/Zscaler.crt >> /etc/ssl/certs/ca-certificates.crt && \
+        update-ca-certificates; \
+    fi
 
 # Optimized caching with mount cache
 WORKDIR /src
@@ -58,25 +69,38 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     set -e; \
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; \
-    export OPENSSL_STATIC=1; \
     export PKG_CONFIG_ALLOW_CROSS=1; \
     TARGET_TRIPLE=""; \
-    case "${TARGETARCH}" in \
-        "amd64") TARGET_TRIPLE="x86_64-unknown-linux-musl";; \
-        "arm64") TARGET_TRIPLE="aarch64-unknown-linux-musl";; \
-        *) echo "Unsupported architecture: ${TARGETARCH}"; exit 1;; \
-    esac; \
+    if [ "${TARGET_ABI}" = "musl" ]; then \
+        export OPENSSL_STATIC=1; \
+        case "${TARGETARCH}" in \
+            "amd64") TARGET_TRIPLE="x86_64-unknown-linux-musl";; \
+            "arm64") TARGET_TRIPLE="aarch64-unknown-linux-musl";; \
+            *) echo "Unsupported architecture: ${TARGETARCH}"; exit 1;; \
+        esac; \
+    else \
+        case "${TARGETARCH}" in \
+            "amd64") TARGET_TRIPLE="x86_64-unknown-linux-gnu";; \
+            "arm64") TARGET_TRIPLE="aarch64-unknown-linux-gnu";; \
+            *) echo "Unsupported architecture: ${TARGETARCH}"; exit 1;; \
+        esac; \
+    fi; \
     rustup target add "${TARGET_TRIPLE}"; \
-    cargo build --release --target "${TARGET_TRIPLE}" --bin cameodb; \
-    cp "/src/target/${TARGET_TRIPLE}/release/cameodb" /src/cameodb
+    cargo build --profile release-docker --target "${TARGET_TRIPLE}" --bin cameodb \
+        --no-default-features \
+        --features client/native-tls-vendored; \
+    cp "/src/target/${TARGET_TRIPLE}/release-docker/cameodb" /src/cameodb
 ```
 
 #### **Runtime Stage Features**
 ```dockerfile
-# Minimal distroless runtime
-FROM gcr.io/distroless/static:latest AS runtime
+# Conditional distroless runtime based on TARGET_ABI
+ARG TARGET_ABI
+FROM gcr.io/distroless/static:nonroot AS runtime-musl
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime-gnu
+FROM runtime-${TARGET_ABI} AS runtime
 
-# Security-first approach
+# Security-first approach (USER already set by :nonroot base)
 USER nonroot:nonroot
 
 # Essential configuration only
@@ -84,11 +108,19 @@ COPY --from=builder --chown=nonroot:nonroot /src/cameodb /usr/local/bin/cameodb
 COPY --chown=nonroot:nonroot docker/cameodb-docker.toml /etc/cameodb/cameodb.toml
 COPY --from=builder --chown=nonroot:nonroot /build-data/cameodb /data/cameodb
 
+ENV CAMEODB_CONFIG=/etc/cameodb/cameodb.toml
+ENV CAMEODB_DATA_DIR=/data/cameodb
+
+VOLUME ["/data/cameodb"]
+
 EXPOSE 9480 9580
 
 # Health check integration
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/cameodb", "--version"]
+
+ENTRYPOINT ["/usr/local/bin/cameodb"]
+CMD ["--config", "/etc/cameodb/cameodb.toml"]
 ```
 
 ### **Distributed Deployment Architecture**
@@ -98,39 +130,81 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 services:
   cameodb-node1: # Primary node
     ports: ["9481:9480", "9581:9580"]
+    user: "65532:65532"
     environment:
+      - RUST_LOG=debug
       - CAMEODB_NODE_LABEL=cameodb-node-1
       - CAMEODB_CLUSTER_NAME=cameodb-production
       - CAMEODB_CLUSTER_ENABLED=true
+      - CAMEODB_HTTP_BIND_ADDRESS=cameodb-node1
       - CAMEODB_HTTP_PORT=9480
+      - CAMEODB_CLUSTER_BIND_ADDRESS=cameodb-node1
       - CAMEODB_CLUSTER_PORT=9580
-      - CAMEODB_SEED_NODES=cameodb-node2:9580,cameodb-node3:9580
+      - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
+      - CAMEODB_CLUSTER_NODES=cameodb-node1:9580,cameodb-node2:9580,cameodb-node3:9580
+      - CAMEODB_MAX_BODY_SIZE_MB=200
+      - CAMEODB_DEFAULT_BATCH_SIZE=5000
+    networks:
+      cameodb-cluster:
+        ipv4_address: 172.20.0.10
       
   cameodb-node2: # Secondary node
     ports: ["9482:9480", "9582:9580"]
-    depends_on: [cameodb-node1]
+    user: "65532:65532"
+    depends_on:
+      cameodb-node1:
+        condition: service_healthy
     environment:
+      - RUST_LOG=debug
       - CAMEODB_NODE_LABEL=cameodb-node-2
       - CAMEODB_CLUSTER_NAME=cameodb-production
       - CAMEODB_CLUSTER_ENABLED=true
+      - CAMEODB_HTTP_BIND_ADDRESS=cameodb-node2
       - CAMEODB_HTTP_PORT=9480
+      - CAMEODB_CLUSTER_BIND_ADDRESS=cameodb-node2
       - CAMEODB_CLUSTER_PORT=9580
-      - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node3:9580
+      - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
+      - CAMEODB_CLUSTER_NODES=cameodb-node1:9580,cameodb-node2:9580,cameodb-node3:9580
+      - CAMEODB_MAX_BODY_SIZE_MB=200
+      - CAMEODB_DEFAULT_BATCH_SIZE=5000
+    networks:
+      cameodb-cluster:
+        ipv4_address: 172.20.0.11
       
   cameodb-node3: # Secondary node  
     ports: ["9483:9480", "9583:9580"]
-    depends_on: [cameodb-node1]
+    user: "65532:65532"
+    depends_on:
+      cameodb-node1:
+        condition: service_healthy
     environment:
+      - RUST_LOG=debug
       - CAMEODB_NODE_LABEL=cameodb-node-3
       - CAMEODB_CLUSTER_NAME=cameodb-production
       - CAMEODB_CLUSTER_ENABLED=true
+      - CAMEODB_HTTP_BIND_ADDRESS=cameodb-node3
       - CAMEODB_HTTP_PORT=9480
+      - CAMEODB_CLUSTER_BIND_ADDRESS=cameodb-node3
       - CAMEODB_CLUSTER_PORT=9580
       - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
+      - CAMEODB_CLUSTER_NODES=cameodb-node1:9580,cameodb-node2:9580,cameodb-node3:9580
+      - CAMEODB_MAX_BODY_SIZE_MB=200
+      - CAMEODB_DEFAULT_BATCH_SIZE=5000
+    networks:
+      cameodb-cluster:
+        ipv4_address: 172.20.0.12
     
-  nginx-lb: # Simple load balancer
+  nginx-lb: # Nginx load balancer with upstream cluster
+    image: nginx:alpine
     ports: ["9480:80"]
-    # Proxies to external ports 9481, 9482, 9483
+    networks:
+      - cameodb-cluster
+    depends_on:
+      - cameodb-node1
+      - cameodb-node2
+      - cameodb-node3
+    # Inline nginx config proxying to internal node addresses
+    # client_max_body_size: 200M for large batch writes
 ```
 
 #### **Network Topology**

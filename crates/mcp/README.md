@@ -18,7 +18,7 @@ The `cameodb_mcp` crate provides a standards-compliant MCP server that exposes C
 ### Key Features
 
 - ✅ **6 MCP Tools** for search, metadata, and query validation
-- ✅ **4 Resource Providers** for index exploration
+- ✅ **4 Resource URIs** for index exploration (indexes, index metadata, schema, stats)
 - ✅ **Field-Type-Aware Query Validation** with syntax reference
 - ✅ **Federated Search** across multiple indexes
 - ✅ **Per-Index Field Projection** for efficient data retrieval
@@ -32,14 +32,22 @@ The `cameodb_mcp` crate provides a standards-compliant MCP server that exposes C
 
 CameoDB is designed as a self-contained document store where indexed fields, schemas, and data types drive automatic agent adaptation. When new indexes are created or fields evolve, the MCP tools **automatically reflect the changes** — no configuration or manual updates needed.
 
+**Optimized Schema Responses:**
+Schema and field structures are optimized to return only relevant information for AI clients to build effective queries. Responses avoid overwhelming agents with redundant or irrelevant metadata, focusing on:
+- `searchable_field_names`: List of all queryable field names (for quick reference)
+- `fields` (from `get_index`/`list_indexes`): Per-field type with compact details
+- `available_fields` (from `validate_query`): Per-field type with detailed query hints
+- `query_hints`: Section showing which operators work with each field type
+- Essential statistics and metadata (for context)
+
 **Agent workflow (no prior knowledge required):**
 
 1. **`list_indexes`** → Discover all indexes with schemas and per-field `query_hint` (what operators work with each field type)
-2. **`get_index`** → Deep-dive into a specific index: field definitions, types, stats, and `queryable_fields` with operator guidance
+2. **`get_index`** → Deep-dive into a specific index: field definitions, types, stats, `fields` array, and `query_hints` section
 3. **`search_index`** → Construct queries using the field names and operators learned from the schema
 4. **`validate_query`** *(optional)* → Get structural validation, typo detection ("did you mean?"), and the full syntax reference with operator-by-field-type matrix
 
-Each `queryable_fields` entry tells the agent exactly what it can do:
+Each `available_fields` entry (from `validate_query`) and `fields` entry (from `get_index`/`list_indexes`) tells the agent exactly what it can do:
 - A `text` field → phrases, slop, prefix, IN set, boost, range
 - A `date` field → exact date, comparisons (>/<), ranges
 - A `numeric` field → exact, ranges (inclusive/exclusive), boost
@@ -57,6 +65,10 @@ Execute full-text search on a single CameoDB index.
 
 > **CRITICAL ANTI-HALLUCINATION RULE FOR AGENTS:**
 > When answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.
+
+**Error Handling:**
+- Schema-aware error messages when queries reference non-existent fields (lists valid fields available)
+- Zero-results warnings for phrase/AND queries with suggestions to use broader boolean OR logic
 
 **Parameters:**
 - `index` (string, required): Name of the CameoDB index to search
@@ -99,6 +111,10 @@ Execute federated search across multiple CameoDB indexes with optional per-index
 > **CRITICAL ANTI-HALLUCINATION RULE FOR AGENTS:**
 > When answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.
 
+**Error Handling:**
+- Schema-aware error messages when queries reference non-existent fields (lists valid fields available)
+- Zero-results warnings for phrase/AND queries with suggestions to use broader boolean OR logic
+
 **Parameters:**
 - `indexes` (array, required): List of indexes to search, each with:
   - `index` (string, required): Name of the CameoDB index
@@ -130,7 +146,7 @@ Retrieve schema and statistics for a single CameoDB index.
 **Parameters:**
 - `index` (string, required): Name of the CameoDB index
 
-**Returns:** Complete field definitions, types, document count, size, metadata, and a `queryable_fields` array with per-field `query_hint` showing exactly which operators work with each field's data type.
+**Returns:** Complete field definitions, types, document count, size, metadata, and a `fields` array with per-field details, plus `query_hints` section showing which operators work with each field type.
 
 **Example:**
 ```json
@@ -142,25 +158,40 @@ Retrieve schema and statistics for a single CameoDB index.
 }
 ```
 
-**Response includes `queryable_fields`:**
+**Response includes `fields` and `query_hints`:**
 ```json
-"queryable_fields": [
-  {
-    "field": "id",
-    "type": "text",
-    "query_hint": "Exact match (no tokenization). Supports: field:exact_value, field: IN [val1 val2]..."
-  },
-  {
-    "field": "title",
-    "type": "text",
-    "query_hint": "Tokenized full-text. Supports: field:term, field:\"phrase\", field:\"phrase\"~N (slop)..."
-  },
-  {
-    "field": "year",
-    "type": "i64",
-    "query_hint": "Numeric field. Supports: field:value, field:[low TO high], field:{low TO high}..."
-  }
-]
+{
+  "fields": [
+    {
+      "field": "id",
+      "type": "text",
+      "indexed": true,
+      "fast": false
+    },
+    {
+      "field": "title",
+      "type": "text",
+      "indexed": true,
+      "fast": true
+    },
+    {
+      "field": "year",
+      "type": "i64",
+      "indexed": true,
+      "fast": true
+    }
+  ],
+  "query_hints": [
+    {
+      "type": "text",
+      "query_hint": "Tokenized full-text. Supports: field:term, field:\"phrase\", field:\"phrase\"~N (slop)..."
+    },
+    {
+      "type": "i64",
+      "query_hint": "Numeric field. Supports: field:value, field:[low TO high], field:{low TO high}..."
+    }
+  ]
+}
 ```
 
 ### 4. `list_indexes`
@@ -169,7 +200,7 @@ List all available CameoDB indexes with their schemas and metadata. **New indexe
 
 **Parameters:** None
 
-**Returns:** All index schemas with metadata (document counts, field definitions, sizes). Each index includes a `queryable_fields` array with per-field type and `query_hint`.
+**Returns:** All index schemas with metadata (document counts, field definitions, sizes). Each index includes a `fields` array with per-field details and `query_hints` section.
 
 **Example:**
 ```json
@@ -196,7 +227,7 @@ Validate and get guidance on CameoDB search query syntax. This is the **primary 
 
 **Returns:**
 - `syntax_reference`: Full query syntax documentation with all operators, examples, and field-type compatibility
-- `available_fields`: Schema fields with types, indexed status, and per-field query hints
+- `available_fields`: Schema fields with types, indexed status, and per-field query hints (includes `query_hint` per field)
 - `field_suggestions`: Autocomplete matches for partial field names
 - `query_analysis`: Structural validation, recognized/unknown fields, warnings, and suggestions
 - `searchable_field_names`: List of all queryable field names
@@ -496,12 +527,13 @@ npx @modelcontextprotocol/inspector http://localhost:9480/mcp/sse
 
 ### Transport Layer
 
-The MCP server supports two HTTP transport modes:
+The MCP server supports multiple HTTP transport modes for maximum client compatibility:
 
 - **SSE Endpoint**: `GET /mcp/sse` — Establishes SSE connection and emits `endpoint` event
 - **Message Endpoint**: `POST /mcp/messages?session_id={id}` — Receives JSON-RPC messages for SSE sessions (returns `202 Accepted`)
 - **Direct HTTP Endpoint**: `POST /mcp` — Processes JSON-RPC requests directly and returns JSON-RPC responses inline
 - **Compatibility Endpoint**: `POST /mcp/sse` — Accepts direct JSON-RPC requests for clients that are hard-coded to post to the SSE path
+- **OpenAI ChatGPT Compatible**: The same POST protocol (`POST /mcp` or `POST /mcp/sse`) works for OpenAI ChatGPT-type requests, enabling support for a wider range of AI clients and different implementation approaches
 
 ### MCP Specification Compliance
 
@@ -529,7 +561,8 @@ For compatibility with some MCP client integrations, `POST /mcp/sse` is also acc
 
 - Sessions are created on SSE connection with unique ID: `mcp-session-{counter}`
 - Server emits structured `Event` objects (not raw strings) for proper MCP compliance
-- Sessions are automatically cleaned up after 5 minutes of inactivity
+- Sessions are kept alive while the SSE connection remains open
+- Sessions are cleaned up after SSE disconnect + 5 minutes of POST inactivity
 - Keepalive messages sent every 15 seconds to maintain connection
 
 ### JSON-RPC Methods

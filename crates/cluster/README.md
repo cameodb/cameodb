@@ -18,10 +18,12 @@ Each CameoDB node maintains a **self-sovereign identity** consisting of:
 - Zero-padded to ensure exactly 3 characters
 - Examples: `A1B`, `X9Z`, `007`
 
-### Node Label (Human-Readable)
-- Optional human-friendly name configured via `node.label`
-- Used for logging, dashboards, and operational visibility
-- Example: `cameodb-node-1`
+### Node Name (Human-Readable)
+- 3-character Base36 name derived from the UUID (e.g., `A1B`, `X9Z`, `007`)
+- Used as the canonical short identifier for the node
+- Serves as the human-readable name for logging and operational visibility
+
+**Note:** The server configuration also supports an optional `node.label` parameter for more descriptive node naming (e.g., `cameodb-node-1`), which is separate from the cluster crate's `NodeIdentity.name` field.
 
 **Algorithm:**
 ```rust
@@ -262,11 +264,13 @@ send_to_single_node(target_node, request).await?;
 #### Scatter-Gather (No routing_key)
 ```rust
 // When no routing_key, broadcast to all shards and aggregate results
-let all_nodes = ring.get_all_nodes();
+// Note: The ConsistentRing doesn't track node identities directly.
+// Applications should maintain a separate registry of active nodes.
+let all_nodes = node_registry.get_all_nodes();
 let futures: Vec<_> = all_nodes.iter()
     .map(|node| send_to_node(*node, request.clone()))
     .collect();
-    
+
 let results = futures::future::join_all(futures).await;
 let aggregated = aggregate_results(results)?;
 ```
@@ -373,11 +377,6 @@ Run tests with:
 ```bash
 # Run all cluster tests
 cargo test -p cluster
-
-# Run specific test suites
-cargo test -p cluster test_consistent_hashing
-cargo test -p cluster test_node_identity
-cargo test -p cluster test_ring_operations
 ```
 
 ### Test Coverage
