@@ -6,10 +6,10 @@ and a protected FSL-covered product surface that eventually becomes Apache-2.0.
 
 ## Summary
 
-| Component / Path                                                   | License                    | Notes                                                                      |
-|--------------------------------------------------------------------|----------------------------|----------------------------------------------------------------------------|
-| Core crates (e.g. `crates/cluster`, `crates/storage`, libraries)   | Apache License 2.0         | Fully open source core with patent protection                              |
-| SDKs and client tooling (e.g. `crates/client`)                     | MIT License                | Maximizes compatibility (including GPL)                                    |
+| Component / Path                                                   | License                    | Notes                                                                         |
+|--------------------------------------------------------------------|----------------------------|-------------------------------------------------------------------------------|
+| Core crates (e.g. `crates/cluster`, `crates/storage`, libraries)   | Apache License 2.0         | Fully open source core with patent protection                                 |
+| SDKs and client tooling (e.g. `crates/client`)                     | MIT License                | Maximizes compatibility (including GPL)                                       |
 | Product / server application (`crates/server`)                     | FSL-1.1-Apache-2.0         | Functional Source License that converts to Apache-2.0 two years after release |
 
 All license texts are available under `licenses/`:
