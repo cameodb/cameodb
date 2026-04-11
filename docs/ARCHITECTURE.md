@@ -281,26 +281,20 @@ all_results.truncate(limit);
 
 ```mermaid
 flowchart TB
-    subgraph Application["🎯 Application Layer"]
-        Server["🚀 CameoDB Node<br/>━━━━━━━━<br/>Actor System<br/>HTTP API<br/>Request Routing<br/>Orchestration"]
-        Client["📦 client<br/>━━━━━━━━<br/>SDK<br/>Client Libraries<br/>API Bindings<br/>(planned)"]
+    subgraph Application["Application Layer"]
+        Server["CameoDB Node<br/>Actor System<br/>HTTP API<br/>Request Routing<br/>Orchestration"]
+        Client["client crate<br/>SDK / Client Libraries<br/>(planned)"]
     end
 
-    subgraph Core["⚙️ Core Infrastructure"]
-        Storage["💾 storage<br/>━━━━━━━━<br/>Hybrid Engine<br/>redb + Tantivy<br/>WAL<br/>Search"]
-        Cluster["🌐 cluster<br/>━━━━━━━━<br/>Consistent Hashing<br/>Node Identity<br/>Topology<br/>Routing"]
+    subgraph Core["Core Infrastructure"]
+        Storage["storage crate<br/>Hybrid Engine<br/>redb + Tantivy<br/>WAL / Search"]
+        Cluster["cluster crate<br/>Consistent Hashing<br/>Node Identity<br/>Topology / Routing"]
     end
 
     Server -->|uses| Storage
     Server -->|routing decisions| Cluster
     Client -->|optional topology| Cluster
     Storage -->|shard metadata| Cluster
-
-    classDef appStyle fill:#4A90E2,stroke:#2E5C8A,stroke-width:2px,color:#fff
-    classDef coreStyle fill:#50C878,stroke:#2E7D4E,stroke-width:2px,color:#fff
-    
-    class Server,Client appStyle
-    class Storage,Cluster coreStyle
 ```
 
 ### 8.2. Crate Responsibilities
