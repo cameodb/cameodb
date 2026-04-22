@@ -71,7 +71,7 @@ pub enum SortOrder {
 /// Wrapper to handle both sorted (u64) and unsorted (f32) search results
 enum SearchResult {
     Unsorted(Vec<(f32, tantivy::DocAddress)>),
-    Sorted(Vec<(u64, tantivy::DocAddress)>),
+    Sorted(Vec<(Option<u64>, tantivy::DocAddress)>),
 }
 
 const TANTIVY_DATA_FILE_EXTENSIONS: &[&str] = &["store", "fast", "idx", "doc", "pos", "term"];
@@ -186,14 +186,20 @@ fn normalize_date_comparisons(input: &str, field: &str) -> String {
         if let Some(op) = chars.next()
             && (op == '<' || op == '>')
         {
-            let value_start = op_idx + op.len_utf8();
+            // Check for compound operators >= and <=
+            let (full_op, op_len) = if chars.next() == Some('=') {
+                (format!("{}=", op), op.len_utf8() + 1)
+            } else {
+                (op.to_string(), op.len_utf8())
+            };
+            let value_start = op_idx + op_len;
             let value_end = input[value_start..]
                 .find(char::is_whitespace)
                 .map(|r| value_start + r)
                 .unwrap_or(input.len());
             let value = &input[value_start..value_end];
             let norm = normalize_date_literal(value).unwrap_or_else(|| value.to_string());
-            out.push_str(&format!("{}{}{}", prefix, op, norm));
+            out.push_str(&format!("{}{}{}", prefix, full_op, norm));
             idx = value_end;
             continue;
         }
@@ -1604,7 +1610,7 @@ impl HybridStore {
                 && let Some(seq) = value.as_u64()
             {
                 tracing::debug!(
-                    inverted_sort_key = inverted_sort_key,
+                    inverted_sort_key = ?inverted_sort_key,
                     actual_seq = seq,
                     doc_address = ?doc_address,
                     "get_highest_indexed_seq: Retrieved actual _seq from stored fields"
@@ -1612,13 +1618,13 @@ impl HybridStore {
                 return Ok(seq);
             } else {
                 tracing::error!(
-                    inverted_sort_key = inverted_sort_key,
+                    inverted_sort_key = ?inverted_sort_key,
                     doc_address = ?doc_address,
                     "_seq field not found in stored document - this should never happen! Returning inverted_sort_key which is WRONG"
                 );
                 // CRITICAL BUG: We should NOT return the inverted sort key here
                 // Return u64::MAX - inverted_sort_key to get the actual value
-                return Ok(u64::MAX - inverted_sort_key);
+                return Ok(u64::MAX - inverted_sort_key.unwrap_or(0));
             }
         } else {
             tracing::debug!("get_highest_indexed_seq: No documents found in index");
@@ -3367,10 +3373,12 @@ impl HybridStore {
                 )));
             }
 
-            // Support u64 and Date fields for sorting (Tantivy 0.25 limitation)
-            // Note: i64 and f64 sorting requires Tantivy >= 0.26 or custom collector
+            // Support u64, i64, f64, and Date fields for sorting via FAST fields
             match field_entry.field_type() {
-                tantivy::schema::FieldType::U64(_) => {
+                tantivy::schema::FieldType::U64(_)
+                | tantivy::schema::FieldType::I64(_)
+                | tantivy::schema::FieldType::F64(_)
+                | tantivy::schema::FieldType::Date(_) => {
                     let order = match sort_spec.order {
                         SortOrder::Asc => tantivy::Order::Asc,
                         SortOrder::Desc => tantivy::Order::Desc,
@@ -3386,30 +3394,7 @@ impl HybridStore {
                     let count_handle = multi_collector.add_collector(count_collector);
 
                     let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
-                    let top_docs: Vec<(u64, tantivy::DocAddress)> =
-                        top_docs_handle.extract(&mut multi_fruit);
-                    let total_hits = count_handle.extract(&mut multi_fruit);
-
-                    (SearchResult::Sorted(top_docs), total_hits)
-                }
-                tantivy::schema::FieldType::Date(_) => {
-                    // Dates are stored as i64 internally, but we can sort them as u64
-                    // since the ordering is preserved (RFC3339 timestamps are monotonic)
-                    let order = match sort_spec.order {
-                        SortOrder::Asc => tantivy::Order::Asc,
-                        SortOrder::Desc => tantivy::Order::Desc,
-                    };
-
-                    let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit)
-                        .order_by_u64_field(&sort_spec.field, order);
-                    let count_collector = tantivy::collector::Count;
-
-                    let mut multi_collector = tantivy::collector::MultiCollector::new();
-                    let top_docs_handle = multi_collector.add_collector(top_docs_collector);
-                    let count_handle = multi_collector.add_collector(count_collector);
-
-                    let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
-                    let top_docs: Vec<(u64, tantivy::DocAddress)> =
+                    let top_docs: Vec<(Option<u64>, tantivy::DocAddress)> =
                         top_docs_handle.extract(&mut multi_fruit);
                     let total_hits = count_handle.extract(&mut multi_fruit);
 
@@ -3419,7 +3404,7 @@ impl HybridStore {
                     return Err(StoreError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!(
-                            "Field '{}' type {:?} is not sortable. Supported types: u64, date (both must be FAST). Note: i64/f64 sorting requires Tantivy >= 0.26.",
+                            "Field '{}' type {:?} is not sortable. Supported sortable FAST field types: u64, i64, f64, date.",
                             sort_spec.field,
                             field_entry.field_type()
                         ),
@@ -3428,7 +3413,8 @@ impl HybridStore {
             }
         } else {
             // Default: sort by relevance score using MultiCollector
-            let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit);
+            let top_docs_collector =
+                tantivy::collector::TopDocs::with_limit(limit).order_by_score();
             let count_collector = tantivy::collector::Count;
             let mut multi_collector = tantivy::collector::MultiCollector::new();
             let top_docs_handle = multi_collector.add_collector(top_docs_collector);
@@ -5033,5 +5019,50 @@ mod tests {
         assert!(seq.index_record_option.is_none());
 
         println!("✅ Schema enrichment correctly preserves explicit values and fills defaults!");
+    }
+
+    #[test]
+    fn test_normalize_date_comparisons() {
+        // Single-char operators should normalize the date
+        assert_eq!(
+            normalize_date_comparisons("created:>2026-01-14", "created"),
+            "created:>2026-01-14T00:00:00Z"
+        );
+        assert_eq!(
+            normalize_date_comparisons("created:<2026-01-14", "created"),
+            "created:<2026-01-14T00:00:00Z"
+        );
+
+        // Compound operators >= and <= must also normalize the date
+        assert_eq!(
+            normalize_date_comparisons("created:>=2026-01-14", "created"),
+            "created:>=2026-01-14T00:00:00Z"
+        );
+        assert_eq!(
+            normalize_date_comparisons("created:<=2026-01-14", "created"),
+            "created:<=2026-01-14T00:00:00Z"
+        );
+
+        // Already RFC3339 should pass through unchanged
+        assert_eq!(
+            normalize_date_comparisons("created:>2026-01-14T00:00:00Z", "created"),
+            "created:>2026-01-14T00:00:00Z"
+        );
+        assert_eq!(
+            normalize_date_comparisons("created:>=2026-01-14T00:00:00Z", "created"),
+            "created:>=2026-01-14T00:00:00Z"
+        );
+
+        // Non-date field should not be touched
+        assert_eq!(
+            normalize_date_comparisons("count:>20", "created"),
+            "count:>20"
+        );
+
+        // Mixed query with date comparison and other terms
+        assert_eq!(
+            normalize_date_comparisons("created:>=2026-01-14 AND status:active", "created"),
+            "created:>=2026-01-14T00:00:00Z AND status:active"
+        );
     }
 }

@@ -1037,14 +1037,14 @@ The `date` field type provides flexible date handling with automatic normalizati
 
 Initially, we attempted to return `Vec<tantivy::Document>` directly from actors for network transmission. However, this approach faced a critical limitation:
 
-**Problem**: Tantivy 0.25 does not provide serde features for `Document` serialization.
+**Problem**: Tantivy does not provide serde features for `Document` serialization.
 
 ### Our Solution: JSON Conversion
 
 Instead of trying to serialize tantivy documents directly, we leverage tantivy's built-in JSON conversion:
 
 ```rust
-// ❌ ATTEMPTED: Direct serde serialization (not supported in tantivy 0.25)
+// ❌ ATTEMPTED: Direct serde serialization (not supported)
 // Vec<tantivy::Document> // Cannot be serialized for actor communication
 
 // ✅ SOLUTION: Convert to JSON via tantivy's built-in method
