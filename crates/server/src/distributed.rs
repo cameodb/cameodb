@@ -36,6 +36,10 @@ pub struct DistributedCluster {
     dial_failures: u64,
     /// Count of routing table update events
     routing_updates: u64,
+    /// Kameo remote messaging max size in bytes (derived from max_record_size_mb)
+    remote_message_size_bytes: usize,
+    /// Kameo remote messaging timeout in seconds
+    remote_timeout_secs: u64,
 }
 
 /// Information about a peer node in the cluster
@@ -78,6 +82,8 @@ impl DistributedCluster {
         local_node_id: Uuid,
         local_node_name: String,
         storage_path: PathBuf,
+        remote_message_size_bytes: usize,
+        remote_timeout_secs: u64,
     ) -> Self {
         Self {
             cluster_config,
@@ -89,6 +95,8 @@ impl DistributedCluster {
             bootstrap_successes: 0,
             dial_failures: 0,
             routing_updates: 0,
+            remote_message_size_bytes,
+            remote_timeout_secs,
         }
     }
 
@@ -120,6 +128,8 @@ impl DistributedCluster {
             self.local_node_id,
             self.local_node_name.clone(),
             &self.storage_path,
+            self.remote_message_size_bytes,
+            self.remote_timeout_secs,
         )
         .await?;
 

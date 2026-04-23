@@ -346,6 +346,7 @@ async fn handle_list_command(
     resource: ListResource,
     name: Option<String>,
     include_data_size: bool,
+    extended: bool,
 ) -> Result<Option<ListIndexesResponse>> {
     match resource {
         ListResource::Indexes => {
@@ -368,19 +369,89 @@ async fn handle_list_command(
                 })?;
 
             let config = client.get_index_config(&info.name).await?;
-            let mut stats = serde_json::to_value(info)?;
-            if let serde_json::Value::Object(ref mut map) = stats {
-                map.remove("field_names");
+
+            if extended {
+                let mut stats = serde_json::to_value(info)?;
+                if let serde_json::Value::Object(ref mut map) = stats {
+                    map.remove("field_names");
+                }
+                let enriched = json!({
+                    "index": info.name,
+                    "stats": stats,
+                    "schema": config,
+                });
+                print_json(&enriched)?;
+            } else {
+                let mut stats = serde_json::to_value(info)?;
+                if let serde_json::Value::Object(ref mut map) = stats {
+                    map.remove("field_names");
+                }
+                let compact = json!({
+                    "index": info.name,
+                    "stats": stats,
+                    "fields": format_compact_fields(&config.fields),
+                });
+                print_json(&compact)?;
             }
-            let enriched = json!({
-                "index": info.name,
-                "stats": stats,
-                "schema": config,
-            });
-            print_json(&enriched)?;
             Ok(Some(indexes))
         }
     }
+}
+
+/// Format schema fields as compact one-line-per-field JSON objects.
+///
+/// Only non-default properties are shown:
+/// - `indexed` is omitted when true (all fields are indexed by default)
+/// - `stored` is omitted when false (most fields are not stored)
+/// - `fast` is omitted when false
+/// - `tokenizer` is omitted when absent or "default"
+/// - `is_shadow` is omitted when false
+/// - `index_record_option` is omitted when absent
+fn format_compact_fields(fields_value: &JsonValue) -> JsonValue {
+    let fields = match fields_value.as_object() {
+        Some(f) => f,
+        None => return fields_value.clone(),
+    };
+
+    let mut result = JsonMap::new();
+    for (name, field_val) in fields {
+        let mut compact = JsonMap::new();
+
+        // Always show field_type
+        if let Some(ft) = field_val.get("field_type") {
+            compact.insert("type".to_string(), ft.clone());
+        }
+
+        // indexed: only show when false (default is true)
+        if let Some(JsonValue::Bool(false)) = field_val.get("indexed") {
+            compact.insert("indexed".to_string(), json!(false));
+        }
+
+        // stored: only show when true (default is false)
+        if let Some(JsonValue::Bool(true)) = field_val.get("stored") {
+            compact.insert("stored".to_string(), json!(true));
+        }
+
+        // fast: only show when true (default is false)
+        if let Some(JsonValue::Bool(true)) = field_val.get("fast") {
+            compact.insert("fast".to_string(), json!(true));
+        }
+
+        // tokenizer: only show when present and not "default"
+        if let Some(JsonValue::String(tok)) = field_val.get("tokenizer")
+            && tok != "default"
+        {
+            compact.insert("tokenizer".to_string(), json!(tok));
+        }
+
+        // is_shadow: only show when true
+        if let Some(JsonValue::Bool(true)) = field_val.get("is_shadow") {
+            compact.insert("shadow".to_string(), json!(true));
+        }
+
+        result.insert(name.clone(), JsonValue::Object(compact));
+    }
+    JsonValue::Object(result)
 }
 
 #[derive(Clone, Debug)]
@@ -1020,6 +1091,9 @@ pub enum ClientCommand {
         resource: ListResource,
         /// Name of the resource (required for `list index <name>`)
         name: Option<String>,
+        /// Show full extended schema details (all field properties)
+        #[arg(long, default_value_t = false)]
+        extended: bool,
     },
 
     /// Search an index
@@ -1151,8 +1225,12 @@ pub async fn run_cli() -> Result<()> {
             let health = client.health().await?;
             print_json(&health)?;
         }
-        ClientCommand::List { resource, name } => {
-            handle_list_command(&client, resource, name, true).await?;
+        ClientCommand::List {
+            resource,
+            name,
+            extended,
+        } => {
+            handle_list_command(&client, resource, name, true, extended).await?;
         }
         ClientCommand::Search {
             index,
@@ -3812,9 +3890,14 @@ async fn dispatch_interactive_command(
             let resource = parts.next().unwrap_or("indexes");
             match resource {
                 "indexes" => {
-                    if let Some(result) =
-                        handle_list_command(session.client(), ListResource::Indexes, None, true)
-                            .await?
+                    if let Some(result) = handle_list_command(
+                        session.client(),
+                        ListResource::Indexes,
+                        None,
+                        true,
+                        false,
+                    )
+                    .await?
                     {
                         session.update_index_cache(&result).await;
                     }
@@ -3822,12 +3905,15 @@ async fn dispatch_interactive_command(
                 "index" => {
                     let name = parts
                         .next()
-                        .ok_or_else(|| anyhow!("Usage: list index <name>"))?;
+                        .ok_or_else(|| anyhow!("Usage: list index <name> [--extended]"))?;
+                    let remaining: Vec<&str> = parts.collect();
+                    let extended = remaining.iter().any(|s| *s == "--extended" || *s == "-e");
                     if let Some(result) = handle_list_command(
                         session.client(),
                         ListResource::Index,
                         Some(name.to_string()),
                         true,
+                        extended,
                     )
                     .await?
                     {

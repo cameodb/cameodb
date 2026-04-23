@@ -2560,7 +2560,14 @@ mod tests {
     fn make_cluster() -> DistributedCluster {
         let cfg = ClusterConfig::default();
         let path = std::env::temp_dir();
-        DistributedCluster::new(cfg, Uuid::new_v4(), "TST".to_string(), path)
+        DistributedCluster::new(
+            cfg,
+            Uuid::new_v4(),
+            "TST".to_string(),
+            path,
+            64 * 1024 * 1024,
+            60,
+        )
     }
 
     #[test]

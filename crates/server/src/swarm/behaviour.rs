@@ -66,12 +66,18 @@ pub struct DhtBehaviour {
 
 impl DhtBehaviour {
     /// Create a new Kademlia DHT behaviour
+    ///
+    /// `remote_message_size_bytes` and `remote_timeout_secs` are derived from
+    /// `CameoDbConfig::max_record_size_mb` at startup so that the Kameo remote
+    /// messaging layer can handle records of the configured maximum size.
     pub fn new(
         local_peer_id: PeerId,
         kad_mode: Option<KadMode>,
         local_public_key: libp2p::identity::PublicKey,
         local_node_uuid: uuid::Uuid,
         local_node_name: String,
+        remote_message_size_bytes: usize,
+        remote_timeout_secs: u64,
     ) -> Result<Self, anyhow::Error> {
         info!("🌐 Initializing Kademlia DHT for distributed peer discovery");
         let store = MemoryStore::new(local_peer_id);
@@ -82,13 +88,17 @@ impl DhtBehaviour {
             info!("⚙️  Kademlia mode set to: {:?}", mode);
         }
 
-        // Configure Kameo remote messaging with larger size limits for batch forwarding
-        // Default is 1MB request / 10MB response, which is too small for bulk writes
-        // Keep timeout at 30s (reasonable for large batches without blocking startup)
+        // Configure Kameo remote messaging with size limits derived from max_record_size_mb.
+        // Bulk batches can contain many records, so the envelope must be generously sized.
+        info!(
+            "⚙️  Kameo remote messaging: max_size={}MB, timeout={}s",
+            remote_message_size_bytes / (1024 * 1024),
+            remote_timeout_secs
+        );
         let messaging_config = remote::messaging::Config::default()
-            .with_request_size_maximum(64 * 1024 * 1024) // 64MB for large batch requests
-            .with_response_size_maximum(64 * 1024 * 1024) // 64MB for large responses
-            .with_request_timeout(std::time::Duration::from_secs(30));
+            .with_request_size_maximum(remote_message_size_bytes as u64)
+            .with_response_size_maximum(remote_message_size_bytes as u64)
+            .with_request_timeout(std::time::Duration::from_secs(remote_timeout_secs));
         let kameo = remote::Behaviour::new(local_peer_id, messaging_config);
 
         // Embed Node UUID and name in agent version for immediate identification during handshake

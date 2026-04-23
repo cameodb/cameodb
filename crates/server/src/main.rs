@@ -154,12 +154,14 @@ async fn main() -> Result<()> {
         .load_persisted_cluster()
         .expect("Failed to load persisted cluster state");
 
-    // Initialize distributed cluster
+    // Initialize distributed cluster with derived remote messaging limits
     let distributed_cluster = DistributedCluster::new(
         cameodb_config.network.cluster.clone(),
         node_id,
         orchestrator.identity().name.clone(),
         primary_path.clone(),
+        cameodb_config.effective_remote_message_size_bytes(),
+        cameodb_config.effective_remote_timeout_secs(),
     );
 
     // Create shared remote peer pool for cached actor ref lookups
@@ -348,8 +350,8 @@ async fn main() -> Result<()> {
         stream_batch_size: cameodb_config.search.stream_batch_size,
     };
 
-    // Create the HTTP router with shared state and configured body limit
-    let (app, mcp_handle) = create_router(app_state, cameodb_config.network.http.max_body_size_mb);
+    // Create the HTTP router with shared state and body limit derived from max_record_size_mb
+    let (app, mcp_handle) = create_router(app_state, cameodb_config.effective_max_body_size_mb());
 
     // Extract HTTP configuration
     let http_config = &cameodb_config.network.http;
@@ -394,6 +396,13 @@ async fn main() -> Result<()> {
     println!(
         "  Total Memory Limit: {}MB",
         cameodb_config.search.total_memory_limit_mb
+    );
+    println!(
+        "  Max Record Size: {}MB (HTTP body: {}MB, remote msg: {}MB, timeout: {}s)",
+        cameodb_config.max_record_size_mb,
+        cameodb_config.effective_max_body_size_mb(),
+        cameodb_config.effective_remote_message_size_bytes() / (1024 * 1024),
+        cameodb_config.effective_request_timeout_secs()
     );
     println!();
     println!("Press Ctrl+C to shutdown...");

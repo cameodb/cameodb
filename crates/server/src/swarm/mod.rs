@@ -315,6 +315,8 @@ pub async fn init_distributed_swarm(
     node_uuid: Uuid,
     node_name: String,
     storage_path: &Path,
+    remote_message_size_bytes: usize,
+    remote_timeout_secs: u64,
 ) -> Result<SwarmStartup> {
     if !config.enabled {
         info!("Cluster mode disabled, running in standalone single-node mode");
@@ -330,7 +332,15 @@ pub async fn init_distributed_swarm(
     info!("🚀 Initializing distributed libp2p swarm");
 
     // Create production-ready swarm with Kademlia DHT
-    let startup = create_production_swarm(config, node_uuid, node_name, storage_path).await?;
+    let startup = create_production_swarm(
+        config,
+        node_uuid,
+        node_name,
+        storage_path,
+        remote_message_size_bytes,
+        remote_timeout_secs,
+    )
+    .await?;
 
     info!("✅ Production swarm initialized successfully");
     info!("   📡 Peer ID: {}", startup.peer_id);
@@ -352,6 +362,8 @@ async fn create_production_swarm(
     node_uuid: Uuid,
     node_name: String,
     storage_path: &Path,
+    remote_message_size_bytes: usize,
+    remote_timeout_secs: u64,
 ) -> Result<SwarmStartup> {
     // Load or generate cryptographic identity for this node
     let (keypair, _identity) = load_or_generate_keypair(storage_path)?;
@@ -384,6 +396,8 @@ async fn create_production_swarm(
         keypair.public(),
         node_uuid,
         node_name,
+        remote_message_size_bytes,
+        remote_timeout_secs,
     )?;
 
     info!("🏗️  Created Kademlia DHT behaviour for peer discovery");

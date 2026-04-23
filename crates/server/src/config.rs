@@ -60,7 +60,7 @@ impl StorageConfig {
 }
 
 /// Complete CameoDB configuration structure
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameoDbConfig {
     /// Node-level configuration (sharding, identity)
     #[serde(default)]
@@ -74,6 +74,20 @@ pub struct CameoDbConfig {
 
     /// Search engine configuration (Tantivy settings)
     pub search: SearchConfig,
+
+    /// Maximum single-record size in MB (default: 512).
+    ///
+    /// This is the **single source of truth** for record size limits across
+    /// the entire system. On startup the following dependent limits are
+    /// derived automatically:
+    ///
+    /// | Derived limit                       | Formula                          |
+    /// |-------------------------------------|----------------------------------|
+    /// | HTTP max body size                   | `max_record_size_mb + 64` MB (overhead) |
+    /// | Kameo remote request/response max    | `max_record_size_mb * 1.25` (25 % headroom) |
+    /// | HTTP request timeout                 | `max(60, max_record_size_mb / 10)` seconds |
+    #[serde(default = "default_max_record_size_mb")]
+    pub max_record_size_mb: usize,
 }
 
 /// Network configuration wrapper
@@ -102,8 +116,11 @@ pub struct HttpConfig {
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
 
-    /// Maximum request body size in MB (default: 20)
-    #[serde(default = "default_max_body_size_mb")]
+    /// Maximum request body size in MB.
+    ///
+    /// When omitted (or 0) the effective value is derived from the top-level
+    /// `max_record_size_mb` setting.  Set explicitly only to override.
+    #[serde(default)]
     pub max_body_size_mb: usize,
 
     /// CORS allowed origins (default: ["*"])
@@ -280,6 +297,58 @@ pub struct SearchConfig {
 }
 
 impl CameoDbConfig {
+    /// Effective HTTP max body size in MB.
+    ///
+    /// If the user set `network.http.max_body_size_mb` explicitly (non-zero),
+    /// that value wins.  Otherwise it is derived as `max_record_size_mb + 64`
+    /// to leave headroom for JSON framing, bulk-write arrays, etc.
+    pub fn effective_max_body_size_mb(&self) -> usize {
+        if self.network.http.max_body_size_mb > 0 {
+            self.network.http.max_body_size_mb
+        } else {
+            self.max_record_size_mb + 64
+        }
+    }
+
+    /// Effective Kameo remote messaging size limit in **bytes**.
+    ///
+    /// The envelope must accommodate a single large record plus serialization
+    /// overhead (JSON framing, field names, routing metadata).  We add 25 %
+    /// headroom on top of the configured record size.
+    pub fn effective_remote_message_size_bytes(&self) -> usize {
+        // max_record_size_mb converted to bytes + 25 % overhead
+        let base = self.max_record_size_mb * 1024 * 1024;
+        base + base / 4
+    }
+
+    /// Effective HTTP request timeout in seconds.
+    ///
+    /// For large records the default 30 s is insufficient.  Scale linearly
+    /// with record size: `max(60, max_record_size_mb / 10)`.
+    /// An explicit non-default `request_timeout_secs` takes precedence.
+    pub fn effective_request_timeout_secs(&self) -> u64 {
+        if self.network.http.request_timeout_secs != default_request_timeout() {
+            // User provided an explicit override – honour it.
+            self.network.http.request_timeout_secs
+        } else {
+            let scaled = (self.max_record_size_mb as u64) / 10;
+            scaled.max(60)
+        }
+    }
+
+    /// Effective Kameo remote messaging timeout in seconds.
+    ///
+    /// Uses the same scaled timeout as HTTP so that inter-node forwarding
+    /// does not time out before the origin request.
+    pub fn effective_remote_timeout_secs(&self) -> u64 {
+        let messaging = &self.network.cluster.messaging;
+        if messaging.request_timeout_secs != default_request_timeout_secs() {
+            messaging.request_timeout_secs
+        } else {
+            self.effective_request_timeout_secs()
+        }
+    }
+
     /// Load configuration from multiple sources with precedence:
     /// 1. Command line arguments (highest priority)
     /// 2. Environment variables
@@ -362,6 +431,20 @@ impl CameoDbConfig {
 
         if let Ok(bind_addr) = std::env::var("CAMEODB_HTTP_BIND_ADDRESS") {
             config.network.http.bind_address = bind_addr;
+        }
+
+        // Record size limit (top-level, derives other limits)
+        if let Ok(record_size) = std::env::var("CAMEODB_MAX_RECORD_SIZE_MB") {
+            config.max_record_size_mb = record_size
+                .parse()
+                .with_context(|| "Invalid CAMEODB_MAX_RECORD_SIZE_MB")?;
+        }
+
+        // Explicit HTTP body size override (optional, usually derived)
+        if let Ok(body_size) = std::env::var("CAMEODB_MAX_BODY_SIZE_MB") {
+            config.network.http.max_body_size_mb = body_size
+                .parse()
+                .with_context(|| "Invalid CAMEODB_MAX_BODY_SIZE_MB")?;
         }
 
         // Storage configuration
@@ -511,6 +594,14 @@ impl CameoDbConfig {
             .into());
         }
 
+        // Validate record size limit
+        if self.max_record_size_mb == 0 {
+            return Err(ConfigError::NetworkConfig {
+                message: "max_record_size_mb must be positive".to_string(),
+            }
+            .into());
+        }
+
         // Validate storage configuration
         if self.storage.data_paths.is_empty() {
             return Err(ConfigError::StorageConfig {
@@ -574,13 +665,25 @@ impl CameoDbConfig {
     }
 }
 
+impl Default for CameoDbConfig {
+    fn default() -> Self {
+        Self {
+            node: NodeConfig::default(),
+            network: NetworkConfig::default(),
+            storage: StorageConfig::default(),
+            search: SearchConfig::default(),
+            max_record_size_mb: default_max_record_size_mb(),
+        }
+    }
+}
+
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             bind_address: default_http_bind_address(),
             port: default_http_port(),
             request_timeout_secs: default_request_timeout(),
-            max_body_size_mb: default_max_body_size_mb(),
+            max_body_size_mb: 0, // derived from max_record_size_mb
             cors_allowed_origins: default_cors_allowed_origins(),
         }
     }
@@ -670,8 +773,8 @@ fn default_request_timeout() -> u64 {
     30
 }
 
-fn default_max_body_size_mb() -> usize {
-    32
+fn default_max_record_size_mb() -> usize {
+    512
 }
 
 fn default_cors_allowed_origins() -> Vec<String> {
@@ -798,9 +901,10 @@ mod tests {
         let config = CameoDbConfig::default();
         assert_eq!(config.network.http.port, 9480);
         assert_eq!(config.network.http.bind_address, "0.0.0.0");
-        assert_eq!(config.search.indexer_memory_min_mb, 32); // Updated from 16
-        assert_eq!(config.search.indexer_memory_max_mb, 512); // Updated from 256
-        assert_eq!(config.storage.default_batch_size, 1000); // New parameter
+        assert_eq!(config.search.indexer_memory_min_mb, 32);
+        assert_eq!(config.search.indexer_memory_max_mb, 512);
+        assert_eq!(config.storage.default_batch_size, 1000);
+        assert_eq!(config.max_record_size_mb, 512);
         assert!(config.validate().is_ok());
     }
 
@@ -837,8 +941,9 @@ mod tests {
     fn test_sample_config_generation() {
         let sample = CameoDbConfig::generate_sample_config().unwrap();
         assert!(sample.contains("port = 9480"));
-        assert!(sample.contains("indexer_memory_min_mb = 32")); // Updated from 16
-        assert!(sample.contains("default_batch_size = 1000")); // New parameter
+        assert!(sample.contains("indexer_memory_min_mb = 32"));
+        assert!(sample.contains("default_batch_size = 1000"));
+        assert!(sample.contains("max_record_size_mb = 512"));
         assert!(sample.contains("data_paths"));
     }
 
@@ -859,5 +964,61 @@ mod tests {
         }
 
         println!("✅ Batch size configuration works!");
+    }
+
+    #[test]
+    fn test_derived_limits_defaults() {
+        let config = CameoDbConfig::default();
+        // HTTP body: max_record_size_mb + 64 = 512 + 64 = 576
+        assert_eq!(config.effective_max_body_size_mb(), 576);
+        // Remote message: 512 MB + 25% overhead = 640 MB in bytes
+        assert_eq!(
+            config.effective_remote_message_size_bytes(),
+            512 * 1024 * 1024 + 512 * 1024 * 1024 / 4
+        );
+        // Timeout: max(60, 512/10) = max(60, 51) = 60
+        assert_eq!(config.effective_request_timeout_secs(), 60);
+    }
+
+    #[test]
+    fn test_derived_limits_large_record() {
+        let config = CameoDbConfig {
+            max_record_size_mb: 2048,
+            ..Default::default()
+        };
+        // HTTP body: 2048 + 64 = 2112
+        assert_eq!(config.effective_max_body_size_mb(), 2112);
+        // Remote message: 2048 MB + 25% overhead = 2560 MB in bytes
+        assert_eq!(
+            config.effective_remote_message_size_bytes(),
+            2048 * 1024 * 1024 + 2048 * 1024 * 1024 / 4
+        );
+        // Timeout: max(60, 2048/10) = max(60, 204) = 204
+        assert_eq!(config.effective_request_timeout_secs(), 204);
+    }
+
+    #[test]
+    fn test_explicit_body_size_override() {
+        let mut config = CameoDbConfig::default();
+        config.network.http.max_body_size_mb = 100;
+        // Explicit override wins
+        assert_eq!(config.effective_max_body_size_mb(), 100);
+    }
+
+    #[test]
+    fn test_explicit_timeout_override() {
+        let mut config = CameoDbConfig::default();
+        config.network.http.request_timeout_secs = 120;
+        // Explicit override wins (120 != default 30)
+        assert_eq!(config.effective_request_timeout_secs(), 120);
+    }
+
+    #[test]
+    fn test_zero_record_size_fails_validation() {
+        let config = CameoDbConfig {
+            max_record_size_mb: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
     }
 }
