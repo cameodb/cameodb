@@ -386,16 +386,67 @@ async fn handle_list_command(
                 if let serde_json::Value::Object(ref mut map) = stats {
                     map.remove("field_names");
                 }
-                let compact = json!({
-                    "index": info.name,
-                    "stats": stats,
-                    "fields": format_compact_fields(&config.fields),
-                });
-                print_json(&compact)?;
+                let compact_fields = format_compact_fields(&config.fields);
+                print_compact_index_output(&info.name, &stats, &compact_fields)?;
             }
             Ok(Some(indexes))
         }
     }
+}
+
+fn print_compact_index_output(index: &str, stats: &JsonValue, fields: &JsonValue) -> Result<()> {
+    let fields_obj = fields
+        .as_object()
+        .ok_or_else(|| anyhow!("Expected compact fields to be an object"))?;
+
+    // Print index + stats using standard colored_json (multi-line is fine for these)
+    let header = json!({ "index": index, "stats": stats });
+    let header_colored = colored_json::to_colored_json_auto(&header).unwrap_or_default();
+    // Strip the outer closing brace — we'll append the fields section
+    let header_trimmed = header_colored.trim_end().trim_end_matches('}');
+    print!("{}", header_trimmed);
+    // Color the "fields" key via a tiny object so it matches the library scheme
+    let fields_key_obj = json!({ "fields": null });
+    let fields_key_colored =
+        colored_json::to_colored_json_auto(&fields_key_obj).unwrap_or_default();
+    // Extract just the colored "fields" key from the output
+    let fields_key = fields_key_colored
+        .lines()
+        .find(|l| l.contains("fields"))
+        .and_then(|l| l.split(':').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "\"fields\"".to_string());
+    println!("  {}: {{", fields_key);
+
+    let mut iter = fields_obj.iter().peekable();
+    while let Some((field_name, props)) = iter.next() {
+        let comma = if iter.peek().is_some() { "," } else { "" };
+        // Color the single-entry object via colored_json, then collapse to one line
+        let entry = json!({ field_name: props });
+        let colored = colored_json::to_colored_json_auto(&entry).unwrap_or_default();
+        let inline = collapse_colored_json(&colored);
+        println!("    {}{}", inline, comma);
+    }
+
+    println!("  }}");
+    println!("}}");
+    Ok(())
+}
+
+/// Collapse a multi-line colored JSON string into a single line,
+/// preserving ANSI escape sequences while stripping indentation.
+fn collapse_colored_json(colored: &str) -> String {
+    // Strip outer braces from the colored_json output (the { and } lines)
+    let inner: String = colored
+        .lines()
+        .skip(1) // skip opening {
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Remove trailing } and clean up whitespace
+    let trimmed = inner.trim().trim_end_matches('}').trim_end();
+    // Remove trailing comma if present
+    let trimmed = trimmed.trim_end_matches(',').trim_end();
+    format!("{{ {} }}", trimmed)
 }
 
 /// Format schema fields as compact one-line-per-field JSON objects.
