@@ -1,6 +1,7 @@
 use crate::sdk::{CameoClient, ListIndexesResponse};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
+use colored_json;
 use csv::ReaderBuilder;
 use flate2::read::GzDecoder;
 use reqwest::Url;
@@ -351,7 +352,49 @@ async fn handle_list_command(
     match resource {
         ListResource::Indexes => {
             let indexes = client.list_indexes(include_data_size).await?;
-            print_json(&indexes)?;
+            let mut entries = Vec::new();
+            let mut enriched_indexes = Vec::new();
+
+            for index_info in &indexes.indexes {
+                let config = client.get_index_config(&index_info.name).await?;
+                let stats = json!({
+                    "document_count": index_info.document_count,
+                    "total_size_bytes": index_info.total_size_bytes,
+                    "index_size_mb": index_info.index_size_mb,
+                    "data_size_mb": index_info.data_size_mb,
+                    "shard_count": index_info.shard_count,
+                });
+                let compact_fields = format_compact_fields(&config.fields);
+                entries.push((index_info.name.clone(), stats.clone(), compact_fields));
+
+                if extended {
+                    let schema = json!({
+                        "fields": config.fields,
+                    });
+                    enriched_indexes.push(json!({
+                        "name": index_info.name,
+                        "stats": stats,
+                        "schema": schema,
+                    }));
+                }
+            }
+
+            if extended {
+                let response = json!({
+                    "indexes": enriched_indexes,
+                    "total_indexes": indexes.total_indexes,
+                    "total_shards": indexes.total_shards,
+                    "node_id": indexes.node_id,
+                });
+                print_json(&response)?;
+            } else {
+                print_compact_indexes_output(
+                    &entries,
+                    indexes.total_indexes,
+                    indexes.total_shards,
+                    &indexes.node_id,
+                )?;
+            }
             Ok(Some(indexes))
         }
         ListResource::Index => {
@@ -371,10 +414,13 @@ async fn handle_list_command(
             let config = client.get_index_config(&info.name).await?;
 
             if extended {
-                let mut stats = serde_json::to_value(info)?;
-                if let serde_json::Value::Object(ref mut map) = stats {
-                    map.remove("field_names");
-                }
+                let stats = json!({
+                    "document_count": info.document_count,
+                    "total_size_bytes": info.total_size_bytes,
+                    "index_size_mb": info.index_size_mb,
+                    "data_size_mb": info.data_size_mb,
+                    "shard_count": info.shard_count,
+                });
                 let enriched = json!({
                     "index": info.name,
                     "stats": stats,
@@ -382,10 +428,13 @@ async fn handle_list_command(
                 });
                 print_json(&enriched)?;
             } else {
-                let mut stats = serde_json::to_value(info)?;
-                if let serde_json::Value::Object(ref mut map) = stats {
-                    map.remove("field_names");
-                }
+                let stats = json!({
+                    "document_count": info.document_count,
+                    "total_size_bytes": info.total_size_bytes,
+                    "index_size_mb": info.index_size_mb,
+                    "data_size_mb": info.data_size_mb,
+                    "shard_count": info.shard_count,
+                });
                 let compact_fields = format_compact_fields(&config.fields);
                 print_compact_index_output(&info.name, &stats, &compact_fields)?;
             }
@@ -395,58 +444,146 @@ async fn handle_list_command(
 }
 
 fn print_compact_index_output(index: &str, stats: &JsonValue, fields: &JsonValue) -> Result<()> {
+    let (open, close) = color_json_braces();
+    println!("{}", open);
+    print_compact_index_entry_body("index", index, stats, fields, "  ")?;
+    println!("{}", close);
+    Ok(())
+}
+
+/// Shared helper to print the body of a compact index entry (name/stats/fields).
+fn print_compact_index_entry_body(
+    key: &str,
+    value: &str,
+    stats: &JsonValue,
+    fields: &JsonValue,
+    indent: &str,
+) -> Result<()> {
     let fields_obj = fields
         .as_object()
         .ok_or_else(|| anyhow!("Expected compact fields to be an object"))?;
 
-    // Print index + stats using standard colored_json (multi-line is fine for these)
-    let header = json!({ "index": index, "stats": stats });
-    let header_colored = colored_json::to_colored_json_auto(&header).unwrap_or_default();
-    // Strip the outer closing brace — we'll append the fields section
-    let header_trimmed = header_colored.trim_end().trim_end_matches('}');
-    print!("{}", header_trimmed);
-    // Color the "fields" key via a tiny object so it matches the library scheme
-    let fields_key_obj = json!({ "fields": null });
-    let fields_key_colored =
-        colored_json::to_colored_json_auto(&fields_key_obj).unwrap_or_default();
-    // Extract just the colored "fields" key from the output
-    let fields_key = fields_key_colored
-        .lines()
-        .find(|l| l.contains("fields"))
-        .and_then(|l| l.split(':').next())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "\"fields\"".to_string());
-    println!("  {}: {{", fields_key);
+    // Print key-value line
+    println!(
+        "{}  {}: {},",
+        indent,
+        color_json_key(key),
+        color_json_string(value)
+    );
 
+    // Print stats via colored_json
+    let stats_wrapper = json!({ "stats": stats });
+    let colored_stats = colored_json::to_colored_json_auto(&stats_wrapper).unwrap_or_default();
+    let stats_lines: Vec<&str> = colored_stats.lines().collect();
+    for line in stats_lines
+        .iter()
+        .skip(1)
+        .take(stats_lines.len().saturating_sub(2))
+    {
+        println!("{}  {}", indent, line.trim());
+    }
+
+    // Print compact fields section with colored key and braces
+    let fields_key_colored = color_json_key("fields");
+    let (open, close) = color_json_braces();
+    println!("{}  {}: {}", indent, fields_key_colored, open);
+    let field_indent = format!("{}    ", indent);
     let mut iter = fields_obj.iter().peekable();
     while let Some((field_name, props)) = iter.next() {
         let comma = if iter.peek().is_some() { "," } else { "" };
-        // Color the single-entry object via colored_json, then collapse to one line
         let entry = json!({ field_name: props });
         let colored = colored_json::to_colored_json_auto(&entry).unwrap_or_default();
-        let inline = collapse_colored_json(&colored);
-        println!("    {}{}", inline, comma);
+        let inline = collapse_single_field_colored(&colored);
+        println!("{}{}{}", field_indent, inline, comma);
     }
 
-    println!("  }}");
-    println!("}}");
+    println!("{}  {}", indent, close);
     Ok(())
 }
 
-/// Collapse a multi-line colored JSON string into a single line,
-/// preserving ANSI escape sequences while stripping indentation.
-fn collapse_colored_json(colored: &str) -> String {
-    // Strip outer braces from the colored_json output (the { and } lines)
-    let inner: String = colored
-        .lines()
-        .skip(1) // skip opening {
+/// Collapse a single-field colored JSON object to an inline entry.
+///
+/// Input (from colored_json pretty-print of `{"field_name": {...}}`):
+///   {
+///     "field_name": {
+///       "type": "Text"
+///     }
+///   }
+///
+/// Output:
+///   "field_name": { "type": "Text" }
+///
+/// This works because we strip the first `{` and last `}` lines, then
+/// join the remaining (indented) lines with single spaces.
+fn collapse_single_field_colored(colored: &str) -> String {
+    let lines: Vec<&str> = colored.lines().collect();
+    if lines.len() < 3 {
+        return colored.to_string();
+    }
+    lines[1..lines.len() - 1] // skip first `{` and last `}`
+        .iter()
+        .map(|l| l.trim())
         .collect::<Vec<_>>()
-        .join(" ");
-    // Remove trailing } and clean up whitespace
-    let trimmed = inner.trim().trim_end_matches('}').trim_end();
-    // Remove trailing comma if present
-    let trimmed = trimmed.trim_end_matches(',').trim_end();
-    format!("{{ {} }}", trimmed)
+        .join(" ")
+}
+
+/// Print multiple indexes with compact single-line field entries.
+fn print_compact_indexes_output(
+    indexes: &[(String, JsonValue, JsonValue)],
+    total_indexes: usize,
+    total_shards: usize,
+    node_id: &str,
+) -> Result<()> {
+    let (open, close) = color_json_braces();
+    println!("{}", open);
+    println!("  {}: [", color_json_key("indexes"));
+
+    for (i, (name, stats, fields)) in indexes.iter().enumerate() {
+        let comma = if i < indexes.len() - 1 { "," } else { "" };
+        println!("    {}", open);
+        print_compact_index_entry_body("name", name, stats, fields, "      ")?;
+        println!("    {}{}", close, comma);
+    }
+
+    println!("  ],");
+    println!("  {}: {},", color_json_key("total_indexes"), total_indexes);
+    println!("  {}: {},", color_json_key("total_shards"), total_shards);
+    println!(
+        "  {}: {},",
+        color_json_key("node_id"),
+        serde_json::to_string(node_id)?
+    );
+    println!("{}", close);
+    Ok(())
+}
+
+/// Extract a colored JSON key string matching colored_json's cyan key color scheme.
+fn color_json_key(key: &str) -> String {
+    let dummy = json!({ key: serde_json::Value::Null });
+    let colored = colored_json::to_colored_json_auto(&dummy).unwrap_or_default();
+    colored
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split(':').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| format!("\"{}\"", key))
+}
+
+/// Extract a colored JSON string value matching colored_json's green string color scheme.
+fn color_json_string(value: &str) -> String {
+    let dummy = json!({ "k": value });
+    let colored = colored_json::to_colored_json_auto(&dummy).unwrap_or_default();
+    colored
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split(':').nth(1))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default())
+}
+
+/// Extract colored braces from colored_json output for consistent coloring.
+fn color_json_braces() -> (String, String) {
+    ("{".to_string(), "}".to_string())
 }
 
 /// Format schema fields as compact one-line-per-field JSON objects.
@@ -783,6 +920,25 @@ impl IndexCompleter {
             .collect()
     }
 
+    fn extended_flag_suggestions(&self, current: &str, tokens: &[&str]) -> Vec<Pair> {
+        let has_extended = tokens.iter().any(|t| *t == "--extended" || *t == "-e");
+        let mut suggestions = Vec::new();
+
+        if !has_extended && "--extended".starts_with(current) {
+            suggestions.push(Pair {
+                display: "--extended".to_string(),
+                replacement: "--extended".to_string(),
+            });
+        }
+        if !has_extended && "-e".starts_with(current) {
+            suggestions.push(Pair {
+                display: "-e".to_string(),
+                replacement: "-e".to_string(),
+            });
+        }
+        suggestions
+    }
+
     fn schema_subcommand_suggestions(&self, prefix: &str) -> Vec<Pair> {
         let subcommands = vec!["detect", "load"];
         subcommands
@@ -825,10 +981,27 @@ impl IndexCompleter {
                 let start = current_start(tokens, current);
                 Some((start, suggestions))
             }
+            "list" if tokens.len() >= 2 && tokens[1] == "indexes" => {
+                if current.starts_with('-') {
+                    // Suggest --extended flag after indexes
+                    let suggestions = self.extended_flag_suggestions(current, tokens);
+                    let start = current_start(tokens, current);
+                    Some((start, suggestions))
+                } else {
+                    None
+                }
+            }
             "list" if tokens.len() >= 2 && tokens[1] == "index" => {
-                let suggestions = self.index_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                if current.starts_with('-') {
+                    // Suggest --extended flag after index name
+                    let suggestions = self.extended_flag_suggestions(current, tokens);
+                    let start = current_start(tokens, current);
+                    Some((start, suggestions))
+                } else {
+                    let suggestions = self.index_suggestions(current);
+                    let start = current_start(tokens, current);
+                    Some((start, suggestions))
+                }
             }
             // Complete schema subcommands and index for schema load
             "schema" if tokens.len() == 2 => {
@@ -1025,6 +1198,23 @@ impl Hinter for IndexCompleter {
         let command = parts.next()?;
 
         match command {
+            "list" => {
+                let subcommand = parts.next()?;
+                let tail = parts.collect::<Vec<_>>();
+                let has_extended = tail.iter().any(|t| *t == "--extended" || *t == "-e");
+
+                if (subcommand == "index" || subcommand == "indexes")
+                    && let Some(current) = tail.last()
+                {
+                    if !has_extended && "--extended".starts_with(current) {
+                        return Some("extended".strip_prefix(current).unwrap_or("").to_string());
+                    }
+                    if !has_extended && "-e".starts_with(current) {
+                        return Some("e".strip_prefix(current).unwrap_or("").to_string());
+                    }
+                }
+                None
+            }
             "search" => {
                 let index = parts.next()?;
                 let tail = parts.collect::<Vec<_>>();
@@ -1142,7 +1332,7 @@ pub enum ClientCommand {
         resource: ListResource,
         /// Name of the resource (required for `list index <name>`)
         name: Option<String>,
-        /// Show full extended schema details (all field properties)
+        /// Show full extended schema with all field properties (for list indexes, also fetches and displays field schemas for each index)
         #[arg(long, default_value_t = false)]
         extended: bool,
     },
@@ -3941,12 +4131,14 @@ async fn dispatch_interactive_command(
             let resource = parts.next().unwrap_or("indexes");
             match resource {
                 "indexes" => {
+                    let remaining: Vec<&str> = parts.collect();
+                    let extended = remaining.iter().any(|s| *s == "--extended" || *s == "-e");
                     if let Some(result) = handle_list_command(
                         session.client(),
                         ListResource::Indexes,
                         None,
                         true,
-                        false,
+                        extended,
                     )
                     .await?
                     {
@@ -3965,6 +4157,19 @@ async fn dispatch_interactive_command(
                         Some(name.to_string()),
                         true,
                         extended,
+                    )
+                    .await?
+                    {
+                        session.update_index_cache(&result).await;
+                    }
+                }
+                "--extended" | "-e" => {
+                    if let Some(result) = handle_list_command(
+                        session.client(),
+                        ListResource::Indexes,
+                        None,
+                        true,
+                        true,
                     )
                     .await?
                     {
