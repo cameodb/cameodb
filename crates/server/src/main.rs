@@ -376,6 +376,7 @@ async fn main() -> Result<()> {
     println!("  GET  /mcp/sse - MCP SSE transport endpoint");
     println!("  POST /mcp/sse - MCP compatibility HTTP endpoint");
     println!("  POST /mcp/messages?session_id=... - MCP JSON-RPC message endpoint");
+    println!("  MCP capabilities: tools (6), resources (4), prompts (1)");
     println!();
     println!("⚙️  Configuration:");
     println!("  Data Paths: {:?}", cameodb_config.storage.data_paths);

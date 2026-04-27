@@ -476,7 +476,8 @@ where
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
                     "tools": {},
-                    "resources": {}
+                    "resources": {},
+                    "prompts": {}
                 },
                 "serverInfo": {
                     "name": "cameodb-mcp",
@@ -520,6 +521,46 @@ where
                 ),
             },
         ),
+
+        // --- Prompts ---
+        "prompts/list" => Some(success_response(
+            request.id,
+            json!({
+                "prompts": [{
+                    "name": "cameodb-orchestrator",
+                    "description": "Universal Data Retrieval & Orchestration Skill for CameoDB.",
+                    "arguments": []
+                }]
+            }),
+        )),
+        "prompts/get" => {
+            let name = request
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if name == "cameodb-orchestrator" {
+                Some(success_response(
+                    request.id,
+                    json!({
+                        "description": "Universal Data Retrieval & Orchestration Skill for CameoDB.",
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": ORCHESTRATOR_SKILL
+                            }
+                        }]
+                    }),
+                ))
+            } else {
+                Some(error_response(
+                    request.id,
+                    -32602,
+                    format!("Unknown prompt: {name}"),
+                ))
+            }
+        }
 
         // --- Tools ---
         "tools/list" => Some(success_response(
@@ -615,12 +656,66 @@ where
     }
 }
 
+const ORCHESTRATOR_SKILL: &str = r#"# CameoDB Agent Skill: Universal Data Retrieval & Orchestration
+
+## Role and Purpose
+You are an expert Data Retrieval Analyst powered by CameoDB, a high-performance, fully-indexed knowledge base. Your sole objective is to extract precise information from CameoDB indexes through optimized queries. Data ingestion is handled externally — you never write data. You retrieve, synthesize, and present answers based **only** on the returned facts.
+
+## Core Directives & Anti-Hallucination Rules
+1. **Zero Hallucination:** You MUST use ONLY the exact data returned by the tools. NEVER invent, guess, or inject prior knowledge into database results.
+2. **Acknowledge Gaps:** If the database returns partial or no results, state exactly what was found and nothing more.
+3. **Schema First:** Never guess field names. If you are unsure of the index structure, you must use `get_index` or `list_indexes` before searching.
+4. **Read-Only:** You do not write, ingest, or modify data. All data is loaded by external processes. Your job is retrieval only.
+
+## The Orchestration Workflow
+When a user asks a question, you must follow this deterministic loop:
+
+### Step 1: Domain & Schema Discovery
+* **Action:** If you do not know which index contains the answer, use `list_indexes`. Read the descriptions to find the right dataset.
+* **Action:** Once an index is identified, use `get_index` to read the descriptive field names.
+* *Logic:* Use the field names to understand the context. (e.g., If you see `customer_id` and `cart_total`, the domain is E-commerce. If you see `process.pid` and `file_hash`, the domain is Security).
+
+### Step 2: Query Formulation & Validation
+* **Action:** Construct your query using CameoDB's Tantivy syntax.
+* **Rule:** Map the user's intent to the specific data types found in Step 1.
+    * *Text fields:* Use phrases (`title:"exact phrase"`), prefix (`name:john*`), or slop (`body:"near this"~2`).
+    * *Numeric/Date fields:* Use ranges (`price:[10.0 TO 100.0]`, `created_at:>2024-01-01`).
+    * *Exact ID lookup:* When the user's question provides an exact document `id` or any field with `shadow: true` property, query it directly (e.g., `id:ABC123`). This is the fastest retrieval path — CameoDB bypasses the search index and reads directly from the KV store.
+* **Action:** If the query is highly complex or you are unsure of syntax compatibility, use the `validate_query` tool to check your structure before executing.
+
+### Step 3: Precision Execution & Field Projection
+* **Action:** Execute the query using `search_index` (for a single index) or `search_indexes` (for federated searches across domains).
+* **Rule:** Optimize your queries. Use boosting (`title:rust^3 OR body:rust`) to ensure the most relevant documents are returned first. Use `limit N` to prevent overflowing your context window.
+* **Field Projection Strategy (`return` clause):** Always request **only the fields needed** to answer the user's goal. However, include additional fields when they provide **business-domain context** or enable **pivoting** to related records.
+    * *Minimal set:* Request exact fields required for the answer (e.g., `return name, price` for a price lookup).
+    * *Context set:* Add fields that reveal relationships or enable follow-up analysis (e.g., `return customer_id, order_id, status, total` — `customer_id` enables pivoting to customer history).
+    * *Domain expertise:* Use your understanding of the business domain to infer which fields are identifiers, timestamps, or foreign keys that unlock deeper investigation.
+
+### Step 4: Iteration and Pivoting
+* **Action:** Analyze the results. If a document contains a unique identifier (like a `session_id`, `user_id`, or `transaction_hash`), and the user's question requires more context, **automatically pivot**.
+* *Logic:* Formulate a new `search_index` query using that identifier to pull all related records and build a complete timeline or picture.
+* *Field-driven pivoting:* When the initial `return` clause included contextual fields (e.g., `category_id`, `parent_order_id`), use those to expand the investigation without re-querying the original record.
+
+## Advanced Querying: Any Field, Any Type
+CameoDB indexes every field. There are no "unqueryable" fields. Use the full Tantivy syntax against any indexed field:
+- **Existence queries:** `field:*` matches documents where the field is present.
+- **Negation:** `-status:deleted` excludes deleted records.
+- **Boolean logic:** `(urgent:true OR priority:>5) AND assignee:john`
+- **Nested access:** Use dot notation for nested JSON fields (e.g., `metadata.source:api`).
+
+## Output Formatting
+When presenting your final answer to the user:
+1. Cite the index(es) where the data was found.
+2. Present structured data (like timelines or aggregations) in Markdown tables.
+3. Explicitly state the query logic and `return` field selection you used so the user understands how the answer was derived.
+4. Note any pivot queries executed and why they were necessary."#;
+
 fn mcp_tools() -> Vec<JsonValue> {
     vec![
         json!({
             "name": "search_index",
             "title": "Search Index",
-            "description": "Execute full-text search on a single CameoDB index. Query syntax supports field:value targeting, phrase queries (field:\"words\"), boolean operators (AND, OR, NOT), grouping with parentheses, range queries (field:[low TO high]), and date comparisons (field:>2024-01-01). \n\nCRITICAL ANTI-HALLUCINATION RULE FOR AGENTS:\nWhen answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.\n\nPRO TIPS FOR AGENTS:\n1. Use Tantivy boosting to improve relevance (e.g., 'title:rust^3 OR body:rust').\n2. The query string supports inline 'return field1,field2' for field projection, and 'limit N' for result count.\n3. If you receive a field error or do not know the available fields, run the 'get_index' tool first to view the schema.\n\nQUERY SYNTAX QUICK REFERENCE:\n- Terms: rust database (AND by default)\n- Field targeting: title:rust (only applies to next term)\n- Term prefix: title:quick* (matches quickwit, quickstart)\n- Phrases: title:\"rust programming\"\n- Phrase slop (proximity): body:\"small bike\"~2\n- Phrase prefix: \"big bad wo\"* (matches 'big bad wolf')\n- Boolean: title:rust AND author:doe | OR | NOT (UPPERCASE required)\n- Must/must-not: +title:rust -author:smith\n- Grouping: (title:rust OR title:go) AND year:[2020 TO 2024]\n- Range (inclusive []): year:[2020 TO 2024]\n- Range (exclusive {}): score:{0 TO 100}\n- Range (comparison): age:>=18 or score:<100\n- Unbounded range: price:[10.0 TO *] or age:[* TO 30]\n- Set operator: status: IN [active pending review]\n- Boosting: title:rust^3 OR body:rust\n- Exists: author:* (matches docs where author field is set)\n- All docs: *\n- Date: created_at:>2024-01-01, created_at:[2024-01-01 TO 2024-12-31]\n- Escape specials: k8s\\.component\\.name:value (reserved: + ^ ` : { } \" [ ] ( ) ~ ! \\\\ * SPACE)\n- Field names: If a field name literally contains a dot, escape it (k8s\\.node) to avoid JSON nested access.\n\nFIELD TYPE IMPACT ON OPERATORS:\n- text: all operators (phrases, slop, prefix, IN set, boost, range, exists)\n- string/exact: exact match, prefix, IN set, exists (no phrases/slop)\n- numeric (i64/u64/f64): exact, comparisons (>, <), range [], {}, boost, exists (no phrases/IN)\n- date: exact, comparisons (>/</>=/<=), range, exists (no phrases/IN)\n- boolean: true/false only, exists (no range/boost)\n- ip: exact, range, exists (no phrases)\n- json: dot notation field.sub:value, nested exists field.sub:* (escape dots with \\\\)\n- facet: path /category/sub, exists",
+            "description": "Execute full-text search on a single CameoDB index. Query syntax supports field:value targeting, phrase queries (field:\"words\"), boolean operators (AND, OR, NOT), grouping with parentheses, range queries (field:[low TO high]), and date comparisons (field:>2024-01-01). \n\nCRITICAL ANTI-HALLUCINATION RULE FOR AGENTS:\nWhen answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.\n\nPRO TIPS FOR AGENTS:\n1. Use Tantivy boosting to improve relevance (e.g., 'title:rust^3 OR body:rust').\n2. The query string supports inline 'return field1,field2' for field projection, and 'limit N' for result count.\n3. If you receive a field error or do not know the available fields, run the 'get_index' tool first to view the schema.\n\nQUERY SYNTAX QUICK REFERENCE:\n- Terms: rust database (AND by default)\n- Field targeting: title:rust (only applies to next term)\n- Term prefix: title:quick* (matches quickwit, quickstart)\n- Phrases: title:\"rust programming\"\n- Phrase slop (proximity): body:\"small bike\"~2\n- Phrase prefix: \"big bad wo\"* (matches 'big bad wolf')\n- Boolean: title:rust AND author:doe | OR | NOT (UPPERCASE required)\n- Must/must-not: +title:rust -author:smith\n- Grouping: (title:rust OR title:go) AND year:[2020 TO 2024]\n- Range (inclusive []): year:[2020 TO 2024]\n- Range (exclusive {}): score:{0 TO 100}\n- Range (comparison): age:>=18 or score:<100\n- Unbounded range: price:[10.0 TO *] or age:[* TO 30]\n- Set operator: status: IN [active pending review]\n- Boosting: title:rust^3 OR body:rust\n- Exists: author:* (matches docs where author field is set)\n- All docs: *\n- Date: created_at:>2024-01-01, created_at:[2024-01-01 TO 2024-12-31]\n- Escape specials: k8s\\.component\\.name:value (reserved: + ^ ` : { } \" [ ] ( ) ~ ! \\\\ * SPACE)\n- Field names: If a field name literally contains a dot, escape it (k8s\\.node) to avoid JSON nested access.\n\nFIELD TYPE IMPACT ON OPERATORS:\n- text: all operators (phrases, slop, prefix, IN set, boost, range, exists)\n- string/exact: exact match, prefix, IN set, exists (no phrases/slop)\n- numeric (i64/u64/f64): exact, comparisons (>, <), range [], {}, boost, exists (no phrases/IN)\n- date: exact, comparisons (>/</>=/<=), range, exists (no phrases/IN)\n- boolean: true/false only, exists (no range/boost)\n- ip: exact, range, exists (no phrases)\n- json: dot notation field.sub:value, nested exists field.sub:* (escape dots with \\\\)\n- facet: path /category/sub, exists\n\nORCHESTRATION TIP: If your query involves an exact document ID or a field marked with `shadow: true`, query it directly (e.g., `id:123`). This bypasses the search index for ultra-fast KV retrieval.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -652,7 +747,7 @@ fn mcp_tools() -> Vec<JsonValue> {
         json!({
             "name": "search_indexes",
             "title": "Federated Search",
-            "description": "Execute federated search across multiple CameoDB indexes with optional per-index field projection. Results are merged by relevance score. Each hit includes an '_index_source' field indicating its origin index.\n\nCRITICAL ANTI-HALLUCINATION RULE FOR AGENTS:\nWhen answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.\n\nUses the same query syntax as search_index (field:value, phrases, boolean operators, ranges, boosting, set IN, slop ~, prefix *, must +/-, grouping). If indexes have different schemas, the query applies to matching fields in each index.",
+            "description": "Execute federated search across multiple CameoDB indexes with optional per-index field projection. Results are merged by relevance score. Each hit includes an '_index_source' field indicating its origin index.\n\nCRITICAL ANTI-HALLUCINATION RULE FOR AGENTS:\nWhen answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.\n\nUses the same query syntax as search_index (field:value, phrases, boolean operators, ranges, boosting, set IN, slop ~, prefix *, must +/-, grouping). If indexes have different schemas, the query applies to matching fields in each index.\n\nORCHESTRATION TIP: When federating across indexes, pay close attention to the `_index_source` field in your results. Use this to focus subsequent, deeper queries on a single index.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -694,7 +789,7 @@ fn mcp_tools() -> Vec<JsonValue> {
         json!({
             "name": "get_index",
             "title": "Get Index",
-            "description": "Retrieve schema and statistics for a single CameoDB index. Returns field definitions with types and a 'queryable_fields' array containing per-field 'query_hint' showing exactly which operators (phrases, ranges, IN set, boost, slop, etc.) work with each field's data type. Use this to understand an index's structure before constructing queries.",
+            "description": "Retrieve schema and statistics for a single CameoDB index. Returns field definitions with types and a 'queryable_fields' array containing per-field 'query_hint' showing exactly which operators (phrases, ranges, IN set, boost, slop, etc.) work with each field's data type. Use this to understand an index's structure before constructing queries.\n\nORCHESTRATION TIP: Review the returned schema to identify potential pivot fields (like foreign keys, user IDs, or hashes) before running your search.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -726,7 +821,7 @@ fn mcp_tools() -> Vec<JsonValue> {
         json!({
             "name": "validate_query",
             "title": "Validate Query",
-            "description": "Validate and get guidance on CameoDB search query syntax. Provides field-type-aware suggestions, detects unknown or non-indexed fields, checks query structure (unbalanced quotes/parens, inline modifiers), and returns the full CameoDB query syntax reference. Supply an index name for schema-aware validation.\n\nPRO TIPS FOR AGENTS:\n1. Call with no arguments to get the complete query syntax reference and operator-by-field-type compatibility matrix.\n2. Supply an index name to get schema-aware field validation with type-specific operator hints per field.\n3. Supply a partial_field to get autocomplete suggestions matching available fields.\n4. Supply a query to get structural validation, field recognition, typo detection ('did you mean?'), and per-field operator guidance.",
+            "description": "Validate and get guidance on CameoDB search query syntax. Provides field-type-aware suggestions, detects unknown or non-indexed fields, checks query structure (unbalanced quotes/parens, inline modifiers), and returns the full CameoDB query syntax reference. Supply an index name for schema-aware validation.\n\nPRO TIPS FOR AGENTS:\n1. Call with no arguments to get the complete query syntax reference and operator-by-field-type compatibility matrix.\n2. Supply an index name to get schema-aware field validation with type-specific operator hints per field.\n3. Supply a partial_field to get autocomplete suggestions matching available fields.\n4. Supply a query to get structural validation, field recognition, typo detection ('did you mean?'), and per-field operator guidance.\n\nORCHESTRATION TIP: Use this tool immediately if `search_index` returns a syntax error, before attempting to guess the correct format.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

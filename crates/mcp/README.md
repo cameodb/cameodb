@@ -18,6 +18,7 @@ The `cameodb_mcp` crate provides a standards-compliant MCP server that exposes C
 ### Key Features
 
 - ✅ **6 MCP Tools** for search, metadata, and query validation
+- ✅ **1 MCP Prompt** (`cameodb-orchestrator`) — universal data retrieval & orchestration skill injected into agent context
 - ✅ **4 Resource URIs** for index exploration (indexes, index metadata, schema, stats)
 - ✅ **Field-Type-Aware Query Validation** with syntax reference
 - ✅ **Federated Search** across multiple indexes
@@ -463,6 +464,36 @@ title:rust AND author:doe return title,author limit 10  # combined
 
 **Note**: CameoDB defaults to port `9480`. You can change this in the configuration file (`[network.http] port = 9480`) or via command line arguments.
 
+### Claude Code (Recommended)
+
+Claude Code supports **native SSE transport** — no bridge or curl workaround needed.
+
+```bash
+# Add via CLI (project-scoped)
+claude mcp add --transport sse cameodb http://localhost:9480/mcp/sse
+
+# Or add as Streamable HTTP
+claude mcp add --transport http cameodb http://localhost:9480/mcp
+
+# Verify connection
+claude mcp get cameodb
+claude mcp list
+```
+
+Inside Claude Code, type `/mcp` to check server status and available tools.
+
+**Project-level config** (`.mcp.json` in repo root, shareable with team):
+```json
+{
+  "mcpServers": {
+    "cameodb": {
+      "type": "sse",
+      "url": "http://localhost:9480/mcp/sse"
+    }
+  }
+}
+```
+
 ### Claude Desktop
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
@@ -471,19 +502,27 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "cameodb": {
-      "command": "curl",
-      "args": [
-        "-N",
-        "-H", "Accept: text/event-stream",
-        "http://localhost:9480/mcp/sse"
-      ],
-      "env": {}
+      "type": "sse",
+      "url": "http://localhost:9480/mcp/sse"
     }
   }
 }
 ```
 
-**Note**: Claude Desktop uses stdio transport. For HTTP/SSE, you'll need a bridge or use the SSE endpoint directly via the MCP Inspector.
+For servers requiring authentication headers:
+```json
+{
+  "mcpServers": {
+    "cameodb": {
+      "type": "sse",
+      "url": "http://localhost:9480/mcp/sse",
+      "headers": {
+        "Authorization": "Bearer your-token"
+      }
+    }
+  }
+}
+```
 
 ### Windsurf
 
@@ -569,7 +608,7 @@ For compatibility with some MCP client integrations, `POST /mcp/sse` is also acc
 
 The server implements these JSON-RPC methods:
 
-- `initialize` — Capability negotiation
+- `initialize` — Capability negotiation (advertises `tools`, `resources`, `prompts`)
 - `ping` — Health check
 - `notifications/initialized` — Client initialization complete (no response)
 - `notifications/cancelled` — Task cancellation (no response)
@@ -577,6 +616,8 @@ The server implements these JSON-RPC methods:
 - `tools/call` — Invoke a tool
 - `resources/list` — List available resources
 - `resources/read` — Read a resource
+- `prompts/list` — List available prompts (`cameodb-orchestrator`)
+- `prompts/get` — Retrieve the orchestration skill prompt
 
 ### Error Handling
 
