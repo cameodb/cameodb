@@ -1200,12 +1200,20 @@ pub fn reconstruct_shadow_fields_in_json(json_blob: &JsonValue, schema: &IndexSc
 
 /// Optimized: Reconstruct shadow fields by consuming the input (Ownership Transfer).
 ///
+/// The `doc_id` parameter provides the canonical document identifier from the redb key
+/// or tantivy stored field. This is used as the authoritative ID source when the blob
+/// does not contain an "id" field (avoiding redundant storage of the key inside the body).
+///
 /// Behavior:
 /// 1. If NO shadow fields exist: Ensures 'id' is the first field in the JSON object.
 /// 2. If shadow fields EXIST: Replaces 'id' with the shadow field(s) (e.g., returns 'book_id' instead of 'id').
 ///
 /// This avoids cloning the bulk of the document (original fields) by using `append`.
-pub fn reconstruct_shadow_fields_owned(json_blob: JsonValue, schema: &IndexSchema) -> JsonValue {
+pub fn reconstruct_shadow_fields_owned(
+    json_blob: JsonValue,
+    schema: &IndexSchema,
+    doc_id: &str,
+) -> JsonValue {
     // Fast fail if not an object
     let mut obj = match json_blob {
         JsonValue::Object(map) => map,
@@ -1223,34 +1231,32 @@ pub fn reconstruct_shadow_fields_owned(json_blob: JsonValue, schema: &IndexSchem
             return JsonValue::Object(obj);
         }
 
-        // Optimization: Reorder using Move semantics (No cloning)
-        if let Some(id_val) = obj.remove("id") {
-            let mut out = JsonMap::with_capacity(obj.len() + 1);
-            out.insert("id".to_string(), id_val);
-            out.append(&mut obj); // Moves pointers only
-            return JsonValue::Object(out);
-        }
-
-        // Edge case: No 'id' field found, return as is
-        return JsonValue::Object(obj);
+        // Reorder: move existing "id" to front, or inject from doc_id
+        let id_val = obj
+            .remove("id")
+            .unwrap_or_else(|| serde_json::Value::String(doc_id.to_string()));
+        let mut out = JsonMap::with_capacity(obj.len() + 1);
+        out.insert("id".to_string(), id_val);
+        out.append(&mut obj); // Moves pointers only
+        return JsonValue::Object(out);
     }
 
     // CASE 2: Shadow Fields Exist -> Replace ID with Shadow Field(s)
     let mut out = JsonMap::with_capacity(obj.len() + shadow_mapping.len());
 
-    // Extract ID (Move ownership out of obj)
-    if let Some(id_val) = obj.remove("id") {
-        // Insert Shadow Fields FIRST
-        for (shadow_field, canonical_field) in shadow_mapping {
-            if canonical_field == "id" {
-                // Insert the shadow field with the ID's value
-                // We clone the value here to support multiple shadow aliases if necessary
-                out.insert(shadow_field, id_val.clone());
-            }
+    // Resolve the canonical ID: prefer blob's "id", fall back to doc_id (redb key)
+    let id_val = obj
+        .remove("id")
+        .unwrap_or_else(|| serde_json::Value::String(doc_id.to_string()));
+
+    // Insert Shadow Fields FIRST
+    for (shadow_field, canonical_field) in shadow_mapping {
+        if canonical_field == "id" {
+            out.insert(shadow_field, id_val.clone());
         }
-        // Note: We deliberately SKIP inserting "id" here.
-        // The shadow field replaces it in the presentation layer.
     }
+    // Note: We deliberately SKIP inserting "id" here.
+    // The shadow field replaces it in the presentation layer.
 
     // Move remaining original fields (bulk data)
     out.append(&mut obj);
@@ -3308,20 +3314,7 @@ impl HybridStore {
 
                     // OPTIMIZATION: Pass ownership to avoid cloning all fields
                     let final_doc = if let Some(json_blob) = stored_doc.json_blob {
-                        let mut doc = reconstruct_shadow_fields_owned(json_blob, &schema);
-
-                        // Safety check: Only add id if it's not already present and no shadow fields exist
-                        // When shadow fields exist, reconstruct_shadow_fields_owned already handles the mapping
-                        if let Some(obj) = doc.as_object_mut() {
-                            let shadow_mapping = schema.get_shadow_mapping();
-                            if shadow_mapping.is_empty() && !obj.contains_key("id") {
-                                obj.insert(
-                                    "id".to_string(),
-                                    serde_json::Value::String(doc_id.clone()),
-                                );
-                            }
-                        }
-                        doc
+                        reconstruct_shadow_fields_owned(json_blob, &schema, &doc_id)
                     } else {
                         // Fallback if blob was empty
                         serde_json::json!({ "id": doc_id })
@@ -3551,17 +3544,7 @@ impl HybridStore {
 
                 // OPTIMIZATION: Pass ownership to avoid cloning all fields
                 let final_doc = if let Some(json_blob) = stored_doc.json_blob {
-                    let mut doc = reconstruct_shadow_fields_owned(json_blob, &schema);
-
-                    // Safety check: Only add id if it's not already present and no shadow fields exist
-                    // When shadow fields exist, reconstruct_shadow_fields_owned already handles the mapping
-                    if let Some(obj) = doc.as_object_mut() {
-                        let shadow_mapping = schema.get_shadow_mapping();
-                        if shadow_mapping.is_empty() && !obj.contains_key("id") {
-                            obj.insert("id".to_string(), serde_json::Value::String(doc_id.clone()));
-                        }
-                    }
-                    doc
+                    reconstruct_shadow_fields_owned(json_blob, &schema, &doc_id)
                 } else {
                     // Fallback if blob was empty
                     serde_json::json!({ "id": doc_id })
