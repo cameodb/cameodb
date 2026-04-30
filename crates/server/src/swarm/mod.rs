@@ -19,6 +19,7 @@ use libp2p::{
 use std::collections::HashMap;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::{select, sync::watch};
@@ -87,16 +88,19 @@ pub enum CoordinatorEvent {
 pub struct SwarmRuntimeHandle {
     shutdown_tx: Option<watch::Sender<SwarmControl>>,
     cmd_tx: Option<UnboundedSender<SwarmCommand>>,
+    runtime_join_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl SwarmRuntimeHandle {
     fn new(
         shutdown_tx: watch::Sender<SwarmControl>,
         cmd_tx: UnboundedSender<SwarmCommand>,
+        runtime_join_handle: tokio::task::JoinHandle<()>,
     ) -> Self {
         Self {
             shutdown_tx: Some(shutdown_tx),
             cmd_tx: Some(cmd_tx),
+            runtime_join_handle: Arc::new(std::sync::Mutex::new(Some(runtime_join_handle))),
         }
     }
 
@@ -104,6 +108,7 @@ impl SwarmRuntimeHandle {
         Self {
             shutdown_tx: None,
             cmd_tx: None,
+            runtime_join_handle: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -112,6 +117,21 @@ impl SwarmRuntimeHandle {
         if let Some(tx) = &self.shutdown_tx {
             tx.send(SwarmControl::Shutdown)
                 .map_err(|err| anyhow::anyhow!("failed to signal swarm shutdown: {}", err))?
+        }
+        Ok(())
+    }
+
+    /// Wait for the swarm runtime task to finish, with timeout.
+    pub async fn wait_for_shutdown(&self, timeout: std::time::Duration) -> Result<()> {
+        let handle = {
+            let mut lock = self.runtime_join_handle.lock().unwrap();
+            lock.take()
+        };
+        if let Some(handle) = handle {
+            tokio::time::timeout(timeout, handle)
+                .await
+                .map_err(|_| anyhow::anyhow!("swarm runtime shutdown timed out"))?
+                .map_err(|e| anyhow::anyhow!("swarm runtime task panicked: {}", e))?;
         }
         Ok(())
     }
@@ -686,7 +706,7 @@ fn launch_swarm_runtime(
 ) -> SwarmRuntimeHandle {
     let (shutdown_signal_tx, mut shutdown_signal_rx) = watch::channel(SwarmControl::Run);
 
-    tokio::spawn(async move {
+    let runtime_handle = tokio::spawn(async move {
         info!("🔄 Swarm runtime task started");
         let mut metrics = SwarmRuntimeMetrics::default();
         let mut peer_book = PeerBook::default();
@@ -713,7 +733,7 @@ fn launch_swarm_runtime(
         info!("✅ Swarm runtime task completed");
     });
 
-    SwarmRuntimeHandle::new(shutdown_signal_tx, cmd_tx)
+    SwarmRuntimeHandle::new(shutdown_signal_tx, cmd_tx, runtime_handle)
 }
 
 /// Commands that can be sent to the swarm runtime

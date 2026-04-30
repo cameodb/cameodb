@@ -67,9 +67,9 @@ const SCHEMA_SAMPLE_LIMIT: usize = 200;
 const SHARD_WRITER_CHANNEL_CAPACITY: usize = 1024;
 
 /// Channel capacity for the orchestrator worker pool job queue.
-/// Double the shard writer capacity to allow buffering of incoming requests
+/// Quadruple the shard writer capacity to allow more buffering of incoming requests
 /// while workers are dispatching to shard writer threads.
-const ORCHESTRATOR_WORKER_QUEUE_CAPACITY: usize = SHARD_WRITER_CHANNEL_CAPACITY * 2;
+const ORCHESTRATOR_WORKER_QUEUE_CAPACITY: usize = SHARD_WRITER_CHANNEL_CAPACITY * 4;
 
 /// Type alias for routing results to reduce complexity
 type RoutingResult = Result<(DocPayload, Option<String>, Option<Uuid>), OrchestratorError>;
@@ -434,10 +434,19 @@ pub struct NodeConfig {
     /// Tantivy indexer memory configuration (per shard)
     pub indexer_memory_min_mb: usize,
     pub indexer_memory_max_mb: usize,
+    /// Total memory limit (in MB) for coordinating per-shard cache sizing
+    pub total_memory_limit_mb: usize,
+    /// Memory pressure threshold used for deriving usable cache capacity
+    pub memory_pressure_threshold_percent: u8,
+    /// Number of threads for the dedicated read (search/stats) runtime
+    pub search_threads: usize,
     /// Enable WAL fsync for durability
     pub wal_sync: bool,
     /// Default batch size for smart commit calculations
     pub default_batch_size: usize,
+    /// Timeout in seconds for writer thread to drain pending commands during shutdown
+    /// Increased from 10s to 30s to handle large coalesced batches
+    pub writer_shutdown_timeout_secs: u64,
 }
 
 impl Default for NodeConfig {
@@ -449,8 +458,12 @@ impl Default for NodeConfig {
             max_shards: 8,
             indexer_memory_min_mb: 16,
             indexer_memory_max_mb: 256,
+            total_memory_limit_mb: 2048,
+            memory_pressure_threshold_percent: 80,
+            search_threads: 8,
             wal_sync: true,
             default_batch_size: 1000,
+            writer_shutdown_timeout_secs: 30,
         }
     }
 }
@@ -1203,6 +1216,8 @@ pub struct MicroshardActor {
     read_pool_handle: Option<tokio::runtime::Handle>,
     /// Total number of shards on this node (for per-shard memory budgeting).
     total_shards: usize,
+    /// Timeout in seconds for writer thread to drain pending commands during shutdown
+    writer_shutdown_timeout_secs: u64,
 }
 
 impl std::fmt::Debug for MicroshardActor {
@@ -1223,6 +1238,7 @@ impl MicroshardActor {
         default_search_limit: usize,
         read_pool_handle: Option<tokio::runtime::Handle>,
         total_shards: usize,
+        writer_shutdown_timeout_secs: u64,
     ) -> Self {
         Self {
             shard_id,
@@ -1234,6 +1250,7 @@ impl MicroshardActor {
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             read_pool_handle,
             total_shards,
+            writer_shutdown_timeout_secs,
         }
     }
 
@@ -1287,14 +1304,14 @@ impl MicroshardActor {
                 info!(shard_id = %writer_shard_id, "Writer thread started (write coalescing enabled)");
 
                 // Reusable buffers to avoid per-iteration allocations
-                let mut pending_cmds: Vec<StorageCommand> = Vec::with_capacity(64);
+                let mut pending_cmds: Vec<StorageCommand> = Vec::with_capacity(256);
 
                 while let Some(first_cmd) = rx.blocking_recv() {
                     // Phase 1: Drain all pending commands from the channel.
                     // The first command blocks until available; subsequent commands
                     // are non-blocking to coalesce as many writes as possible.
-                    // Limit drain to prevent starvation - max 64 additional commands per iteration.
-                    const MAX_DRAIN_PER_ITERATION: usize = 64;
+                    // Limit drain to prevent starvation - max 256 additional commands per iteration.
+                    const MAX_DRAIN_PER_ITERATION: usize = 256;
                     pending_cmds.clear();
                     pending_cmds.push(first_cmd);
                     let mut drained = 0;
@@ -1448,12 +1465,13 @@ impl MicroshardActor {
                                         let segment_new_docs = if idx == total_segments - 1 {
                                             // Last segment gets all remaining to ensure exact total
                                             remaining_new_docs
-                                        } else if total_ops > 0 {
-                                            // Integer division with proper distribution
-                                            let proportional = (new_docs * op_count) / total_ops;
-                                            proportional.min(remaining_new_docs)
                                         } else {
-                                            0
+                                            // Integer division with proper distribution
+                                            let proportional = new_docs
+                                                .checked_mul(op_count)
+                                                .and_then(|product| product.checked_div(total_ops))
+                                                .unwrap_or(0);
+                                            proportional.min(remaining_new_docs)
                                         };
                                         remaining_new_docs = remaining_new_docs.saturating_sub(segment_new_docs);
                                         let _ = reply.send(Ok((segment, segment_new_docs)));
@@ -1557,28 +1575,31 @@ impl MicroshardActor {
     async fn shutdown_writer(&mut self) {
         use tokio::time::{Duration, timeout};
 
-        // Step 1: Drop all supervisor senders so their tasks terminate.
-        // Supervisors hold cloned writer_tx and would otherwise keep running
-        // (and failing to send) after the writer thread exits.
+        // Drop supervisor senders so their tasks terminate (they hold cloned writer_tx)
         {
             let mut supervisors = self.supervisors.write().await;
             let count = supervisors.len();
-            supervisors.clear(); // Dropping senders causes supervisor rx.recv() to return None
+            supervisors.clear();
             if count > 0 {
                 tracing::debug!(shard_id = %self.shard_id, count, "Cleared supervisor tasks before writer shutdown");
             }
         }
 
-        // Step 2: Send Shutdown to writer thread and wait for acknowledgement (with timeout)
+        // Send shutdown signal and wait for writer thread to exit
         if let Some(tx) = self.writer_tx.take() {
             if tx.send(StorageCommand::Shutdown).await.is_ok() {
-                // Wait for the writer thread to acknowledge shutdown (max 10s)
-                match timeout(Duration::from_secs(10), self.shutdown_notify.notified()).await {
+                let timeout_secs = self.writer_shutdown_timeout_secs;
+                match timeout(
+                    Duration::from_secs(timeout_secs),
+                    self.shutdown_notify.notified(),
+                )
+                .await
+                {
                     Ok(()) => {
                         tracing::info!(shard_id = %self.shard_id, "Writer thread shutdown complete")
                     }
                     Err(_) => {
-                        tracing::warn!(shard_id = %self.shard_id, "Writer thread shutdown timed out after 10s")
+                        tracing::warn!(shard_id = %self.shard_id, timeout_secs = timeout_secs, "Writer thread shutdown timed out after {}s", timeout_secs)
                     }
                 }
             } else {
@@ -4038,11 +4059,15 @@ impl NodeOrchestrator {
         info!("Node identity: {} ({})", identity.name, identity.uuid);
 
         // Create dedicated read thread pool for isolated search/stats operations.
-        // Thread count: max(2, cpu_cores / 2) — reserves half the cores for reads.
+        // Use configured search_threads if > 0, otherwise default to max(2, cpu_cores / 2).
         let cpu_cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let read_threads = std::cmp::max(2, cpu_cores / 2);
+        let read_threads = if config.search_threads > 0 {
+            config.search_threads
+        } else {
+            std::cmp::max(2, cpu_cores / 2)
+        };
         let read_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(read_threads)
             .thread_name("cameodb-read")
@@ -4053,6 +4078,7 @@ impl NodeOrchestrator {
 
         info!(
             read_threads = read_threads,
+            search_threads_config = config.search_threads,
             cpu_cores = cpu_cores,
             "Dedicated read thread pool created"
         );
@@ -4246,6 +4272,7 @@ impl NodeOrchestrator {
 
         // Create tasks for all shards — semaphore gates actual execution
         let total_shards = existing_shards.len();
+        let writer_shutdown_timeout_secs = self.config.writer_shutdown_timeout_secs;
         for &shard_id in &existing_shards {
             let shard_path = self.deterministic_shard_directory(shard_id);
             let storage_config = self.create_shard_storage_config(shard_id, shard_path);
@@ -4265,6 +4292,7 @@ impl NodeOrchestrator {
                     default_search_limit,
                     read_handle,
                     total_shards,
+                    writer_shutdown_timeout_secs,
                 );
 
                 match microshard.start().await {
@@ -4485,10 +4513,8 @@ impl NodeOrchestrator {
             indexer_memory_budget: indexer_memory_mb * 1024 * 1024,
             indexer_memory_min_mb: self.config.indexer_memory_min_mb,
             indexer_memory_max_mb: self.config.indexer_memory_max_mb,
-
-            // Cache Configuration
-            redb_read_cache_bytes: 64 * 1024 * 1024, // 64MB default
-            redb_write_cache_bytes: 32 * 1024 * 1024, // 32MB default
+            total_memory_limit_bytes: (self.config.total_memory_limit_mb as u64) * 1024 * 1024,
+            memory_pressure_threshold_percent: self.config.memory_pressure_threshold_percent,
 
             // Other Configuration
             default_batch_size: self.config.default_batch_size,
@@ -4533,6 +4559,7 @@ impl NodeOrchestrator {
             self.default_search_limit,
             read_handle,
             total_shards,
+            self.config.writer_shutdown_timeout_secs,
         );
         microshard.start().await?;
 
@@ -4613,39 +4640,77 @@ impl NodeOrchestrator {
     }
 
     /// Shutdown all shards gracefully, committing pending writes and releasing resources.
-    pub async fn shutdown_all_shards(&self) -> Result<(), OrchestratorError> {
+    ///
+    /// Shutdown sequence per shard (order is critical for data integrity):
+    /// 1. Stop the dedicated writer thread — drains queued commands and completes
+    ///    in-flight writes before returning.
+    /// 2. Take exclusive ownership of the store Arc (no other references remain
+    ///    after the writer thread has exited).
+    /// 3. Call `store.shutdown()` in a blocking task — commits pending tantivy
+    ///    writers and flushes redb WAL.
+    /// 4. Explicitly `drop(store)` inside the blocking task so redb file handles
+    ///    are released deterministically before the task completes.
+    pub async fn shutdown_all_shards(&mut self) -> Result<(), OrchestratorError> {
         tracing::info!("NodeOrchestrator: Shutting down all shards");
 
-        // Stop worker pool first so no new work is queued during shard shutdown.
         self.shutdown_worker_pool().await;
 
         let mut errors = Vec::new();
 
-        for (shard_id, shard) in self.shards.iter() {
-            tracing::debug!(shard_id = %shard_id, "Shutting down shard");
+        // Writer threads must exit before storage shutdown to release IndexWriter locks
+        for (shard_id, shard) in self.shards.iter_mut() {
+            tracing::debug!(shard_id = %shard_id, "Shutting down shard writer thread");
+            shard.shutdown_writer().await;
+        }
 
-            if let Some(store) = shard.store.as_ref() {
-                let store_clone = store.clone();
+        // Parallel storage shutdown with per-shard 30s timeout
+        let mut shard_ids = Vec::new();
+        let mut shutdown_futures = Vec::new();
+        for (shard_id, shard) in self.shards.iter_mut() {
+            if let Some(store) = shard.store.take() {
                 let shard_id_clone = *shard_id;
 
-                // Call shutdown in spawn_blocking since it's a blocking operation
-                match tokio::task::spawn_blocking(move || {
-                    tracing::info!(shard_id = %shard_id_clone, "Calling storage shutdown");
-                    store_clone.shutdown()
-                })
-                .await
-                {
-                    Ok(Ok(())) => {
-                        tracing::debug!(shard_id = %shard_id, "Shard storage shutdown successful");
-                    }
-                    Ok(Err(e)) => {
-                        tracing::error!(shard_id = %shard_id, error = %e, "Shard storage shutdown failed");
-                        errors.push(format!("Shard {} shutdown error: {}", shard_id, e));
-                    }
-                    Err(e) => {
-                        tracing::error!(shard_id = %shard_id, error = %e, "Failed to execute shutdown task");
-                        errors.push(format!("Shard {} task error: {}", shard_id, e));
-                    }
+                let future = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    tokio::task::spawn_blocking(move || {
+                        tracing::info!(shard_id = %shard_id_clone, "Calling storage shutdown");
+                        if let Err(e) = store.shutdown() {
+                            tracing::error!(shard_id = %shard_id_clone, error = %e, "Storage shutdown failed");
+                            return Err(e);
+                        }
+                        // Drop inside blocking task ensures file handles are released deterministically
+                        drop(store);
+                        tracing::debug!(shard_id = %shard_id_clone, "Storage dropped successfully");
+                        Ok(())
+                    }),
+                );
+                shard_ids.push(shard_id_clone);
+                shutdown_futures.push(future);
+            } else {
+                tracing::warn!(shard_id = %shard_id, "Shard store already taken, skipping shutdown");
+            }
+        }
+
+        let results = join_all(shutdown_futures).await;
+        for (shard_id, result) in shard_ids.iter().zip(results.iter()) {
+            match result {
+                Ok(Ok(Ok(()))) => {
+                    tracing::debug!(shard_id = %shard_id, "Shard storage shutdown successful");
+                }
+                Ok(Ok(Err(e))) => {
+                    let msg = format!("Shard {} storage shutdown error: {}", shard_id, e);
+                    tracing::error!(shard_id = %shard_id, error = %e, "{}", msg);
+                    errors.push(msg);
+                }
+                Ok(Err(e)) => {
+                    let msg = format!("Shard {} shutdown task failed: {}", shard_id, e);
+                    tracing::error!(shard_id = %shard_id, error = %e, "{}", msg);
+                    errors.push(msg);
+                }
+                Err(_) => {
+                    let msg = format!("Shard {} storage shutdown timed out after 30s", shard_id);
+                    tracing::error!(shard_id = %shard_id, "{}", msg);
+                    errors.push(msg);
                 }
             }
         }

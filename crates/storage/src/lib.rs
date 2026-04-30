@@ -114,11 +114,11 @@ pub struct StorageConfig {
     /// Maximum memory budget for IndexWriter in MB.
     pub indexer_memory_max_mb: usize,
 
-    // Cache Configuration
-    /// Redb read cache size in bytes (default: 64MB).
-    pub redb_read_cache_bytes: usize,
-    /// Redb write cache size in bytes (default: 32MB).
-    pub redb_write_cache_bytes: usize,
+    /// Total memory limit available to this node (across all shards) in bytes.
+    /// Used to derive per-shard cache sizing without probing the host OS each time.
+    pub total_memory_limit_bytes: u64,
+    /// Percentage of the total memory limit considered safe for cache allocations (0-100).
+    pub memory_pressure_threshold_percent: u8,
 
     // Other Configuration
     /// Default batch size for smart commit calculations.
@@ -305,6 +305,8 @@ fn normalize_date_query(query: &str, schema: &IndexSchema) -> String {
 
 impl Default for StorageConfig {
     fn default() -> Self {
+        const DEFAULT_TOTAL_MEMORY_LIMIT_MB: u64 = 1024;
+        const DEFAULT_MEMORY_PRESSURE_THRESHOLD_PERCENT: u8 = 80;
         Self {
             shard_path: PathBuf::from("/var/tmp/cameodb"),
 
@@ -312,10 +314,8 @@ impl Default for StorageConfig {
             indexer_memory_budget: 64 * 1024 * 1024,
             indexer_memory_min_mb: 32,
             indexer_memory_max_mb: 512,
-
-            // Cache Configuration
-            redb_read_cache_bytes: 64 * 1024 * 1024,  // 64MB
-            redb_write_cache_bytes: 32 * 1024 * 1024, // 32MB
+            total_memory_limit_bytes: DEFAULT_TOTAL_MEMORY_LIMIT_MB * 1024 * 1024,
+            memory_pressure_threshold_percent: DEFAULT_MEMORY_PRESSURE_THRESHOLD_PERCENT,
 
             // Other Configuration
             default_batch_size: 1000,
@@ -333,13 +333,21 @@ impl StorageConfig {
     /// - 501-2000MB index → 128MB (4x min)
     /// - 2001-8000MB index → 256MB (8x min)
     /// - >8000MB index    → 512MB (max)
-    pub fn get_optimal_memory_budget(&self, index_path: &PathBuf) -> usize {
+    ///
+    /// Field-count awareness: Schemas with many indexed fields require more memory
+    /// for segment building (each field has its own postings writer and fast-field writer).
+    /// If field_count is provided, scales budget by 1.25x for >50 fields, 1.5x for >100 fields.
+    pub fn get_optimal_memory_budget(
+        &self,
+        index_path: &PathBuf,
+        field_count: Option<usize>,
+    ) -> usize {
         let min_budget_bytes = self.indexer_memory_min_mb * 1024 * 1024;
         let max_budget_bytes = self.indexer_memory_max_mb * 1024 * 1024;
         let default_budget_bytes = self.indexer_memory_budget;
 
         // Check index size and adjust budget dynamically within configurable range
-        if let Ok(metadata) = std::fs::metadata(index_path) {
+        let size_based_budget = if let Ok(metadata) = std::fs::metadata(index_path) {
             let size_mb = metadata.len() / (1024 * 1024);
             let optimal_budget = match size_mb {
                 0..=100 => min_budget_bytes,         // 32MB - very small
@@ -354,6 +362,21 @@ impl StorageConfig {
         } else {
             // New index, use minimum budget (starting point will scale as data is written)
             min_budget_bytes
+        };
+
+        // Apply field-count scaling if provided
+        if let Some(fc) = field_count {
+            let field_multiplier = if fc > 100 {
+                1.5
+            } else if fc > 50 {
+                1.25
+            } else {
+                1.0
+            };
+            let field_adjusted = (size_based_budget as f64 * field_multiplier) as usize;
+            field_adjusted.min(max_budget_bytes)
+        } else {
+            size_based_budget
         }
     }
 
@@ -364,7 +387,7 @@ impl StorageConfig {
     /// - batch_size > 1000: 1.5x base budget
     /// - otherwise: base budget
     pub fn get_bulk_operation_budget(&self, index_path: &PathBuf, batch_size: usize) -> usize {
-        let base_budget = self.get_optimal_memory_budget(index_path);
+        let base_budget = self.get_optimal_memory_budget(index_path, None);
 
         // Scale budget based on batch size to optimize indexing throughput
         let scaled_budget = match batch_size {
@@ -793,9 +816,7 @@ impl IndexSchema {
                 | TantivyFieldType::F64
                 | TantivyFieldType::Date => {
                     // Numeric and date types should be fast by default for range queries
-                    if !field_def.fast {
-                        field_def.fast = true;
-                    }
+                    field_def.fast = true;
                 }
                 _ => {}
             }
@@ -1329,28 +1350,40 @@ impl HybridStore {
     ///
     /// Memory is divided by max_shards to ensure we don't exceed system limits
     /// when multiple shards are initialized on the same node.
-    fn calculate_cache_sizes(db_file_size_bytes: u64, max_shards: usize) -> (usize, usize) {
+    fn calculate_cache_sizes(
+        config: &StorageConfig,
+        db_file_size_bytes: u64,
+        total_shards: usize,
+    ) -> (usize, usize) {
         use sysinfo::{MemoryRefreshKind, System};
 
-        // Get system memory info
-        let mut system = System::new();
-        system.refresh_memory_specifics(MemoryRefreshKind::everything());
-        let total_memory = system.total_memory();
-        // macOS sometimes reports 0 for available_memory, so use fallback
-        let available_memory = if system.available_memory() > 0 {
-            system.available_memory()
+        const MIN_CACHE_BYTES: u64 = 32 * 1024 * 1024; // 32MB safety floor per shard
+
+        let shard_count = total_shards.max(1) as u64;
+
+        // Use configured total limit when provided, otherwise fall back to host memory stats
+        let (total_memory_bytes, available_memory_bytes) = if config.total_memory_limit_bytes > 0 {
+            let pressure = config.memory_pressure_threshold_percent.clamp(1, 100) as u64;
+            let total = config.total_memory_limit_bytes;
+            let available = total.saturating_mul(pressure) / 100;
+            (total, available.max(MIN_CACHE_BYTES * shard_count))
         } else {
-            // Fallback: use 25% of total as "available working memory"
-            total_memory / 4
+            let mut system = System::new();
+            system.refresh_memory_specifics(MemoryRefreshKind::everything());
+            let total = system.total_memory();
+            let available = if system.available_memory() > 0 {
+                system.available_memory()
+            } else {
+                total / 4
+            };
+            (total, available)
         };
 
-        // Ensure at least 1 shard to avoid division by zero
-        let shard_count = max_shards.max(1);
+        let cache_pool_bytes = (available_memory_bytes / 4).max(MIN_CACHE_BYTES * shard_count);
+        let total_pool_bytes = (total_memory_bytes / 2).max(MIN_CACHE_BYTES * shard_count);
 
-        // Calculate per-shard memory budget (divide available memory by shard count)
-        // Use 25% of available memory as the pool for all redb caches
-        let per_shard_available = (available_memory / 4) / shard_count as u64;
-        let per_shard_total = (total_memory / 2) / shard_count as u64;
+        let per_shard_available = cache_pool_bytes / shard_count;
+        let per_shard_total = total_pool_bytes / shard_count;
 
         // Base standard cache sizes by database tier (before per-shard limits)
         let base_standard_cache = if db_file_size_bytes < 1024 * 1024 {
@@ -1382,23 +1415,20 @@ impl HybridStore {
         let init_cache = if boost_multiplier == 1 {
             standard_cache
         } else {
-            let max_boost = if db_file_size_bytes < 100 * 1024 * 1024 {
-                128usize * 1024 * 1024
-            } else if db_file_size_bytes < 1024 * 1024 * 1024 {
-                512usize * 1024 * 1024
-            } else {
-                2usize * 1024 * 1024 * 1024
-            };
-            let boosted = (base_standard_cache * boost_multiplier).min(max_boost);
+            // Cap init boost at per_shard_available to prevent excessive memory usage
+            // across many shards. Previously used fixed caps (128MB/512MB/2GB) which could
+            // lead to OOM with many large shards.
+            let max_boost = per_shard_available;
+            let boosted = (base_standard_cache * boost_multiplier).min(max_boost as usize);
             (boosted as u64)
-                .min(per_shard_available * 2)
+                .min(per_shard_available)
                 .min(per_shard_total) as usize
         };
 
         tracing::info!(
             file_size_mb = db_file_size_bytes / (1024 * 1024),
-            available_memory_mb = available_memory / (1024 * 1024),
-            total_memory_mb = total_memory / (1024 * 1024),
+            available_memory_mb = available_memory_bytes / (1024 * 1024),
+            total_memory_mb = total_memory_bytes / (1024 * 1024),
             max_shards = shard_count,
             per_shard_available_mb = per_shard_available / (1024 * 1024),
             standard_cache_mb = standard_cache / (1024 * 1024),
@@ -1446,7 +1476,7 @@ impl HybridStore {
 
         // Calculate tiered cache sizes based on file size and shard count
         let (init_cache_size, normal_cache_size) =
-            Self::calculate_cache_sizes(db_file_size, total_shards);
+            Self::calculate_cache_sizes(&config, db_file_size, total_shards);
 
         let kv = if db_file_exists {
             // EXISTING DATABASE: Two-phase open for fast recovery
@@ -1544,15 +1574,27 @@ impl HybridStore {
             let index = entry.key();
             let writer_arc = entry.value();
             if indices_with_pending_ops.contains(index) {
-                match writer_arc.try_lock() {
-                    Ok(mut writer) => {
-                        tracing::debug!(index = %index, "Committing index during shutdown");
-                        if let Err(e) = writer.commit() {
-                            tracing::warn!(index = %index, error = %e, "Failed to commit index during shutdown");
+                // Retry with 5s timeout to handle slow writer thread lock release
+                let writer = {
+                    let start = std::time::Instant::now();
+                    let timeout = std::time::Duration::from_secs(5);
+                    loop {
+                        match writer_arc.try_lock() {
+                            Ok(guard) => break Some(guard),
+                            Err(_) if start.elapsed() < timeout => {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            Err(_) => {
+                                tracing::error!(index = %index, "Writer lock timeout during shutdown, skipping commit — data may be lost");
+                                break None;
+                            }
                         }
                     }
-                    Err(_) => {
-                        tracing::warn!(index = %index, "Writer lock busy during shutdown, skipping commit");
+                };
+                if let Some(mut w) = writer {
+                    tracing::debug!(index = %index, "Committing index during shutdown");
+                    if let Err(e) = w.commit() {
+                        tracing::warn!(index = %index, error = %e, "Failed to commit index during shutdown");
                     }
                 }
             } else {
@@ -1567,8 +1609,8 @@ impl HybridStore {
         self.current_seq.clear();
         self.index_size_cache.lock().unwrap().clear();
 
-        // Force a final redb fsync/flush using an empty Immediate-durability transaction
-        // This reduces WAL replay on next startup and ensures the current root is persisted.
+        // Force a final redb fsync/flush to reduce WAL replay on startup
+        let redb_start = std::time::Instant::now();
         match self.kv.begin_write() {
             Ok(mut txn) => {
                 if let Err(e) = txn.set_durability(Durability::Immediate) {
@@ -1580,6 +1622,12 @@ impl HybridStore {
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to open shutdown flush transaction");
             }
+        }
+        let redb_elapsed = redb_start.elapsed();
+        if redb_elapsed > std::time::Duration::from_secs(10) {
+            tracing::warn!(elapsed = ?redb_elapsed, "Redb shutdown flush exceeded 10s");
+        } else {
+            tracing::debug!(elapsed = ?redb_elapsed, "Redb shutdown flush completed");
         }
 
         tracing::info!("HybridStore: Graceful shutdown completed");
@@ -2229,14 +2277,18 @@ impl HybridStore {
 
         let open_elapsed = open_start.elapsed();
 
-        // Create writer with dynamic memory budget based on index size
+        // Create writer with dynamic memory budget based on index size and field count
         let writer_start = Instant::now();
-        let optimal_budget = self.config.get_optimal_memory_budget(&index_path);
+        let field_count = Some(fields.indexed_fields.len());
+        let optimal_budget = self
+            .config
+            .get_optimal_memory_budget(&index_path, field_count);
 
         // Cache the budget
         self.budget_cache.insert(index.to_string(), optimal_budget);
 
         let mut writer = tantivy_index.writer(optimal_budget)?;
+
         let writer_elapsed = writer_start.elapsed();
 
         // WAL Recovery: Check if there are any operations in the WAL that need to be replayed
@@ -2333,7 +2385,7 @@ impl HybridStore {
         } else {
             // Fallback: calculate and cache
             let index_path = self.config.shard_path.join("indices").join(index);
-            let b = self.config.get_optimal_memory_budget(&index_path);
+            let b = self.config.get_optimal_memory_budget(&index_path, None);
             self.budget_cache.insert(index.to_string(), b);
             b
         };
@@ -2444,7 +2496,7 @@ impl HybridStore {
 
             // Refresh budget cache after commit since index size likely changed
             let index_path = self.config.shard_path.join("indices").join(index);
-            let new_budget = self.config.get_optimal_memory_budget(&index_path);
+            let new_budget = self.config.get_optimal_memory_budget(&index_path, None);
             self.budget_cache.insert(index.to_string(), new_budget);
         }
 
@@ -4432,10 +4484,8 @@ mod tests {
             indexer_memory_budget: 32 * 1024 * 1024,
             indexer_memory_min_mb: 16,
             indexer_memory_max_mb: 256,
-
-            // Cache Configuration
-            redb_read_cache_bytes: 64 * 1024 * 1024,
-            redb_write_cache_bytes: 32 * 1024 * 1024,
+            total_memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+            memory_pressure_threshold_percent: 80,
 
             // Other Configuration
             default_batch_size: 1000,

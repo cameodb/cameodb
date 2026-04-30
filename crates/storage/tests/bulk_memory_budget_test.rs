@@ -12,10 +12,8 @@ fn test_bulk_memory_budget_scaling() {
         indexer_memory_budget: 64 * 1024 * 1024,
         indexer_memory_min_mb: 32,
         indexer_memory_max_mb: 512,
-
-        // Cache Configuration
-        redb_read_cache_bytes: 64 * 1024 * 1024,
-        redb_write_cache_bytes: 32 * 1024 * 1024,
+        total_memory_limit_bytes: 4 * 1024 * 1024 * 1024, // 4GB budget for tests
+        memory_pressure_threshold_percent: 80,
 
         // Other Configuration
         default_batch_size: 1000,
@@ -83,10 +81,8 @@ fn test_optimal_memory_budget_by_index_size() {
         indexer_memory_budget: 64 * 1024 * 1024,
         indexer_memory_min_mb: 32,
         indexer_memory_max_mb: 512,
-
-        // Cache Configuration
-        redb_read_cache_bytes: 64 * 1024 * 1024,
-        redb_write_cache_bytes: 32 * 1024 * 1024,
+        total_memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+        memory_pressure_threshold_percent: 80,
 
         // Other Configuration
         default_batch_size: 1000,
@@ -95,7 +91,7 @@ fn test_optimal_memory_budget_by_index_size() {
 
     // Test with non-existent index (should return min budget)
     let non_existent = temp_dir.path().join("non_existent");
-    let budget_new = config.get_optimal_memory_budget(&non_existent);
+    let budget_new = config.get_optimal_memory_budget(&non_existent, None);
     let min_budget = config.indexer_memory_min_mb * 1024 * 1024;
     assert_eq!(
         budget_new, min_budget,
@@ -105,7 +101,7 @@ fn test_optimal_memory_budget_by_index_size() {
     // Test with small index (create a small file)
     let small_index = temp_dir.path().join("small_index");
     std::fs::write(&small_index, vec![0u8; 50 * 1024 * 1024]).expect("Failed to create small file");
-    let budget_small = config.get_optimal_memory_budget(&small_index);
+    let budget_small = config.get_optimal_memory_budget(&small_index, None);
     assert_eq!(
         budget_small, min_budget,
         "Small index (<100MB) should use minimum budget"
@@ -115,7 +111,7 @@ fn test_optimal_memory_budget_by_index_size() {
     let medium_index = temp_dir.path().join("medium_index");
     std::fs::write(&medium_index, vec![0u8; 300 * 1024 * 1024])
         .expect("Failed to create medium file");
-    let budget_medium = config.get_optimal_memory_budget(&medium_index);
+    let budget_medium = config.get_optimal_memory_budget(&medium_index, None);
     let default_budget = config.indexer_memory_budget;
     assert_eq!(
         budget_medium, default_budget,

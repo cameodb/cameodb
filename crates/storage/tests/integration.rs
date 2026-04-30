@@ -13,10 +13,8 @@ fn test_storage_engine_basics() {
         indexer_memory_budget: 32 * 1024 * 1024, // 32MB per index
         indexer_memory_min_mb: 16,               // 16MB minimum
         indexer_memory_max_mb: 256,              // 256MB maximum
-
-        // Cache Configuration
-        redb_read_cache_bytes: 64 * 1024 * 1024,
-        redb_write_cache_bytes: 32 * 1024 * 1024,
+        total_memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+        memory_pressure_threshold_percent: 80,
 
         // Other Configuration
         default_batch_size: 1000, // 1000 operations default
@@ -108,13 +106,11 @@ fn test_storage_configuration() {
         shard_path: temp_dir.path().to_path_buf(),
 
         // Memory Budget Configuration
-        indexer_memory_budget: 64 * 1024 * 1024,
-        indexer_memory_min_mb: 32,
-        indexer_memory_max_mb: 512,
-
-        // Cache Configuration
-        redb_read_cache_bytes: 64 * 1024 * 1024,
-        redb_write_cache_bytes: 32 * 1024 * 1024,
+        indexer_memory_budget: 32 * 1024 * 1024, // 32MB per index
+        indexer_memory_min_mb: 16,
+        indexer_memory_max_mb: 256,
+        total_memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+        memory_pressure_threshold_percent: 80,
 
         // Other Configuration
         default_batch_size: 500,

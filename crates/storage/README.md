@@ -382,9 +382,11 @@ use std::path::PathBuf;
 // Configure storage with performance optimizations
 let config = StorageConfig {
     shard_path: PathBuf::from("./data/shard1"),
-    indexer_memory_budget: 64 * 1024 * 1024, // 64MB default (increased from 32MB)
-    indexer_memory_min_mb: 32,               // 32MB minimum (increased from 16MB)
-    indexer_memory_max_mb: 512,              // 512MB maximum (increased from 256MB)
+    indexer_memory_budget: 64 * 1024 * 1024, // 64MB default
+    indexer_memory_min_mb: 64,               // 64MB minimum
+    indexer_memory_max_mb: 512,              // 512MB maximum
+    total_memory_limit_bytes: 2048 * 1024 * 1024, // 2GB total memory budget
+    memory_pressure_threshold_percent: 80,   // Use 80% of configured limit for cache
     default_batch_size: 1000,                // Supervised Smart Commits threshold
     wal_sync: true,                          // Maximum durability
 };
@@ -521,8 +523,10 @@ use std::path::PathBuf;
 let high_perf_config = StorageConfig {
     shard_path: PathBuf::from("/fast-ssd/shard1"),
     indexer_memory_budget: 64 * 1024 * 1024, // 64MB default
-    indexer_memory_min_mb: 32,               // 32MB minimum (increased from 16MB)
-    indexer_memory_max_mb: 512,              // 512MB maximum (increased from 256MB)
+    indexer_memory_min_mb: 64,               // 64MB minimum
+    indexer_memory_max_mb: 512,              // 512MB maximum
+    total_memory_limit_bytes: 8192 * 1024 * 1024, // 8GB total memory budget
+    memory_pressure_threshold_percent: 90,   // Aggressive memory usage
     default_batch_size: 2000,                // Higher commit threshold
     wal_sync: false,                         // Skip fsync for speed
 };
@@ -531,8 +535,10 @@ let high_perf_config = StorageConfig {
 let high_durability_config = StorageConfig {
     shard_path: PathBuf::from("/redundant-storage/shard1"),
     indexer_memory_budget: 32 * 1024 * 1024, // 32MB default
-    indexer_memory_min_mb: 32,               // 32MB minimum (increased from 16MB)
+    indexer_memory_min_mb: 64,               // 64MB minimum
     indexer_memory_max_mb: 128,              // 128MB maximum
+    total_memory_limit_bytes: 1024 * 1024 * 1024, // 1GB total memory budget
+    memory_pressure_threshold_percent: 80,
     default_batch_size: 500,                 // Lower commit threshold
     wal_sync: true,                          // Always fsync
 };
@@ -540,9 +546,11 @@ let high_durability_config = StorageConfig {
 // Memory-constrained configuration
 let low_memory_config = StorageConfig {
     shard_path: PathBuf::from("./shard1"),
-    indexer_memory_budget: 32 * 1024 * 1024, // 32MB default (increased from 16MB)
-    indexer_memory_min_mb: 32,               // 32MB minimum (increased from 8MB)
-    indexer_memory_max_mb: 64,               // 64MB maximum (increased from 32MB)
+    indexer_memory_budget: 32 * 1024 * 1024, // 32MB default
+    indexer_memory_min_mb: 16,               // 16MB absolute floor (validation enforces >= 16)
+    indexer_memory_max_mb: 64,               // 64MB maximum
+    total_memory_limit_bytes: 512 * 1024 * 1024, // 512MB total memory budget
+    memory_pressure_threshold_percent: 80,
     default_batch_size: 250,                 // Very low commit threshold
     wal_sync: true,
 };
@@ -637,7 +645,7 @@ Commit → Supervisor self-cleanup
 
 ```toml
 [search]
-indexer_memory_min_mb = 32      # Minimum memory budget
+indexer_memory_min_mb = 64      # Minimum memory budget
 indexer_memory_max_mb = 512     # Maximum memory budget  
 default_batch_size = 1000       # Base smart commit threshold
 # Supervisor timeout is fixed at 5 seconds (configurable in future versions)
@@ -677,20 +685,21 @@ For existing databases, redb is initialized in two phases:
 
 ### Database Size Tiers
 
-| Database Size | Tier  | Standard Cache | Init Boost Cache | Multiplier |
-|---------------|-------|----------------|------------------|------------|
-| < 1MB         | New   | 32MB           | 32MB             | 1×         |
-| < 100MB       | Small | 64MB           | 128MB            | 2×         |
-| 100MB - 1GB   | Medium| 128MB          | 512MB            | 4×         |
-| > 1GB         | Large | 256MB          | 2GB              | 8×         |
+| Database Size | Tier  | Standard Cache | Init Boost Cache    | Multiplier |
+|---------------|-------|----------------|---------------------|------------|
+| < 1MB         | New   | 32MB           | 32MB                | 1×         |
+| < 100MB       | Small | 64MB           | 128MB               | 2×         |
+| 100MB - 1GB   | Medium| 128MB          | 512MB               | 4×         |
+| > 1GB         | Large | 256MB          | per_shard_available | 8×         |
 
 ### Per-Shard Memory Budgeting
 
 When multiple shards run on a single node, memory is automatically divided to prevent overallocation:
 
-- **Available Memory Pool**: 25% of system available memory
+- **Configured Limit**: Uses `total_memory_limit_bytes` when configured (> 0), otherwise falls back to system memory stats
+- **Available Memory Pool**: 25% of the configured/ detected available memory
 - **Per-Shard Budget**: Divided equally among all active shards
-- **Safety Caps**: Standard cache capped at 12.5% available, init cache at 25%
+- **Safety Caps**: Standard cache capped at 12.5% available, init boost capped at `per_shard_available` (prevents OOM with many large shards)
 - **Cross-Platform**: Uses system memory detection with macOS fallback (25% of total if unavailable)
 
 ### Example Log Output

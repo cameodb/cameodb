@@ -127,8 +127,12 @@ async fn main() -> Result<()> {
         max_shards: cameodb_config.storage.max_shards_per_node,
         indexer_memory_min_mb: cameodb_config.search.indexer_memory_min_mb,
         indexer_memory_max_mb: cameodb_config.search.indexer_memory_max_mb,
+        total_memory_limit_mb: cameodb_config.search.total_memory_limit_mb,
+        memory_pressure_threshold_percent: cameodb_config.search.memory_pressure_threshold_percent,
+        search_threads: cameodb_config.search.search_threads,
         wal_sync: cameodb_config.storage.wal_sync,
         default_batch_size: cameodb_config.storage.default_batch_size,
+        writer_shutdown_timeout_secs: 30, // Increased from 10s to handle large coalesced batches
     };
 
     // Create the NodeOrchestrator actor

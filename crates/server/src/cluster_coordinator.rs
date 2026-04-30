@@ -1375,8 +1375,17 @@ impl Message<ShutdownSwarm> for ClusterCoordinator {
         if let Some(handle) = self.cluster.swarm_handle() {
             if let Err(err) = handle.shutdown() {
                 warn!(error = %err, "ClusterCoordinator: shutdown signal failed");
+                return;
+            }
+            info!("ClusterCoordinator: swarm shutdown signaled");
+
+            if let Err(err) = handle
+                .wait_for_shutdown(std::time::Duration::from_secs(10))
+                .await
+            {
+                warn!(error = %err, "ClusterCoordinator: swarm runtime shutdown timed out");
             } else {
-                info!("ClusterCoordinator: swarm shutdown signaled");
+                info!("ClusterCoordinator: swarm runtime shutdown complete");
             }
         }
     }

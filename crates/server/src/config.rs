@@ -18,7 +18,7 @@
 //!   search:
 //!     indexer_memory_min_mb: 16
 //!     indexer_memory_max_mb: 256
-//!     total_memory_limit_mb: 1024
+//!     total_memory_limit_mb: 2048
 //!     pressure_threshold: 0.8
 //! ```
 
@@ -255,7 +255,7 @@ pub struct SearchConfig {
     #[serde(default = "default_indexer_memory_max_mb")]
     pub indexer_memory_max_mb: usize,
 
-    /// Total memory limit in MB (default: 1024)
+    /// Total memory limit in MB (default: 2048)
     #[serde(default = "default_total_memory_limit_mb")]
     pub total_memory_limit_mb: usize,
 
@@ -618,9 +618,9 @@ impl CameoDbConfig {
         }
 
         // Validate memory configuration
-        if self.search.indexer_memory_min_mb < 32 {
+        if self.search.indexer_memory_min_mb < 16 {
             return Err(ConfigError::MemoryConfig {
-                message: "Indexer memory minimum cannot be less than 32MB".to_string(),
+                message: "Indexer memory minimum cannot be less than 16MB".to_string(),
             }
             .into());
         }
@@ -810,13 +810,13 @@ fn default_max_shards_per_node() -> usize {
 }
 
 fn default_indexer_memory_min_mb() -> usize {
-    32
+    64
 }
 fn default_indexer_memory_max_mb() -> usize {
     512
 }
 fn default_total_memory_limit_mb() -> usize {
-    1024
+    2048
 }
 fn default_memory_pressure_threshold_percent() -> u8 {
     80
@@ -901,7 +901,7 @@ mod tests {
         let config = CameoDbConfig::default();
         assert_eq!(config.network.http.port, 9480);
         assert_eq!(config.network.http.bind_address, "0.0.0.0");
-        assert_eq!(config.search.indexer_memory_min_mb, 32);
+        assert_eq!(config.search.indexer_memory_min_mb, 64);
         assert_eq!(config.search.indexer_memory_max_mb, 512);
         assert_eq!(config.storage.default_batch_size, 1000);
         assert_eq!(config.max_record_size_mb, 512);
@@ -917,10 +917,15 @@ mod tests {
         config.search.indexer_memory_max_mb = 512;
         assert!(config.validate().is_err());
 
-        // Test memory too small
-        config.search.indexer_memory_min_mb = 16; // Below current min of 32
+        // Test memory too small (below new floor of 16)
+        config.search.indexer_memory_min_mb = 8;
         config.search.indexer_memory_max_mb = 512;
         assert!(config.validate().is_err());
+
+        // Test memory at new floor (should be valid)
+        config.search.indexer_memory_min_mb = 16;
+        config.search.indexer_memory_max_mb = 512;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -941,7 +946,7 @@ mod tests {
     fn test_sample_config_generation() {
         let sample = CameoDbConfig::generate_sample_config().unwrap();
         assert!(sample.contains("port = 9480"));
-        assert!(sample.contains("indexer_memory_min_mb = 32"));
+        assert!(sample.contains("indexer_memory_min_mb = 64"));
         assert!(sample.contains("default_batch_size = 1000"));
         assert!(sample.contains("max_record_size_mb = 512"));
         assert!(sample.contains("data_paths"));
