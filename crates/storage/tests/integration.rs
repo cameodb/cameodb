@@ -16,6 +16,10 @@ fn test_storage_engine_basics() {
         total_memory_limit_bytes: 4 * 1024 * 1024 * 1024,
         memory_pressure_threshold_percent: 80,
 
+        // Thread Configuration
+        indexer_num_threads: 1,
+        merge_num_threads: 2,
+
         // Other Configuration
         default_batch_size: 1000, // 1000 operations default
         wal_sync: true,
@@ -111,6 +115,10 @@ fn test_storage_configuration() {
         indexer_memory_max_mb: 256,
         total_memory_limit_bytes: 4 * 1024 * 1024 * 1024,
         memory_pressure_threshold_percent: 80,
+
+        // Thread Configuration
+        indexer_num_threads: 1,
+        merge_num_threads: 2,
 
         // Other Configuration
         default_batch_size: 500,

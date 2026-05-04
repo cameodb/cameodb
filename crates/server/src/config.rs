@@ -294,6 +294,17 @@ pub struct SearchConfig {
     /// Number of documents per micro-batch when ingesting NDJSON write streams (default: 500)
     #[serde(default = "default_stream_batch_size")]
     pub stream_batch_size: usize,
+
+    /// Number of indexing worker threads per tantivy IndexWriter (default: 1).
+    /// Each worker creates one segment per commit.
+    #[serde(default = "default_indexer_num_threads")]
+    pub indexer_num_threads: usize,
+
+    /// Number of background merge (compaction) threads per IndexWriter (default: 1).
+    /// Tantivy default is 4, but on memory-constrained nodes with many indices
+    /// this causes mmap storms. Scale up on nodes with ample RAM.
+    #[serde(default = "default_merge_num_threads")]
+    pub merge_num_threads: usize,
 }
 
 impl CameoDbConfig {
@@ -727,6 +738,8 @@ impl Default for SearchConfig {
             default_search_limit: default_search_limit(),
             supervisor_timeout_secs: default_supervisor_timeout_secs(),
             stream_batch_size: default_stream_batch_size(),
+            indexer_num_threads: default_indexer_num_threads(),
+            merge_num_threads: default_merge_num_threads(),
         }
     }
 }
@@ -828,6 +841,12 @@ fn default_search_limit() -> usize {
     10
 }
 
+fn default_indexer_num_threads() -> usize {
+    1
+}
+fn default_merge_num_threads() -> usize {
+    2
+}
 fn default_supervisor_timeout_secs() -> u64 {
     5
 }

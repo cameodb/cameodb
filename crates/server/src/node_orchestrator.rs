@@ -444,6 +444,10 @@ pub struct NodeConfig {
     pub wal_sync: bool,
     /// Default batch size for smart commit calculations
     pub default_batch_size: usize,
+    /// Number of indexing worker threads per tantivy IndexWriter (default: 1)
+    pub indexer_num_threads: usize,
+    /// Number of background merge (compaction) threads per IndexWriter (default: 1)
+    pub merge_num_threads: usize,
     /// Timeout in seconds for writer thread to drain pending commands during shutdown
     /// Increased from 10s to 30s to handle large coalesced batches
     pub writer_shutdown_timeout_secs: u64,
@@ -463,6 +467,8 @@ impl Default for NodeConfig {
             search_threads: 8,
             wal_sync: true,
             default_batch_size: 1000,
+            indexer_num_threads: 1,
+            merge_num_threads: 2,
             writer_shutdown_timeout_secs: 30,
         }
     }
@@ -4515,6 +4521,10 @@ impl NodeOrchestrator {
             indexer_memory_max_mb: self.config.indexer_memory_max_mb,
             total_memory_limit_bytes: (self.config.total_memory_limit_mb as u64) * 1024 * 1024,
             memory_pressure_threshold_percent: self.config.memory_pressure_threshold_percent,
+
+            // Thread Configuration
+            indexer_num_threads: self.config.indexer_num_threads,
+            merge_num_threads: self.config.merge_num_threads,
 
             // Other Configuration
             default_batch_size: self.config.default_batch_size,

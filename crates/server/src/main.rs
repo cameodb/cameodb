@@ -132,7 +132,9 @@ async fn main() -> Result<()> {
         search_threads: cameodb_config.search.search_threads,
         wal_sync: cameodb_config.storage.wal_sync,
         default_batch_size: cameodb_config.storage.default_batch_size,
-        writer_shutdown_timeout_secs: 30, // Increased from 10s to handle large coalesced batches
+        indexer_num_threads: cameodb_config.search.indexer_num_threads,
+        merge_num_threads: cameodb_config.search.merge_num_threads,
+        writer_shutdown_timeout_secs: 30,
     };
 
     // Create the NodeOrchestrator actor

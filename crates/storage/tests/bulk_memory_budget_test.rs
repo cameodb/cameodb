@@ -15,6 +15,10 @@ fn test_bulk_memory_budget_scaling() {
         total_memory_limit_bytes: 4 * 1024 * 1024 * 1024, // 4GB budget for tests
         memory_pressure_threshold_percent: 80,
 
+        // Thread Configuration
+        indexer_num_threads: 1,
+        merge_num_threads: 2,
+
         // Other Configuration
         default_batch_size: 1000,
         wal_sync: true,
@@ -83,6 +87,10 @@ fn test_optimal_memory_budget_by_index_size() {
         indexer_memory_max_mb: 512,
         total_memory_limit_bytes: 4 * 1024 * 1024 * 1024,
         memory_pressure_threshold_percent: 80,
+
+        // Thread Configuration
+        indexer_num_threads: 1,
+        merge_num_threads: 2,
 
         // Other Configuration
         default_batch_size: 1000,

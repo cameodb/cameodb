@@ -120,6 +120,17 @@ pub struct StorageConfig {
     /// Percentage of the total memory limit considered safe for cache allocations (0-100).
     pub memory_pressure_threshold_percent: u8,
 
+    // Thread Configuration
+    /// Number of indexing worker threads per tantivy IndexWriter.
+    /// Each worker creates one segment per commit. Default: 1 (optimal for
+    /// CameoDB's single-writer-thread-per-shard architecture).
+    pub indexer_num_threads: usize,
+    /// Number of background merge (compaction) threads per tantivy IndexWriter.
+    /// Controls how many segment merges run concurrently. Tantivy default is 4,
+    /// but on memory-constrained nodes with many indices this causes mmap storms.
+    /// Default: 1. Scale up on nodes with ample RAM and high write throughput.
+    pub merge_num_threads: usize,
+
     // Other Configuration
     /// Default batch size for smart commit calculations.
     pub default_batch_size: usize,
@@ -316,6 +327,10 @@ impl Default for StorageConfig {
             indexer_memory_max_mb: 512,
             total_memory_limit_bytes: DEFAULT_TOTAL_MEMORY_LIMIT_MB * 1024 * 1024,
             memory_pressure_threshold_percent: DEFAULT_MEMORY_PRESSURE_THRESHOLD_PERCENT,
+
+            // Thread Configuration
+            indexer_num_threads: 1,
+            merge_num_threads: 2,
 
             // Other Configuration
             default_batch_size: 1000,
@@ -2287,7 +2302,24 @@ impl HybridStore {
         // Cache the budget
         self.budget_cache.insert(index.to_string(), optimal_budget);
 
-        let mut writer = tantivy_index.writer(optimal_budget)?;
+        let num_worker_threads = self.config.indexer_num_threads.max(1);
+        let num_merge_threads = self.config.merge_num_threads.max(1);
+        let memory_per_thread = optimal_budget / num_worker_threads;
+
+        let writer_options = tantivy::indexer::IndexWriterOptions::builder()
+            .num_worker_threads(num_worker_threads)
+            .memory_budget_per_thread(memory_per_thread)
+            .num_merge_threads(num_merge_threads)
+            .build();
+        let mut writer = tantivy_index.writer_with_options(writer_options)?;
+
+        tracing::info!(
+            index = %index,
+            worker_threads = num_worker_threads,
+            merge_threads = num_merge_threads,
+            budget_mb = optimal_budget / (1024 * 1024),
+            "IndexWriter created with explicit thread configuration"
+        );
 
         let writer_elapsed = writer_start.elapsed();
 
@@ -2485,7 +2517,10 @@ impl HybridStore {
         }
 
         if let Some(writer_arc) = self.writers.get(index) {
-            let mut writer = writer_arc.value().lock().unwrap();
+            let mut writer = writer_arc.value().lock().unwrap_or_else(|poisoned| {
+                tracing::error!(index = %index, "Writer mutex was poisoned during commit, recovering");
+                poisoned.into_inner()
+            });
             writer.commit()?;
             self.reset_operations_counter(index);
 
@@ -2550,30 +2585,6 @@ impl HybridStore {
         }
         write_txn.commit()?;
 
-        Ok(())
-    }
-
-    /// Refresh writer cache for an index to handle lock contention
-    /// This removes and recreates the writer to ensure clean state
-    pub fn refresh_writer(&self, index: &str) -> Result<(), StoreError> {
-        tracing::debug!(index = %index, "Refreshing writer cache to resolve lock contention");
-
-        // Remove existing writer from cache
-        self.writers.remove(index);
-
-        // Force garbage collection to ensure locks are released
-        {
-            let index_path = self.config.shard_path.join("indices").join(index);
-            if let Ok(tantivy_index) = tantivy::Index::open_in_dir(&index_path) {
-                // This will help ensure any lingering locks are released
-                drop(tantivy_index);
-            }
-        }
-
-        // Minimal delay to ensure writer cache cleanup completes
-        std::thread::sleep(std::time::Duration::from_micros(100));
-
-        // Recreate the writer (will be done lazily on next access)
         Ok(())
     }
 
@@ -2839,7 +2850,10 @@ impl HybridStore {
                         }
                     }
 
-                    let writer = writer_arc.lock().unwrap();
+                    let writer = writer_arc.lock().unwrap_or_else(|poisoned| {
+                        tracing::error!(index = %index, "Writer mutex was poisoned, recovering");
+                        poisoned.into_inner()
+                    });
 
                     // Optimized Tantivy operations: delete only if document was updated
                     if !is_new_document {
@@ -2856,7 +2870,10 @@ impl HybridStore {
 
                     // Delete from tantivy index
                     let term = tantivy::Term::from_field_text(fields.id, &id);
-                    let writer = writer_arc.lock().unwrap();
+                    let writer = writer_arc.lock().unwrap_or_else(|poisoned| {
+                        tracing::error!(index = %index, "Writer mutex was poisoned, recovering");
+                        poisoned.into_inner()
+                    });
                     writer.delete_term(term);
                 }
             }
@@ -3919,38 +3936,10 @@ impl HybridStore {
 
         // Apply all tantivy operations with optimized selective deletes
         {
-            // Try to acquire writer lock, with retry logic for lock contention
-            let writer = {
-                let mut attempts = 0;
-                let max_attempts = 3;
-                loop {
-                    match writer_arc.try_lock() {
-                        Ok(w) => break w,
-                        Err(_) if attempts < max_attempts => {
-                            // Attempt to refresh writer cache and retry
-                            if attempts == 0 {
-                                tracing::warn!(index = %index, "Writer lock contention detected, refreshing writer cache");
-                            } else {
-                                tracing::debug!(index = %index, attempt = attempts + 1, "Retrying writer lock acquisition");
-                            }
-
-                            self.refresh_writer(index)?;
-                            attempts += 1;
-
-                            // Small delay to allow other threads to release locks
-                            std::thread::sleep(std::time::Duration::from_millis(1 << attempts));
-                            continue;
-                        }
-                        Err(_) => {
-                            // Still failed after all retries
-                            return Err(StoreError::Serialization(format!(
-                                "Failed to acquire writer lock after {} attempts",
-                                max_attempts + 1
-                            )));
-                        }
-                    }
-                }
-            };
+            let writer = writer_arc.lock().unwrap_or_else(|poisoned| {
+                tracing::error!(index = %index, "Writer mutex was poisoned, recovering");
+                poisoned.into_inner()
+            });
 
             // Step 1: Delete only updated documents (selective optimization)
             if !updated_document_ids.is_empty() {
@@ -4482,10 +4471,14 @@ mod tests {
 
             // Memory Budget Configuration
             indexer_memory_budget: 32 * 1024 * 1024,
-            indexer_memory_min_mb: 16,
-            indexer_memory_max_mb: 256,
-            total_memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+            indexer_memory_min_mb: 32,
+            indexer_memory_max_mb: 512,
+            total_memory_limit_bytes: 2048 * 1024 * 1024,
             memory_pressure_threshold_percent: 80,
+
+            // Thread Configuration
+            indexer_num_threads: 1,
+            merge_num_threads: 2,
 
             // Other Configuration
             default_batch_size: 1000,
