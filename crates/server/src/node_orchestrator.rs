@@ -1208,21 +1208,21 @@ struct IndexStats {
 pub struct MicroshardActor {
     shard_id: Uuid,
     store: Option<Arc<HybridStore>>,
-    /// Channel sender for dispatching write commands to the dedicated writer thread.
+    /// Channel sender for dispatching write commands to the writer thread.
     writer_tx: Option<mpsc::Sender<StorageCommand>>,
+    /// Writer thread handle for forceful termination on shutdown timeout.
+    writer_thread_handle: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
     storage_config: StorageConfig,
-    /// Default search limit for this shard
     default_search_limit: usize,
-    /// Track active supervision tasks per index
+    /// Active supervision tasks per index (idle-timeout commits).
     supervisors: Arc<AsyncRwLock<HashMap<String, mpsc::Sender<()>>>>,
-    /// Notified when the writer thread has fully stopped.
+    /// Notified when writer thread has stopped.
     shutdown_notify: Arc<tokio::sync::Notify>,
-    /// Dedicated read thread pool handle for isolated search/stats operations.
-    /// Separates read I/O from the writer thread and tokio's generic blocking pool.
+    /// Read thread pool handle for isolated search/stats operations.
     read_pool_handle: Option<tokio::runtime::Handle>,
-    /// Total number of shards on this node (for per-shard memory budgeting).
+    /// Total shards on this node (for per-shard memory budgeting).
     total_shards: usize,
-    /// Timeout in seconds for writer thread to drain pending commands during shutdown
+    /// Writer thread shutdown timeout in seconds.
     writer_shutdown_timeout_secs: u64,
 }
 
@@ -1250,6 +1250,7 @@ impl MicroshardActor {
             shard_id,
             store: None,
             writer_tx: None,
+            writer_thread_handle: Arc::new(std::sync::Mutex::new(None)),
             storage_config,
             default_search_limit,
             supervisors: Arc::new(AsyncRwLock::new(HashMap::new())),
@@ -1304,7 +1305,7 @@ impl MicroshardActor {
         let shutdown = self.shutdown_notify.clone();
         let writer_shard_id = self.shard_id;
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("writer-shard-{}", writer_shard_id))
             .spawn(move || {
                 info!(shard_id = %writer_shard_id, "Writer thread started (write coalescing enabled)");
@@ -1517,6 +1518,9 @@ impl MicroshardActor {
             })
             .map_err(OrchestratorError::Io)?;
 
+        // Store the thread handle for forceful termination if needed during shutdown
+        *self.writer_thread_handle.lock().unwrap() = Some(handle);
+
         info!(shard_id = %self.shard_id, "MicroshardActor initialized with dedicated writer thread");
         Ok(())
     }
@@ -1561,6 +1565,13 @@ impl MicroshardActor {
         index: String,
         ops: Vec<WalOp>,
     ) -> Result<(Vec<u64>, usize), OrchestratorError> {
+        let index_for_log = index.clone();
+        tracing::debug!(
+            shard_id = %self.shard_id,
+            index = %index_for_log,
+            ops_count = ops.len(),
+            "MicroshardActor: Sending batch write to writer thread"
+        );
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_write_command(StorageCommand::BatchWrite {
             index,
@@ -1568,30 +1579,41 @@ impl MicroshardActor {
             reply: reply_tx,
         })
         .await?;
-        reply_rx
+        tracing::debug!(
+            shard_id = %self.shard_id,
+            index = %index_for_log,
+            "MicroshardActor: Waiting for writer thread reply"
+        );
+        let result = reply_rx
             .await
             .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer dropped reply")))?
-            .map_err(OrchestratorError::Storage)
+            .map_err(OrchestratorError::Storage)?;
+        tracing::debug!(
+            shard_id = %self.shard_id,
+            index = %index_for_log,
+            seq_count = result.0.len(),
+            "MicroshardActor: Batch write completed successfully"
+        );
+        Ok(result)
     }
 
-    /// Gracefully stop the dedicated writer thread.
-    /// First drains all supervisor tasks (they hold cloned writer_tx senders),
-    /// then sends `Shutdown` command and waits for the thread to finish.
-    /// Includes timeout to prevent indefinite hangs if writer thread panics.
+    /// Gracefully stop the writer thread with timeout.
+    /// Clears supervisors, sends shutdown command, and waits for completion.
+    /// If timeout expires, abandons the thread (OS cleanup on process exit).
     async fn shutdown_writer(&mut self) {
         use tokio::time::{Duration, timeout};
 
-        // Drop supervisor senders so their tasks terminate (they hold cloned writer_tx)
+        // Clear supervisors (they hold cloned writer_tx)
         {
             let mut supervisors = self.supervisors.write().await;
             let count = supervisors.len();
             supervisors.clear();
             if count > 0 {
-                tracing::debug!(shard_id = %self.shard_id, count, "Cleared supervisor tasks before writer shutdown");
+                tracing::debug!(shard_id = %self.shard_id, count, "Cleared supervisor tasks");
             }
         }
 
-        // Send shutdown signal and wait for writer thread to exit
+        // Send shutdown signal and wait for thread exit
         if let Some(tx) = self.writer_tx.take() {
             if tx.send(StorageCommand::Shutdown).await.is_ok() {
                 let timeout_secs = self.writer_shutdown_timeout_secs;
@@ -1602,10 +1624,23 @@ impl MicroshardActor {
                 .await
                 {
                     Ok(()) => {
-                        tracing::info!(shard_id = %self.shard_id, "Writer thread shutdown complete")
+                        tracing::info!(shard_id = %self.shard_id, "Writer thread shutdown complete");
+                        // Join thread cleanly
+                        if let Some(handle) = self.writer_thread_handle.lock().unwrap().take()
+                            && let Err(e) = handle.join()
+                        {
+                            tracing::warn!(shard_id = %self.shard_id, error = ?e, "Writer thread panicked");
+                        }
                     }
                     Err(_) => {
-                        tracing::warn!(shard_id = %self.shard_id, timeout_secs = timeout_secs, "Writer thread shutdown timed out after {}s", timeout_secs)
+                        tracing::error!(
+                            shard_id = %self.shard_id,
+                            timeout_secs = timeout_secs,
+                            "Writer thread shutdown timed out after {}s - abandoning",
+                            timeout_secs
+                        );
+                        // Abandon thread - OS will clean up on process exit
+                        *self.writer_thread_handle.lock().unwrap() = None;
                     }
                 }
             } else {

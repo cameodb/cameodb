@@ -1649,6 +1649,24 @@ impl HybridStore {
         Ok(())
     }
 
+    /// Forcefully remove a writer from cache, even if locked.
+    /// Last-resort operation for stuck writers. WARNING: May cause data loss.
+    /// Returns true if writer was removed, false if not found.
+    pub fn force_remove_writer(&self, index: &str) -> bool {
+        if let Some((_, writer_arc)) = self.writers.remove(index) {
+            if writer_arc.try_lock().is_ok() {
+                tracing::warn!(index = %index, "Force-removing writer (lock available)");
+            } else {
+                tracing::error!(index = %index, "Force-removing LOCKED writer - data loss possible");
+            }
+            drop(writer_arc);
+            true
+        } else {
+            tracing::debug!(index = %index, "No writer to force-remove");
+            false
+        }
+    }
+
     /// Get the highest indexed sequence number using FAST field ordering.
     /// Leverages columnar FAST field storage for O(1) access instead of O(n) scanning.
     fn get_highest_indexed_seq(&self, reader: &IndexReader) -> Result<u64, StoreError> {
@@ -2343,13 +2361,20 @@ impl HybridStore {
                 index
             );
 
-            // Commit immediately to persist the recovery with proper meta.json update
-            // This ensures all segments created during recovery are properly tracked
-            writer.commit()?;
-
+            // CRITICAL FIX: Do NOT commit immediately after recovery.
+            // The blocking commit() call can take a very long time (segment merging, fsync, etc.)
+            // which blocks the writer thread and causes HTTP requests to timeout.
+            // Instead, rely on the normal commit flow:
+            //   1. Operations are already in Tantivy's in-memory buffer
+            //   2. The next normal commit (via maybe_commit_writer) will persist them
+            //   3. If the process crashes before that commit, WAL recovery will replay again
+            // This is safe because:
+            //   - WAL entries are still present until after the next commit
+            //   - The sequence counter is set to max(max_wal_seq, last_committed_seq)
+            //   - Recovery is idempotent - replaying again is safe
             tracing::info!(
                 index = %index,
-                "Recovery commit completed - {} operations now stable",
+                "Recovery complete - {} operations in Tantivy buffer, will persist on next commit",
                 replayed_count
             );
         }
@@ -2517,11 +2542,19 @@ impl HybridStore {
         }
 
         if let Some(writer_arc) = self.writers.get(index) {
-            let mut writer = writer_arc.value().lock().unwrap_or_else(|poisoned| {
-                tracing::error!(index = %index, "Writer mutex was poisoned during commit, recovering");
-                poisoned.into_inner()
-            });
-            writer.commit()?;
+            // CRITICAL: Minimize lock hold time to prevent deadlocks
+            // The writer lock must be dropped IMMEDIATELY after commit
+            {
+                let mut writer = writer_arc.value().lock().unwrap_or_else(|poisoned| {
+                    tracing::error!(index = %index, "Writer mutex was poisoned during commit, recovering");
+                    poisoned.into_inner()
+                });
+                writer.commit()?;
+                // Explicit drop to release lock before any other operations
+                drop(writer);
+            }
+
+            // All post-commit operations happen WITHOUT holding the writer lock
             self.reset_operations_counter(index);
 
             tracing::debug!(index = %index, ops_committed = ops_pending, "commit_index: committed");

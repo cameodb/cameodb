@@ -45,6 +45,10 @@ const MCP_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 /// Maximum time to wait for coordinator swarm shutdown.
 const COORDINATOR_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 
+/// Emergency shutdown timeout: forces process exit if total shutdown exceeds this time.
+/// Prevents indefinite hangs from stuck resources.
+const EMERGENCY_SHUTDOWN_TIMEOUT_SECS: u64 = 120;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Handle CLI arguments for configuration utilities and client mode
@@ -498,7 +502,14 @@ async fn main() -> Result<()> {
     }
     println!("Shutting down gracefully (press Ctrl+C again to force)...");
 
-    // Phase 1: Shutdown MCP sessions (non-critical, timeout after 5s)
+    // Start emergency shutdown timer
+    let shutdown_start = std::time::Instant::now();
+    tracing::info!(
+        "Starting graceful shutdown (emergency timeout: {}s)",
+        EMERGENCY_SHUTDOWN_TIMEOUT_SECS
+    );
+
+    // Phase 1: Shutdown MCP sessions (timeout: 5s)
     tracing::info!(
         "Phase 1/4: Closing MCP sessions (timeout: {}s)...",
         MCP_SHUTDOWN_TIMEOUT_SECS
@@ -516,7 +527,13 @@ async fn main() -> Result<()> {
         ),
     }
 
-    // Phase 2: Signal HTTP server to drain (with timeout)
+    // Emergency timeout check
+    if shutdown_start.elapsed() > Duration::from_secs(EMERGENCY_SHUTDOWN_TIMEOUT_SECS) {
+        tracing::error!("EMERGENCY: Shutdown timeout exceeded after Phase 1 - forcing exit");
+        std::process::exit(1);
+    }
+
+    // Phase 2: Drain HTTP server (timeout: 10s)
     tracing::info!(
         "Phase 2/4: Draining HTTP connections (timeout: {}s)...",
         HTTP_DRAIN_TIMEOUT_SECS
@@ -531,7 +548,13 @@ async fn main() -> Result<()> {
         ),
     }
 
-    // Phase 3: Shutdown all shards (critical, longer timeout)
+    // Emergency timeout check
+    if shutdown_start.elapsed() > Duration::from_secs(EMERGENCY_SHUTDOWN_TIMEOUT_SECS) {
+        tracing::error!("EMERGENCY: Shutdown timeout exceeded after Phase 2 - forcing exit");
+        std::process::exit(1);
+    }
+
+    // Phase 3: Shutdown all shards (timeout: 60s)
     tracing::info!(
         "Phase 3/4: Shutting down all shards (timeout: {}s)...",
         SHARD_SHUTDOWN_TIMEOUT_SECS
@@ -545,12 +568,18 @@ async fn main() -> Result<()> {
         Ok(Ok(())) => tracing::info!("All shards shut down successfully"),
         Ok(Err(e)) => tracing::error!(error = %e, "Shard shutdown failed"),
         Err(_) => tracing::error!(
-            "Shard shutdown timed out after {}s - some data may not be persisted!",
+            "Shard shutdown timed out after {}s - data may not be persisted!",
             SHARD_SHUTDOWN_TIMEOUT_SECS
         ),
     }
 
-    // Phase 4: Shutdown coordinator swarm (non-critical)
+    // Emergency timeout check
+    if shutdown_start.elapsed() > Duration::from_secs(EMERGENCY_SHUTDOWN_TIMEOUT_SECS) {
+        tracing::error!("EMERGENCY: Shutdown timeout exceeded after Phase 3 - forcing exit");
+        std::process::exit(1);
+    }
+
+    // Phase 4: Shutdown coordinator (timeout: 10s)
     tracing::info!(
         "Phase 4/4: Shutting down coordinator (timeout: {}s)...",
         COORDINATOR_SHUTDOWN_TIMEOUT_SECS
@@ -569,6 +598,21 @@ async fn main() -> Result<()> {
         ),
     }
 
-    tracing::info!("Shutdown complete - process exiting");
+    // Final emergency timeout check
+    let shutdown_elapsed = shutdown_start.elapsed();
+    if shutdown_elapsed > Duration::from_secs(EMERGENCY_SHUTDOWN_TIMEOUT_SECS) {
+        tracing::error!(
+            elapsed_secs = shutdown_elapsed.as_secs(),
+            timeout_secs = EMERGENCY_SHUTDOWN_TIMEOUT_SECS,
+            "EMERGENCY: Shutdown exceeded {}s - forcing exit",
+            EMERGENCY_SHUTDOWN_TIMEOUT_SECS
+        );
+        std::process::exit(1);
+    }
+
+    tracing::info!(
+        elapsed_secs = shutdown_elapsed.as_secs(),
+        "Shutdown complete - process exiting cleanly"
+    );
     Ok(())
 }
