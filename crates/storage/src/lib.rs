@@ -76,9 +76,6 @@ enum SearchResult {
 
 const TANTIVY_DATA_FILE_EXTENSIONS: &[&str] = &["store", "fast", "idx", "doc", "pos", "term"];
 
-/// Number of records to sample for size estimation in large tables
-const TABLE_SIZE_SAMPLE_COUNT: u64 = 200;
-
 /// Tantivy DateTime safe range limits (to avoid i64 overflow during nanosecond conversion)
 /// DateTime::from_timestamp_secs() multiplies by 1_000_000_000, so safe range is:
 /// i64::MIN / 1_000_000_000 to i64::MAX / 1_000_000_000
@@ -1323,12 +1320,19 @@ pub struct SchemaFields {
 }
 
 /// Unified cache entry for index sizes (both Tantivy directory and Redb table) with timestamp
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct IndexSizeCache {
     tantivy_bytes: u64,
     redb_bytes: u64,
     document_count: u64,
     timestamp: Instant,
+}
+
+/// Result of batch index size measurement
+struct IndexSizes {
+    tantivy_bytes: u64,
+    redb_bytes: u64,
+    document_count: u64,
 }
 
 /// Multi-tenant hybrid storage engine combining redb and tantivy.
@@ -4039,10 +4043,27 @@ impl HybridStore {
         Ok((seq_ids, new_documents_count))
     }
 
+    /// Get adaptive sample count based on table size.
+    /// Larger tables get more samples for better statistical accuracy,
+    /// while maintaining O(1) fixed cost (not O(N)).
+    fn get_adaptive_sample_count(table_count: u64) -> u64 {
+        match table_count {
+            0..=200 => table_count,       // Exact for tiny tables
+            201..=10_000 => 200,          // 200 samples for small tables
+            10_001..=100_000 => 500,      // 500 samples for medium tables
+            100_001..=1_000_000 => 1_000, // 1K samples for large tables
+            _ => 2_000,                   // 2K samples for huge tables (millions)
+        }
+    }
+
     /// Calculate table size using Hybrid Exact/Sampling Estimation algorithm
     ///
-    /// For small tables (≤TABLE_SIZE_SAMPLE_COUNT records): Exact calculation by iterating all records
-    /// For large tables (>TABLE_SIZE_SAMPLE_COUNT records): Sample TABLE_SIZE_SAMPLE_COUNT records to estimate average size
+    /// Uses adaptive sampling: larger tables get more samples for better accuracy.
+    /// - Tiny tables (≤200): Exact calculation by iterating all records
+    /// - Small tables (≤10K): 200 samples
+    /// - Medium tables (≤100K): 500 samples
+    /// - Large tables (≤1M): 1,000 samples
+    /// - Huge tables (>1M): 2,000 samples
     ///
     /// Returns (raw_size, is_estimated) where raw_size is the calculated/estimated size
     /// and is_estimated indicates whether sampling was used
@@ -4051,8 +4072,9 @@ impl HybridStore {
         table: &redb::ReadOnlyTable<&str, &[u8]>,
     ) -> Result<(u64, bool), StoreError> {
         let count = table.len()?;
+        let sample_count = Self::get_adaptive_sample_count(count);
 
-        if count <= TABLE_SIZE_SAMPLE_COUNT {
+        if count <= sample_count {
             // Exact calculation for small tables
             let mut total_size = 0u64;
             for result in table.iter()? {
@@ -4061,28 +4083,40 @@ impl HybridStore {
             }
             Ok((total_size, false))
         } else {
-            // Sample records for large tables
+            // Sample-based estimation for large tables
             let mut sample_size = 0u64;
-            let mut sample_count = 0u64;
+            let mut actual_samples = 0u64;
 
-            for result in table.iter()?.take(TABLE_SIZE_SAMPLE_COUNT as usize) {
+            for result in table.iter()?.take(sample_count as usize) {
                 let (key, value): (redb::AccessGuard<&str>, redb::AccessGuard<&[u8]>) = result?;
                 sample_size += key.value().len() as u64 + value.value().len() as u64;
-                sample_count += 1;
+                actual_samples += 1;
             }
 
-            let average_row_size = if sample_count > 0 {
-                sample_size as f64 / sample_count as f64
+            let average_row_size = if actual_samples > 0 {
+                sample_size as f64 / actual_samples as f64
             } else {
                 0.0
             };
 
             let estimated_raw_size = (average_row_size * count as f64) as u64;
+
+            tracing::trace!(
+                table_count = count,
+                sample_count = actual_samples,
+                avg_row_size = average_row_size as u64,
+                estimated_size = estimated_raw_size,
+                "Adaptive sampling used for table size estimation"
+            );
+
             Ok((estimated_raw_size, true))
         }
     }
 
     /// Gather per-index statistics and timing information for this shard.
+    ///
+    /// PERFORMANCE: This function now uses batch measurement to avoid N² complexity.
+    /// All indexes are measured once in a single pass, reusing a single transaction.
     pub fn gather_index_stats(
         &self,
         include_data_size: bool,
@@ -4110,29 +4144,29 @@ impl HybridStore {
             }
         }
 
-        // Step 1: Get Physical Baseline (for future correction factor implementation)
-        let _kv_path = self.config.shard_path.join("store.redb");
+        // Batch measure all indexes once (eliminates N² pattern)
+        let all_sizes =
+            self.batch_measure_all_indexes(&index_names, &read_txn, include_data_size)?;
 
-        // Step 2: Iterate & Classify Tables
+        // Build result from batch measurements
         for index_name in &index_names {
-            let (tantivy_bytes, redb_bytes, document_count) =
-                self.get_index_sizes_cached(index_name, include_data_size, &index_names)?;
+            if let Some(sizes) = all_sizes.get(index_name) {
+                // Check if Tantivy index directory exists (not just if it has size)
+                // This ensures empty indexes (after schema creation) are counted
+                let index_path = self.config.shard_path.join("indices").join(index_name);
+                let tantivy_index_exists = index_path.join("meta.json").exists();
 
-            // Check if Tantivy index directory exists (not just if it has size)
-            // This ensures empty indexes (after schema creation) are counted
-            let index_path = self.config.shard_path.join("indices").join(index_name);
-            let tantivy_index_exists = index_path.join("meta.json").exists();
-
-            per_index.insert(
-                index_name.clone(),
-                IndexShardStats {
-                    document_count,
-                    redb_bytes,
-                    tantivy_bytes,
-                    tantivy_index_exists,
-                    tantivy_scan_ms: 0,
-                },
-            );
+                per_index.insert(
+                    index_name.clone(),
+                    IndexShardStats {
+                        document_count: sizes.document_count,
+                        redb_bytes: sizes.redb_bytes,
+                        tantivy_bytes: sizes.tantivy_bytes,
+                        tantivy_index_exists,
+                        tantivy_scan_ms: 0,
+                    },
+                );
+            }
         }
         let redb_duration = redb_phase_start.elapsed();
         drop(read_txn);
@@ -4246,124 +4280,6 @@ impl HybridStore {
         Ok(0)
     }
 
-    /// Get index size statistics, optionally including the corrected redb measurement.
-    fn get_index_sizes_cached(
-        &self,
-        index_name: &str,
-        include_redb: bool,
-        all_index_names: &HashSet<String>,
-    ) -> Result<(u64, u64, u64), StoreError> {
-        let cache_suffix = if include_redb { "full" } else { "fast" };
-        let cache_key = format!(
-            "{}:{}:{}",
-            self.config.shard_path.display(),
-            cache_suffix,
-            index_name
-        );
-
-        {
-            let cache = self.index_size_cache.lock().unwrap();
-            if let Some(entry) = cache.get(&cache_key)
-                && entry.timestamp.elapsed() < self.index_cache_expiry
-            {
-                return Ok((entry.tantivy_bytes, entry.redb_bytes, entry.document_count));
-            }
-        }
-
-        let tantivy_bytes = self.measure_tantivy_bytes(index_name)?;
-
-        if !include_redb {
-            let document_count = self.get_document_count_only(index_name)?;
-            let mut cache = self.index_size_cache.lock().unwrap();
-            cache.insert(
-                cache_key,
-                IndexSizeCache {
-                    tantivy_bytes,
-                    redb_bytes: 0,
-                    document_count,
-                    timestamp: Instant::now(),
-                },
-            );
-            return Ok((tantivy_bytes, 0, document_count));
-        }
-
-        let mut per_index_stats = Vec::with_capacity(all_index_names.len());
-        let mut total_raw_redb_size = 0u64;
-
-        for idx_name in all_index_names {
-            let idx_tantivy_bytes = if idx_name == index_name {
-                tantivy_bytes
-            } else {
-                self.measure_tantivy_bytes(idx_name)?
-            };
-
-            let (doc_count, raw_redb_bytes) = self.measure_redb_stats(idx_name)?;
-            per_index_stats.push((
-                idx_name.clone(),
-                idx_tantivy_bytes,
-                doc_count,
-                raw_redb_bytes,
-            ));
-            total_raw_redb_size = total_raw_redb_size.saturating_add(raw_redb_bytes);
-        }
-
-        let physical_db_size = match std::fs::metadata(self.config.shard_path.join("store.redb")) {
-            Ok(metadata) => metadata.len(),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to get database file size, using raw estimation"
-                );
-                total_raw_redb_size
-            }
-        };
-
-        let correction_factor = if total_raw_redb_size > 0 {
-            physical_db_size as f64 / total_raw_redb_size as f64
-        } else {
-            1.0
-        };
-
-        let mut target_redb_bytes = 0u64;
-        let mut target_document_count = 0u64;
-
-        {
-            let mut cache = self.index_size_cache.lock().unwrap();
-            for (idx_name, idx_tantivy_bytes, doc_count, raw_redb_bytes) in per_index_stats {
-                let corrected_redb_bytes = (raw_redb_bytes as f64 * correction_factor) as u64;
-
-                let full_key = format!("{}:full:{}", self.config.shard_path.display(), idx_name);
-                cache.insert(
-                    full_key,
-                    IndexSizeCache {
-                        tantivy_bytes: idx_tantivy_bytes,
-                        redb_bytes: corrected_redb_bytes,
-                        document_count: doc_count,
-                        timestamp: Instant::now(),
-                    },
-                );
-
-                let fast_key = format!("{}:fast:{}", self.config.shard_path.display(), idx_name);
-                cache.insert(
-                    fast_key,
-                    IndexSizeCache {
-                        tantivy_bytes: idx_tantivy_bytes,
-                        redb_bytes: 0,
-                        document_count: doc_count,
-                        timestamp: Instant::now(),
-                    },
-                );
-
-                if idx_name == index_name {
-                    target_redb_bytes = corrected_redb_bytes;
-                    target_document_count = doc_count;
-                }
-            }
-        }
-
-        Ok((tantivy_bytes, target_redb_bytes, target_document_count))
-    }
-
     fn measure_tantivy_bytes(&self, index_name: &str) -> Result<u64, StoreError> {
         let index_dir = self.config.shard_path.join("indices").join(index_name);
         if !index_dir.exists() {
@@ -4387,22 +4303,13 @@ impl HybridStore {
         Ok(total_size)
     }
 
-    fn get_document_count_only(&self, index_name: &str) -> Result<u64, StoreError> {
-        let read_txn = self.kv.begin_read()?;
-        let data_table_name = format!("data_{}", index_name);
-        let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
-
-        let count = match read_txn.open_table(data_table_def) {
-            Ok(data_table) => data_table.len().unwrap_or(0),
-            Err(_) => 0,
-        };
-        drop(read_txn);
-
-        Ok(count)
-    }
-
-    fn measure_redb_stats(&self, index_name: &str) -> Result<(u64, u64), StoreError> {
-        let read_txn = self.kv.begin_read()?;
+    /// Measure redb stats using an existing transaction (avoids opening new transaction).
+    /// This is more efficient when measuring multiple indexes.
+    fn measure_redb_stats_with_txn(
+        &self,
+        index_name: &str,
+        read_txn: &redb::ReadTransaction,
+    ) -> Result<(u64, u64), StoreError> {
         let data_table_name = format!("data_{}", index_name);
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
 
@@ -4414,9 +4321,178 @@ impl HybridStore {
             }
             Err(_) => (0, 0),
         };
-        drop(read_txn);
 
         Ok((doc_count, raw_bytes))
+    }
+
+    /// Get document count from Tantivy index (O(1) operation).
+    /// This is faster than querying redb when we don't need size calculation.
+    fn get_document_count_from_tantivy(&self, index_name: &str) -> Result<u64, StoreError> {
+        // Try to get reader from cache first
+        if let Some(reader) = self.readers.get(index_name) {
+            let searcher = reader.searcher();
+            return Ok(searcher.num_docs());
+        }
+
+        // If reader not cached, try to create index (which will cache the reader)
+        match self.get_or_create_index(index_name) {
+            Ok(_) => {
+                // Now reader should be cached, try again
+                if let Some(reader) = self.readers.get(index_name) {
+                    let searcher = reader.searcher();
+                    Ok(searcher.num_docs())
+                } else {
+                    Ok(0) // Shouldn't happen, but handle gracefully
+                }
+            }
+            Err(_) => Ok(0), // Index doesn't exist or not yet created
+        }
+    }
+
+    /// Batch measure all indexes in a single pass with shared transaction.
+    /// This eliminates the N² complexity of the old approach where get_index_sizes_cached
+    /// was called once per index, and each call measured ALL indexes.
+    ///
+    /// Returns a HashMap of index_name -> IndexSizes for all indexes.
+    fn batch_measure_all_indexes(
+        &self,
+        index_names: &HashSet<String>,
+        read_txn: &redb::ReadTransaction,
+        include_data_size: bool,
+    ) -> Result<HashMap<String, IndexSizes>, StoreError> {
+        let mut results = HashMap::new();
+
+        // Check cache first for all indexes
+        let cache_suffix = if include_data_size { "full" } else { "fast" };
+        let cache_key_prefix = format!("{}:{}:", self.config.shard_path.display(), cache_suffix);
+
+        {
+            let cache = self.index_size_cache.lock().unwrap();
+            for index_name in index_names {
+                let cache_key = format!("{}{}", cache_key_prefix, index_name);
+                if let Some(entry) = cache.get(&cache_key)
+                    && entry.timestamp.elapsed() < self.index_cache_expiry
+                {
+                    results.insert(
+                        index_name.clone(),
+                        IndexSizes {
+                            tantivy_bytes: entry.tantivy_bytes,
+                            redb_bytes: entry.redb_bytes,
+                            document_count: entry.document_count,
+                        },
+                    );
+                }
+            }
+        }
+
+        // If all cached, return early
+        if results.len() == index_names.len() {
+            tracing::debug!(
+                cached_count = results.len(),
+                "All index sizes retrieved from cache"
+            );
+            return Ok(results);
+        }
+
+        // Measure uncached indexes
+        let mut per_index_stats = Vec::new();
+        let mut total_raw_redb_size = 0u64;
+
+        for idx_name in index_names {
+            if results.contains_key(idx_name) {
+                continue; // Skip cached
+            }
+
+            let tantivy_bytes = self.measure_tantivy_bytes(idx_name)?;
+
+            let (doc_count, raw_redb_bytes) = if include_data_size {
+                // When calculating data size, get count from redb for consistency
+                self.measure_redb_stats_with_txn(idx_name, read_txn)?
+            } else {
+                // When skipping data size, use Tantivy count (faster, no redb access)
+                let doc_count = self.get_document_count_from_tantivy(idx_name)?;
+                (doc_count, 0)
+            };
+
+            per_index_stats.push((idx_name.clone(), tantivy_bytes, doc_count, raw_redb_bytes));
+            total_raw_redb_size = total_raw_redb_size.saturating_add(raw_redb_bytes);
+        }
+
+        tracing::debug!(
+            uncached_count = per_index_stats.len(),
+            cached_count = results.len(),
+            "Measured uncached indexes"
+        );
+
+        // Calculate correction factor (only when include_data_size is true)
+        let correction_factor = if include_data_size && total_raw_redb_size > 0 {
+            let physical_db_size =
+                match std::fs::metadata(self.config.shard_path.join("store.redb")) {
+                    Ok(metadata) => metadata.len(),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to get database file size, using raw estimation"
+                        );
+                        total_raw_redb_size
+                    }
+                };
+            physical_db_size as f64 / total_raw_redb_size as f64
+        } else {
+            1.0
+        };
+
+        // Cache and build results for uncached indexes
+        // OPTIMIZATION: Populate BOTH fast and full cache entries to enable cache sharing
+        {
+            let mut cache = self.index_size_cache.lock().unwrap();
+            let shard_path = self.config.shard_path.display().to_string();
+
+            for (idx_name, tantivy_bytes, doc_count, raw_redb_bytes) in per_index_stats {
+                let corrected_redb_bytes = if include_data_size {
+                    (raw_redb_bytes as f64 * correction_factor) as u64
+                } else {
+                    0
+                };
+
+                // Always cache the "fast" entry (tantivy bytes + doc count, no redb size)
+                let fast_key = format!("{}:fast:{}", shard_path, idx_name);
+                cache.insert(
+                    fast_key,
+                    IndexSizeCache {
+                        tantivy_bytes,
+                        redb_bytes: 0,
+                        document_count: doc_count,
+                        timestamp: Instant::now(),
+                    },
+                );
+
+                // When we have redb data, also cache the "full" entry
+                if include_data_size {
+                    let full_key = format!("{}:full:{}", shard_path, idx_name);
+                    cache.insert(
+                        full_key,
+                        IndexSizeCache {
+                            tantivy_bytes,
+                            redb_bytes: corrected_redb_bytes,
+                            document_count: doc_count,
+                            timestamp: Instant::now(),
+                        },
+                    );
+                }
+
+                results.insert(
+                    idx_name.clone(),
+                    IndexSizes {
+                        tantivy_bytes,
+                        redb_bytes: corrected_redb_bytes,
+                        document_count: doc_count,
+                    },
+                );
+            }
+        }
+
+        Ok(results)
     }
 
     fn is_tantivy_data_file(path: &std::path::Path) -> bool {
