@@ -4388,6 +4388,7 @@ impl HybridStore {
         // If all cached, return early
         if results.len() == index_names.len() {
             tracing::debug!(
+                shard = %self.config.shard_path.display(),
                 cached_count = results.len(),
                 "All index sizes retrieved from cache"
             );
@@ -4419,6 +4420,7 @@ impl HybridStore {
         }
 
         tracing::debug!(
+            shard = %self.config.shard_path.display(),
             uncached_count = per_index_stats.len(),
             cached_count = results.len(),
             "Measured uncached indexes"
