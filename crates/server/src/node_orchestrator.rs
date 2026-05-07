@@ -2676,7 +2676,7 @@ impl RouterActor {
                     "errors": errors
                 }))
             }
-            ClientOp::ListClusterIndexes { .. } => {
+            ClientOp::ListClusterIndexes { include_data_size } => {
                 // Merge index statistics from all nodes
                 let mut index_map: HashMap<String, IndexStats> = HashMap::new();
                 let mut node_details: Vec<JsonValue> = Vec::new();
@@ -2807,15 +2807,21 @@ impl RouterActor {
                             "document_count".to_string(),
                             serde_json::json!(stats.document_count),
                         );
-                        json_obj.insert(
-                            "total_size_bytes".to_string(),
-                            serde_json::json!(stats.total_size_bytes),
-                        );
+
+                        // Only include size fields when data size is requested
+                        if *include_data_size {
+                            json_obj.insert(
+                                "total_size_bytes".to_string(),
+                                serde_json::json!(stats.total_size_bytes),
+                            );
+                        }
+
                         json_obj.insert(
                             "index_size_mb".to_string(),
                             serde_json::json!(stats.index_size_mb),
                         );
-                        if stats.data_size_mb > 0 {
+
+                        if *include_data_size {
                             json_obj.insert(
                                 "data_size_mb".to_string(),
                                 serde_json::json!(stats.data_size_mb),
@@ -4500,9 +4506,57 @@ impl NodeOrchestrator {
                     elapsed_ms = warmup_elapsed.as_millis(),
                     "Background reader warmup completed for all shards"
                 );
+
+                // After reader warmup, trigger cache warmup by calling gather_index_stats with include_data_size=true
+                // This populates both "fast" and "full" cache entries for all indexes on all shards
+                info!("Starting background cache warmup for index statistics");
+                let cache_warmup_start = std::time::Instant::now();
+                let mut cache_warmup_tasks = Vec::new();
+
+                for (shard_id, store_opt) in &shards_for_warmup {
+                    if let Some(store) = store_opt {
+                        let sc = Arc::clone(store);
+                        let sid = *shard_id;
+
+                        let task = tokio::task::spawn_blocking(move || {
+                            let result = sc.gather_index_stats(true);
+                            (sid, result)
+                        });
+                        cache_warmup_tasks.push(task);
+                    }
+                }
+
+                let mut cache_success = 0;
+                let mut cache_fail = 0;
+                for task in cache_warmup_tasks {
+                    match task.await {
+                        Ok((shard_id, Ok(_))) => {
+                            debug!(shard_id = %shard_id, "Cache warmup succeeded");
+                            cache_success += 1;
+                        }
+                        Ok((shard_id, Err(e))) => {
+                            warn!(shard_id = %shard_id, error = %e, "Cache warmup failed");
+                            cache_fail += 1;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Cache warmup task panicked");
+                            cache_fail += 1;
+                        }
+                    }
+                }
+
+                let cache_warmup_elapsed = cache_warmup_start.elapsed();
+                info!(
+                    success = cache_success,
+                    failed = cache_fail,
+                    elapsed_ms = cache_warmup_elapsed.as_millis(),
+                    "Background cache warmup completed for all shards"
+                );
             });
 
-            info!("Reader warmup spawned in background, node is ready to serve requests");
+            info!(
+                "Reader warmup and cache warmup spawned in background, node is ready to serve requests"
+            );
         }
 
         Ok(())

@@ -404,7 +404,7 @@ impl McpBackend for AppState {
             let listing = state
                 .router
                 .handle_client_op(ClientOp::ListIndexes {
-                    include_data_size: true,
+                    include_data_size: false,
                 })
                 .await
                 .map_err(|err| err.to_string())?;
@@ -437,7 +437,7 @@ impl McpBackend for AppState {
             let listing = state
                 .router
                 .handle_client_op(ClientOp::ListIndexes {
-                    include_data_size: true,
+                    include_data_size: false,
                 })
                 .await
                 .map_err(|err| err.to_string())?;

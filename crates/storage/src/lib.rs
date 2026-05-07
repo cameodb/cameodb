@@ -1357,7 +1357,7 @@ pub struct HybridStore {
     fields_cache: Arc<DashMap<String, SchemaFields>>,
     /// Unified cache for index sizes (Tantivy + Redb) with expiration to avoid repeated expensive calculations
     index_size_cache: Arc<Mutex<HashMap<String, IndexSizeCache>>>,
-    /// Cache expiration duration for index sizes (10 minutes)
+    /// Cache expiration duration for index sizes (1 hour)
     index_cache_expiry: Duration,
     /// Storage configuration
     config: StorageConfig,
@@ -1561,7 +1561,7 @@ impl HybridStore {
             schema_cache: Arc::new(DashMap::new()),
             fields_cache: Arc::new(DashMap::new()),
             index_size_cache: Arc::new(Mutex::new(HashMap::new())),
-            index_cache_expiry: Duration::from_secs(600), // 10 minutes
+            index_cache_expiry: Duration::from_secs(3600), // 1 hour
             config: config.clone(),
         })
     }
@@ -4048,11 +4048,11 @@ impl HybridStore {
     /// while maintaining O(1) fixed cost (not O(N)).
     fn get_adaptive_sample_count(table_count: u64) -> u64 {
         match table_count {
-            0..=200 => table_count,       // Exact for tiny tables
-            201..=10_000 => 200,          // 200 samples for small tables
-            10_001..=100_000 => 500,      // 500 samples for medium tables
-            100_001..=1_000_000 => 1_000, // 1K samples for large tables
-            _ => 2_000,                   // 2K samples for huge tables (millions)
+            0..=200 => table_count,     // Exact for tiny tables
+            201..=10_000 => 200,        // 200 samples for small tables
+            10_001..=100_000 => 300,    // 300 samples for medium tables
+            100_001..=1_000_000 => 400, // 400 samples for large tables
+            _ => 500,                   // 500 samples for huge tables (millions+)
         }
     }
 
@@ -4061,9 +4061,9 @@ impl HybridStore {
     /// Uses adaptive sampling: larger tables get more samples for better accuracy.
     /// - Tiny tables (≤200): Exact calculation by iterating all records
     /// - Small tables (≤10K): 200 samples
-    /// - Medium tables (≤100K): 500 samples
-    /// - Large tables (≤1M): 1,000 samples
-    /// - Huge tables (>1M): 2,000 samples
+    /// - Medium tables (≤100K): 300 samples
+    /// - Large tables (≤1M): 400 samples
+    /// - Huge tables (>1M): 500 samples
     ///
     /// Returns (raw_size, is_estimated) where raw_size is the calculated/estimated size
     /// and is_estimated indicates whether sampling was used

@@ -255,7 +255,7 @@ impl InteractiveSession {
     }
 
     async fn refresh_index_cache(&self) {
-        if let Ok(indexes) = self.client.list_indexes(true).await {
+        if let Ok(indexes) = self.client.list_indexes(false).await {
             self.update_index_cache(&indexes).await;
         }
     }
@@ -357,13 +357,22 @@ async fn handle_list_command(
 
             for index_info in &indexes.indexes {
                 let config = client.get_index_config(&index_info.name).await?;
-                let stats = json!({
-                    "document_count": index_info.document_count,
-                    "total_size_bytes": index_info.total_size_bytes,
-                    "index_size_mb": index_info.index_size_mb,
-                    "data_size_mb": index_info.data_size_mb,
-                    "shard_count": index_info.shard_count,
-                });
+                let mut stats = serde_json::Map::new();
+                stats.insert(
+                    "document_count".to_string(),
+                    json!(index_info.document_count),
+                );
+                if let Some(total_size) = index_info.total_size_bytes {
+                    stats.insert("total_size_bytes".to_string(), json!(total_size));
+                }
+                if let Some(index_size) = index_info.index_size_mb {
+                    stats.insert("index_size_mb".to_string(), json!(index_size));
+                }
+                if let Some(data_size) = index_info.data_size_mb {
+                    stats.insert("data_size_mb".to_string(), json!(data_size));
+                }
+                stats.insert("shard_count".to_string(), json!(index_info.shard_count));
+                let stats = serde_json::Value::Object(stats);
                 let compact_fields = format_compact_fields(&config.fields);
                 entries.push((index_info.name.clone(), stats.clone(), compact_fields));
 
@@ -414,13 +423,19 @@ async fn handle_list_command(
             let config = client.get_index_config(&info.name).await?;
 
             if extended {
-                let stats = json!({
-                    "document_count": info.document_count,
-                    "total_size_bytes": info.total_size_bytes,
-                    "index_size_mb": info.index_size_mb,
-                    "data_size_mb": info.data_size_mb,
-                    "shard_count": info.shard_count,
-                });
+                let mut stats = serde_json::Map::new();
+                stats.insert("document_count".to_string(), json!(info.document_count));
+                if let Some(total_size) = info.total_size_bytes {
+                    stats.insert("total_size_bytes".to_string(), json!(total_size));
+                }
+                if let Some(index_size) = info.index_size_mb {
+                    stats.insert("index_size_mb".to_string(), json!(index_size));
+                }
+                if let Some(data_size) = info.data_size_mb {
+                    stats.insert("data_size_mb".to_string(), json!(data_size));
+                }
+                stats.insert("shard_count".to_string(), json!(info.shard_count));
+                let stats = serde_json::Value::Object(stats);
                 let enriched = json!({
                     "index": info.name,
                     "stats": stats,
@@ -428,13 +443,19 @@ async fn handle_list_command(
                 });
                 print_json(&enriched)?;
             } else {
-                let stats = json!({
-                    "document_count": info.document_count,
-                    "total_size_bytes": info.total_size_bytes,
-                    "index_size_mb": info.index_size_mb,
-                    "data_size_mb": info.data_size_mb,
-                    "shard_count": info.shard_count,
-                });
+                let mut stats = serde_json::Map::new();
+                stats.insert("document_count".to_string(), json!(info.document_count));
+                if let Some(total_size) = info.total_size_bytes {
+                    stats.insert("total_size_bytes".to_string(), json!(total_size));
+                }
+                if let Some(index_size) = info.index_size_mb {
+                    stats.insert("index_size_mb".to_string(), json!(index_size));
+                }
+                if let Some(data_size) = info.data_size_mb {
+                    stats.insert("data_size_mb".to_string(), json!(data_size));
+                }
+                stats.insert("shard_count".to_string(), json!(info.shard_count));
+                let stats = serde_json::Value::Object(stats);
                 let compact_fields = format_compact_fields(&config.fields);
                 print_compact_index_output(&info.name, &stats, &compact_fields)?;
             }
@@ -922,6 +943,7 @@ impl IndexCompleter {
 
     fn extended_flag_suggestions(&self, current: &str, tokens: &[&str]) -> Vec<Pair> {
         let has_extended = tokens.iter().any(|t| *t == "--extended" || *t == "-e");
+        let has_data_size = tokens.contains(&"--data-size");
         let mut suggestions = Vec::new();
 
         if !has_extended && "--extended".starts_with(current) {
@@ -934,6 +956,12 @@ impl IndexCompleter {
             suggestions.push(Pair {
                 display: "-e".to_string(),
                 replacement: "-e".to_string(),
+            });
+        }
+        if !has_data_size && "--data-size".starts_with(current) {
+            suggestions.push(Pair {
+                display: "--data-size".to_string(),
+                replacement: "--data-size".to_string(),
             });
         }
         suggestions
@@ -1335,6 +1363,9 @@ pub enum ClientCommand {
         /// Show full extended schema with all field properties (for list indexes, also fetches and displays field schemas for each index)
         #[arg(long, default_value_t = false)]
         extended: bool,
+        /// Include data size information (default: false)
+        #[arg(long, default_value_t = false)]
+        data_size: bool,
     },
 
     /// Search an index
@@ -1470,8 +1501,9 @@ pub async fn run_cli() -> Result<()> {
             resource,
             name,
             extended,
+            data_size,
         } => {
-            handle_list_command(&client, resource, name, true, extended).await?;
+            handle_list_command(&client, resource, name, data_size, extended).await?;
         }
         ClientCommand::Search {
             index,
@@ -4082,7 +4114,7 @@ fn interactive_loop(
 
         if matches!(input.as_str(), "help" | "\\h") {
             println!(
-                "Available commands:\n  health\n  list indexes\n  list index <name>\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  connect <host[:port]>\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
+                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  connect <host[:port]>\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
             );
             continue;
         }
@@ -4133,11 +4165,12 @@ async fn dispatch_interactive_command(
                 "indexes" => {
                     let remaining: Vec<&str> = parts.collect();
                     let extended = remaining.iter().any(|s| *s == "--extended" || *s == "-e");
+                    let data_size = remaining.contains(&"--data-size");
                     if let Some(result) = handle_list_command(
                         session.client(),
                         ListResource::Indexes,
                         None,
-                        true,
+                        data_size,
                         extended,
                     )
                     .await?
@@ -4146,16 +4179,17 @@ async fn dispatch_interactive_command(
                     }
                 }
                 "index" => {
-                    let name = parts
-                        .next()
-                        .ok_or_else(|| anyhow!("Usage: list index <name> [--extended]"))?;
+                    let name = parts.next().ok_or_else(|| {
+                        anyhow!("Usage: list index <name> [--extended] [--data-size]")
+                    })?;
                     let remaining: Vec<&str> = parts.collect();
                     let extended = remaining.iter().any(|s| *s == "--extended" || *s == "-e");
+                    let data_size = remaining.contains(&"--data-size");
                     if let Some(result) = handle_list_command(
                         session.client(),
                         ListResource::Index,
                         Some(name.to_string()),
-                        true,
+                        data_size,
                         extended,
                     )
                     .await?
@@ -4164,11 +4198,13 @@ async fn dispatch_interactive_command(
                     }
                 }
                 "--extended" | "-e" => {
+                    let remaining: Vec<&str> = parts.collect();
+                    let data_size = remaining.contains(&"--data-size");
                     if let Some(result) = handle_list_command(
                         session.client(),
                         ListResource::Indexes,
                         None,
-                        true,
+                        data_size,
                         true,
                     )
                     .await?
