@@ -451,6 +451,10 @@ pub struct NodeConfig {
     /// Timeout in seconds for writer thread to drain pending commands during shutdown
     /// Increased from 10s to 30s to handle large coalesced batches
     pub writer_shutdown_timeout_secs: u64,
+    /// Pin per-shard writer threads to a CPU core derived from `xxh3(shard_id) % num_cores`.
+    /// Improves cache locality and reduces cross-core wakeups under heavy write load.
+    /// Default: false (no pinning, OS scheduler decides).
+    pub writer_core_affinity: bool,
 }
 
 impl Default for NodeConfig {
@@ -470,6 +474,7 @@ impl Default for NodeConfig {
             indexer_num_threads: 1,
             merge_num_threads: 2,
             writer_shutdown_timeout_secs: 30,
+            writer_core_affinity: true,
         }
     }
 }
@@ -1224,6 +1229,8 @@ pub struct MicroshardActor {
     total_shards: usize,
     /// Writer thread shutdown timeout in seconds.
     writer_shutdown_timeout_secs: u64,
+    /// Pin the per-shard writer thread to a deterministic CPU core for cache locality.
+    writer_core_affinity: bool,
 }
 
 impl std::fmt::Debug for MicroshardActor {
@@ -1245,6 +1252,7 @@ impl MicroshardActor {
         read_pool_handle: Option<tokio::runtime::Handle>,
         total_shards: usize,
         writer_shutdown_timeout_secs: u64,
+        writer_core_affinity: bool,
     ) -> Self {
         Self {
             shard_id,
@@ -1258,6 +1266,7 @@ impl MicroshardActor {
             read_pool_handle,
             total_shards,
             writer_shutdown_timeout_secs,
+            writer_core_affinity,
         }
     }
 
@@ -1304,10 +1313,44 @@ impl MicroshardActor {
         let writer_store = store_arc;
         let shutdown = self.shutdown_notify.clone();
         let writer_shard_id = self.shard_id;
+        let pin_core = self.writer_core_affinity;
 
         let handle = std::thread::Builder::new()
             .name(format!("writer-shard-{}", writer_shard_id))
             .spawn(move || {
+                // Optionally pin this writer thread to a deterministic CPU core
+                // derived from `xxh3(shard_id) % num_cores`. This improves cache
+                // locality for redb/tantivy data structures and reduces cross-core
+                // wakeups on the write hot path.
+                if pin_core {
+                    if let Some(core_ids) = core_affinity::get_core_ids()
+                        && !core_ids.is_empty()
+                    {
+                        let hash = xxh3_64(writer_shard_id.as_bytes()) as usize;
+                        let core_idx = hash % core_ids.len();
+                        let target = core_ids[core_idx];
+                        if core_affinity::set_for_current(target) {
+                            info!(
+                                shard_id = %writer_shard_id,
+                                core_id = target.id,
+                                num_cores = core_ids.len(),
+                                "Writer thread pinned to CPU core"
+                            );
+                        } else {
+                            warn!(
+                                shard_id = %writer_shard_id,
+                                core_id = target.id,
+                                "Failed to pin writer thread to CPU core (continuing unpinned)"
+                            );
+                        }
+                    } else {
+                        warn!(
+                            shard_id = %writer_shard_id,
+                            "core_affinity::get_core_ids() returned None/empty; writer thread unpinned"
+                        );
+                    }
+                }
+
                 info!(shard_id = %writer_shard_id, "Writer thread started (write coalescing enabled)");
 
                 // Reusable buffers to avoid per-iteration allocations
@@ -4320,6 +4363,7 @@ impl NodeOrchestrator {
         // Create tasks for all shards — semaphore gates actual execution
         let total_shards = existing_shards.len();
         let writer_shutdown_timeout_secs = self.config.writer_shutdown_timeout_secs;
+        let writer_core_affinity = self.config.writer_core_affinity;
         for &shard_id in &existing_shards {
             let shard_path = self.deterministic_shard_directory(shard_id);
             let storage_config = self.create_shard_storage_config(shard_id, shard_path);
@@ -4340,6 +4384,7 @@ impl NodeOrchestrator {
                     read_handle,
                     total_shards,
                     writer_shutdown_timeout_secs,
+                    writer_core_affinity,
                 );
 
                 match microshard.start().await {
@@ -4659,6 +4704,7 @@ impl NodeOrchestrator {
             read_handle,
             total_shards,
             self.config.writer_shutdown_timeout_secs,
+            self.config.writer_core_affinity,
         );
         microshard.start().await?;
 

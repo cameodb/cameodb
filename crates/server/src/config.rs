@@ -171,6 +171,13 @@ pub struct StorageConfig {
     /// Maximum number of shards this node can host (default: 8)
     #[serde(default = "default_max_shards_per_node")]
     pub max_shards_per_node: usize,
+
+    /// Pin per-shard writer threads to a CPU core (default: false).
+    /// When enabled, each shard's writer thread is pinned to a deterministic
+    /// CPU core derived from `xxh3(shard_id) % num_cores`, improving cache
+    /// locality and reducing cross-core wakeups under heavy write load.
+    #[serde(default = "default_writer_core_affinity")]
+    pub writer_core_affinity: bool,
 }
 
 /// Cluster configuration for distributed actor system
@@ -719,6 +726,7 @@ impl Default for StorageConfig {
             default_batch_size: default_default_batch_size(),
             num_shards_init: default_num_shards_init(),
             max_shards_per_node: default_max_shards_per_node(),
+            writer_core_affinity: default_writer_core_affinity(),
         }
     }
 }
@@ -820,6 +828,9 @@ fn default_num_shards_init() -> usize {
 }
 fn default_max_shards_per_node() -> usize {
     8
+}
+fn default_writer_core_affinity() -> bool {
+    true
 }
 
 fn default_indexer_memory_min_mb() -> usize {

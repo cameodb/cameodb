@@ -139,6 +139,7 @@ async fn main() -> Result<()> {
         indexer_num_threads: cameodb_config.search.indexer_num_threads,
         merge_num_threads: cameodb_config.search.merge_num_threads,
         writer_shutdown_timeout_secs: 30,
+        writer_core_affinity: cameodb_config.storage.writer_core_affinity,
     };
 
     // Create the NodeOrchestrator actor
