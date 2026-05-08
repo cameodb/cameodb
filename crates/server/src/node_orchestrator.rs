@@ -1337,17 +1337,34 @@ impl MicroshardActor {
                                 "Writer thread pinned to CPU core"
                             );
                         } else {
-                            warn!(
-                                shard_id = %writer_shard_id,
-                                core_id = target.id,
-                                "Failed to pin writer thread to CPU core (continuing unpinned)"
-                            );
+                            // CPU pinning is not supported on macOS, so log as info instead of warn
+                            if cfg!(target_os = "macos") {
+                                info!(
+                                    shard_id = %writer_shard_id,
+                                    core_id = target.id,
+                                    "CPU pinning not supported on macOS; writer thread continuing unpinned"
+                                );
+                            } else {
+                                warn!(
+                                    shard_id = %writer_shard_id,
+                                    core_id = target.id,
+                                    "Failed to pin writer thread to CPU core (continuing unpinned)"
+                                );
+                            }
                         }
                     } else {
-                        warn!(
-                            shard_id = %writer_shard_id,
-                            "core_affinity::get_core_ids() returned None/empty; writer thread unpinned"
-                        );
+                        // CPU pinning is not supported on macOS, so log as info instead of warn
+                        if cfg!(target_os = "macos") {
+                            info!(
+                                shard_id = %writer_shard_id,
+                                "CPU pinning not supported on macOS; writer thread continuing unpinned"
+                            );
+                        } else {
+                            warn!(
+                                shard_id = %writer_shard_id,
+                                "core_affinity::get_core_ids() returned None/empty; writer thread unpinned"
+                            );
+                        }
                     }
                 }
 
