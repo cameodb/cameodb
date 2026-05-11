@@ -57,6 +57,8 @@ use storage::{
     FieldDef, HybridStore, IndexSchema, ShardStatsTimings, StorageConfig, StoreError,
     TantivyFieldType, WalOp,
 };
+#[cfg(target_os = "linux")]
+use tikv_jemalloc_sys;
 use xxhash_rust::xxh3::xxh3_64;
 
 /// Sample limit for enhanced schema detection during initial creation
@@ -586,6 +588,55 @@ pub struct GetShardStats {
     pub include_data_size: bool,
 }
 
+/// Memory snapshot read from /proc/self/status (Linux-only; fields are None on other OSes).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProcessMemoryStats {
+    pub vm_size_kb: Option<u64>,
+    pub vm_rss_kb: Option<u64>,
+    pub rss_anon_kb: Option<u64>,
+    pub rss_file_kb: Option<u64>,
+    pub rss_shmem_kb: Option<u64>,
+    pub vm_data_kb: Option<u64>,
+    pub vm_swap_kb: Option<u64>,
+    pub threads: Option<u64>,
+}
+
+/// Jemalloc-native allocator statistics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JemallocStats {
+    pub allocated: Option<u64>,
+    pub active: Option<u64>,
+    pub resident: Option<u64>,
+    pub metadata: Option<u64>,
+    pub retained: Option<u64>,
+}
+
+/// Report returned by GET /_admin/memory and POST /_admin/memory/trim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminMemoryReport {
+    pub before: ProcessMemoryStats,
+    pub after: Option<ProcessMemoryStats>,
+    pub jemalloc: Option<JemallocStats>,
+    pub memory_purge_supported: bool,
+    pub memory_purge_result: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GetAdminMemory;
+
+#[derive(Debug, Clone)]
+pub struct TrimAdminMemory;
+
+#[derive(Debug, Clone)]
+pub struct CommitAdminIndex {
+    pub index: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct EvictAdminIndexWriter {
+    pub index: String,
+}
+
 /// Remote-friendly error type for cross-node microshard calls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RemoteError {
@@ -721,6 +772,10 @@ pub enum StorageCommand {
     Commit {
         index: String,
         reply: tokio::sync::oneshot::Sender<Result<(), StoreError>>,
+    },
+    EvictWriter {
+        index: String,
+        reply: tokio::sync::oneshot::Sender<bool>,
     },
     Shutdown,
 }
@@ -1398,6 +1453,7 @@ impl MicroshardActor {
                     let mut write_groups: HashMap<String, Vec<WriteCommand>> = HashMap::new();
                     let mut batch_groups: HashMap<String, Vec<BatchCommand>> = HashMap::new();
                     let mut commits: Vec<(String, tokio::sync::oneshot::Sender<Result<(), StoreError>>)> = Vec::new();
+                    let mut evictions: Vec<(String, tokio::sync::oneshot::Sender<bool>)> = Vec::new();
                     let mut should_shutdown = false;
 
                     for cmd in pending_cmds.drain(..) {
@@ -1410,6 +1466,9 @@ impl MicroshardActor {
                             }
                             StorageCommand::Commit { index, reply } => {
                                 commits.push((index, reply));
+                            }
+                            StorageCommand::EvictWriter { index, reply } => {
+                                evictions.push((index, reply));
                             }
                             StorageCommand::Shutdown => {
                                 should_shutdown = true;
@@ -1567,6 +1626,16 @@ impl MicroshardActor {
                         let _ = reply.send(res);
                     }
 
+                    // Phase 5b: Process writer evictions (commit then drop from cache)
+                    for (index, reply) in evictions {
+                        if let Err(e) = writer_store.commit_index(&index) {
+                            tracing::warn!(index = %index, error = %e, "Evict: commit failed, evicting anyway");
+                        }
+                        let removed = writer_store.force_remove_writer(&index);
+                        tracing::info!(index = %index, removed, "Writer evicted from cache");
+                        let _ = reply.send(removed);
+                    }
+
                     // Phase 6: Handle shutdown after draining all pending work
                     if should_shutdown {
                         info!(shard_id = %writer_shard_id, "Writer thread shutting down");
@@ -1655,6 +1724,26 @@ impl MicroshardActor {
             "MicroshardActor: Batch write completed successfully"
         );
         Ok(result)
+    }
+
+    pub async fn admin_commit_via_channel(&self, index: String) -> Result<(), OrchestratorError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.send_write_command(StorageCommand::Commit { index, reply: tx })
+            .await?;
+        rx.await
+            .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer dropped reply")))?
+            .map_err(OrchestratorError::Storage)
+    }
+
+    pub async fn admin_evict_writer_via_channel(
+        &self,
+        index: String,
+    ) -> Result<bool, OrchestratorError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.send_write_command(StorageCommand::EvictWriter { index, reply: tx })
+            .await?;
+        rx.await
+            .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer dropped reply")))
     }
 
     /// Gracefully stop the writer thread with timeout.
@@ -2261,6 +2350,39 @@ impl RouterActor {
                 e
             )))),
         }
+    }
+
+    pub async fn admin_memory(&self) -> Result<AdminMemoryReport, OrchestratorError> {
+        self.orchestrator.ask(GetAdminMemory).await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
+        })
+    }
+
+    pub async fn admin_trim_memory(&self) -> Result<AdminMemoryReport, OrchestratorError> {
+        self.orchestrator.ask(TrimAdminMemory).await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
+        })
+    }
+
+    pub async fn admin_commit_index(&self, index: String) -> Result<JsonValue, OrchestratorError> {
+        self.orchestrator
+            .ask(CommitAdminIndex { index })
+            .await
+            .map_err(|e| {
+                OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
+            })
+    }
+
+    pub async fn admin_evict_index_writer(
+        &self,
+        index: String,
+    ) -> Result<JsonValue, OrchestratorError> {
+        self.orchestrator
+            .ask(EvictAdminIndexWriter { index })
+            .await
+            .map_err(|e| {
+                OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
+            })
     }
 
     /// Route via ClusterCoordinator then handle locally (remote/broadcast stubbed).
@@ -5925,6 +6047,122 @@ impl NodeOrchestrator {
             ))
         })
     }
+
+    async fn orch_admin_commit_index(&self, index: String) -> Result<JsonValue, OrchestratorError> {
+        let mut committed = 0usize;
+        let mut errors: Vec<JsonValue> = Vec::new();
+        for (shard_id, shard) in &self.shards {
+            match shard.admin_commit_via_channel(index.clone()).await {
+                Ok(()) => committed += 1,
+                Err(e) => errors.push(serde_json::json!({
+                    "shard_id": shard_id.to_string(),
+                    "error": e.to_string()
+                })),
+            }
+        }
+        Ok(serde_json::json!({
+            "index": index,
+            "shards_total": self.shards.len(),
+            "shards_committed": committed,
+            "errors": errors,
+        }))
+    }
+
+    async fn orch_admin_evict_index_writer(
+        &self,
+        index: String,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let mut evicted = 0usize;
+        let mut missing = 0usize;
+        let mut errors: Vec<JsonValue> = Vec::new();
+        for (shard_id, shard) in &self.shards {
+            match shard.admin_evict_writer_via_channel(index.clone()).await {
+                Ok(true) => evicted += 1,
+                Ok(false) => missing += 1,
+                Err(e) => errors.push(serde_json::json!({
+                    "shard_id": shard_id.to_string(),
+                    "error": e.to_string()
+                })),
+            }
+        }
+        Ok(serde_json::json!({
+            "index": index,
+            "shards_total": self.shards.len(),
+            "writers_evicted": evicted,
+            "writers_missing": missing,
+            "errors": errors,
+        }))
+    }
+}
+
+fn read_process_memory_stats() -> ProcessMemoryStats {
+    let mut stats = ProcessMemoryStats::default();
+    let Ok(contents) = fs::read_to_string("/proc/self/status") else {
+        return stats;
+    };
+    for line in contents.lines() {
+        let parse = |l: &str| -> Option<u64> { l.split_whitespace().nth(1)?.parse().ok() };
+        if line.starts_with("VmSize:") {
+            stats.vm_size_kb = parse(line);
+        } else if line.starts_with("VmRSS:") {
+            stats.vm_rss_kb = parse(line);
+        } else if line.starts_with("RssAnon:") {
+            stats.rss_anon_kb = parse(line);
+        } else if line.starts_with("RssFile:") {
+            stats.rss_file_kb = parse(line);
+        } else if line.starts_with("RssShmem:") {
+            stats.rss_shmem_kb = parse(line);
+        } else if line.starts_with("VmData:") {
+            stats.vm_data_kb = parse(line);
+        } else if line.starts_with("VmSwap:") {
+            stats.vm_swap_kb = parse(line);
+        } else if line.starts_with("Threads:") {
+            stats.threads = parse(line);
+        }
+    }
+    stats
+}
+
+#[cfg(target_os = "linux")]
+fn call_memory_purge() -> i32 {
+    // mallctl returns 0 on success, non-zero errno on failure.
+    unsafe {
+        tikv_jemalloc_sys::mallctl(
+            b"arena.4294967295.purge\0".as_ptr().cast(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_jemalloc_stats() -> JemallocStats {
+    let mut stats = JemallocStats::default();
+
+    let read_u64 = |name: &[u8]| -> Option<u64> {
+        let mut value: u64 = 0;
+        let mut sz = std::mem::size_of::<u64>();
+        let ret = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                name.as_ptr().cast(),
+                (&mut value as *mut u64).cast(),
+                &mut sz,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ret == 0 { Some(value) } else { None }
+    };
+
+    stats.allocated = read_u64(b"stats.allocated\0");
+    stats.active = read_u64(b"stats.active\0");
+    stats.resident = read_u64(b"stats.resident\0");
+    stats.metadata = read_u64(b"stats.metadata\0");
+    stats.retained = read_u64(b"stats.retained\0");
+
+    stats
 }
 
 /// Derive a deterministic routing key from document content.
@@ -5966,6 +6204,83 @@ impl Message<GetShardCount> for NodeOrchestrator {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.shards.len()
+    }
+}
+
+impl Message<GetAdminMemory> for NodeOrchestrator {
+    type Reply = Result<AdminMemoryReport, OrchestratorError>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetAdminMemory,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        #[cfg(target_os = "linux")]
+        let jemalloc = Some(read_jemalloc_stats());
+        #[cfg(not(target_os = "linux"))]
+        let jemalloc = None;
+
+        Ok(AdminMemoryReport {
+            before: read_process_memory_stats(),
+            after: None,
+            jemalloc,
+            memory_purge_supported: cfg!(target_os = "linux"),
+            memory_purge_result: None,
+        })
+    }
+}
+
+impl Message<TrimAdminMemory> for NodeOrchestrator {
+    type Reply = Result<AdminMemoryReport, OrchestratorError>;
+
+    async fn handle(
+        &mut self,
+        _msg: TrimAdminMemory,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let before = read_process_memory_stats();
+        #[cfg(target_os = "linux")]
+        let memory_purge_result = Some(call_memory_purge());
+        #[cfg(not(target_os = "linux"))]
+        let memory_purge_result = None;
+        let after = read_process_memory_stats();
+
+        #[cfg(target_os = "linux")]
+        let jemalloc = Some(read_jemalloc_stats());
+        #[cfg(not(target_os = "linux"))]
+        let jemalloc = None;
+
+        Ok(AdminMemoryReport {
+            before,
+            after: Some(after),
+            jemalloc,
+            memory_purge_supported: cfg!(target_os = "linux"),
+            memory_purge_result,
+        })
+    }
+}
+
+impl Message<CommitAdminIndex> for NodeOrchestrator {
+    type Reply = Result<JsonValue, OrchestratorError>;
+
+    async fn handle(
+        &mut self,
+        msg: CommitAdminIndex,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.orch_admin_commit_index(msg.index).await
+    }
+}
+
+impl Message<EvictAdminIndexWriter> for NodeOrchestrator {
+    type Reply = Result<JsonValue, OrchestratorError>;
+
+    async fn handle(
+        &mut self,
+        msg: EvictAdminIndexWriter,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.orch_admin_evict_index_writer(msg.index).await
     }
 }
 

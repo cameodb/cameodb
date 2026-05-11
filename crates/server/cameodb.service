@@ -4,6 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
+Environment=MALLOC_CONF=narenas:16,dirty_decay_ms:5000,muzzy_decay_ms:5000,background_thread:true,max_background_threads:1
 ExecStart=/usr/local/bin/cameodb --config /etc/cameodb/cameodb.toml
 Restart=on-failure
 User=cameodb

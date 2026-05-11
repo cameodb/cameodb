@@ -24,7 +24,7 @@ use tower_http::{
 use tracing::{error, info, warn};
 
 use crate::cluster_coordinator::{ClusterCoordinator, GetStatus, OperationType};
-use crate::node_orchestrator::{ClientOp, DocPayload, RouterActor};
+use crate::node_orchestrator::{AdminMemoryReport, ClientOp, DocPayload, RouterActor};
 use storage::IndexSchema;
 
 /// Application error wrapper for consistent error handling
@@ -1252,6 +1252,17 @@ pub fn create_router(state: AppState, max_body_size_mb: usize) -> (Router, McpSh
         .route("/api/{index}", delete(delete_index_handler))
         .route("/_indexes", get(list_indexes_handler))
         .route("/_cluster/_indexes", get(list_cluster_indexes_handler))
+        // Admin endpoints
+        .route("/_admin/memory", get(admin_memory_handler))
+        .route("/_admin/memory/trim", post(admin_memory_trim_handler))
+        .route(
+            "/_admin/index/{index}/commit",
+            post(admin_index_commit_handler),
+        )
+        .route(
+            "/_admin/index/{index}/evict-writer",
+            post(admin_index_evict_writer_handler),
+        )
         // Health check
         .route("/_cluster/health", get(health_handler))
         .fallback(fallback_handler)
@@ -1819,6 +1830,32 @@ async fn list_indexes_handler(
         .route_and_handle(client_op, None, OperationType::Read)
         .await?;
     Ok(Json(result))
+}
+
+async fn admin_memory_handler(
+    State(state): State<AppState>,
+) -> Result<Json<AdminMemoryReport>, AppError> {
+    Ok(Json(state.router.admin_memory().await?))
+}
+
+async fn admin_memory_trim_handler(
+    State(state): State<AppState>,
+) -> Result<Json<AdminMemoryReport>, AppError> {
+    Ok(Json(state.router.admin_trim_memory().await?))
+}
+
+async fn admin_index_commit_handler(
+    Path(index): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<JsonValue>, AppError> {
+    Ok(Json(state.router.admin_commit_index(index).await?))
+}
+
+async fn admin_index_evict_writer_handler(
+    Path(index): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<JsonValue>, AppError> {
+    Ok(Json(state.router.admin_evict_index_writer(index).await?))
 }
 
 /// Handler for cluster health check
