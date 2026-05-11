@@ -621,11 +621,39 @@ pub struct AdminMemoryReport {
     pub memory_purge_result: Option<i32>,
 }
 
+/// Per-shard error detail for index admin operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardError {
+    pub shard_id: String,
+    pub error: String,
+}
+
+/// Report returned by POST /_admin/index/{index}/commit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminIndexCommitReport {
+    pub index: String,
+    pub shards_total: usize,
+    pub shards_committed: usize,
+    pub errors: Vec<ShardError>,
+}
+
+/// Report returned by POST /_admin/index/{index}/evict_writer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminIndexEvictWriterReport {
+    pub index: String,
+    pub shards_total: usize,
+    pub writers_evicted: usize,
+    pub writers_missing: usize,
+    pub errors: Vec<ShardError>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GetAdminMemory;
 
 #[derive(Debug, Clone)]
-pub struct TrimAdminMemory;
+pub struct TrimAdminMemory {
+    pub force: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct CommitAdminIndex {
@@ -2358,13 +2386,22 @@ impl RouterActor {
         })
     }
 
-    pub async fn admin_trim_memory(&self) -> Result<AdminMemoryReport, OrchestratorError> {
-        self.orchestrator.ask(TrimAdminMemory).await.map_err(|e| {
-            OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
-        })
+    pub async fn admin_trim_memory(
+        &self,
+        force: bool,
+    ) -> Result<AdminMemoryReport, OrchestratorError> {
+        self.orchestrator
+            .ask(TrimAdminMemory { force })
+            .await
+            .map_err(|e| {
+                OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
+            })
     }
 
-    pub async fn admin_commit_index(&self, index: String) -> Result<JsonValue, OrchestratorError> {
+    pub async fn admin_commit_index(
+        &self,
+        index: String,
+    ) -> Result<AdminIndexCommitReport, OrchestratorError> {
         self.orchestrator
             .ask(CommitAdminIndex { index })
             .await
@@ -2376,7 +2413,7 @@ impl RouterActor {
     pub async fn admin_evict_index_writer(
         &self,
         index: String,
-    ) -> Result<JsonValue, OrchestratorError> {
+    ) -> Result<AdminIndexEvictWriterReport, OrchestratorError> {
         self.orchestrator
             .ask(EvictAdminIndexWriter { index })
             .await
@@ -6048,50 +6085,53 @@ impl NodeOrchestrator {
         })
     }
 
-    async fn orch_admin_commit_index(&self, index: String) -> Result<JsonValue, OrchestratorError> {
+    async fn orch_admin_commit_index(
+        &self,
+        index: String,
+    ) -> Result<AdminIndexCommitReport, OrchestratorError> {
         let mut committed = 0usize;
-        let mut errors: Vec<JsonValue> = Vec::new();
+        let mut errors: Vec<ShardError> = Vec::new();
         for (shard_id, shard) in &self.shards {
             match shard.admin_commit_via_channel(index.clone()).await {
                 Ok(()) => committed += 1,
-                Err(e) => errors.push(serde_json::json!({
-                    "shard_id": shard_id.to_string(),
-                    "error": e.to_string()
-                })),
+                Err(e) => errors.push(ShardError {
+                    shard_id: shard_id.to_string(),
+                    error: e.to_string(),
+                }),
             }
         }
-        Ok(serde_json::json!({
-            "index": index,
-            "shards_total": self.shards.len(),
-            "shards_committed": committed,
-            "errors": errors,
-        }))
+        Ok(AdminIndexCommitReport {
+            index,
+            shards_total: self.shards.len(),
+            shards_committed: committed,
+            errors,
+        })
     }
 
     async fn orch_admin_evict_index_writer(
         &self,
         index: String,
-    ) -> Result<JsonValue, OrchestratorError> {
+    ) -> Result<AdminIndexEvictWriterReport, OrchestratorError> {
         let mut evicted = 0usize;
         let mut missing = 0usize;
-        let mut errors: Vec<JsonValue> = Vec::new();
+        let mut errors: Vec<ShardError> = Vec::new();
         for (shard_id, shard) in &self.shards {
             match shard.admin_evict_writer_via_channel(index.clone()).await {
                 Ok(true) => evicted += 1,
                 Ok(false) => missing += 1,
-                Err(e) => errors.push(serde_json::json!({
-                    "shard_id": shard_id.to_string(),
-                    "error": e.to_string()
-                })),
+                Err(e) => errors.push(ShardError {
+                    shard_id: shard_id.to_string(),
+                    error: e.to_string(),
+                }),
             }
         }
-        Ok(serde_json::json!({
-            "index": index,
-            "shards_total": self.shards.len(),
-            "writers_evicted": evicted,
-            "writers_missing": missing,
-            "errors": errors,
-        }))
+        Ok(AdminIndexEvictWriterReport {
+            index,
+            shards_total: self.shards.len(),
+            writers_evicted: evicted,
+            writers_missing: missing,
+            errors,
+        })
     }
 }
 
@@ -6124,11 +6164,18 @@ fn read_process_memory_stats() -> ProcessMemoryStats {
 }
 
 #[cfg(target_os = "linux")]
-fn call_memory_purge() -> i32 {
+fn call_memory_purge(force: bool) -> i32 {
     // mallctl returns 0 on success, non-zero errno on failure.
+    // Decay-based purge respects dirty_decay_ms / muzzy_decay_ms config.
+    // Force purge immediately purges all dirty and muzzy pages.
+    let name: &[u8] = if force {
+        b"arena.4294967295.purge\0"
+    } else {
+        b"arena.4294967295_decay.purge\0"
+    };
     unsafe {
         tikv_jemalloc_sys::mallctl(
-            b"arena.4294967295.purge\0".as_ptr().cast(),
+            name.as_ptr().cast(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -6267,13 +6314,15 @@ impl Message<TrimAdminMemory> for NodeOrchestrator {
 
     async fn handle(
         &mut self,
-        _msg: TrimAdminMemory,
+        msg: TrimAdminMemory,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let report = tokio::task::spawn_blocking(|| {
+        #[allow(unused_variables)]
+        let force = msg.force;
+        let report = tokio::task::spawn_blocking(move || {
             let before = read_process_memory_stats();
             #[cfg(target_os = "linux")]
-            let memory_purge_result = Some(call_memory_purge());
+            let memory_purge_result = Some(call_memory_purge(force));
             #[cfg(not(target_os = "linux"))]
             let memory_purge_result = None;
             let after = read_process_memory_stats();
@@ -6299,7 +6348,7 @@ impl Message<TrimAdminMemory> for NodeOrchestrator {
 }
 
 impl Message<CommitAdminIndex> for NodeOrchestrator {
-    type Reply = Result<JsonValue, OrchestratorError>;
+    type Reply = Result<AdminIndexCommitReport, OrchestratorError>;
 
     async fn handle(
         &mut self,
@@ -6311,7 +6360,7 @@ impl Message<CommitAdminIndex> for NodeOrchestrator {
 }
 
 impl Message<EvictAdminIndexWriter> for NodeOrchestrator {
-    type Reply = Result<JsonValue, OrchestratorError>;
+    type Reply = Result<AdminIndexEvictWriterReport, OrchestratorError>;
 
     async fn handle(
         &mut self,

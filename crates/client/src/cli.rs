@@ -1358,6 +1358,12 @@ impl Hinter for IndexCompleter {
                         if op.is_none() {
                             return Some(" <stats|trim>".to_string());
                         }
+                        if op == Some("trim") {
+                            let has_force = parts.any(|p| p == "--force");
+                            if !has_force {
+                                return Some(" [--force]".to_string());
+                            }
+                        }
                         None
                     }
                     "index" => {
@@ -1516,6 +1522,9 @@ pub enum AdminCommand {
         /// Memory operation to perform
         #[arg(value_enum)]
         operation: MemoryOperation,
+        /// Force aggressive purge (ignore decay timers, purge all pages immediately)
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
     /// Index admin operations
     Index {
@@ -1683,13 +1692,13 @@ pub async fn run_cli() -> Result<()> {
             print_json(&result)?;
         }
         ClientCommand::Admin { subcommand } => match subcommand {
-            AdminCommand::Memory { operation } => match operation {
+            AdminCommand::Memory { operation, force } => match operation {
                 MemoryOperation::Stats => {
                     let result = client.admin_memory_stats().await?;
                     print_json(&result)?;
                 }
                 MemoryOperation::Trim => {
-                    let result = client.admin_memory_trim().await?;
+                    let result = client.admin_memory_trim(force).await?;
                     print_json(&result)?;
                 }
             },
@@ -4258,7 +4267,7 @@ fn interactive_loop(
 
         if matches!(input.as_str(), "help" | "\\h") {
             println!(
-                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  admin memory stats\n  admin memory trim\n  admin index <name> commit\n  admin index <name> evict-writer\n  connect <host[:port]>\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
+                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  admin memory stats\n  admin memory trim [--force]\n  admin index <name> commit\n  admin index <name> evict-writer\n  connect <host[:port]>\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
             );
             continue;
         }
@@ -4531,7 +4540,8 @@ async fn dispatch_interactive_command(
                             print_json(&result)?;
                         }
                         "trim" => {
-                            let result = session.client().admin_memory_trim().await?;
+                            let force = parts.any(|p| p == "--force");
+                            let result = session.client().admin_memory_trim(force).await?;
                             print_json(&result)?;
                         }
                         other => {

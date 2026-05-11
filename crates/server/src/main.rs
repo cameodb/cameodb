@@ -388,7 +388,9 @@ async fn main() -> Result<()> {
     println!("  GET  /_cluster/_indexes - List cluster indexes");
     println!("  GET  /_cluster/health - Health check");
     println!("  GET  /_admin/memory - Memory statistics (jemalloc + process)");
-    println!("  POST /_admin/memory/trim - Trigger jemalloc memory purge");
+    println!(
+        "  POST /_admin/memory/trim - Trigger jemalloc memory purge (?force=true for aggressive)"
+    );
     println!("  POST /_admin/index/{{index}}/commit - Force index writer commit");
     println!("  POST /_admin/index/{{index}}/evict_writer - Evict index writer from cache");
     println!("  POST /mcp - MCP direct HTTP JSON-RPC endpoint");

@@ -192,8 +192,11 @@ impl CameoClient {
             .context("Failed to parse memory stats response")
     }
 
-    pub async fn admin_memory_trim(&self) -> Result<AdminMemoryResponse> {
-        let url = self.base_url.join("_admin/memory/trim")?;
+    pub async fn admin_memory_trim(&self, force: bool) -> Result<AdminMemoryResponse> {
+        let mut url = self.base_url.join("_admin/memory/trim")?;
+        if force {
+            url.query_pairs_mut().append_pair("force", "true");
+        }
         let resp = self.http.post(url).send().await?;
         let status = resp.status();
         if !status.is_success() {
@@ -205,7 +208,7 @@ impl CameoClient {
             .context("Failed to parse memory trim response")
     }
 
-    pub async fn admin_index_commit(&self, index: &str) -> Result<JsonValue> {
+    pub async fn admin_index_commit(&self, index: &str) -> Result<AdminIndexCommitResponse> {
         let url = self
             .base_url
             .join(&format!("_admin/index/{}/commit", index))?;
@@ -220,7 +223,10 @@ impl CameoClient {
             .context("Failed to parse index commit response")
     }
 
-    pub async fn admin_index_evict_writer(&self, index: &str) -> Result<JsonValue> {
+    pub async fn admin_index_evict_writer(
+        &self,
+        index: &str,
+    ) -> Result<AdminIndexEvictWriterResponse> {
         let url = self
             .base_url
             .join(&format!("_admin/index/{}/evict_writer", index))?;
@@ -304,4 +310,27 @@ pub struct JemallocStats {
     pub resident: Option<u64>,
     pub metadata: Option<u64>,
     pub retained: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardError {
+    pub shard_id: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminIndexCommitResponse {
+    pub index: String,
+    pub shards_total: usize,
+    pub shards_committed: usize,
+    pub errors: Vec<ShardError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminIndexEvictWriterResponse {
+    pub index: String,
+    pub shards_total: usize,
+    pub writers_evicted: usize,
+    pub writers_missing: usize,
+    pub errors: Vec<ShardError>,
 }

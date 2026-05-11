@@ -24,7 +24,10 @@ use tower_http::{
 use tracing::{error, info, warn};
 
 use crate::cluster_coordinator::{ClusterCoordinator, GetStatus, OperationType};
-use crate::node_orchestrator::{AdminMemoryReport, ClientOp, DocPayload, RouterActor};
+use crate::node_orchestrator::{
+    AdminIndexCommitReport, AdminIndexEvictWriterReport, AdminMemoryReport, ClientOp, DocPayload,
+    RouterActor,
+};
 use storage::IndexSchema;
 
 /// Application error wrapper for consistent error handling
@@ -1840,21 +1843,22 @@ async fn admin_memory_handler(
 
 async fn admin_memory_trim_handler(
     State(state): State<AppState>,
+    Query(params): Query<AdminTrimParams>,
 ) -> Result<Json<AdminMemoryReport>, AppError> {
-    Ok(Json(state.router.admin_trim_memory().await?))
+    Ok(Json(state.router.admin_trim_memory(params.force).await?))
 }
 
 async fn admin_index_commit_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
-) -> Result<Json<JsonValue>, AppError> {
+) -> Result<Json<AdminIndexCommitReport>, AppError> {
     Ok(Json(state.router.admin_commit_index(index).await?))
 }
 
 async fn admin_index_evict_writer_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
-) -> Result<Json<JsonValue>, AppError> {
+) -> Result<Json<AdminIndexEvictWriterReport>, AppError> {
     Ok(Json(state.router.admin_evict_index_writer(index).await?))
 }
 
@@ -2047,6 +2051,11 @@ async fn delete_index_handler(
 #[derive(Deserialize, Default)]
 struct DeleteIndexParams {
     delete_schema: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct AdminTrimParams {
+    force: bool,
 }
 
 /// Fallback handler for 404/405 to return JSON error shape
