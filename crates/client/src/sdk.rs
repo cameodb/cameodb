@@ -178,6 +178,62 @@ impl CameoClient {
     pub fn http(&self) -> &Client {
         &self.http
     }
+
+    pub async fn admin_memory_stats(&self) -> Result<JsonValue> {
+        let url = self.base_url.join("_admin/memory")?;
+        let resp = self.http.get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Admin memory stats failed: {} - {}", status, text);
+        }
+        resp.json()
+            .await
+            .context("Failed to parse memory stats response")
+    }
+
+    pub async fn admin_memory_trim(&self) -> Result<JsonValue> {
+        let url = self.base_url.join("_admin/memory/trim")?;
+        let resp = self.http.post(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Admin memory trim failed: {} - {}", status, text);
+        }
+        resp.json()
+            .await
+            .context("Failed to parse memory trim response")
+    }
+
+    pub async fn admin_index_commit(&self, index: &str) -> Result<JsonValue> {
+        let url = self
+            .base_url
+            .join(&format!("_admin/index/{}/commit", index))?;
+        let resp = self.http.post(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Admin index commit failed: {} - {}", status, text);
+        }
+        resp.json()
+            .await
+            .context("Failed to parse index commit response")
+    }
+
+    pub async fn admin_index_evict_writer(&self, index: &str) -> Result<JsonValue> {
+        let url = self
+            .base_url
+            .join(&format!("_admin/index/{}/evict_writer", index))?;
+        let resp = self.http.post(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Admin index evict-writer failed: {} - {}", status, text);
+        }
+        resp.json()
+            .await
+            .context("Failed to parse index evict-writer response")
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

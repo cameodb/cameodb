@@ -827,8 +827,8 @@ impl IndexCompleter {
 
     fn command_suggestions(&self, prefix: &str) -> Vec<Pair> {
         let commands = vec![
-            "health", "list", "search", "schema", "data", "delete", "connect", "conn", "exit",
-            "quit", "help",
+            "health", "list", "search", "schema", "data", "delete", "admin", "connect", "conn",
+            "exit", "quit", "help",
         ];
         commands
             .into_iter()
@@ -927,6 +927,42 @@ impl IndexCompleter {
         } else {
             Vec::new()
         }
+    }
+
+    fn admin_subcommand_suggestions(&self, prefix: &str) -> Vec<Pair> {
+        let subcommands = vec!["memory", "index"];
+        subcommands
+            .into_iter()
+            .filter(|sub| sub.starts_with(prefix))
+            .map(|sub| Pair {
+                display: sub.to_string(),
+                replacement: sub.to_string(),
+            })
+            .collect()
+    }
+
+    fn admin_memory_operation_suggestions(&self, prefix: &str) -> Vec<Pair> {
+        let operations = vec!["stats", "trim"];
+        operations
+            .into_iter()
+            .filter(|op| op.starts_with(prefix))
+            .map(|op| Pair {
+                display: op.to_string(),
+                replacement: op.to_string(),
+            })
+            .collect()
+    }
+
+    fn admin_index_operation_suggestions(&self, prefix: &str) -> Vec<Pair> {
+        let operations = vec!["commit", "evict-writer"];
+        operations
+            .into_iter()
+            .filter(|op| op.starts_with(prefix))
+            .map(|op| Pair {
+                display: op.to_string(),
+                replacement: op.to_string(),
+            })
+            .collect()
     }
 
     fn list_subcommand_suggestions(&self, prefix: &str) -> Vec<Pair> {
@@ -1202,6 +1238,27 @@ impl IndexCompleter {
                 let start = current_start(tokens, current);
                 Some((start, suggestions))
             }
+            // Admin subcommands
+            "admin" if tokens.len() == 2 => {
+                let suggestions = self.admin_subcommand_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
+            "admin" if tokens.len() >= 2 && tokens[1] == "memory" && tokens.len() == 3 => {
+                let suggestions = self.admin_memory_operation_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
+            "admin" if tokens.len() >= 2 && tokens[1] == "index" && tokens.len() == 3 => {
+                let suggestions = self.index_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
+            "admin" if tokens.len() >= 3 && tokens[1] == "index" && tokens.len() == 4 => {
+                let suggestions = self.admin_index_operation_suggestions(current);
+                let start = current_start(tokens, current);
+                Some((start, suggestions))
+            }
             _ => None,
         }
     }
@@ -1292,6 +1349,30 @@ impl Hinter for IndexCompleter {
                 }
 
                 None
+            }
+            "admin" => {
+                let subcommand = parts.next()?;
+                match subcommand {
+                    "memory" => {
+                        let op = parts.next();
+                        if op.is_none() {
+                            return Some(" <stats|trim>".to_string());
+                        }
+                        None
+                    }
+                    "index" => {
+                        let index = parts.next();
+                        if index.is_none() {
+                            return Some(" <index>".to_string());
+                        }
+                        let op = parts.next();
+                        if op.is_none() {
+                            return Some(" <commit|evict-writer>".to_string());
+                        }
+                        None
+                    }
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -1419,6 +1500,47 @@ pub enum ClientCommand {
         #[arg(long, default_value_t = false)]
         delete_schema: bool,
     },
+
+    /// Admin operations
+    Admin {
+        /// Admin subcommand
+        #[command(subcommand)]
+        subcommand: AdminCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AdminCommand {
+    /// Memory management operations
+    Memory {
+        /// Memory operation to perform
+        #[arg(value_enum)]
+        operation: MemoryOperation,
+    },
+    /// Index admin operations
+    Index {
+        /// Target index name
+        index: String,
+        /// Operation to perform
+        #[arg(value_enum)]
+        operation: IndexAdminOperation,
+    },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum MemoryOperation {
+    /// Show memory statistics (process + jemalloc)
+    Stats,
+    /// Trigger jemalloc memory purge
+    Trim,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum IndexAdminOperation {
+    /// Force commit the index writer
+    Commit,
+    /// Evict the index writer from cache
+    EvictWriter,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -1560,6 +1682,28 @@ pub async fn run_cli() -> Result<()> {
             let result = client.delete_index(&index, delete_schema).await?;
             print_json(&result)?;
         }
+        ClientCommand::Admin { subcommand } => match subcommand {
+            AdminCommand::Memory { operation } => match operation {
+                MemoryOperation::Stats => {
+                    let result = client.admin_memory_stats().await?;
+                    print_json(&result)?;
+                }
+                MemoryOperation::Trim => {
+                    let result = client.admin_memory_trim().await?;
+                    print_json(&result)?;
+                }
+            },
+            AdminCommand::Index { index, operation } => match operation {
+                IndexAdminOperation::Commit => {
+                    let result = client.admin_index_commit(&index).await?;
+                    print_json(&result)?;
+                }
+                IndexAdminOperation::EvictWriter => {
+                    let result = client.admin_index_evict_writer(&index).await?;
+                    print_json(&result)?;
+                }
+            },
+        },
     }
 
     Ok(())
@@ -4114,7 +4258,7 @@ fn interactive_loop(
 
         if matches!(input.as_str(), "help" | "\\h") {
             println!(
-                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  connect <host[:port]>\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
+                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  admin memory stats\n  admin memory trim\n  admin index <name> commit\n  admin index <name> evict-writer\n  connect <host[:port]>\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
             );
             continue;
         }
@@ -4371,6 +4515,64 @@ async fn dispatch_interactive_command(
             session.reconnect(&target)?;
             println!("Connected to {}", session.display_host());
             session.refresh_index_cache().await;
+        }
+        "admin" => {
+            let subcommand = parts
+                .next()
+                .ok_or_else(|| anyhow!("Usage: admin <memory|index> ..."))?;
+            match subcommand {
+                "memory" => {
+                    let op = parts
+                        .next()
+                        .ok_or_else(|| anyhow!("Usage: admin memory <stats|trim>"))?;
+                    match op {
+                        "stats" => {
+                            let result = session.client().admin_memory_stats().await?;
+                            print_json(&result)?;
+                        }
+                        "trim" => {
+                            let result = session.client().admin_memory_trim().await?;
+                            print_json(&result)?;
+                        }
+                        other => {
+                            return Err(anyhow!(
+                                "Unknown memory operation '{}'. Use 'stats' or 'trim'.",
+                                other
+                            ));
+                        }
+                    }
+                }
+                "index" => {
+                    let index = parts.next().ok_or_else(|| {
+                        anyhow!("Usage: admin index <name> <commit|evict-writer>")
+                    })?;
+                    let op = parts.next().ok_or_else(|| {
+                        anyhow!("Usage: admin index <name> <commit|evict-writer>")
+                    })?;
+                    match op {
+                        "commit" => {
+                            let result = session.client().admin_index_commit(index).await?;
+                            print_json(&result)?;
+                        }
+                        "evict-writer" => {
+                            let result = session.client().admin_index_evict_writer(index).await?;
+                            print_json(&result)?;
+                        }
+                        other => {
+                            return Err(anyhow!(
+                                "Unknown index operation '{}'. Use 'commit' or 'evict-writer'.",
+                                other
+                            ));
+                        }
+                    }
+                }
+                other => {
+                    return Err(anyhow!(
+                        "Unknown admin subcommand '{}'. Use 'memory' or 'index'.",
+                        other
+                    ));
+                }
+            }
         }
         other => {
             return Err(anyhow!(
