@@ -179,7 +179,7 @@ impl CameoClient {
         &self.http
     }
 
-    pub async fn admin_memory_stats(&self) -> Result<JsonValue> {
+    pub async fn admin_memory_stats(&self) -> Result<AdminMemoryResponse> {
         let url = self.base_url.join("_admin/memory")?;
         let resp = self.http.get(url).send().await?;
         let status = resp.status();
@@ -192,7 +192,7 @@ impl CameoClient {
             .context("Failed to parse memory stats response")
     }
 
-    pub async fn admin_memory_trim(&self) -> Result<JsonValue> {
+    pub async fn admin_memory_trim(&self) -> Result<AdminMemoryResponse> {
         let url = self.base_url.join("_admin/memory/trim")?;
         let resp = self.http.post(url).send().await?;
         let status = resp.status();
@@ -274,4 +274,34 @@ pub struct IndexInfo {
 pub struct IndexConfigResponse {
     #[serde(default)]
     pub fields: JsonValue,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminMemoryResponse {
+    pub before: ProcessMemoryStats,
+    pub after: Option<ProcessMemoryStats>,
+    pub jemalloc: Option<JemallocStats>,
+    pub memory_purge_supported: bool,
+    pub memory_purge_result: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProcessMemoryStats {
+    pub vm_size_kb: Option<u64>,
+    pub vm_rss_kb: Option<u64>,
+    pub rss_anon_kb: Option<u64>,
+    pub rss_file_kb: Option<u64>,
+    pub rss_shmem_kb: Option<u64>,
+    pub vm_data_kb: Option<u64>,
+    pub vm_swap_kb: Option<u64>,
+    pub threads: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JemallocStats {
+    pub allocated: Option<u64>,
+    pub active: Option<u64>,
+    pub resident: Option<u64>,
+    pub metadata: Option<u64>,
+    pub retained: Option<u64>,
 }

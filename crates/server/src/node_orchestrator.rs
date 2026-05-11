@@ -6141,6 +6141,22 @@ fn call_memory_purge() -> i32 {
 fn read_jemalloc_stats() -> JemallocStats {
     let mut stats = JemallocStats::default();
 
+    // Advance epoch to refresh cached statistics before reading.
+    let mut epoch: u64 = 1;
+    let mut epoch_sz = std::mem::size_of::<u64>();
+    let epoch_ret = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            b"epoch\0".as_ptr().cast(),
+            (&mut epoch as *mut u64).cast(),
+            &mut epoch_sz,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if epoch_ret != 0 {
+        tracing::warn!("jemalloc epoch refresh failed with code {}", epoch_ret);
+    }
+
     let read_u64 = |name: &[u8]| -> Option<u64> {
         let mut value: u64 = 0;
         let mut sz = std::mem::size_of::<u64>();
@@ -6153,7 +6169,17 @@ fn read_jemalloc_stats() -> JemallocStats {
                 0,
             )
         };
-        if ret == 0 { Some(value) } else { None }
+        if ret == 0 {
+            Some(value)
+        } else {
+            tracing::warn!(
+                "jemalloc mallctl '{}' failed with code {} (errno {})",
+                String::from_utf8_lossy(&name[..name.len().saturating_sub(1)]),
+                ret,
+                ret
+            );
+            None
+        }
     };
 
     stats.allocated = read_u64(b"stats.allocated\0");
@@ -6215,18 +6241,24 @@ impl Message<GetAdminMemory> for NodeOrchestrator {
         _msg: GetAdminMemory,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        #[cfg(target_os = "linux")]
-        let jemalloc = Some(read_jemalloc_stats());
-        #[cfg(not(target_os = "linux"))]
-        let jemalloc = None;
+        let report = tokio::task::spawn_blocking(|| {
+            #[cfg(target_os = "linux")]
+            let jemalloc = Some(read_jemalloc_stats());
+            #[cfg(not(target_os = "linux"))]
+            let jemalloc = None;
 
-        Ok(AdminMemoryReport {
-            before: read_process_memory_stats(),
-            after: None,
-            jemalloc,
-            memory_purge_supported: cfg!(target_os = "linux"),
-            memory_purge_result: None,
+            AdminMemoryReport {
+                before: read_process_memory_stats(),
+                after: None,
+                jemalloc,
+                memory_purge_supported: cfg!(target_os = "linux"),
+                memory_purge_result: None,
+            }
         })
+        .await
+        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+
+        Ok(report)
     }
 }
 
@@ -6238,25 +6270,31 @@ impl Message<TrimAdminMemory> for NodeOrchestrator {
         _msg: TrimAdminMemory,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let before = read_process_memory_stats();
-        #[cfg(target_os = "linux")]
-        let memory_purge_result = Some(call_memory_purge());
-        #[cfg(not(target_os = "linux"))]
-        let memory_purge_result = None;
-        let after = read_process_memory_stats();
+        let report = tokio::task::spawn_blocking(|| {
+            let before = read_process_memory_stats();
+            #[cfg(target_os = "linux")]
+            let memory_purge_result = Some(call_memory_purge());
+            #[cfg(not(target_os = "linux"))]
+            let memory_purge_result = None;
+            let after = read_process_memory_stats();
 
-        #[cfg(target_os = "linux")]
-        let jemalloc = Some(read_jemalloc_stats());
-        #[cfg(not(target_os = "linux"))]
-        let jemalloc = None;
+            #[cfg(target_os = "linux")]
+            let jemalloc = Some(read_jemalloc_stats());
+            #[cfg(not(target_os = "linux"))]
+            let jemalloc = None;
 
-        Ok(AdminMemoryReport {
-            before,
-            after: Some(after),
-            jemalloc,
-            memory_purge_supported: cfg!(target_os = "linux"),
-            memory_purge_result,
+            AdminMemoryReport {
+                before,
+                after: Some(after),
+                jemalloc,
+                memory_purge_supported: cfg!(target_os = "linux"),
+                memory_purge_result,
+            }
         })
+        .await
+        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+
+        Ok(report)
     }
 }
 
