@@ -617,8 +617,7 @@ pub struct AdminMemoryReport {
     pub before: ProcessMemoryStats,
     pub after: Option<ProcessMemoryStats>,
     pub jemalloc: Option<JemallocStats>,
-    pub memory_purge_supported: bool,
-    pub memory_purge_result: Option<i32>,
+    pub purge_result: Option<i32>,
 }
 
 /// Per-shard error detail for index admin operations.
@@ -6135,6 +6134,7 @@ impl NodeOrchestrator {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn read_process_memory_stats() -> ProcessMemoryStats {
     let mut stats = ProcessMemoryStats::default();
     let Ok(contents) = fs::read_to_string("/proc/self/status") else {
@@ -6161,6 +6161,11 @@ fn read_process_memory_stats() -> ProcessMemoryStats {
         }
     }
     stats
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_process_memory_stats() -> ProcessMemoryStats {
+    ProcessMemoryStats::default()
 }
 
 #[cfg(target_os = "linux")]
@@ -6298,8 +6303,7 @@ impl Message<GetAdminMemory> for NodeOrchestrator {
                 before: read_process_memory_stats(),
                 after: None,
                 jemalloc,
-                memory_purge_supported: cfg!(target_os = "linux"),
-                memory_purge_result: None,
+                purge_result: None,
             }
         })
         .await
@@ -6322,9 +6326,9 @@ impl Message<TrimAdminMemory> for NodeOrchestrator {
         let report = tokio::task::spawn_blocking(move || {
             let before = read_process_memory_stats();
             #[cfg(target_os = "linux")]
-            let memory_purge_result = Some(call_memory_purge(force));
+            let purge_result = Some(call_memory_purge(force));
             #[cfg(not(target_os = "linux"))]
-            let memory_purge_result = None;
+            let purge_result = None;
             let after = read_process_memory_stats();
 
             #[cfg(target_os = "linux")]
@@ -6336,8 +6340,7 @@ impl Message<TrimAdminMemory> for NodeOrchestrator {
                 before,
                 after: Some(after),
                 jemalloc,
-                memory_purge_supported: cfg!(target_os = "linux"),
-                memory_purge_result,
+                purge_result,
             }
         })
         .await

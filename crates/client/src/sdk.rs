@@ -287,8 +287,7 @@ pub struct AdminMemoryResponse {
     pub before: ProcessMemoryStats,
     pub after: Option<ProcessMemoryStats>,
     pub jemalloc: Option<JemallocStats>,
-    pub memory_purge_supported: bool,
-    pub memory_purge_result: Option<i32>,
+    pub purge_result: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
