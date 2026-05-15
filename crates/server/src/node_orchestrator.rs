@@ -591,32 +591,48 @@ pub struct GetShardStats {
 /// Memory snapshot read from /proc/self/status (Linux-only; fields are None on other OSes).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProcessMemoryStats {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_size_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_rss_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rss_anon_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rss_file_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rss_shmem_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_data_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_swap_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub threads: Option<u64>,
 }
 
 /// Jemalloc-native allocator statistics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JemallocStats {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allocated: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub active: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resident: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retained: Option<u64>,
 }
 
-/// Report returned by GET /_admin/memory and POST /_admin/memory/trim.
+/// Report returned by GET /_admin/memory and POST /_admin/memory/purge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminMemoryReport {
-    pub before: ProcessMemoryStats,
-    pub after: Option<ProcessMemoryStats>,
+    pub process: ProcessMemoryStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_after_purge: Option<ProcessMemoryStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub jemalloc: Option<JemallocStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub purge_result: Option<i32>,
 }
 
@@ -650,7 +666,7 @@ pub struct AdminIndexEvictWriterReport {
 pub struct GetAdminMemory;
 
 #[derive(Debug, Clone)]
-pub struct TrimAdminMemory {
+pub struct PurgeAdminMemory {
     pub force: bool,
 }
 
@@ -2385,12 +2401,12 @@ impl RouterActor {
         })
     }
 
-    pub async fn admin_trim_memory(
+    pub async fn admin_purge_memory(
         &self,
         force: bool,
     ) -> Result<AdminMemoryReport, OrchestratorError> {
         self.orchestrator
-            .ask(TrimAdminMemory { force })
+            .ask(PurgeAdminMemory { force })
             .await
             .map_err(|e| {
                 OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
@@ -6163,9 +6179,71 @@ fn read_process_memory_stats() -> ProcessMemoryStats {
     stats
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn read_process_memory_stats() -> ProcessMemoryStats {
-    ProcessMemoryStats::default()
+    let mut stats = ProcessMemoryStats::default();
+    unsafe {
+        let pid = std::process::id() as i32;
+        let mut info: libc::proc_taskinfo = std::mem::zeroed();
+        let size = libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<libc::proc_taskinfo>() as i32,
+        );
+        if size == std::mem::size_of::<libc::proc_taskinfo>() as i32 {
+            stats.vm_rss_kb = Some(info.pti_resident_size / 1024);
+            stats.vm_size_kb = Some(info.pti_virtual_size / 1024);
+            stats.threads = Some(info.pti_threadnum as u64);
+        } else {
+            tracing::warn!("proc_pidinfo(PROC_PIDTASKINFO) failed, size={}", size);
+        }
+    }
+    stats
+}
+
+#[cfg(target_os = "windows")]
+fn read_process_memory_stats() -> ProcessMemoryStats {
+    let mut stats = ProcessMemoryStats::default();
+    let pid = std::process::id();
+    let output = match std::process::Command::new("wmic")
+        .args([
+            "process",
+            "where",
+            &format!("ProcessId={}", pid),
+            "get",
+            "VirtualSize,WorkingSetSize,ThreadCount",
+            "/format:list",
+        ])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("wmic command failed: {}", e);
+            return stats;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Format: key=value lines, e.g.:
+    //   ThreadCount=12
+    //   VirtualSize=2150400000
+    //   WorkingSetSize=46208000
+    for line in stdout.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Ok(num) = value.trim().parse::<u64>() else {
+            continue;
+        };
+        match key.trim() {
+            "VirtualSize" => stats.vm_size_kb = Some(num / 1024),
+            "WorkingSetSize" => stats.vm_rss_kb = Some(num / 1024),
+            "ThreadCount" => stats.threads = Some(num),
+            _ => {}
+        }
+    }
+    stats
 }
 
 #[cfg(target_os = "linux")]
@@ -6300,8 +6378,8 @@ impl Message<GetAdminMemory> for NodeOrchestrator {
             let jemalloc = None;
 
             AdminMemoryReport {
-                before: read_process_memory_stats(),
-                after: None,
+                process: read_process_memory_stats(),
+                process_after_purge: None,
                 jemalloc,
                 purge_result: None,
             }
@@ -6313,23 +6391,23 @@ impl Message<GetAdminMemory> for NodeOrchestrator {
     }
 }
 
-impl Message<TrimAdminMemory> for NodeOrchestrator {
+impl Message<PurgeAdminMemory> for NodeOrchestrator {
     type Reply = Result<AdminMemoryReport, OrchestratorError>;
 
     async fn handle(
         &mut self,
-        msg: TrimAdminMemory,
+        msg: PurgeAdminMemory,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         #[allow(unused_variables)]
         let force = msg.force;
         let report = tokio::task::spawn_blocking(move || {
-            let before = read_process_memory_stats();
+            let process = read_process_memory_stats();
             #[cfg(target_os = "linux")]
             let purge_result = Some(call_memory_purge(force));
             #[cfg(not(target_os = "linux"))]
             let purge_result = None;
-            let after = read_process_memory_stats();
+            let process_after_purge = read_process_memory_stats();
 
             #[cfg(target_os = "linux")]
             let jemalloc = Some(read_jemalloc_stats());
@@ -6337,8 +6415,8 @@ impl Message<TrimAdminMemory> for NodeOrchestrator {
             let jemalloc = None;
 
             AdminMemoryReport {
-                before,
-                after: Some(after),
+                process,
+                process_after_purge: Some(process_after_purge),
                 jemalloc,
                 purge_result,
             }

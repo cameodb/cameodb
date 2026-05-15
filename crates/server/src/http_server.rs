@@ -1257,7 +1257,7 @@ pub fn create_router(state: AppState, max_body_size_mb: usize) -> (Router, McpSh
         .route("/_cluster/_indexes", get(list_cluster_indexes_handler))
         // Admin endpoints
         .route("/_admin/memory", get(admin_memory_handler))
-        .route("/_admin/memory/trim", post(admin_memory_trim_handler))
+        .route("/_admin/memory/purge", post(admin_memory_purge_handler))
         .route(
             "/_admin/index/{index}/commit",
             post(admin_index_commit_handler),
@@ -1841,11 +1841,11 @@ async fn admin_memory_handler(
     Ok(Json(state.router.admin_memory().await?))
 }
 
-async fn admin_memory_trim_handler(
+async fn admin_memory_purge_handler(
     State(state): State<AppState>,
-    Query(params): Query<AdminTrimParams>,
+    Query(params): Query<AdminPurgeParams>,
 ) -> Result<Json<AdminMemoryReport>, AppError> {
-    Ok(Json(state.router.admin_trim_memory(params.force).await?))
+    Ok(Json(state.router.admin_purge_memory(params.force).await?))
 }
 
 async fn admin_index_commit_handler(
@@ -2054,7 +2054,7 @@ struct DeleteIndexParams {
 }
 
 #[derive(Deserialize, Default)]
-struct AdminTrimParams {
+struct AdminPurgeParams {
     force: bool,
 }
 

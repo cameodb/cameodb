@@ -192,8 +192,8 @@ impl CameoClient {
             .context("Failed to parse memory stats response")
     }
 
-    pub async fn admin_memory_trim(&self, force: bool) -> Result<AdminMemoryResponse> {
-        let mut url = self.base_url.join("_admin/memory/trim")?;
+    pub async fn admin_memory_purge(&self, force: bool) -> Result<AdminMemoryResponse> {
+        let mut url = self.base_url.join("_admin/memory/purge")?;
         if force {
             url.query_pairs_mut().append_pair("force", "true");
         }
@@ -201,11 +201,11 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Admin memory trim failed: {} - {}", status, text);
+            anyhow::bail!("Admin memory purge failed: {} - {}", status, text);
         }
         resp.json()
             .await
-            .context("Failed to parse memory trim response")
+            .context("Failed to parse memory purge response")
     }
 
     pub async fn admin_index_commit(&self, index: &str) -> Result<AdminIndexCommitResponse> {
@@ -284,30 +284,46 @@ pub struct IndexConfigResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AdminMemoryResponse {
-    pub before: ProcessMemoryStats,
-    pub after: Option<ProcessMemoryStats>,
+    pub process: ProcessMemoryStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_after_purge: Option<ProcessMemoryStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub jemalloc: Option<JemallocStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub purge_result: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProcessMemoryStats {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_size_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_rss_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rss_anon_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rss_file_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rss_shmem_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_data_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_swap_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub threads: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JemallocStats {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allocated: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub active: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resident: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retained: Option<u64>,
 }
 

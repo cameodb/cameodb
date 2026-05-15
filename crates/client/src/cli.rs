@@ -942,7 +942,7 @@ impl IndexCompleter {
     }
 
     fn admin_memory_operation_suggestions(&self, prefix: &str) -> Vec<Pair> {
-        let operations = vec!["stats", "trim"];
+        let operations = vec!["stats", "purge"];
         operations
             .into_iter()
             .filter(|op| op.starts_with(prefix))
@@ -1356,9 +1356,9 @@ impl Hinter for IndexCompleter {
                     "memory" => {
                         let op = parts.next();
                         if op.is_none() {
-                            return Some(" <stats|trim>".to_string());
+                            return Some(" <stats|purge>".to_string());
                         }
-                        if op == Some("trim") {
+                        if op == Some("purge") {
                             let has_force = parts.any(|p| p == "--force");
                             if !has_force {
                                 return Some(" [--force]".to_string());
@@ -1541,7 +1541,7 @@ pub enum MemoryOperation {
     /// Show memory statistics (process + jemalloc)
     Stats,
     /// Trigger jemalloc memory purge
-    Trim,
+    Purge,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -1697,8 +1697,8 @@ pub async fn run_cli() -> Result<()> {
                     let result = client.admin_memory_stats().await?;
                     print_json(&result)?;
                 }
-                MemoryOperation::Trim => {
-                    let result = client.admin_memory_trim(force).await?;
+                MemoryOperation::Purge => {
+                    let result = client.admin_memory_purge(force).await?;
                     print_json(&result)?;
                 }
             },
@@ -4267,7 +4267,7 @@ fn interactive_loop(
 
         if matches!(input.as_str(), "help" | "\\h") {
             println!(
-                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  admin memory stats\n  admin memory trim [--force]\n  admin index <name> commit\n  admin index <name> evict-writer\n  connect <host[:port]>\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
+                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  admin memory stats\n  admin memory purge [--force]\n  admin index <name> commit\n  admin index <name> evict-writer\n  connect <host[:port]>\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
             );
             continue;
         }
@@ -4533,20 +4533,20 @@ async fn dispatch_interactive_command(
                 "memory" => {
                     let op = parts
                         .next()
-                        .ok_or_else(|| anyhow!("Usage: admin memory <stats|trim>"))?;
+                        .ok_or_else(|| anyhow!("Usage: admin memory <stats|purge>"))?;
                     match op {
                         "stats" => {
                             let result = session.client().admin_memory_stats().await?;
                             print_json(&result)?;
                         }
-                        "trim" => {
+                        "purge" => {
                             let force = parts.any(|p| p == "--force");
-                            let result = session.client().admin_memory_trim(force).await?;
+                            let result = session.client().admin_memory_purge(force).await?;
                             print_json(&result)?;
                         }
                         other => {
                             return Err(anyhow!(
-                                "Unknown memory operation '{}'. Use 'stats' or 'trim'.",
+                                "Unknown memory operation '{}'. Use 'stats' or 'purge'.",
                                 other
                             ));
                         }
