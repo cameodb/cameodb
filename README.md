@@ -22,6 +22,8 @@ By leveraging the **Kameo** actor framework and **Tokio**'s async runtime, Cameo
 * **Intelligent Data Loader:** Robust, zero-copy ingestion pipeline that transparently handles multiple formats (`CSV`, `TSV`, `JSON`, `JSONL`) and on-the-fly decompression (`Gzip`, `Bzip2`, `Zstd`, `XZ`, `LZ4`, `Deflate`). It supports loading from local disk, distributed network files, and directly streaming from HTTP(S) endpoints.
 * **Consistent Hybrid Recovery:** Guarantees data consistency during startup by automatically recovering and syncing uncommitted records from the ACID datastore (KV) into the search index.
 * **Graceful Shutdowns:** Multi-phase process ensuring zero WAL replay on clean reboots.
+* **Production Memory Management:** Jemalloc allocator with per-CPU arenas, background purge threads, and runtime admin endpoints for memory diagnostics and manual intervention.
+* **Writer Core Pinning:** Optional CPU core affinity for shard writer threads to improve cache locality and reduce scheduling jitter on the write hot path.
 
 ## 📦 Quick Start (Docker)
 
@@ -81,6 +83,8 @@ cameodb@localhost:9480 ▶ health
 cameodb@localhost:9480 ▶ schema detect ./examples/data/booksummaries.tsv
 cameodb@localhost:9480 ▶ data load books ./examples/data/booksummaries.tsv
 cameodb@localhost:9480 ▶ search books "title:Hitchhiker" limit 10
+cameodb@localhost:9480 ▶ admin memory stats
+cameodb@localhost:9480 ▶ admin memory purge --force
 ```
 
 ### 🗜️ Supported Ingestion Formats

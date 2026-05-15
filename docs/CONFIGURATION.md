@@ -129,6 +129,39 @@ search_threads = 8
 default_search_limit = 10
 ```
 
+### Storage Configuration
+
+```toml
+[storage]
+# Data directories for shard storage (default: ["./data/cameodb"])
+data_paths = ["./data/cameodb"]
+
+# Disk usage alert threshold in percent (default: 90)
+disk_usage_threshold_percent = 90
+
+# Enable fsync after WAL batches for durability (default: true)
+wal_sync = true
+
+# WAL segment size in MB (default: 64)
+wal_segment_size_mb = 64
+
+# Default batch size for bulk ingestion (default: 5000)
+default_batch_size = 5000
+
+# Initial number of shards per index (default: 4)
+num_shards_init = 4
+
+# Maximum shards allowed on this node (default: 8)
+max_shards_per_node = 8
+
+# Pin each shard's writer thread to a dedicated CPU core (default: true)
+writer_core_affinity = true
+```
+
+#### Core Pinning (`writer_core_affinity`)
+
+When enabled, each shard's dedicated writer thread is pinned to a CPU core determined by `xxh3_64(shard_uuid) % num_cores`. This keeps redb/tantivy data structures cache-hot and reduces scheduling jitter on the write hot path. Zero behavioral change when disabled (OS scheduler manages thread placement).
+
 ### Cluster Configuration
 
 ```toml
@@ -297,6 +330,7 @@ wal_sync = true  # Enable for durability
 wal_segment_size_mb = 128
 default_batch_size = 1000
 max_shards_per_node = 20
+writer_core_affinity = true
 
 [search]
 indexer_memory_min_mb = 64

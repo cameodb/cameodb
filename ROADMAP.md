@@ -104,12 +104,29 @@ This document outlines the current development priorities and optimization roadm
 
 ---
 
+## Phase 11.5: Jemalloc Memory Management ✅ COMPLETED
+
+**Implementation Summary:**
+- **Jemalloc integration**: Integrated `tikv-jemallocator` and `tikv-jemalloc-sys` (with `stats` feature) on Linux targets for production memory management.
+- **Admin HTTP endpoints**: Added `GET /_admin/memory` (stats) and `POST /_admin/memory/purge` (manual purge with optional `force` flag).
+- **Admin CLI commands**: Added `admin memory stats` and `admin memory purge [--force]` to the interactive CLI and command-line client.
+- **Typed response structs**: `AdminMemoryReport`, `ProcessMemoryStats`, `JemallocStats` with platform-aware field omission (null fields excluded from JSON).
+- **Cross-platform stats**: Linux uses `/proc/self/status`, macOS uses `proc_pidinfo` syscall, Windows uses `wmic process` — all providing RSS, VSZ, and thread count.
+- **Jemalloc purge**: Decay-based purge (respects `dirty_decay_ms`) and aggressive purge (bypasses timers). Returns `process` (before) and `process_after_purge` snapshots plus `purge_result`.
+- **Systemd service tuning**: `cameodb.service` ships with production `MALLOC_CONF`: `background_thread:true,percpu_arena:percpu,oversize_threshold:0,dirty_decay_ms:2000,muzzy_decay_ms:0`.
+
+**Default `MALLOC_CONF` rationale:**
+- `dirty_decay_ms:2000` — balances throughput for 8-32 parallel writers while keeping memory pressure reasonable. Override via `systemctl edit cameodb` if RSS becomes a concern.
+
+---
+
 ## Summary & Next Steps
 
 ### **Current Status**
 - ✅ **Phases 1-9**: All completed and archived
 - ✅ **Phase 10 (Field Projection)**: Completed – query string parsing, routing propagation, and JSON filtering fully implemented and tested.
 - ✅ **Phase 11 (Workflow Hot-Path Optimizations)**: All 7 steps completed and verified.
+- ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed — cross-platform memory stats, jemalloc purge endpoints, systemd tuning.
 
 ### **Recommended Next Steps**
 1. **Follow-up Validation**: Benchmark the completed Phase 11 hot-path improvements under broadcast-heavy and ingestion-heavy workloads

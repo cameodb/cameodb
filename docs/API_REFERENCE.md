@@ -357,3 +357,127 @@ curl -s http://localhost:9480/_cluster/health
 }
 ```
 
+#### Memory Statistics
+Get process memory and jemalloc allocator statistics.
+
+```bash
+GET /_admin/memory
+```
+
+**Example:**
+```bash
+curl -s http://localhost:9480/_admin/memory
+```
+
+**Response (Linux with jemalloc):**
+```json
+{
+  "process": {
+    "vm_rss_kb": 46208,
+    "vm_size_kb": 2150400,
+    "rss_anon_kb": 39000,
+    "rss_file_kb": 7208,
+    "vm_data_kb": 123000,
+    "threads": 12
+  },
+  "jemalloc": {
+    "allocated": 33554432,
+    "active": 41943040,
+    "resident": 47349760,
+    "metadata": 1048576,
+    "retained": 8388608
+  }
+}
+```
+
+> **Note:** Fields vary by platform. macOS and Windows provide `vm_rss_kb`, `vm_size_kb`, and `threads`. Linux additionally provides `rss_anon_kb`, `rss_file_kb`, `rss_shmem_kb`, `vm_data_kb`, `vm_swap_kb`, and jemalloc-native stats (when jemalloc is enabled). Fields that cannot be determined on a platform are omitted.
+
+#### Memory Purge
+Trigger a jemalloc memory purge to return dirty pages to the OS.
+
+```bash
+POST /_admin/memory/purge?force=<bool>
+```
+
+**Parameters:**
+- `force` (query, optional, default: `false`): When `true`, performs an aggressive purge that bypasses decay timers and immediately purges all dirty and muzzy pages. When `false`, uses decay-based purge respecting `dirty_decay_ms` / `muzzy_decay_ms`.
+
+**Example (decay-based purge):**
+```bash
+curl -s -X POST http://localhost:9480/_admin/memory/purge
+```
+
+**Example (aggressive purge):**
+```bash
+curl -s -X POST 'http://localhost:9480/_admin/memory/purge?force=true'
+```
+
+**Response:**
+```json
+{
+  "process": {
+    "vm_rss_kb": 46208,
+    "vm_size_kb": 2150400,
+    "threads": 12
+  },
+  "process_after_purge": {
+    "vm_rss_kb": 32100,
+    "vm_size_kb": 2150400,
+    "threads": 12
+  },
+  "jemalloc": {
+    "allocated": 33554432,
+    "active": 41943040,
+    "resident": 32833536
+  },
+  "purge_result": 0
+}
+```
+
+> **Note:** `purge_result` is `0` on success, non-zero jemalloc `mallctl` error code on failure. `process_after_purge` shows memory state after the purge. On non-Linux platforms, jemalloc and `purge_result` are omitted.
+
+#### Index Commit
+Force an index writer commit across all shards for the given index.
+
+```bash
+POST /_admin/index/{index}/commit
+```
+
+**Example:**
+```bash
+curl -s -X POST http://localhost:9480/_admin/index/books/commit
+```
+
+**Response:**
+```json
+{
+  "index": "books",
+  "shards_total": 4,
+  "shards_committed": 4,
+  "errors": []
+}
+```
+
+#### Evict Index Writer
+Evict the index writer from cache for the given index, freeing its memory.
+
+```bash
+POST /_admin/index/{index}/evict_writer
+```
+
+**Example:**
+```bash
+curl -s -X POST http://localhost:9480/_admin/index/books/evict_writer
+```
+
+**Response:**
+```json
+{
+  "index": "books",
+  "shards_total": 4,
+  "writers_evicted": 4,
+  "writers_missing": 0,
+  "errors": []
+}
+```
+

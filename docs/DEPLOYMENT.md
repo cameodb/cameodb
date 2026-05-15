@@ -203,5 +203,51 @@ docker-compose logs -f
 docker-compose down -v
 ```
 
+## 🐧 Production Deployment with systemd
+
+CameoDB ships with a systemd service file (`crates/server/cameodb.service`) configured for production workloads with jemalloc memory tuning.
+
+### Jemalloc Memory Tuning
+
+CameoDB uses `tikv-jemallocator` as its memory allocator on Linux. The service file sets `MALLOC_CONF` for optimal performance with pinned shard threads:
+
+```ini
+Environment=MALLOC_CONF=background_thread:true,percpu_arena:percpu,oversize_threshold:0,dirty_decay_ms:2000,muzzy_decay_ms:0
+```
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| `background_thread:true` | — | Background purging doesn't block writer threads |
+| `percpu_arena:percpu` | — | One arena per CPU core, optimal for pinned shard threads |
+| `oversize_threshold:0` | — | All allocations share per-CPU arenas |
+| `dirty_decay_ms:2000` | 2s | Dirty pages held for 2s before background purge (tuned for 8-32 parallel writers) |
+| `muzzy_decay_ms:0` | immediate | Muzzy pages released immediately |
+
+To override per-deployment, use `systemctl edit cameodb` rather than editing the packaged service file:
+
+```bash
+sudo systemctl edit cameodb
+# Add:
+[Service]
+Environment=MALLOC_CONF=background_thread:true,percpu_arena:percpu,oversize_threshold:0,dirty_decay_ms:1000,muzzy_decay_ms=0
+```
+
+### Admin Memory Operations
+
+CameoDB exposes memory management endpoints for runtime diagnostics and manual intervention:
+
+```bash
+# Get process + jemalloc memory statistics
+curl -s http://localhost:9480/_admin/memory
+
+# Trigger decay-based memory purge (respects dirty_decay_ms)
+curl -s -X POST http://localhost:9480/_admin/memory/purge
+
+# Trigger aggressive purge (bypasses decay timers)
+curl -s -X POST 'http://localhost:9480/_admin/memory/purge?force=true'
+```
+
+These endpoints are useful after large bulk ingestions to verify memory has been returned to the OS, or during memory pressure investigations.
+
 For more details, see the [Docker README](docker/README.md), which includes the latest swarm environment variables and configuration guidance.
 
