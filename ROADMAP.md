@@ -71,36 +71,16 @@ This document outlines the current development priorities and optimization roadm
 
 ---
 
-## Phase 11: Read/Write Workflow Hot-Path Optimizations 🚧 IN PROGRESS
+## Phase 11: Read/Write Workflow Hot-Path Optimizations ✅ COMPLETED
 
-**Implementation Steps:**
-1. **Remove Tantivy ID roundtrip in search hits** ✅ COMPLETED
-   - Replace the current `TantivyDocument -> JSON string -> serde_json::Value -> id extraction` flow with direct extraction of stored `id` field values from Tantivy search results.
-   - Reduce per-hit allocation and parsing overhead in `HybridStore::search_documents()`.
-
-2. **Tighten duplicate work inside `apply_batch()`** ✅ COMPLETED
-   - Reuse already loaded schema and prepared document state throughout the batch path.
-   - Eliminate repeated shadow filtering, repeated schema lookups, and avoidable re-serialization/deserialization inside the per-operation loop.
-
-3. **Enforce configured shard and remote concurrency limits** ✅ COMPLETED
-   - Apply `max_concurrent_shard_searches` and `max_concurrent_remote_searches` in scatter-gather paths with bounded concurrency.
-   - Prevent search fan-out from oversubscribing local resources or remote peers under wide broadcasts.
-
-4. **Reduce worker-pool coordination contention** ✅ COMPLETED
-   - Revisit the shared receiver mutex in the orchestrator worker pool and move toward a lower-contention queue design.
-   - Preserve the hot-path worker model while improving throughput under concurrent read/write load.
-
-5. **Improve early-termination and result-merge behavior** ✅ COMPLETED
-   - Refine broadcast search merging so early termination does not stop on count alone when higher-scoring remote hits may still arrive.
-   - Move toward bounded top-K merging with score-aware pruning.
-
-6. **Implement true end-to-end search streaming** ✅ COMPLETED
-   - Replace buffered result aggregation with incremental shard-to-router-to-HTTP streaming for NDJSON search responses.
-   - Keep projection, score metadata, and bounded backpressure-aware fan-in behavior.
-
-7. **Implement incremental write-stream ingestion** ✅ COMPLETED
-   - Replace whole-body buffering in `write_stream_handler` with incremental NDJSON decoding and bounded ingestion.
-   - Preserve shard routing, batch coalescing, and backpressure while lowering peak memory for large imports.
+**Implementation Summary:**
+1. **Remove Tantivy ID roundtrip in search hits** ✅ — Direct extraction of stored `id` field values from Tantivy search results, eliminating per-hit JSON parse overhead.
+2. **Tighten duplicate work inside `apply_batch()`** ✅ — Reuse schema and prepared document state; eliminate repeated shadow filtering and re-serialization.
+3. **Enforce configured shard and remote concurrency limits** ✅ — Bounded concurrency in scatter-gather paths.
+4. **Reduce worker-pool coordination contention** ✅ — Lower-contention queue design for hot-path workers.
+5. **Improve early-termination and result-merge behavior** ✅ — Bounded top-K merging with score-aware pruning.
+6. **Implement true end-to-end search streaming** ✅ — Incremental NDJSON streaming with backpressure-aware fan-in.
+7. **Implement incremental write-stream ingestion** ✅ — Incremental NDJSON decoding with bounded ingestion.
 
 ---
 
@@ -124,13 +104,16 @@ This document outlines the current development priorities and optimization roadm
 
 ### **Current Status**
 - ✅ **Phases 1-9**: All completed and archived
-- ✅ **Phase 10 (Field Projection)**: Completed – query string parsing, routing propagation, and JSON filtering fully implemented and tested.
-- ✅ **Phase 11 (Workflow Hot-Path Optimizations)**: All 7 steps completed and verified.
-- ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed — cross-platform memory stats, jemalloc purge endpoints, systemd tuning.
+- ✅ **Phase 10 (Field Projection)**: Completed
+- ✅ **Phase 11 (Workflow Hot-Path Optimizations)**: All 7 steps completed
+- ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed
+- ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, and resources completed; security/docs/testing planned
+- 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stage 1 (writer pinning) completed; Stages 2a–2f planned
 
 ### **Recommended Next Steps**
-1. **Follow-up Validation**: Benchmark the completed Phase 11 hot-path improvements under broadcast-heavy and ingestion-heavy workloads
-2. **Phase 12 (MCP Server Integration)**: Enable AI agents to efficiently search CameoDB indexes via Model Context Protocol
+1. **Phase 13 Stage 2a**: Shard-affine worker dispatch (highest ROI, lowest risk)
+2. **Phase 13 Stage 2b**: Extract admin memory module (refactoring prerequisite)
+3. **Phase 13 Stage 2c**: Auto-purge timer and per-index memory stats
 
 ---
 
@@ -229,9 +212,9 @@ This document outlines the current development priorities and optimization roadm
 
 ---
 
-## Phase 13: Thread-Per-Core Optimization for Write Operations 🎯 PLANNED
+## Phase 13: Thread-Per-Core & Memory Operations 🎯 IN PROGRESS
 
-**Objective**: Eliminate cross-core wakeups and cache thrashing on the write hot path by implementing shard-affine worker dispatch and per-shard core pinning. Achieve true thread-per-core semantics where each shard's compute (parse → route → enqueue → wait reply) executes on the same core as its writer thread.
+**Objective**: Eliminate cross-core wakeups and cache thrashing on the write hot path, improve memory observability, and extract admin code into maintainable modules. Each stage is linear, flag-gated, and independently testable.
 
 ### Current Architecture Analysis
 
@@ -243,155 +226,132 @@ This document outlines the current development priorities and optimization roadm
 - **Orchestrator Worker Pool** (async, mailbox-bypass):
   - One `mpsc::channel::<OrchestratorJob>` per worker (not shared)
   - `worker_count = max(1, min(local_shards * 2, cpu_cores * 2))`
-  - `per_worker_queue_capacity = ORCHESTRATOR_WORKER_QUEUE_CAPACITY (4096) / worker_count`
   - Dispatch is round-robin via `OrchestratorWorkerTx::try_send` (atomic counter, fall-through on Full)
   - Workers are tokio tasks on the main runtime — NOT pinned
 
 - **Per-Shard Dedicated Writer Thread** (sync OS thread):
-  - One OS thread per shard, named `writer-shard-<uuid>`, spawned via `std::thread::Builder`
+  - One OS thread per shard, named `writer-shard-<uuid>`
   - Receives `StorageCommand` over bounded `mpsc::channel` (capacity = 1024)
   - Implements write coalescing: blocks on first command, then `try_recv` drains up to 256 more
-  - Groups by `(operation_type, index)`, merges into single `apply_batch_and_maybe_commit` per index
   - Strictly serializes writes per shard (required by redb single-writer semantics)
-
-- **Tantivy Indexer Threads** (per index):
-  - `indexer_num_threads: 1` (default — optimal because writer thread is already serial)
-  - `merge_num_threads: 2` (background segment compaction)
-  - Extra threads spawned inside Tantivy per IndexWriter
 
 **Current Hot-Path Trace (Write):**
 ```
 HTTP req on axum tokio worker (any core)
-  → AppState::router.route_and_handle(op, ...)        [main rt task]
+  → AppState::router.route_and_handle(op, ...)
   → OrchestratorWorkerTx::try_send (round-robin)      [atomic fetch_add]
-  → mpsc::Sender<OrchestratorJob> (per-worker queue)
   → Orchestrator worker tokio task on main rt (any core, may migrate)
-  → engine.execute(op) → engine_write(...)            [routing, validation]
+  → engine.execute(op) → engine_write(...)
   → MicroshardActor.handle_write_via_channel
-  → mpsc::Sender<StorageCommand> (per-shard, cap 1024)
   → writer-shard-<uuid> OS thread (pinned in Stage 1)
   → reply via oneshot back across all the layers
 ```
 
-**Hops:** axum task → worker task → writer thread → reply path. Three queue boundaries, three potential context switches per write.
+---
 
 ### Stage 1: Writer Thread Core Pinning ✅ COMPLETED
 
-**Implementation:**
 - Added `core_affinity = "0.8"` dependency to `crates/server/Cargo.toml`
 - Added `writer_core_affinity: bool` to `NodeConfig`, `StorageConfig`, and `MicroshardActor`
 - When enabled, each shard's writer thread pins to `core_ids[xxh3_64(shard_uuid_bytes) % num_cores]`
-- Configurable via `[storage].writer_core_affinity` in `cameodb.toml` (default: false)
+- Configurable via `[storage].writer_core_affinity` in `cameodb.toml` (default: true)
 
-**Benefits:**
-- Improves cache locality for redb/tantivy data structures
-- Reduces cross-core wakeups on the write hot path
-- Zero behavioral change when disabled (default)
+---
 
-### Stage 2: Shard-Affine Worker Dispatch 🎯 PLANNED
+### Stage 2a: Shard-Affine Worker Dispatch 🎯 NEXT
 
-**Goal:** Eliminate the cross-thread/cross-core hop between orchestrator worker and per-shard writer thread for write/search hot paths.
+**Risk:** Low | **LOC:** ~50 | **Prerequisite:** None
 
-#### Architectural Variants
+**Goal:** Replace round-robin dispatch with shard-affine routing so that operations targeting the same shard always land on the same worker, reducing cross-core wakeups when writer pinning is enabled.
 
-**Variant A — Shard-affine round-robin (minimal change)**
-- Keep current pool topology but replace round-robin with hash-based dispatch
-- ~30 LOC change, no runtime restructuring
-- Shard ID must be known before dispatch (requires routing lookup before worker dispatch)
-- Fall-through to neighboring workers on `Full` to preserve throughput
-- Risk: one hot shard can saturate its worker queue
-
-**Variant B — Worker-per-shard (1:1 mapping)**
-- `worker_count = local_shards`
-- Each worker owns exactly one shard's hot path
-- Each worker is a single-threaded tokio runtime pinned to one core
-- Pros: zero contention between shards, trivial co-location with writer
-- Cons: multiple shards share cores when `local_shards > cpu_cores`, idle shards waste workers
-
-**Variant C — Worker-per-core, shard-pinned (RECOMMENDED)**
-- `worker_count = min(local_shards, cpu_cores - reserved)`
-- Shard → worker via `xxh3(shard_id) % worker_count`
-- Each worker = single-threaded tokio rt pinned to dedicated core
-- Shard writer thread pinned to SAME core as its worker
-- Read pool gets remaining cores
-- This is the canonical "thread-per-core" model (à la Glommio/Seastar/ScyllaDB)
-
-#### Recommended Architecture (Variant C)
-
-**Core Partitioning:**
-```
-total_cores = N (e.g. 16)
-reserved_cores = 2  (axum/kameo/coordinator/system tasks)
-write_cores = min(local_shards, N - reserved_cores - read_cores_min)
-read_cores = remaining
-
-For N=16, local_shards=4:
-  cores 0–1   → reserved (main runtime: axum, kameo, coordinator)
-  cores 2–5   → write_cores (one per shard)
-  cores 6–15  → read pool (10 threads)
-```
-
-**Component Topology:**
-
-| Component | Runtime | Threads | Pinned to |
-|---|---|---|---|
-| axum + kameo + coordinator | main multi-thread rt | `reserved_cores` | reserved set |
-| Orchestrator worker N | one single-thread rt **per shard** | 1 | `core[N + reserved]` |
-| Writer thread for shard N | std::thread (existing) | 1 | same core as worker N |
-| Read pool | dedicated multi-thread rt (existing) | rest | read core set |
-| Tantivy merge threads | global pool | configurable | read or reserved set |
-
-#### Implementation Plan
-
-**Step 1 — Compute core layout once at startup**
-- Add `CoreLayout` struct to `NodeOrchestrator` with `reserved`, `per_shard`, `read_pool` core vectors
-- Read total via `core_affinity::get_core_ids`
-- Partition by config: `storage.thread_per_core_mode = "auto"|"manual"|"disabled"`
-
-**Step 2 — Replace generic worker pool with per-shard single-thread runtimes**
-- Today: `tokio::spawn(async move { worker_loop })` on main rt
-- New: spawn `PinnedWorker` struct with dedicated `current_thread` runtime per shard
-- Use `on_thread_start` callback to pin each worker to its assigned core
-- Use `current_thread` runtime because orchestrator worker does minimal CPU work (mostly routing + channel sends)
-
-**Step 3 — Shard-aware dispatch**
-- Replace `OrchestratorWorkerTx::try_send` round-robin with shard-affine routing
+**Implementation:**
 - Add `affinity_shard: Option<Uuid>` to `OrchestratorJob::Execute`
-- For single-shard ops (Write, Read with routing key), compute routing key before dispatch
-- For broadcast/scatter ops, use round-robin fallback
+- Add `try_send_affine(&self, job, shard_id: Option<Uuid>)` to `OrchestratorWorkerTx`
+  - When `shard_id` is `Some`, route to `workers[xxh3(shard_id) % worker_count]`
+  - Fall through to neighboring workers on `Full` (preserve throughput)
+  - When `shard_id` is `None` (broadcast/scatter), fall back to round-robin
+- In `handle_client_op`, extract routing key from `ClientOp::Write`/`ClientOp::Search` before dispatch
+- Flag-gated via config, default preserves current round-robin behavior
 
-**Step 4 — Plumb shard_id through dispatch**
-- Two approaches:
-  - **Cheap**: Extract routing key in `try_send_affine` caller, compute ring lookup before dispatch
-  - **Clean**: Add `affinity_shard: Option<Uuid>` to `OrchestratorJob::Execute`
-- Recommended: Clean approach for maintainability
+**Expected Impact:**
+- Eliminates 1 cross-core wakeup per write when writer pinning is enabled
+- Cache locality: `Arc<HybridStore>`, `routing_ring`, `schema_cache` stay hot on same worker
+- Zero impact on broadcast/scatter operations (round-robin fallback)
 
-**Step 5 — Co-locate writer thread with its worker**
-- Replace Stage 1 hash-based pinning with direct lookup from `CoreLayout`
+---
+
+### Stage 2b: Extract Admin Memory Module 🎯 PLANNED
+
+**Risk:** Low | **LOC:** ~200 (mostly move) | **Prerequisite:** None (independent of 2a)
+
+**Goal:** Move memory-related types and functions out of the 6700-line `node_orchestrator.rs` into a dedicated module for maintainability and testability.
+
+**Implementation:**
+- Create `crates/server/src/admin/memory.rs` (new module)
+- Move into it:
+  - `ProcessMemoryStats`, `JemallocStats`, `AdminMemoryReport` structs
+  - `read_process_memory_stats()` (all platform variants)
+  - `read_jemalloc_stats()`, `call_memory_purge()`
+  - `PurgeAdminMemory` message struct
+- Add `pub mod admin;` to `main.rs` and `use` imports in `node_orchestrator.rs`
+- No behavioral changes — pure refactoring
+
+---
+
+### Stage 2c: Auto-Purge Timer & Per-Index Memory Stats 🎯 PLANNED
+
+**Risk:** Low | **LOC:** ~70 | **Prerequisite:** Stage 2b
+
+**Goal:** Add automatic periodic memory purge and per-index memory visibility.
+
+**2c.1 — Auto-Purge Timer:**
+- Add `auto_purge_interval_secs: u64` to `StorageConfig` (default: 0 = disabled)
+- When > 0, spawn a `tokio::time::interval` task that calls `call_memory_purge(false)` periodically
+- Prevents RSS creep under sustained write workloads without manual intervention
+- Config via `[storage] auto_purge_interval_secs = 300`
+
+**2c.2 — Per-Index Memory in `/_indexes`:**
+- Add optional `memory_mb: Option<u64>` per index to the `list_indexes` response
+- Derived from redb table sizes + tantivy index directory size on disk
+- Helps operators identify bloated indexes without hitting `/_admin/memory`
+
+---
+
+### Stage 2d: Co-Locate Writer Pinning with Worker Hash 🎯 PLANNED
+
+**Risk:** Low | **LOC:** ~10 | **Prerequisite:** Stage 2a
+
+**Goal:** Ensure the writer thread for shard X is pinned to the same core as the worker that handles shard X's operations.
+
+**Implementation:**
+- Add `CoreLayout` struct to `NodeOrchestrator` with `reserved`, `per_shard`, `read_pool` core vectors
+- Compute once at startup from `core_affinity::get_core_ids`
+- Replace Stage 1 hash-based pinning (`xxh3(shard_uuid) % num_cores`) with direct lookup from `CoreLayout`
 - Use same hash as worker dispatch: `layout.shard_core(shard_id)`
 - Guarantees: routing/validation/serialization (worker) + redb txn + tantivy commit (writer) all execute on same core
 
-#### Edge Cases & Risks
+---
 
-1. **Broadcast/scatter-gather** — fan out across all workers; affinity hint is `None` (acceptable, rare)
-2. **Dynamic shard creation** — worker assigned by hash already exists; writer pins to that core (no restructuring needed)
-3. **Shard migration** — only affects new node; no issue
-4. **`current_thread` runtime drawback** — only one task at a time on that core; mitigated by keeping validation cheap, spawning heavy work to read pool
-5. **Tokio's `LocalSet` semantics** — `Runtime::spawn` works without `block_on` (we're fine)
-6. **Backpressure semantics change** — affine routing exposes per-shard imbalance; expose per-worker queue depth as metric
-7. **`indexer_num_threads > 1`** — extra tantivy indexer threads spill to other cores (user's choice)
-8. **Tantivy merge threads** — currently global; recommend pinning to read core set (Stage 2.5)
-9. **Memory ordering** — `Relaxed` on round-robin counter only used for non-affine ops (semantics unchanged)
-10. **Test impact** — additive change, default `None` preserves current behavior
+### Stage 2e: Per-Shard Single-Thread Runtimes 🎯 PLANNED
 
-#### Configuration Surface
+**Risk:** Medium | **LOC:** ~150 | **Prerequisite:** Stages 2a + 2d validated
 
+**Goal:** Convert workers from `tokio::spawn` on main runtime to dedicated `current_thread` runtimes pinned per core — the full thread-per-core model.
+
+**Implementation:**
+- Spawn `PinnedWorker` struct with dedicated `current_thread` runtime per shard
+- Use `on_thread_start` callback to pin each worker to its assigned core
+- Use `current_thread` runtime because orchestrator worker does minimal CPU work (routing + channel sends)
+- Add `[runtime]` config section: `thread_per_core_mode`, `reserved_cores`, `read_cores_min`
+- Careful shutdown handling required (drain per-worker queues, join runtimes)
+
+**Configuration Surface:**
 ```toml
 [storage]
-writer_core_affinity = false              # Stage 1 — already done
+writer_core_affinity = true               # Stage 1 — already done
 
 [runtime]                                  # NEW section
-thread_per_core_mode = "auto"             # "disabled" | "auto" | "manual"
+thread_per_core_mode = "disabled"         # "disabled" | "auto" | "manual"
 reserved_cores = 2                        # for main rt (axum/kameo)
 read_cores_min = 2                        # min cores for read pool
 # manual override (only when mode = "manual"):
@@ -400,34 +360,47 @@ read_cores_min = 2                        # min cores for read pool
 # read_cores_list    = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 ```
 
-#### Phased Roll-Out
+**Edge Cases:**
+1. Broadcast/scatter-gather — fan out across all workers; affinity hint is `None` (acceptable)
+2. Dynamic shard creation — worker assigned by hash already exists; no restructuring needed
+3. `current_thread` runtime — only one task at a time; mitigated by keeping validation cheap
+4. Backpressure — affine routing exposes per-shard imbalance; expose per-worker queue depth as metric
 
-| Phase | Change | Risk | Rollback |
-|---|---|---|---|
-| **2a** | Shard-affine dispatch only (Variant A), keep multi-thread main rt | low | flag-gated via `runtime.thread_per_core_mode = "auto"` |
-| **2b** | Per-shard `current_thread` workers, pinned, without changing main rt | medium | flag-gated |
-| **2c** | Co-locate writer thread to worker's core (replace Stage-1 hash) | low | reverts to Stage 1 hash |
-| **2d** | Pin Tantivy merge threads to read core set | low | unflagged |
+---
 
-#### Expected Impact
+### Stage 2f: Tantivy Merge Thread Pinning & Per-Arena Jemalloc Stats 🎯 PLANNED
 
-- **Per-write reduction**: 1 cross-core wakeup (router → worker) → 0 (worker is shard-affine)
-- **Cache locality**: `Arc<HybridStore>`, `routing_ring`, `schema_cache` all stay hot on same core
-- **Tail latency (p99)**: Significant improvement under heavy load due to reduced scheduling jitter
-- **Throughput**: Modest improvement when CPU-bound on orchestrator side (currently I/O-bound on redb commits, gains smaller unless `wal_sync = false`)
-- **Predictability**: Biggest win — SLO-driven workloads benefit from reduced jitter
+**Risk:** Low–Medium | **LOC:** ~80 | **Prerequisite:** Stage 2e
 
-### Recommended Execution Order
+**2f.1 — Tantivy Merge Thread Pinning:**
+- Pin Tantivy merge threads to the read core set to avoid interfering with writer threads
+- Currently merge threads run unbounded; with `merge_num_threads: 1` they still run on whatever core the OS picks
 
-1. **Phase 2a** (highest ROI, lowest risk): Shard-affine routing in `OrchestratorWorkerTx`. ~50 LOC, additive, gated. Measure write p99 before/after.
-2. **Phase 2c**: Co-locate writer pinning with worker hash. ~10 LOC change to existing Stage 1 code.
-3. **Phase 2b**: Convert workers to pinned `current_thread` runtimes — only after 2a/2c validated. ~150 LOC + careful shutdown handling.
-4. **Phase 2d**: Tantivy merge thread pinning — independent, can be done any time.
+**2f.2 — Per-Arena Jemalloc Stats:**
+- `read_jemalloc_stats()` currently reads global stats only
+- With `percpu_arena:percpu`, expose per-arena stats via `mallctl("arena.i.allocated", ...)` and `mallctl("arena.i.resident", ...)`
+- Useful for diagnosing which shard/core is consuming the most memory
+- Requires Stage 2e (CoreLayout) to map arena IDs to shard/core
+
+---
+
+### Phase 13 Execution Order & Risk Matrix
+
+| Order | Stage | Risk | LOC | Prerequisite | Gain |
+|-------|-------|------|-----|-------------|------|
+| **1** | 2a: Shard-affine dispatch | Low | ~50 | None | Eliminates 1 cross-core wakeup/write |
+| **2** | 2b: Extract memory module | Low | ~200 | None | Maintainability, testability |
+| **3** | 2c: Auto-purge + per-index memory | Low | ~70 | 2b | Operational safety, observability |
+| **4** | 2d: Co-locate writer pinning | Low | ~10 | 2a | Full core co-location |
+| **5** | 2e: Per-shard single-thread rt | Medium | ~150 | 2a+2d | True thread-per-core |
+| **6** | 2f: Merge pinning + per-arena stats | Low–Med | ~80 | 2e | Reduced interference, diagnostics |
 
 **Success Metrics:**
 - Write p99 latency reduced by 20-40% under high concurrent load
 - Cache miss rate reduced on shard-specific data structures
 - No degradation in throughput for broadcast/scatter operations
-- Clean rollback path via config flags at each phase
+- Clean rollback path via config flags at each stage
+- Memory module independently testable with unit tests
+- Auto-purge prevents RSS creep under sustained writes
 
 ---
