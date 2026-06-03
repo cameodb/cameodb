@@ -33,7 +33,7 @@ tokio-stream = "0.1.18"
 tokio-util = { version = "0.7.18", features = ["codec", "io"] }
 rustyline = "18"
 rayon = "1.12"
-sysinfo = "0.38.4"
+sysinfo = "0.39.3"
 yamux = "0.13"
 
 [profile.release]

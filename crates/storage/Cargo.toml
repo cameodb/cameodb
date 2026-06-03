@@ -17,7 +17,7 @@ chrono = { version = "0.4.44", features = ["serde"] }
 walkdir = "2.5"
 dashmap = "6.1.0"
 xxhash-rust = { workspace = true }
-sysinfo = "0.33"
+sysinfo = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true }
