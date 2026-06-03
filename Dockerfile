@@ -3,7 +3,7 @@
 ################################################################################
 # STAGE 1: Builder
 ################################################################################
-ARG RUST_VERSION=1.94
+ARG RUST_VERSION=1.95
 ARG TARGET_ABI=musl
 FROM rust:${RUST_VERSION}-slim AS builder
 
@@ -13,6 +13,8 @@ ARG TARGETARCH
 # 1. Install system build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
+    xz-utils \
     libssl-dev \
     musl-tools \
     gcc-aarch64-linux-gnu \
@@ -22,12 +24,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Trust corporate CA certificate (if provided)
-RUN --mount=type=secret,id=zscaler,dst=/usr/local/share/ca-certificates/Zscaler.crt \
-    if [ -f /usr/local/share/ca-certificates/Zscaler.crt ]; then \
+RUN --mount=type=secret,id=zscaler,dst=/usr/local/share/ca-certificates/zscaler.crt \
+    if [ -f /usr/local/share/ca-certificates/zscaler.crt ]; then \
         echo "Zscaler certificate detected, adding to CA bundle..." && \
         mkdir -p /etc/ssl/certs && \
-        cat /usr/local/share/ca-certificates/Zscaler.crt >> /etc/ssl/certs/ca-certificates.crt && \
-        cp /usr/local/share/ca-certificates/Zscaler.crt /usr/local/share/ca-certificates/zscaler.crt && \
+        cat /usr/local/share/ca-certificates/zscaler.crt >> /etc/ssl/certs/ca-certificates.crt && \
         update-ca-certificates && \
         echo "CA certificates updated successfully"; \
     else \
@@ -35,9 +36,8 @@ RUN --mount=type=secret,id=zscaler,dst=/usr/local/share/ca-certificates/Zscaler.
     fi
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-
-# Use curl for rustup downloads to better handle system CA certificates
-ENV RUSTUP_USE_CURL=1
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
 
 # 3. Configure Cargo to use system CA store
 RUN mkdir -p /usr/local/cargo && \
@@ -74,6 +74,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     set -e; \
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; \
+    export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt; \
+    export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt; \
+    export CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt; \
+    export CARGO_HTTP_CHECK_REVOKE=false; \
     export PKG_CONFIG_ALLOW_CROSS=1; \
     TARGET_TRIPLE=""; \
     if [ "${TARGET_ABI}" = "musl" ]; then \
@@ -90,7 +94,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
             *) echo "Unsupported architecture: ${TARGETARCH}"; exit 1;; \
         esac; \
     fi; \
-    rustup target add "${TARGET_TRIPLE}"; \
+    rustup target add "${TARGET_TRIPLE}" || ( \
+        echo "rustup failed, trying manual download..."; \
+        RUST_STD_URL="https://static.rust-lang.org/dist/2026-04-16/rust-std-1.95.0-${TARGET_TRIPLE}.tar.xz"; \
+        curl -k -L -o /tmp/rust-std.tar.xz "${RUST_STD_URL}" && \
+        mkdir -p /tmp/rust-std && \
+        tar -xf /tmp/rust-std.tar.xz -C /tmp/rust-std && \
+        /tmp/rust-std/rust-std-1.95.0-${TARGET_TRIPLE}/install.sh --prefix=$(rustup show home); \
+    ); \
     cargo build --profile release-docker --target "${TARGET_TRIPLE}" --bin cameodb \
         --no-default-features \
         --features client/native-tls-vendored; \
