@@ -240,6 +240,19 @@ impl CameoClient {
             .await
             .context("Failed to parse index evict-writer response")
     }
+
+    pub async fn admin_worker_stats(&self) -> Result<AdminWorkersResponse> {
+        let url = self.base_url.join("_admin/workers")?;
+        let resp = self.http.get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Admin workers stats failed: {} - {}", status, text);
+        }
+        resp.json()
+            .await
+            .context("Failed to parse workers stats response")
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -348,4 +361,30 @@ pub struct AdminIndexEvictWriterResponse {
     pub writers_evicted: usize,
     pub writers_missing: usize,
     pub errors: Vec<ShardError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminWorkersResponse {
+    pub pinned: bool,
+    pub hash_aligned: bool,
+    pub worker_count: usize,
+    pub workers: Vec<WorkerStatsResponse>,
+    pub dispatch: DispatchStatsResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerStatsResponse {
+    pub id: usize,
+    pub core_id: Option<usize>,
+    pub queue_depth: usize,
+    pub queue_capacity: usize,
+    pub jobs_completed: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchStatsResponse {
+    pub affine_sends: u64,
+    pub affine_full_fallbacks: u64,
+    pub round_robin_sends: u64,
+    pub actor_mailbox_fallbacks: u64,
 }

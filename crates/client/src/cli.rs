@@ -930,7 +930,7 @@ impl IndexCompleter {
     }
 
     fn admin_subcommand_suggestions(&self, prefix: &str) -> Vec<Pair> {
-        let subcommands = vec!["memory", "index"];
+        let subcommands = vec!["memory", "index", "workers"];
         subcommands
             .into_iter()
             .filter(|sub| sub.starts_with(prefix))
@@ -1534,6 +1534,8 @@ pub enum AdminCommand {
         #[arg(value_enum)]
         operation: IndexAdminOperation,
     },
+    /// Worker pool statistics (queue depth, jobs completed, dispatch metrics)
+    Workers,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -1712,6 +1714,10 @@ pub async fn run_cli() -> Result<()> {
                     print_json(&result)?;
                 }
             },
+            AdminCommand::Workers => {
+                let result = client.admin_worker_stats().await?;
+                print_json(&result)?;
+            }
         },
     }
 
@@ -4267,7 +4273,7 @@ fn interactive_loop(
 
         if matches!(input.as_str(), "help" | "\\h") {
             println!(
-                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  admin memory stats\n  admin memory purge [--force]\n  admin index <name> commit\n  admin index <name> evict-writer\n  connect <host[:port]>\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
+                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  admin memory stats\n  admin memory purge [--force]\n  admin index <name> commit\n  admin index <name> evict-writer\n  admin workers\n  connect <host[:port]>\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
             );
             continue;
         }
@@ -4528,7 +4534,7 @@ async fn dispatch_interactive_command(
         "admin" => {
             let subcommand = parts
                 .next()
-                .ok_or_else(|| anyhow!("Usage: admin <memory|index> ..."))?;
+                .ok_or_else(|| anyhow!("Usage: admin <memory|index|workers> ..."))?;
             match subcommand {
                 "memory" => {
                     let op = parts
@@ -4576,9 +4582,13 @@ async fn dispatch_interactive_command(
                         }
                     }
                 }
+                "workers" => {
+                    let result = session.client().admin_worker_stats().await?;
+                    print_json(&result)?;
+                }
                 other => {
                     return Err(anyhow!(
-                        "Unknown admin subcommand '{}'. Use 'memory' or 'index'.",
+                        "Unknown admin subcommand '{}'. Use 'memory', 'index', or 'workers'.",
                         other
                     ));
                 }

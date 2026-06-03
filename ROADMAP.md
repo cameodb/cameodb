@@ -100,6 +100,25 @@ This document outlines the current development priorities and optimization roadm
 
 ---
 
+## Phase 13 Stage 2a: Shard-Affine Worker Observability ✅ COMPLETED
+
+**Implementation Summary:**
+- **Per-worker atomic counters**: Added `WorkerCounters` struct with `queue_depth` (AtomicUsize) and `jobs_completed` (AtomicU64) to track per-worker queue state and throughput.
+- **Dispatch-level counters**: Added `DispatchCounters` struct tracking `affine_sends`, `affine_full_fallbacks`, `round_robin_sends`, and `actor_mailbox_fallbacks` (all AtomicU64) to measure dispatch behavior.
+- **Counter wiring**: Integrated counters into `OrchestratorWorkerTx::try_send` and `try_send_affine` to increment on send, and into `orchestrator_worker_loop` to decrement queue depth and increment jobs completed on receive.
+- **Snapshot API**: Added `OrchestratorWorkerTx::snapshot()` method to generate `WorkerPoolReport` with per-worker stats (id, core_id, queue_depth, queue_capacity, jobs_completed) and dispatch metrics.
+- **RouterActor integration**: Added `RouterActor::admin_worker_stats()` method to expose worker pool stats via direct method call (no kameo message routing needed for this admin endpoint).
+- **HTTP endpoint**: Added `GET /_admin/workers` route and handler in `http_server.rs` returning JSON `WorkerPoolReport`.
+- **Client SDK**: Added `admin_worker_stats()` method in `crates/client/src/sdk.rs` with corresponding response structs (`AdminWorkersResponse`, `WorkerStatsResponse`, `DispatchStatsResponse`).
+- **CLI integration**: Added `AdminCommand::Workers` variant and dispatch handling in both command-line and interactive REPL modes, with tab-completion support and help text updates.
+
+**Usage:**
+- HTTP: `GET /_admin/workers` returns JSON with worker pool state and dispatch metrics
+- CLI: `cameodb admin workers` displays the same stats in formatted JSON
+- REPL: `admin workers` command in interactive shell
+
+---
+
 ## Summary & Next Steps
 
 ### **Current Status**
@@ -108,12 +127,11 @@ This document outlines the current development priorities and optimization roadm
 - ✅ **Phase 11 (Workflow Hot-Path Optimizations)**: All 7 steps completed
 - ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed
 - ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, and resources completed; security/docs/testing planned
-- 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stage 1 (writer pinning) completed; Stages 2a–2f planned
+- 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stage 1 (writer pinning) completed; Stage 2a (worker observability) completed; Stages 2b–2f planned
 
 ### **Recommended Next Steps**
-1. **Phase 13 Stage 2a**: Shard-affine worker dispatch (highest ROI, lowest risk)
-2. **Phase 13 Stage 2b**: Extract admin memory module (refactoring prerequisite)
-3. **Phase 13 Stage 2c**: Auto-purge timer and per-index memory stats
+1. **Phase 13 Stage 2b**: Extract admin memory module (refactoring prerequisite)
+2. **Phase 13 Stage 2c**: Auto-purge timer and per-index memory stats
 
 ---
 

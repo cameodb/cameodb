@@ -857,6 +857,7 @@ async fn orchestrator_worker_loop(
     mut rx: mpsc::Receiver<OrchestratorJob>,
     engine: Arc<OrchestratorEngine>,
     worker_id: usize,
+    counters: Option<Arc<WorkerCounters>>,
 ) {
     loop {
         match rx.recv().await {
@@ -868,6 +869,10 @@ async fn orchestrator_worker_loop(
                 let result = engine.execute(*op, affinity_shard).await;
                 // Send result back; ignore error if caller dropped the receiver
                 let _ = reply.send(result);
+                if let Some(c) = &counters {
+                    c.queue_depth.fetch_sub(1, AtomicOrdering::Relaxed);
+                    c.jobs_completed.fetch_add(1, AtomicOrdering::Relaxed);
+                }
             }
             Some(OrchestratorJob::Shutdown) => {
                 debug!(
@@ -884,17 +889,99 @@ async fn orchestrator_worker_loop(
     }
 }
 
+/// Per-worker atomic counters — updated on the send and receive hot paths.
+#[derive(Debug, Default)]
+struct WorkerCounters {
+    /// Current number of jobs waiting in this worker's mpsc channel.
+    queue_depth: AtomicUsize,
+    /// Total jobs completed by this worker since startup.
+    jobs_completed: AtomicU64,
+}
+
+/// Dispatch-level counters across the entire worker pool.
+#[derive(Debug, Default)]
+struct DispatchCounters {
+    /// Jobs sent directly to the affinity-assigned worker.
+    affine_sends: AtomicU64,
+    /// Jobs where the affinity-assigned worker was full and fell through to a neighbor.
+    affine_full_fallbacks: AtomicU64,
+    /// Jobs sent via round-robin (no affinity hint or affine dispatch disabled).
+    round_robin_sends: AtomicU64,
+    /// Jobs that fell all the way back to the actor mailbox (all workers full/closed).
+    actor_mailbox_fallbacks: AtomicU64,
+}
+
+/// Snapshot of a single worker's stats for the `/_admin/workers` endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerStats {
+    pub id: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core_id: Option<usize>,
+    pub queue_depth: usize,
+    pub queue_capacity: usize,
+    pub jobs_completed: u64,
+}
+
+/// Snapshot of the dispatch counters for the `/_admin/workers` endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchStats {
+    pub affine_sends: u64,
+    pub affine_full_fallbacks: u64,
+    pub round_robin_sends: u64,
+    pub actor_mailbox_fallbacks: u64,
+}
+
+/// Full worker pool report returned by `GET /_admin/workers`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerPoolReport {
+    pub pinned: bool,
+    pub hash_aligned: bool,
+    pub worker_count: usize,
+    pub workers: Vec<WorkerStats>,
+    pub dispatch: DispatchStats,
+}
+
+/// Message to retrieve worker pool stats from the RouterActor.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct GetWorkerStats;
+
 #[derive(Clone, Debug)]
 pub struct OrchestratorWorkerTx {
     workers: Arc<Vec<mpsc::Sender<OrchestratorJob>>>,
     next_worker: Arc<AtomicUsize>,
+    /// Per-worker atomic counters for observability.
+    worker_stats: Arc<Vec<Arc<WorkerCounters>>>,
+    /// Dispatch-level counters across all workers.
+    dispatch_stats: Arc<DispatchCounters>,
+    /// Per-worker channel capacity (same for all workers).
+    per_worker_queue_capacity: usize,
+    /// Whether workers are pinned to dedicated OS threads.
+    pinned: bool,
+    /// Whether worker_count was aligned to num_cores for hash co-location.
+    hash_aligned: bool,
+    /// Core IDs used for pinning (empty if not pinned).
+    core_ids: Vec<core_affinity::CoreId>,
 }
 
 impl OrchestratorWorkerTx {
-    fn new(workers: Vec<mpsc::Sender<OrchestratorJob>>) -> Self {
+    fn new_with_stats(
+        workers: Vec<mpsc::Sender<OrchestratorJob>>,
+        worker_stats: Arc<Vec<Arc<WorkerCounters>>>,
+        per_worker_queue_capacity: usize,
+        pinned: bool,
+        hash_aligned: bool,
+        core_ids: Vec<core_affinity::CoreId>,
+    ) -> Self {
         Self {
             workers: Arc::new(workers),
             next_worker: Arc::new(AtomicUsize::new(0)),
+            worker_stats,
+            dispatch_stats: Arc::new(DispatchCounters::default()),
+            per_worker_queue_capacity,
+            pinned,
+            hash_aligned,
+            core_ids,
         }
     }
 
@@ -910,13 +997,21 @@ impl OrchestratorWorkerTx {
             return Err(Box::new(mpsc::error::TrySendError::Closed(job)));
         }
 
+        self.dispatch_stats
+            .round_robin_sends
+            .fetch_add(1, AtomicOrdering::Relaxed);
         let start = self.next_worker.fetch_add(1, AtomicOrdering::Relaxed);
         let mut saw_full = false;
 
         for offset in 0..self.workers.len() {
             let idx = (start + offset) % self.workers.len();
             match self.workers[idx].try_send(job) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.worker_stats[idx]
+                        .queue_depth
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    return Ok(());
+                }
                 Err(mpsc::error::TrySendError::Full(returned_job)) => {
                     saw_full = true;
                     job = returned_job;
@@ -928,6 +1023,9 @@ impl OrchestratorWorkerTx {
         }
 
         if saw_full {
+            self.dispatch_stats
+                .actor_mailbox_fallbacks
+                .fetch_add(1, AtomicOrdering::Relaxed);
             Err(Box::new(mpsc::error::TrySendError::Full(job)))
         } else {
             Err(Box::new(mpsc::error::TrySendError::Closed(job)))
@@ -946,6 +1044,7 @@ impl OrchestratorWorkerTx {
             return Err(Box::new(mpsc::error::TrySendError::Closed(job)));
         }
 
+        let is_affine = shard_id.is_some();
         let start = match shard_id {
             Some(sid) => {
                 // Deterministic worker selection: same shard → same worker
@@ -958,13 +1057,35 @@ impl OrchestratorWorkerTx {
         };
 
         let mut saw_full = false;
+        let mut fell_back = false;
 
         for offset in 0..self.workers.len() {
             let idx = (start + offset) % self.workers.len();
             match self.workers[idx].try_send(job) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.worker_stats[idx]
+                        .queue_depth
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    if is_affine {
+                        if offset == 0 {
+                            self.dispatch_stats
+                                .affine_sends
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                        } else {
+                            self.dispatch_stats
+                                .affine_full_fallbacks
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                    } else {
+                        self.dispatch_stats
+                            .round_robin_sends
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    return Ok(());
+                }
                 Err(mpsc::error::TrySendError::Full(returned_job)) => {
                     saw_full = true;
+                    fell_back = true;
                     job = returned_job;
                 }
                 Err(mpsc::error::TrySendError::Closed(returned_job)) => {
@@ -974,6 +1095,14 @@ impl OrchestratorWorkerTx {
         }
 
         if saw_full {
+            if is_affine && fell_back {
+                self.dispatch_stats
+                    .affine_full_fallbacks
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            self.dispatch_stats
+                .actor_mailbox_fallbacks
+                .fetch_add(1, AtomicOrdering::Relaxed);
             Err(Box::new(mpsc::error::TrySendError::Full(job)))
         } else {
             Err(Box::new(mpsc::error::TrySendError::Closed(job)))
@@ -985,6 +1114,57 @@ impl OrchestratorWorkerTx {
             if worker.send(OrchestratorJob::Shutdown).await.is_err() {
                 break;
             }
+        }
+    }
+
+    /// Produce a snapshot of all worker and dispatch counters for `/_admin/workers`.
+    pub fn snapshot(&self) -> WorkerPoolReport {
+        let core_ids_slice: &[core_affinity::CoreId] = &self.core_ids;
+        let workers = self
+            .worker_stats
+            .iter()
+            .enumerate()
+            .map(|(id, counters)| {
+                let core_id = if core_ids_slice.is_empty() {
+                    None
+                } else {
+                    Some(core_ids_slice[id % core_ids_slice.len()].id)
+                };
+                WorkerStats {
+                    id,
+                    core_id,
+                    queue_depth: counters.queue_depth.load(AtomicOrdering::Relaxed),
+                    queue_capacity: self.per_worker_queue_capacity,
+                    jobs_completed: counters.jobs_completed.load(AtomicOrdering::Relaxed),
+                }
+            })
+            .collect();
+
+        let dispatch = DispatchStats {
+            affine_sends: self
+                .dispatch_stats
+                .affine_sends
+                .load(AtomicOrdering::Relaxed),
+            affine_full_fallbacks: self
+                .dispatch_stats
+                .affine_full_fallbacks
+                .load(AtomicOrdering::Relaxed),
+            round_robin_sends: self
+                .dispatch_stats
+                .round_robin_sends
+                .load(AtomicOrdering::Relaxed),
+            actor_mailbox_fallbacks: self
+                .dispatch_stats
+                .actor_mailbox_fallbacks
+                .load(AtomicOrdering::Relaxed),
+        };
+
+        WorkerPoolReport {
+            pinned: self.pinned,
+            hash_aligned: self.hash_aligned,
+            worker_count: self.workers.len(),
+            workers,
+            dispatch,
         }
     }
 }
@@ -2612,6 +2792,16 @@ impl RouterActor {
             .map_err(|e| {
                 OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
             })
+    }
+
+    /// Returns a snapshot of the worker pool stats for `/_admin/workers`.
+    pub fn admin_worker_stats(&self) -> Result<WorkerPoolReport, OrchestratorError> {
+        match &self.worker_tx {
+            Some(tx) => Ok(tx.snapshot()),
+            None => Err(OrchestratorError::Io(std::io::Error::other(
+                "Worker pool not initialized",
+            ))),
+        }
     }
 
     /// Route via ClusterCoordinator then handle locally (remote/broadcast stubbed).
@@ -4670,12 +4860,18 @@ impl NodeOrchestrator {
         } else {
             None
         };
+        let worker_stats: Arc<Vec<Arc<WorkerCounters>>> = Arc::new(
+            (0..worker_count)
+                .map(|_| Arc::new(WorkerCounters::default()))
+                .collect::<Vec<_>>(),
+        );
         let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
         for worker_id in 0..worker_count {
             let (tx, rx) = mpsc::channel::<OrchestratorJob>(per_worker_queue_capacity);
             worker_txs.push(tx);
             let engine = Arc::clone(&engine);
+            let counters = Arc::clone(&worker_stats[worker_id]);
 
             if let Some(ids) = core_ids.as_ref() {
                 // Pinned path: dedicated OS thread + current_thread runtime
@@ -4714,17 +4910,34 @@ impl NodeOrchestrator {
                             .thread_name(format!("orch-worker-{}-bg", worker_id))
                             .build()
                             .expect("Failed to build orchestrator worker runtime");
-                        rt.block_on(orchestrator_worker_loop(rx, engine, worker_id));
+                        rt.block_on(orchestrator_worker_loop(
+                            rx,
+                            engine,
+                            worker_id,
+                            Some(counters),
+                        ));
                     })
                     .expect("Failed to spawn orchestrator worker thread");
                 worker_threads.push(handle);
             } else {
                 // Default path: tokio task on main multi-threaded runtime.
-                tokio::spawn(orchestrator_worker_loop(rx, engine, worker_id));
+                tokio::spawn(orchestrator_worker_loop(
+                    rx,
+                    engine,
+                    worker_id,
+                    Some(counters),
+                ));
             }
         }
 
-        let tx = OrchestratorWorkerTx::new(worker_txs);
+        let tx = OrchestratorWorkerTx::new_with_stats(
+            worker_txs,
+            worker_stats,
+            per_worker_queue_capacity,
+            pin_workers,
+            aligned,
+            core_ids.unwrap_or_default(),
+        );
         self.engine = Some(engine);
         self.worker_count = tx.len();
         self.worker_tx = Some(tx);

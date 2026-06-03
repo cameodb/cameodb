@@ -26,7 +26,7 @@ use tracing::{error, info, warn};
 use crate::cluster_coordinator::{ClusterCoordinator, GetStatus, OperationType};
 use crate::node_orchestrator::{
     AdminIndexCommitReport, AdminIndexEvictWriterReport, AdminMemoryReport, ClientOp, DocPayload,
-    RouterActor,
+    RouterActor, WorkerPoolReport,
 };
 use storage::IndexSchema;
 
@@ -1258,6 +1258,7 @@ pub fn create_router(state: AppState, max_body_size_mb: usize) -> (Router, McpSh
         // Admin endpoints
         .route("/_admin/memory", get(admin_memory_handler))
         .route("/_admin/memory/purge", post(admin_memory_purge_handler))
+        .route("/_admin/workers", get(admin_workers_handler))
         .route(
             "/_admin/index/{index}/commit",
             post(admin_index_commit_handler),
@@ -1860,6 +1861,12 @@ async fn admin_index_evict_writer_handler(
     State(state): State<AppState>,
 ) -> Result<Json<AdminIndexEvictWriterReport>, AppError> {
     Ok(Json(state.router.admin_evict_index_writer(index).await?))
+}
+
+async fn admin_workers_handler(
+    State(state): State<AppState>,
+) -> Result<Json<WorkerPoolReport>, AppError> {
+    Ok(Json(state.router.admin_worker_stats()?))
 }
 
 /// Handler for cluster health check
