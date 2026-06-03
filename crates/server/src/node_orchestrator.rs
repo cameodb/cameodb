@@ -457,6 +457,16 @@ pub struct NodeConfig {
     /// Improves cache locality and reduces cross-core wakeups under heavy write load.
     /// Default: false (no pinning, OS scheduler decides).
     pub writer_core_affinity: bool,
+    /// Enable shard-affine worker dispatch (default: false).
+    /// When enabled, operations targeting the same shard are routed to the same
+    /// orchestrator worker via `xxh3(shard_id) % worker_count`, reducing cross-core
+    /// wakeups when writer pinning is also enabled.
+    pub shard_affine_dispatch: bool,
+
+    /// Pin orchestrator worker tasks to CPU cores as dedicated OS threads (Stage 2e).
+    /// Requires `shard_affine_dispatch` AND `writer_core_affinity` to take effect.
+    /// Default: false.
+    pub worker_core_affinity: bool,
 }
 
 impl Default for NodeConfig {
@@ -477,6 +487,8 @@ impl Default for NodeConfig {
             merge_num_threads: 2,
             writer_shutdown_timeout_secs: 30,
             writer_core_affinity: true,
+            shard_affine_dispatch: false,
+            worker_core_affinity: false,
         }
     }
 }
@@ -828,10 +840,48 @@ pub enum StorageCommand {
 /// back via the oneshot channel, bypassing the actor mailbox.
 pub enum OrchestratorJob {
     Execute {
-        op: ClientOp,
+        op: Box<ClientOp>,
+        /// Shard affinity hint for dispatch. When Some, the job was routed to
+        /// a worker determined by `xxh3(shard_id) % worker_count`. Passed to
+        /// `engine.execute()` so `engine_write` can skip the redundant ring lookup.
+        affinity_shard: Option<Uuid>,
         reply: tokio::sync::oneshot::Sender<Result<JsonValue, OrchestratorError>>,
     },
     Shutdown,
+}
+
+/// Shared worker loop body used by both the default tokio-task spawn and the
+/// pinned OS-thread spawn (Stage 2e). Exits cleanly when receiving `Shutdown`
+/// or when the channel is closed.
+async fn orchestrator_worker_loop(
+    mut rx: mpsc::Receiver<OrchestratorJob>,
+    engine: Arc<OrchestratorEngine>,
+    worker_id: usize,
+) {
+    loop {
+        match rx.recv().await {
+            Some(OrchestratorJob::Execute {
+                op,
+                affinity_shard,
+                reply,
+            }) => {
+                let result = engine.execute(*op, affinity_shard).await;
+                // Send result back; ignore error if caller dropped the receiver
+                let _ = reply.send(result);
+            }
+            Some(OrchestratorJob::Shutdown) => {
+                debug!(
+                    worker_id = worker_id,
+                    "Orchestrator worker received shutdown signal"
+                );
+                break;
+            }
+            None => {
+                debug!(worker_id = worker_id, "Orchestrator worker exiting");
+                break;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -884,6 +934,52 @@ impl OrchestratorWorkerTx {
         }
     }
 
+    /// Shard-affine dispatch: route the job to the worker that "owns" the given
+    /// shard, falling through to neighboring workers on `Full` to preserve
+    /// throughput. When `shard_id` is `None`, falls back to round-robin.
+    fn try_send_affine(
+        &self,
+        mut job: OrchestratorJob,
+        shard_id: Option<Uuid>,
+    ) -> Result<(), Box<mpsc::error::TrySendError<OrchestratorJob>>> {
+        if self.workers.is_empty() {
+            return Err(Box::new(mpsc::error::TrySendError::Closed(job)));
+        }
+
+        let start = match shard_id {
+            Some(sid) => {
+                // Deterministic worker selection: same shard → same worker
+                (xxh3_64(sid.as_bytes()) as usize) % self.workers.len()
+            }
+            None => {
+                // No affinity hint — fall back to round-robin
+                self.next_worker.fetch_add(1, AtomicOrdering::Relaxed)
+            }
+        };
+
+        let mut saw_full = false;
+
+        for offset in 0..self.workers.len() {
+            let idx = (start + offset) % self.workers.len();
+            match self.workers[idx].try_send(job) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Full(returned_job)) => {
+                    saw_full = true;
+                    job = returned_job;
+                }
+                Err(mpsc::error::TrySendError::Closed(returned_job)) => {
+                    job = returned_job;
+                }
+            }
+        }
+
+        if saw_full {
+            Err(Box::new(mpsc::error::TrySendError::Full(job)))
+        } else {
+            Err(Box::new(mpsc::error::TrySendError::Closed(job)))
+        }
+    }
+
     async fn send_shutdown(&self) {
         for worker in self.workers.iter() {
             if worker.send(OrchestratorJob::Shutdown).await.is_err() {
@@ -905,8 +1001,10 @@ impl OrchestratorWorkerTx {
 pub struct OrchestratorEngine {
     /// Shard map — updated atomically on topology changes via ArcSwap.
     pub shards: ArcSwap<HashMap<Uuid, MicroshardActor>>,
-    /// Consistent hash ring — updated atomically on topology changes via ArcSwap.
-    pub routing_ring: ArcSwap<ConsistentRing>,
+    /// Consistent hash ring — single shared instance across the engine and
+    /// the `RouterActor` (shard-affine dispatch). Updated atomically via
+    /// `ArcSwap::store` on topology changes; readers always see the latest snapshot.
+    pub routing_ring: Arc<ArcSwap<ConsistentRing>>,
     /// Per-index schema cache (lock-free via ArcSwap).
     pub schema_cache: Arc<ArcSwap<HashMap<String, Arc<IndexSchema>>>>,
     /// Fingerprint → index_name reverse lookup (lock-free via ArcSwap).
@@ -1026,14 +1124,24 @@ impl OrchestratorEngine {
     /// Execute a ClientOp on the shared engine state.
     /// Returns `Ok(result)` for ops handled by the engine, or an error
     /// with `ErrorKind::Unsupported` for ops that must go through the actor mailbox.
-    pub async fn execute(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
+    ///
+    /// `affinity_shard` is a pre-resolved shard hint from shard-affine dispatch.
+    /// When `Some`, `engine_write` skips the redundant ring lookup.
+    pub async fn execute(
+        &self,
+        op: ClientOp,
+        affinity_shard: Option<Uuid>,
+    ) -> Result<JsonValue, OrchestratorError> {
         match op {
             ClientOp::Write {
                 index,
                 id,
                 routing_key,
                 doc,
-            } => self.engine_write(&index, id, routing_key, doc).await,
+            } => {
+                self.engine_write(&index, id, routing_key, doc, affinity_shard)
+                    .await
+            }
             ClientOp::BulkWrite { index, docs } => self.engine_bulk_write(&index, docs).await,
             ClientOp::Search {
                 index,
@@ -1088,6 +1196,7 @@ impl OrchestratorEngine {
         id: String,
         routing_key: Option<String>,
         doc: JsonValue,
+        affinity_shard: Option<Uuid>,
     ) -> Result<JsonValue, OrchestratorError> {
         let shards = self.shards.load();
         if shards.is_empty() {
@@ -1133,7 +1242,19 @@ impl OrchestratorEngine {
                     .or_else(|| (!id.is_empty()).then(|| id.clone()))
                     .or_else(|| derive_routing_key_from_doc(&doc));
 
-                let target = self.route_write(&effective_routing_key)?;
+                // Use pre-resolved shard from shard-affine dispatch when available,
+                // skipping the redundant ring lookup. Fall back to route_write when
+                // affinity is None (round-robin dispatch) or the hinted shard is gone.
+                let target = if let Some(hint) = affinity_shard {
+                    if shards.contains_key(&hint) {
+                        hint
+                    } else {
+                        // Shard was removed or reassigned — re-resolve via ring
+                        self.route_write(&effective_routing_key)?
+                    }
+                } else {
+                    self.route_write(&effective_routing_key)?
+                };
                 let shard = shards.get(&target).ok_or_else(|| {
                     OrchestratorError::Io(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
@@ -2271,26 +2392,58 @@ pub struct RouterActor {
     broadcasts_total: Arc<AtomicU64>,
     broadcast_failures: Arc<AtomicU64>,
     // Streaming search configuration
-    enable_streaming_search: bool,
-    enable_early_termination: bool,
-    max_concurrent_shard_searches: usize,
-    max_concurrent_remote_searches: usize,
+    streaming: StreamingSearchConfig,
     /// Worker pool channel for dispatching hot-path ops (Write, Search)
     /// bypassing the actor mailbox for concurrent processing.
     worker_tx: Option<OrchestratorWorkerTx>,
     /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups.
     remote_peer_pool: Arc<RemotePeerPool>,
+    /// Shard-affine dispatch configuration and shared routing ring.
+    shard_affine: ShardAffineConfig,
+}
+
+/// Configuration for shard-affine worker dispatch.
+#[derive(Clone, Debug)]
+pub struct ShardAffineConfig {
+    /// Shared routing ring for shard-affine dispatch (lock-free via ArcSwap).
+    /// When `enabled` is true, the router resolves the target shard from the
+    /// routing key and routes the job to the affine worker.
+    pub routing_ring: Arc<ArcSwap<ConsistentRing>>,
+    /// Enable shard-affine worker dispatch (default: false).
+    pub enabled: bool,
+}
+
+/// Configuration for streaming search behavior.
+#[derive(Clone, Debug)]
+pub struct StreamingSearchConfig {
+    pub enable_streaming_search: bool,
+    pub enable_early_termination: bool,
+    pub max_concurrent_shard_searches: usize,
+    pub max_concurrent_remote_searches: usize,
+}
+
+impl StreamingSearchConfig {
+    pub fn from_search_config(sc: &SearchConfig) -> Self {
+        Self {
+            enable_streaming_search: sc.enable_streaming_search,
+            enable_early_termination: sc.enable_early_termination,
+            max_concurrent_shard_searches: sc.max_concurrent_shard_searches,
+            max_concurrent_remote_searches: sc.max_concurrent_remote_searches,
+        }
+    }
 }
 
 impl RouterActor {
+    #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         orchestrator: ActorRef<NodeOrchestrator>,
         coordinator: ActorRef<ClusterCoordinator>,
         messaging: &MessagingConfig,
-        search_config: &SearchConfig,
+        streaming: StreamingSearchConfig,
         default_search_limit: usize,
         worker_tx: Option<OrchestratorWorkerTx>,
         remote_peer_pool: Arc<RemotePeerPool>,
+        shard_affine: ShardAffineConfig,
     ) -> Self {
         Self {
             orchestrator,
@@ -2302,13 +2455,10 @@ impl RouterActor {
             default_search_limit,
             broadcasts_total: Arc::new(AtomicU64::new(0)),
             broadcast_failures: Arc::new(AtomicU64::new(0)),
-            // Streaming search configuration
-            enable_streaming_search: search_config.enable_streaming_search,
-            max_concurrent_shard_searches: search_config.max_concurrent_shard_searches,
-            max_concurrent_remote_searches: search_config.max_concurrent_remote_searches,
-            enable_early_termination: search_config.enable_early_termination,
+            streaming,
             worker_tx,
             remote_peer_pool,
+            shard_affine,
         }
     }
 
@@ -2326,11 +2476,38 @@ impl RouterActor {
                 ClientOp::Write { .. } | ClientOp::Search { .. } | ClientOp::Stream { .. }
             );
             if is_worker_eligible {
+                // Resolve shard affinity hint when shard-affine dispatch is enabled.
+                // For Write ops, the routing_key maps to a shard via the consistent ring.
+                // For Search/Stream ops (scatter-gather), no single shard owns the query,
+                // so affinity is None and dispatch falls back to round-robin.
+                let affinity_shard = if self.shard_affine.enabled {
+                    match &op {
+                        ClientOp::Write { routing_key, .. } => {
+                            routing_key.as_ref().and_then(|key| {
+                                let ring = self.shard_affine.routing_ring.load();
+                                ring.get_owner(key)
+                            })
+                        }
+                        _ => None, // Search/Stream → scatter-gather, no affinity
+                    }
+                } else {
+                    None
+                };
+
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                match tx.try_send(OrchestratorJob::Execute {
-                    op,
+                let job = OrchestratorJob::Execute {
+                    op: Box::new(op),
+                    affinity_shard,
                     reply: reply_tx,
-                }) {
+                };
+
+                let send_result = if self.shard_affine.enabled {
+                    tx.try_send_affine(job, affinity_shard)
+                } else {
+                    tx.try_send(job)
+                };
+
+                match send_result {
                     Ok(()) => {
                         // Await worker result
                         return match reply_rx.await {
@@ -2360,7 +2537,7 @@ impl RouterActor {
                             // Queue full — fall through to actor mailbox
                             debug!("Worker pool queue full, falling back to actor mailbox");
                             if let OrchestratorJob::Execute { op, .. } = job {
-                                return self.ask_orchestrator(op).await;
+                                return self.ask_orchestrator(*op).await;
                             }
                             return Err(OrchestratorError::Io(std::io::Error::other(
                                 "Worker queue full while shutting down",
@@ -2369,7 +2546,7 @@ impl RouterActor {
                         mpsc::error::TrySendError::Closed(job) => {
                             warn!("Worker pool channel closed, falling back to actor mailbox");
                             if let OrchestratorJob::Execute { op, .. } = job {
-                                return self.ask_orchestrator(op).await;
+                                return self.ask_orchestrator(*op).await;
                             }
                             return Err(OrchestratorError::Io(std::io::Error::other(
                                 "Worker pool channel closed during shutdown",
@@ -2474,7 +2651,7 @@ impl RouterActor {
                 }
 
                 // Use streaming for search operations if enabled
-                if self.enable_streaming_search
+                if self.streaming.enable_streaming_search
                     && matches!(op, ClientOp::Search { .. } | ClientOp::Stream { .. })
                 {
                     self.handle_broadcast_streaming(op).await
@@ -2627,8 +2804,8 @@ impl RouterActor {
         info!(
             timeout_ms = self.broadcast_timeout.as_millis(),
             fanout_limit = self.broadcast_fanout_limit,
-            local_shard_concurrency_limit = self.max_concurrent_shard_searches,
-            remote_concurrency_limit = self.max_concurrent_remote_searches.max(1),
+            local_shard_concurrency_limit = self.streaming.max_concurrent_shard_searches,
+            remote_concurrency_limit = self.streaming.max_concurrent_remote_searches.max(1),
             known_peers = peers.len(),
             target_peers = peer_count,
             "RouterActor: broadcast routing with remote fan-out"
@@ -2639,7 +2816,7 @@ impl RouterActor {
         let local_future = self.handle_client_op(local_op);
 
         // Fan out to remote peers (up to fanout_limit)
-        let remote_limit = self.max_concurrent_remote_searches.max(1);
+        let remote_limit = self.streaming.max_concurrent_remote_searches.max(1);
         let remote_timeout = self.broadcast_timeout;
         let remote_router = self.clone();
         let remote_op = op.clone();
@@ -3105,8 +3282,8 @@ impl RouterActor {
         op: ClientOp,
     ) -> Result<JsonValue, OrchestratorError> {
         tracing::info!(
-            max_concurrent_shard_searches = self.max_concurrent_shard_searches,
-            max_concurrent_remote_searches = self.max_concurrent_remote_searches.max(1),
+            max_concurrent_shard_searches = self.streaming.max_concurrent_shard_searches,
+            max_concurrent_remote_searches = self.streaming.max_concurrent_remote_searches.max(1),
             "🚀 Using STREAMING search for improved performance"
         );
 
@@ -3183,7 +3360,7 @@ impl RouterActor {
                     }
                 };
 
-                let remote_limit = self.max_concurrent_remote_searches.max(1);
+                let remote_limit = self.streaming.max_concurrent_remote_searches.max(1);
                 let remote_timeout = self.broadcast_timeout;
                 let mut peer_iter = peers.into_iter().take(self.broadcast_fanout_limit);
                 let remote_router = self.clone();
@@ -3250,7 +3427,7 @@ impl RouterActor {
                     }
 
                     // Early termination if limit reached and enabled
-                    if self.enable_early_termination
+                    if self.streaming.enable_early_termination
                         && all_hits.len() >= limit
                         && search_futures.is_empty()
                         && peer_iter.size_hint().0 == 0
@@ -3489,6 +3666,10 @@ pub struct NodeOrchestrator {
     routing_ring: ConsistentRing,
     /// Optional coordinator reference for shard registration
     coordinator: Option<ActorRef<ClusterCoordinator>>,
+    /// Shared routing ring snapshot (lock-free via ArcSwap).
+    /// Wrapped in Arc so it can be shared with the OrchestratorEngine worker pool
+    /// and the RouterActor for shard-affine dispatch.
+    shared_routing_ring: Arc<ArcSwap<ConsistentRing>>,
     /// Per-index schema cache to avoid repeated metadata reads (lock-free via ArcSwap).
     /// Wrapped in Arc so it can be shared with the OrchestratorEngine worker pool.
     schema_cache: Arc<ArcSwap<HashMap<String, Arc<IndexSchema>>>>,
@@ -3507,6 +3688,10 @@ pub struct NodeOrchestrator {
     /// Number of worker tasks spawned in the pool.
     /// Used to signal explicit worker shutdown.
     worker_count: usize,
+    /// Handles for pinned worker OS threads (Stage 2e). Empty when running in the
+    /// default unpinned tokio-task mode. Joined during shutdown to ensure clean
+    /// teardown of per-worker `current_thread` runtimes.
+    worker_threads: Vec<std::thread::JoinHandle<()>>,
     /// Dedicated tokio runtime for read operations (search, stats).
     /// Isolates read I/O from the writer threads and tokio's generic blocking pool.
     /// Arc-wrapped so the runtime outlives shard clones that hold its Handle.
@@ -4370,6 +4555,7 @@ impl NodeOrchestrator {
             config,
             routing_ring: ConsistentRing::new(),
             coordinator: None,
+            shared_routing_ring: Arc::new(ArcSwap::from_pointee(ConsistentRing::new())),
             schema_cache: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             fingerprint_index: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             default_search_limit,
@@ -4377,6 +4563,7 @@ impl NodeOrchestrator {
             engine: None,
             worker_tx: None,
             worker_count: 0,
+            worker_threads: Vec::new(),
             read_runtime: Some(read_runtime),
             remote_peer_pool: None,
         };
@@ -4402,6 +4589,11 @@ impl NodeOrchestrator {
         self.worker_tx.clone()
     }
 
+    /// Returns a clone of the shared routing ring for shard-affine dispatch.
+    pub fn shared_routing_ring(&self) -> Arc<ArcSwap<ConsistentRing>> {
+        Arc::clone(&self.shared_routing_ring)
+    }
+
     /// Build the shared `OrchestratorEngine` and spawn the worker pool.
     ///
     /// Must be called **after** `hydrate_existing_shards` and `set_coordinator`
@@ -4418,9 +4610,13 @@ impl NodeOrchestrator {
             .clone()
             .unwrap_or_else(|| Arc::new(RemotePeerPool::new()));
 
+        // Seed the shared ring with the current canonical state before sharing.
+        self.shared_routing_ring
+            .store(Arc::new(self.routing_ring.clone()));
+
         let engine = Arc::new(OrchestratorEngine {
             shards: ArcSwap::from_pointee(self.shards.clone()),
-            routing_ring: ArcSwap::from_pointee(self.routing_ring.clone()),
+            routing_ring: Arc::clone(&self.shared_routing_ring),
             schema_cache: Arc::clone(&self.schema_cache),
             fingerprint_index: Arc::clone(&self.fingerprint_index),
             coordinator: self.coordinator.clone(),
@@ -4430,12 +4626,25 @@ impl NodeOrchestrator {
             remote_peer_pool: pool,
         });
 
-        // Worker count: min(local_shards * 2, cpu_cores * 2), minimum 1
+        // Worker count: min(local_shards * 2, cpu_cores * 2), minimum 1.
+        //
+        // Stage 2c — hash-space alignment: when shard-affine dispatch AND writer
+        // core pinning are both enabled, force `worker_count == cpu_cores` so that
+        // `xxh3(shard_id) % worker_count` (dispatch) and `xxh3(shard_id) % cpu_cores`
+        // (writer pinning) produce the SAME bucket. Then for any shard S, the worker
+        // handling S dispatches into the writer pinned on the matching core, giving
+        // the OS scheduler the best chance to keep the worker task near that core.
         let cpu_cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
         let local_shards = self.shards.len();
-        let worker_count = std::cmp::max(1, std::cmp::min(local_shards * 2, cpu_cores * 2));
+        let aligned =
+            self.config.shard_affine_dispatch && self.config.writer_core_affinity && cpu_cores > 0;
+        let worker_count = if aligned {
+            cpu_cores
+        } else {
+            std::cmp::max(1, std::cmp::min(local_shards * 2, cpu_cores * 2))
+        };
 
         let per_worker_queue_capacity =
             std::cmp::max(1, ORCHESTRATOR_WORKER_QUEUE_CAPACITY / worker_count);
@@ -4445,55 +4654,94 @@ impl NodeOrchestrator {
             worker_count = worker_count,
             local_shards = local_shards,
             cpu_cores = cpu_cores,
+            hash_aligned = aligned,
             queue_capacity = ORCHESTRATOR_WORKER_QUEUE_CAPACITY,
             per_worker_queue_capacity = per_worker_queue_capacity,
             "Spawning orchestrator worker pool"
         );
 
+        // Stage 2e — true OS-thread pinning gate. Only active when all three
+        // affinity flags are on AND we successfully retrieved core_ids. Falls
+        // back to plain tokio::spawn otherwise.
+        let pin_workers = aligned && self.config.worker_core_affinity;
+        let core_ids: Option<Vec<core_affinity::CoreId>> = if pin_workers {
+            let ids = core_affinity::get_core_ids().unwrap_or_default();
+            if ids.is_empty() { None } else { Some(ids) }
+        } else {
+            None
+        };
+        let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
         for worker_id in 0..worker_count {
-            let (tx, mut rx) = mpsc::channel::<OrchestratorJob>(per_worker_queue_capacity);
+            let (tx, rx) = mpsc::channel::<OrchestratorJob>(per_worker_queue_capacity);
             worker_txs.push(tx);
             let engine = Arc::clone(&engine);
-            tokio::spawn(async move {
-                loop {
-                    let job = rx.recv().await;
-                    match job {
-                        Some(OrchestratorJob::Execute { op, reply }) => {
-                            let result = engine.execute(op).await;
-                            // Send result back; ignore error if caller dropped the receiver
-                            let _ = reply.send(result);
-                        }
-                        Some(OrchestratorJob::Shutdown) => {
-                            debug!(
+
+            if let Some(ids) = core_ids.as_ref() {
+                // Pinned path: dedicated OS thread + current_thread runtime
+                let target_core = ids[worker_id % ids.len()];
+                let handle = std::thread::Builder::new()
+                    .name(format!("orch-worker-{}", worker_id))
+                    .spawn(move || {
+                        // Pin this OS thread to the target core (best-effort).
+                        if core_affinity::set_for_current(target_core) {
+                            info!(
                                 worker_id = worker_id,
-                                "Orchestrator worker received shutdown signal"
+                                core_id = target_core.id,
+                                "Orchestrator worker thread pinned to CPU core"
                             );
-                            break;
+                        } else if cfg!(target_os = "macos") {
+                            info!(
+                                worker_id = worker_id,
+                                core_id = target_core.id,
+                                "CPU pinning not supported on macOS; worker continuing unpinned"
+                            );
+                        } else {
+                            warn!(
+                                worker_id = worker_id,
+                                core_id = target_core.id,
+                                "Failed to pin orchestrator worker thread to CPU core"
+                            );
                         }
-                        None => {
-                            // Channel closed — worker pool shutting down
-                            debug!(worker_id = worker_id, "Orchestrator worker exiting");
-                            break;
-                        }
-                    }
-                }
-            });
+
+                        // Per-worker current_thread runtime. `max_blocking_threads(4)`
+                        // is plenty: hot-path search delegates to the shared
+                        // `read_runtime` and writes use the pinned writer thread, so
+                        // very little work hits this local blocking pool.
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .max_blocking_threads(4)
+                            .thread_name(format!("orch-worker-{}-bg", worker_id))
+                            .build()
+                            .expect("Failed to build orchestrator worker runtime");
+                        rt.block_on(orchestrator_worker_loop(rx, engine, worker_id));
+                    })
+                    .expect("Failed to spawn orchestrator worker thread");
+                worker_threads.push(handle);
+            } else {
+                // Default path: tokio task on main multi-threaded runtime.
+                tokio::spawn(orchestrator_worker_loop(rx, engine, worker_id));
+            }
         }
 
         let tx = OrchestratorWorkerTx::new(worker_txs);
         self.engine = Some(engine);
         self.worker_count = tx.len();
         self.worker_tx = Some(tx);
+        self.worker_threads = worker_threads;
 
         info!(
             worker_count = self.worker_count,
+            pinned = !self.worker_threads.is_empty(),
             "Orchestrator worker pool started"
         );
     }
 
     /// Explicitly signal all worker tasks to exit.
     /// Uses one shutdown message per worker for deterministic teardown.
-    async fn shutdown_worker_pool(&self) {
+    /// For Stage 2e pinned workers, also joins their OS threads so the per-worker
+    /// `current_thread` runtimes are dropped before this returns.
+    async fn shutdown_worker_pool(&mut self) {
         let Some(tx) = &self.worker_tx else {
             return;
         };
@@ -4504,20 +4752,36 @@ impl NodeOrchestrator {
 
         tracing::info!(
             worker_count = self.worker_count,
+            pinned_threads = self.worker_threads.len(),
             "Shutting down orchestrator worker pool"
         );
         tx.send_shutdown().await;
+
+        // For pinned workers, join the OS threads so their runtimes drop cleanly.
+        // `join` is blocking, so it must run on the blocking pool.
+        if !self.worker_threads.is_empty() {
+            let handles = std::mem::take(&mut self.worker_threads);
+            let _ = tokio::task::spawn_blocking(move || {
+                for handle in handles {
+                    if let Err(panic) = handle.join() {
+                        tracing::warn!(?panic, "Orchestrator worker thread panicked during join");
+                    }
+                }
+            })
+            .await;
+        }
     }
 
     /// Publish updated shard map and routing ring to the engine's ArcSwap fields.
     /// Called after topology changes (new shards, topology updates) so workers
     /// see the latest state without restart.
     fn publish_engine_state(&self) {
+        // Single source of truth: `shared_routing_ring` is the same Arc held by
+        // both the engine and the RouterActor, so one store fans out to everyone.
+        self.shared_routing_ring
+            .store(Arc::new(self.routing_ring.clone()));
         if let Some(engine) = &self.engine {
             engine.shards.store(Arc::new(self.shards.clone()));
-            engine
-                .routing_ring
-                .store(Arc::new(self.routing_ring.clone()));
         }
     }
 

@@ -178,6 +178,25 @@ pub struct StorageConfig {
     /// locality and reducing cross-core wakeups under heavy write load.
     #[serde(default = "default_writer_core_affinity")]
     pub writer_core_affinity: bool,
+
+    /// Enable shard-affine worker dispatch (default: false).
+    /// When enabled, operations targeting the same shard are routed to the same
+    /// orchestrator worker, reducing cross-core wakeups when writer pinning is
+    /// also enabled. Uses `xxh3(shard_id) % worker_count` for deterministic
+    /// worker selection. Falls back to round-robin for scatter-gather ops.
+    #[serde(default = "default_shard_affine_dispatch")]
+    pub shard_affine_dispatch: bool,
+
+    /// Pin orchestrator worker tasks to CPU cores as dedicated OS threads
+    /// (default: false). Requires `shard_affine_dispatch = true` AND
+    /// `writer_core_affinity = true` to take effect; otherwise silently no-op.
+    ///
+    /// When enabled, each worker runs on its own `tokio::current_thread` runtime
+    /// pinned to `core_ids[worker_id]`. Combined with hash-aligned dispatch
+    /// (Stage 2d) this guarantees worker and writer for the same shard land on
+    /// the same CPU core, maximizing cache locality.
+    #[serde(default = "default_worker_core_affinity")]
+    pub worker_core_affinity: bool,
 }
 
 /// Cluster configuration for distributed actor system
@@ -727,6 +746,8 @@ impl Default for StorageConfig {
             num_shards_init: default_num_shards_init(),
             max_shards_per_node: default_max_shards_per_node(),
             writer_core_affinity: default_writer_core_affinity(),
+            shard_affine_dispatch: default_shard_affine_dispatch(),
+            worker_core_affinity: default_worker_core_affinity(),
         }
     }
 }
@@ -831,6 +852,14 @@ fn default_max_shards_per_node() -> usize {
 }
 fn default_writer_core_affinity() -> bool {
     true
+}
+
+fn default_shard_affine_dispatch() -> bool {
+    false
+}
+
+fn default_worker_core_affinity() -> bool {
+    false
 }
 
 fn default_indexer_memory_min_mb() -> usize {

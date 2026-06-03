@@ -258,9 +258,9 @@ HTTP req on axum tokio worker (any core)
 
 ---
 
-### Stage 2a: Shard-Affine Worker Dispatch 🎯 NEXT
+### Stage 2a: Shard-Affine Worker Dispatch ✅ DONE
 
-**Risk:** Low | **LOC:** ~50 | **Prerequisite:** None
+**Risk:** Low | **LOC:** ~80 | **Prerequisite:** None
 
 **Goal:** Replace round-robin dispatch with shard-affine routing so that operations targeting the same shard always land on the same worker, reducing cross-core wakeups when writer pinning is enabled.
 
@@ -270,8 +270,9 @@ HTTP req on axum tokio worker (any core)
   - When `shard_id` is `Some`, route to `workers[xxh3(shard_id) % worker_count]`
   - Fall through to neighboring workers on `Full` (preserve throughput)
   - When `shard_id` is `None` (broadcast/scatter), fall back to round-robin
-- In `handle_client_op`, extract routing key from `ClientOp::Write`/`ClientOp::Search` before dispatch
-- Flag-gated via config, default preserves current round-robin behavior
+- In `handle_client_op`, extract routing key from `ClientOp::Write` before dispatch
+- Engine fast path: `engine_write` skips redundant `route_write` ring lookup when `affinity_shard` is `Some`
+- Flag-gated via `shard_affine_dispatch` config, default `false` preserves round-robin behavior
 
 **Expected Impact:**
 - Eliminates 1 cross-core wakeup per write when writer pinning is enabled
@@ -317,54 +318,54 @@ HTTP req on axum tokio worker (any core)
 
 ---
 
-### Stage 2d: Co-Locate Writer Pinning with Worker Hash 🎯 PLANNED
+### Stage 2d: Co-Locate Writer Pinning with Worker Hash ✅ DONE
 
-**Risk:** Low | **LOC:** ~10 | **Prerequisite:** Stage 2a
+**Risk:** Low | **LOC:** ~15 | **Prerequisite:** Stage 2a
 
-**Goal:** Ensure the writer thread for shard X is pinned to the same core as the worker that handles shard X's operations.
+**Goal:** Ensure the writer thread for shard X uses the same hash bucket as the worker that handles shard X's operations.
 
-**Implementation:**
-- Add `CoreLayout` struct to `NodeOrchestrator` with `reserved`, `per_shard`, `read_pool` core vectors
-- Compute once at startup from `core_affinity::get_core_ids`
-- Replace Stage 1 hash-based pinning (`xxh3(shard_uuid) % num_cores`) with direct lookup from `CoreLayout`
-- Use same hash as worker dispatch: `layout.shard_core(shard_id)`
-- Guarantees: routing/validation/serialization (worker) + redb txn + tantivy commit (writer) all execute on same core
+**Implementation (delivered):**
+- In `NodeOrchestrator::spawn_worker_pool`, when `shard_affine_dispatch && writer_core_affinity` are both enabled, force `worker_count = cpu_cores`.
+- This makes `xxh3(shard_id) % worker_count == xxh3(shard_id) % num_cores`, so for any shard S: the worker handling S dispatches into the writer pinned on the matching core.
+- Tokio worker tasks aren't OS-pinned, but the scheduler keeps frequently-running tasks near their last core under sustained load — co-locating dispatch with writer thread on the same hash bucket maximizes that locality.
+- Behind a config gate: default behavior (either flag off) preserves the existing `min(local_shards * 2, cpu_cores * 2)` worker sizing.
+
+**Deferred to Stage 2e:**
+- Explicit `CoreLayout` struct (`reserved`, `per_shard`, `read_pool` cores) becomes valuable only when workers are pinned as dedicated OS threads with single-thread runtimes (Stage 2e). For pure hash alignment, the implicit `% cpu_cores` math is sufficient.
 
 ---
 
-### Stage 2e: Per-Shard Single-Thread Runtimes 🎯 PLANNED
+### Stage 2e: Per-Worker Single-Thread Runtimes ✅ DONE
 
-**Risk:** Medium | **LOC:** ~150 | **Prerequisite:** Stages 2a + 2d validated
+**Risk:** Medium | **LOC:** ~70 | **Prerequisite:** Stages 2a + 2d
 
-**Goal:** Convert workers from `tokio::spawn` on main runtime to dedicated `current_thread` runtimes pinned per core — the full thread-per-core model.
+**Goal:** Convert workers from `tokio::spawn` on main runtime to dedicated `current_thread` runtimes pinned per core — completing the thread-per-core model for the write hot path.
 
-**Implementation:**
-- Spawn `PinnedWorker` struct with dedicated `current_thread` runtime per shard
-- Use `on_thread_start` callback to pin each worker to its assigned core
-- Use `current_thread` runtime because orchestrator worker does minimal CPU work (routing + channel sends)
-- Add `[runtime]` config section: `thread_per_core_mode`, `reserved_cores`, `read_cores_min`
-- Careful shutdown handling required (drain per-worker queues, join runtimes)
+**Implementation (delivered):**
+- Extracted worker body into `orchestrator_worker_loop` helper (one body, two spawn paths).
+- New config flag `[storage].worker_core_affinity` (default: `false`). Requires `shard_affine_dispatch` AND `writer_core_affinity` to take effect; otherwise silently no-op.
+- When all three flags are on, `spawn_worker_pool`:
+  - Sizes `worker_count = num_cores` (inherited from Stage 2d alignment).
+  - Spawns each worker as a dedicated `std::thread::Builder` thread named `orch-worker-N`.
+  - Pins the OS thread to `core_ids[worker_id % num_cores]` via `core_affinity::set_for_current`.
+  - Runs an isolated `tokio::runtime::Builder::new_current_thread()` runtime with `max_blocking_threads(4)` (kept tiny because search delegates to the shared `read_runtime` and writes go through the pinned writer thread).
+  - Falls back gracefully on macOS / when pinning fails (logged, runs unpinned on a dedicated thread).
+- `NodeOrchestrator.worker_threads: Vec<std::thread::JoinHandle<()>>` stores handles; `shutdown_worker_pool` sends shutdown messages then joins them via `spawn_blocking`.
 
-**Configuration Surface:**
-```toml
-[storage]
-writer_core_affinity = true               # Stage 1 — already done
+**Why minimal:**
+- No new `[runtime]` config section — just one boolean. Reserved-core layout (`CoreLayout` from the original plan) deferred until a concrete need.
+- No changes to `OrchestratorJob`, `OrchestratorWorkerTx`, `OrchestratorEngine`, `RouterActor`, `MicroshardActor`, or `engine.execute()` body — they work identically across both runtimes.
+- The shared `read_runtime` continues handling all heavy I/O, preserving search throughput.
 
-[runtime]                                  # NEW section
-thread_per_core_mode = "disabled"         # "disabled" | "auto" | "manual"
-reserved_cores = 2                        # for main rt (axum/kameo)
-read_cores_min = 2                        # min cores for read pool
-# manual override (only when mode = "manual"):
-# reserved_cores_list = [0, 1]
-# shard_cores_list   = [2, 3, 4, 5]
-# read_cores_list    = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-```
+**Wakeup math:**
+- Default mode: router-task → mpsc → worker-task → channel → writer-thread (cross-core wakeup if worker scheduled away from writer's pinned core).
+- Pinned mode: router-task → mpsc cross-runtime → worker-thread (pinned core C) → channel → writer-thread (pinned core C) — second hop becomes a same-core mpsc push (no wakeup syscall). Cache locality wins for schema cache, routing ring, and shard map.
 
-**Edge Cases:**
-1. Broadcast/scatter-gather — fan out across all workers; affinity hint is `None` (acceptable)
-2. Dynamic shard creation — worker assigned by hash already exists; no restructuring needed
-3. `current_thread` runtime — only one task at a time; mitigated by keeping validation cheap
-4. Backpressure — affine routing exposes per-shard imbalance; expose per-worker queue depth as metric
+**Edge cases handled:**
+1. Broadcast/scatter — `affinity_shard = None`, falls through to round-robin send across pinned workers.
+2. Dynamic shard creation — workers already cover all cores; hash determines the new shard's worker.
+3. `current_thread` runtime — fine because the worker only awaits channels and delegates blocking work elsewhere.
+4. Shutdown — JoinHandles ensure runtimes drop before the orchestrator returns.
 
 ---
 

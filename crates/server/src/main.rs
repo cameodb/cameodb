@@ -27,8 +27,8 @@ use config::CameoDbConfig;
 use distributed::{ClusterStatus, DistributedCluster};
 use http_server::{AppState, create_router};
 use node_orchestrator::{
-    NodeConfig, NodeOrchestrator, ProposeShard, RouterActor, UpdateTopology,
-    orchestrator_remote_name,
+    NodeConfig, NodeOrchestrator, ProposeShard, RouterActor, ShardAffineConfig,
+    StreamingSearchConfig, UpdateTopology, orchestrator_remote_name,
 };
 use remote_peer_pool::RemotePeerPool;
 use tokio::sync::mpsc;
@@ -144,6 +144,8 @@ async fn main() -> Result<()> {
         merge_num_threads: cameodb_config.search.merge_num_threads,
         writer_shutdown_timeout_secs: 30,
         writer_core_affinity: cameodb_config.storage.writer_core_affinity,
+        shard_affine_dispatch: cameodb_config.storage.shard_affine_dispatch,
+        worker_core_affinity: cameodb_config.storage.worker_core_affinity,
     };
 
     // Create the NodeOrchestrator actor
@@ -246,6 +248,7 @@ async fn main() -> Result<()> {
     // Spawn the worker pool BEFORE spawning the actor (we need &mut access)
     orchestrator.spawn_worker_pool();
     let worker_tx = orchestrator.worker_tx();
+    let shared_routing_ring = orchestrator.shared_routing_ring();
 
     // NOW spawn the NodeOrchestrator as an actor (after all setup is done)
     let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
@@ -353,10 +356,14 @@ async fn main() -> Result<()> {
         orchestrator_ref.clone(),
         coordinator_actor.clone(),
         &cameodb_config.network.cluster.messaging,
-        &cameodb_config.search,
+        StreamingSearchConfig::from_search_config(&cameodb_config.search),
         cameodb_config.search.default_search_limit,
         worker_tx,
         Arc::clone(&remote_peer_pool),
+        ShardAffineConfig {
+            routing_ring: shared_routing_ring,
+            enabled: cameodb_config.storage.shard_affine_dispatch,
+        },
     );
 
     let app_state = AppState {
