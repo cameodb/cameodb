@@ -94,13 +94,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
             *) echo "Unsupported architecture: ${TARGETARCH}"; exit 1;; \
         esac; \
     fi; \
-    rustup target add "${TARGET_TRIPLE}" || ( \
+    rustup target add "${TARGET_TRIPLE}" || \
+    rustup component add rust-std --target "${TARGET_TRIPLE}" || ( \
         echo "rustup failed, trying manual download..."; \
         RUST_STD_URL="https://static.rust-lang.org/dist/2026-04-16/rust-std-1.95.0-${TARGET_TRIPLE}.tar.xz"; \
         curl -k -L -o /tmp/rust-std.tar.xz "${RUST_STD_URL}" && \
         mkdir -p /tmp/rust-std && \
         tar -xf /tmp/rust-std.tar.xz -C /tmp/rust-std && \
-        /tmp/rust-std/rust-std-1.95.0-${TARGET_TRIPLE}/install.sh --prefix=$(rustup show home); \
+        /tmp/rust-std/rust-std-1.95.0-${TARGET_TRIPLE}/install.sh --prefix=$(rustup show home) && \
+        rustup target add "${TARGET_TRIPLE}"; \
     ); \
     cargo build --profile release-docker --target "${TARGET_TRIPLE}" --bin cameodb \
         --no-default-features \
