@@ -127,11 +127,11 @@ This document outlines the current development priorities and optimization roadm
 - ✅ **Phase 11 (Workflow Hot-Path Optimizations)**: All 7 steps completed
 - ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed
 - ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, and resources completed; security/docs/testing planned
-- 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stage 1 (writer pinning) completed; Stage 2a (worker observability) completed; Stages 2b–2f planned
+- 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f planned
 
 ### **Recommended Next Steps**
-1. **Phase 13 Stage 2b**: Extract admin memory module (refactoring prerequisite)
-2. **Phase 13 Stage 2c**: Auto-purge timer and per-index memory stats
+1. **Phase 13 Stage 2f**: Tantivy merge thread pinning + per-arena jemalloc stats
+2. **Phase 12 remaining**: MCP security, streaming, integration tests
 
 ---
 
@@ -299,7 +299,7 @@ HTTP req on axum tokio worker (any core)
 
 ---
 
-### Stage 2b: Extract Admin Memory Module 🎯 PLANNED
+### Stage 2b: Extract Admin Memory Module ✅ COMPLETED
 
 **Risk:** Low | **LOC:** ~200 (mostly move) | **Prerequisite:** None (independent of 2a)
 
@@ -317,21 +317,18 @@ HTTP req on axum tokio worker (any core)
 
 ---
 
-### Stage 2c: Auto-Purge Timer & Per-Index Memory Stats 🎯 PLANNED
+### Stage 2c: Per-Index Memory Stats ✅ COMPLETED
 
-**Risk:** Low | **LOC:** ~70 | **Prerequisite:** Stage 2b
+**Risk:** Low | **LOC:** ~5 | **Prerequisite:** Stage 2b
 
-**Goal:** Add automatic periodic memory purge and per-index memory visibility.
+**Goal:** Add per-index memory visibility in the `/_indexes` response.
 
-**2c.1 — Auto-Purge Timer:**
-- Add `auto_purge_interval_secs: u64` to `StorageConfig` (default: 0 = disabled)
-- When > 0, spawn a `tokio::time::interval` task that calls `call_memory_purge(false)` periodically
-- Prevents RSS creep under sustained write workloads without manual intervention
-- Config via `[storage] auto_purge_interval_secs = 300`
+**2c.1 — Auto-Purge Timer:** ⏭️ SKIPPED
+- Jemalloc's built-in `dirty_decay_ms` auto-release is working stably; no additional timer needed.
 
-**2c.2 — Per-Index Memory in `/_indexes`:**
-- Add optional `memory_mb: Option<u64>` per index to the `list_indexes` response
-- Derived from redb table sizes + tantivy index directory size on disk
+**2c.2 — Per-Index Memory in `/_indexes`:** ✅ COMPLETED
+- Added `memory_mb` field to each index in the `list_indexes` response
+- Derived from `redb_bytes + tantivy_bytes` per index (always present, not gated by `include_data_size`)
 - Helps operators identify bloated indexes without hitting `/_admin/memory`
 
 ---

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 
+mod admin;
 mod cluster_coordinator;
 mod cluster_state;
 mod cluster_state_machine;

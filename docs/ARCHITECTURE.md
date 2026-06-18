@@ -1,8 +1,8 @@
 # Distributed Hybrid-Search Database: Architecture Design Document
 
-**Version:** 0.2.1
-**Stack:** Rust, Kameo (Actors), Tokio, Redb, Tantivy, Axum
-**Crates:** `server`, `storage`, `cluster`, `client`
+**Version:** 0.2.2
+**Stack:** Rust, Kameo (Actors), Tokio, Redb, Tantivy, Axum, Libp2p
+**Crates:** `server`, `storage`, `cluster`, `client`, `mcp`
 
 ---
 
@@ -283,7 +283,8 @@ all_results.truncate(limit);
 flowchart TB
     subgraph Application["Application Layer"]
         Server["CameoDB Node<br/>Actor System<br/>HTTP API<br/>Request Routing<br/>Orchestration"]
-        Client["client crate<br/>SDK / Client Libraries<br/>(planned)"]
+        Client["client crate<br/>SDK / Client Libraries"]
+        Mcp["mcp crate<br/>MCP Server<br/>AI Agent Tools<br/>SSE Transport"]
     end
 
     subgraph Core["Core Infrastructure"]
@@ -293,15 +294,17 @@ flowchart TB
 
     Server -->|uses| Storage
     Server -->|routing decisions| Cluster
+    Server -->|nests MCP router| Mcp
     Client -->|optional topology| Cluster
     Storage -->|shard metadata| Cluster
 ```
 
 ### 8.2. Crate Responsibilities
-- **`server`:** Actor system, HTTP API, request routing, orchestration
-- **`storage`:** Hybrid storage engine (redb + tantivy), WAL, search functionality
-- **`cluster`:** Consistent hashing, node identity, topology management
-- **`client`:** SDK for application integration (planned)
+- **`server`:** Actor system (Kameo + Libp2p), HTTP API (Axum), request routing, orchestration, admin endpoints, thread-per-core worker pool
+- **`storage`:** Hybrid storage engine (redb + tantivy), WAL, search functionality, schema evolution
+- **`cluster`:** Consistent hashing (XXH3), node identity, topology management
+- **`client`:** SDK for application integration (HTTP client, CLI REPL)
+- **`mcp`:** Model Context Protocol server for AI agents (SSE transport, JSON-RPC, tool definitions)
 
 ## 9. Resilience & Recovery
 

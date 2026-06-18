@@ -4,12 +4,15 @@ This document outlines the highly specific architectural rules, dependencies, an
 
 ## 1. Core Dependencies & Versions
 *Do not hallucinate versions. Use these strictly:*
-- **Actor Framework**: `kameo` (0.19) - *Note: It uses Tokio 1.x.*
-- **Web Server**: `axum` (0.7)
-- **KV Store**: `redb` (3.1)
-- **Search**: `tantivy` (0.25)
-- **Async Runtime**: `tokio` (1.48)
-- **HTTP Client**: `reqwest` (0.12)
+- **Actor Framework**: `kameo` (0.19) with features ["remote", "macros"]
+- **Web Server**: `axum` (0.8.9), `axum-extra` (0.10.3)
+- **P2P Networking**: `libp2p` (0.56.0)
+- **KV Store**: `redb` (3.1.3)
+- **Search**: `tantivy` (0.26.1) with features ["stemmer"]
+- **Async Runtime**: `tokio` (1.52.1) with features ["full"]
+- **HTTP Client**: `reqwest` (0.12.28)
+- **Hashing**: `xxhash-rust` (0.8) with features ["xxh3"]
+- **Error Handling**: `thiserror` (2.0.18), `anyhow` (1.0.102)
 
 ---
 

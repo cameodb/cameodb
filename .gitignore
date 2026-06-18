@@ -53,8 +53,8 @@ tramp
 # Rust Analyzer
 .rust-analyzer
 
-# Windsurf IDE
-.windsurfrules
+# Devin IDE
+.devinrules
 
 # Other editors
 .project
