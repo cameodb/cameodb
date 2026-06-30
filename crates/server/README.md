@@ -286,6 +286,7 @@ Cluster metadata is persisted to `metadata.redb` using a **zero-polling, event-d
 - **No background tasks** - All persistence triggered inline with state-changing actor messages.
 - **No timeouts** - State transitions occur only on actual membership events.
 - **Message-driven lifecycle** - Fully aligned with Kameo actor model.
+- **Serialization format** - All metadata is serialized as JSON (`serde_json`) for unified, debuggable persistence. Deserialization errors on startup are treated as fresh cluster state (graceful upgrade from older formats).
 
 **Persistence Triggers:**
 - `PeerDiscovered` → Update node registry, evaluate cluster state, persist snapshot.

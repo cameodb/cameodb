@@ -427,7 +427,7 @@ if let Some(bytes) = data {
 }
 
 // Search within specific index
-let results = store.search_documents("employees", "software engineer", 10)?;
+let (results, total_hits) = store.search_documents("employees", "software engineer", 10, None)?;
 for (score, doc) in results {
     println!("Score: {:.3}, ID: {}", score, doc["id"]);
 }
@@ -811,7 +811,7 @@ At a high level, storage operations can fail with the following **error categori
   - Examples: index directory missing, schema mismatch, segment corruption
 
 - **Serialization errors**
-  - JSON or bincode encoding/decoding issues for WAL entries, documents, or schemas
+  - JSON encoding/decoding issues for WAL entries, documents, or schemas
 
 - **Query errors**
   - Problems parsing or executing search queries (invalid syntax, unknown fields)
@@ -933,8 +933,11 @@ pub fn search_documents(
     index: &str,
     query: &str,
     limit: usize,
-) -> Result<Vec<(f32, JsonValue)>, StoreError>
+    _sort: Option<&SortSpec>,
+) -> Result<(Vec<(f32, JsonValue)>, usize), StoreError>
 ```
+
+Returns a tuple of `(results, total_hits)` where `total_hits` is the total number of matching documents (may exceed `limit`).
 
 ### Return Format
 - **`f32`**: Relevance score (higher = more relevant)
@@ -946,8 +949,9 @@ pub fn search_documents(
 use storage::{HybridStore, StorageConfig};
 use serde_json::Value as JsonValue;
 
-// Multi-tenant search
-let results: Vec<(f32, JsonValue)> = store.search_documents("employees", "software engineer", 10)?;
+// Multi-tenant search (no sorting)
+let (results, total_hits) = store.search_documents("employees", "software engineer", 10, None)?;
+println!("Total matches: {}", total_hits);
 
 for (score, document) in results {
     println!("Score: {:.3}", score);
@@ -960,8 +964,8 @@ for (score, document) in results {
 // Search across multiple indices
 let indices = ["employees", "contractors", "vendors"];
 for index in &indices {
-    let results = store.search_documents(index, "software engineer", 5)?;
-    println!("Results from {}: {} matches", index, results.len());
+    let (results, total) = store.search_documents(index, "software engineer", 5, None)?;
+    println!("Results from {}: {}/{} matches", index, results.len(), total);
 }
 ```
 
@@ -974,21 +978,28 @@ async fn async_multi_tenant_search(
     index: String,
     query: String,
     limit: usize
-) -> Result<Vec<(f32, JsonValue)>, StoreError> {
-    let results = task::spawn_blocking(move || {
-        store.search_documents(&index, &query, limit)
+) -> Result<(Vec<(f32, JsonValue)>, usize), StoreError> {
+    let (results, total_hits) = task::spawn_blocking(move || {
+        store.search_documents(&index, &query, limit, None)
     }).await.map_err(|_| StoreError::Serialization("Task panicked".to_string()))??;
     
-    Ok(results)
+    Ok((results, total_hits))
 }
 ```
 
 ### Query Syntax
 Supports standard tantivy query syntax:
-- **Simple terms**: `"engineer"`
+- **Simple terms**: `"engineer"` — searches all text/string fields by default
 - **Phrase queries**: `"software engineer"`
 - **Boolean operators**: `"software AND engineer"`
 - **Field-specific**: `"title:manager"` (if fields are properly indexed)
+- **Range queries**: `year:[2020 TO 2024]`, `price:{10 TO 100}`
+- **Comparison operators**: `created_at:>2024-01-01`, `score:>=4.5`
+- **Set operator**: `status: IN [active pending review]`
+
+**Default Search Fields**: Only `text` and `json` fields are used as default search fields for unqualified queries (no `field:` prefix). Numeric, date, boolean, bytes, IP, and facet fields require explicit `field:value` syntax. This prevents parse errors when a generic text search would otherwise try to match against numeric fields.
+
+**Lenient Parsing**: Queries are parsed with `parse_query_lenient()`, which gracefully handles type mismatches (e.g., `field:hello` on a numeric field skips that field instead of failing the entire query). Non-fatal parse errors are logged at debug level.
 
 ### Search Performance Characteristics
 - **Latency**: ~10-100ms per index (depends on index size and query complexity)
@@ -1104,7 +1115,7 @@ impl MicroshardActor {
         
         // Offload blocking tantivy operations to thread pool
         let results = tokio::task::spawn_blocking(move || {
-            store.search_documents(&request.query, request.limit)
+            store.search_documents(&request.query, request.limit, None)
         }).await??;
         
         Ok(results) // Can be serialized and sent to other actors
@@ -1115,8 +1126,8 @@ impl MicroshardActor {
 ## Future Enhancements
 
 ### Planned Features
-- **Schema Evolution**: Dynamic field addition with type validation
-- **Advanced Query Support**: Range queries, faceted search, aggregations
+- **Schema Evolution**: ✅ Implemented - Dynamic field addition with type inference and validation
+- **Advanced Query Support**: Range queries ✅, faceted search, aggregations
 - **WAL Compaction**: Periodic cleanup of old WAL entries
 - **Cross-Index Search**: Federated search across multiple indices
 - **Index Templates**: Predefined schemas for new indices

@@ -10,9 +10,9 @@ use std::{
 use axum::{
     Json, Router,
     extract::{Extension, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{
-        IntoResponse, Sse,
+        IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
     },
     routing::{get, post},
@@ -24,6 +24,35 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
+use uuid::Uuid;
+
+/// MCP protocol versions this server supports, newest first.
+/// Used for version negotiation during `initialize` and for validating the
+/// `MCP-Protocol-Version` HTTP header on the Streamable HTTP transport.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// Latest protocol version supported (returned when the client requests an
+/// unknown version or omits one).
+const LATEST_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
+
+/// HTTP header carrying the session identifier on the Streamable HTTP transport.
+const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+
+/// HTTP header carrying the negotiated protocol version on subsequent requests.
+const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+
+/// Negotiate the protocol version: echo the client's requested version if we
+/// support it, otherwise fall back to our latest supported version (per MCP spec).
+fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    match requested {
+        Some(req) => SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .find(|version| **version == req)
+            .copied()
+            .unwrap_or(LATEST_PROTOCOL_VERSION),
+        None => LATEST_PROTOCOL_VERSION,
+    }
+}
 
 #[derive(Clone)]
 struct McpTransportState {
@@ -55,6 +84,27 @@ impl McpTransportState {
             );
         }
     }
+
+    /// Create a new Streamable HTTP session (no SSE push channel) and return its id.
+    /// The id is a cryptographically random UUID per the MCP spec recommendation.
+    async fn create_session(&self) -> String {
+        let session_id = Uuid::new_v4().to_string();
+        let mut inner = self.inner.lock().await;
+        inner.sessions.insert(
+            session_id.clone(),
+            McpSession {
+                sender: None,
+                last_activity: std::time::Instant::now(),
+            },
+        );
+        session_id
+    }
+
+    /// Remove a session by id. Returns `true` if a session was removed.
+    async fn remove_session(&self, session_id: &str) -> bool {
+        let mut inner = self.inner.lock().await;
+        inner.sessions.remove(session_id).is_some()
+    }
 }
 
 /// Opaque handle returned by [`mcp_router`] to trigger graceful MCP shutdown.
@@ -80,7 +130,10 @@ struct McpTransportInner {
 
 #[derive(Clone)]
 struct McpSession {
-    sender: mpsc::UnboundedSender<Event>,
+    /// SSE push channel. `Some` for legacy SSE sessions (server pushes responses
+    /// over the stream); `None` for Streamable HTTP sessions where responses are
+    /// returned inline on the POST request.
+    sender: Option<mpsc::UnboundedSender<Event>>,
     last_activity: std::time::Instant,
 }
 
@@ -232,14 +285,17 @@ where
 
                     // Remove sessions: only clean up if SSE connection is closed AND inactive
                     inner.sessions.retain(|session_id, session| {
-                        if !session.sender.is_closed() {
-                            // SSE connection still alive — keep regardless of last POST activity
+                        // Legacy SSE sessions with a live push channel are kept regardless
+                        // of last POST activity. Streamable HTTP sessions (sender = None)
+                        // and disconnected SSE sessions fall through to the inactivity check.
+                        if let Some(sender) = &session.sender
+                            && !sender.is_closed()
+                        {
                             return true;
                         }
-                        // SSE disconnected — apply inactivity timeout
                         let is_active = now.duration_since(session.last_activity) < timeout;
                         if !is_active {
-                            info!(session_id = %session_id, "Cleaning up disconnected MCP session");
+                            info!(session_id = %session_id, "Cleaning up inactive MCP session");
                         }
                         is_active
                     });
@@ -254,14 +310,28 @@ where
     };
 
     let router = Router::new()
+        // Streamable HTTP transport (MCP spec 2025-03-26+): a single MCP endpoint
+        // that supports POST (send messages), GET (open a listening SSE stream),
+        // and DELETE (terminate a session).
         .route(
             "/",
             post(
-                |State(app_state): State<S>, Json(payload): Json<JsonValue>| async move {
-                    process_mcp_http_message(app_state, payload).await
+                |State(app_state): State<S>,
+                 Extension(state): Extension<McpTransportState>,
+                 headers: HeaderMap,
+                 Json(payload): Json<JsonValue>| async move {
+                    process_streamable_http(app_state, state, headers, payload).await
+                },
+            )
+            .get(streamable_listen_handler)
+            .delete(
+                |Extension(state): Extension<McpTransportState>, headers: HeaderMap| async move {
+                    streamable_delete_handler(state, headers).await
                 },
             ),
         )
+        // Legacy HTTP+SSE transport (MCP spec 2024-11-05): kept for backwards
+        // compatibility with already-configured clients.
         .route(
             "/sse",
             get(mcp_sse_handler).post(
@@ -297,7 +367,7 @@ async fn mcp_sse_handler(
         let now = std::time::Instant::now();
 
         let session = McpSession {
-            sender: tx.clone(),
+            sender: Some(tx.clone()),
             last_activity: now,
         };
 
@@ -396,8 +466,14 @@ async fn process_mcp_message<B: McpBackend>(
 
                 if let Some(envelope) = maybe_response {
                     let event = Event::default().event("message").data(envelope.to_string());
-                    if sender.send(event).is_err() {
-                        debug!(session_id = %session_id, "MCP session receiver dropped during async processing");
+                    match sender {
+                        Some(sender) if sender.send(event).is_ok() => {}
+                        Some(_) => {
+                            debug!(session_id = %session_id, "MCP session receiver dropped during async processing");
+                        }
+                        None => {
+                            debug!(session_id = %session_id, "MCP session has no SSE push channel; response dropped");
+                        }
                     }
                 }
             });
@@ -437,6 +513,108 @@ async fn process_mcp_http_message<B: McpBackend>(
     }
 }
 
+/// Streamable HTTP transport POST handler (MCP spec 2025-03-26+).
+///
+/// Processes a single JSON-RPC message and returns the response inline as
+/// `application/json`. On `initialize`, a new session id is generated and
+/// returned in the `MCP-Session-Id` response header. Notifications and
+/// responses (which produce no reply) return `202 Accepted` per the spec.
+///
+/// If a client sends an `MCP-Protocol-Version` header, it is validated against
+/// the supported set and rejected with `400 Bad Request` if unsupported.
+async fn process_streamable_http<B: McpBackend>(
+    app_state: B,
+    state: McpTransportState,
+    headers: HeaderMap,
+    payload: JsonValue,
+) -> Response {
+    // Validate the protocol version header if present (spec: 400 if unsupported).
+    if let Some(version) = headers
+        .get(MCP_PROTOCOL_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        && !SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_response(
+                None,
+                -32600,
+                format!("Unsupported MCP-Protocol-Version: {version}"),
+            )),
+        )
+            .into_response();
+    }
+
+    let is_initialize =
+        payload.get("method").and_then(|method| method.as_str()) == Some("initialize");
+
+    match parse_json_rpc_request(payload) {
+        Ok(request) => match handle_rpc_request(app_state, request).await {
+            Some(response) => {
+                if is_initialize {
+                    // Establish a session and advertise it via the MCP-Session-Id header.
+                    let session_id = state.create_session().await;
+                    let mut response_headers = HeaderMap::new();
+                    if let Ok(value) = HeaderValue::from_str(&session_id) {
+                        response_headers
+                            .insert(HeaderName::from_static(MCP_SESSION_ID_HEADER), value);
+                    }
+                    (StatusCode::OK, response_headers, Json(response)).into_response()
+                } else {
+                    (StatusCode::OK, Json(response)).into_response()
+                }
+            }
+            // No response body => JSON-RPC notification or response: 202 Accepted.
+            None => StatusCode::ACCEPTED.into_response(),
+        },
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(error_response(
+                None,
+                -32600,
+                format!("Invalid JSON-RPC request: {err}"),
+            )),
+        )
+            .into_response(),
+    }
+}
+
+/// Streamable HTTP transport GET handler (MCP spec 2025-03-26+).
+///
+/// Opens a server-to-client SSE stream. CameoDB does not currently initiate
+/// server-side requests, so this stream only emits keep-alive comments to hold
+/// the connection open, satisfying clients that establish a listening channel.
+async fn streamable_listen_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = futures::stream::pending::<Result<Event, Infallible>>();
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    )
+}
+
+/// Streamable HTTP transport DELETE handler (MCP spec 2025-03-26+).
+///
+/// Explicitly terminates the session identified by the `MCP-Session-Id` header.
+/// Returns `200 OK` if removed, `404 Not Found` if unknown, `400 Bad Request`
+/// if the header is missing.
+async fn streamable_delete_handler(state: McpTransportState, headers: HeaderMap) -> StatusCode {
+    match headers
+        .get(MCP_SESSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(session_id) => {
+            if state.remove_session(session_id).await {
+                info!(session_id = %session_id, "MCP Streamable HTTP session terminated");
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        }
+        None => StatusCode::BAD_REQUEST,
+    }
+}
+
 fn parse_json_rpc_request(payload: JsonValue) -> Result<JsonRpcRequest, serde_json::Error> {
     serde_json::from_value::<JsonRpcRequest>(payload)
 }
@@ -470,21 +648,28 @@ where
 {
     match request.method.as_str() {
         // --- Lifecycle ---
-        "initialize" => Some(success_response(
-            request.id,
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {},
-                    "resources": {},
-                    "prompts": {}
-                },
-                "serverInfo": {
-                    "name": "cameodb-mcp",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-        )),
+        "initialize" => {
+            let client_version = request
+                .params
+                .get("protocolVersion")
+                .and_then(|v| v.as_str());
+            let negotiated = negotiate_protocol_version(client_version);
+            Some(success_response(
+                request.id,
+                json!({
+                    "protocolVersion": negotiated,
+                    "capabilities": {
+                        "tools": {},
+                        "resources": {},
+                        "prompts": {}
+                    },
+                    "serverInfo": {
+                        "name": "cameodb-mcp",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            ))
+        }
         "ping" => Some(success_response(request.id, json!({}))),
 
         // --- Notifications (no response per JSON-RPC spec) ---
@@ -765,6 +950,22 @@ fn mcp_tools() -> Vec<JsonValue> {
                                     "type": "array",
                                     "items": { "type": "string" },
                                     "description": "Fields to include from this index."
+                                },
+                                "sort": {
+                                    "type": "object",
+                                    "description": "Sort results by a FAST field within this index.",
+                                    "properties": {
+                                        "field": {
+                                            "type": "string",
+                                            "description": "FAST field name to sort by."
+                                        },
+                                        "order": {
+                                            "type": "string",
+                                            "enum": ["asc", "desc"],
+                                            "description": "Sort order. Defaults to desc."
+                                        }
+                                    },
+                                    "required": ["field"]
                                 }
                             },
                             "required": ["index"]

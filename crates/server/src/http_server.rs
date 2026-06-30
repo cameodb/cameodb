@@ -802,7 +802,7 @@ fn field_type_query_hint(field_type: &str) -> &'static str {
             "Exact match (no tokenization). Supports: field:exact_value, field: IN [val1 val2] (set), +/- (must/must-not). No phrase or slop queries."
         }
         "i64" | "u64" | "f64" => {
-            "Numeric field. Supports: field:value (exact), field:[low TO high] (inclusive range), field:{low TO high} (exclusive range), field:[low TO *] or field:[* TO high] (unbounded), field:value^2.0 (boost), +/- (must/must-not). No phrase or IN set queries."
+            "Numeric field. Supports: field:value (exact), field:>value, field:<value, field:>=value, field:<=value (comparisons), field:[low TO high] (inclusive range), field:{low TO high} (exclusive range), field:[low TO *] or field:[* TO high] (unbounded), field:value^2.0 (boost), +/- (must/must-not). No phrase or IN set queries."
         }
         "date" => {
             "Date field (YYYY-MM-DD or RFC3339). Supports: field:2024-01-15, field:>2024-01-01, field:<2024-12-31, field:>=date, field:<=date, field:[start TO end] (inclusive), field:{start TO end} (exclusive), +/- (must/must-not). No phrase or IN set queries."
@@ -1178,8 +1178,8 @@ fn cameodb_syntax_reference() -> JsonValue {
                     "title:rust sort timestamp:asc",
                     "title:rust sort price"
                 ],
-                "supported_types": "u64, date (both must be FAST)",
-                "note": "Sorting by i64/f64 requires Tantivy >= 0.26. Date fields use timestamp ordering."
+                "supported_types": "u64, i64, f64, date (all must be FAST)",
+                "note": "Date fields use timestamp ordering. All numeric FAST fields support sort."
             },
             "combined": {
                 "example": "title:rust AND author:doe return title,author limit 10 sort year:desc"

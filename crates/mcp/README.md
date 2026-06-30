@@ -85,8 +85,11 @@ Execute full-text search on a single CameoDB index.
   - Set operator: `status: IN [active pending review]`
   - Boosting: `title:rust^3 OR body:rust`
   - Date comparisons: `created_at:>2024-01-01`
+  - Numeric comparisons: `score:>=4.5`, `price:<100`
   - All docs: `*`
   - Inline modifiers: `title:rust return title,author limit 5`
+
+  **Default search fields**: Unqualified queries (no `field:` prefix) search only `text` and `json` fields. Numeric, date, and other typed fields require explicit `field:value` syntax. Query parsing is lenient — type mismatches (e.g., `field:hello` on a numeric field) are silently skipped rather than failing the entire query.
 - `limit` (integer, optional): Maximum number of results to return
 - `fields` (array of strings, optional): Field names to include in results (field projection)
 
@@ -120,6 +123,9 @@ Execute federated search across multiple CameoDB indexes with optional per-index
 - `indexes` (array, required): List of indexes to search, each with:
   - `index` (string, required): Name of the CameoDB index
   - `fields` (array of strings, optional): Fields to include from this index
+  - `sort` (object, optional): Sort results by a FAST field within this index
+    - `field` (string, required): FAST field name to sort by (u64, i64, f64, or date)
+    - `order` (string, optional): `asc` or `desc` (defaults to `desc`)
 - `query` (string, required): Search query applied to all specified indexes
 - `limit` (integer, optional): Maximum total results across all indexes
 
@@ -131,7 +137,7 @@ Execute federated search across multiple CameoDB indexes with optional per-index
   "name": "search_indexes",
   "arguments": {
     "indexes": [
-      {"index": "papers", "fields": ["title", "author"]},
+      {"index": "papers", "fields": ["title", "author"], "sort": {"field": "year", "order": "desc"}},
       {"index": "books", "fields": ["title", "isbn"]}
     ],
     "query": "rust programming",
@@ -402,6 +408,17 @@ timestamp:[2024-01-01T00:00:00Z TO 2024-01-02T00:00:00Z}  # exclusive upper
 
 > Accepts YYYY-MM-DD or full RFC3339 (e.g. `2024-01-15T10:30:00Z`). Dates are auto-normalized internally.
 
+### Numeric Comparison Queries
+```
+score:>=4.5                    # score greater than or equal to 4.5
+price:<100                     # price less than 100
+year:>2020                     # year after 2020
+count:[10 TO 100]              # inclusive range
+temperature:{20.0 TO 30.0}     # exclusive range
+```
+
+> Comparison operators (`>`, `<`, `>=`, `<=`) work natively with numeric fields (i64, u64, f64) and date fields. No normalization is needed for numeric values.
+
 ### Exact ID Lookup
 ```
 id:my-document-id
@@ -454,7 +471,7 @@ title:rust AND author:doe return title,author limit 10  # combined
 | `"phrase"~N` (slop) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | — | ❌ |
 | `"phrase"*` (prefix) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | — | ❌ |
 | `field:[a TO z]` (range) | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ | — | ❌ |
-| `field:>val` (comparison) | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | — | ❌ |
+| `field:>val` (comparison) | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | — | ❌ |
 | `field: IN [a b]` (set) | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | — | ❌ |
 | `term^boost` | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | — | ❌ |
 | `AND/OR/NOT` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |

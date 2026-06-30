@@ -400,12 +400,19 @@ async fn main() -> Result<()> {
         "  POST /_admin/memory/purge - Trigger jemalloc memory purge (?force=true for aggressive)"
     );
     println!("  POST /_admin/index/{{index}}/commit - Force index writer commit");
-    println!("  POST /_admin/index/{{index}}/evict_writer - Evict index writer from cache");
-    println!("  POST /mcp - MCP direct HTTP JSON-RPC endpoint");
-    println!("  GET  /mcp/sse - MCP SSE transport endpoint");
-    println!("  POST /mcp/sse - MCP compatibility HTTP endpoint");
-    println!("  POST /mcp/messages?session_id=... - MCP JSON-RPC message endpoint");
-    println!("  MCP capabilities: tools (6), resources (4), prompts (1)");
+    println!("  GET  /_admin/workers - Worker pool statistics");
+    println!("  POST /_admin/index/{{index}}/evict-writer - Evict index writer from cache");
+    println!(
+        "  POST /mcp - MCP Streamable HTTP endpoint (JSON-RPC, returns MCP-Session-Id on initialize)"
+    );
+    println!("  GET  /mcp - MCP Streamable HTTP listening stream (SSE)");
+    println!("  DELETE /mcp - MCP Streamable HTTP session termination (MCP-Session-Id header)");
+    println!("  GET  /mcp/sse - MCP legacy SSE transport endpoint");
+    println!("  POST /mcp/sse - MCP legacy compatibility HTTP endpoint");
+    println!("  POST /mcp/messages?session_id=... - MCP legacy JSON-RPC message endpoint");
+    println!(
+        "  MCP protocol: 2025-06-18 (negotiated), capabilities: tools (6), resources (4), prompts (1)"
+    );
     println!();
     println!("⚙️  Configuration:");
     println!("  Data Paths: {:?}", cameodb_config.storage.data_paths);

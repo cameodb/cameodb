@@ -114,7 +114,7 @@ The CLI mirrors Tantivy's query parser (see [docs](https://docs.rs/tantivy/lates
 | Range / comparisons | `price:[10 TO 20]`, `rating:>=4` | Hinter ignores `> < = !` so hints still show. |
 | Prefix / wildcard | `tag:rust*` | Type `*` manually after completion. |
 | Boost | `title:rust^2` | Manual entry; CLI does not alter caret syntax. |
-| Sort | `sort field:desc` | Sort by FAST field (u64/date). Order optional (defaults to desc). |
+| Sort | `sort field:desc` | Sort by FAST field (u64, i64, f64, date). Order optional (defaults to desc). |
 
 If Tantivy adds more operators, update this table and (optionally) extend the completer to understand them.
 
@@ -129,7 +129,7 @@ CameoDB supports inline modifiers in the query string for convenience:
 | Sort results | `sort field:order` | `title:rust sort year:desc` | Sort by FAST field |
 
 **Sorting Details:**
-- Supported field types: `u64` and `date` (both must be marked as FAST)
+- Supported field types: `u64`, `i64`, `f64`, and `date` (all must be marked as FAST)
 - Order can be `asc` or `desc` (defaults to `desc`)
 - CLI provides autocomplete for sortable fields and `:asc`/:desc` suffixes
 - Example: `search books title:rust sort publication_year:asc limit 20`
