@@ -3440,16 +3440,37 @@ impl HybridStore {
         let normalized_query = normalize_date_query(query, &schema);
 
         // Create query parser and execute search
-        let query_fields: Vec<Field> = fields.indexed_fields.values().cloned().collect();
-        let query_parser = tantivy::query::QueryParser::for_index(tantivy_index, query_fields);
-        let parsed_query = query_parser.parse_query(&normalized_query)?;
+        // Only text/string fields are used as default search fields (for unqualified queries).
+        // Numeric/date fields require explicit field:value syntax.
+        // This prevents parse errors when a generic text search tries to match against numeric fields.
+        let tantivy_schema = tantivy_index.schema();
+        let default_query_fields: Vec<Field> = fields
+            .indexed_fields
+            .values()
+            .filter(|field| {
+                let field_entry = tantivy_schema.get_field_entry(**field);
+                matches!(
+                    field_entry.field_type(),
+                    tantivy::schema::FieldType::Str(_) | tantivy::schema::FieldType::JsonObject(_)
+                )
+            })
+            .cloned()
+            .collect();
+        let query_parser =
+            tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
 
-        // Debug: log the parsed query to verify field-specific clauses are recognized
-        debug!(
-            index = %index,
-            parsed_query = %format!("{:?}", parsed_query),
-            "Parsed tantivy query"
-        );
+        // Use lenient parsing to gracefully handle type mismatches
+        // (e.g. field:hello on a numeric field skips that field instead of failing the entire query)
+        let (parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
+
+        if !parse_errors.is_empty() {
+            debug!(
+                index = %index,
+                query = %normalized_query,
+                errors = ?parse_errors,
+                "Lenient query parse produced non-fatal errors"
+            );
+        }
 
         // Execute search with sorting if specified, otherwise use MultiCollector
         // OPTIMIZATION: Use MultiCollector for both sorted and unsorted to get count in single pass
