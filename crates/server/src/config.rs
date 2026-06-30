@@ -450,11 +450,11 @@ impl CameoDbConfig {
         if path.ends_with(".toml") {
             toml::from_str(content).with_context(|| "Failed to parse TOML configuration")
         } else if path.ends_with(".yaml") || path.ends_with(".yml") {
-            serde_yml::from_str(content).with_context(|| "Failed to parse YAML configuration")
+            serde_saphyr::from_str(content).with_context(|| "Failed to parse YAML configuration")
         } else {
             // Try TOML first, then YAML
             toml::from_str(content)
-                .or_else(|_| serde_yml::from_str(content))
+                .or_else(|_| serde_saphyr::from_str(content))
                 .with_context(|| "Failed to parse configuration (tried TOML and YAML)")
         }
     }

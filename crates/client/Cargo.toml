@@ -8,7 +8,7 @@ license = "MIT"
 default = ["native-tls"]
 native-tls = ["reqwest/native-tls"]
 native-tls-vendored = ["reqwest/native-tls-vendored"]
-rustls-tls = ["reqwest/rustls-tls"]
+rustls-tls = ["reqwest/rustls"]
 
 [dependencies]
 anyhow.workspace = true

@@ -13,6 +13,7 @@
 //! - `ring_snapshot`: Serialized ConsistentRing for fast recovery
 
 use anyhow::{Context as AnyhowContext, Result};
+use bincode_next::config::legacy;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -217,7 +218,7 @@ impl ClusterStateStore {
         // Write cluster config
         {
             let mut table = txn.open_table(TABLE_CLUSTER_CONFIG)?;
-            let config_bytes = bincode::serialize(config)?;
+            let config_bytes = bincode_next::serde::encode_to_vec(config, legacy())?;
             table.insert("current", config_bytes.as_slice())?;
         }
 
@@ -237,7 +238,7 @@ impl ClusterStateStore {
                     state: ShardAssignmentState::Active,
                     last_seen: current_timestamp(),
                 };
-                let value_bytes = bincode::serialize(&persisted)?;
+                let value_bytes = bincode_next::serde::encode_to_vec(&persisted, legacy())?;
                 table.insert(key_bytes.as_slice(), value_bytes.as_slice())?;
             }
 
@@ -279,7 +280,7 @@ impl ClusterStateStore {
                         NodeStatus::Disconnected => NodeState::Lost,
                     },
                 };
-                let value_bytes = bincode::serialize(&persisted)?;
+                let value_bytes = bincode_next::serde::encode_to_vec(&persisted, legacy())?;
                 table.insert(key_bytes.as_slice(), value_bytes.as_slice())?;
             }
 
@@ -309,10 +310,10 @@ impl ClusterStateStore {
                 generation: config.generation,
                 node_count: nodes.len(),
                 shard_count: shards.len(),
-                ring_data: bincode::serialize(ring)?,
+                ring_data: bincode_next::serde::encode_to_vec(ring, legacy())?,
                 created_at: current_timestamp(),
             };
-            let snapshot_bytes = bincode::serialize(&ring_snapshot)?;
+            let snapshot_bytes = bincode_next::serde::encode_to_vec(&ring_snapshot, legacy())?;
             table.insert("latest", snapshot_bytes.as_slice())?;
         }
 
@@ -339,7 +340,8 @@ impl ClusterStateStore {
         match txn.open_table(TABLE_CLUSTER_CONFIG) {
             Ok(table) => {
                 if let Some(value) = table.get("current")? {
-                    let config: PersistedClusterConfig = bincode::deserialize(value.value())?;
+                    let (config, _) =
+                        bincode_next::serde::decode_from_slice(value.value(), legacy())?;
                     Ok(Some(config))
                 } else {
                     Ok(None)
@@ -359,7 +361,8 @@ impl ClusterStateStore {
             Ok(table) => {
                 for result in table.iter()? {
                     let (_key, value) = result?;
-                    let shard: PersistedShardAssignment = bincode::deserialize(value.value())?;
+                    let (shard, _): (PersistedShardAssignment, usize) =
+                        bincode_next::serde::decode_from_slice(value.value(), legacy())?;
                     shards.insert(shard.shard_id, shard);
                 }
             }
@@ -381,7 +384,8 @@ impl ClusterStateStore {
             Ok(table) => {
                 for result in table.iter()? {
                     let (_key, value) = result?;
-                    let node: PersistedNodeInfo = bincode::deserialize(value.value())?;
+                    let (node, _): (PersistedNodeInfo, usize) =
+                        bincode_next::serde::decode_from_slice(value.value(), legacy())?;
                     nodes.insert(node.node_id, node);
                 }
             }
@@ -397,7 +401,8 @@ impl ClusterStateStore {
         match txn.open_table(TABLE_RING_SNAPSHOT) {
             Ok(table) => {
                 if let Some(value) = table.get("latest")? {
-                    let snapshot: RingSnapshot = bincode::deserialize(value.value())?;
+                    let (snapshot, _) =
+                        bincode_next::serde::decode_from_slice(value.value(), legacy())?;
                     Ok(Some(snapshot))
                 } else {
                     Ok(None)
