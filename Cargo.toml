@@ -7,7 +7,6 @@ anyhow = "1.0.102"
 arc-swap = "1"
 axum = "0.8.9"
 axum-extra = "0.10.3"
-bincode-next = { version = "3", features = ["serde"] }
 futures = "0.3.32"
 kameo = { version = "0.21", features = ["remote", "macros"] }
 libp2p = { version = "0.56.0", features = ["tcp", "dns", "quic", "noise", "yamux", "macros", "kad", "tokio", "serde", "request-response"] }

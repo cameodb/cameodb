@@ -13,7 +13,6 @@
 //! - `ring_snapshot`: Serialized ConsistentRing for fast recovery
 
 use anyhow::{Context as AnyhowContext, Result};
-use bincode_next::config::legacy;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -126,7 +125,7 @@ pub struct RingSnapshot {
     pub node_count: usize,
     /// Number of shards in the ring
     pub shard_count: usize,
-    /// Serialized ConsistentRing data (bincode)
+    /// Serialized ConsistentRing data (JSON)
     pub ring_data: Vec<u8>,
     /// When this snapshot was created
     pub created_at: u64,
@@ -175,10 +174,18 @@ impl ClusterStateStore {
         let txn = self.db.begin_read()?;
 
         // Load cluster config (if exists, indicates this is an existing cluster)
-        let config = match self.load_cluster_config(&txn)? {
-            Some(c) => c,
-            None => {
+        // Deserialization errors (e.g. old bincode format) are treated as no persisted state
+        let config = match self.load_cluster_config(&txn) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
                 info!("No persisted cluster config found, treating as fresh cluster");
+                return Ok(None);
+            }
+            Err(e) => {
+                info!(
+                    error = %e,
+                    "Failed to deserialize persisted cluster config, treating as fresh cluster"
+                );
                 return Ok(None);
             }
         };
@@ -218,7 +225,7 @@ impl ClusterStateStore {
         // Write cluster config
         {
             let mut table = txn.open_table(TABLE_CLUSTER_CONFIG)?;
-            let config_bytes = bincode_next::serde::encode_to_vec(config, legacy())?;
+            let config_bytes = serde_json::to_vec(config)?;
             table.insert("current", config_bytes.as_slice())?;
         }
 
@@ -238,7 +245,7 @@ impl ClusterStateStore {
                     state: ShardAssignmentState::Active,
                     last_seen: current_timestamp(),
                 };
-                let value_bytes = bincode_next::serde::encode_to_vec(&persisted, legacy())?;
+                let value_bytes = serde_json::to_vec(&persisted)?;
                 table.insert(key_bytes.as_slice(), value_bytes.as_slice())?;
             }
 
@@ -280,7 +287,7 @@ impl ClusterStateStore {
                         NodeStatus::Disconnected => NodeState::Lost,
                     },
                 };
-                let value_bytes = bincode_next::serde::encode_to_vec(&persisted, legacy())?;
+                let value_bytes = serde_json::to_vec(&persisted)?;
                 table.insert(key_bytes.as_slice(), value_bytes.as_slice())?;
             }
 
@@ -310,10 +317,10 @@ impl ClusterStateStore {
                 generation: config.generation,
                 node_count: nodes.len(),
                 shard_count: shards.len(),
-                ring_data: bincode_next::serde::encode_to_vec(ring, legacy())?,
+                ring_data: serde_json::to_vec(ring)?,
                 created_at: current_timestamp(),
             };
-            let snapshot_bytes = bincode_next::serde::encode_to_vec(&ring_snapshot, legacy())?;
+            let snapshot_bytes = serde_json::to_vec(&ring_snapshot)?;
             table.insert("latest", snapshot_bytes.as_slice())?;
         }
 
@@ -340,8 +347,7 @@ impl ClusterStateStore {
         match txn.open_table(TABLE_CLUSTER_CONFIG) {
             Ok(table) => {
                 if let Some(value) = table.get("current")? {
-                    let (config, _) =
-                        bincode_next::serde::decode_from_slice(value.value(), legacy())?;
+                    let config: PersistedClusterConfig = serde_json::from_slice(value.value())?;
                     Ok(Some(config))
                 } else {
                     Ok(None)
@@ -361,8 +367,7 @@ impl ClusterStateStore {
             Ok(table) => {
                 for result in table.iter()? {
                     let (_key, value) = result?;
-                    let (shard, _): (PersistedShardAssignment, usize) =
-                        bincode_next::serde::decode_from_slice(value.value(), legacy())?;
+                    let shard: PersistedShardAssignment = serde_json::from_slice(value.value())?;
                     shards.insert(shard.shard_id, shard);
                 }
             }
@@ -384,8 +389,7 @@ impl ClusterStateStore {
             Ok(table) => {
                 for result in table.iter()? {
                     let (_key, value) = result?;
-                    let (node, _): (PersistedNodeInfo, usize) =
-                        bincode_next::serde::decode_from_slice(value.value(), legacy())?;
+                    let node: PersistedNodeInfo = serde_json::from_slice(value.value())?;
                     nodes.insert(node.node_id, node);
                 }
             }
@@ -401,8 +405,7 @@ impl ClusterStateStore {
         match txn.open_table(TABLE_RING_SNAPSHOT) {
             Ok(table) => {
                 if let Some(value) = table.get("latest")? {
-                    let (snapshot, _) =
-                        bincode_next::serde::decode_from_slice(value.value(), legacy())?;
+                    let snapshot: RingSnapshot = serde_json::from_slice(value.value())?;
                     Ok(Some(snapshot))
                 } else {
                     Ok(None)
