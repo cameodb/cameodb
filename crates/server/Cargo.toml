@@ -59,11 +59,9 @@ axum-test = "20.0.0"
 [package.metadata.generate-rpm]
 release = "1"
 assets = [
-    # NOTE: When running inside the crate, the path to target might change depending on where you run cargo build.
-    # Usually relative to the workspace root, so ../../target might be needed if not using --target-dir
-    # However, cargo-generate-rpm usually handles strictly defined paths.
-    # Ensure this path points to where the binary actually compiles.
-    { source = "../../target/x86_64-unknown-linux-musl/release/cameodb", dest = "/usr/local/bin/cameodb", mode = "755" },
+    # NOTE: cargo-generate-rpm automatically resolves target/release/ to the correct
+    # target/<triple>/<profile>/ path when --target and --profile are specified.
+    { source = "target/release/cameodb", dest = "/usr/local/bin/cameodb", mode = "755" },
     { source = "cameodb.toml", dest = "/etc/cameodb/cameodb.toml", mode = "644", config = true },
     { source = "cameodb.service", dest = "/usr/lib/systemd/system/cameodb.service", mode = "644" }
 ]

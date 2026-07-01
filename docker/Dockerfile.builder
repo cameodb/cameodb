@@ -1,6 +1,6 @@
 # Builder image for cross-compilation distribution builds
 # This image bakes in all heavy dependencies so they aren't downloaded every build
-FROM rust:1.94-slim
+FROM rust:1.95-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -22,6 +22,8 @@ RUN --mount=type=secret,id=zscaler,dst=/usr/local/share/ca-certificates/zscaler.
     fi
 
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ENV CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
 
 # Use curl for rustup downloads to better handle system CA certificates

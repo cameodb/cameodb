@@ -69,9 +69,9 @@ run_write_test() {
         local http_code="${response: -3}"
         
         if [ "$http_code" = "200" ]; then
-            ((success_count++))
+            success_count=$((success_count + 1))
         else
-            ((error_count++))
+            error_count=$((error_count + 1))
         fi
         
         echo "$response_time" >> "$results_file"
@@ -103,9 +103,9 @@ run_search_test() {
         local http_code="${response: -3}"
         
         if [ "$http_code" = "200" ]; then
-            ((success_count++))
+            success_count=$((success_count + 1))
         else
-            ((error_count++))
+            error_count=$((error_count + 1))
         fi
         
         echo "$response_time" >> "$results_file"

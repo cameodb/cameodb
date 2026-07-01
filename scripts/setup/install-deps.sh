@@ -37,6 +37,22 @@ for tool in "${REQUIRED_TOOLS[@]}"; do
     fi
 done
 
+# Check cross-compilation tools (macOS only)
+if [ "$OS_TYPE" = "macOS" ]; then
+    for tool in "zig" "cargo-zigbuild"; do
+        if ! command -v "$tool" &> /dev/null; then
+            echo "⚠️  $tool is not installed (required for musl cross-compilation)"
+            if [ "$tool" = "zig" ]; then
+                echo "   Install with: brew install zig"
+            else
+                echo "   Install with: cargo install cargo-zigbuild"
+            fi
+        else
+            echo "✅ $tool is available"
+        fi
+    done
+fi
+
 # Install missing tools based on OS
 if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
     echo "📦 Installing missing tools: ${MISSING_TOOLS[*]}"

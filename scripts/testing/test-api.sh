@@ -1,11 +1,16 @@
 #!/bin/bash
 
 # Simple script to test CameoDB HTTP API endpoints
+set -e
+
 echo "Testing CameoDB HTTP API..."
 
 # Start CameoDB in background from workspace root
 cargo run --release --bin cameodb &
 SERVER_PID=$!
+
+# Ensure server is killed on exit
+trap 'kill $SERVER_PID 2>/dev/null || true' EXIT INT TERM
 
 # Wait for CameoDB to start
 sleep 5
@@ -39,5 +44,5 @@ timeout 2s curl -s -X POST \
 
 echo -e "\n\nAPI tests completed!"
 
-# Clean up
-kill $SERVER_PID 2>/dev/null
+# Clean up (trap handles it, but explicit for clarity)
+kill $SERVER_PID 2>/dev/null || true
