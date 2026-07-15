@@ -3371,6 +3371,56 @@ impl HybridStore {
             .get_schema_cached(index)?
             .unwrap_or_else(|| Arc::new(IndexSchema::default()));
 
+        // Count-only mode: limit=0 means return just total_hits without document data.
+        // Runs only the Count collector (cheaper than TopDocs) and skips all redb lookups.
+        if limit == 0 {
+            // For exact ID queries, we can short-circuit: total_hits is 0 or 1
+            if let Some((id_value, _)) = parse_exact_id_query(query, &schema) {
+                let exists = self.get_batch_by_keys(index, &[id_value])?.len();
+                let total_hits = if exists > 0 { 1 } else { 0 };
+                return Ok((Vec::new(), total_hits));
+            }
+
+            let normalized_query = normalize_date_query(query, &schema);
+            let tantivy_schema = tantivy_index.schema();
+            let default_query_fields: Vec<Field> = fields
+                .indexed_fields
+                .values()
+                .filter(|field| {
+                    let field_entry = tantivy_schema.get_field_entry(**field);
+                    matches!(
+                        field_entry.field_type(),
+                        tantivy::schema::FieldType::Str(_)
+                            | tantivy::schema::FieldType::JsonObject(_)
+                    )
+                })
+                .cloned()
+                .collect();
+            let query_parser =
+                tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
+            let (parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
+
+            if !parse_errors.is_empty() {
+                debug!(
+                    index = %index,
+                    query = %normalized_query,
+                    errors = ?parse_errors,
+                    "Count-only: lenient query parse produced non-fatal errors"
+                );
+            }
+
+            let count_collector = tantivy::collector::Count;
+            let total_hits = searcher.search(&parsed_query, &count_collector)?;
+
+            debug!(
+                index = %index,
+                total_hits = total_hits,
+                "Count-only search completed (limit=0)"
+            );
+
+            return Ok((Vec::new(), total_hits));
+        }
+
         // Check if this is an exact ID lookup (id:field or shadow field) that can bypass Tantivy
         if let Some((id_value, _is_exact_id_query)) = parse_exact_id_query(query, &schema) {
             debug!(

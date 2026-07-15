@@ -125,7 +125,7 @@ CameoDB supports inline modifiers in the query string for convenience:
 | Modifier | Syntax | Example | Description |
 | --- | --- | --- | --- |
 | Return fields | `return field1,field2` | `title:rust return title,author` | Project only specific fields |
-| Limit results | `limit N` | `title:rust limit 10` | Limit number of results |
+| Limit results | `limit N` | `title:rust limit 10` | Limit number of results. Use `limit 0` for count-only queries (returns total_hits without documents) |
 | Sort results | `sort field:order` | `title:rust sort year:desc` | Sort by FAST field |
 
 **Sorting Details:**

@@ -55,6 +55,25 @@ curl -s -X POST http://localhost:9480/api/books/search \
   }'
 ```
 
+> **Count-Only Mode (`limit: 0`):** Pass `"limit": 0` (or inline `limit 0` in the query) to retrieve only the total hit count without any document data. The response will contain an empty `hits` array, but `total_hits`, `took_ms`, and shard statistics are still returned. This is significantly faster than a regular search because it skips document retrieval from the KV store entirely — only the Tantivy `Count` collector runs.
+>
+> ```bash
+> curl -s -X POST http://localhost:9480/api/books/search \
+>   -H "Content-Type: application/json" \
+>   -d '{"query": "science fiction", "limit": 0}'
+> ```
+>
+> **Response (count-only):**
+> ```json
+> {
+>   "hits": [],
+>   "hits_returned": 0,
+>   "total_hits": 42,
+>   "limit": 0,
+>   "took_ms": 3
+> }
+> ```
+
 **Response:**
 ```json
 {

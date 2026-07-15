@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Configuration errors that can occur during loading or validation
 #[derive(Debug, Error)]
@@ -529,6 +529,12 @@ impl CameoDbConfig {
             config.search.default_search_limit = limit
                 .parse()
                 .with_context(|| "Invalid CAMEODB_DEFAULT_SEARCH_LIMIT")?;
+        }
+
+        // Guard: default_search_limit must be >= 1 to prevent tantivy panic
+        if config.search.default_search_limit == 0 {
+            warn!("Configured default_search_limit is 0, clamping to 1");
+            config.search.default_search_limit = 1;
         }
 
         if let Ok(timeout) = std::env::var("CAMEODB_SUPERVISOR_TIMEOUT_SECS") {

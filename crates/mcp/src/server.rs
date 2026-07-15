@@ -910,11 +910,12 @@ fn mcp_tools() -> Vec<JsonValue> {
                     },
                     "query": {
                         "type": "string",
-                        "description": "Search query string. Supports field:value, phrases, AND/OR/NOT, ranges, and inline 'return'/'limit' modifiers."
+                        "description": "Search query string. Supports field:value, phrases, AND/OR/NOT, ranges, and inline 'return'/'limit' modifiers. Use 'limit 0' for count-only queries."
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of results to return."
+                        "minimum": 0,
+                        "description": "Maximum number of results to return. Pass 0 for count-only mode (returns total_hits without document data). If omitted, defaults to 10."
                     },
                     "fields": {
                         "type": "array",
@@ -977,7 +978,8 @@ fn mcp_tools() -> Vec<JsonValue> {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum total results across all indexes."
+                        "minimum": 0,
+                        "description": "Maximum total results across all indexes. Pass 0 for count-only mode (returns total_hits without document data). If omitted, defaults to 10."
                     }
                 },
                 "required": ["indexes", "query"]

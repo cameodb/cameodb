@@ -90,7 +90,7 @@ Execute full-text search on a single CameoDB index.
   - Inline modifiers: `title:rust return title,author limit 5`
 
   **Default search fields**: Unqualified queries (no `field:` prefix) search only `text` and `json` fields. Numeric, date, and other typed fields require explicit `field:value` syntax. Query parsing is lenient — type mismatches (e.g., `field:hello` on a numeric field) are silently skipped rather than failing the entire query.
-- `limit` (integer, optional): Maximum number of results to return
+- `limit` (integer, optional): Maximum number of results to return. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10.
 - `fields` (array of strings, optional): Field names to include in results (field projection)
 
 **Returns:** JSON array of matching documents with relevance scores.
@@ -127,7 +127,7 @@ Execute federated search across multiple CameoDB indexes with optional per-index
     - `field` (string, required): FAST field name to sort by (u64, i64, f64, or date)
     - `order` (string, optional): `asc` or `desc` (defaults to `desc`)
 - `query` (string, required): Search query applied to all specified indexes
-- `limit` (integer, optional): Maximum total results across all indexes
+- `limit` (integer, optional): Maximum total results across all indexes. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10.
 
 **Returns:** Combined results merged by relevance score. Each hit includes an `_index_source` field indicating its origin index.
 
@@ -459,6 +459,7 @@ k8s\.component\.name:quickwit    # matches field named "k8s.component.name"
 ```
 title:rust return title,author,year               # field projection
 title:rust limit 5                                 # result limit
+title:rust limit 0                                 # count-only (no document data)
 title:rust AND author:doe return title,author limit 10  # combined
 ```
 

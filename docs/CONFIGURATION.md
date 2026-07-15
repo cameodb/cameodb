@@ -126,6 +126,7 @@ memory_pressure_threshold_percent = 80
 search_threads = 8
 
 # Default search result limit (default: 10)
+# Note: Explicit limit 0 in queries means count-only mode (returns total_hits without documents)
 default_search_limit = 10
 ```
 

@@ -2101,6 +2101,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_query_keywords_limit_zero() {
+        let query = "title:rust limit 0";
+        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        assert_eq!(cleaned, "title:rust");
+        assert_eq!(limit, Some(0));
+        assert_eq!(fields, None);
+        assert_eq!(parsed_sort, None);
+    }
+
+    #[test]
     fn test_parse_query_keywords_return_only() {
         let query = "title:rust return title,author,year";
         let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
