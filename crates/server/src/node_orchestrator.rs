@@ -236,10 +236,70 @@ fn push_hit_into_top_k(top_hits: &mut Vec<JsonValue>, hit: JsonValue, limit: usi
     top_hits.truncate(limit);
 }
 
+/// Metadata field carrying the normalized sort value of a hit.
+///
+/// Injected by the shard-gather search paths (`engine_search` / `orch_search`) before
+/// field projection runs, and consumed by every merge layer. Because it is `_`-prefixed
+/// it survives `apply_field_projection` automatically, so cross-node merges can order
+/// results even when the user's `return` projection excludes the sort field itself. It
+/// is stripped from every hit at the client boundary (`route_and_handle`).
+const SORT_KEY_FIELD: &str = "_sort_key";
+
+/// Produce a comparable sort key for a hit's raw field value.
+///
+/// Date fields are parsed to epoch seconds so that cross-node merges order them
+/// chronologically (matching each shard's FAST-field ordering) rather than by
+/// lexicographic string comparison, which breaks across mixed date formats/offsets.
+/// Every other value passes through unchanged — the merge comparator handles the
+/// numeric-vs-string distinction. Returns `None` when the value cannot be keyed
+/// (e.g. an unparseable date string), in which case the hit sorts last.
+fn normalize_sort_key(value: &JsonValue, field_def: Option<&FieldDef>) -> Option<JsonValue> {
+    if let Some(def) = field_def
+        && matches!(def.field_type, TantivyFieldType::Date)
+    {
+        return value
+            .as_str()
+            .and_then(storage::parse_date_to_timestamp_secs)
+            .map(|ts| JsonValue::Number(ts.into()));
+    }
+    Some(value.clone())
+}
+
+/// Attach the `SORT_KEY_FIELD` metadata value to each gathered hit, in place, so that
+/// downstream merges (local multi-shard and cross-node) have a projection-independent
+/// key to order by. No-op for hits lacking the sort field or an unparseable date.
+fn stamp_sort_keys(hits: &mut [(Uuid, f32, JsonValue)], spec: &SortSpec, schema: &IndexSchema) {
+    let field_def = schema.fields.get(&spec.field);
+    for (_, _, doc) in hits.iter_mut() {
+        if let JsonValue::Object(o) = doc
+            && let Some(raw) = o.get(&spec.field)
+            && let Some(key) = normalize_sort_key(raw, field_def)
+        {
+            o.insert(SORT_KEY_FIELD.to_string(), key);
+        }
+    }
+}
+
+/// Remove the internal `SORT_KEY_FIELD` from every hit in a search response, in place.
+/// Called once at the client boundary so the key never leaks to callers.
+fn strip_sort_keys(response: &mut JsonValue) {
+    if let Some(hits) = response
+        .get_mut("hits")
+        .and_then(|h| h.as_array_mut())
+    {
+        for hit in hits.iter_mut() {
+            if let Some(o) = hit.as_object_mut() {
+                o.remove(SORT_KEY_FIELD);
+            }
+        }
+    }
+}
+
 /// Compare two hit documents by a named field for field-sorted search merges.
 ///
-/// Numeric values are compared numerically; otherwise values fall back to string
-/// comparison (which orders RFC3339 date strings correctly). Documents missing the
+/// Integer values are compared as `i64` first (so keys beyond f64's exact-integer
+/// range, e.g. large ids or nanosecond timestamps, order precisely); otherwise values
+/// are compared as `f64`, then fall back to string comparison. Documents missing the
 /// field always sort last, regardless of the requested order.
 fn compare_hits_by_field(
     a: &JsonValue,
@@ -251,11 +311,14 @@ fn compare_hits_by_field(
 
     match (a.get(field), b.get(field)) {
         (Some(x), Some(y)) => {
-            let base = match (x.as_f64(), y.as_f64()) {
-                (Some(nx), Some(ny)) => nx.partial_cmp(&ny).unwrap_or(Ordering::Equal),
-                _ => match (x.as_str(), y.as_str()) {
-                    (Some(sx), Some(sy)) => sx.cmp(sy),
-                    _ => Ordering::Equal,
+            let base = match (x.as_i64(), y.as_i64()) {
+                (Some(nx), Some(ny)) => nx.cmp(&ny),
+                _ => match (x.as_f64(), y.as_f64()) {
+                    (Some(nx), Some(ny)) => nx.partial_cmp(&ny).unwrap_or(Ordering::Equal),
+                    _ => match (x.as_str(), y.as_str()) {
+                        (Some(sx), Some(sy)) => sx.cmp(sy),
+                        _ => Ordering::Equal,
+                    },
                 },
             };
             match order {
@@ -270,12 +333,14 @@ fn compare_hits_by_field(
     }
 }
 
-/// Order merged search hits in place: by an explicit sort field when provided,
-/// otherwise by relevance score (descending).
+/// Order merged search hits in place: by the injected `SORT_KEY_FIELD` when an explicit
+/// sort is requested, otherwise by relevance score (descending). The sort field itself
+/// may have been projected away, so the merge always keys on the metadata field, which
+/// is preserved through projection.
 fn order_merged_hits(hits: &mut [JsonValue], sort: Option<&SortSpec>) {
     match sort {
         Some(spec) => {
-            hits.sort_by(|a, b| compare_hits_by_field(a, b, &spec.field, spec.order));
+            hits.sort_by(|a, b| compare_hits_by_field(a, b, SORT_KEY_FIELD, spec.order));
         }
         None => {
             hits.sort_by(|a, b| {
@@ -1521,11 +1586,18 @@ impl OrchestratorEngine {
 
         // Order merged results: by the requested sort field when provided, otherwise by
         // score descending. Each shard already returned field-sorted results, so a global
-        // re-sort here is required to interleave them correctly across shards. This runs
-        // before field projection so the sort field is still present on the doc.
+        // re-sort here is required to interleave them correctly across shards.
+        //
+        // When sorting, stamp each hit with the normalized `SORT_KEY_FIELD` first (while
+        // the full doc is still present) and key the sort on it. The metadata field
+        // survives the field projection below and lets a downstream cross-node merge
+        // re-order these results even if the sort field is not among the returned fields.
         match sort {
             Some(spec) => {
-                results.sort_by(|a, b| compare_hits_by_field(&a.2, &b.2, &spec.field, spec.order))
+                stamp_sort_keys(&mut results, spec, &schema);
+                results.sort_by(|a, b| {
+                    compare_hits_by_field(&a.2, &b.2, SORT_KEY_FIELD, spec.order)
+                })
             }
             None => {
                 results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -2801,6 +2873,12 @@ impl RouterActor {
             return self.handle_client_op(op).await;
         }
 
+        // Search/Stream responses carry an internal `SORT_KEY_FIELD` on each hit so that
+        // merges can order by the sort field even when it is projected away. This is the
+        // single client-facing boundary for every routing decision (local, broadcast,
+        // remote, streaming-buffered), so strip that metadata here before returning.
+        let is_search = matches!(op, ClientOp::Search { .. } | ClientOp::Stream { .. });
+
         let decision = self
             .coordinator
             .ask(RouteOperation {
@@ -2809,7 +2887,7 @@ impl RouterActor {
             })
             .await;
 
-        match decision {
+        let mut result = match decision {
             Ok(RoutingDecision::Local) => self.handle_client_op(op).await,
             Ok(RoutingDecision::Broadcast) => {
                 // CRITICAL: Never broadcast write operations - this causes data duplication
@@ -2843,7 +2921,15 @@ impl RouterActor {
                     .await;
                 Err(OrchestratorError::Io(std::io::Error::other(reason)))
             }
+        };
+
+        if is_search
+            && let Ok(response) = result.as_mut()
+        {
+            strip_sort_keys(response);
         }
+
+        result
     }
 
     /// Streaming variant of `route_and_handle` for NDJSON search responses.
@@ -3493,7 +3579,12 @@ impl RouterActor {
 
                 // Create local search stream using improved concurrent approach
                 let local_future = async {
-                    match self
+                    // Bind to an explicit `Result` type: the reply flows through a nested
+                    // `async` block feeding a `Pin<Box<dyn Future>>`, which defeats
+                    // rust-analyzer's inference of the `ask().await` output and makes it
+                    // flag the `Ok`/`Err` match as non-exhaustive (E0004). The annotation
+                    // resolves the type without changing behavior (rustc already accepts it).
+                    let local_result: Result<JsonValue, _> = self
                         .orchestrator
                         .ask(ClientOp::Search {
                             index: index.clone(),
@@ -3502,8 +3593,8 @@ impl RouterActor {
                             fields: fields.clone(),
                             sort: sort.clone(),
                         })
-                        .await
-                    {
+                        .await;
+                    match local_result {
                         Ok(result) => StreamingSearchResult::Local {
                             shard_id: Uuid::nil(), // Individual shard IDs are in the documents
                             hits: result
@@ -6169,8 +6260,23 @@ impl NodeOrchestrator {
             }
         }
 
-        // Sort by score descending
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Order merged results: by the requested sort field when provided, otherwise by
+        // score descending. Each shard already returned field-sorted results, so a global
+        // re-sort here interleaves them correctly across this node's shards. When sorting,
+        // stamp the normalized `SORT_KEY_FIELD` first (while the full doc is present) so it
+        // survives projection and lets the requesting node's cross-node merge re-order
+        // these hits even when the sort field is not among the returned fields.
+        match sort {
+            Some(spec) => {
+                stamp_sort_keys(&mut results, spec, &schema);
+                results.sort_by(|a, b| {
+                    compare_hits_by_field(&a.2, &b.2, SORT_KEY_FIELD, spec.order)
+                })
+            }
+            None => {
+                results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            }
+        }
         results.truncate(limit);
         let hits: Vec<JsonValue> = results
             .into_iter()
@@ -6825,5 +6931,134 @@ mod tests {
         );
         assert_eq!(result.get("_score").unwrap(), 0.95);
         assert!(result.get("title").is_none());
+    }
+
+    // ---- Field-sort merge helpers (`_sort_key`) ----
+
+    fn titles(hits: &[JsonValue]) -> Vec<String> {
+        hits.iter()
+            .map(|h| h["title"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The core of finding #1: even when the sort field itself is projected away, the
+    /// `_sort_key` metadata lets a cross-node merge interleave per-node blocks correctly.
+    #[test]
+    fn order_merged_hits_interleaves_nodes_by_sort_key_without_sort_field() {
+        let spec = SortSpec {
+            field: "year".to_string(),
+            order: SortOrder::Desc,
+        };
+        // Two nodes, each already field-sorted + projected (no `year`), concatenated as
+        // the merge would receive them: all of node A, then all of node B.
+        let mut hits = vec![
+            json!({"title": "a", "_sort_key": 2020}),
+            json!({"title": "c", "_sort_key": 2018}),
+            json!({"title": "d", "_sort_key": 2024}),
+            json!({"title": "b", "_sort_key": 2022}),
+        ];
+        order_merged_hits(&mut hits, Some(&spec));
+        assert_eq!(titles(&hits), vec!["d", "b", "a", "c"]);
+    }
+
+    #[test]
+    fn order_merged_hits_ascending_and_missing_key_sorts_last() {
+        let spec = SortSpec {
+            field: "year".to_string(),
+            order: SortOrder::Asc,
+        };
+        let mut hits = vec![
+            json!({"title": "b", "_sort_key": 2022}),
+            json!({"title": "missing"}), // no `_sort_key` → sorts last
+            json!({"title": "a", "_sort_key": 2018}),
+        ];
+        order_merged_hits(&mut hits, Some(&spec));
+        assert_eq!(titles(&hits), vec!["a", "b", "missing"]);
+    }
+
+    /// Finding #2: i64 keys beyond f64's exact-integer range must order precisely.
+    #[test]
+    fn compare_hits_by_field_distinguishes_large_i64_keys() {
+        use std::cmp::Ordering;
+        let big = 9_007_199_254_740_992i64; // 2^53
+        let bigger = big + 1; // not representable distinctly as f64
+        let a = json!({ "_sort_key": bigger });
+        let b = json!({ "_sort_key": big });
+        assert_eq!(
+            compare_hits_by_field(&a, &b, "_sort_key", SortOrder::Asc),
+            Ordering::Greater
+        );
+    }
+
+    /// Finding #3: date sort keys are normalized to epoch seconds so ordering is
+    /// chronological rather than lexicographic.
+    #[test]
+    fn normalize_sort_key_converts_dates_to_epoch_seconds() {
+        let date_def = FieldDef::new("published".to_string(), TantivyFieldType::Date);
+
+        let early = normalize_sort_key(&json!("2018-11-30"), Some(&date_def)).unwrap();
+        let late = normalize_sort_key(&json!("2024-03-10T00:00:00Z"), Some(&date_def)).unwrap();
+
+        assert!(early.is_i64(), "date key should be numeric, got {early:?}");
+        assert!(
+            early.as_i64().unwrap() < late.as_i64().unwrap(),
+            "chronological order must hold numerically"
+        );
+
+        // Unparseable date → no key (hit will sort last).
+        assert!(normalize_sort_key(&json!("not-a-date"), Some(&date_def)).is_none());
+    }
+
+    #[test]
+    fn normalize_sort_key_passes_through_non_date_values() {
+        let numeric_def = FieldDef::new("year".to_string(), TantivyFieldType::I64);
+        assert_eq!(
+            normalize_sort_key(&json!(2020), Some(&numeric_def)).unwrap(),
+            json!(2020)
+        );
+        // No schema entry → passthrough.
+        assert_eq!(
+            normalize_sort_key(&json!("hello"), None).unwrap(),
+            json!("hello")
+        );
+    }
+
+    #[test]
+    fn stamp_sort_keys_injects_normalized_date_key() {
+        let mut schema = IndexSchema::default();
+        schema.fields.insert(
+            "published".to_string(),
+            FieldDef::new("published".to_string(), TantivyFieldType::Date),
+        );
+        let spec = SortSpec {
+            field: "published".to_string(),
+            order: SortOrder::Asc,
+        };
+        let mut hits = vec![(
+            Uuid::nil(),
+            1.0f32,
+            json!({"title": "x", "published": "2020-06-01"}),
+        )];
+        stamp_sort_keys(&mut hits, &spec, &schema);
+        let key = hits[0].2.get(SORT_KEY_FIELD).expect("sort key stamped");
+        assert!(key.is_i64());
+    }
+
+    #[test]
+    fn strip_sort_keys_removes_only_the_metadata_key() {
+        let mut response = json!({
+            "hits": [
+                {"title": "a", "_score": 1.0, "_sort_key": 2020},
+                {"title": "b", "_score": 0.9, "_sort_key": 2018},
+            ],
+            "hits_returned": 2
+        });
+        strip_sort_keys(&mut response);
+        let hits = response["hits"].as_array().unwrap();
+        for hit in hits {
+            assert!(hit.get(SORT_KEY_FIELD).is_none(), "_sort_key must be stripped");
+            assert!(hit.get("_score").is_some(), "other metadata preserved");
+            assert!(hit.get("title").is_some(), "content preserved");
+        }
     }
 }

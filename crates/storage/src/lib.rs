@@ -675,6 +675,18 @@ impl FieldDef {
     }
 }
 
+/// Parse a date string (RFC3339, naive datetime, date-only, year-month, or year-only)
+/// into the epoch-second timestamp that the Date FAST field is sorted on.
+///
+/// Returns the value **clamped to Tantivy's supported range**, matching exactly what
+/// `parse_date_str_to_tantivy` feeds into the index. Callers that need a comparable
+/// numeric sort key for a date value (e.g. cross-node merge ordering) should use this
+/// so the merge order agrees with each shard's local FAST-field ordering. Returns
+/// `None` when the string is not a recognized date format.
+pub fn parse_date_to_timestamp_secs(s: &str) -> Option<i64> {
+    parse_date_str_to_tantivy(s).map(|(_, _, clamped)| clamped)
+}
+
 /// Parse a date string (RFC3339, naive datetime, date-only, year-month, or year-only) into Tantivy DateTime
 fn parse_date_str_to_tantivy(s: &str) -> Option<(DateTime, i64, i64)> {
     // RFC3339 with offset
