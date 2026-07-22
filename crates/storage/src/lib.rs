@@ -3543,19 +3543,20 @@ impl HybridStore {
                 )));
             }
 
-            // Support u64, i64, f64, and Date fields for sorting via FAST fields
-            match field_entry.field_type() {
-                tantivy::schema::FieldType::U64(_)
-                | tantivy::schema::FieldType::I64(_)
-                | tantivy::schema::FieldType::F64(_)
-                | tantivy::schema::FieldType::Date(_) => {
-                    let order = match sort_spec.order {
-                        SortOrder::Asc => tantivy::Order::Asc,
-                        SortOrder::Desc => tantivy::Order::Desc,
-                    };
+            let order = match sort_spec.order {
+                SortOrder::Asc => tantivy::Order::Asc,
+                SortOrder::Desc => tantivy::Order::Desc,
+            };
 
+            // Run a TopDocs sort ordered by a FAST field of the given type. The generic
+            // type MUST match the field's actual type — `order_by_fast_field::<u64>` on an
+            // i64/f64/date field returns a Tantivy SchemaError at collection time.
+            // The sort key itself is discarded downstream (ordering is encoded in the Vec
+            // sequence), so all branches normalize to `(None, doc_address)`.
+            macro_rules! collect_sorted {
+                ($t:ty) => {{
                     let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit)
-                        .order_by_u64_field(&sort_spec.field, order);
+                        .order_by_fast_field::<$t>(&sort_spec.field, order);
                     let count_collector = tantivy::collector::Count;
 
                     // Use MultiCollector to get both results and count in single query execution
@@ -3564,12 +3565,22 @@ impl HybridStore {
                     let count_handle = multi_collector.add_collector(count_collector);
 
                     let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
-                    let top_docs: Vec<(Option<u64>, tantivy::DocAddress)> =
+                    let sorted: Vec<(Option<$t>, tantivy::DocAddress)> =
                         top_docs_handle.extract(&mut multi_fruit);
                     let total_hits = count_handle.extract(&mut multi_fruit);
 
-                    (SearchResult::Sorted(top_docs), total_hits)
-                }
+                    let docs: Vec<(Option<u64>, tantivy::DocAddress)> =
+                        sorted.into_iter().map(|(_, addr)| (None, addr)).collect();
+                    (SearchResult::Sorted(docs), total_hits)
+                }};
+            }
+
+            // Support u64, i64, f64, and Date fields for sorting via FAST fields
+            match field_entry.field_type() {
+                tantivy::schema::FieldType::U64(_) => collect_sorted!(u64),
+                tantivy::schema::FieldType::I64(_) => collect_sorted!(i64),
+                tantivy::schema::FieldType::F64(_) => collect_sorted!(f64),
+                tantivy::schema::FieldType::Date(_) => collect_sorted!(tantivy::DateTime),
                 _ => {
                     return Err(StoreError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,

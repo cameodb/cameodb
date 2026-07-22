@@ -70,12 +70,14 @@ impl CameoClient {
         query: &str,
         limit: Option<usize>,
         fields: Option<Vec<String>>,
+        sort: Option<storage::SortSpec>,
     ) -> Result<JsonValue> {
         let url = self.base_url.join(&format!("api/{}/search", index))?;
         let body = serde_json::json!({
             "query": query,
             "limit": limit,
             "fields": fields,
+            "sort": sort,
         });
 
         let resp = self.http.post(url).json(&body).send().await?;

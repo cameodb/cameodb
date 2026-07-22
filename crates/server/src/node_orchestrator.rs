@@ -52,11 +52,11 @@ use crate::remote_peer_pool::{ConnectionChannel, RemotePeerPool};
 use chrono::{NaiveDate, NaiveDateTime};
 use cluster::{ConsistentRing, IdentityError, NodeIdentity, generate_tokens};
 use serde_json::{Map as JsonMap, Value as JsonValue};
-pub use storage::SortSpec;
 use storage::{
     FieldDef, HybridStore, IndexSchema, ShardStatsTimings, StorageConfig, StoreError,
     TantivyFieldType, WalOp,
 };
+pub use storage::{SortOrder, SortSpec};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// Sample limit for enhanced schema detection during initial creation
@@ -198,6 +198,14 @@ fn hit_score(hit: &JsonValue) -> f64 {
     hit.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0)
 }
 
+/// Accumulator for broadcast search statistics across local and remote results.
+struct BroadcastStats {
+    total_shards_queried: usize,
+    nodes_contacted: usize,
+    max_took_ms: Option<u64>,
+    total_hits_sum: usize,
+}
+
 fn push_hit_into_top_k(top_hits: &mut Vec<JsonValue>, hit: JsonValue, limit: usize) {
     if limit == 0 {
         return;
@@ -226,6 +234,57 @@ fn push_hit_into_top_k(top_hits: &mut Vec<JsonValue>, hit: JsonValue, limit: usi
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     top_hits.truncate(limit);
+}
+
+/// Compare two hit documents by a named field for field-sorted search merges.
+///
+/// Numeric values are compared numerically; otherwise values fall back to string
+/// comparison (which orders RFC3339 date strings correctly). Documents missing the
+/// field always sort last, regardless of the requested order.
+fn compare_hits_by_field(
+    a: &JsonValue,
+    b: &JsonValue,
+    field: &str,
+    order: SortOrder,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    match (a.get(field), b.get(field)) {
+        (Some(x), Some(y)) => {
+            let base = match (x.as_f64(), y.as_f64()) {
+                (Some(nx), Some(ny)) => nx.partial_cmp(&ny).unwrap_or(Ordering::Equal),
+                _ => match (x.as_str(), y.as_str()) {
+                    (Some(sx), Some(sy)) => sx.cmp(sy),
+                    _ => Ordering::Equal,
+                },
+            };
+            match order {
+                SortOrder::Asc => base,
+                SortOrder::Desc => base.reverse(),
+            }
+        }
+        // Present values sort before missing ones, independent of order.
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Order merged search hits in place: by an explicit sort field when provided,
+/// otherwise by relevance score (descending).
+fn order_merged_hits(hits: &mut [JsonValue], sort: Option<&SortSpec>) {
+    match sort {
+        Some(spec) => {
+            hits.sort_by(|a, b| compare_hits_by_field(a, b, &spec.field, spec.order));
+        }
+        None => {
+            hits.sort_by(|a, b| {
+                hit_score(b)
+                    .partial_cmp(&hit_score(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+    }
 }
 
 /// Recursively transform shadow field names in JSON query structure
@@ -1460,8 +1519,18 @@ impl OrchestratorEngine {
             }
         }
 
-        // Sort by score descending
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Order merged results: by the requested sort field when provided, otherwise by
+        // score descending. Each shard already returned field-sorted results, so a global
+        // re-sort here is required to interleave them correctly across shards. This runs
+        // before field projection so the sort field is still present on the doc.
+        match sort {
+            Some(spec) => {
+                results.sort_by(|a, b| compare_hits_by_field(&a.2, &b.2, &spec.field, spec.order))
+            }
+            None => {
+                results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            }
+        }
         results.truncate(limit);
         let total_shards = shards.len();
         let hits: Vec<JsonValue> = results
@@ -2946,49 +3015,59 @@ impl RouterActor {
         let (local_result, remote_results) = tokio::join!(local_future, remote_results_future);
 
         // If this is a search, prefer fastest/local results and stop after hitting the limit.
-        if let ClientOp::Search { limit, .. } = &op {
+        if let ClientOp::Search { limit, sort, .. } = &op {
             let limit = limit.unwrap_or(self.default_search_limit);
+            let sort = sort.clone();
             let mut merged_hits: Vec<JsonValue> = Vec::with_capacity(limit);
-            let mut total_shards_queried = 0usize;
             let mut error_count = 0u64;
-            let mut nodes_contacted = 0usize;
-            let mut max_took_ms: Option<u64> = None;
-            let mut total_hits_sum = 0usize;
+            let mut stats = BroadcastStats {
+                total_shards_queried: 0,
+                nodes_contacted: 0,
+                max_took_ms: None,
+                total_hits_sum: 0,
+            };
 
-            // Helper to push hits from a result up to the remaining limit
+            // Helper to push hits from a result up to the remaining limit.
+            // For field-sorted queries we must collect all hits (bounded by fanout*limit)
+            // and order them globally afterwards; the score-based top-K heap would drop
+            // the wrong hits when ranking is by a document field rather than by score.
             fn push_hits(
                 value: &mut JsonValue,
                 merged_hits: &mut Vec<JsonValue>,
                 limit: usize,
-                total_shards_queried: &mut usize,
-                nodes_contacted: &mut usize,
-                max_took_ms: &mut Option<u64>,
-                total_hits_sum: &mut usize,
+                is_field_sorted: bool,
+                stats: &mut BroadcastStats,
             ) {
                 if let Some(hits) = value.get_mut("hits").and_then(|h| h.as_array_mut()) {
                     for hit in hits.drain(..) {
-                        push_hit_into_top_k(merged_hits, hit, limit);
+                        if is_field_sorted {
+                            merged_hits.push(hit);
+                        } else {
+                            push_hit_into_top_k(merged_hits, hit, limit);
+                        }
                     }
                 }
                 // Extract shard statistics from the response
-                if let Some(stats) = value.get("stats").and_then(|s| s.as_object())
-                    && let Some(shards) = stats.get("shards").and_then(|s| s.as_object())
+                if let Some(stats_obj) = value.get("stats").and_then(|s| s.as_object())
+                    && let Some(shards) = stats_obj.get("shards").and_then(|s| s.as_object())
                     && let Some(responded) = shards.get("responded").and_then(|r| r.as_u64())
                 {
-                    *total_shards_queried += responded as usize;
+                    stats.total_shards_queried += responded as usize;
                     _ = shards.get("total").and_then(|t| t.as_u64()); // Could track total shards attempted
                 }
                 if let Some(total) = value.get("total_hits").and_then(|t| t.as_u64()) {
-                    *total_hits_sum += total as usize;
+                    stats.total_hits_sum += total as usize;
                 }
-                *nodes_contacted += 1;
+                stats.nodes_contacted += 1;
                 if let Some(t) = value.get("took_ms").and_then(|v| v.as_u64()) {
-                    *max_took_ms = match *max_took_ms {
+                    stats.max_took_ms = match stats.max_took_ms {
                         Some(cur) => Some(cur.max(t)),
                         None => Some(t),
                     };
                 }
             }
+
+            let is_field_sorted = sort.is_some();
 
             // Process local result first
             match local_result {
@@ -2996,10 +3075,8 @@ impl RouterActor {
                     &mut val,
                     &mut merged_hits,
                     limit,
-                    &mut total_shards_queried,
-                    &mut nodes_contacted,
-                    &mut max_took_ms,
-                    &mut total_hits_sum,
+                    is_field_sorted,
+                    &mut stats,
                 ),
                 Err(e) => {
                     error_count += 1;
@@ -3014,10 +3091,8 @@ impl RouterActor {
                         &mut val,
                         &mut merged_hits,
                         limit,
-                        &mut total_shards_queried,
-                        &mut nodes_contacted,
-                        &mut max_took_ms,
-                        &mut total_hits_sum,
+                        is_field_sorted,
+                        &mut stats,
                     ),
                     Ok(Err(e)) => {
                         error_count += 1;
@@ -3036,30 +3111,25 @@ impl RouterActor {
                     .fetch_add(error_count, AtomicOrdering::Relaxed);
             }
 
-            // Keep local/fast-first ordering, but stabilize scores within the collected set
-            merged_hits.sort_by(|a, b| {
-                let score_a = a.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-                let score_b = b.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-                score_b
-                    .partial_cmp(&score_a)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            // Order the collected set: by the requested sort field when provided,
+            // otherwise by relevance score (descending).
+            order_merged_hits(&mut merged_hits, sort.as_ref());
             merged_hits.truncate(limit);
 
             return Ok(serde_json::json!({
                 "hits": merged_hits,
                 "hits_returned": merged_hits.len(),
-                "total_hits": total_hits_sum,
+                "total_hits": stats.total_hits_sum,
                 "limit": limit,
-                "took_ms": max_took_ms.unwrap_or_else(|| t_start.elapsed().as_millis() as u64),
+                "took_ms": stats.max_took_ms.unwrap_or_else(|| t_start.elapsed().as_millis() as u64),
                 "stats": {
                     "shards": {
-                        "total": total_shards_queried,
-                        "responded": total_shards_queried.saturating_sub(error_count as usize),
+                        "total": stats.total_shards_queried,
+                        "responded": stats.total_shards_queried.saturating_sub(error_count as usize),
                         "failed": error_count as usize
                     },
                     "nodes": {
-                        "contacted": nodes_contacted
+                        "contacted": stats.nodes_contacted
                     }
                 }
             }));
@@ -3419,6 +3489,7 @@ impl RouterActor {
                 sort,
             } => {
                 let limit = limit.unwrap_or(self.default_search_limit);
+                let is_field_sorted = sort.is_some();
 
                 // Create local search stream using improved concurrent approach
                 let local_future = async {
@@ -3563,7 +3634,11 @@ impl RouterActor {
                                         unique_shard_ids.insert(uuid);
                                     }
                                 }
-                                push_hit_into_top_k(&mut all_hits, hit_doc, limit);
+                                if is_field_sorted {
+                                    all_hits.push(hit_doc);
+                                } else {
+                                    push_hit_into_top_k(&mut all_hits, hit_doc, limit);
+                                }
                             }
                             total_hits_sum += total_hits;
                             shards_queried = unique_shard_ids.len();
@@ -3579,7 +3654,11 @@ impl RouterActor {
                                         val.get_mut("hits").and_then(|h| h.as_array_mut())
                                     {
                                         for hit in hits.drain(..) {
-                                            push_hit_into_top_k(&mut all_hits, hit, limit);
+                                            if is_field_sorted {
+                                                all_hits.push(hit);
+                                            } else {
+                                                push_hit_into_top_k(&mut all_hits, hit, limit);
+                                            }
                                         }
                                     }
                                     if let Some(total) =
@@ -3609,14 +3688,9 @@ impl RouterActor {
                     }
                 }
 
-                // Sort by score descending and apply limit
-                all_hits.sort_by(|a, b| {
-                    let score_a = a.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-                    let score_b = b.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-                    score_b
-                        .partial_cmp(&score_a)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                // Order the collected set: by the requested sort field when provided,
+                // otherwise by relevance score (descending), then apply the limit.
+                order_merged_hits(&mut all_hits, sort.as_ref());
                 all_hits.truncate(limit);
 
                 Ok(serde_json::json!({

@@ -88,33 +88,45 @@ impl ProgressSpinner {
     }
 }
 
-fn parse_query_modifiers(query: &str) -> (String, Option<usize>, Option<Vec<String>>) {
+fn parse_query_modifiers(
+    query: &str,
+) -> (
+    String,
+    Option<usize>,
+    Option<Vec<String>>,
+    Option<storage::SortSpec>,
+) {
     let parts: Vec<&str> = query.split_whitespace().collect();
     if parts.is_empty() {
-        return (String::new(), None, None);
+        return (String::new(), None, None, None);
     }
 
     let mut cleaned_end = parts.len();
     let mut inline_limit = None;
     let mut inline_fields = None;
+    let mut inline_sort = None;
     let mut return_idx = None;
     let mut limit_idx = None;
+    let mut sort_idx = None;
 
     for (idx, token) in parts.iter().enumerate() {
         if token.eq_ignore_ascii_case("return") && return_idx.is_none() {
             return_idx = Some(idx);
         } else if token.eq_ignore_ascii_case("limit") && limit_idx.is_none() {
             limit_idx = Some(idx);
+        } else if token.eq_ignore_ascii_case("sort") && sort_idx.is_none() {
+            sort_idx = Some(idx);
         }
     }
 
     if let Some(idx) = return_idx
         && idx + 1 < parts.len()
     {
-        let field_end = match limit_idx {
-            Some(l_idx) if l_idx > idx => l_idx,
-            _ => parts.len(),
-        };
+        let field_end = [limit_idx, sort_idx]
+            .iter()
+            .filter_map(|&opt| opt.filter(|&i| i > idx))
+            .min()
+            .unwrap_or(parts.len());
         let field_slice = &parts[idx + 1..field_end];
         let field_str = field_slice.join(" ");
         let fields: Vec<String> = field_str
@@ -139,6 +151,24 @@ fn parse_query_modifiers(query: &str) -> (String, Option<usize>, Option<Vec<Stri
         }
     }
 
+    if let Some(idx) = sort_idx
+        && idx + 1 < parts.len()
+    {
+        let sort_spec = parts[idx + 1];
+        let (field, order) = match sort_spec.split_once(':') {
+            Some((f, o)) => {
+                let order = match o.to_lowercase().as_str() {
+                    "asc" => storage::SortOrder::Asc,
+                    _ => storage::SortOrder::Desc,
+                };
+                (f.to_string(), order)
+            }
+            None => (sort_spec.to_string(), storage::SortOrder::Desc),
+        };
+        inline_sort = Some(storage::SortSpec { field, order });
+        cleaned_end = cleaned_end.min(idx);
+    }
+
     let cleaned_query = if cleaned_end == 0 {
         "".to_string()
     } else if cleaned_end >= parts.len() {
@@ -151,6 +181,7 @@ fn parse_query_modifiers(query: &str) -> (String, Option<usize>, Option<Vec<Stri
         cleaned_query.trim().to_string(),
         inline_limit,
         inline_fields,
+        inline_sort,
     )
 }
 
@@ -1027,7 +1058,7 @@ impl IndexCompleter {
             .collect()
     }
 
-    fn complete_tokens(&self, tokens: &[&str], current: &str) -> Option<(usize, Vec<Pair>)> {
+    fn complete_tokens(&self, tokens: &[&str], current: &str) -> Option<Vec<Pair>> {
         if tokens.is_empty() {
             return None;
         }
@@ -1036,21 +1067,18 @@ impl IndexCompleter {
             // Complete main commands when first token or partial command
             _cmd if tokens.len() == 1 => {
                 let suggestions = self.command_suggestions(current);
-                let start = 0;
-                Some((start, suggestions))
+                Some(suggestions)
             }
             // Complete subcommands for 'list'
             "list" if tokens.len() == 2 => {
                 let suggestions = self.list_subcommand_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             "list" if tokens.len() >= 2 && tokens[1] == "indexes" => {
                 if current.starts_with('-') {
                     // Suggest --extended flag after indexes
                     let suggestions = self.extended_flag_suggestions(current, tokens);
-                    let start = current_start(tokens, current);
-                    Some((start, suggestions))
+                    Some(suggestions)
                 } else {
                     None
                 }
@@ -1059,43 +1087,36 @@ impl IndexCompleter {
                 if current.starts_with('-') {
                     // Suggest --extended flag after index name
                     let suggestions = self.extended_flag_suggestions(current, tokens);
-                    let start = current_start(tokens, current);
-                    Some((start, suggestions))
+                    Some(suggestions)
                 } else {
                     let suggestions = self.index_suggestions(current);
-                    let start = current_start(tokens, current);
-                    Some((start, suggestions))
+                    Some(suggestions)
                 }
             }
             // Complete schema subcommands and index for schema load
             "schema" if tokens.len() == 2 => {
                 let suggestions = self.schema_subcommand_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             "schema" if tokens.len() == 3 && tokens[1] == "load" => {
                 let suggestions = self.index_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             "schema"
                 if (tokens.len() == 3 && tokens[1] == "detect")
                     || (tokens.len() == 4 && tokens[1] == "load") =>
             {
                 let suggestions = self.file_path_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             "schema" if current.starts_with('-') => {
                 let suggestions = self.delimiter_flag_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             // Complete index name for 'search'
             "search" if tokens.len() == 2 => {
                 let suggestions = self.index_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             // Complete field names in search query
             "search" if tokens.len() >= 3 => {
@@ -1121,8 +1142,7 @@ impl IndexCompleter {
 
                     if !after_limit && !after_sort {
                         let suggestions = self.return_field_suggestions(index, current);
-                        let start = current_start(tokens, current);
-                        return Some((start, suggestions));
+                        return Some(suggestions);
                     }
                 }
 
@@ -1145,8 +1165,7 @@ impl IndexCompleter {
 
                     if !after_return_kw && !after_limit_kw {
                         let suggestions = self.sort_field_suggestions(index, current);
-                        let start = current_start(tokens, current);
-                        return Some((start, suggestions));
+                        return Some(suggestions);
                     }
                 }
 
@@ -1191,73 +1210,60 @@ impl IndexCompleter {
                     }
 
                     if !suggestions.is_empty() {
-                        let start = current_start(tokens, current);
-                        return Some((start, suggestions));
+                        return Some(suggestions);
                     }
                 }
 
                 // Default: suggest field names for query construction
                 let suggestions = self.field_suggestions(index, current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             // Complete data subcommands and index for data load
             "data" if tokens.len() == 2 => {
                 let suggestions = self.data_subcommand_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             "data" if tokens.len() == 3 && tokens[1] == "load" => {
                 let suggestions = self.index_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             "data" if tokens.len() == 4 && tokens[1] == "load" => {
                 let suggestions = self.file_path_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             "data" if current.starts_with("--delimiter") => {
                 let suggestions = self.delimiter_flag_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             "data" if current.starts_with("--batch-size") || current == "--batch-size" => {
                 let suggestions = self.batch_size_flag_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             // Complete index name for delete
             "delete" if tokens.len() == 2 => {
                 let suggestions = self.index_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             "delete" if current.starts_with('-') => {
                 let suggestions = self.delete_flag_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             // Admin subcommands
             "admin" if tokens.len() == 2 => {
                 let suggestions = self.admin_subcommand_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             "admin" if tokens.len() >= 2 && tokens[1] == "memory" && tokens.len() == 3 => {
                 let suggestions = self.admin_memory_operation_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             "admin" if tokens.len() >= 2 && tokens[1] == "index" && tokens.len() == 3 => {
                 let suggestions = self.index_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             "admin" if tokens.len() >= 3 && tokens[1] == "index" && tokens.len() == 4 => {
                 let suggestions = self.admin_index_operation_suggestions(current);
-                let start = current_start(tokens, current);
-                Some((start, suggestions))
+                Some(suggestions)
             }
             _ => None,
         }
@@ -1395,43 +1401,38 @@ impl Completer for IndexCompleter {
         _ctx: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let prefix = &line[..pos];
+
+        // Find the byte offset where the token under the cursor begins.  This is
+        // the position that rustyline should start replacing from.  Scanning
+        // backwards from the cursor is more robust than `pos - token.len()`
+        // because it tolerates any leading whitespace (tabs, multiple spaces,
+        // etc.) and never confuses a trailing-whitespace insertion point with
+        // the previous token.
+        let start = prefix
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+
+        let current = &prefix[start..pos];
+
         let mut parts: Vec<&str> = prefix.split_whitespace().collect();
-
-        let current = if prefix.ends_with(' ') {
+        if prefix.chars().last().is_some_and(|c| c.is_whitespace()) {
             parts.push("");
-            ""
-        } else {
-            parts.last().copied().unwrap_or("")
-        };
-
-        // Handle empty line case
-        if parts.is_empty() || (parts.len() == 1 && parts[0].is_empty()) {
-            let suggestions = self.command_suggestions("");
-            return Ok((0, suggestions));
         }
 
-        if let Some((_, suggestions)) = self.complete_tokens(&parts, current) {
-            // Use the actual cursor position minus current token length for safe replacement
-            let safe_start = pos.saturating_sub(current.len());
-            Ok((safe_start, suggestions))
+        // Handle empty/whitespace-only line case
+        if parts.is_empty() || (parts.len() == 1 && parts[0].is_empty()) {
+            let suggestions = self.command_suggestions("");
+            return Ok((start, suggestions));
+        }
+
+        if let Some(suggestions) = self.complete_tokens(&parts, current) {
+            Ok((start, suggestions))
         } else {
             Ok((pos, Vec::new()))
         }
-    }
-}
-
-fn current_start(tokens: &[&str], current: &str) -> usize {
-    if current.is_empty() {
-        // Position is at end of line after space
-        tokens.iter().map(|t| t.len() + 1).sum::<usize>()
-    } else {
-        // Position is within the current token
-        let before_current = tokens.len().saturating_sub(1);
-        tokens
-            .iter()
-            .take(before_current)
-            .map(|t| t.len() + 1)
-            .sum::<usize>()
     }
 }
 
@@ -1643,13 +1644,20 @@ pub async fn run_cli() -> Result<()> {
             query,
             limit,
         } => {
-            let (clean_query, parsed_limit, parsed_fields) = parse_query_modifiers(&query);
+            let (clean_query, parsed_limit, parsed_fields, parsed_sort) =
+                parse_query_modifiers(&query);
             if clean_query.is_empty() {
                 anyhow::bail!("Query cannot be empty after removing modifiers");
             }
             let final_limit = limit.or(parsed_limit);
             let results = client
-                .search(&index, &clean_query, final_limit, parsed_fields)
+                .search(
+                    &index,
+                    &clean_query,
+                    final_limit,
+                    parsed_fields,
+                    parsed_sort,
+                )
                 .await?;
             print_json(&results)?;
         }
@@ -4405,7 +4413,8 @@ async fn dispatch_interactive_command(
                 return Err(anyhow!("Usage: search <index> <query> [limit N]"));
             }
 
-            let (clean_query, keyword_limit, keyword_fields) = parse_query_modifiers(&raw_query);
+            let (clean_query, keyword_limit, keyword_fields, keyword_sort) =
+                parse_query_modifiers(&raw_query);
             if clean_query.is_empty() {
                 return Err(anyhow!("Search query cannot be empty"));
             }
@@ -4413,7 +4422,13 @@ async fn dispatch_interactive_command(
             let final_limit = trailing_limit.or(keyword_limit);
             let results = session
                 .client()
-                .search(index, &clean_query, final_limit, keyword_fields)
+                .search(
+                    index,
+                    &clean_query,
+                    final_limit,
+                    keyword_fields,
+                    keyword_sort,
+                )
                 .await?;
             print_json(&results)?;
         }
@@ -4603,4 +4618,102 @@ async fn dispatch_interactive_command(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustyline::Context;
+    use rustyline::history::MemHistory;
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+
+    fn completer_with_index() -> IndexCompleter {
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let mut guard = cache.write().unwrap();
+            guard.insert(
+                "myindex".to_string(),
+                IndexMetadata {
+                    fields: vec![FieldInfo {
+                        name: "title".to_string(),
+                        field_type: "text".to_string(),
+                    }],
+                },
+            );
+        }
+        IndexCompleter::new(cache)
+    }
+
+    fn ctx(history: &MemHistory) -> Context<'_> {
+        Context::new(history)
+    }
+
+    #[test]
+    fn command_completion_respects_leading_whitespace() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        let (start, pairs) = c.complete("  se", 4, &ctx(&history)).unwrap();
+        assert_eq!(start, 2);
+        assert!(pairs.iter().any(|p| p.replacement == "search"));
+    }
+
+    #[test]
+    fn command_completion_at_start_of_line() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        let (start, pairs) = c.complete("se", 2, &ctx(&history)).unwrap();
+        assert_eq!(start, 0);
+        assert!(pairs.iter().any(|p| p.replacement == "search"));
+    }
+
+    #[test]
+    fn index_completion_start_is_beginning_of_token() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        let line = "search myindex";
+        let (start, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert_eq!(start, 7);
+        assert!(pairs.iter().any(|p| p.replacement == "myindex"));
+    }
+
+    #[test]
+    fn keyword_completion_after_trailing_space() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        let line = "search myindex ";
+        let (start, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert_eq!(start, line.len());
+        assert!(pairs.iter().any(|p| p.replacement == "return "));
+    }
+
+    #[test]
+    fn keyword_completion_after_trailing_tab() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        let line = "search myindex\t";
+        let (start, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert_eq!(start, line.len());
+        assert!(pairs.iter().any(|p| p.replacement == "return "));
+    }
+
+    #[test]
+    fn partial_keyword_completion_replaces_current_token() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        let line = "search myindex re";
+        let (start, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert_eq!(start, 15);
+        assert!(pairs.iter().any(|p| p.replacement == "return "));
+    }
+
+    #[test]
+    fn field_completion_replaces_partial_field_token() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        let line = "search myindex ti";
+        let (start, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert_eq!(start, 15);
+        assert!(pairs.iter().any(|p| p.replacement == "title:"));
+    }
 }
