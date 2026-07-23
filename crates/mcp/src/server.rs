@@ -147,7 +147,7 @@ struct MessageQuery {
 pub struct SortSpec {
     /// Field name to sort by
     pub field: String,
-    /// Sort order (default: Desc)
+    /// Sort order (default: Asc)
     #[serde(default)]
     pub order: SortOrder,
 }
@@ -157,8 +157,8 @@ pub struct SortSpec {
 #[serde(rename_all = "lowercase")]
 pub enum SortOrder {
     #[default]
-    Desc,
     Asc,
+    Desc,
 }
 
 #[derive(Debug, Clone, Deserialize)]

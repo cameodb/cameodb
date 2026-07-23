@@ -169,22 +169,28 @@ fn transform_shadow_query(query: &str, schema: &IndexSchema) -> String {
 }
 
 /// Apply field projection to a JSON document, keeping only specified fields.
-/// Always preserves metadata fields (_score, shard_id, etc.) that start with underscore.
+/// Always preserves metadata fields (_score, _sort_key, etc.) that start with underscore.
+///
+/// User-specified fields are inserted first in the exact order given by the projection
+/// list, so the response field order matches the user's `return` clause. Metadata fields
+/// are appended afterwards. This guarantees a consistent field order whether or not a
+/// sort is active — the internal `_sort_key` (if present) simply appears at the end and
+/// is stripped by `strip_sort_keys` at the client boundary.
 fn apply_field_projection(doc: JsonValue, fields: &[String]) -> JsonValue {
     if let JsonValue::Object(mut map) = doc {
         let mut filtered = serde_json::Map::new();
 
-        // Always keep metadata fields (those starting with _)
-        for (key, value) in map.iter() {
-            if key.starts_with('_') {
-                filtered.insert(key.clone(), value.clone());
-            }
-        }
-
-        // Add requested fields
+        // Add requested fields first, in user-specified projection order
         for field in fields {
             if let Some(value) = map.remove(field) {
                 filtered.insert(field.clone(), value);
+            }
+        }
+
+        // Then append metadata fields (those starting with _)
+        for (key, value) in map.iter() {
+            if key.starts_with('_') {
+                filtered.insert(key.clone(), value.clone());
             }
         }
 
@@ -283,10 +289,7 @@ fn stamp_sort_keys(hits: &mut [(Uuid, f32, JsonValue)], spec: &SortSpec, schema:
 /// Remove the internal `SORT_KEY_FIELD` from every hit in a search response, in place.
 /// Called once at the client boundary so the key never leaks to callers.
 fn strip_sort_keys(response: &mut JsonValue) {
-    if let Some(hits) = response
-        .get_mut("hits")
-        .and_then(|h| h.as_array_mut())
-    {
+    if let Some(hits) = response.get_mut("hits").and_then(|h| h.as_array_mut()) {
         for hit in hits.iter_mut() {
             if let Some(o) = hit.as_object_mut() {
                 o.remove(SORT_KEY_FIELD);
@@ -1595,9 +1598,8 @@ impl OrchestratorEngine {
         match sort {
             Some(spec) => {
                 stamp_sort_keys(&mut results, spec, &schema);
-                results.sort_by(|a, b| {
-                    compare_hits_by_field(&a.2, &b.2, SORT_KEY_FIELD, spec.order)
-                })
+                results
+                    .sort_by(|a, b| compare_hits_by_field(&a.2, &b.2, SORT_KEY_FIELD, spec.order))
             }
             None => {
                 results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -2923,9 +2925,7 @@ impl RouterActor {
             }
         };
 
-        if is_search
-            && let Ok(response) = result.as_mut()
-        {
+        if is_search && let Ok(response) = result.as_mut() {
             strip_sort_keys(response);
         }
 
@@ -6269,9 +6269,8 @@ impl NodeOrchestrator {
         match sort {
             Some(spec) => {
                 stamp_sort_keys(&mut results, spec, &schema);
-                results.sort_by(|a, b| {
-                    compare_hits_by_field(&a.2, &b.2, SORT_KEY_FIELD, spec.order)
-                })
+                results
+                    .sort_by(|a, b| compare_hits_by_field(&a.2, &b.2, SORT_KEY_FIELD, spec.order))
             }
             None => {
                 results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -6933,6 +6932,97 @@ mod tests {
         assert!(result.get("title").is_none());
     }
 
+    #[test]
+    fn test_apply_field_projection_preserves_user_order() {
+        let doc = json!({
+            "id": "doc1",
+            "title": "Rust Programming",
+            "author": "John Doe",
+            "year": 2024,
+            "_score": 0.95
+        });
+
+        let fields = vec![
+            "year".to_string(),
+            "title".to_string(),
+            "author".to_string(),
+        ];
+        let result = apply_field_projection(doc, &fields);
+
+        // User fields should appear first, in projection order
+        let keys: Vec<&str> = result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(keys, vec!["year", "title", "author", "_score"]);
+    }
+
+    #[test]
+    fn test_apply_field_projection_order_with_sort_key() {
+        // Simulate a document after stamp_sort_keys + _score insertion
+        let doc = json!({
+            "id": "doc1",
+            "title": "Rust Programming",
+            "author": "John Doe",
+            "year": 2024,
+            "_sort_key": 2024,
+            "_score": 1.0,
+            "shard_id": "abc-123"
+        });
+
+        let fields = vec![
+            "year".to_string(),
+            "title".to_string(),
+            "author".to_string(),
+        ];
+        let mut result = apply_field_projection(doc, &fields);
+
+        // Strip _sort_key as route_and_handle would
+        if let Some(o) = result.as_object_mut() {
+            o.remove(SORT_KEY_FIELD);
+        }
+
+        // After stripping, order should be: user fields (in projection order), then _score
+        let keys: Vec<&str> = result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(keys, vec!["year", "title", "author", "_score"]);
+    }
+
+    #[test]
+    fn test_apply_field_projection_order_without_sort_key() {
+        // Same document but without _sort_key (no sort applied)
+        let doc = json!({
+            "id": "doc1",
+            "title": "Rust Programming",
+            "author": "John Doe",
+            "year": 2024,
+            "_score": 1.0,
+            "shard_id": "abc-123"
+        });
+
+        let fields = vec![
+            "year".to_string(),
+            "title".to_string(),
+            "author".to_string(),
+        ];
+        let result = apply_field_projection(doc, &fields);
+
+        // Order should be: user fields (in projection order), then _score
+        let keys: Vec<&str> = result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(keys, vec!["year", "title", "author", "_score"]);
+    }
+
     // ---- Field-sort merge helpers (`_sort_key`) ----
 
     fn titles(hits: &[JsonValue]) -> Vec<String> {
@@ -7056,7 +7146,10 @@ mod tests {
         strip_sort_keys(&mut response);
         let hits = response["hits"].as_array().unwrap();
         for hit in hits {
-            assert!(hit.get(SORT_KEY_FIELD).is_none(), "_sort_key must be stripped");
+            assert!(
+                hit.get(SORT_KEY_FIELD).is_none(),
+                "_sort_key must be stripped"
+            );
             assert!(hit.get("_score").is_some(), "other metadata preserved");
             assert!(hit.get("title").is_some(), "content preserved");
         }

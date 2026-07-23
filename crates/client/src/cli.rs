@@ -158,12 +158,12 @@ fn parse_query_modifiers(
         let (field, order) = match sort_spec.split_once(':') {
             Some((f, o)) => {
                 let order = match o.to_lowercase().as_str() {
-                    "asc" => storage::SortOrder::Asc,
-                    _ => storage::SortOrder::Desc,
+                    "desc" => storage::SortOrder::Desc,
+                    _ => storage::SortOrder::Asc,
                 };
                 (f.to_string(), order)
             }
-            None => (sort_spec.to_string(), storage::SortOrder::Desc),
+            None => (sort_spec.to_string(), storage::SortOrder::Asc),
         };
         inline_sort = Some(storage::SortSpec { field, order });
         cleaned_end = cleaned_end.min(idx);
@@ -794,17 +794,20 @@ impl IndexCompleter {
                 (prefix, false)
             };
 
-            // Filter for sortable fields (u64, date types)
-            // Note: We can't check FAST flag from client, so we suggest all u64/date fields
+            // Filter for sortable fields: FAST numeric/date fields and text/string fields
+            // (text/string are sorted alphabetically post-fetch, no FAST flag required).
             let sortable_fields: Vec<_> = metadata
                 .fields
                 .iter()
                 .filter(|field| {
-                    // Check if field name matches prefix
+                    let ft = field.field_type.to_lowercase();
                     field.name.starts_with(field_prefix)
-                        // Check if field is potentially sortable (u64 or date)
-                        && (field.field_type.to_lowercase().contains("u64")
-                            || field.field_type.to_lowercase().contains("date"))
+                        && (ft.contains("u64")
+                            || ft.contains("i64")
+                            || ft.contains("f64")
+                            || ft.contains("date")
+                            || ft.contains("text")
+                            || ft.contains("string"))
                 })
                 .collect();
 
@@ -822,18 +825,18 @@ impl IndexCompleter {
                     },
                 ]
             } else {
-                // Suggest sortable field names with :desc suffix (default)
+                // Suggest sortable field names with :asc suffix (default)
                 sortable_fields
                     .iter()
                     .flat_map(|field| {
                         vec![
                             Pair {
-                                display: format!("{}:desc (default)", field.name),
-                                replacement: format!("{}:desc", field.name),
+                                display: format!("{}:asc (default)", field.name),
+                                replacement: format!("{}:asc", field.name),
                             },
                             Pair {
-                                display: format!("{}:asc", field.name),
-                                replacement: format!("{}:asc", field.name),
+                                display: format!("{}:desc", field.name),
+                                replacement: format!("{}:desc", field.name),
                             },
                         ]
                     })
@@ -1209,6 +1212,10 @@ impl IndexCompleter {
                         });
                     }
 
+                    if current.is_empty() {
+                        suggestions.extend(self.field_suggestions(index, current));
+                    }
+
                     if !suggestions.is_empty() {
                         return Some(suggestions);
                     }
@@ -1312,7 +1319,13 @@ impl Hinter for IndexCompleter {
 
                 // Check if user is typing a field value
                 if let Some(current) = tail.last() {
-                    if let Some((field, value_prefix)) = current.split_once(':') {
+                    // Check if we're after the 'sort' keyword — sort values are asc/desc,
+                    // not field values, so field type hints are irrelevant.
+                    let after_sort = tail.iter().any(|t| t.eq_ignore_ascii_case("sort"));
+
+                    if let Some((field, value_prefix)) = current.split_once(':')
+                        && !after_sort
+                    {
                         let trimmed_value = value_prefix
                             .trim_start_matches(&['>', '<', '=', '!'][..])
                             .trim();
@@ -1329,12 +1342,12 @@ impl Hinter for IndexCompleter {
 
                     // If typing 'r', hint 'return'
                     if current.eq_ignore_ascii_case("r") && !has_return {
-                        return Some("eturn <fields>".to_string());
+                        return Some("eturn ".to_string());
                     }
 
                     // If typing 'l', hint 'limit'
                     if current.eq_ignore_ascii_case("l") && !has_limit {
-                        return Some("imit <n>".to_string());
+                        return Some("imit ".to_string());
                     }
 
                     // If typing 'ret', hint 'return'
@@ -1342,7 +1355,7 @@ impl Hinter for IndexCompleter {
                         && current.len() < "return".len()
                         && !has_return
                     {
-                        return Some(format!("{} <fields>", &"return"[current.len()..]));
+                        return Some(format!("{} ", &"return"[current.len()..]));
                     }
 
                     // If typing 'lim', hint 'limit'
@@ -1350,7 +1363,7 @@ impl Hinter for IndexCompleter {
                         && current.len() < "limit".len()
                         && !has_limit
                     {
-                        return Some(format!("{} <n>", &"limit"[current.len()..]));
+                        return Some(format!("{} ", &"limit"[current.len()..]));
                     }
                 }
 
@@ -4678,23 +4691,25 @@ mod tests {
     }
 
     #[test]
-    fn keyword_completion_after_trailing_space() {
+    fn keyword_and_field_completion_after_trailing_space() {
         let c = completer_with_index();
         let history = MemHistory::new();
         let line = "search myindex ";
         let (start, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
         assert_eq!(start, line.len());
         assert!(pairs.iter().any(|p| p.replacement == "return "));
+        assert!(pairs.iter().any(|p| p.replacement == "title:"));
     }
 
     #[test]
-    fn keyword_completion_after_trailing_tab() {
+    fn keyword_and_field_completion_after_trailing_tab() {
         let c = completer_with_index();
         let history = MemHistory::new();
         let line = "search myindex\t";
         let (start, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
         assert_eq!(start, line.len());
         assert!(pairs.iter().any(|p| p.replacement == "return "));
+        assert!(pairs.iter().any(|p| p.replacement == "title:"));
     }
 
     #[test]

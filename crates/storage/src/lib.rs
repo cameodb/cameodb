@@ -54,7 +54,7 @@ use xxhash_rust::xxh3::xxh3_64;
 pub struct SortSpec {
     /// Field name to sort by
     pub field: String,
-    /// Sort order (default: Desc)
+    /// Sort order (default: Asc)
     #[serde(default)]
     pub order: SortOrder,
 }
@@ -64,8 +64,8 @@ pub struct SortSpec {
 #[serde(rename_all = "lowercase")]
 pub enum SortOrder {
     #[default]
-    Desc,
     Asc,
+    Desc,
 }
 
 /// Wrapper to handle both sorted (u64) and unsorted (f32) search results
@@ -90,9 +90,19 @@ const NAIVE_DATETIME_FORMATS: &[&str] = &[
     "%Y-%m-%dT%H:%M",
     "%Y-%m-%d %H:%M:%S%.f",
     "%Y-%m-%dT%H:%M:%S%.f",
+    // Slash separator for date part
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M",
+    "%Y/%m/%dT%H:%M:%S",
+    "%Y/%m/%dT%H:%M",
+    // Dot separator for date part
+    "%Y.%m.%d %H:%M:%S",
+    "%Y.%m.%d %H:%M",
+    "%Y.%m.%dT%H:%M:%S",
+    "%Y.%m.%dT%H:%M",
 ];
 
-const NAIVE_DATE_FORMATS: &[&str] = &["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%Y-%m", "%Y"];
+const NAIVE_DATE_FORMATS: &[&str] = &["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d", "%Y-%m", "%Y"];
 
 /// Schema metadata table: maps index names to their schema definitions.
 const TABLE_SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("schema");
@@ -142,7 +152,9 @@ fn normalize_date_literal(lit: &str) -> Option<String> {
         return None;
     }
 
-    let (_, _, clamped) = parse_date_str_to_tantivy(lit)?;
+    // Strip surrounding quotes (e.g. ""2026.07.01"" -> "2026.07.01")
+    let stripped = lit.trim_matches('"');
+    let (_, _, clamped) = parse_date_str_to_tantivy(stripped)?;
     let dt = Utc.timestamp_opt(clamped, 0).single()?;
     Some(dt.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
@@ -201,10 +213,19 @@ fn normalize_date_comparisons(input: &str, field: &str) -> String {
                 (op.to_string(), op.len_utf8())
             };
             let value_start = op_idx + op_len;
-            let value_end = input[value_start..]
-                .find(char::is_whitespace)
-                .map(|r| value_start + r)
-                .unwrap_or(input.len());
+            // If the value is quoted, find the closing quote as the boundary.
+            // Otherwise, use whitespace as the boundary.
+            let value_end = if input[value_start..].starts_with('"') {
+                input[value_start + 1..]
+                    .find('"')
+                    .map(|r| value_start + 1 + r + 1)
+                    .unwrap_or(input.len())
+            } else {
+                input[value_start..]
+                    .find(char::is_whitespace)
+                    .map(|r| value_start + r)
+                    .unwrap_or(input.len())
+            };
             let value = &input[value_start..value_end];
             let norm = normalize_date_literal(value).unwrap_or_else(|| value.to_string());
             out.push_str(&format!("{}{}{}", prefix, full_op, norm));
@@ -231,10 +252,19 @@ fn normalize_date_literals(input: &str, field: &str) -> String {
         out.push_str(&input[idx..start]);
 
         let value_start = start + prefix.len();
-        let value_end = input[value_start..]
-            .find(char::is_whitespace)
-            .map(|r| value_start + r)
-            .unwrap_or(input.len());
+        // If the value is quoted, find the closing quote as the boundary.
+        // Otherwise, use whitespace as the boundary.
+        let value_end = if input[value_start..].starts_with('"') {
+            input[value_start + 1..]
+                .find('"')
+                .map(|r| value_start + 1 + r + 1)
+                .unwrap_or(input.len())
+        } else {
+            input[value_start..]
+                .find(char::is_whitespace)
+                .map(|r| value_start + r)
+                .unwrap_or(input.len())
+        };
         let value = &input[value_start..value_end];
 
         // Skip if this looks like a range or comparison already handled
@@ -658,6 +688,8 @@ impl FieldDef {
     /// - 2024-05-01 12:30
     /// - 2024-05-01T12:30:00
     /// - 2024-05-01T12:30:00.123
+    /// - 2024/05/01 12:30:00
+    /// - 2024.05.01T12:30:00
     fn is_naive_datetime(s: &str) -> bool {
         NAIVE_DATETIME_FORMATS
             .iter()
@@ -667,6 +699,7 @@ impl FieldDef {
     /// Check common date-only formats such as
     /// - 2024-05-01
     /// - 2024/05/01
+    /// - 2024.05.01
     /// - 20240501
     fn is_naive_date(s: &str) -> bool {
         NAIVE_DATE_FORMATS
@@ -675,8 +708,9 @@ impl FieldDef {
     }
 }
 
-/// Parse a date string (RFC3339, naive datetime, date-only, year-month, or year-only)
-/// into the epoch-second timestamp that the Date FAST field is sorted on.
+/// Parse a date string (RFC3339, naive datetime, date-only, compact datetime,
+/// unix epoch seconds, year-month, or year-only) into the epoch-second timestamp
+/// that the Date FAST field is sorted on.
 ///
 /// Returns the value **clamped to Tantivy's supported range**, matching exactly what
 /// `parse_date_str_to_tantivy` feeds into the index. Callers that need a comparable
@@ -708,8 +742,8 @@ fn parse_date_str_to_tantivy(s: &str) -> Option<(DateTime, i64, i64)> {
         return Some((tantivy_dt, ts, clamped));
     }
 
-    // Date-only formats that NaiveDate can parse directly (YYYY-MM-DD, YYYY/MM/DD, YYYYMMDD)
-    for fmt in &["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"] {
+    // Date-only formats that NaiveDate can parse directly (YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD, YYYYMMDD)
+    for fmt in &["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d"] {
         if let Ok(nd) = NaiveDate::parse_from_str(s, fmt)
             && let Some(ndt) = nd.and_hms_opt(0, 0, 0)
         {
@@ -718,6 +752,57 @@ fn parse_date_str_to_tantivy(s: &str) -> Option<(DateTime, i64, i64)> {
             let tantivy_dt = DateTime::from_timestamp_secs(clamped);
             return Some((tantivy_dt, ts, clamped));
         }
+    }
+
+    // Compact datetime: YYYYMMDDHHMMSS or YYYYMMDDHHMM (no separators)
+    if s.len() == 14
+        && s.chars().all(|c| c.is_ascii_digit())
+        && let (Ok(year), Ok(month), Ok(day), Ok(hour), Ok(min), Ok(sec)) = (
+            s[0..4].parse::<i32>(),
+            s[4..6].parse::<u32>(),
+            s[6..8].parse::<u32>(),
+            s[8..10].parse::<u32>(),
+            s[10..12].parse::<u32>(),
+            s[12..14].parse::<u32>(),
+        )
+        && let Some(nd) = NaiveDate::from_ymd_opt(year, month, day)
+        && let Some(ndt) = nd.and_hms_opt(hour, min, sec)
+    {
+        let ts = Utc.from_utc_datetime(&ndt).timestamp();
+        let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+        let tantivy_dt = DateTime::from_timestamp_secs(clamped);
+        return Some((tantivy_dt, ts, clamped));
+    }
+    if s.len() == 12
+        && s.chars().all(|c| c.is_ascii_digit())
+        && let (Ok(year), Ok(month), Ok(day), Ok(hour), Ok(min)) = (
+            s[0..4].parse::<i32>(),
+            s[4..6].parse::<u32>(),
+            s[6..8].parse::<u32>(),
+            s[8..10].parse::<u32>(),
+            s[10..12].parse::<u32>(),
+        )
+        && let Some(nd) = NaiveDate::from_ymd_opt(year, month, day)
+        && let Some(ndt) = nd.and_hms_opt(hour, min, 0)
+    {
+        let ts = Utc.from_utc_datetime(&ndt).timestamp();
+        let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+        let tantivy_dt = DateTime::from_timestamp_secs(clamped);
+        return Some((tantivy_dt, ts, clamped));
+    }
+
+    // Unix epoch seconds (pure integer, not a date format)
+    // Only attempt this for values that look like reasonable timestamps (10-11 digits for
+    // contemporary dates, or smaller for historical). This avoids misinterpreting 4-digit
+    // years (already handled above) or 8-digit YYYYMMDD dates (already handled above).
+    if (s.len() == 10 || s.len() == 11)
+        && s.chars().all(|c| c.is_ascii_digit())
+        && let Ok(secs) = s.parse::<i64>()
+        && (946_684_800..=10_000_000_000).contains(&secs)
+    {
+        let clamped = secs.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+        let tantivy_dt = DateTime::from_timestamp_secs(clamped);
+        return Some((tantivy_dt, secs, clamped));
     }
 
     // Year-month format (YYYY-MM) -> first day of month, midnight UTC
@@ -3534,8 +3619,10 @@ impl HybridStore {
             );
         }
 
-        // Execute search with sorting if specified, otherwise use MultiCollector
-        // OPTIMIZATION: Use MultiCollector for both sorted and unsorted to get count in single pass
+        // Flag set when sorting by a string field (post-fetch alphabetic sort).
+        // The field name and order are captured here and used after redb retrieval.
+        let mut string_sort: Option<(String, SortOrder)> = None;
+
         let (top_docs, total_hits) = if let Some(sort_spec) = _sort {
             // Get field from schema to check type and FAST flag
             let schema = tantivy_index.schema();
@@ -3545,7 +3632,11 @@ impl HybridStore {
 
             let field_entry = schema.get_field_entry(field);
 
-            if !field_entry.is_fast() {
+            // Text/String fields don't require the FAST flag — they use a post-fetch sort.
+            let is_str_field =
+                matches!(field_entry.field_type(), tantivy::schema::FieldType::Str(_));
+
+            if !field_entry.is_fast() && !is_str_field {
                 return Err(StoreError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
@@ -3587,17 +3678,36 @@ impl HybridStore {
                 }};
             }
 
-            // Support u64, i64, f64, and Date fields for sorting via FAST fields
+            // Support u64, i64, f64, and Date fields via FAST fields; Text/String via post-fetch sort.
             match field_entry.field_type() {
                 tantivy::schema::FieldType::U64(_) => collect_sorted!(u64),
                 tantivy::schema::FieldType::I64(_) => collect_sorted!(i64),
                 tantivy::schema::FieldType::F64(_) => collect_sorted!(f64),
                 tantivy::schema::FieldType::Date(_) => collect_sorted!(tantivy::DateTime),
+                tantivy::schema::FieldType::Str(_) => {
+                    // String sort: collect limit*2 candidates by relevance score, sort
+                    // alphabetically after the redb fetch.
+                    let budget = limit.saturating_mul(2);
+                    string_sort = Some((sort_spec.field.clone(), sort_spec.order));
+
+                    let top_docs_collector =
+                        tantivy::collector::TopDocs::with_limit(budget).order_by_score();
+                    let count_collector = tantivy::collector::Count;
+                    let mut multi_collector = tantivy::collector::MultiCollector::new();
+                    let top_docs_handle = multi_collector.add_collector(top_docs_collector);
+                    let count_handle = multi_collector.add_collector(count_collector);
+
+                    let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
+                    let top_docs: Vec<(f32, tantivy::DocAddress)> =
+                        top_docs_handle.extract(&mut multi_fruit);
+                    let total_hits = count_handle.extract(&mut multi_fruit);
+                    (SearchResult::Unsorted(top_docs), total_hits)
+                }
                 _ => {
                     return Err(StoreError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!(
-                            "Field '{}' type {:?} is not sortable. Supported sortable FAST field types: u64, i64, f64, date.",
+                            "Field '{}' type {:?} is not sortable. Supported types: u64, i64, f64, date (FAST), text, string.",
                             sort_spec.field,
                             field_entry.field_type()
                         ),
@@ -3754,6 +3864,26 @@ impl HybridStore {
             } else {
                 trace!(index = %index, doc_id = %doc_id, "Document not found in redb lookup map");
             }
+        }
+
+        // Post-fetch alphabetic sort for string fields.
+        // Candidates were collected with budget = limit*2; sort and truncate to limit.
+        if let Some((field, order)) = string_sort {
+            results.sort_by(|a, b| {
+                let av = a.1.get(&field).and_then(|v| v.as_str());
+                let bv = b.1.get(&field).and_then(|v| v.as_str());
+                let base = match (av, bv) {
+                    (Some(ax), Some(bx)) => ax.cmp(bx),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
+                match order {
+                    SortOrder::Asc => base,
+                    SortOrder::Desc => base.reverse(),
+                }
+            });
+            results.truncate(limit);
         }
 
         Ok((results, total_hits))

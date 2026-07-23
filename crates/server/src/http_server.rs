@@ -1172,14 +1172,14 @@ fn cameodb_syntax_reference() -> JsonValue {
             },
             "sort_results": {
                 "syntax": "sort field:order",
-                "description": "Sort results by a FAST field. Order is optional (asc or desc, defaults to desc).",
+                "description": "Sort results by a FAST field or text/string field. Order is optional (asc or desc, defaults to asc).",
                 "examples": [
                     "title:rust sort year:desc",
                     "title:rust sort timestamp:asc",
                     "title:rust sort price"
                 ],
-                "supported_types": "u64, i64, f64, date (all must be FAST)",
-                "note": "Date fields use timestamp ordering. All numeric FAST fields support sort."
+                "supported_types": "u64, i64, f64, date (FAST), text, string (post-fetch)",
+                "note": "Date fields use timestamp ordering. Numeric FAST fields sort natively. Text/string fields sort alphabetically post-fetch."
             },
             "combined": {
                 "example": "title:rust AND author:doe return title,author limit 10 sort year:desc"
@@ -1371,8 +1371,8 @@ fn parse_query_keywords(
     {
         if let Some((field, order_str)) = sort_spec.split_once(':') {
             let order = match order_str.to_lowercase().as_str() {
-                "asc" => SortOrder::Asc,
-                _ => SortOrder::Desc,
+                "desc" => SortOrder::Desc,
+                _ => SortOrder::Asc,
             };
             sort = Some(SortSpec {
                 field: field.to_string(),
@@ -1380,10 +1380,10 @@ fn parse_query_keywords(
             });
             sort_parsed = true;
         } else {
-            // No order specified, default to desc
+            // No order specified, default to asc
             sort = Some(SortSpec {
                 field: sort_spec.to_string(),
-                order: SortOrder::Desc,
+                order: SortOrder::Asc,
             });
             sort_parsed = true;
         }
@@ -2278,7 +2278,7 @@ mod tests {
             parsed_sort,
             Some(SortSpec {
                 field: "year".to_string(),
-                order: SortOrder::Desc,
+                order: SortOrder::Asc,
             })
         );
     }
