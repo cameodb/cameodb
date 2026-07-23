@@ -45,16 +45,15 @@ libc = "0.2"
 yamux = { workspace = true }
 
 [target.'cfg(target_env = "musl")'.dependencies]
-tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "stats"] }
-tikv-jemalloc-sys = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "stats"] }
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms", "stats"] }
+tikv-jemalloc-sys = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms", "stats"] }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-tikv-jemallocator = { version = "0.6", features = ["stats"] }
-tikv-jemalloc-sys = { version = "0.6", features = ["stats"] }
+tikv-jemallocator = { version = "0.7", features = ["stats"] }
+tikv-jemalloc-sys = { version = "0.7", features = ["stats"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
-axum-test = "20.0.0"
 
 [package.metadata.generate-rpm]
 release = "1"

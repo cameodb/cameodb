@@ -2,17 +2,9 @@
 
 ## Building for x86_64-unknown-linux-musl
 
-### Recommended: Using native-tls-vendored with zigbuild
+### Recommended: Using the build script
 
-For musl targets, use `native-tls-vendored` with `cargo-zigbuild` for maximum HTTPS compatibility:
-
-```bash
-cargo zigbuild --release --target x86_64-unknown-linux-musl \
-    --no-default-features \
-    --features client/native-tls-vendored
-```
-
-Or use the convenience script:
+For musl targets, use the convenience script, which builds with `native-tls-vendored` via `cargo-zigbuild` for maximum HTTPS compatibility:
 
 ```bash
 ./scripts/build/build-musl.sh
@@ -23,14 +15,27 @@ Or use the convenience script:
 - ✅ Zig provides complete C toolchain (no glibc/musl compatibility issues)
 - ✅ Self-contained binary
 - ✅ Same approach used in Docker builds
+- ✅ Sets `AR`/`RANLIB` to Zig's archiver — see the warning below
 
 **How it works:** Zig's C compiler provides a complete libc implementation that's compatible with musl, avoiding the glibc symbol issues that occur with traditional cross-compilation.
+
+> **⚠️ If you run `cargo zigbuild` directly instead of the script**, you must export `AR="zig ar"` and `RANLIB="zig ranlib"` first. Any target using `target_env = "musl"` pulls in `tikv-jemallocator`/`tikv-jemalloc-sys`, which compile jemalloc's C sources via `configure`/`make`. That build step never sets `AR`/`RANLIB` itself, so without the exports it silently falls back to macOS's native `ar`/`ranlib`. Those tools don't understand the ELF `.o` files Zig's cross-compiler produces — `ranlib` prints `warning: archive member '...' not a mach-o file` and drops every unrecognized member while rebuilding the archive's symbol index, leaving a valid but **empty** `libjemalloc.a` (just a `__.SYMDEF` header, no object code). The failure only shows up later, at link time, as `undefined symbol: mallocx` / `rallocx` / `sdallocx` / `mallctl` — misleading because the actual defect is in an archiving step several layers upstream of the link error.
+>
+> ```bash
+> export AR="zig ar"
+> export RANLIB="zig ranlib"
+> cargo zigbuild --release --target x86_64-unknown-linux-musl \
+>     --no-default-features \
+>     --features client/native-tls-vendored
+> ```
 
 ### Alternative: Using rustls-tls
 
 For faster builds with pure Rust TLS:
 
 ```bash
+export AR="zig ar"
+export RANLIB="zig ranlib"
 cargo zigbuild --release --target x86_64-unknown-linux-musl \
     --no-default-features \
     --features client/rustls-tls
@@ -438,6 +443,8 @@ undefined reference to `__isoc23_strtol'
 
 This is a glibc/musl compatibility issue with vendored OpenSSL. Use `rustls-tls` instead:
 ```bash
+export AR="zig ar"
+export RANLIB="zig ranlib"
 cargo zigbuild --release --target x86_64-unknown-linux-musl \
     --no-default-features \
     --features client/rustls-tls
@@ -446,6 +453,19 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl \
 ### Certificate validation errors
 
 If you encounter certificate validation errors with `rustls-tls`, the site may have unusual certificate requirements. Try `native-tls` for local development or investigate the specific certificate issue.
+
+### Undefined symbol errors: `mallocx`, `rallocx`, `sdallocx`, `mallctl`
+
+If linking fails with errors like:
+```
+ld.lld: error: undefined symbol: mallocx
+ld.lld: error: undefined symbol: mallctl
+```
+
+You ran `cargo zigbuild` directly without exporting `AR`/`RANLIB` first (see the warning in [Building for x86_64-unknown-linux-musl](#building-for-x86_64-unknown-linux-musl) above). Either use `./scripts/build/build-musl.sh`, or export `AR="zig ar"` and `RANLIB="zig ranlib"` before your `cargo zigbuild` invocation. As a quick diagnostic, check whether `libjemalloc.a` in the build output is suspiciously small (a healthy archive is several MB; an empty one built with the wrong `ranlib` is under 100 bytes):
+```bash
+find target -name "libjemalloc.a" -exec ls -la {} \;
+```
 
 ### OpenSSL not found during cross-compilation
 
@@ -488,7 +508,12 @@ cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-re
 ```
 
 **Option 2: Cross-compilation with cargo-zigbuild (supports hardening)**
+
+`cargo generate-rpm` needs its own `--target` invocation, so this option can't go through `./scripts/build/build-musl.sh` directly — `AR`/`RANLIB` must be exported manually (see the warning in [Building for x86_64-unknown-linux-musl](#building-for-x86_64-unknown-linux-musl)):
 ```bash
+export AR="zig ar"
+export RANLIB="zig ranlib"
+
 # Build hardened binary for Linux x86_64 musl target (flags in .cargo/config.toml)
 cargo zigbuild --release --target x86_64-unknown-linux-musl \
     --no-default-features \

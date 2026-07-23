@@ -14,6 +14,20 @@ For a quick overview of all available scripts and project status:
 
 ### � `build/` - Build and Distribution
 
+#### `build-musl.sh`
+**Purpose**: Local cross-compile to `x86_64-unknown-linux-musl` via `cargo-zigbuild`, without Docker
+- **Features**:
+  - Uses `native-tls-vendored` for maximum HTTPS compatibility
+  - Exports `AR="zig ar"` / `RANLIB="zig ranlib"` so jemalloc's C build archives correctly — without this, macOS's native `ranlib` silently produces an empty `libjemalloc.a` (it can't parse the ELF objects Zig's cross-compiler emits), and the failure only surfaces later as `undefined symbol: mallocx`/`mallctl` at link time. See [docs/BUILDING.md](../../docs/BUILDING.md#building-for-x86_64-unknown-linux-musl) for the full explanation.
+- **Usage**:
+  ```bash
+  ./scripts/build/build-musl.sh                # release build (default)
+  ./scripts/build/build-musl.sh dev            # dev/debug build (binary lands in target/.../debug/)
+  ./scripts/build/build-musl.sh release-docker # this repo's thin-LTO profile
+  ```
+- **Prerequisites**: `zig` and `cargo-zigbuild` (`brew install zig && cargo install cargo-zigbuild`)
+- **Audience**: Developers building/testing Linux binaries locally on macOS
+
 #### `docker-push.sh`
 **Purpose**: Build and push multi-platform Docker images to DockerHub
 - **Features**:
