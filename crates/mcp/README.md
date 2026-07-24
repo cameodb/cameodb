@@ -88,6 +88,7 @@ Execute full-text search on a single CameoDB index.
   - Numeric comparisons: `score:>=4.5`, `price:<100`
   - All docs: `*`
   - Inline modifiers: `title:rust return title,author limit 5`
+  - Inline sort: `title:rust sort year:asc`, `title:rust sort year:desc`
 
   **Default search fields**: Unqualified queries (no `field:` prefix) search only `text` and `json` fields. Numeric, date, and other typed fields require explicit `field:value` syntax. Query parsing is lenient — type mismatches (e.g., `field:hello` on a numeric field) are silently skipped rather than failing the entire query.
 - `limit` (integer, optional): Maximum number of results to return. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10.
@@ -110,7 +111,7 @@ Execute full-text search on a single CameoDB index.
 
 ### 2. `search_indexes`
 
-Execute federated search across multiple CameoDB indexes with optional per-index field projection.
+Execute federated search across multiple CameoDB indexes with optional per-index field projection. Searches execute **concurrently** across all specified indexes, and results are merged into a single ranked list.
 
 > **CRITICAL ANTI-HALLUCINATION RULE FOR AGENTS:**
 > When answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.
@@ -123,13 +124,13 @@ Execute federated search across multiple CameoDB indexes with optional per-index
 - `indexes` (array, required): List of indexes to search, each with:
   - `index` (string, required): Name of the CameoDB index
   - `fields` (array of strings, optional): Fields to include from this index
-  - `sort` (object, optional): Sort results by a FAST field within this index
-    - `field` (string, required): FAST field name to sort by (u64, i64, f64, or date)
-    - `order` (string, optional): `asc` or `desc` (defaults to `desc`)
+  - `sort` (object, optional): Sort results by a field within this index
+    - `field` (string, required): Field name to sort by (u64, i64, f64, date, or text/string for alphabetic sort)
+    - `order` (string, optional): `asc` or `desc` (defaults to `asc`)
 - `query` (string, required): Search query applied to all specified indexes
 - `limit` (integer, optional): Maximum total results across all indexes. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10.
 
-**Returns:** Combined results merged by relevance score. Each hit includes an `_index_source` field indicating its origin index.
+**Returns:** Combined results merged by relevance score (or by the sort field if specified). Each hit includes an `_index_source` field indicating its origin index. The response contains only the merged `hits` array — per-index results are not duplicated, keeping token usage proportional to the limit.
 
 **Example:**
 ```json
@@ -137,7 +138,7 @@ Execute federated search across multiple CameoDB indexes with optional per-index
   "name": "search_indexes",
   "arguments": {
     "indexes": [
-      {"index": "papers", "fields": ["title", "author"], "sort": {"field": "year", "order": "desc"}},
+      {"index": "papers", "fields": ["title", "author"], "sort": {"field": "year", "order": "asc"}},
       {"index": "books", "fields": ["title", "isbn"]}
     ],
     "query": "rust programming",
@@ -460,7 +461,9 @@ k8s\.component\.name:quickwit    # matches field named "k8s.component.name"
 title:rust return title,author,year               # field projection
 title:rust limit 5                                 # result limit
 title:rust limit 0                                 # count-only (no document data)
-title:rust AND author:doe return title,author limit 10  # combined
+title:rust sort year:asc                            # sort ascending by field
+title:rust sort year:desc                           # sort descending by field
+title:rust AND author:doe return title,author sort year:desc limit 10  # combined
 ```
 
 ### Field Type ↔ Operator Compatibility
@@ -733,9 +736,19 @@ cargo test -p cameodb_mcp
 cargo clippy -p cameodb_mcp -- -D warnings
 ```
 
-### Recent Changes (v0.1.0)
+### Recent Changes
 
-#### MCP Specification Compliance
+#### v0.2.3 — Federated Search Overhaul & Sort Improvements
+
+- **Concurrent Multi-Index Search**: `search_indexes` now executes all index searches concurrently using `FuturesUnordered`, reducing latency from sum-of-all-searches to max-of-all-searches
+- **Fixed Merge Sort**: Relevance merge now reads `_score` (the actual field name) instead of `score`, which was a no-op causing arbitrary truncation order
+- **Removed `results_by_index`**: Response no longer includes per-index result duplicates — only the merged `hits` array is returned, cutting token usage by 2-4x for LLM consumers
+- **Sort-Aware Merge**: When a per-index sort spec is provided, the federated merge orders hits by `_sort_key` (internal metadata) instead of score, preserving sort order across indexes
+- **Default Sort Order**: Changed from `desc` to `asc` across MCP, storage, and HTTP server layers
+- **Expanded Sortable Types**: Text/string fields now supported for alphabetic post-fetch sort in addition to FAST fields (u64, i64, f64, date)
+- **Field Projection Order**: `apply_field_projection` now inserts user-specified fields first in projection order, then metadata fields after, ensuring consistent response field ordering regardless of sort
+
+#### v0.1.0 — MCP Specification Compliance
 - **Fixed SSE Handshake**: Now emits proper `endpoint` event per MCP spec
 - **Asynchronous POST Processing**: Returns `202 Accepted` immediately, processes in background
 - **Structured Events**: Uses Axum SSE `Event` objects instead of raw strings

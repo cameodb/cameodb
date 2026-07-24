@@ -875,6 +875,12 @@ When a user asks a question, you must follow this deterministic loop:
     * *Minimal set:* Request exact fields required for the answer (e.g., `return name, price` for a price lookup).
     * *Context set:* Add fields that reveal relationships or enable follow-up analysis (e.g., `return customer_id, order_id, status, total` — `customer_id` enables pivoting to customer history).
     * *Domain expertise:* Use your understanding of the business domain to infer which fields are identifiers, timestamps, or foreign keys that unlock deeper investigation.
+    * *Ordering:* Fields are returned in the exact order specified in the `return` clause or `fields` parameter. Metadata fields (like `_score`) are always included automatically.
+* **Sorting Strategy (`sort` clause):** When results need to be ordered by a specific field (e.g., newest first, highest price first), use inline `sort field:asc` or `sort field:desc` in the query string, or the `sort` parameter on `search_indexes`.
+    * *Supported types:* u64, i64, f64, date (FAST fields), and text/string (alphabetic sort).
+    * *Default order:* Ascending (`asc`) when not specified.
+    * *Example:* `title:rust sort year:desc limit 10` returns the 10 most recent results matching "rust" in title.
+    * *Federated sort:* When using `search_indexes` with a per-index `sort` spec, results are merged by the sort field across all indexes, preserving global ordering.
 
 ### Step 4: Iteration and Pivoting
 * **Action:** Analyze the results. If a document contains a unique identifier (like a `session_id`, `user_id`, or `transaction_hash`), and the user's question requires more context, **automatically pivot**.
@@ -900,7 +906,7 @@ fn mcp_tools() -> Vec<JsonValue> {
         json!({
             "name": "search_index",
             "title": "Search Index",
-            "description": "Execute full-text search on a single CameoDB index. Query syntax supports field:value targeting, phrase queries (field:\"words\"), boolean operators (AND, OR, NOT), grouping with parentheses, range queries (field:[low TO high]), and date comparisons (field:>2024-01-01). \n\nCRITICAL ANTI-HALLUCINATION RULE FOR AGENTS:\nWhen answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.\n\nPRO TIPS FOR AGENTS:\n1. Use Tantivy boosting to improve relevance (e.g., 'title:rust^3 OR body:rust').\n2. The query string supports inline 'return field1,field2' for field projection, and 'limit N' for result count.\n3. If you receive a field error or do not know the available fields, run the 'get_index' tool first to view the schema.\n\nQUERY SYNTAX QUICK REFERENCE:\n- Terms: rust database (AND by default)\n- Field targeting: title:rust (only applies to next term)\n- Term prefix: title:quick* (matches quickwit, quickstart)\n- Phrases: title:\"rust programming\"\n- Phrase slop (proximity): body:\"small bike\"~2\n- Phrase prefix: \"big bad wo\"* (matches 'big bad wolf')\n- Boolean: title:rust AND author:doe | OR | NOT (UPPERCASE required)\n- Must/must-not: +title:rust -author:smith\n- Grouping: (title:rust OR title:go) AND year:[2020 TO 2024]\n- Range (inclusive []): year:[2020 TO 2024]\n- Range (exclusive {}): score:{0 TO 100}\n- Range (comparison): age:>=18 or score:<100\n- Unbounded range: price:[10.0 TO *] or age:[* TO 30]\n- Set operator: status: IN [active pending review]\n- Boosting: title:rust^3 OR body:rust\n- Exists: author:* (matches docs where author field is set)\n- All docs: *\n- Date: created_at:>2024-01-01, created_at:[2024-01-01 TO 2024-12-31]\n- Escape specials: k8s\\.component\\.name:value (reserved: + ^ ` : { } \" [ ] ( ) ~ ! \\\\ * SPACE)\n- Field names: If a field name literally contains a dot, escape it (k8s\\.node) to avoid JSON nested access.\n\nFIELD TYPE IMPACT ON OPERATORS:\n- text: all operators (phrases, slop, prefix, IN set, boost, range, exists)\n- string/exact: exact match, prefix, IN set, exists (no phrases/slop)\n- numeric (i64/u64/f64): exact, comparisons (>, <), range [], {}, boost, exists (no phrases/IN)\n- date: exact, comparisons (>/</>=/<=), range, exists (no phrases/IN)\n- boolean: true/false only, exists (no range/boost)\n- ip: exact, range, exists (no phrases)\n- json: dot notation field.sub:value, nested exists field.sub:* (escape dots with \\\\)\n- facet: path /category/sub, exists\n\nORCHESTRATION TIP: If your query involves an exact document ID or a field marked with `shadow: true`, query it directly (e.g., `id:123`). This bypasses the search index for ultra-fast KV retrieval.",
+            "description": "Execute full-text search on a single CameoDB index. Query syntax supports field:value targeting, phrase queries (field:\"words\"), boolean operators (AND, OR, NOT), grouping with parentheses, range queries (field:[low TO high]), and date comparisons (field:>2024-01-01). \n\nCRITICAL ANTI-HALLUCINATION RULE FOR AGENTS:\nWhen answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.\n\nPRO TIPS FOR AGENTS:\n1. Use Tantivy boosting to improve relevance (e.g., 'title:rust^3 OR body:rust').\n2. The query string supports inline modifiers: 'return field1,field2' for field projection, 'limit N' for result count, and 'sort field:asc' or 'sort field:desc' for sorting.\n3. Field projection: when using the 'fields' parameter or inline 'return', fields appear in the response in the exact order specified. Metadata fields (like '_score') are always included automatically.\n4. Sorting: use inline 'sort field:asc' or 'sort field:desc' in the query string, or the 'sort' parameter on search_indexes. Supported sort field types: u64, i64, f64, date (FAST fields), and text/string (alphabetic post-fetch sort). Default order is ascending.\n5. If you receive a field error or do not know the available fields, run the 'get_index' tool first to view the schema.\n\nQUERY SYNTAX QUICK REFERENCE:\n- Terms: rust database (AND by default)\n- Field targeting: title:rust (only applies to next term)\n- Term prefix: title:quick* (matches quickwit, quickstart)\n- Phrases: title:\"rust programming\"\n- Phrase slop (proximity): body:\"small bike\"~2\n- Phrase prefix: \"big bad wo\"* (matches 'big bad wolf')\n- Boolean: title:rust AND author:doe | OR | NOT (UPPERCASE required)\n- Must/must-not: +title:rust -author:smith\n- Grouping: (title:rust OR title:go) AND year:[2020 TO 2024]\n- Range (inclusive []): year:[2020 TO 2024]\n- Range (exclusive {}): score:{0 TO 100}\n- Range (comparison): age:>=18 or score:<100\n- Unbounded range: price:[10.0 TO *] or age:[* TO 30]\n- Set operator: status: IN [active pending review]\n- Boosting: title:rust^3 OR body:rust\n- Exists: author:* (matches docs where author field is set)\n- All docs: *\n- Date: created_at:>2024-01-01, created_at:[2024-01-01 TO 2024-12-31]\n- Escape specials: k8s\\.component\\.name:value (reserved: + ^ ` : { } \" [ ] ( ) ~ ! \\\\ * SPACE)\n- Field names: If a field name literally contains a dot, escape it (k8s\\.node) to avoid JSON nested access.\n\nFIELD TYPE IMPACT ON OPERATORS:\n- text: all operators (phrases, slop, prefix, IN set, boost, range, exists)\n- string/exact: exact match, prefix, IN set, exists (no phrases/slop)\n- numeric (i64/u64/f64): exact, comparisons (>, <), range [], {}, boost, exists (no phrases/IN)\n- date: exact, comparisons (>/</>=/<=), range, exists (no phrases/IN)\n- boolean: true/false only, exists (no range/boost)\n- ip: exact, range, exists (no phrases)\n- json: dot notation field.sub:value, nested exists field.sub:* (escape dots with \\\\)\n- facet: path /category/sub, exists\n\nORCHESTRATION TIP: If your query involves an exact document ID or a field marked with `shadow: true`, query it directly (e.g., `id:123`). This bypasses the search index for ultra-fast KV retrieval.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -910,7 +916,7 @@ fn mcp_tools() -> Vec<JsonValue> {
                     },
                     "query": {
                         "type": "string",
-                        "description": "Search query string. Supports field:value, phrases, AND/OR/NOT, ranges, and inline 'return'/'limit' modifiers. Use 'limit 0' for count-only queries."
+                        "description": "Search query string. Supports field:value, phrases, AND/OR/NOT, ranges, and inline 'return'/'limit'/'sort' modifiers. Use 'limit 0' for count-only queries. Inline sort: 'sort field:asc' or 'sort field:desc'."
                     },
                     "limit": {
                         "type": "integer",
@@ -920,7 +926,7 @@ fn mcp_tools() -> Vec<JsonValue> {
                     "fields": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Field names to include in results (field projection)."
+                        "description": "Field names to include in results (field projection). Fields are returned in the exact order specified. Metadata fields (like '_score') are always included automatically."
                     }
                 },
                 "required": ["index", "query"]
@@ -933,7 +939,7 @@ fn mcp_tools() -> Vec<JsonValue> {
         json!({
             "name": "search_indexes",
             "title": "Federated Search",
-            "description": "Execute federated search across multiple CameoDB indexes with optional per-index field projection. Results are merged by relevance score. Each hit includes an '_index_source' field indicating its origin index.\n\nCRITICAL ANTI-HALLUCINATION RULE FOR AGENTS:\nWhen answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.\n\nUses the same query syntax as search_index (field:value, phrases, boolean operators, ranges, boosting, set IN, slop ~, prefix *, must +/-, grouping). If indexes have different schemas, the query applies to matching fields in each index.\n\nORCHESTRATION TIP: When federating across indexes, pay close attention to the `_index_source` field in your results. Use this to focus subsequent, deeper queries on a single index.",
+            "description": "Execute federated search across multiple CameoDB indexes with optional per-index field projection. Results are merged by relevance score (or by the sort field if specified). Each hit includes an '_index_source' field indicating its origin index. Searches execute concurrently across all specified indexes.\n\nCRITICAL ANTI-HALLUCINATION RULE FOR AGENTS:\nWhen answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.\n\nUses the same query syntax as search_index (field:value, phrases, boolean operators, ranges, boosting, set IN, slop ~, prefix *, must +/-, grouping). The query string also supports inline 'return field1,field2' for projection, 'limit N' for result count, and 'sort field:asc'/'sort field:desc' for sorting. Per-index 'fields' and 'sort' parameters take precedence over inline modifiers. If indexes have different schemas, the query applies to matching fields in each index.\n\nORCHESTRATION TIP: When federating across indexes, pay close attention to the `_index_source` field in your results. Use this to focus subsequent, deeper queries on a single index.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -950,20 +956,20 @@ fn mcp_tools() -> Vec<JsonValue> {
                                 "fields": {
                                     "type": "array",
                                     "items": { "type": "string" },
-                                    "description": "Fields to include from this index."
+                                    "description": "Fields to include from this index. Fields are returned in the exact order specified. Metadata fields (like '_score') are always included automatically."
                                 },
                                 "sort": {
                                     "type": "object",
-                                    "description": "Sort results by a FAST field within this index.",
+                                    "description": "Sort results by a field within this index. Supported types: u64, i64, f64, date (FAST fields), and text/string (alphabetic sort).",
                                     "properties": {
                                         "field": {
                                             "type": "string",
-                                            "description": "FAST field name to sort by."
+                                            "description": "Field name to sort by. Supports u64, i64, f64, date, and text/string fields."
                                         },
                                         "order": {
                                             "type": "string",
                                             "enum": ["asc", "desc"],
-                                            "description": "Sort order. Defaults to desc."
+                                            "description": "Sort order. Defaults to asc."
                                         }
                                     },
                                     "required": ["field"]
