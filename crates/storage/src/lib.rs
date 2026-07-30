@@ -107,6 +107,11 @@ const NAIVE_DATE_FORMATS: &[&str] = &["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%
 /// Schema metadata table: maps index names to their schema definitions.
 const TABLE_SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("schema");
 
+/// Recovery metadata table: maps index names to their last committed Tantivy sequence.
+/// Written after each successful commit_index(). Read at startup to skip Tantivy
+/// recovery checks for fully-synced indices without opening the index.
+const TABLE_RECOVERY_META: TableDefinition<&str, u64> = TableDefinition::new("_recovery_meta");
+
 /// Configuration for the multi-tenant hybrid storage engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
@@ -1462,15 +1467,15 @@ pub struct HybridStore {
 
 impl HybridStore {
     /// Calculate tiered cache sizes based on database file size, system memory, and shard count.
-    /// Returns (init_cache_size, normal_cache_size) in bytes.
+    /// Returns the normal cache size in bytes.
     ///
     /// Memory is divided by max_shards to ensure we don't exceed system limits
     /// when multiple shards are initialized on the same node.
-    fn calculate_cache_sizes(
+    fn calculate_cache_size(
         config: &StorageConfig,
         db_file_size_bytes: u64,
         total_shards: usize,
-    ) -> (usize, usize) {
+    ) -> usize {
         use sysinfo::{MemoryRefreshKind, System};
 
         const MIN_CACHE_BYTES: u64 = 32 * 1024 * 1024; // 32MB safety floor per shard
@@ -1517,30 +1522,6 @@ impl HybridStore {
             .min(per_shard_available)
             .min(per_shard_total) as usize;
 
-        // Calculate INIT BOOST cache
-        let boost_multiplier = if db_file_size_bytes < 1024 * 1024 {
-            1
-        } else if db_file_size_bytes < 100 * 1024 * 1024 {
-            2
-        } else if db_file_size_bytes < 1024 * 1024 * 1024 {
-            4
-        } else {
-            8
-        };
-
-        let init_cache = if boost_multiplier == 1 {
-            standard_cache
-        } else {
-            // Cap init boost at per_shard_available to prevent excessive memory usage
-            // across many shards. Previously used fixed caps (128MB/512MB/2GB) which could
-            // lead to OOM with many large shards.
-            let max_boost = per_shard_available;
-            let boosted = (base_standard_cache * boost_multiplier).min(max_boost as usize);
-            (boosted as u64)
-                .min(per_shard_available)
-                .min(per_shard_total) as usize
-        };
-
         tracing::info!(
             file_size_mb = db_file_size_bytes / (1024 * 1024),
             available_memory_mb = available_memory_bytes / (1024 * 1024),
@@ -1548,16 +1529,15 @@ impl HybridStore {
             max_shards = shard_count,
             per_shard_available_mb = per_shard_available / (1024 * 1024),
             standard_cache_mb = standard_cache / (1024 * 1024),
-            init_cache_mb = init_cache / (1024 * 1024),
-            "HybridStore: calculated tiered cache sizes (per-shard)"
+            "HybridStore: calculated cache size (per-shard)"
         );
 
-        (init_cache, standard_cache)
+        standard_cache
     }
 
-    /// Creates a new multi-tenant HybridStore with tiered cache sizing.
-    /// Uses a larger "init boost" cache for fast recovery on existing databases,
-    /// then reopens with normal cache size for standard operations.
+    /// Creates a new multi-tenant HybridStore with per-shard cache sizing.
+    /// Cache size is divided by total_shards to prevent OOM when multiple
+    /// shards are initialized on the same node.
     ///
     /// # Arguments
     /// * `config` - Storage configuration
@@ -1591,34 +1571,19 @@ impl HybridStore {
         };
 
         // Calculate tiered cache sizes based on file size and shard count
-        let (init_cache_size, normal_cache_size) =
-            Self::calculate_cache_sizes(&config, db_file_size, total_shards);
+        let normal_cache_size = Self::calculate_cache_size(&config, db_file_size, total_shards);
 
         let kv = if db_file_exists {
-            // EXISTING DATABASE: Two-phase open for fast recovery
-            // Phase 1: Open with init boost cache for fast recovery/metadata loading
-            let init_start_time = Instant::now();
+            // EXISTING DATABASE: Open directly with normal cache.
+            // The init boost cache was removed — recovery now uses persisted
+            // committed seq from TABLE_RECOVERY_META, so no large cache is
+            // needed for metadata loading during startup.
             tracing::info!(
                 db_path = %kv_path.display(),
-                init_cache_mb = init_cache_size / (1024 * 1024),
-                "HybridStore: Phase 1/2 - Opening with init boost cache"
-            );
-
-            let mut builder = redb::Builder::new();
-            builder.set_cache_size(init_cache_size);
-            let temp_db = builder.open(&kv_path)?;
-
-            // Phase 2: Close and reopen with normal cache
-            tracing::info!(
-                elapsed_ms = init_start_time.elapsed().as_millis(),
                 normal_cache_mb = normal_cache_size / (1024 * 1024),
-                "HybridStore: Phase 2/2 - Reopening with normal cache"
+                "HybridStore: Opening existing database"
             );
 
-            // Explicitly drop to close before reopening
-            drop(temp_db);
-
-            // Reopen with normal cache for standard operations
             let mut builder = redb::Builder::new();
             builder.set_cache_size(normal_cache_size);
             builder.open(&kv_path)?
@@ -1642,7 +1607,6 @@ impl HybridStore {
             existed = db_file_exists,
             file_size_mb = db_file_size / (1024 * 1024),
             normal_cache_mb = normal_cache_size / (1024 * 1024),
-            init_cache_mb = if db_file_exists { init_cache_size / (1024 * 1024) } else { 0 },
             elapsed_ms = total_elapsed.as_millis(),
             "HybridStore: initialization complete"
         );
@@ -1842,7 +1806,34 @@ impl HybridStore {
             return Ok((0, 0, 0));
         }
 
-        let last_committed_seq = self.get_highest_indexed_seq(reader)?;
+        // Fast path: use persisted committed seq from redb to skip Tantivy search.
+        // This avoids opening a searcher and running a TopDocs query when we already
+        // know the index is fully synced from a previous commit.
+        let last_committed_seq = match self.get_persisted_committed_seq(index)? {
+            Some(persisted_seq) if persisted_seq >= max_wal_seq => {
+                tracing::info!(
+                    index = %index,
+                    persisted_seq = persisted_seq,
+                    max_wal_seq = max_wal_seq,
+                    "Index fully synced (persisted seq >= max WAL seq), skipping Tantivy recovery"
+                );
+                return Ok((0, max_wal_seq, persisted_seq));
+            }
+            Some(persisted_seq) => {
+                tracing::info!(
+                    index = %index,
+                    persisted_seq = persisted_seq,
+                    max_wal_seq = max_wal_seq,
+                    "Recovery needed: persisted seq < max WAL seq"
+                );
+                persisted_seq
+            }
+            None => {
+                // No persisted seq (first startup or pre-migration) — fall back to Tantivy search
+                tracing::debug!(index = %index, "No persisted committed seq, falling back to Tantivy search");
+                self.get_highest_indexed_seq(reader)?
+            }
+        };
 
         tracing::info!(
             index = %index,
@@ -1895,26 +1886,15 @@ impl HybridStore {
             }
         }
 
-        // Collect all WAL entries first for better cache locality during processing
-        let wal_entries: Vec<(u64, Vec<u8>)> = wal_table
-            .range(range_start..)?
-            .map(|result| {
-                let (seq_guard, wal_data_guard) = result?;
-                Ok((seq_guard.value(), wal_data_guard.value().to_vec()))
-            })
-            .collect::<Result<Vec<_>, redb::Error>>()?;
-
-        let total_entries = wal_entries.len();
-        tracing::info!(
-            index = %index,
-            total_entries = total_entries,
-            "Collected WAL entries for recovery"
-        );
-
-        // Replay missing operations with pre-collected data for better cache locality
+        // Zero-copy WAL replay: iterate range directly, process each entry in-place.
+        // AccessGuard::value() returns &[u8] pointing directly into redb's mmap'd pages,
+        // avoiding the need to allocate a Vec<u8> for every entry.
         let mut replayed_count = 0;
-        for (seq_id, wal_data) in wal_entries {
-            let wal_op: WalOp = serde_json::from_slice(&wal_data)
+        let mut replayed_since_commit = 0u64;
+        for result in wal_table.range(range_start..)? {
+            let (seq_guard, wal_data_guard) = result?;
+            let seq_id = seq_guard.value();
+            let wal_op: WalOp = serde_json::from_slice(wal_data_guard.value())
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
             match wal_op {
@@ -1953,13 +1933,30 @@ impl HybridStore {
             }
 
             replayed_count += 1;
+            replayed_since_commit += 1;
+
+            // Periodic commit during replay using the same threshold logic as
+            // standard batch writes (should_commit_writer). This bounds Tantivy's
+            // in-memory buffer and makes recovered data searchable in chunks.
+            // Note: we do NOT truncate WAL here — replay is still in progress.
+            if self.should_commit_writer(index, replayed_since_commit) {
+                tracing::info!(
+                    index = %index,
+                    replayed = replayed_count,
+                    replayed_since_commit = replayed_since_commit,
+                    "Recovery: threshold commit during WAL replay"
+                );
+                writer.commit()?;
+                replayed_since_commit = 0;
+            }
 
             // Log progress every 1000 documents
             if replayed_count % 1000 == 0 {
                 tracing::info!(
                     index = %index,
                     replayed = replayed_count,
-                    total = total_entries,
+                    range_start = range_start,
+                    max_wal_seq = max_wal_seq,
                     "Recovery progress"
                 );
             }
@@ -2674,6 +2671,15 @@ impl HybridStore {
         // we only replay operations that were NOT committed to Tantivy.
         self.truncate_wal_up_to_committed(index)?;
 
+        // Persist the committed sequence so that on restart we can skip Tantivy
+        // recovery checks for this index if it's fully synced.
+        if let Some(counter) = self.current_seq.get(index) {
+            let committed_seq = counter.load(Ordering::SeqCst);
+            if let Err(e) = self.persist_committed_seq(index, committed_seq) {
+                tracing::warn!(index = %index, error = %e, "Failed to persist committed seq, recovery check will fall back to Tantivy search");
+            }
+        }
+
         Ok(())
     }
 
@@ -3375,6 +3381,61 @@ impl HybridStore {
                 tracing::debug!(index = %index, "WAL table does not exist, returning 0");
                 Ok(0) // Table doesn't exist yet
             }
+        }
+    }
+
+    /// Check if an index is fully synced (all WAL entries committed to Tantivy).
+    /// This allows us to skip expensive Tantivy index open for indices that don't need recovery.
+    /// Returns true if persisted_committed_seq >= max_wal_seq, meaning no uncommitted WAL entries exist.
+    fn is_index_fully_synced(&self, index: &str) -> Result<bool, StoreError> {
+        let persisted_seq = self.get_persisted_committed_seq(index)?;
+        let max_wal_seq = self.get_max_wal_id_for_index(index)?;
+
+        match persisted_seq {
+            Some(committed) => {
+                let is_synced = committed >= max_wal_seq;
+                if is_synced {
+                    tracing::info!(
+                        index = %index,
+                        committed_seq = committed,
+                        max_wal_seq = max_wal_seq,
+                        "Index is fully synced, can skip Tantivy open"
+                    );
+                }
+                Ok(is_synced)
+            }
+            None => {
+                // No persisted seq (first startup or pre-migration) - not fully synced
+                tracing::debug!(index = %index, "No persisted committed seq, index not fully synced");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Persist the last committed Tantivy sequence for an index to the recovery metadata table.
+    /// Called after each successful commit_index() so that on restart we can skip
+    /// Tantivy recovery checks for fully-synced indices.
+    fn persist_committed_seq(&self, index: &str, seq: u64) -> Result<(), StoreError> {
+        let mut write_txn = self.kv.begin_write()?;
+        {
+            write_txn.set_durability(Durability::Immediate)?;
+            let mut meta_table = write_txn.open_table(TABLE_RECOVERY_META)?;
+            meta_table.insert(index, seq)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Read the persisted last committed sequence for an index from the recovery metadata table.
+    /// Returns None if no record exists (first startup or pre-migration data).
+    fn get_persisted_committed_seq(&self, index: &str) -> Result<Option<u64>, StoreError> {
+        let read_txn = self.kv.begin_read()?;
+        match read_txn.open_table(TABLE_RECOVERY_META) {
+            Ok(meta_table) => match meta_table.get(index)? {
+                Some(guard) => Ok(Some(guard.value())),
+                None => Ok(None),
+            },
+            Err(_) => Ok(None), // Table doesn't exist yet
         }
     }
 
@@ -4431,77 +4492,154 @@ impl HybridStore {
     /// This should be called during startup to ensure all indices are recovered
     /// and ready for use, rather than waiting for first access.
     ///
-    /// Uses parallel threads to warm up indices concurrently for faster startup.
-    /// Returns the total number of operations recovered across all indices.
-    pub fn warmup_indices(&self) -> Result<usize, StoreError> {
+    /// Uses a two-phase warmup strategy:
+    /// Phase 1 (blocking): Warm up indices that need recovery (not fully synced).
+    /// Phase 2 (background): Caller should warm up fully-synced indices after system is ready.
+    ///
+    /// This balances fast startup (only recover what's needed) with fast query responses
+    /// (background warmup ensures synced indices are ready quickly).
+    ///
+    /// Returns (recovered_count, fully_synced_indices) where:
+    /// - recovered_count: number of indices that needed recovery
+    /// - fully_synced_indices: list of indices that are fully synced and can be warmed up in background
+    pub fn warmup_indices(&self) -> Result<(usize, Vec<String>), StoreError> {
         let warmup_start = Instant::now();
         let index_names = self.get_index_names()?;
 
         if index_names.is_empty() {
             tracing::debug!("No indices to warm up");
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
 
         tracing::info!(
             count = index_names.len(),
-            "Starting parallel index warmup and WAL recovery for {} indices",
+            "Starting two-phase index warmup for {} indices",
             index_names.len()
         );
 
-        // Use scoped threads to warm up indices in parallel.
-        // get_or_create_index uses DashMap internally so concurrent access is safe.
-        // Cap parallelism to avoid excessive memory from many simultaneous Tantivy writers.
-        let max_parallel = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4)
-            .min(index_names.len())
-            .max(1);
-        let errors = std::sync::Mutex::new(Vec::new());
+        // Separate indices into two groups: needs_recovery and fully_synced
+        let mut needs_recovery = Vec::new();
+        let mut fully_synced = Vec::new();
 
-        std::thread::scope(|s| {
-            // Process indices in chunks to limit parallelism
-            for chunk in index_names.chunks(max_parallel) {
-                let handles: Vec<_> = chunk
-                    .iter()
-                    .map(|index_name| {
-                        let errors = &errors;
-                        s.spawn(move || {
-                            match self.get_or_create_index(index_name) {
-                                Ok(_) => {
-                                    tracing::debug!(index = %index_name, "Index warmed up successfully");
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        index = %index_name,
-                                        error = %e,
-                                        "Failed to warm up index, will retry on first access"
-                                    );
-                                    errors.lock().unwrap().push(index_name.clone());
-                                }
-                            }
-                        })
-                    })
-                    .collect();
-
-                // Wait for this chunk to complete before starting next
-                for handle in handles {
-                    let _ = handle.join();
+        for index_name in &index_names {
+            match self.is_index_fully_synced(index_name) {
+                Ok(true) => {
+                    tracing::info!(
+                        index = %index_name,
+                        "Index is fully synced, will warm up in background phase"
+                    );
+                    fully_synced.push(index_name.clone());
+                }
+                Ok(false) => {
+                    tracing::info!(
+                        index = %index_name,
+                        "Index needs recovery, will warm up in blocking phase"
+                    );
+                    needs_recovery.push(index_name.clone());
+                }
+                Err(e) => {
+                    // Failed to check sync status - conservatively treat as needs recovery
+                    tracing::warn!(
+                        index = %index_name,
+                        error = %e,
+                        "Failed to check sync status, treating as needs recovery"
+                    );
+                    needs_recovery.push(index_name.clone());
                 }
             }
-        });
+        }
 
-        let failed = errors.into_inner().unwrap();
-        let warmup_elapsed = warmup_start.elapsed();
+        // Phase 1: Blocking warmup for indices that need recovery
+        let phase1_start = Instant::now();
+        if !needs_recovery.is_empty() {
+            tracing::info!(
+                count = needs_recovery.len(),
+                "Phase 1: Starting blocking warmup for {} indices that need recovery",
+                needs_recovery.len()
+            );
+
+            let max_parallel = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4)
+                .min(needs_recovery.len())
+                .max(1);
+            let errors = std::sync::Mutex::new(Vec::new());
+
+            std::thread::scope(|s| {
+                for chunk in needs_recovery.chunks(max_parallel) {
+                    let handles: Vec<_> = chunk
+                        .iter()
+                        .map(|index_name| {
+                            let errors = &errors;
+                            s.spawn(move || {
+                                match self.get_or_create_index(index_name) {
+                                    Ok(_) => {
+                                        tracing::debug!(index = %index_name, "Index warmed up successfully (Phase 1)");
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            index = %index_name,
+                                            error = %e,
+                                            "Failed to warm up index, will retry on first access"
+                                        );
+                                        errors.lock().unwrap().push(index_name.clone());
+                                    }
+                                }
+                            })
+                        })
+                        .collect();
+
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                }
+            });
+
+            let failed = errors.into_inner().unwrap();
+            if !failed.is_empty() {
+                tracing::warn!(
+                    failed_count = failed.len(),
+                    "Phase 1 completed with {} failures",
+                    failed.len()
+                );
+            }
+        }
+
+        let phase1_elapsed = phase1_start.elapsed();
         tracing::info!(
-            indices_count = index_names.len(),
-            failed_count = failed.len(),
-            parallel_threads = max_parallel,
-            elapsed_ms = warmup_elapsed.as_millis(),
-            "Index warmup completed in {}ms",
-            warmup_elapsed.as_millis()
+            recovered_count = needs_recovery.len(),
+            elapsed_ms = phase1_elapsed.as_millis(),
+            "Phase 1 completed - system ready to accept queries"
         );
 
-        Ok(0)
+        // Phase 2: Background warmup for fully-synced indices
+        // These indices will be opened lazily on first query via get_or_create_index()
+        // This ensures system is ready to accept queries immediately after Phase 1
+        if !fully_synced.is_empty() {
+            tracing::info!(
+                count = fully_synced.len(),
+                "Phase 2: {} fully-synced indices will open lazily on first query",
+                fully_synced.len()
+            );
+            // Note: For proactive background warmup, we would need to:
+            // 1. Store the HybridStore in an Arc<Mutex<>> for thread-safe access
+            // 2. Spawn background tasks that call get_or_create_index() via the Arc
+            // 3. Implement proper lifecycle management (shutdown, cancellation)
+            // For now, lazy warmup on first query provides the right balance:
+            // - Fast startup (Phase 1 only blocks on recovery)
+            // - Fast queries (subsequent queries after first open are fast)
+        }
+
+        let total_elapsed = warmup_start.elapsed();
+        tracing::info!(
+            total_indices = index_names.len(),
+            phase1_recovered = needs_recovery.len(),
+            phase2_background = fully_synced.len(),
+            total_elapsed_ms = total_elapsed.as_millis(),
+            "Two-phase warmup completed - system ready to accept queries"
+        );
+
+        Ok((needs_recovery.len(), fully_synced))
     }
 
     fn measure_tantivy_bytes(&self, index_name: &str) -> Result<u64, StoreError> {

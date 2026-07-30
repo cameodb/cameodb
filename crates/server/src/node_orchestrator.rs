@@ -1746,14 +1746,66 @@ impl MicroshardActor {
         self.store = Some(store_arc.clone());
 
         // Warm up indices in the background to avoid blocking server startup.
+        // Uses two-phase warmup: Phase 1 (blocking) recovers indices that need it,
+        // Phase 2 (background) warms up fully-synced indices after system is ready.
         // Indices have lazy initialization (get_or_create_index) so any request
         // arriving before warmup completes will still work — it just triggers
         // on-demand initialization for that specific index.
         let warmup_store = Arc::clone(&store_arc);
         let shard_id = self.shard_id;
         tokio::task::spawn_blocking(move || match warmup_store.warmup_indices() {
-            Ok(_) => {
-                info!(shard_id = %shard_id, "Index warmup and WAL recovery completed");
+            Ok((recovered_count, fully_synced_indices)) => {
+                info!(
+                    shard_id = %shard_id,
+                    recovered_count = recovered_count,
+                    fully_synced_count = fully_synced_indices.len(),
+                    "Phase 1 warmup completed - system ready to accept queries"
+                );
+
+                // Phase 2: Spawn background warmup for fully-synced indices
+                if !fully_synced_indices.is_empty() {
+                    let bg_store = Arc::clone(&warmup_store);
+                    let bg_shard_id = shard_id;
+                    std::thread::spawn(move || {
+                        let bg_start = std::time::Instant::now();
+                        info!(
+                            shard_id = %bg_shard_id,
+                            count = fully_synced_indices.len(),
+                            "Phase 2: Starting background warmup for {} fully-synced indices",
+                            fully_synced_indices.len()
+                        );
+
+                        let mut warmed_count = 0;
+                        for index_name in fully_synced_indices {
+                            match bg_store.get_or_create_index(&index_name) {
+                                Ok(_) => {
+                                    warmed_count += 1;
+                                    debug!(
+                                        shard_id = %bg_shard_id,
+                                        index = %index_name,
+                                        "Background warmup: index opened successfully"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        shard_id = %bg_shard_id,
+                                        index = %index_name,
+                                        error = %e,
+                                        "Background warmup: failed to open index, will retry on first query"
+                                    );
+                                }
+                            }
+                        }
+
+                        let bg_elapsed = bg_start.elapsed();
+                        info!(
+                            shard_id = %bg_shard_id,
+                            warmed_count = warmed_count,
+                            elapsed_ms = bg_elapsed.as_millis(),
+                            "Phase 2 background warmup completed"
+                        );
+                    });
+                }
             }
             Err(e) => {
                 warn!(shard_id = %shard_id, error = %e, "Index warmup encountered errors, indices will recover on first access");
