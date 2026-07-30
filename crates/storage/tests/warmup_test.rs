@@ -239,17 +239,29 @@ fn warmup_plan_is_ordered_smallest_first() {
     );
 }
 
-/// New segments produced after warmup are warmed automatically, because the warmer is
-/// registered on the reader and runs on every new searcher generation. Without that, a
-/// long-running node would go cold again as commits and merges produce fresh segments.
+/// A commit publishes a new segment and a new searcher generation, which discards the
+/// per-field caches the previous generation had warmed. Re-warming must therefore do real
+/// work again — a warm that skipped the new generation would leave a write-active index
+/// permanently cold. In the server this re-warm is driven by the shard's warmup thread,
+/// which the writer thread notifies after each commit.
 #[test]
-fn segments_committed_after_warmup_stay_searchable() {
+fn commit_invalidates_warmup_and_rewarm_restores_it() {
     let temp_dir = TempDir::new().expect("temp dir");
     let index = "growing";
 
     let store = open_store(temp_dir.path());
     seed_index(&store, index, 20);
-    store.warm_index(index).expect("warm_index");
+
+    let first = store.warm_index(index).expect("warm_index").expect("stats");
+    assert!(first.segments_warmed > 0, "first warm must do work");
+
+    // Re-warming the same generation is free.
+    let repeat = store.warm_index(index).expect("warm_index").expect("stats");
+    assert_eq!(
+        repeat.segments_warmed, 0,
+        "an unchanged generation must not be re-warmed"
+    );
+
     assert_eq!(
         store
             .search_documents(index, "*", 0, None)
@@ -258,8 +270,7 @@ fn segments_committed_after_warmup_stay_searchable() {
         20
     );
 
-    // A second batch creates a new segment on commit; the reader reloads and the warmer
-    // runs against the new generation.
+    // A second batch creates a new segment on commit, replacing the searcher generation.
     let ops: Vec<WalOp> = (21..=40)
         .map(|id| WalOp::Put {
             id: format!("doc-{id}"),
@@ -269,6 +280,7 @@ fn segments_committed_after_warmup_stay_searchable() {
     store.apply_batch(index, ops).expect("apply_batch");
     store.commit_index(index).expect("commit");
 
+    // Data is visible regardless of warmup — warmup is latency, not correctness.
     assert_eq!(
         store
             .search_documents(index, "*", 0, None)
@@ -277,5 +289,12 @@ fn segments_committed_after_warmup_stay_searchable() {
         40,
         "documents from the new segment must be visible"
     );
+
+    let after_commit = store.warm_index(index).expect("warm_index").expect("stats");
+    assert!(
+        after_commit.segments_warmed > 0,
+        "the post-commit generation must be warmed, not skipped as already warm"
+    );
+    assert_eq!(after_commit.num_docs, 40);
     assert!(store.is_index_warm(index));
 }

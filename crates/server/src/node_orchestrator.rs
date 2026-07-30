@@ -30,10 +30,13 @@
 //!   worker → read pool → back. Deliberately unpinned: reads leave the writer's core so
 //!   they cannot compete with it, which is why the hash-space alignment between worker and
 //!   writer cores applies to the write path only.
+//! - **`warmup-shard-<id>`** — one per shard. Runs startup warmup, then serves re-warm
+//!   requests posted by the writer thread after each commit. Never on a request path.
 //! - **tantivy, per open index** — `indexer_num_threads` + `merge_num_threads` per
-//!   `IndexWriter`, plus one `tantivy-warm-gc` thread per `IndexReader` that has warmers
-//!   registered (see `SegmentWarmer`). Thread count therefore scales with the number of
-//!   *open* indices, not just shards.
+//!   `IndexWriter`. Thread count therefore scales with the number of *open* indices, not
+//!   just shards. No warming threads: warming is driven explicitly from the shard's warmup
+//!   thread rather than through a registered tantivy `Warmer`, which would both run on the
+//!   writer thread inside `reload()` and add a GC thread per open index.
 //!
 //! Note that `core_affinity::set_for_current` is a no-op on macOS, so every pinning path
 //! here degrades to unpinned threads on that platform and only takes effect on Linux.
@@ -88,6 +91,13 @@ const SCHEMA_SAMPLE_LIMIT: usize = 200;
 /// Channel capacity for per-shard dedicated writer threads.
 /// Each MicroshardActor sends StorageCommands through this bounded channel.
 const SHARD_WRITER_CHANNEL_CAPACITY: usize = 1024;
+
+/// Capacity of the writer → warmup-thread re-warm request channel.
+///
+/// Small on purpose. Requests are posted with `try_send` and dropped when full, and a dropped
+/// request costs nothing: the index warms on its next commit or on its first query. A deep
+/// queue would only accumulate stale requests for generations that have already been replaced.
+const WARM_REQUEST_CAPACITY: usize = 64;
 
 /// Channel capacity for the orchestrator worker pool job queue.
 /// Quadruple the shard writer capacity to allow more buffering of incoming requests
@@ -1800,6 +1810,13 @@ impl MicroshardActor {
         //
         // Neither phase blocks `start()`. Requests are served throughout via lazy
         // initialization; the phases only determine whether that work has already been done.
+        //
+        // After startup the same thread keeps serving re-warm requests: the writer thread
+        // posts an index name here after each commit, so the segment a commit just published
+        // gets warmed without doing that work on the write hot path. The channel is bounded
+        // and posted to with `try_send`, making re-warming strictly best-effort — a full
+        // channel drops the request rather than ever stalling a write.
+        let (warm_tx, warm_rx) = std::sync::mpsc::sync_channel::<String>(WARM_REQUEST_CAPACITY);
         let warmup_store = Arc::clone(&store_arc);
         let shard_id = self.shard_id;
         tokio::task::spawn_blocking(move || {
@@ -1823,24 +1840,40 @@ impl MicroshardActor {
                 "Phase 1 complete - shard is queryable"
             );
 
-            if plan.pending_warmup.is_empty() {
-                return;
-            }
-
-            // One warmup thread per shard. With N shards that is already N-way parallelism
-            // against the same disk, so warming a shard's indices sequentially keeps the IO
-            // pattern sane instead of turning startup into a seek storm.
+            // One warmup thread per shard, for startup warmup and then for post-commit
+            // re-warms. With N shards that is already N-way parallelism against the same
+            // disk, so warming a shard's indices sequentially keeps the IO pattern sane
+            // instead of turning startup into a seek storm.
             let spawned = std::thread::Builder::new()
                 .name(format!("warmup-shard-{shard_id}"))
                 .spawn(move || {
-                    let requested = plan.pending_warmup.len();
-                    let warmed = warmup_store.warm_indices(&plan.pending_warmup);
-                    info!(
-                        shard_id = %shard_id,
-                        warmed = warmed,
-                        requested = requested,
-                        "Phase 2 complete - index readers warmed"
-                    );
+                    if !plan.pending_warmup.is_empty() {
+                        let requested = plan.pending_warmup.len();
+                        let warmed = warmup_store.warm_indices(&plan.pending_warmup);
+                        info!(
+                            shard_id = %shard_id,
+                            warmed = warmed,
+                            requested = requested,
+                            "Phase 2 complete - index readers warmed"
+                        );
+                    }
+
+                    // Serve re-warm requests until the writer thread drops its sender, which
+                    // happens when the shard shuts down. `warm_index` skips a searcher
+                    // generation it has already warmed, so bursts of commits on one index
+                    // collapse into a single warm.
+                    while let Ok(index) = warm_rx.recv() {
+                        if let Err(e) = warmup_store.warm_index(&index) {
+                            debug!(
+                                shard_id = %shard_id,
+                                index = %index,
+                                error = %e,
+                                "Post-commit warm failed; queries will warm this index on demand"
+                            );
+                        }
+                    }
+
+                    debug!(shard_id = %shard_id, "Warmup thread stopped");
                 });
 
             if let Err(e) = spawned {
@@ -1948,6 +1981,10 @@ impl MicroshardActor {
                     let mut evictions: Vec<(String, tokio::sync::oneshot::Sender<bool>)> = Vec::new();
                     let mut deletions: Vec<DeleteCommand> = Vec::new();
                     let mut should_shutdown = false;
+                    // Indices whose Tantivy commit published a new segment this iteration.
+                    // Collected rather than posted inline so a burst that commits the same
+                    // index several times results in one re-warm request.
+                    let mut committed_indices: HashSet<String> = HashSet::new();
 
                     for cmd in pending_cmds.drain(..) {
                         match cmd {
@@ -1981,7 +2018,10 @@ impl MicroshardActor {
                             let (op, reply) = writes.pop().unwrap();
                             let res = writer_store.apply_write_and_maybe_commit(index, op);
                             match &res {
-                                Ok((_, true)) => tracing::info!(index = %index, "Writer: threshold commit after write"),
+                                Ok((_, true)) => {
+                                    tracing::info!(index = %index, "Writer: threshold commit after write");
+                                    committed_indices.insert(index.clone());
+                                }
                                 Ok((_, false)) => {}
                                 Err(e) => tracing::error!(index = %index, error = %e, "Writer: write failed"),
                             }
@@ -2000,6 +2040,7 @@ impl MicroshardActor {
                                             coalesced = coalesced_count,
                                             "Writer: threshold commit after coalesced writes"
                                         );
+                                        committed_indices.insert(index.clone());
                                     }
                                     tracing::debug!(
                                         index = %index,
@@ -2038,7 +2079,10 @@ impl MicroshardActor {
                             let (ops, reply) = batches.into_iter().next().unwrap();
                             let res = writer_store.apply_batch_and_maybe_commit(&index, ops);
                             match &res {
-                                Ok((_, true)) => tracing::info!(index = %index, "Writer: threshold commit after batch write"),
+                                Ok((_, true)) => {
+                                    tracing::info!(index = %index, "Writer: threshold commit after batch write");
+                                    committed_indices.insert(index.clone());
+                                }
                                 Ok((_, false)) => {}
                                 Err(e) => tracing::error!(index = %index, error = %e, "Writer: batch write failed"),
                             }
@@ -2066,6 +2110,7 @@ impl MicroshardActor {
                                             total_ops = total_ops,
                                             "Writer: threshold commit after coalesced batch writes"
                                         );
+                                        committed_indices.insert(index.clone());
                                     }
                                     tracing::debug!(
                                         index = %index,
@@ -2119,6 +2164,9 @@ impl MicroshardActor {
                     // Phase 5: Process commits after all writes are applied
                     for (index, reply) in commits {
                         let res = writer_store.commit_index(&index);
+                        if res.is_ok() {
+                            committed_indices.insert(index.clone());
+                        }
                         let _ = reply.send(res);
                     }
 
@@ -2141,6 +2189,18 @@ impl MicroshardActor {
                             Err(e) => warn!(index = %index, error = %e, "Index deletion failed"),
                         }
                         let _ = reply.send(res);
+                    }
+
+                    // Phase 5d: Ask the warmup thread to re-warm the indices we just
+                    // committed. A commit publishes a new segment and replaces the searcher
+                    // generation, which discards the per-field caches the previous generation
+                    // had warmed. `try_send` keeps this strictly best-effort: if the warmup
+                    // thread is behind, the request is dropped rather than stalling writes,
+                    // and those indices simply warm on their next commit or first query.
+                    for index in committed_indices.drain() {
+                        if warm_tx.try_send(index).is_err() {
+                            tracing::trace!("Warm request dropped; warmup thread busy or stopped");
+                        }
                     }
 
                     // Phase 6: Handle shutdown after draining all pending work
