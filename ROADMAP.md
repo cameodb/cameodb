@@ -197,11 +197,11 @@ This document outlines the current development priorities and optimization roadm
    - Provide schema documentation as resources
    - Enable agents to discover available datasets dynamically
 
-7. **Security & Access Control** 📋 PLANNED
-   - Optional index-level access restrictions
-   - Query complexity limits (prevent resource exhaustion)
-   - Rate limiting for agent requests
-   - Audit logging for MCP tool invocations
+7. **Security & Access Control** ➡️ MOVED to Phase 14
+   - Authentication, authorization, TLS, and hardening are tracked as a dedicated
+     security project — see **Phase 14: Security Hardening** below.
+   - MCP-specific security (rate limiting, query complexity, audit logging) is
+     covered under Phase 14 Stage C once the core auth layer exists.
 
 8. **Documentation & Examples** 📋 PLANNED
    - MCP server setup guide
@@ -418,5 +418,119 @@ HTTP req on axum tokio worker (any core)
 - Clean rollback path via config flags at each stage
 - Memory module independently testable with unit tests
 - Auto-purge prevents RSS creep under sustained writes
+
+---
+
+## Phase 14: Security Hardening 🔒 PLANNED
+
+**Objective**: Close the security gaps identified in the code security review (2026-07-30). Currently CameoDB has **no authentication, no authorization, no TLS, permissive CORS, and unvalidated index names** reaching the filesystem. This phase turns CameoDB from a trusted-LAN-only system into one that can be safely exposed to untrusted networks.
+
+**Current state (verified by audit):**
+- ✅ No hardcoded secrets, no command execution, no regex/ReDoS surface, no SSRF
+- ✅ libp2p cluster transport already uses Noise encryption
+- ⚠️ All HTTP/MCP endpoints unauthenticated (write, delete, admin included)
+- ⚠️ Index name flows unvalidated into `shard_path.join("indices").join(index)` → path traversal → arbitrary directory delete via `DELETE /api/..%2f..`
+- ⚠️ `CorsLayer::permissive()` hardcoded; configured `cors_allowed_origins` never wired
+- ⚠️ No TLS on HTTP; default bind `0.0.0.0:9480`
+- ⚠️ No cluster join authentication (any reachable node can join)
+- ⚠️ No rate limiting / concurrency caps; 576MB default body limit + decompression layer = memory DoS vector
+- ⚠️ `CAMEODB_ACCEPT_INVALID_CERTS` presence-check disables TLS validation globally in the client
+
+### Execution Order (impact-per-effort ranked)
+
+| Order | Stage | Effort | Impact | Risk if unfixed |
+|-------|-------|--------|--------|-----------------|
+| **1** | A1: Index name validation | ~1 day | Critical | Arbitrary dir deletion (RCE-adjacent) |
+| **2** | A2: CORS config wiring | ~2 hrs | High | Drive-by browser attacks on local instances |
+| **3** | A3: `ACCEPT_INVALID_CERTS` value check | ~30 min | Medium | Accidental TLS bypass |
+| **4** | A4: Body limits + concurrency caps | ~1 day | High | Memory DoS / decompression bomb |
+| **5** | A5: CI security tooling (`cargo audit`, `cargo deny`) | ~2 hrs | Medium | Silent vulnerable deps |
+| **6** | B1: API key authentication | ~3–5 days | Critical | Full unauthenticated R/W/D access |
+| **7** | B2: HTTPS/TLS via rustls | ~2–3 days | High | Traffic interception |
+| **8** | B3: Cluster join secret (PSK) | ~2–3 days | High | Rogue node data access |
+| **9** | C1: MCP rate limiting + query complexity | ~2 days | Medium | Agent-driven resource exhaustion |
+| **10** | C2: Audit logging | ~2 days | Medium | No forensic trail |
+| **11** | C3: Index-level authorization (RBAC) | ~5+ days | Medium | Multi-tenant isolation |
+
+### Stage A: Quick Wins (no protocol changes)
+
+**A1 — Index Name Validation** 🔴 CRITICAL
+- Add `validate_index_name()` at the HTTP boundary (`http_server.rs`) AND defense-in-depth at the storage boundary (`storage/src/lib.rs`)
+- Rules: `^[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,254}$`, reject `..` segments, reject absolute paths, reject path separators (`/`, `\`)
+- Apply to every route taking `Path(index)`: search, write, bulk, config, schema, delete, admin commit/evict
+- Regression tests: `DELETE /api/..%2f..%2fetc` must return 400, must not touch the filesystem
+
+**A2 — Wire CORS Config** 🟠 HIGH
+- Replace hardcoded `CorsLayer::permissive()` with origins from `network.http.cors_allowed_origins`
+- Default to `localhost`/`127.0.0.1` origins only when binding to loopback; require explicit `["*"]` opt-in for wildcard
+- Deny credentials with wildcard origin (per CORS spec pitfalls)
+
+**A3 — Strict Env Flag for TLS Bypass** 🟡 MEDIUM
+- Change `CAMEODB_ACCEPT_INVALID_CERTS` presence-check to value-check (`== "true"`)
+- Log a loud `warn!` at client startup when active
+
+**A4 — DoS Hardening** 🟠 HIGH
+- Lower default `max_record_size_mb` (512MB → e.g. 64MB) or document the risk prominently
+- Add `tower::limit::ConcurrencyLimitLayer` on search/stream endpoints (configurable)
+- Verify `DefaultBodyLimit` applies to the *decompressed* byte count; if not, add an explicit decompressed-size guard
+
+**A5 — CI Security Tooling** 🟡 MEDIUM
+- `cargo audit` + `cargo deny check advisories bans sources` in CI (currently `cargo audit` can't even run: stale binary fails on CVSS 4.0 advisories)
+- `cargo clippy -- -D warnings` gate
+- Dependabot/Renovate for Cargo dependencies
+
+### Stage B: Core Auth & Transport Security (the "auth project")
+
+**B1 — API Key Authentication** 🔴 CRITICAL
+- Design: single `Authorization: Bearer <key>` middleware (axum `from_fn`) covering all `/api/*`, `/_admin/*`, `/_indexes`, `/mcp/*` routes; `/_cluster/health` stays open for load balancers
+- Config: `[security] api_keys = [...]` (hashed with SHA-256, constant-time compare), env `CAMEODB_API_KEY` override
+- Backward compat: auth disabled by default (trusted-LAN mode), enabled = hard requirement for non-loopback binds (fail-fast at startup if `--bind 0.0.0.0` without auth)
+- Client SDK + CLI: `--api-key` flag, `CAMEODB_API_KEY` env, persisted per-connection in REPL
+- Admin routes (`/_admin/*`) optionally require a separate admin-scoped key
+
+**B2 — HTTPS/TLS via rustls** 🟠 HIGH
+- axum-server or tokio-rustls acceptor; config `[network.http.tls] cert_file, key_file`
+- Client-side: evaluate switching default feature from `native-tls` to `rustls-tls` — the original reason for native-tls was interoperability with misbehaving HTTPS endpoints during schema/URL ingestion; modern rustls (via reqwest 0.13, aws-lc-rs backend) handles TLS 1.2+ universally, so the compatibility concern is likely obsolete. **Action: test the URL-ingestion paths against a corpus of real-world HTTPS sources with `rustls-tls` before switching the default.** Keep `native-tls-vendored` for musl static builds regardless (OpenSSL vendored works fine there).
+- Optional mTLS for client verification later
+
+**B3 — Cluster Join Authentication** 🟠 HIGH
+- PSK for libp2p swarm (`/swarm/psk/1.0.0/` private network protocol — one-line behaviour change with `pnet` pre-shared key)
+- Config `[network.cluster] psk_file` (32-byte key, hex/base64)
+- Covers kameo remote messaging too once the swarm is private
+- Rotate story: support primary + secondary PSK during rolling upgrades
+
+### Stage C: Defense in Depth (post-auth)
+
+**C1 — MCP-Specific Limits** 🟡 MEDIUM
+- Rate limiting per session/key on MCP tool invocations
+- Query complexity caps: max boolean clauses, max prefix-expansion terms, per-request timeout already exists — wire it into MCP path
+- Index-level allow-list for MCP agents (`[mcp] allowed_indexes = [...]`)
+
+**C2 — Audit Logging** 🟡 MEDIUM
+- Structured `tracing` events: who (key id / peer), what (op, index), when, result
+- Append-only audit ring buffer + optional file sink; admin endpoint to query recent events
+
+**C3 — Index-Level Authorization (RBAC)** 🟢 LOWER (needed for multi-tenant)
+- Key → role → index permissions mapping (read/write/admin scopes)
+- Enforced at `RouterActor` boundary so local + remote paths are both covered
+- Depends on B1 identity model
+
+### TLS Inventory (verified 2026-07-30)
+
+| Component | Current TLS | Notes |
+|-----------|-------------|-------|
+| HTTP server | ❌ none | axum, plaintext; Stage B2 adds rustls |
+| Client SDK (`reqwest 0.13`) | ✅ default `native-tls`; features: `native-tls`, `native-tls-vendored`, `rustls-tls` | native-tls chosen historically for misbehaving HTTPS endpoints; re-evaluate rustls default (Stage B2) |
+| musl static builds | ✅ `native-tls-vendored` via `scripts/build/build-musl.sh` + `build-dist.sh` | keep as-is |
+| libp2p cluster transport | ✅ Noise (`noise::Config`) + yamux mux | encrypted but unauthenticated membership; Stage B3 adds PSK |
+| kameo remote messaging | ⚠️ rides libp2p swarm | inherits B3 protection |
+| Client TLS bypass | ⚠️ `CAMEODB_ACCEPT_INVALID_CERTS` presence-check → `danger_accept_invalid_certs(true)` | Stage A3 tightens to value-check |
+
+**Success Metrics:**
+- No unauthenticated write/delete path reachable in default config
+- Path-traversal regression tests in CI
+- `cargo audit` green in CI
+- TLS + auth enabled = zero plaintext credentials on the wire
+- Cluster rejects unknown peers without valid PSK
 
 ---
