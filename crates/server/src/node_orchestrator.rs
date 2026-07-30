@@ -1745,70 +1745,69 @@ impl MicroshardActor {
         let store_arc = Arc::new(store);
         self.store = Some(store_arc.clone());
 
-        // Warm up indices in the background to avoid blocking server startup.
-        // Uses two-phase warmup: Phase 1 (blocking) recovers indices that need it,
-        // Phase 2 (background) warms up fully-synced indices after system is ready.
-        // Indices have lazy initialization (get_or_create_index) so any request
-        // arriving before warmup completes will still work — it just triggers
-        // on-demand initialization for that specific index.
+        // Startup runs in two phases, both off the async runtime.
+        //
+        // Phase 1 (recovery) is a correctness requirement: an index whose WAL tail was never
+        // committed answers searches without its most recent writes, so it must be replayed.
+        // Only indices whose persisted checkpoint falls short of their WAL are touched.
+        //
+        // Phase 2 (warmup) is purely latency: it opens and caches the *reader* for each
+        // index and faults in its segment structures, so the first query from an agent or
+        // client does not pay for opening the index. It runs on its own thread and never
+        // gates serving — a request arriving first just warms that index on demand.
+        //
+        // Neither phase blocks `start()`. Requests are served throughout via lazy
+        // initialization; the phases only determine whether that work has already been done.
         let warmup_store = Arc::clone(&store_arc);
         let shard_id = self.shard_id;
-        tokio::task::spawn_blocking(move || match warmup_store.warmup_indices() {
-            Ok((recovered_count, fully_synced_indices)) => {
-                info!(
-                    shard_id = %shard_id,
-                    recovered_count = recovered_count,
-                    fully_synced_count = fully_synced_indices.len(),
-                    "Phase 1 warmup completed - system ready to accept queries"
-                );
-
-                // Phase 2: Spawn background warmup for fully-synced indices
-                if !fully_synced_indices.is_empty() {
-                    let bg_store = Arc::clone(&warmup_store);
-                    let bg_shard_id = shard_id;
-                    std::thread::spawn(move || {
-                        let bg_start = std::time::Instant::now();
-                        info!(
-                            shard_id = %bg_shard_id,
-                            count = fully_synced_indices.len(),
-                            "Phase 2: Starting background warmup for {} fully-synced indices",
-                            fully_synced_indices.len()
-                        );
-
-                        let mut warmed_count = 0;
-                        for index_name in fully_synced_indices {
-                            match bg_store.get_or_create_index(&index_name) {
-                                Ok(_) => {
-                                    warmed_count += 1;
-                                    debug!(
-                                        shard_id = %bg_shard_id,
-                                        index = %index_name,
-                                        "Background warmup: index opened successfully"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        shard_id = %bg_shard_id,
-                                        index = %index_name,
-                                        error = %e,
-                                        "Background warmup: failed to open index, will retry on first query"
-                                    );
-                                }
-                            }
-                        }
-
-                        let bg_elapsed = bg_start.elapsed();
-                        info!(
-                            shard_id = %bg_shard_id,
-                            warmed_count = warmed_count,
-                            elapsed_ms = bg_elapsed.as_millis(),
-                            "Phase 2 background warmup completed"
-                        );
-                    });
+        tokio::task::spawn_blocking(move || {
+            let plan = match warmup_store.recover_indices() {
+                Ok(plan) => plan,
+                Err(e) => {
+                    warn!(
+                        shard_id = %shard_id,
+                        error = %e,
+                        "Index recovery failed; indices will recover on first access"
+                    );
+                    return;
                 }
+            };
+
+            info!(
+                shard_id = %shard_id,
+                recovered = plan.recovered.len(),
+                failed = plan.failed.len(),
+                pending_warmup = plan.pending_warmup.len(),
+                "Phase 1 complete - shard is queryable"
+            );
+
+            if plan.pending_warmup.is_empty() {
+                return;
             }
-            Err(e) => {
-                warn!(shard_id = %shard_id, error = %e, "Index warmup encountered errors, indices will recover on first access");
+
+            // One warmup thread per shard. With N shards that is already N-way parallelism
+            // against the same disk, so warming a shard's indices sequentially keeps the IO
+            // pattern sane instead of turning startup into a seek storm.
+            let spawned = std::thread::Builder::new()
+                .name(format!("warmup-shard-{shard_id}"))
+                .spawn(move || {
+                    let requested = plan.pending_warmup.len();
+                    let warmed = warmup_store.warm_indices(&plan.pending_warmup);
+                    info!(
+                        shard_id = %shard_id,
+                        warmed = warmed,
+                        requested = requested,
+                        "Phase 2 complete - index readers warmed"
+                    );
+                });
+
+            if let Err(e) = spawned {
+                // Not fatal: every index still warms itself on its first query.
+                warn!(
+                    shard_id = %shard_id,
+                    error = %e,
+                    "Could not spawn warmup thread; indices will warm on first query"
+                );
             }
         });
 
@@ -6538,7 +6537,19 @@ impl NodeOrchestrator {
             }));
         }
 
-        let mut all: HashMap<String, (u64, u64, u64, usize)> = HashMap::new();
+        /// Per-index totals accumulated across this node's shards.
+        #[derive(Default)]
+        struct IndexTotals {
+            document_count: u64,
+            redb_bytes: u64,
+            tantivy_bytes: u64,
+            /// Shards that hold data for this index.
+            shard_count: usize,
+            /// Of those, how many have finished warming their reader.
+            warm_shards: usize,
+        }
+
+        let mut all: HashMap<String, IndexTotals> = HashMap::new();
         let mut field_cache: HashMap<String, Vec<String>> = HashMap::new();
 
         // Create GetShardStats message
@@ -6569,17 +6580,20 @@ impl NodeOrchestrator {
                     shard_timings.push((shard_id, snapshot.timings.clone()));
 
                     for (index_name, stats) in snapshot.per_index {
-                        let entry = all.entry(index_name).or_insert((0, 0, 0, 0));
-                        entry.0 += stats.document_count;
-                        entry.1 += stats.redb_bytes;
-                        entry.2 += stats.tantivy_bytes;
+                        let entry = all.entry(index_name).or_default();
+                        entry.document_count += stats.document_count;
+                        entry.redb_bytes += stats.redb_bytes;
+                        entry.tantivy_bytes += stats.tantivy_bytes;
 
                         if stats.document_count > 0
                             || stats.redb_bytes > 0
                             || stats.tantivy_bytes > 0
                             || stats.tantivy_index_exists
                         {
-                            entry.3 += 1;
+                            entry.shard_count += 1;
+                            if stats.warmup_state == storage::IndexWarmupState::Warm {
+                                entry.warm_shards += 1;
+                            }
                         }
                     }
                 }
@@ -6605,14 +6619,24 @@ impl NodeOrchestrator {
         let total_ms = total_redb_ms + total_tantivy_ms;
 
         let mut indexes: Vec<(String, JsonValue)> = Vec::new();
-        for (name, (doc_count, redb_bytes, tantivy_bytes, shard_count)) in all {
+        for (name, totals) in all {
+            let IndexTotals {
+                document_count,
+                redb_bytes,
+                tantivy_bytes,
+                shard_count,
+                warm_shards,
+            } = totals;
             let total_size_bytes = tantivy_bytes + if include_data_size { redb_bytes } else { 0 };
             let index_size_mb = tantivy_bytes / (1024 * 1024);
             let memory_mb = (redb_bytes + tantivy_bytes) / (1024 * 1024);
 
             let mut json_obj = JsonMap::new();
             json_obj.insert("name".to_string(), JsonValue::String(name.clone()));
-            json_obj.insert("document_count".to_string(), JsonValue::from(doc_count));
+            json_obj.insert(
+                "document_count".to_string(),
+                JsonValue::from(document_count),
+            );
 
             // Only include size fields when data size is requested
             if include_data_size {
@@ -6632,6 +6656,10 @@ impl NodeOrchestrator {
                 );
             }
             json_obj.insert("shard_count".to_string(), JsonValue::from(shard_count));
+            // Warmup coverage on this node: how many of the shards holding this index are
+            // already serving from warm readers. Below shard_count means the first query
+            // routed to a cold shard still pays the open-and-fault cost.
+            json_obj.insert("warm_shards".to_string(), JsonValue::from(warm_shards));
             let fields = if let Some(cached) = field_cache.get(&name) {
                 cached.clone()
             } else {

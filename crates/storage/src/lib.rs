@@ -39,11 +39,14 @@ use serde::{Deserialize, Serialize, de::Error as DeserializeError};
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use tantivy::collector::TopDocs;
+use tantivy::index::SegmentId;
 use tantivy::query::{AllQuery, QueryParserError};
 use tantivy::schema::{
     Document, FAST, Field, INDEXED, STORED, STRING, Schema, TEXT, Value as TantivyValue,
 };
-use tantivy::{DateTime, Index, IndexReader, IndexWriter, Order, doc};
+use tantivy::{
+    DateTime, Index, IndexReader, IndexWriter, Order, Searcher, SearcherGeneration, Warmer, doc,
+};
 use thiserror::Error;
 use tracing::{debug, trace, warn};
 use walkdir::WalkDir;
@@ -1232,6 +1235,9 @@ pub struct IndexShardStats {
     pub tantivy_bytes: u64,
     pub tantivy_index_exists: bool,
     pub tantivy_scan_ms: u128,
+    /// Where this index sits in the startup warmup lifecycle. `Cold` means the first query
+    /// will pay the open-and-fault cost; `Warm` means it is served from warm buffers.
+    pub warmup_state: IndexWarmupState,
 }
 
 /// Timing metadata for shard-level statistics gathering.
@@ -1466,6 +1472,199 @@ struct IndexSizes {
     document_count: u64,
 }
 
+/// Where an index sits in the startup warmup lifecycle.
+///
+/// Queries are served in every state — a cold index just pays the open-and-fault cost on
+/// the first query instead of having paid it in the background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexWarmupState {
+    /// Not yet touched. The first query opens and faults in everything it needs.
+    Cold,
+    /// Replaying WAL entries that were not committed to Tantivy before the last shutdown.
+    /// Searches against this index can miss the uncommitted tail until replay finishes.
+    Recovering,
+    /// Reader is being opened and its segment structures faulted in.
+    Warming,
+    /// Reader cached and every segment warmed. Queries hit warm buffers.
+    Warm,
+    /// Warmup failed; the index still works, the first query just pays the cold cost.
+    Failed,
+}
+
+/// Result of the blocking recovery phase, and the work handed to the background phase.
+#[derive(Debug, Clone, Default)]
+pub struct WarmupPlan {
+    /// Indices that had uncommitted WAL entries and were replayed synchronously.
+    pub recovered: Vec<String>,
+    /// Indices whose recovery failed. They are excluded from warmup and will retry on
+    /// first access.
+    pub failed: Vec<String>,
+    /// Indices to warm in the background, ordered smallest first.
+    pub pending_warmup: Vec<String>,
+}
+
+/// What a single index's warmup accomplished.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexWarmupStats {
+    pub index: String,
+    pub segments: usize,
+    pub num_docs: u64,
+    pub elapsed_ms: u128,
+}
+
+/// Warms the per-segment structures a query touches, once per segment.
+///
+/// Registered on every `IndexReader` this store opens, so it runs both when the reader is
+/// first created (startup warmup) and whenever a reload produces a new searcher generation —
+/// which is how freshly committed and freshly merged segments get warmed without anyone
+/// asking.
+///
+/// Tantivy invokes warmers **synchronously** inside `IndexReader::reload()`, and
+/// `commit_index` reloads on the shard writer thread. That makes incrementality a
+/// correctness-adjacent requirement rather than an optimization: the `warmed` set means a
+/// post-commit reload only touches the one new segment (whose files this process just wrote,
+/// so they are already in page cache) instead of rescanning the whole index on the write
+/// hot path.
+struct SegmentWarmer {
+    index: String,
+    /// Segments already warmed. Pruned by `garbage_collect` as generations retire.
+    warmed: Mutex<HashSet<SegmentId>>,
+}
+
+impl SegmentWarmer {
+    fn new(index: String) -> Self {
+        Self {
+            index,
+            warmed: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Touch the structures `search_documents` reads, so the first real query does not pay
+    /// for opening them or for the page faults behind them:
+    ///
+    /// - inverted indexes (term dictionaries) for indexed fields — query parsing and term
+    ///   lookup
+    /// - fast field columns — `order_by_fast_field` sorting
+    /// - the doc store — `searcher.doc()` for the `id` of every hit
+    fn warm_segment(&self, segment_reader: &tantivy::SegmentReader) {
+        let schema = segment_reader.schema();
+
+        for (field, field_entry) in schema.fields() {
+            if field_entry.is_indexed() {
+                // Opens and mmaps the term dictionary for this field.
+                if let Err(e) = segment_reader.inverted_index(field) {
+                    trace!(
+                        index = %self.index,
+                        field = field_entry.name(),
+                        error = %e,
+                        "Warmup: could not open inverted index for field"
+                    );
+                }
+            }
+
+            if field_entry.is_fast() {
+                // Column type must match the field type; a mismatch just means this column
+                // stays cold, which is not worth failing a warmup over.
+                let name = field_entry.name();
+                let fast_fields = segment_reader.fast_fields();
+                let opened = match field_entry.field_type() {
+                    tantivy::schema::FieldType::Str(_) => {
+                        fast_fields.str(name).map(|column| column.is_some())
+                    }
+                    tantivy::schema::FieldType::U64(_) => fast_fields.u64(name).map(|_| true),
+                    tantivy::schema::FieldType::I64(_) => fast_fields.i64(name).map(|_| true),
+                    tantivy::schema::FieldType::F64(_) => fast_fields.f64(name).map(|_| true),
+                    tantivy::schema::FieldType::Bool(_) => fast_fields.bool(name).map(|_| true),
+                    tantivy::schema::FieldType::Date(_) => fast_fields.date(name).map(|_| true),
+                    tantivy::schema::FieldType::IpAddr(_) => {
+                        fast_fields.ip_addr(name).map(|_| true)
+                    }
+                    tantivy::schema::FieldType::Bytes(_) => {
+                        fast_fields.bytes(name).map(|column| column.is_some())
+                    }
+                    _ => Ok(false),
+                };
+                if let Err(e) = opened {
+                    trace!(
+                        index = %self.index,
+                        field = name,
+                        error = %e,
+                        "Warmup: could not open fast field column"
+                    );
+                }
+            }
+        }
+
+        // The doc store is on the hot path: every hit resolves its `id` through
+        // `searcher.doc()` before the documents are batch-fetched from redb.
+        if let Err(e) = segment_reader.get_store_reader(DOC_STORE_WARM_CACHE_BLOCKS) {
+            trace!(
+                index = %self.index,
+                error = %e,
+                "Warmup: could not open doc store reader"
+            );
+        }
+    }
+}
+
+/// Doc store blocks to keep cached per segment while warming. Small on purpose: the point is
+/// to fault the store in and leave a useful cache behind, not to hold the index in memory.
+const DOC_STORE_WARM_CACHE_BLOCKS: usize = 16;
+
+impl Warmer for SegmentWarmer {
+    fn warm(&self, searcher: &Searcher) -> tantivy::Result<()> {
+        let start = Instant::now();
+        let mut newly_warmed = 0usize;
+
+        for segment_reader in searcher.segment_readers() {
+            let segment_id = segment_reader.segment_id();
+            {
+                // Check-then-insert under one lock so two warming threads racing on the same
+                // generation do not both warm the same segment.
+                let mut warmed = self.warmed.lock().unwrap_or_else(|p| p.into_inner());
+                if !warmed.insert(segment_id) {
+                    continue;
+                }
+            }
+            self.warm_segment(segment_reader);
+            newly_warmed += 1;
+        }
+
+        if newly_warmed > 0 {
+            debug!(
+                index = %self.index,
+                segments_warmed = newly_warmed,
+                total_segments = searcher.segment_readers().len(),
+                elapsed_ms = start.elapsed().as_millis(),
+                "Warmed new segments"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn garbage_collect(&self, live_generations: &[&SearcherGeneration]) {
+        let live: HashSet<SegmentId> = live_generations
+            .iter()
+            .flat_map(|generation| generation.segments().keys().copied())
+            .collect();
+
+        let mut warmed = self.warmed.lock().unwrap_or_else(|p| p.into_inner());
+        let before = warmed.len();
+        warmed.retain(|segment_id| live.contains(segment_id));
+
+        if before != warmed.len() {
+            trace!(
+                index = %self.index,
+                pruned = before - warmed.len(),
+                remaining = warmed.len(),
+                "Pruned warmup state for retired segments"
+            );
+        }
+    }
+}
+
 /// Multi-tenant hybrid storage engine combining redb and tantivy.
 pub struct HybridStore {
     /// Shared redb database across all indices
@@ -1490,6 +1689,11 @@ pub struct HybridStore {
     /// Tantivy's `INDEX_WRITER_LOCK` is a non-blocking flock on `.tantivy-writer.lock`, so
     /// two threads opening a writer for the same index race and one fails with `LockBusy`.
     index_init_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    /// Owning references to the per-index segment warmers. Tantivy holds only `Weak`
+    /// references, so dropping these would silently stop warming new segments.
+    segment_warmers: Arc<DashMap<String, Arc<SegmentWarmer>>>,
+    /// Per-index warmup lifecycle state, for observability.
+    warmup_states: Arc<DashMap<String, IndexWarmupState>>,
     /// Unified cache for index sizes (Tantivy + Redb) with expiration to avoid repeated expensive calculations
     index_size_cache: Arc<Mutex<HashMap<String, IndexSizeCache>>>,
     /// Cache expiration duration for index sizes (1 hour)
@@ -1655,6 +1859,8 @@ impl HybridStore {
             schema_cache: Arc::new(DashMap::new()),
             fields_cache: Arc::new(DashMap::new()),
             index_init_locks: Arc::new(DashMap::new()),
+            segment_warmers: Arc::new(DashMap::new()),
+            warmup_states: Arc::new(DashMap::new()),
             index_size_cache: Arc::new(Mutex::new(HashMap::new())),
             index_cache_expiry: Duration::from_secs(3600), // 1 hour
             config: config.clone(),
@@ -3645,6 +3851,15 @@ impl HybridStore {
             return Ok(None);
         }
 
+        // Owning handle for the warmer must outlive the reader — tantivy keeps only a Weak.
+        let warmer = {
+            let entry = self
+                .segment_warmers
+                .entry(index.to_string())
+                .or_insert_with(|| Arc::new(SegmentWarmer::new(index.to_string())));
+            Arc::clone(entry.value())
+        };
+
         // Use DashMap entry API for concurrent-safe creation
         let reader = self
             .readers
@@ -3653,10 +3868,16 @@ impl HybridStore {
                 let tantivy_index = Index::open_in_dir(&index_path)?;
 
                 // Configure reader with ReloadPolicy::OnCommitWithDelay for automatic background reloading
-                // This watches meta.json and reloads within milliseconds after commits
+                // This watches meta.json and reloads within milliseconds after commits.
+                //
+                // The warmer runs when this builder creates the first searcher, and again on
+                // every reload that produces a new generation — so segments arriving from
+                // commits and from background merges are warmed without an explicit call.
+                let weak_warmer: std::sync::Weak<dyn Warmer> = Arc::downgrade(&warmer) as _;
                 let reader = tantivy_index
                     .reader_builder()
                     .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
+                    .warmers(vec![weak_warmer])
                     .try_into()?;
 
                 Ok::<IndexReader, StoreError>(reader)
@@ -3667,6 +3888,80 @@ impl HybridStore {
         let fields = self.get_fields_for_index(index, &tantivy_index)?;
 
         Ok(Some((reader.value().clone(), fields)))
+    }
+
+    /// Warm one index so the first query does not pay cold-start costs.
+    ///
+    /// Opens and caches the `IndexReader` (which is what the search path uses — the *writer*
+    /// cache is irrelevant to queries), populates the schema and field caches, and, via the
+    /// registered [`SegmentWarmer`], faults in each segment's term dictionaries, fast field
+    /// columns and doc store.
+    ///
+    /// Safe to call concurrently and repeatedly: already-warm indices are a cheap no-op.
+    /// Returns `None` when the index has no Tantivy directory yet (nothing to warm).
+    pub fn warm_index(&self, index: &str) -> Result<Option<IndexWarmupStats>, StoreError> {
+        let start = Instant::now();
+        self.warmup_states
+            .insert(index.to_string(), IndexWarmupState::Warming);
+
+        // Loading the schema here keeps the first query off the redb metadata path.
+        if let Err(e) = self.get_schema_cached(index) {
+            self.warmup_states
+                .insert(index.to_string(), IndexWarmupState::Failed);
+            return Err(e);
+        }
+
+        let reader = match self.get_reader(index) {
+            Ok(Some((reader, _fields))) => reader,
+            Ok(None) => {
+                // No Tantivy directory: an index that has a schema but has never been
+                // written to. Nothing to warm, and nothing wrong.
+                self.warmup_states
+                    .insert(index.to_string(), IndexWarmupState::Warm);
+                return Ok(None);
+            }
+            Err(e) => {
+                self.warmup_states
+                    .insert(index.to_string(), IndexWarmupState::Failed);
+                return Err(e);
+            }
+        };
+
+        let searcher = reader.searcher();
+        let stats = IndexWarmupStats {
+            index: index.to_string(),
+            segments: searcher.segment_readers().len(),
+            num_docs: searcher.num_docs(),
+            elapsed_ms: start.elapsed().as_millis(),
+        };
+
+        self.warmup_states
+            .insert(index.to_string(), IndexWarmupState::Warm);
+
+        tracing::debug!(
+            index = %index,
+            segments = stats.segments,
+            num_docs = stats.num_docs,
+            elapsed_ms = stats.elapsed_ms,
+            "Index warmed"
+        );
+
+        Ok(Some(stats))
+    }
+
+    /// Current warmup state for every index this store knows about.
+    pub fn warmup_states(&self) -> HashMap<String, IndexWarmupState> {
+        self.warmup_states
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect()
+    }
+
+    /// Whether an index has completed warmup and will answer from warm buffers.
+    pub fn is_index_warm(&self, index: &str) -> bool {
+        self.warmup_states
+            .get(index)
+            .is_some_and(|state| *state.value() == IndexWarmupState::Warm)
     }
 
     /// Search documents in a specific index
@@ -4616,6 +4911,11 @@ impl HybridStore {
                         tantivy_bytes: sizes.tantivy_bytes,
                         tantivy_index_exists,
                         tantivy_scan_ms: 0,
+                        warmup_state: self
+                            .warmup_states
+                            .get(index_name)
+                            .map(|state| *state.value())
+                            .unwrap_or(IndexWarmupState::Cold),
                     },
                 );
             }
@@ -4655,102 +4955,92 @@ impl HybridStore {
         Ok(index_names)
     }
 
-    /// Warm up all existing indices by opening them, which triggers WAL recovery.
-    /// This should be called during startup to ensure all indices are recovered
-    /// and ready for use, rather than waiting for first access.
+    /// Phase 1 of startup: recover every index that has uncommitted WAL entries.
     ///
-    /// Uses a two-phase warmup strategy:
-    /// Phase 1 (blocking): Warm up indices that need recovery (not fully synced).
-    /// Phase 2 (background): Caller should warm up fully-synced indices after system is ready.
+    /// This is the only part of startup that must complete before queries are trustworthy —
+    /// an index with an unreplayed WAL tail answers searches without its most recent writes.
+    /// Indices already synced (their persisted checkpoint covers the whole WAL) are skipped
+    /// entirely, which is a metadata read rather than a Tantivy open.
     ///
-    /// This balances fast startup (only recover what's needed) with fast query responses
-    /// (background warmup ensures synced indices are ready quickly).
-    ///
-    /// Returns (recovered_count, fully_synced_indices) where:
-    /// - recovered_count: number of indices that needed recovery
-    /// - fully_synced_indices: list of indices that are fully synced and can be warmed up in background
-    pub fn warmup_indices(&self) -> Result<(usize, Vec<String>), StoreError> {
-        let warmup_start = Instant::now();
+    /// Returns the plan for phase 2. Recovery and warmup are deliberately split: recovery
+    /// is a correctness requirement and blocks, warmup is a latency optimization and does
+    /// not. See [`HybridStore::warm_index`] for phase 2.
+    pub fn recover_indices(&self) -> Result<WarmupPlan, StoreError> {
+        let start = Instant::now();
         let index_names = self.get_index_names()?;
 
         if index_names.is_empty() {
-            tracing::debug!("No indices to warm up");
-            return Ok((0, Vec::new()));
+            tracing::debug!("No indices to recover");
+            return Ok(WarmupPlan::default());
         }
 
-        tracing::info!(
-            count = index_names.len(),
-            "Starting two-phase index warmup for {} indices",
-            index_names.len()
-        );
-
-        // Separate indices into two groups: needs_recovery and fully_synced
+        // Partition on the persisted checkpoint. This costs two small redb reads per index
+        // and avoids opening Tantivy for indices that do not need it.
         let mut needs_recovery = Vec::new();
-        let mut fully_synced = Vec::new();
-
         for index_name in &index_names {
             match self.is_index_fully_synced(index_name) {
                 Ok(true) => {
-                    tracing::info!(
-                        index = %index_name,
-                        "Index is fully synced, will warm up in background phase"
-                    );
-                    fully_synced.push(index_name.clone());
+                    self.warmup_states
+                        .insert(index_name.clone(), IndexWarmupState::Cold);
                 }
                 Ok(false) => {
-                    tracing::info!(
-                        index = %index_name,
-                        "Index needs recovery, will warm up in blocking phase"
-                    );
+                    self.warmup_states
+                        .insert(index_name.clone(), IndexWarmupState::Recovering);
                     needs_recovery.push(index_name.clone());
                 }
                 Err(e) => {
-                    // Failed to check sync status - conservatively treat as needs recovery
+                    // Cannot tell: assume the worst and replay. Recovery is idempotent, so
+                    // the cost of a false positive is time, not correctness.
                     tracing::warn!(
                         index = %index_name,
                         error = %e,
                         "Failed to check sync status, treating as needs recovery"
                     );
+                    self.warmup_states
+                        .insert(index_name.clone(), IndexWarmupState::Recovering);
                     needs_recovery.push(index_name.clone());
                 }
             }
         }
 
-        // Phase 1: Blocking warmup for indices that need recovery
-        let phase1_start = Instant::now();
-        if !needs_recovery.is_empty() {
-            tracing::info!(
-                count = needs_recovery.len(),
-                "Phase 1: Starting blocking warmup for {} indices that need recovery",
-                needs_recovery.len()
-            );
+        tracing::info!(
+            total = index_names.len(),
+            needs_recovery = needs_recovery.len(),
+            "Phase 1: recovering indices with uncommitted WAL entries"
+        );
 
+        let mut recovered = Vec::new();
+        let mut failed = Vec::new();
+
+        if !needs_recovery.is_empty() {
+            // Recovery is CPU- and IO-heavy per index, so cap parallelism at the core count.
+            // Each recovering index holds a Tantivy writer with its own indexing arena.
             let max_parallel = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(4)
                 .min(needs_recovery.len())
                 .max(1);
-            let errors = std::sync::Mutex::new(Vec::new());
+            let results = std::sync::Mutex::new(Vec::new());
 
-            std::thread::scope(|s| {
+            std::thread::scope(|scope| {
                 for chunk in needs_recovery.chunks(max_parallel) {
                     let handles: Vec<_> = chunk
                         .iter()
                         .map(|index_name| {
-                            let errors = &errors;
-                            s.spawn(move || {
-                                match self.get_or_create_index(index_name) {
-                                    Ok(_) => {
-                                        tracing::debug!(index = %index_name, "Index warmed up successfully (Phase 1)");
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            index = %index_name,
-                                            error = %e,
-                                            "Failed to warm up index, will retry on first access"
-                                        );
-                                        errors.lock().unwrap().push(index_name.clone());
-                                    }
+                            let results = &results;
+                            scope.spawn(move || {
+                                // get_or_create_index runs recover_index as a side effect.
+                                let outcome = self.get_or_create_index(index_name);
+                                results
+                                    .lock()
+                                    .unwrap()
+                                    .push((index_name.clone(), outcome.is_ok()));
+                                if let Err(e) = outcome {
+                                    tracing::warn!(
+                                        index = %index_name,
+                                        error = %e,
+                                        "Recovery failed, index will retry on first access"
+                                    );
                                 }
                             })
                         })
@@ -4762,51 +5052,100 @@ impl HybridStore {
                 }
             });
 
-            let failed = errors.into_inner().unwrap();
-            if !failed.is_empty() {
-                tracing::warn!(
-                    failed_count = failed.len(),
-                    "Phase 1 completed with {} failures",
-                    failed.len()
-                );
+            for (index_name, ok) in results.into_inner().unwrap() {
+                if ok {
+                    // Recovered, but the reader is still cold — phase 2 warms it.
+                    self.warmup_states
+                        .insert(index_name.clone(), IndexWarmupState::Cold);
+                    recovered.push(index_name);
+                } else {
+                    self.warmup_states
+                        .insert(index_name.clone(), IndexWarmupState::Failed);
+                    failed.push(index_name);
+                }
             }
         }
 
-        let phase1_elapsed = phase1_start.elapsed();
+        // Phase 2 covers every index, recovered or not: recovery populates the *writer*
+        // cache, which queries never touch. Order smallest-first so the greatest number of
+        // indices become warm soonest — a large index left for last still answers queries,
+        // it just pays its own cold cost once.
+        let mut pending_warmup: Vec<String> = index_names
+            .iter()
+            .filter(|name| !failed.contains(name))
+            .cloned()
+            .collect();
+        pending_warmup.sort_by_key(|name| {
+            let index_path = self.config.shard_path.join("indices").join(name);
+            index_size_bytes(&index_path).unwrap_or(0)
+        });
+
+        let plan = WarmupPlan {
+            recovered,
+            failed,
+            pending_warmup,
+        };
+
         tracing::info!(
-            recovered_count = needs_recovery.len(),
-            elapsed_ms = phase1_elapsed.as_millis(),
-            "Phase 1 completed - system ready to accept queries"
+            total = index_names.len(),
+            recovered = plan.recovered.len(),
+            failed = plan.failed.len(),
+            pending_warmup = plan.pending_warmup.len(),
+            elapsed_ms = start.elapsed().as_millis(),
+            "Phase 1 complete: all indices are queryable"
         );
 
-        // Phase 2: Background warmup for fully-synced indices
-        // These indices will be opened lazily on first query via get_or_create_index()
-        // This ensures system is ready to accept queries immediately after Phase 1
-        if !fully_synced.is_empty() {
-            tracing::info!(
-                count = fully_synced.len(),
-                "Phase 2: {} fully-synced indices will open lazily on first query",
-                fully_synced.len()
-            );
-            // Note: For proactive background warmup, we would need to:
-            // 1. Store the HybridStore in an Arc<Mutex<>> for thread-safe access
-            // 2. Spawn background tasks that call get_or_create_index() via the Arc
-            // 3. Implement proper lifecycle management (shutdown, cancellation)
-            // For now, lazy warmup on first query provides the right balance:
-            // - Fast startup (Phase 1 only blocks on recovery)
-            // - Fast queries (subsequent queries after first open are fast)
+        Ok(plan)
+    }
+
+    /// Phase 2 of startup: warm the readers for `indices`, in the order given.
+    ///
+    /// Runs on the calling thread — callers put it on a background thread so it never delays
+    /// serving. Individual failures are logged and skipped: a failed warmup costs latency on
+    /// the first query, not correctness.
+    ///
+    /// Returns the number of indices warmed.
+    pub fn warm_indices(&self, indices: &[String]) -> usize {
+        if indices.is_empty() {
+            return 0;
         }
 
-        let total_elapsed = warmup_start.elapsed();
+        let start = Instant::now();
+        let mut warmed = 0usize;
+        let mut total_segments = 0usize;
+        let mut total_docs = 0u64;
+
+        for index in indices {
+            match self.warm_index(index) {
+                Ok(Some(stats)) => {
+                    warmed += 1;
+                    total_segments += stats.segments;
+                    total_docs += stats.num_docs;
+                }
+                Ok(None) => {
+                    // Schema exists but nothing was ever written; nothing to warm.
+                    warmed += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        index = %index,
+                        error = %e,
+                        "Warmup failed; first query for this index will pay the cold cost"
+                    );
+                }
+            }
+        }
+
         tracing::info!(
-            total_indices = index_names.len(),
-            phase1_recovered = needs_recovery.len(),
-            phase2_background = fully_synced.len(),
-            total_elapsed_ms = total_elapsed.as_millis(),
-            "Two-phase warmup completed - system ready to accept queries"
+            requested = indices.len(),
+            warmed = warmed,
+            segments = total_segments,
+            documents = total_docs,
+            elapsed_ms = start.elapsed().as_millis(),
+            "Phase 2 complete: index readers warmed"
         );
 
-        Ok((needs_recovery.len(), fully_synced))
+        warmed
     }
 
     fn measure_tantivy_bytes(&self, index_name: &str) -> Result<u64, StoreError> {
@@ -5096,6 +5435,92 @@ unsafe impl Sync for HybridStore {}
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The `SegmentWarmer` must actually be reached by tantivy.
+    ///
+    /// Registration is easy to get wrong in a way no black-box test would notice: tantivy
+    /// holds warmers as `Weak` references, so if the store dropped its `Arc` the warmer would
+    /// be silently pruned on the first reload and every query would run cold while all the
+    /// behavioural tests still passed. This reaches into the warmer's own bookkeeping to
+    /// prove it ran, and that a later commit warms only the new segment.
+    #[test]
+    fn segment_warmer_is_invoked_and_incremental() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            shard_path: temp_dir.path().to_path_buf(),
+            indexer_memory_budget: 32 * 1024 * 1024,
+            indexer_memory_min_mb: 16,
+            indexer_memory_max_mb: 256,
+            total_memory_limit_bytes: 2048 * 1024 * 1024,
+            memory_pressure_threshold_percent: 80,
+            indexer_num_threads: 1,
+            merge_num_threads: 1,
+            default_batch_size: 100_000,
+            wal_sync: true,
+        };
+
+        let store = HybridStore::new(config, 1).unwrap();
+        let index = "warmer_wiring";
+        store
+            .store_schema_and_cache(index, &IndexSchema::default())
+            .unwrap();
+
+        store
+            .apply_write(
+                index,
+                WalOp::Put {
+                    id: "doc-1".to_string(),
+                    json_blob: Some(serde_json::json!({ "title": "first" })),
+                },
+            )
+            .unwrap();
+        store.commit_index(index).unwrap();
+
+        // Opening the reader creates the first searcher generation, which runs the warmer.
+        store.warm_index(index).unwrap();
+
+        let warmer = store
+            .segment_warmers
+            .get(index)
+            .expect("a warmer should be registered for any index with a reader")
+            .value()
+            .clone();
+
+        let after_first = warmer.warmed.lock().unwrap().len();
+        assert!(
+            after_first > 0,
+            "warmer should have recorded the committed segment; it was never invoked"
+        );
+
+        // A second commit produces another segment. The reload that follows must warm only
+        // the new one — warming is on the writer thread's commit path, so a full rescan here
+        // would be a write-throughput regression.
+        store
+            .apply_write(
+                index,
+                WalOp::Put {
+                    id: "doc-2".to_string(),
+                    json_blob: Some(serde_json::json!({ "title": "second" })),
+                },
+            )
+            .unwrap();
+        store.commit_index(index).unwrap();
+
+        // Force the reader to publish the new generation.
+        let (reader, _) = store.get_reader(index).unwrap().unwrap();
+        reader.reload().unwrap();
+
+        let after_second = warmer.warmed.lock().unwrap().len();
+        assert!(
+            after_second >= after_first,
+            "warmed segment set should not shrink while generations are live"
+        );
+        assert_eq!(
+            reader.searcher().num_docs(),
+            2,
+            "both documents should be searchable"
+        );
+    }
 
     #[test]
     fn test_multi_tenant_storage() {

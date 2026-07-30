@@ -70,9 +70,10 @@ fn uncommitted_writes_are_replayed_after_crash() {
     }
 
     let store = open_store(shard_path);
-    let (recovered, _synced) = store.warmup_indices().expect("warmup failed");
+    let plan = store.recover_indices().expect("recovery failed");
     assert_eq!(
-        recovered, 1,
+        plan.recovered,
+        vec![index.to_string()],
         "index with uncommitted WAL entries must be recovered on startup"
     );
 
@@ -106,12 +107,15 @@ fn committed_writes_skip_replay_on_restart() {
     }
 
     let store = open_store(shard_path);
-    let (recovered, fully_synced) = store.warmup_indices().expect("warmup failed");
-    assert_eq!(recovered, 0, "committed index must not need recovery");
+    let plan = store.recover_indices().expect("recovery failed");
+    assert!(
+        plan.recovered.is_empty(),
+        "committed index must not need recovery"
+    );
     assert_eq!(
-        fully_synced,
+        plan.pending_warmup,
         vec![index.to_string()],
-        "committed index should be reported as fully synced"
+        "every queryable index should be queued for reader warmup"
     );
     assert_eq!(
         search_hit_count(&store, index, "*"),
@@ -140,12 +144,12 @@ fn graceful_shutdown_checkpoints_committed_data() {
     }
 
     let store = open_store(shard_path);
-    let (recovered, fully_synced) = store.warmup_indices().expect("warmup failed");
-    assert_eq!(
-        recovered, 0,
+    let plan = store.recover_indices().expect("recovery failed");
+    assert!(
+        plan.recovered.is_empty(),
         "shutdown checkpointed its commit, so nothing should need replay"
     );
-    assert_eq!(fully_synced, vec![index.to_string()]);
+    assert_eq!(plan.pending_warmup, vec![index.to_string()]);
     assert_eq!(
         search_hit_count(&store, index, "*"),
         30,
@@ -173,8 +177,12 @@ fn writes_after_commit_are_replayed_after_crash() {
     }
 
     let store = open_store(shard_path);
-    let (recovered, _) = store.warmup_indices().expect("warmup failed");
-    assert_eq!(recovered, 1, "the uncommitted tail must trigger recovery");
+    let plan = store.recover_indices().expect("recovery failed");
+    assert_eq!(
+        plan.recovered,
+        vec![index.to_string()],
+        "the uncommitted tail must trigger recovery"
+    );
     store.commit_index(index).expect("post-recovery commit");
 
     assert_eq!(
