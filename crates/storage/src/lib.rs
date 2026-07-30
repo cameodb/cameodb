@@ -25,7 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -371,6 +371,35 @@ impl Default for StorageConfig {
     }
 }
 
+/// Measure the on-disk size of a Tantivy index.
+///
+/// Callers pass the index directory (`<shard>/indices/<name>`). `fs::metadata(dir).len()`
+/// reports the size of the directory entry itself — a couple of KB regardless of contents —
+/// so summing the files inside is the only way to size an index. Tantivy lays its segment
+/// files out flat, so one non-recursive `read_dir` suffices: a `getdents` plus a `stat`
+/// per file.
+///
+/// A plain file path is measured directly, so the function is meaningful for any path a
+/// caller might reasonably hand it.
+///
+/// Returns `None` when the path does not exist yet (a brand-new index).
+fn index_size_bytes(index_path: &Path) -> Option<u64> {
+    let metadata = fs::metadata(index_path).ok()?;
+    if metadata.is_file() {
+        return Some(metadata.len());
+    }
+
+    let mut total = 0u64;
+    for entry in fs::read_dir(index_path).ok()?.flatten() {
+        if let Ok(entry_meta) = entry.metadata()
+            && entry_meta.is_file()
+        {
+            total = total.saturating_add(entry_meta.len());
+        }
+    }
+    Some(total)
+}
+
 impl StorageConfig {
     /// Calculate optimal memory budget based on index size with consistent linear scaling.
     ///
@@ -386,7 +415,7 @@ impl StorageConfig {
     /// If field_count is provided, scales budget by 1.25x for >50 fields, 1.5x for >100 fields.
     pub fn get_optimal_memory_budget(
         &self,
-        index_path: &PathBuf,
+        index_path: &Path,
         field_count: Option<usize>,
     ) -> usize {
         let min_budget_bytes = self.indexer_memory_min_mb * 1024 * 1024;
@@ -394,8 +423,8 @@ impl StorageConfig {
         let default_budget_bytes = self.indexer_memory_budget;
 
         // Check index size and adjust budget dynamically within configurable range
-        let size_based_budget = if let Ok(metadata) = std::fs::metadata(index_path) {
-            let size_mb = metadata.len() / (1024 * 1024);
+        let size_based_budget = if let Some(index_bytes) = index_size_bytes(index_path) {
+            let size_mb = index_bytes / (1024 * 1024);
             let optimal_budget = match size_mb {
                 0..=100 => min_budget_bytes,         // 32MB - very small
                 101..=500 => default_budget_bytes,   // 64MB - small
@@ -433,7 +462,7 @@ impl StorageConfig {
     /// - batch_size > 5000: 2x base budget
     /// - batch_size > 1000: 1.5x base budget
     /// - otherwise: base budget
-    pub fn get_bulk_operation_budget(&self, index_path: &PathBuf, batch_size: usize) -> usize {
+    pub fn get_bulk_operation_budget(&self, index_path: &Path, batch_size: usize) -> usize {
         let base_budget = self.get_optimal_memory_budget(index_path, None);
 
         // Scale budget based on batch size to optimize indexing throughput
@@ -1457,6 +1486,10 @@ pub struct HybridStore {
     schema_cache: Arc<DashMap<String, Arc<IndexSchema>>>,
     /// Cache of Tantivy field mappings per index
     fields_cache: Arc<DashMap<String, SchemaFields>>,
+    /// Per-index initialization locks, serializing concurrent `get_or_create_index` calls.
+    /// Tantivy's `INDEX_WRITER_LOCK` is a non-blocking flock on `.tantivy-writer.lock`, so
+    /// two threads opening a writer for the same index race and one fails with `LockBusy`.
+    index_init_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     /// Unified cache for index sizes (Tantivy + Redb) with expiration to avoid repeated expensive calculations
     index_size_cache: Arc<Mutex<HashMap<String, IndexSizeCache>>>,
     /// Cache expiration duration for index sizes (1 hour)
@@ -1621,6 +1654,7 @@ impl HybridStore {
             budget_cache: Arc::new(DashMap::new()),
             schema_cache: Arc::new(DashMap::new()),
             fields_cache: Arc::new(DashMap::new()),
+            index_init_locks: Arc::new(DashMap::new()),
             index_size_cache: Arc::new(Mutex::new(HashMap::new())),
             index_cache_expiry: Duration::from_secs(3600), // 1 hour
             config: config.clone(),
@@ -1654,6 +1688,13 @@ impl HybridStore {
             let index = entry.key();
             let writer_arc = entry.value();
             if indices_with_pending_ops.contains(index) {
+                // Capture the sequence before committing — see commit_index for why the
+                // checkpoint must never claim a sequence allocated after the commit started.
+                let committed_seq = self
+                    .current_seq
+                    .get(index)
+                    .map(|counter| counter.load(Ordering::SeqCst));
+
                 // Retry with 5s timeout to handle slow writer thread lock release
                 let writer = {
                     let start = std::time::Instant::now();
@@ -1673,8 +1714,26 @@ impl HybridStore {
                 };
                 if let Some(mut w) = writer {
                     tracing::debug!(index = %index, "Committing index during shutdown");
-                    if let Err(e) = w.commit() {
-                        tracing::warn!(index = %index, error = %e, "Failed to commit index during shutdown");
+                    match w.commit() {
+                        Ok(_) => {
+                            // Release the writer lock before touching redb.
+                            drop(w);
+                            // Checkpoint what we just made durable. Without this the next
+                            // startup sees a stale recovery sequence and replays the entire
+                            // tail of the WAL even though it is all already in Tantivy.
+                            if let Some(seq) = committed_seq
+                                && let Err(e) = self.checkpoint_committed(index, seq)
+                            {
+                                tracing::warn!(
+                                    index = %index,
+                                    error = %e,
+                                    "Failed to checkpoint on shutdown; next startup will replay the WAL tail"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(index = %index, error = %e, "Failed to commit index during shutdown");
+                        }
                     }
                 }
             } else {
@@ -1886,6 +1945,11 @@ impl HybridStore {
             }
         }
 
+        // Replay commits are checkpoints, not throughput throttles: size them well above the
+        // steady-state write threshold so a large WAL produces a handful of big segments
+        // rather than one small segment per batch.
+        let recovery_commit_threshold = self.recovery_commit_threshold();
+
         // Zero-copy WAL replay: iterate range directly, process each entry in-place.
         // AccessGuard::value() returns &[u8] pointing directly into redb's mmap'd pages,
         // avoiding the need to allocate a Vec<u8> for every entry.
@@ -1935,19 +1999,32 @@ impl HybridStore {
             replayed_count += 1;
             replayed_since_commit += 1;
 
-            // Periodic commit during replay using the same threshold logic as
-            // standard batch writes (should_commit_writer). This bounds Tantivy's
-            // in-memory buffer and makes recovered data searchable in chunks.
-            // Note: we do NOT truncate WAL here — replay is still in progress.
-            if self.should_commit_writer(index, replayed_since_commit) {
+            // Periodic commit during replay, on a much coarser threshold than steady-state
+            // writes: each commit seals a segment and fsyncs, so replaying a large WAL at the
+            // normal batch threshold would produce hundreds of tiny segments and the merge
+            // storm that follows. Checkpointing after each commit is what makes these
+            // worthwhile — a crash mid-recovery resumes from the last checkpoint instead of
+            // replaying the whole tail again.
+            if replayed_since_commit >= recovery_commit_threshold {
                 tracing::info!(
                     index = %index,
                     replayed = replayed_count,
                     replayed_since_commit = replayed_since_commit,
+                    checkpoint_seq = seq_id,
                     "Recovery: threshold commit during WAL replay"
                 );
                 writer.commit()?;
                 replayed_since_commit = 0;
+
+                // Persist progress only — the WAL is not truncated here because we are
+                // iterating it inside an open read transaction.
+                if let Err(e) = self.persist_committed_seq(index, seq_id) {
+                    tracing::warn!(
+                        index = %index,
+                        error = %e,
+                        "Failed to checkpoint recovery progress; replay will restart from the previous checkpoint"
+                    );
+                }
             }
 
             // Log progress every 1000 documents
@@ -1962,9 +2039,22 @@ impl HybridStore {
             }
         }
 
+        // Documents replayed since the last commit are in the writer's buffer but not yet
+        // durable. Seed the operations counter with them so the normal commit path (threshold
+        // or supervisor idle timeout) flushes them; otherwise the no-op guard in commit_index
+        // would leave them buffered until unrelated traffic arrives for this index.
+        if replayed_since_commit > 0 {
+            self.operations_counter
+                .entry(index.to_string())
+                .or_insert_with(|| AtomicU64::new(0))
+                .value()
+                .fetch_add(replayed_since_commit, Ordering::SeqCst);
+        }
+
         tracing::info!(
             index = %index,
             replayed_count = replayed_count,
+            uncommitted = replayed_since_commit,
             "WAL recovery completed - replayed missing operations"
         );
 
@@ -2338,6 +2428,31 @@ impl HybridStore {
             return Ok((Arc::clone(writer.value()), fields.value().clone()));
         }
 
+        // Slow path: serialize initialization per index. `get_or_create_index` is reachable
+        // concurrently from the shard writer thread, the read pool (stats) and the startup
+        // warmup threads. Without this guard two of them can both miss the fast path and
+        // both call `writer_with_options`, where tantivy's non-blocking `.tantivy-writer.lock`
+        // makes the loser fail with `LockError::LockBusy`.
+        let init_lock = {
+            let entry = self
+                .index_init_locks
+                .entry(index.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())));
+            Arc::clone(entry.value())
+        };
+        let _init_guard = init_lock.lock().unwrap_or_else(|poisoned| {
+            tracing::error!(index = %index, "Index init mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        // Re-check under the init lock: another thread may have finished initialization
+        // while we were waiting for it.
+        if let Some(writer) = self.writers.get(index)
+            && let Some(fields) = self.fields_cache.get(index)
+        {
+            return Ok((Arc::clone(writer.value()), fields.value().clone()));
+        }
+
         // Create index directory and Tantivy index if it doesn't exist
         let index_path = self.config.shard_path.join("indices").join(index);
         let init_start = Instant::now();
@@ -2572,6 +2687,24 @@ impl HybridStore {
         operations_since_commit >= threshold
     }
 
+    /// Number of replayed WAL entries between commits during recovery.
+    ///
+    /// Recovery has different economics from steady-state writes. There is no client waiting
+    /// on durability, so the only reasons to commit mid-replay are bounding the writer's
+    /// in-memory buffer and checkpointing progress. Each commit costs an fsync and seals a
+    /// segment, so committing at the steady-state threshold turns a large WAL into hundreds
+    /// of tiny segments and a long merge tail. Scaled off the configured batch size, with a
+    /// floor that keeps a small `default_batch_size` from checkpointing constantly.
+    fn recovery_commit_threshold(&self) -> u64 {
+        const RECOVERY_THRESHOLD_MULTIPLIER: u64 = 10;
+        const MIN_RECOVERY_COMMIT_OPS: u64 = 25_000;
+
+        let steady_state = self.config.default_batch_size.max(1) as u64;
+        steady_state
+            .saturating_mul(RECOVERY_THRESHOLD_MULTIPLIER)
+            .max(MIN_RECOVERY_COMMIT_OPS)
+    }
+
     /// Get operation count for an index since last commit
     pub fn get_operations_count(&self, index: &str) -> u64 {
         self.operations_counter
@@ -2630,7 +2763,8 @@ impl HybridStore {
 
     /// Force a commit for a specific index.
     /// Skips the commit if there are no pending operations (no-op guard).
-    /// After commit, truncates WAL entries that are now safely persisted in Tantivy.
+    /// After commit, checkpoints the durable sequence and truncates the WAL entries
+    /// that are now safely persisted in Tantivy.
     pub fn commit_index(&self, index: &str) -> Result<(), StoreError> {
         // No-op guard: skip commit if no operations pending since last commit.
         let ops_pending = self.get_operations_count(index);
@@ -2639,60 +2773,75 @@ impl HybridStore {
             return Ok(());
         }
 
-        if let Some(writer_arc) = self.writers.get(index) {
-            // CRITICAL: Minimize lock hold time to prevent deadlocks
-            // The writer lock must be dropped IMMEDIATELY after commit
-            {
-                let mut writer = writer_arc.value().lock().unwrap_or_else(|poisoned| {
-                    tracing::error!(index = %index, "Writer mutex was poisoned during commit, recovering");
-                    poisoned.into_inner()
-                });
-                writer.commit()?;
-                // Explicit drop to release lock before any other operations
-                drop(writer);
-            }
+        let Some(writer_arc) = self.writers.get(index) else {
+            // Pending operations with no writer: the buffered documents were dropped
+            // together with the writer (admin eviction, forced removal). They are NOT in
+            // Tantivy, so the WAL must be kept and the recovery checkpoint must not move —
+            // the next open replays them.
+            tracing::error!(
+                index = %index,
+                ops_pending = ops_pending,
+                "commit_index: writer missing with pending operations; keeping WAL for replay"
+            );
+            return Err(StoreError::IndexNotFound(format!(
+                "no writer for index {index} with {ops_pending} pending operations"
+            )));
+        };
 
-            // All post-commit operations happen WITHOUT holding the writer lock
-            self.reset_operations_counter(index);
+        // Capture the sequence to checkpoint BEFORE committing. Anything allocated after
+        // this point may not be included in the commit below, so claiming it durable would
+        // truncate a WAL entry whose document never reached Tantivy.
+        let committed_seq = self
+            .current_seq
+            .get(index)
+            .map(|counter| counter.load(Ordering::SeqCst));
 
-            tracing::debug!(index = %index, ops_committed = ops_pending, "commit_index: committed");
-
-            // CRITICAL: Smart refresh reader cache after commit to ensure search sees latest data
-            self.smart_refresh_reader(index)?;
-
-            // Refresh budget cache after commit since index size likely changed
-            let index_path = self.config.shard_path.join("indices").join(index);
-            let new_budget = self.config.get_optimal_memory_budget(&index_path, None);
-            self.budget_cache.insert(index.to_string(), new_budget);
+        // CRITICAL: Minimize lock hold time to prevent deadlocks
+        // The writer lock must be dropped IMMEDIATELY after commit
+        {
+            let mut writer = writer_arc.value().lock().unwrap_or_else(|poisoned| {
+                tracing::error!(index = %index, "Writer mutex was poisoned during commit, recovering");
+                poisoned.into_inner()
+            });
+            writer.commit()?;
+            // Explicit drop to release lock before any other operations
+            drop(writer);
         }
+        drop(writer_arc);
 
-        // AFTER Tantivy commit succeeds: Truncate WAL entries that are now safely persisted.
-        // This prevents the WAL from growing indefinitely and ensures that on restart,
-        // we only replay operations that were NOT committed to Tantivy.
-        self.truncate_wal_up_to_committed(index)?;
+        // All post-commit operations happen WITHOUT holding the writer lock
+        self.reset_operations_counter(index);
 
-        // Persist the committed sequence so that on restart we can skip Tantivy
-        // recovery checks for this index if it's fully synced.
-        if let Some(counter) = self.current_seq.get(index) {
-            let committed_seq = counter.load(Ordering::SeqCst);
-            if let Err(e) = self.persist_committed_seq(index, committed_seq) {
-                tracing::warn!(index = %index, error = %e, "Failed to persist committed seq, recovery check will fall back to Tantivy search");
-            }
+        tracing::debug!(index = %index, ops_committed = ops_pending, "commit_index: committed");
+
+        // CRITICAL: Smart refresh reader cache after commit to ensure search sees latest data
+        self.smart_refresh_reader(index)?;
+
+        // Refresh budget cache after commit since index size likely changed
+        let index_path = self.config.shard_path.join("indices").join(index);
+        let new_budget = self.config.get_optimal_memory_budget(&index_path, None);
+        self.budget_cache.insert(index.to_string(), new_budget);
+
+        // AFTER the Tantivy commit succeeds: record the durable sequence and drop the WAL
+        // entries it covers. Both happen in one redb transaction so a crash can never leave
+        // the checkpoint ahead of the WAL.
+        if let Some(seq) = committed_seq {
+            self.checkpoint_committed(index, seq)?;
         }
 
         Ok(())
     }
 
-    /// Truncate WAL entries up to the current sequence counter.
-    /// Called after a successful Tantivy commit — all WAL entries up to current_seq
-    /// are now safely persisted in Tantivy and can be removed from redb.
-    fn truncate_wal_up_to_committed(&self, index: &str) -> Result<(), StoreError> {
-        let last_committed_seq = match self.current_seq.get(index) {
-            Some(counter) => counter.load(Ordering::SeqCst),
-            None => return Ok(()),
-        };
-
-        if last_committed_seq == 0 {
+    /// Record `committed_seq` as durable in Tantivy and drop the WAL entries it covers.
+    ///
+    /// Both writes share a single `Durability::Immediate` transaction: one fsync instead of
+    /// two, and no window where the checkpoint has advanced but the WAL entries it claims
+    /// are still present (or, worse, the reverse).
+    ///
+    /// The caller must have completed a successful `IndexWriter::commit()` covering every
+    /// sequence up to and including `committed_seq`.
+    fn checkpoint_committed(&self, index: &str, committed_seq: u64) -> Result<(), StoreError> {
+        if committed_seq == 0 {
             return Ok(());
         }
 
@@ -2702,24 +2851,26 @@ impl HybridStore {
         let mut write_txn = self.kv.begin_write()?;
         {
             write_txn.set_durability(Durability::Immediate)?;
-            let mut wal_table = write_txn.open_table(wal_table_def)?;
 
-            let keys_to_delete: Vec<u64> = wal_table
-                .range(0..=last_committed_seq)?
-                .map(|result| result.map(|(k, _)| k.value()))
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let deleted_count = keys_to_delete.len();
-            for key in keys_to_delete {
-                wal_table.remove(key)?;
+            let mut deleted_count = 0usize;
+            {
+                let mut wal_table = write_txn.open_table(wal_table_def)?;
+                // retain_in deletes in-place over the range — no Vec of keys to materialize.
+                wal_table.retain_in(0..=committed_seq, |_, _| {
+                    deleted_count += 1;
+                    false
+                })?;
             }
+
+            let mut meta_table = write_txn.open_table(TABLE_RECOVERY_META)?;
+            meta_table.insert(index, committed_seq)?;
 
             if deleted_count > 0 {
                 tracing::debug!(
                     index = %index,
                     deleted = deleted_count,
-                    up_to_seq = last_committed_seq,
-                    "Truncated committed WAL entries"
+                    up_to_seq = committed_seq,
+                    "Checkpointed committed sequence and truncated WAL"
                 );
             }
         }
@@ -3066,6 +3217,13 @@ impl HybridStore {
         self.schema_cache.remove(index);
         self.fields_cache.remove(index);
         self.budget_cache.remove(index);
+        // The operations counter tracks documents buffered in the writer we just dropped.
+        // Leaving it non-zero makes the next commit_index for this name believe there is
+        // unflushed data.
+        self.operations_counter.remove(index);
+        // Note: index_init_locks is deliberately not cleared. A concurrent
+        // get_or_create_index may be holding the lock, and replacing it here would let a
+        // later caller initialize the same index in parallel with that holder.
 
         // Invalidate size cache entries for this index
         {
@@ -3089,6 +3247,15 @@ impl HybridStore {
             // Note: delete_table returns bool indicating if table existed, we ignore the result
             let _ = write_txn.delete_table(data_table_def)?;
             let _ = write_txn.delete_table(wal_table_def)?;
+
+            // Drop the recovery checkpoint together with the data it describes. A stale
+            // checkpoint outlives the deleted index and, once the name is recreated, reads
+            // as "already synced" far beyond the new WAL — which would skip recovery for an
+            // index that genuinely needs it.
+            {
+                let mut meta_table = write_txn.open_table(TABLE_RECOVERY_META)?;
+                let _ = meta_table.remove(index)?;
+            }
 
             // Conditionally delete schema metadata if requested
             if delete_schema {
@@ -4690,24 +4857,18 @@ impl HybridStore {
     /// Get document count from Tantivy index (O(1) operation).
     /// This is faster than querying redb when we don't need size calculation.
     fn get_document_count_from_tantivy(&self, index_name: &str) -> Result<u64, StoreError> {
-        // Try to get reader from cache first
-        if let Some(reader) = self.readers.get(index_name) {
-            let searcher = reader.searcher();
-            return Ok(searcher.num_docs());
-        }
-
-        // If reader not cached, try to create index (which will cache the reader)
-        match self.get_or_create_index(index_name) {
-            Ok(_) => {
-                // Now reader should be cached, try again
-                if let Some(reader) = self.readers.get(index_name) {
-                    let searcher = reader.searcher();
-                    Ok(searcher.num_docs())
-                } else {
-                    Ok(0) // Shouldn't happen, but handle gracefully
-                }
+        // get_reader owns the reader cache: it serves the cached reader when there is one and
+        // otherwise opens the index and caches it. The previous implementation fell back to
+        // get_or_create_index, which only populates the *writer* cache, so the follow-up
+        // reader lookup always missed and this reported 0 documents for any index that had
+        // not been searched yet.
+        match self.get_reader(index_name) {
+            Ok(Some((reader, _fields))) => Ok(reader.searcher().num_docs()),
+            Ok(None) => Ok(0), // Index has no Tantivy directory yet
+            Err(e) => {
+                tracing::debug!(index = %index_name, error = %e, "Failed to open reader for document count");
+                Ok(0)
             }
-            Err(_) => Ok(0), // Index doesn't exist or not yet created
         }
     }
 
