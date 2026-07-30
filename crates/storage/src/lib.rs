@@ -1510,81 +1510,46 @@ pub struct IndexWarmupStats {
     /// Segments actually warmed by this call. Zero means the searcher generation was already
     /// warm and the call was a no-op.
     pub segments_warmed: usize,
+    /// Searcher generation this call observed. Tantivy mints a new one on every
+    /// `IndexReader::reload()`, and readers here reload only from `commit_index`, so this
+    /// changes exactly once per commit.
+    pub generation: u64,
     pub num_docs: u64,
     pub elapsed_ms: u128,
 }
 
-/// Doc store blocks to keep cached per segment while warming. Small on purpose: the point is
-/// to fault the store in and leave a useful cache behind, not to hold the index in memory.
-const DOC_STORE_WARM_CACHE_BLOCKS: usize = 16;
-
-/// Touch the structures `search_documents` reads, so the first real query pays for neither
-/// opening them nor the page faults behind them:
+/// Build the per-field `InvertedIndexReader`s (term dictionaries) a query needs, so the first
+/// real query pays for neither opening them nor the page faults behind them.
 ///
-/// - inverted indexes (term dictionaries) for indexed fields — query parsing and term lookup
-/// - fast field columns — `order_by_fast_field` sorting
-/// - the doc store — `searcher.doc()` for the `id` of every hit
+/// Only inverted indexes are warmed, because in tantivy 0.26 they are the only thing a
+/// `SegmentReader` keeps: `inverted_index()` memoizes into `inv_idx_reader_cache`, so every
+/// later query on this generation reuses the work. The two obvious neighbours do not memoize
+/// and were dropped from this function:
 ///
-/// `SegmentReader::open` already mmaps the underlying composite files; what is deferred, and
-/// what this fills in, is the per-field `InvertedIndexReader` and the typed fast-field
-/// columns. Those live in caches owned by the `SegmentReader`, which tantivy rebuilds from
-/// scratch on every reload — so warming is per *searcher generation*, not per segment. The
-/// durable half of the win is page-cache residency, which outlives any generation.
+/// - fast fields — `FastFieldReaders::u64()` and friends go through `read_columns()`, which
+///   re-reads the columnar on every call; nothing is cached to hand the next query.
+/// - the doc store — `SegmentReader::get_store_reader()` returns a *fresh* `StoreReader` with
+///   its own block cache, dropped the moment warming returns, and the searcher builds its own
+///   store readers regardless.
+///
+/// Warming those two bought page-cache residency and nothing else — which a segment this
+/// process just wrote already has. What remains here is per *searcher generation*, not per
+/// segment: tantivy rebuilds every `SegmentReader` on reload, so the cache dies with the
+/// generation that owned it.
 fn warm_segment(index: &str, segment_reader: &tantivy::SegmentReader) {
-    let schema = segment_reader.schema();
-
-    for (field, field_entry) in schema.fields() {
-        if field_entry.is_indexed() {
-            // Builds and caches this field's InvertedIndexReader (term dictionary).
-            if let Err(e) = segment_reader.inverted_index(field) {
-                trace!(
-                    index = %index,
-                    field = field_entry.name(),
-                    error = %e,
-                    "Warmup: could not open inverted index for field"
-                );
-            }
+    for (field, field_entry) in segment_reader.schema().fields() {
+        if !field_entry.is_indexed() {
+            continue;
         }
-
-        if field_entry.is_fast() {
-            // Column type must match the field type; a mismatch just means this column
-            // stays cold, which is not worth failing a warmup over.
-            let name = field_entry.name();
-            let fast_fields = segment_reader.fast_fields();
-            let opened = match field_entry.field_type() {
-                tantivy::schema::FieldType::Str(_) => {
-                    fast_fields.str(name).map(|column| column.is_some())
-                }
-                tantivy::schema::FieldType::U64(_) => fast_fields.u64(name).map(|_| true),
-                tantivy::schema::FieldType::I64(_) => fast_fields.i64(name).map(|_| true),
-                tantivy::schema::FieldType::F64(_) => fast_fields.f64(name).map(|_| true),
-                tantivy::schema::FieldType::Bool(_) => fast_fields.bool(name).map(|_| true),
-                tantivy::schema::FieldType::Date(_) => fast_fields.date(name).map(|_| true),
-                tantivy::schema::FieldType::IpAddr(_) => fast_fields.ip_addr(name).map(|_| true),
-                tantivy::schema::FieldType::Bytes(_) => {
-                    fast_fields.bytes(name).map(|column| column.is_some())
-                }
-                _ => Ok(false),
-            };
-            if let Err(e) = opened {
-                trace!(
-                    index = %index,
-                    field = name,
-                    error = %e,
-                    "Warmup: could not open fast field column"
-                );
-            }
+        // Builds and caches this field's InvertedIndexReader (term dictionary).
+        if let Err(e) = segment_reader.inverted_index(field) {
+            trace!(
+                index = %index,
+                field = field_entry.name(),
+                error = %e,
+                "Warmup: could not open inverted index for field"
+            );
         }
-    }
-
-    // The doc store is on the hot path: every hit resolves its `id` through
-    // `searcher.doc()` before the documents are batch-fetched from redb.
-    if let Err(e) = segment_reader.get_store_reader(DOC_STORE_WARM_CACHE_BLOCKS) {
-        trace!(
-            index = %index,
-            error = %e,
-            "Warmup: could not open doc store reader"
-        );
     }
 }
 
@@ -2687,9 +2652,12 @@ impl HybridStore {
         // WAL Recovery: Check if there are any operations in the WAL that need to be replayed
         // This happens when the index was opened after a crash or restart
         let recovery_start = Instant::now();
+        // Manual reload: this reader is local to recovery and is only read before any commit
+        // (`get_highest_indexed_seq`). See `get_reader` for why no reader here watches the
+        // directory.
         let reader = tantivy_index
             .reader_builder()
-            .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
+            .reload_policy(tantivy::ReloadPolicy::Manual)
             .try_into()?;
 
         let (replayed_count, max_wal_seq, last_committed_seq) =
@@ -2720,6 +2688,19 @@ impl HybridStore {
                 "Recovery complete - {} operations in Tantivy buffer, will persist on next commit",
                 replayed_count
             );
+
+            // Replay may have made threshold commits, and a query arriving during recovery
+            // can already have cached a reader for this directory — the shard answers
+            // searches throughout startup. Readers reload only when told to, and the next
+            // `commit_index` may be far off on an index that stops taking writes here, so
+            // tell them now rather than serving the pre-recovery segment set until then.
+            if let Err(e) = self.smart_refresh_reader(index) {
+                tracing::warn!(
+                    index = %index,
+                    error = %e,
+                    "Could not refresh reader after recovery; it will refresh on the next commit"
+                );
+            }
         }
 
         let recovery_elapsed = recovery_start.elapsed();
@@ -3753,14 +3734,15 @@ impl HybridStore {
         Ok(fields)
     }
 
-    /// Get or create a cached IndexReader for the given index
-    /// Uses lock-free fast path with DashMap and ReloadPolicy::OnCommitWithDelay for automatic background updates
+    /// Get or create a cached IndexReader for the given index.
+    ///
+    /// Lock-free fast path via DashMap. Readers reload only when `commit_index` tells them to.
     fn get_reader(&self, index: &str) -> Result<Option<(IndexReader, SchemaFields)>, StoreError> {
         // Fast path: Zero-lock retrieval from cache
         if let Some(reader_ref) = self.readers.get(index) {
             let reader = reader_ref.value();
-            // Note: Manual reload() removed. Reader configured with ReloadPolicy::OnCommitWithDelay
-            // will automatically reload within milliseconds after commits.
+            // No reload() here: `commit_index` reloads through `smart_refresh_reader` as part
+            // of the commit, so a cached reader is already current.
 
             // Get fields (fast lookup)
             let tantivy_index = reader.searcher().index().clone();
@@ -3782,18 +3764,28 @@ impl HybridStore {
             .or_try_insert_with(|| {
                 let tantivy_index = Index::open_in_dir(&index_path)?;
 
-                // Configure reader with ReloadPolicy::OnCommitWithDelay for automatic background reloading
-                // This watches meta.json and reloads within milliseconds after commits.
+                // `ReloadPolicy::Manual`, deliberately. Every commit in this process goes
+                // through `commit_index`, which reloads the reader itself, so the alternative
+                // (`OnCommitWithDelay`) would only ever reload a *second* time for a commit
+                // already reflected here. That redundant reload is not free:
                 //
-                // Deliberately no tantivy `Warmer` registered here. Warmers run synchronously
-                // inside `reload()`, and `commit_index` reloads on the shard writer thread, so
-                // a registered warmer would put warming on the write hot path. Registering one
-                // also makes tantivy spawn a `tantivy-warm-gc` thread per reader — one thread
-                // per open index. Warming is instead driven explicitly by `warm_index`, off
-                // the writer thread. See `warm_index` for what that costs us.
+                // - it makes tantivy spawn a `thread-tantivy-meta-file-watcher` per open
+                //   index, each waking every 500ms forever to read and checksum meta.json,
+                // - and because reload() rebuilds every SegmentReader, it discards the caches
+                //   `warm_index` had just filled for the generation the first reload made.
+                //
+                // What manual reloading gives up: segments published by a background merge
+                // become visible at the next commit rather than within 500ms. Nothing reads
+                // stale data — the live searcher keeps its own (pre-merge) segments
+                // referenced, and merges are triggered by commits anyway.
+                //
+                // Also deliberately no tantivy `Warmer`: warmers run synchronously inside
+                // reload(), which happens on the shard writer thread, so one would put
+                // warming on the write hot path — and cost another thread per open index.
+                // Warming is driven explicitly by `warm_index` instead.
                 let reader = tantivy_index
                     .reader_builder()
-                    .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
+                    .reload_policy(tantivy::ReloadPolicy::Manual)
                     .try_into()?;
 
                 Ok::<IndexReader, StoreError>(reader)
@@ -3809,8 +3801,8 @@ impl HybridStore {
     /// Warm one index so the first query does not pay cold-start costs.
     ///
     /// Opens and caches the `IndexReader` (which is what the search path uses — the *writer*
-    /// cache is irrelevant to queries), populates the schema and field caches, and faults in
-    /// each segment's term dictionaries, fast field columns and doc store.
+    /// cache is irrelevant to queries), populates the schema and field caches, and builds each
+    /// segment's term dictionaries. See [`warm_segment`] for why that is the whole list.
     ///
     /// Best-effort by design. Warming is driven explicitly — at startup and after commits —
     /// rather than by a registered tantivy `Warmer`, which would run on the writer thread
@@ -3878,6 +3870,7 @@ impl HybridStore {
             index: index.to_string(),
             segments,
             segments_warmed,
+            generation,
             num_docs: searcher.num_docs(),
             elapsed_ms: start.elapsed().as_millis(),
         };
@@ -5433,8 +5426,13 @@ mod tests {
             "the first warm must warm every segment"
         );
 
-        // The generation is unchanged, so a second warm must do no work.
+        // Nothing reloads a reader except `commit_index`, so the generation cannot move
+        // under us here and a second warm must do no work.
         let second = store.warm_index(index).unwrap().expect("stats");
+        assert_eq!(
+            second.generation, first.generation,
+            "no commit means no reload, so no new generation"
+        );
         assert_eq!(
             second.segments_warmed, 0,
             "re-warming an unchanged generation must be a no-op"

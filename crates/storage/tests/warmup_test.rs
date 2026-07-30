@@ -255,7 +255,8 @@ fn commit_invalidates_warmup_and_rewarm_restores_it() {
     let first = store.warm_index(index).expect("warm_index").expect("stats");
     assert!(first.segments_warmed > 0, "first warm must do work");
 
-    // Re-warming the same generation is free.
+    // Re-warming the same generation is free. Readers reload only from `commit_index`, so
+    // without a commit the generation — and its warmed caches — stay put.
     let repeat = store.warm_index(index).expect("warm_index").expect("stats");
     assert_eq!(
         repeat.segments_warmed, 0,

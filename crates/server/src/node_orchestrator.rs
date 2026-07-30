@@ -34,9 +34,10 @@
 //!   requests posted by the writer thread after each commit. Never on a request path.
 //! - **tantivy, per open index** — `indexer_num_threads` + `merge_num_threads` per
 //!   `IndexWriter`. Thread count therefore scales with the number of *open* indices, not
-//!   just shards. No warming threads: warming is driven explicitly from the shard's warmup
-//!   thread rather than through a registered tantivy `Warmer`, which would both run on the
-//!   writer thread inside `reload()` and add a GC thread per open index.
+//!   just shards. Nothing else is per-index: readers use `ReloadPolicy::Manual` (no
+//!   `thread-tantivy-meta-file-watcher` polling meta.json every 500ms per index) and register
+//!   no `Warmer` (no GC thread per index). Reloading and warming are both driven explicitly —
+//!   reloads from `commit_index`, warming from the shard's warmup thread.
 //!
 //! Note that `core_affinity::set_for_current` is a no-op on macOS, so every pinning path
 //! here degrades to unpinned threads on that platform and only takes effect on Linux.
@@ -5392,174 +5393,47 @@ impl NodeOrchestrator {
             self.shards.len()
         );
 
-        // Spawn detached background task for reader warmup (schema preloading)
-        // This allows the node to start serving requests immediately while readers warm up
-        let shard_count = self.shards.len();
-        if shard_count > 0 {
-            // Clone necessary data for background task
-            let shards_for_warmup: Vec<(Uuid, Option<Arc<storage::HybridStore>>)> = self
-                .shards
-                .iter()
-                .map(|(id, shard)| (*id, shard.store.clone()))
-                .collect();
+        // Reader warmup is not spawned here. Each shard warms its own readers on its own
+        // warmup thread (phase 2 in `start_shard`), which walks that shard's indices smallest
+        // first and sequentially. A second, node-wide warmup fanned out over every
+        // shard × index in parallel — as this function used to do with a `SELECT *` per pair —
+        // duplicates that work and turns startup IO into a seek storm.
+        //
+        // The statistics cache is a different cache, and still worth priming: it is what the
+        // admin and index-listing endpoints read, and computing data sizes walks the index
+        // directories.
+        let stats_stores: Vec<(Uuid, Arc<storage::HybridStore>)> = self
+            .shards
+            .iter()
+            .filter_map(|(id, shard)| shard.store.clone().map(|store| (*id, store)))
+            .collect();
 
+        if !stats_stores.is_empty() {
             tokio::spawn(async move {
-                info!(
-                    "Starting background reader warmup for {} shards",
-                    shard_count
-                );
+                let started = std::time::Instant::now();
+                let shard_count = stats_stores.len();
 
-                // Get all unique index names from the first shard (all shards have the same indexes)
-                let mut all_index_names = std::collections::HashSet::new();
-                if let Some((first_shard_id, Some(store))) = shards_for_warmup.first() {
-                    let sc = Arc::clone(store);
-                    match tokio::task::spawn_blocking({
-                        let sc_clone = Arc::clone(&sc);
-                        move || sc_clone.get_index_names()
-                    })
-                    .await
+                for (shard_id, store) in stats_stores {
+                    // One shard at a time, for the same reason phase 2 warms one index at a
+                    // time: these all hit the same disk.
+                    match tokio::task::spawn_blocking(move || store.gather_index_stats(true)).await
                     {
-                        Ok(Ok(index_names)) => {
-                            for index_name in index_names {
-                                all_index_names.insert(index_name);
-                            }
-                            info!(
-                                "Found {} unique indexes for reader warmup",
-                                all_index_names.len()
-                            );
-                        }
+                        Ok(Ok(_)) => debug!(shard_id = %shard_id, "Stats cache primed"),
                         Ok(Err(e)) => {
-                            warn!(
-                                shard_id = %first_shard_id,
-                                error = %e,
-                                "Failed to get index names for warmup"
-                            );
+                            warn!(shard_id = %shard_id, error = %e, "Stats cache priming failed")
                         }
                         Err(e) => {
-                            warn!(
-                                shard_id = %first_shard_id,
-                                error = %e,
-                                "Task panicked while getting index names"
-                            );
+                            warn!(shard_id = %shard_id, error = %e, "Stats cache task panicked")
                         }
                     }
                 }
 
-                // Warm up readers in PARALLEL for all shards and indexes
-                // This populates DashMap cache and forces Tantivy to mmap segment files
-                let warmup_start = std::time::Instant::now();
-                let mut warmup_tasks = Vec::new();
-
-                for index_name in &all_index_names {
-                    for (shard_id, store_opt) in &shards_for_warmup {
-                        if let Some(store) = store_opt {
-                            let sc = Arc::clone(store);
-                            let index = index_name.clone();
-                            let sid = *shard_id;
-
-                            // Spawn parallel warmup tasks
-                            let task = tokio::task::spawn_blocking(move || {
-                                // Trigger reader creation/caching by performing a dummy search
-                                // This warms up the DashMap cache with IndexReaders AND
-                                // forces Tantivy to mmap segment files into memory
-                                let result = sc.search_documents(&index, "*", 1, None);
-                                (sid, index, result)
-                            });
-                            warmup_tasks.push(task);
-                        }
-                    }
-                }
-
-                // Wait for all warmup tasks to complete
-                let total_tasks = warmup_tasks.len();
-                let mut success_count = 0;
-                let mut fail_count = 0;
-
-                for task in warmup_tasks {
-                    match task.await {
-                        Ok((shard_id, index_name, Ok(_))) => {
-                            debug!(
-                                shard_id = %shard_id,
-                                index = %index_name,
-                                "Reader warmed up successfully"
-                            );
-                            success_count += 1;
-                        }
-                        Ok((shard_id, index_name, Err(e))) => {
-                            debug!(
-                                shard_id = %shard_id,
-                                index = %index_name,
-                                error = %e,
-                                "Reader warmup failed (index may not exist in this shard)"
-                            );
-                            fail_count += 1;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Reader warmup task panicked");
-                            fail_count += 1;
-                        }
-                    }
-                }
-
-                let warmup_elapsed = warmup_start.elapsed();
                 info!(
-                    total_tasks = total_tasks,
-                    success = success_count,
-                    failed = fail_count,
-                    elapsed_ms = warmup_elapsed.as_millis(),
-                    "Background reader warmup completed for all shards"
-                );
-
-                // After reader warmup, trigger cache warmup by calling gather_index_stats with include_data_size=true
-                // This populates both "fast" and "full" cache entries for all indexes on all shards
-                info!("Starting background cache warmup for index statistics");
-                let cache_warmup_start = std::time::Instant::now();
-                let mut cache_warmup_tasks = Vec::new();
-
-                for (shard_id, store_opt) in &shards_for_warmup {
-                    if let Some(store) = store_opt {
-                        let sc = Arc::clone(store);
-                        let sid = *shard_id;
-
-                        let task = tokio::task::spawn_blocking(move || {
-                            let result = sc.gather_index_stats(true);
-                            (sid, result)
-                        });
-                        cache_warmup_tasks.push(task);
-                    }
-                }
-
-                let mut cache_success = 0;
-                let mut cache_fail = 0;
-                for task in cache_warmup_tasks {
-                    match task.await {
-                        Ok((shard_id, Ok(_))) => {
-                            debug!(shard_id = %shard_id, "Cache warmup succeeded");
-                            cache_success += 1;
-                        }
-                        Ok((shard_id, Err(e))) => {
-                            warn!(shard_id = %shard_id, error = %e, "Cache warmup failed");
-                            cache_fail += 1;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Cache warmup task panicked");
-                            cache_fail += 1;
-                        }
-                    }
-                }
-
-                let cache_warmup_elapsed = cache_warmup_start.elapsed();
-                info!(
-                    success = cache_success,
-                    failed = cache_fail,
-                    elapsed_ms = cache_warmup_elapsed.as_millis(),
-                    "Background cache warmup completed for all shards"
+                    shards = shard_count,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "Index statistics cache primed for all shards"
                 );
             });
-
-            info!(
-                "Reader warmup and cache warmup spawned in background, node is ready to serve requests"
-            );
         }
 
         Ok(())
