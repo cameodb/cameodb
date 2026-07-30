@@ -59,65 +59,75 @@ async fn main() -> Result<()> {
     // Handle CLI arguments for configuration utilities and client mode
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() > 1 {
-        let wants_client = args.iter().skip(1).any(|arg| {
-            matches!(
-                arg.as_str(),
-                "client" | "health" | "index" | "search" | "schema" | "data" | "list" | "delete"
-            )
-        });
-        let interactive_requested = args
-            .iter()
-            .skip(1)
-            .any(|arg| arg == "-i" || arg == "--interactive");
+    // Subcommands are dispatched on the first argument only. Matching anywhere in the
+    // argument list would let a server flag's *value* — `--node-label search`, say — hijack
+    // the process into client mode.
+    let subcommand = args.get(1).map(String::as_str).unwrap_or_default();
+    let interactive_requested = args
+        .iter()
+        .skip(1)
+        .any(|arg| arg == "-i" || arg == "--interactive");
 
-        if wants_client || interactive_requested {
-            return client::run_cli().await;
-        }
-
-        if let Some(arg) = args.get(1).map(String::as_str) {
-            match arg {
-                "--version" | "-V" => {
-                    println!("cameodb {}", env!("CARGO_PKG_VERSION"));
-                    return Ok(());
-                }
-                "generate-config" => {
-                    println!("{}", CameoDbConfig::generate_sample_config()?);
-                    return Ok(());
-                }
-                "--help" | "-h" => {
-                    println!(
-                        "cameodb {}\n\n\
-                         Usage:\n  \
-                         cameodb [OPTIONS]\n  \
-                         cameodb generate-config\n  \
-                         cameodb client <subcommand>\n\n\
-                         Options:\n  \
-                         -h, --help       Show this help message\n  \
-                         -V, --version    Show version information\n\n\
-                         Commands:\n  \
-                         generate-config  Print a sample configuration file\n  \
-                         client           Run the bundled client CLI (health, index, search)\n\n\
-                         Client examples:\n  \
-                         cameodb client health\n  \
-                         cameodb client index list\n  \
-                         cameodb client search myindex \"foo bar\" --limit 5 --url http://host:9480\n\n\
-                         When no command is provided, cameodb starts the server using configuration\n  \
-                         loaded from config files and environment variables.",
-                        env!("CARGO_PKG_VERSION")
-                    );
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
+    if interactive_requested
+        || matches!(
+            subcommand,
+            "client" | "health" | "index" | "search" | "schema" | "data" | "list" | "delete"
+        )
+    {
+        return client::run_cli().await;
     }
 
-    // Load configuration from multiple sources
-    let cameodb_config = CameoDbConfig::load()?;
+    if args
+        .iter()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("cameodb {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
-    // Initialize tracing with configuration
+    if subcommand == "generate-config" {
+        println!("{}", CameoDbConfig::generate_sample_config()?);
+        return Ok(());
+    }
+
+    if args
+        .iter()
+        .skip(1)
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        println!(
+            "cameodb {}\n\n\
+             Usage:\n  \
+             cameodb [OPTIONS]\n  \
+             cameodb generate-config\n  \
+             cameodb client <subcommand>\n\n\
+             Options:\n\
+             {}\n  \
+             -h, --help                                  Show this help message\n  \
+             -V, --version                               Show version information\n\n\
+             Commands:\n  \
+             generate-config  Print a sample configuration file\n  \
+             client           Run the bundled client CLI (health, index, search)\n\n\
+             Client examples:\n  \
+             cameodb client health\n  \
+             cameodb client index list\n  \
+             cameodb client search myindex \"foo bar\" --limit 5 --url http://host:9480\n\n\
+             Configuration sources, highest precedence first: command-line options, then the\n  \
+             CAMEODB_* environment variables shown above, then the config file, then defaults.",
+            env!("CARGO_PKG_VERSION"),
+            config::cli_help(),
+        );
+        return Ok(());
+    }
+
+    // Initialize tracing before loading config, so that which config file was chosen — and
+    // any complaint about it — is visible rather than swallowed.
     tracing_subscriber::fmt::init();
+
+    // Load configuration: command line over environment over file over defaults.
+    let cli_overrides = config::CliOverrides::parse(args.into_iter().skip(1))?;
+    let cameodb_config = CameoDbConfig::load_with_cli(&cli_overrides)?;
 
     // Establish deterministic node identity from libp2p keypair
     let primary_path = cameodb_config

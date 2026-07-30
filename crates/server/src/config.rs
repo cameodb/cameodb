@@ -43,6 +43,321 @@ pub enum ConfigError {
 
     #[error("Network configuration error: {message}")]
     NetworkConfig { message: String },
+
+    #[error("{message}\n\nRun `cameodb --help` for the list of options.")]
+    CommandLine { message: String },
+}
+
+/// Whether a flag carries a value or is a bare switch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlagKind {
+    /// `--http-port 9480` or `--http-port=9480`.
+    Value,
+    /// `--cluster-enabled` (means `true`), or an explicit `--cluster-enabled=false`.
+    Switch,
+}
+
+/// One setting that can be overridden after the config file is read.
+///
+/// Each entry ties a flag and an environment variable to a single setter, which is the point:
+/// the two layers are declared together, so neither can be added, renamed or given different
+/// parsing rules without the other. [`CameoDbConfig::apply_overrides`] walks this table, and
+/// [`cli_help`] renders it into `--help`, so the flag list cannot go stale either.
+struct Override {
+    /// Long flag, including the leading dashes.
+    flag: &'static str,
+    /// Environment variable with the same effect.
+    env: &'static str,
+    kind: FlagKind,
+    /// Value placeholder shown in `--help` (empty for switches).
+    placeholder: &'static str,
+    help: &'static str,
+    /// Applies a raw string — from either layer — to the config.
+    apply: fn(&mut CameoDbConfig, &str) -> Result<()>,
+}
+
+/// Parse the boolean spellings the environment layer has always accepted; anything else is
+/// false. Kept lenient, and identical for flags, so `FOO=yes` and `--foo=yes` agree.
+fn parse_bool(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes"
+    )
+}
+
+/// Split a comma- or semicolon-separated list, dropping empty entries.
+fn parse_list(raw: &str) -> Vec<String> {
+    raw.split([',', ';'])
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every setting overridable from the command line or the environment.
+#[rustfmt::skip]
+const OVERRIDES: &[Override] = &[
+    Override {
+        flag: "--http-port", env: "CAMEODB_HTTP_PORT", kind: FlagKind::Value,
+        placeholder: "<PORT>", help: "HTTP API listen port",
+        apply: |c, v| { c.network.http.port = v.parse()?; Ok(()) },
+    },
+    Override {
+        flag: "--http-bind-address", env: "CAMEODB_HTTP_BIND_ADDRESS", kind: FlagKind::Value,
+        placeholder: "<ADDR>", help: "HTTP API bind address",
+        apply: |c, v| { c.network.http.bind_address = v.to_string(); Ok(()) },
+    },
+    Override {
+        flag: "--max-record-size-mb", env: "CAMEODB_MAX_RECORD_SIZE_MB", kind: FlagKind::Value,
+        placeholder: "<MB>", help: "Largest accepted record; derives body and message limits",
+        apply: |c, v| { c.max_record_size_mb = v.parse()?; Ok(()) },
+    },
+    Override {
+        flag: "--max-body-size-mb", env: "CAMEODB_MAX_BODY_SIZE_MB", kind: FlagKind::Value,
+        placeholder: "<MB>", help: "HTTP body limit (defaults to derived from record size)",
+        apply: |c, v| { c.network.http.max_body_size_mb = v.parse()?; Ok(()) },
+    },
+    Override {
+        flag: "--data-paths", env: "CAMEODB_DATA_PATHS", kind: FlagKind::Value,
+        placeholder: "<PATHS>", help: "Colon-separated storage directories",
+        apply: |c, v| { c.storage.data_paths = v.split(':').map(PathBuf::from).collect(); Ok(()) },
+    },
+    Override {
+        flag: "--storage-wal-sync", env: "CAMEODB_STORAGE_WAL_SYNC", kind: FlagKind::Switch,
+        placeholder: "", help: "fsync the WAL on every write",
+        apply: |c, v| { c.storage.wal_sync = parse_bool(v); Ok(()) },
+    },
+    Override {
+        flag: "--storage-default-batch-size", env: "CAMEODB_STORAGE_DEFAULT_BATCH_SIZE", kind: FlagKind::Value,
+        placeholder: "<N>", help: "Documents per write batch before an automatic commit",
+        apply: |c, v| { c.storage.default_batch_size = v.parse()?; Ok(()) },
+    },
+    Override {
+        flag: "--indexer-memory-min-mb", env: "CAMEODB_INDEXER_MEMORY_MIN_MB", kind: FlagKind::Value,
+        placeholder: "<MB>", help: "Lower bound on per-index writer memory",
+        apply: |c, v| { c.search.indexer_memory_min_mb = v.parse()?; Ok(()) },
+    },
+    Override {
+        flag: "--indexer-memory-max-mb", env: "CAMEODB_INDEXER_MEMORY_MAX_MB", kind: FlagKind::Value,
+        placeholder: "<MB>", help: "Upper bound on per-index writer memory",
+        apply: |c, v| { c.search.indexer_memory_max_mb = v.parse()?; Ok(()) },
+    },
+    Override {
+        flag: "--total-memory-limit-mb", env: "CAMEODB_TOTAL_MEMORY_LIMIT_MB", kind: FlagKind::Value,
+        placeholder: "<MB>", help: "Memory budget shared by all indices on this node",
+        apply: |c, v| { c.search.total_memory_limit_mb = v.parse()?; Ok(()) },
+    },
+    Override {
+        flag: "--memory-pressure-threshold-percent", env: "CAMEODB_MEMORY_PRESSURE_THRESHOLD_PERCENT", kind: FlagKind::Value,
+        placeholder: "<PCT>", help: "Percent of the budget that counts as memory pressure",
+        apply: |c, v| { c.search.memory_pressure_threshold_percent = v.parse()?; Ok(()) },
+    },
+    Override {
+        flag: "--default-search-limit", env: "CAMEODB_DEFAULT_SEARCH_LIMIT", kind: FlagKind::Value,
+        placeholder: "<N>", help: "Hits returned when a query names no limit",
+        apply: |c, v| { c.search.default_search_limit = v.parse()?; Ok(()) },
+    },
+    Override {
+        flag: "--supervisor-timeout-secs", env: "CAMEODB_SUPERVISOR_TIMEOUT_SECS", kind: FlagKind::Value,
+        placeholder: "<SECS>", help: "Shard supervisor timeout",
+        apply: |c, v| { c.search.supervisor_timeout_secs = v.parse()?; Ok(()) },
+    },
+    Override {
+        flag: "--node-label", env: "CAMEODB_NODE_LABEL", kind: FlagKind::Value,
+        placeholder: "<NAME>", help: "Human-readable name for this node",
+        apply: |c, v| { c.node.label = Some(v.to_string()); Ok(()) },
+    },
+    Override {
+        flag: "--node-zone", env: "CAMEODB_NODE_ZONE", kind: FlagKind::Value,
+        placeholder: "<ZONE>", help: "Availability zone this node reports",
+        apply: |c, v| { c.node.zone = v.to_string(); Ok(()) },
+    },
+    Override {
+        flag: "--cluster-enabled", env: "CAMEODB_CLUSTER_ENABLED", kind: FlagKind::Switch,
+        placeholder: "", help: "Join a cluster instead of running single-node",
+        apply: |c, v| { c.network.cluster.enabled = parse_bool(v); Ok(()) },
+    },
+    Override {
+        flag: "--cluster-bind-address", env: "CAMEODB_CLUSTER_BIND_ADDRESS", kind: FlagKind::Value,
+        placeholder: "<ADDR>", help: "Cluster transport bind address",
+        apply: |c, v| { c.network.cluster.bind_address = v.to_string(); Ok(()) },
+    },
+    Override {
+        flag: "--cluster-port", env: "CAMEODB_CLUSTER_PORT", kind: FlagKind::Value,
+        placeholder: "<PORT>", help: "Cluster transport port",
+        apply: |c, v| { c.network.cluster.cluster_port = v.parse()?; Ok(()) },
+    },
+    Override {
+        flag: "--cluster-name", env: "CAMEODB_CLUSTER_NAME", kind: FlagKind::Value,
+        placeholder: "<NAME>", help: "Cluster this node belongs to (ignored if empty)",
+        apply: |c, v| {
+            if !v.trim().is_empty() { c.network.cluster.cluster_name = v.to_string(); }
+            Ok(())
+        },
+    },
+    Override {
+        flag: "--seed-nodes", env: "CAMEODB_SEED_NODES", kind: FlagKind::Value,
+        placeholder: "<ADDRS>", help: "Comma-separated seed node addresses (ignored if empty)",
+        apply: |c, v| {
+            let parsed = parse_list(v);
+            if !parsed.is_empty() { c.network.cluster.seed_nodes = parsed; }
+            Ok(())
+        },
+    },
+    Override {
+        flag: "--cluster-nodes", env: "CAMEODB_CLUSTER_NODES", kind: FlagKind::Value,
+        placeholder: "<ADDRS>", help: "Comma-separated static cluster members (ignored if empty)",
+        apply: |c, v| {
+            let parsed = parse_list(v);
+            if !parsed.is_empty() { c.network.cluster.cluster_nodes = parsed; }
+            Ok(())
+        },
+    },
+];
+
+/// Configuration overrides collected from the command line.
+///
+/// Values are kept as raw strings and interpreted by [`OVERRIDES`] during
+/// [`CameoDbConfig::load_with_cli`], so parsing a command line never depends on config state
+/// and can be unit-tested on its own.
+#[derive(Debug, Default, Clone)]
+pub struct CliOverrides {
+    /// `--config <path>`, if given.
+    pub config_path: Option<String>,
+    /// `(flag, raw value)` in the order the flags appeared; a repeated flag keeps the last.
+    values: Vec<(&'static str, String)>,
+}
+
+impl CliOverrides {
+    /// Parse server flags from `args`, which must not include the program name.
+    ///
+    /// Unknown flags and missing values are hard errors. Silently ignoring them is what let
+    /// `cameodb --config foo.toml` start on a completely different configuration than asked.
+    pub fn parse<I>(args: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut parsed = Self::default();
+        let mut args = args.into_iter().peekable();
+
+        while let Some(arg) = args.next() {
+            let (name, inline_value) = match arg.split_once('=') {
+                Some((name, value)) => (name.to_string(), Some(value.to_string())),
+                None => (arg.clone(), None),
+            };
+
+            if name == "--config" || name == "-c" {
+                let path = match inline_value {
+                    Some(value) => value,
+                    None => args.next().ok_or_else(|| ConfigError::CommandLine {
+                        message: format!("{name} requires a path"),
+                    })?,
+                };
+                parsed.config_path = Some(path);
+                continue;
+            }
+
+            let Some(entry) = OVERRIDES.iter().find(|entry| entry.flag == name) else {
+                return Err(ConfigError::CommandLine {
+                    message: format!("Unknown option: {arg}"),
+                }
+                .into());
+            };
+
+            let value = match (inline_value, entry.kind) {
+                (Some(value), _) => value,
+                // A bare switch means "true"; it must not swallow the next argument.
+                (None, FlagKind::Switch) => "true".to_string(),
+                (None, FlagKind::Value) => args.next().ok_or_else(|| ConfigError::CommandLine {
+                    message: format!("{} requires a value {}", entry.flag, entry.placeholder),
+                })?,
+            };
+
+            parsed.values.retain(|(flag, _)| *flag != entry.flag);
+            parsed.values.push((entry.flag, value));
+        }
+
+        Ok(parsed)
+    }
+
+    /// Whether the operator named a config file on the command line.
+    fn has_explicit_config_path(&self) -> bool {
+        self.config_path.is_some() || std::env::var_os("CAMEODB_CONFIG").is_some()
+    }
+
+    /// The raw value given for `flag`, if any.
+    fn value_for(&self, flag: &str) -> Option<&str> {
+        self.values
+            .iter()
+            .find(|(name, _)| *name == flag)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Dotted paths in `content` that no configuration field claims, deepest name last
+/// (`storrage`, `network.http.prot`).
+///
+/// TOML only: it is the documented format, the one `generate-config` emits, and the one a
+/// generic value tree is cheap to build for. A YAML file simply gets no report.
+fn unrecognized_keys(content: &str) -> Vec<String> {
+    let Ok(parsed) = toml::from_str::<toml::Value>(content) else {
+        return Vec::new();
+    };
+    // The schema is the serialized default config: exactly the set of keys that mean
+    // something, derived from the structs themselves rather than a hand-maintained list.
+    let Ok(schema) = toml::Value::try_from(CameoDbConfig::default()) else {
+        return Vec::new();
+    };
+
+    let mut unknown = Vec::new();
+    collect_unrecognized(&parsed, &schema, "", &mut unknown);
+    unknown
+}
+
+/// Walk `parsed` against `schema`, recording paths absent from the schema.
+fn collect_unrecognized(
+    parsed: &toml::Value,
+    schema: &toml::Value,
+    prefix: &str,
+    unknown: &mut Vec<String>,
+) {
+    let (Some(parsed), Some(schema)) = (parsed.as_table(), schema.as_table()) else {
+        return;
+    };
+
+    for (key, value) in parsed {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+
+        match schema.get(key) {
+            // Recurse only into nested tables; a table where the schema wants a value (or the
+            // reverse) is a type error the parse above would already have rejected.
+            Some(known) => collect_unrecognized(value, known, &path, unknown),
+            None => unknown.push(path),
+        }
+    }
+}
+
+/// Render the server options for `--help`, straight from [`OVERRIDES`].
+pub fn cli_help() -> String {
+    let mut lines = vec![format!(
+        "  {:<44}{}",
+        "-c, --config <PATH>", "Configuration file to load (TOML or YAML)"
+    )];
+
+    for entry in OVERRIDES {
+        let flag = if entry.placeholder.is_empty() {
+            entry.flag.to_string()
+        } else {
+            format!("{} {}", entry.flag, entry.placeholder)
+        };
+        lines.push(format!("  {:<44}{} [{}]", flag, entry.help, entry.env));
+    }
+
+    lines.join("\n")
 }
 
 impl StorageConfig {
@@ -59,11 +374,17 @@ impl StorageConfig {
     }
 }
 
-/// Complete CameoDB configuration structure
+/// Complete CameoDB configuration structure.
+///
+/// Every struct in this module carries a container-level `#[serde(default)]`, so a config
+/// file may contain as much or as little as it wants: name only the settings you are
+/// changing, and everything else — whole sections included — comes from [`Default`]. Each
+/// `Default` impl is built from the same `default_*()` functions the per-field
+/// `#[serde(default = "...")]` attributes use, so the two can never disagree about a value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CameoDbConfig {
     /// Node-level configuration (sharding, identity)
-    #[serde(default)]
     pub node: NodeConfig,
 
     /// Network configuration (HTTP, cluster)
@@ -92,6 +413,7 @@ pub struct CameoDbConfig {
 
 /// Network configuration wrapper
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct NetworkConfig {
     /// HTTP server configuration
     pub http: HttpConfig,
@@ -103,6 +425,7 @@ pub struct NetworkConfig {
 
 /// HTTP server specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HttpConfig {
     /// Bind address for HTTP server (default: "0.0.0.0")
     #[serde(default = "default_http_bind_address")]
@@ -130,6 +453,7 @@ pub struct HttpConfig {
 
 /// Node-level configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NodeConfig {
     /// Human-readable label for this node (optional, for logs/dashboards)
     #[serde(default = "default_node_label_opt")]
@@ -142,6 +466,7 @@ pub struct NodeConfig {
 
 /// Storage configuration for data persistence
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StorageConfig {
     /// List of data directories for multi-disk setups
     /// Each path serves as a mount point for data storage
@@ -201,6 +526,7 @@ pub struct StorageConfig {
 
 /// Cluster configuration for distributed actor system
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ClusterConfig {
     /// Enable distributed cluster mode (default: false)
     #[serde(default = "default_cluster_enabled")]
@@ -244,6 +570,7 @@ pub struct ClusterConfig {
 
 /// Messaging configuration for Kameo remote actors
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MessagingConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_request_timeout_secs")]
@@ -272,6 +599,7 @@ pub struct MessagingConfig {
 
 /// Tantivy search engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SearchConfig {
     /// Minimum indexer memory in MB (default: 16)
     #[serde(default = "default_indexer_memory_min_mb")]
@@ -395,22 +723,38 @@ impl CameoDbConfig {
         }
     }
 
-    /// Load configuration from multiple sources with precedence:
-    /// 1. Command line arguments (highest priority)
-    /// 2. Environment variables
-    /// 3. Configuration file
-    /// 4. Defaults (lowest priority)
-    pub fn load() -> Result<Self> {
+    /// Load configuration from every source, in this order of precedence:
+    ///
+    /// 1. Command-line arguments (`--http-port 9999`) — highest
+    /// 2. Environment variables (`CAMEODB_HTTP_PORT=9999`)
+    /// 3. Configuration file (`--config <path>`, `CAMEODB_CONFIG`, or the search list in
+    ///    [`CameoDbConfig::load_from_file`])
+    /// 4. Defaults — lowest
+    ///
+    /// The same order picks the config file itself: `--config` wins over `CAMEODB_CONFIG`.
+    /// Every overridable setting has both a flag and an environment variable, defined once as
+    /// a pair in [`OVERRIDES`], so the two layers can never drift apart.
+    pub fn load_with_cli(cli: &CliOverrides) -> Result<Self> {
         // Start with defaults
         let mut config = Self::default();
 
-        // Try to load from config file
-        if let Ok(file_config) = Self::load_from_file() {
-            config = Self::merge_configs(config, file_config);
+        // Layer the config file on top, if there is one
+        match Self::load_from_file(cli.config_path.as_deref()) {
+            Ok(file_config) => config = Self::merge_configs(config, file_config),
+            // Only a *missing* file from the implicit search list is survivable. A file the
+            // operator explicitly named, or one that exists but does not parse, is an error:
+            // booting on defaults because a config was unreadable is how a node quietly comes
+            // up on the wrong port with the wrong data directory.
+            Err(e) => match e.downcast_ref::<ConfigError>() {
+                Some(ConfigError::FileNotFound { .. }) if !cli.has_explicit_config_path() => {
+                    info!("No configuration file found; using defaults, environment and flags");
+                }
+                _ => return Err(e),
+            },
         }
 
-        // Apply environment variable overrides
-        config = Self::apply_env_overrides(config)?;
+        // Apply environment then command-line overrides — command line last, so it wins.
+        config = Self::apply_overrides(config, cli)?;
 
         // Normalize storage paths for deterministic behavior
         config.storage.normalize_paths();
@@ -421,9 +765,34 @@ impl CameoDbConfig {
         Ok(config)
     }
 
-    /// Load configuration from YAML or TOML file
-    pub fn load_from_file() -> Result<Self> {
-        let mut config_paths = vec![
+    /// Load configuration from a YAML or TOML file.
+    ///
+    /// `cli_path` is the `--config` argument; it takes precedence over `CAMEODB_CONFIG`, per
+    /// the precedence documented on [`CameoDbConfig::load_with_cli`]. When both are set and
+    /// disagree, the losing one is logged rather than silently ignored. If either is set, the
+    /// implicit search list is skipped entirely — an operator who named a file gets that file
+    /// or an error, never a different one.
+    pub fn load_from_file(cli_path: Option<&str>) -> Result<Self> {
+        let env_path = std::env::var("CAMEODB_CONFIG").ok();
+
+        if let (Some(env_path), Some(cli_path)) = (env_path.as_deref(), cli_path)
+            && env_path != cli_path
+        {
+            info!(
+                "--config {} overrides CAMEODB_CONFIG={} (command line has higher precedence)",
+                cli_path, env_path
+            );
+        }
+
+        if let Some(path) = cli_path.or(env_path.as_deref()) {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read config file: {path}"))?;
+            info!("📄 Loading configuration from: {}", path);
+            return Self::parse_config_content(&content, path)
+                .with_context(|| format!("Failed to parse config file: {path}"));
+        }
+
+        let config_paths = [
             "cameodb.toml",
             "cameodb.yaml",
             "cameodb.yml",
@@ -433,18 +802,11 @@ impl CameoDbConfig {
             "/etc/cameodb/config.toml",
         ];
 
-        // If CAMEODB_CONFIG env var is set, prepend it to the search list
-        let env_config = std::env::var("CAMEODB_CONFIG").ok();
-        if let Some(path) = env_config.as_deref() {
-            // Insert at the beginning to give it highest priority
-            config_paths.insert(0, path);
-        }
-
         for path in &config_paths {
             if let Ok(content) = fs::read_to_string(path) {
                 info!("📄 Loading configuration from: {}", path);
                 return Self::parse_config_content(&content, path)
-                    .with_context(|| format!("Failed to parse config file: {}", path));
+                    .with_context(|| format!("Failed to parse config file: {path}"));
             }
         }
 
@@ -454,169 +816,52 @@ impl CameoDbConfig {
         .into())
     }
 
-    /// Parse configuration content based on file extension
+    /// Parse configuration content based on file extension.
+    ///
+    /// Files are partial by design (see [`CameoDbConfig`]), which means a misspelled key is
+    /// indistinguishable from an omitted one — it silently leaves the default in place. So
+    /// every key that survived parsing without landing anywhere is reported.
     fn parse_config_content(content: &str, path: &str) -> Result<Self> {
-        if path.ends_with(".toml") {
-            toml::from_str(content).with_context(|| "Failed to parse TOML configuration")
+        let config: Self = if path.ends_with(".toml") {
+            toml::from_str(content).with_context(|| "Failed to parse TOML configuration")?
         } else if path.ends_with(".yaml") || path.ends_with(".yml") {
-            serde_saphyr::from_str(content).with_context(|| "Failed to parse YAML configuration")
+            serde_saphyr::from_str(content).with_context(|| "Failed to parse YAML configuration")?
         } else {
             // Try TOML first, then YAML
             toml::from_str(content)
                 .or_else(|_| serde_saphyr::from_str(content))
-                .with_context(|| "Failed to parse configuration (tried TOML and YAML)")
+                .with_context(|| "Failed to parse configuration (tried TOML and YAML)")?
+        };
+
+        for key in unrecognized_keys(content) {
+            warn!("Ignoring unknown setting in {}: {}", path, key);
         }
+
+        Ok(config)
     }
 
-    /// Apply environment variable overrides
-    fn apply_env_overrides(mut config: Self) -> Result<Self> {
-        // HTTP configuration
-        if let Ok(port) = std::env::var("CAMEODB_HTTP_PORT") {
-            config.network.http.port = port.parse().with_context(|| "Invalid CAMEODB_HTTP_PORT")?;
-        }
+    /// Apply the environment and then the command line over `config`.
+    ///
+    /// Both layers walk the same [`OVERRIDES`] table and hand the same raw string to the same
+    /// setter, so a flag and its environment variable cannot disagree about what a value
+    /// means. The command line is applied second and therefore wins.
+    fn apply_overrides(mut config: Self, cli: &CliOverrides) -> Result<Self> {
+        for entry in OVERRIDES {
+            if let Ok(value) = std::env::var(entry.env) {
+                (entry.apply)(&mut config, &value)
+                    .with_context(|| format!("Invalid {}: {value:?}", entry.env))?;
+            }
 
-        if let Ok(bind_addr) = std::env::var("CAMEODB_HTTP_BIND_ADDRESS") {
-            config.network.http.bind_address = bind_addr;
-        }
-
-        // Record size limit (top-level, derives other limits)
-        if let Ok(record_size) = std::env::var("CAMEODB_MAX_RECORD_SIZE_MB") {
-            config.max_record_size_mb = record_size
-                .parse()
-                .with_context(|| "Invalid CAMEODB_MAX_RECORD_SIZE_MB")?;
-        }
-
-        // Explicit HTTP body size override (optional, usually derived)
-        if let Ok(body_size) = std::env::var("CAMEODB_MAX_BODY_SIZE_MB") {
-            config.network.http.max_body_size_mb = body_size
-                .parse()
-                .with_context(|| "Invalid CAMEODB_MAX_BODY_SIZE_MB")?;
-        }
-
-        // Storage configuration
-        if let Ok(data_paths) = std::env::var("CAMEODB_DATA_PATHS") {
-            config.storage.data_paths = data_paths.split(':').map(PathBuf::from).collect();
-        }
-
-        if let Ok(wal_sync) = std::env::var("CAMEODB_STORAGE_WAL_SYNC") {
-            let normalized = wal_sync.trim().to_ascii_lowercase();
-            config.storage.wal_sync = matches!(normalized.as_str(), "true" | "1" | "yes");
-        }
-
-        if let Ok(batch_size) = std::env::var("CAMEODB_STORAGE_DEFAULT_BATCH_SIZE") {
-            config.storage.default_batch_size = batch_size
-                .parse()
-                .with_context(|| "Invalid CAMEODB_STORAGE_DEFAULT_BATCH_SIZE")?;
-        }
-
-        // Search configuration
-        if let Ok(min_mem) = std::env::var("CAMEODB_INDEXER_MEMORY_MIN_MB") {
-            config.search.indexer_memory_min_mb = min_mem
-                .parse()
-                .with_context(|| "Invalid CAMEODB_INDEXER_MEMORY_MIN_MB")?;
-        }
-
-        if let Ok(max_mem) = std::env::var("CAMEODB_INDEXER_MEMORY_MAX_MB") {
-            config.search.indexer_memory_max_mb = max_mem
-                .parse()
-                .with_context(|| "Invalid CAMEODB_INDEXER_MEMORY_MAX_MB")?;
-        }
-
-        if let Ok(total_mem) = std::env::var("CAMEODB_TOTAL_MEMORY_LIMIT_MB") {
-            config.search.total_memory_limit_mb = total_mem
-                .parse()
-                .with_context(|| "Invalid CAMEODB_TOTAL_MEMORY_LIMIT_MB")?;
-        }
-
-        if let Ok(threshold) = std::env::var("CAMEODB_MEMORY_PRESSURE_THRESHOLD_PERCENT") {
-            config.search.memory_pressure_threshold_percent = threshold
-                .parse()
-                .with_context(|| "Invalid CAMEODB_MEMORY_PRESSURE_THRESHOLD_PERCENT")?;
-        }
-
-        if let Ok(limit) = std::env::var("CAMEODB_DEFAULT_SEARCH_LIMIT") {
-            config.search.default_search_limit = limit
-                .parse()
-                .with_context(|| "Invalid CAMEODB_DEFAULT_SEARCH_LIMIT")?;
+            if let Some(value) = cli.value_for(entry.flag) {
+                (entry.apply)(&mut config, value)
+                    .with_context(|| format!("Invalid {}: {value:?}", entry.flag))?;
+            }
         }
 
         // Guard: default_search_limit must be >= 1 to prevent tantivy panic
         if config.search.default_search_limit == 0 {
             warn!("Configured default_search_limit is 0, clamping to 1");
             config.search.default_search_limit = 1;
-        }
-
-        if let Ok(timeout) = std::env::var("CAMEODB_SUPERVISOR_TIMEOUT_SECS") {
-            config.search.supervisor_timeout_secs = timeout
-                .parse()
-                .with_context(|| "Invalid CAMEODB_SUPERVISOR_TIMEOUT_SECS")?;
-        }
-
-        // Node configuration
-        if let Ok(label) = std::env::var("CAMEODB_NODE_LABEL") {
-            config.node.label = Some(label);
-        }
-
-        if let Ok(zone) = std::env::var("CAMEODB_NODE_ZONE") {
-            config.node.zone = zone;
-        }
-
-        // Cluster configuration
-        if let Ok(enabled) = std::env::var("CAMEODB_CLUSTER_ENABLED") {
-            let normalized = enabled.trim().to_ascii_lowercase();
-            config.network.cluster.enabled = matches!(normalized.as_str(), "true" | "1" | "yes");
-        }
-
-        if let Ok(bind_addr) = std::env::var("CAMEODB_CLUSTER_BIND_ADDRESS") {
-            config.network.cluster.bind_address = bind_addr;
-        }
-
-        if let Ok(port) = std::env::var("CAMEODB_CLUSTER_PORT") {
-            config.network.cluster.cluster_port = port
-                .parse()
-                .with_context(|| "Invalid CAMEODB_CLUSTER_PORT")?;
-        }
-
-        if let Ok(name) = std::env::var("CAMEODB_CLUSTER_NAME")
-            && !name.trim().is_empty()
-        {
-            config.network.cluster.cluster_name = name;
-        }
-
-        if let Ok(nodes) = std::env::var("CAMEODB_SEED_NODES") {
-            let parsed: Vec<String> = nodes
-                .split([',', ';'])
-                .filter_map(|entry| {
-                    let trimmed = entry.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    }
-                })
-                .collect();
-
-            if !parsed.is_empty() {
-                config.network.cluster.seed_nodes = parsed;
-            }
-        }
-
-        if let Ok(nodes) = std::env::var("CAMEODB_CLUSTER_NODES") {
-            let parsed: Vec<String> = nodes
-                .split([',', ';'])
-                .filter_map(|entry| {
-                    let trimmed = entry.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    }
-                })
-                .collect();
-
-            if !parsed.is_empty() {
-                config.network.cluster.cluster_nodes = parsed;
-            }
         }
 
         Ok(config)
@@ -970,6 +1215,189 @@ fn default_stream_batch_size() -> usize {
 mod tests {
     use super::*;
 
+    fn cli(args: &[&str]) -> CliOverrides {
+        CliOverrides::parse(args.iter().map(|arg| arg.to_string())).expect("parse")
+    }
+
+    #[test]
+    fn cli_parses_both_value_syntaxes() {
+        let parsed = cli(&["--http-port", "1234", "--node-label=alpha"]);
+        assert_eq!(parsed.value_for("--http-port"), Some("1234"));
+        assert_eq!(parsed.value_for("--node-label"), Some("alpha"));
+    }
+
+    #[test]
+    fn cli_parses_config_path_including_short_form() {
+        assert_eq!(
+            cli(&["--config", "a.toml"]).config_path.as_deref(),
+            Some("a.toml")
+        );
+        assert_eq!(
+            cli(&["-c", "b.toml"]).config_path.as_deref(),
+            Some("b.toml")
+        );
+        assert_eq!(
+            cli(&["--config=c.yaml"]).config_path.as_deref(),
+            Some("c.yaml")
+        );
+    }
+
+    /// A bare switch must not eat the argument after it — `--cluster-enabled --http-port 1`
+    /// once would have consumed `--http-port` as the switch's value.
+    #[test]
+    fn cli_switch_defaults_to_true_without_consuming_the_next_argument() {
+        let parsed = cli(&["--cluster-enabled", "--http-port", "1234"]);
+        assert_eq!(parsed.value_for("--cluster-enabled"), Some("true"));
+        assert_eq!(parsed.value_for("--http-port"), Some("1234"));
+
+        let explicit = cli(&["--cluster-enabled=false"]);
+        assert_eq!(explicit.value_for("--cluster-enabled"), Some("false"));
+    }
+
+    #[test]
+    fn cli_last_occurrence_of_a_flag_wins() {
+        let parsed = cli(&["--http-port", "1", "--http-port", "2"]);
+        assert_eq!(parsed.value_for("--http-port"), Some("2"));
+    }
+
+    /// The bug this whole path exists to prevent: an unrecognized option used to be ignored,
+    /// so the server booted on a configuration nobody asked for.
+    #[test]
+    fn cli_rejects_unknown_options_and_missing_values() {
+        let unknown = CliOverrides::parse(["--nope".to_string()]).unwrap_err();
+        assert!(unknown.to_string().contains("Unknown option: --nope"));
+
+        let missing = CliOverrides::parse(["--http-port".to_string()]).unwrap_err();
+        assert!(missing.to_string().contains("--http-port requires a value"));
+
+        let no_path = CliOverrides::parse(["--config".to_string()]).unwrap_err();
+        assert!(no_path.to_string().contains("--config requires a path"));
+    }
+
+    #[test]
+    fn every_override_is_reachable_from_both_layers() {
+        for entry in OVERRIDES {
+            assert!(
+                entry.flag.starts_with("--"),
+                "{} must be a long flag",
+                entry.flag
+            );
+            assert!(
+                entry.env.starts_with("CAMEODB_"),
+                "{} must be a CAMEODB_ variable",
+                entry.env
+            );
+            assert_eq!(
+                entry.placeholder.is_empty(),
+                entry.kind == FlagKind::Switch,
+                "{} must have a placeholder iff it takes a value",
+                entry.flag
+            );
+            assert!(
+                cli_help().contains(entry.flag),
+                "{} is missing from --help",
+                entry.flag
+            );
+        }
+    }
+
+    /// Precedence, on one setting, through all four layers at once.
+    #[test]
+    fn command_line_beats_environment_beats_file_beats_default() {
+        let dir = std::env::temp_dir().join(format!("cameodb-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("cameodb.toml");
+        // Config files are deserialized strictly, so write a complete one.
+        let mut on_disk = CameoDbConfig::default();
+        on_disk.network.http.port = 7001;
+        std::fs::write(&file, toml::to_string_pretty(&on_disk).expect("serialize"))
+            .expect("write config");
+        let path = file.to_str().expect("utf-8 path").to_string();
+
+        // Defaults only.
+        let config = CameoDbConfig::load_with_cli(&CliOverrides::default()).expect("defaults");
+        assert_eq!(config.network.http.port, 9480);
+
+        // File over defaults.
+        let from_file =
+            CameoDbConfig::load_with_cli(&cli(&["--config", &path])).expect("file config");
+        assert_eq!(from_file.network.http.port, 7001);
+
+        unsafe { std::env::set_var("CAMEODB_HTTP_PORT", "7002") };
+
+        // Environment over file.
+        let from_env =
+            CameoDbConfig::load_with_cli(&cli(&["--config", &path])).expect("env override");
+        assert_eq!(from_env.network.http.port, 7002);
+
+        // Command line over environment.
+        let from_cli =
+            CameoDbConfig::load_with_cli(&cli(&["--config", &path, "--http-port", "7003"]))
+                .expect("cli override");
+        assert_eq!(from_cli.network.http.port, 7003);
+
+        unsafe { std::env::remove_var("CAMEODB_HTTP_PORT") };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The long-standing contract: name only what you are changing.
+    #[test]
+    fn partial_config_files_keep_defaults_for_everything_omitted() {
+        let config: CameoDbConfig = toml::from_str(
+            "[network.http]\n\
+             port = 7001\n",
+        )
+        .expect("a partial config must parse");
+
+        assert_eq!(config.network.http.port, 7001, "the named setting applies");
+        // Neighbours in the same table, sibling sections, and whole missing sections.
+        assert_eq!(config.network.http.bind_address, "0.0.0.0");
+        assert_eq!(config.network.cluster.cluster_port, 9580);
+        assert_eq!(
+            config.storage.data_paths,
+            vec![PathBuf::from("./data/cameodb")]
+        );
+        assert_eq!(config.search.indexer_memory_min_mb, 64);
+        assert_eq!(config.max_record_size_mb, 512);
+        assert!(config.validate().is_ok());
+    }
+
+    /// An empty file is the degenerate partial config and must behave like no file at all.
+    #[test]
+    fn empty_config_file_is_all_defaults() {
+        let config: CameoDbConfig = toml::from_str("").expect("empty config must parse");
+        let defaults = CameoDbConfig::default();
+        assert_eq!(config.network.http.port, defaults.network.http.port);
+        assert_eq!(config.storage.data_paths, defaults.storage.data_paths);
+    }
+
+    /// Partial files make a typo indistinguishable from an omission, so typos get reported.
+    #[test]
+    fn unknown_keys_are_reported_and_known_ones_are_not() {
+        let unknown = unrecognized_keys(
+            "[network.http]\n\
+             port = 7001\n\
+             prot = 7002\n\n\
+             [storrage]\n\
+             data_paths = [\"/tmp/x\"]\n",
+        );
+        assert_eq!(unknown, vec!["network.http.prot", "storrage"]);
+
+        let sample = CameoDbConfig::generate_sample_config().expect("sample");
+        assert!(
+            unrecognized_keys(&sample).is_empty(),
+            "the generated sample must not report against its own schema"
+        );
+    }
+
+    /// A named config file that cannot be read must fail the boot, not fall back to defaults.
+    #[test]
+    fn explicitly_named_config_file_must_exist() {
+        let err = CameoDbConfig::load_with_cli(&cli(&["--config", "/nonexistent/cameodb.toml"]))
+            .unwrap_err();
+        assert!(err.to_string().contains("Failed to read config file"));
+    }
+
     #[test]
     fn test_default_configuration() {
         let config = CameoDbConfig::default();
@@ -1034,7 +1462,7 @@ mod tests {
         }
 
         // Load config and verify the value
-        let config = CameoDbConfig::load().unwrap();
+        let config = CameoDbConfig::load_with_cli(&CliOverrides::default()).unwrap();
         assert_eq!(config.storage.default_batch_size, 750);
 
         // Clean up
