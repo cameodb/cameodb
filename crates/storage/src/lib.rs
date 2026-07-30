@@ -1526,6 +1526,12 @@ pub struct IndexWarmupStats {
 /// post-commit reload only touches the one new segment (whose files this process just wrote,
 /// so they are already in page cache) instead of rescanning the whole index on the write
 /// hot path.
+///
+/// Thread cost: registering any warmer makes tantivy spawn one `tantivy-warm-gc` thread per
+/// `IndexReader`, ticking once a second to prune retired generations. That is one extra
+/// thread per *open index*, which is the price of having new segments warmed automatically.
+/// Warming itself does not add a thread — with a single warmer tantivy uses
+/// `Executor::single_thread()` and runs it on the reloading thread.
 struct SegmentWarmer {
     index: String,
     /// Segments already warmed. Pruned by `garbage_collect` as generations retire.

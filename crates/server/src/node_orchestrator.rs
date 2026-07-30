@@ -10,10 +10,33 @@
 //! │           NodeOrchestrator              │
 //! ├─────────────────────────────────────────┤
 //! │ - identity: NodeIdentity                │
-//! │ - shards: HashMap<Uuid, ActorRef>       │
+//! │ - shards: HashMap<Uuid, MicroshardActor> │
 //! │ - config: NodeConfig                    │
 //! └─────────────────────────────────────────┘
 //! ```
+//!
+//! # Thread topology
+//!
+//! Local shards are held by value, not as `ActorRef`s, so calls into them are plain async
+//! method calls — no mailbox hop. The threads a request actually crosses:
+//!
+//! - **main runtime** — axum, coordinator, libp2p swarm.
+//! - **`orch-worker-N`** — one dedicated OS thread per worker (`cpu_cores` when hash-space
+//!   aligned), each running a `current_thread` runtime. Requests hop here from the main
+//!   runtime via a per-worker mpsc queue.
+//! - **`writer-shard-<id>`** — one per shard, pinned to `xxh3(shard_id) % cores`. All writes
+//!   and commits for that shard are serialized here. Writes hop worker → writer → back.
+//! - **`cameodb-read`** — shared blocking pool sized by `search_threads`. Reads hop
+//!   worker → read pool → back. Deliberately unpinned: reads leave the writer's core so
+//!   they cannot compete with it, which is why the hash-space alignment between worker and
+//!   writer cores applies to the write path only.
+//! - **tantivy, per open index** — `indexer_num_threads` + `merge_num_threads` per
+//!   `IndexWriter`, plus one `tantivy-warm-gc` thread per `IndexReader` that has warmers
+//!   registered (see `SegmentWarmer`). Thread count therefore scales with the number of
+//!   *open* indices, not just shards.
+//!
+//! Note that `core_affinity::set_for_current` is a no-op on macOS, so every pinning path
+//! here degrades to unpinned threads on that platform and only takes effect on Linux.
 
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -81,6 +104,13 @@ type WriteCommand = (WalOp, tokio::sync::oneshot::Sender<Result<u64, StoreError>
 type BatchCommand = (
     Vec<WalOp>,
     tokio::sync::oneshot::Sender<Result<(Vec<u64>, usize), StoreError>>,
+);
+
+/// Type alias for index deletions enqueued in the writer thread: (index, delete_schema, reply)
+type DeleteCommand = (
+    String,
+    bool,
+    tokio::sync::oneshot::Sender<Result<(), StoreError>>,
 );
 
 /// Type alias for tracking reply slices when coalescing batch writes
@@ -870,6 +900,18 @@ pub enum StorageCommand {
     EvictWriter {
         index: String,
         reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// Drop an index's tables, caches and Tantivy directory.
+    ///
+    /// Routed through the writer thread rather than run on a blocking-pool thread so it is
+    /// serialized against writes to the same index: deletion tears down the writer, the
+    /// sequence counter and the redb tables that an in-flight `apply_write` is actively
+    /// using, and running the two concurrently let a write recreate what deletion had just
+    /// removed.
+    DeleteIndex {
+        index: String,
+        delete_schema: bool,
+        reply: tokio::sync::oneshot::Sender<Result<(), StoreError>>,
     },
     Shutdown,
 }
@@ -1904,6 +1946,7 @@ impl MicroshardActor {
                     let mut batch_groups: HashMap<String, Vec<BatchCommand>> = HashMap::new();
                     let mut commits: Vec<(String, tokio::sync::oneshot::Sender<Result<(), StoreError>>)> = Vec::new();
                     let mut evictions: Vec<(String, tokio::sync::oneshot::Sender<bool>)> = Vec::new();
+                    let mut deletions: Vec<DeleteCommand> = Vec::new();
                     let mut should_shutdown = false;
 
                     for cmd in pending_cmds.drain(..) {
@@ -1919,6 +1962,9 @@ impl MicroshardActor {
                             }
                             StorageCommand::EvictWriter { index, reply } => {
                                 evictions.push((index, reply));
+                            }
+                            StorageCommand::DeleteIndex { index, delete_schema, reply } => {
+                                deletions.push((index, delete_schema, reply));
                             }
                             StorageCommand::Shutdown => {
                                 should_shutdown = true;
@@ -2084,6 +2130,17 @@ impl MicroshardActor {
                         let removed = writer_store.force_remove_writer(&index);
                         tracing::info!(index = %index, removed, "Writer evicted from cache");
                         let _ = reply.send(removed);
+                    }
+
+                    // Phase 5c: Process index deletions last, so any writes that were
+                    // batched alongside the delete are applied before their tables go away.
+                    for (index, delete_schema, reply) in deletions {
+                        let res = writer_store.delete_index_data(&index, delete_schema);
+                        match &res {
+                            Ok(()) => info!(index = %index, delete_schema, "Index data deleted"),
+                            Err(e) => warn!(index = %index, error = %e, "Index deletion failed"),
+                        }
+                        let _ = reply.send(res);
                     }
 
                     // Phase 6: Handle shutdown after draining all pending work
@@ -2339,7 +2396,21 @@ impl MicroshardActor {
             None => return,
         };
 
+        // Fast path: the supervisor for this index already exists, which is the case for
+        // every write after the first. Taking the write lock here — as this used to — made
+        // all concurrent writes to a shard serialize on the supervisor map and gave the
+        // scheduler a reason to park the task, on the hot path, purely to send a timer reset.
+        {
+            let supervisors = self.supervisors.read().await;
+            if let Some(tx) = supervisors.get(&index) {
+                let _ = tx.try_send(());
+                return;
+            }
+        }
+
         let mut supervisors = self.supervisors.write().await;
+        // Re-check: another writer may have created the supervisor while we waited for the
+        // write lock.
         if let Some(tx) = supervisors.get(&index) {
             // Signal existing supervisor to reset its timer
             let _ = tx.try_send(());
@@ -2520,32 +2591,31 @@ impl MicroshardActor {
         Ok(all_seq_ids)
     }
 
-    /// Deletes all data for an index from this shard's storage
+    /// Deletes all data for an index from this shard's storage.
+    ///
+    /// Dispatched to the shard's writer thread so it is serialized against writes to the
+    /// same index — deletion tears down the writer, sequence counter and redb tables that
+    /// an in-flight write is using.
     pub async fn delete_index(
         &self,
         index: &str,
         delete_schema: bool,
     ) -> Result<(), OrchestratorError> {
-        let store = self.store.as_ref().ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "HybridStore not initialized",
-            ))
-        })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_write_command(StorageCommand::DeleteIndex {
+            index: index.to_string(),
+            delete_schema,
+            reply: reply_tx,
+        })
+        .await?;
 
-        let store = Arc::clone(store);
-        let index = index.to_string();
-
-        // Use spawn_blocking to execute delete on blocking thread pool
-        tokio::task::spawn_blocking(move || store.delete_index_data(&index, delete_schema))
+        reply_rx
             .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
+            .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer dropped reply")))?
             .map_err(|e: StoreError| match e {
                 StoreError::Io(io_err) => OrchestratorError::Io(io_err),
                 _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
-            })?;
-
-        Ok(())
+            })
     }
 }
 
@@ -4216,6 +4286,25 @@ impl NodeOrchestrator {
 
         let is_initial_creation = schema_cache.fields.is_empty();
 
+        // Small batches validate inline. Offloading them costs two thread hops (onto this
+        // worker's blocking pool, then a rayon fan-out onto the global rayon pool, which is
+        // unpinned and competes with the writer threads) plus a full clone of the documents
+        // and schema — all to run a handful of cheap per-document checks. Both hops are pure
+        // overhead below this size.
+        const INLINE_VALIDATION_MAX_DOCS: usize = 64;
+        if !is_initial_creation && docs.len() <= INLINE_VALIDATION_MAX_DOCS {
+            return Ok(docs
+                .iter()
+                .map(|doc_payload| {
+                    Self::validate_single_document_readonly_fast(
+                        &doc_payload.doc,
+                        schema_cache,
+                        is_initial_creation,
+                    )
+                })
+                .collect());
+        }
+
         // Fast path: if schema is mature and batch is small, skip expensive clone
         let use_fast_path = !is_initial_creation && docs.len() < 1000;
 
@@ -4852,8 +4941,21 @@ impl NodeOrchestrator {
         } else {
             std::cmp::max(2, cpu_cores / 2)
         };
+        // Every read that reaches this pool arrives through `Handle::spawn_blocking`
+        // (see MicroshardActor::spawn_on_read_pool), which dispatches to the runtime's
+        // *blocking* pool — not its async worker threads. Two consequences drive this
+        // configuration:
+        //
+        // - The async workers never run search work, so one is enough to host the runtime.
+        //   Sizing them by `search_threads` just created idle threads.
+        // - `max_blocking_threads` is what actually bounds search parallelism. Left at
+        //   tokio's 512 default, `search_threads` named a limit it did not enforce and a
+        //   burst of queries could put hundreds of concurrent tantivy searches on the CPU,
+        //   thrashing against the pinned writer threads. Bounding it here turns excess
+        //   load into queueing, which is the behaviour the config already advertises.
         let read_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(read_threads)
+            .worker_threads(1)
+            .max_blocking_threads(read_threads)
             .thread_name("cameodb-read")
             .enable_all()
             .build()
@@ -4861,7 +4963,7 @@ impl NodeOrchestrator {
         let read_runtime = Arc::new(read_runtime);
 
         info!(
-            read_threads = read_threads,
+            max_concurrent_reads = read_threads,
             search_threads_config = config.search_threads,
             cpu_cores = cpu_cores,
             "Dedicated read thread pool created"

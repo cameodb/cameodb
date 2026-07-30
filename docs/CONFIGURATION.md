@@ -122,7 +122,9 @@ total_memory_limit_mb = 2048
 # Threshold for memory pressure (percent, default: 80)
 memory_pressure_threshold_percent = 80
 
-# Number of search threads (default: 8, fallback to max(2, CPU/2) if set to 0)
+# Maximum searches running concurrently on this node
+# (default: 8, fallback to max(2, CPU/2) if set to 0)
+# Searches beyond this limit queue instead of spawning more threads.
 search_threads = 8
 
 # Default search result limit (default: 10)
@@ -410,8 +412,10 @@ cargo run --release --bin cameodb  # Should start without errors
 - Use faster storage (NVMe)
 
 **Slow Searches**:
-- Increase `search_threads`
+- Increase `search_threads` if queries are queueing (concurrency-bound)
 - Add more RAM for caching
+- Check `warm_shards` vs `shard_count` in `/_indexes` — if it is short, first queries are
+  still paying cold-start costs while background warmup catches up
 
 ### Debug Configuration Loading
 

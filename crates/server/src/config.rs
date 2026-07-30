@@ -289,7 +289,16 @@ pub struct SearchConfig {
     #[serde(default = "default_memory_pressure_threshold_percent")]
     pub memory_pressure_threshold_percent: u8,
 
-    /// Number of search threads (default: num_cpus)
+    /// Maximum number of searches executing concurrently on this node (default: 8).
+    ///
+    /// Sizes the dedicated read pool's blocking threads, which is where search and stats
+    /// work actually runs. Queries beyond this limit queue rather than adding threads, so
+    /// raising it trades memory and CPU contention for concurrency. Setting it to 0 derives
+    /// `max(2, cpu_cores / 2)`.
+    ///
+    /// Note this bounds concurrency across all queries; `max_concurrent_shard_searches`
+    /// separately bounds the shard fan-out of a single query, and cannot exceed this in
+    /// practice for local shards.
     #[serde(default = "default_search_threads")]
     pub search_threads: usize,
 
