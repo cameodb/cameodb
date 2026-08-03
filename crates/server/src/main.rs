@@ -391,7 +391,17 @@ async fn main() -> Result<()> {
     let bind_address = format!("{}:{}", http_config.bind_address, http_config.port);
 
     // Print startup information
-    println!("🚀 CameoDB HTTP Server starting on http://{}", bind_address);
+    let protocol = if http_config.tls.enabled {
+        "https"
+    } else {
+        "http"
+    };
+    println!(
+        "🚀 CameoDB {} Server starting on {}://{}",
+        protocol.to_uppercase(),
+        protocol,
+        bind_address
+    );
     println!("🎯 API endpoints:");
     println!("  POST /api/{{index}}/search - Standard search");
     println!("  POST /api/{{index}}/search/stream - Streaming search");
@@ -456,24 +466,61 @@ async fn main() -> Result<()> {
     println!();
 
     // Start the HTTP server with configured address
-    let listener = tokio::net::TcpListener::bind(&bind_address).await?;
-
-    // Start the HTTP server (with connect info for client addr extraction)
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-    let server_handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async {
-            let _ = shutdown_rx.await;
+    let server_handle = if http_config.tls.enabled {
+        // TLS enabled: use axum-server with rustls
+        let cert_file = http_config
+            .tls
+            .cert_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TLS enabled but cert_file not configured"))?;
+        let key_file = http_config
+            .tls
+            .key_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TLS enabled but key_file not configured"))?;
+
+        tracing::info!(
+            cert_file = %cert_file.display(),
+            key_file = %key_file.display(),
+            "TLS enabled, starting HTTPS server"
+        );
+
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_file, key_file)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to load TLS certificates: {}", e))?;
+
+        let addr: std::net::SocketAddr = bind_address
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid bind address {}: {}", bind_address, e))?;
+
+        tokio::spawn(async move {
+            if let Err(e) = axum_server::bind_rustls(addr, tls_config)
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await
+            {
+                eprintln!("HTTPS server error: {}", e);
+            }
         })
-        .await
-        {
-            eprintln!("Server error: {}", e);
-        }
-    });
+    } else {
+        // TLS disabled: use regular axum with TCP listener
+        let listener = tokio::net::TcpListener::bind(&bind_address).await?;
+
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            {
+                eprintln!("HTTP server error: {}", e);
+            }
+        })
+    };
 
     // Wait for shutdown signal (Ctrl+C or systemctl stop)
     #[cfg(unix)]

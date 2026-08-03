@@ -30,6 +30,30 @@ cargo run --bin cameodb -- client -i
 Flags:
 - `--connect http://host:port` – default `http://localhost:9480`
 - `--interactive` / `-i` – launch the REPL
+- `--insecure` – accept invalid TLS certificates (for self-signed certs in development)
+
+### TLS/HTTPS Support
+
+The client supports HTTPS connections with TLS certificate validation:
+
+```bash
+# Connect to HTTPS server with valid certificate
+cameodb client -i --connect https://cameodb.example.com
+
+# Connect to HTTPS server with self-signed certificate (development only)
+cameodb client -i --connect https://localhost:9480 --insecure
+```
+
+**Per-command `--insecure` for remote sources:**
+```bash
+# Load schema from external HTTPS URL with self-signed cert
+cameodb client schema detect https://external.com/schema.csv --insecure
+
+# Load data from external HTTPS URL with self-signed cert
+cameodb client data load myindex https://external.com/data.csv --insecure
+```
+
+The global `--insecure` flag applies to the entire session (server connection + all commands). Per-command `--insecure` applies only to specific remote schema/data loading operations.
 
 ## 🧭 Available Commands
 

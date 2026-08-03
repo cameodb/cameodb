@@ -24,6 +24,7 @@ By leveraging the **Kameo** actor framework and **Tokio**'s async runtime, Cameo
 * **Graceful Shutdowns:** Multi-phase process ensuring zero WAL replay on clean reboots.
 * **Production Memory Management:** Jemalloc allocator with per-CPU arenas, background purge threads, and runtime admin endpoints for memory diagnostics and manual intervention.
 * **Writer Core Pinning:** Optional CPU core affinity for shard writer threads to improve cache locality and reduce scheduling jitter on the write hot path.
+* **TLS/HTTPS Support:** Native HTTPS support via rustls for encrypted client connections and secure API access.
 
 ## 📦 Quick Start (Docker)
 
@@ -52,7 +53,156 @@ docker run -it --rm \
 
 For more deployment options (Docker Compose, multi-node clusters), see the [Deployment Guide](docs/DEPLOYMENT.md).
 
-## 📚 Documentation
+## � TLS/HTTPS Configuration
+
+CameoDB supports native HTTPS via rustls for encrypted client connections. This is essential for production deployments where data security is required.
+
+### Quick Start with TLS
+
+1. **Generate a self-signed certificate** (for testing/development):
+```bash
+# Create a self-signed certificate and private key
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes \
+  -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+```
+
+2. **Configure TLS in cameodb.toml**:
+```toml
+[network.http]
+bind_address = "0.0.0.0"
+port = 9480
+
+[network.http.tls]
+enabled = true
+cert_file = "/path/to/cert.pem"
+key_file = "/path/to/key.pem"
+```
+
+3. **Start the server**:
+```bash
+cameodb
+# Server will now be available on https://localhost:9480
+```
+
+### Production Certificates
+
+For production deployments, use certificates from a trusted Certificate Authority (CA):
+
+1. **Obtain certificates** from Let's Encrypt, DigiCert, or your organization's CA
+2. **Configure the paths** in your `cameodb.toml`:
+```toml
+[network.http.tls]
+enabled = true
+cert_file = "/etc/letsencrypt/live/yourdomain.com/fullchain.pem"
+key_file = "/etc/letsencrypt/live/yourdomain.com/privkey.pem"
+```
+
+### Linux System Certificate Paths
+
+For production Linux deployments, follow standard filesystem hierarchy and security practices:
+
+**Recommended directory structure:**
+```
+/etc/cameodb/certs/          # CameoDB-specific certificate directory
+├── cert.pem                 # Certificate file (644 root:root)
+├── key.pem                  # Private key file (600 root:root)
+└── ca-cert.pem              # CA certificate for client validation (644 root:root)
+```
+
+**Standard Linux certificate locations:**
+- **System-wide certificates**: `/etc/ssl/certs/` (symlinks to actual certs)
+- **Private keys**: `/etc/ssl/private/` (restricted access, 700 root:root)
+- **Let's Encrypt**: `/etc/letsencrypt/live/<domain>/`
+- **Custom applications**: `/etc/<appname>/certs/` (CameoDB approach)
+
+**Security best practices for production:**
+```bash
+# Create certificate directory
+sudo mkdir -p /etc/cameodb/certs
+sudo chmod 755 /etc/cameodb/certs
+
+# Copy certificates with proper permissions
+sudo cp cert.pem /etc/cameodb/certs/
+sudo cp key.pem /etc/cameodb/certs/
+
+# Set restrictive permissions
+sudo chmod 644 /etc/cameodb/certs/cert.pem    # Certificate can be world-readable
+sudo chmod 600 /etc/cameodb/certs/key.pem     # Private key must be restricted
+sudo chown root:root /etc/cameodb/certs/*.pem
+```
+
+**Systemd service integration:**
+When running CameoDB as a systemd service, ensure the service user can read the certificates:
+```ini
+[Service]
+User=cameodb
+Group=cameodb
+# Add read access to certificates
+ExecStartPre=/bin/chmod 644 /etc/cameodb/certs/cert.pem
+ExecStartPre=/bin/chmod 640 /etc/cameodb/certs/key.pem
+```
+
+**Configuration with standard paths:**
+```toml
+[network.http.tls]
+enabled = true
+cert_file = "/etc/cameodb/certs/cert.pem"
+key_file = "/etc/cameodb/certs/key.pem"
+```
+
+This approach follows the **Filesystem Hierarchy Standard (FHS)** and ensures proper isolation and security for production deployments.
+
+### Client Connection with TLS
+
+When connecting to a TLS-enabled CameoDB server:
+
+```bash
+# Interactive CLI with HTTPS
+cameodb client --interactive --connect https://localhost:9480
+
+# For self-signed certificates (development only)
+cameodb client --interactive --connect https://localhost:9480 --insecure
+```
+
+**Per-command `--insecure` for remote sources:**
+```bash
+# Load schema from external HTTPS URL with self-signed cert
+cameodb client schema detect https://external.com/schema.csv --insecure
+
+# Load data from external HTTPS URL with self-signed cert
+cameodb client data load myindex https://external.com/data.csv --insecure
+```
+
+The global `--insecure` flag applies to the entire session (server connection + all commands). Per-command `--insecure` applies only to specific remote schema/data loading operations.
+
+### TLS Configuration Options
+
+| Option | Description | Required |
+|--------|-------------|----------|
+| `enabled` | Enable/disable TLS (default: `false`) | No |
+| `cert_file` | Path to PEM certificate file | Yes (when enabled) |
+| `key_file` | Path to PEM private key file | Yes (when enabled) |
+
+### Security Considerations
+
+- **Certificate Validation**: Clients validate server certificates by default. Use `--insecure` flag only for development.
+- **Key Permissions**: Ensure private key files have restricted permissions (`chmod 600 key.pem`).
+- **Certificate Rotation**: Update certificates before expiration; CameoDB requires restart to load new certificates.
+- **Mutual TLS (mTLS)**: Not currently supported. All client connections are accepted if TLS handshake succeeds.
+
+### Troubleshooting TLS
+
+**Certificate errors**: Verify certificate and key files are valid PEM format:
+```bash
+openssl x509 -in cert.pem -text -noout  # Validate certificate
+openssl rsa -in key.pem -check -noout   # Validate private key
+```
+
+**Connection refused**: Ensure the server is listening on HTTPS (check startup logs for "HTTPS Server starting on https://").
+
+**Client certificate verification failed**: Use `--insecure` flag for self-signed certificates, or add the CA certificate to your system's trust store.
+
+## �� Documentation
 
 Dive deeper into CameoDB's architecture and APIs:
 

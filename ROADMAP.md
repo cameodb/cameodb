@@ -488,9 +488,14 @@ HTTP req on axum tokio worker (any core)
 - Client SDK + CLI: `--api-key` flag, `CAMEODB_API_KEY` env, persisted per-connection in REPL
 - Admin routes (`/_admin/*`) optionally require a separate admin-scoped key
 
-**B2 — HTTPS/TLS via rustls** 🟠 HIGH
-- axum-server or tokio-rustls acceptor; config `[network.http.tls] cert_file, key_file`
-- Client-side: evaluate switching default feature from `native-tls` to `rustls-tls` — the original reason for native-tls was interoperability with misbehaving HTTPS endpoints during schema/URL ingestion; modern rustls (via reqwest 0.13, aws-lc-rs backend) handles TLS 1.2+ universally, so the compatibility concern is likely obsolete. **Action: test the URL-ingestion paths against a corpus of real-world HTTPS sources with `rustls-tls` before switching the default.** Keep `native-tls-vendored` for musl static builds regardless (OpenSSL vendored works fine there).
+**B2 — HTTPS/TLS via rustls** ✅ COMPLETED
+- Implemented axum-server with rustls for HTTPS support; config `[network.http.tls] enabled, cert_file, key_file`
+- Added TLS validation to config (cert/key file existence, required fields when enabled)
+- Client-side: added `--insecure` flag for accepting invalid TLS certificates (self-signed certs in development)
+- Per-command `--insecure` for remote schema/data loading operations (fine-grained control)
+- Removed `CAMEODB_ACCEPT_INVALID_CERTS` environment variable (simplified to flag-only interface)
+- Documentation updated with TLS configuration, Linux system certificate paths, and security best practices
+- Keep `native-tls-vendored` for musl static builds regardless (OpenSSL vendored works fine there)
 - Optional mTLS for client verification later
 
 **B3 — Cluster Join Authentication** 🟠 HIGH
@@ -515,16 +520,16 @@ HTTP req on axum tokio worker (any core)
 - Enforced at `RouterActor` boundary so local + remote paths are both covered
 - Depends on B1 identity model
 
-### TLS Inventory (verified 2026-07-30)
+### TLS Inventory (verified 2026-08-03)
 
 | Component | Current TLS | Notes |
 |-----------|-------------|-------|
-| HTTP server | ❌ none | axum, plaintext; Stage B2 adds rustls |
-| Client SDK (`reqwest 0.13`) | ✅ default `native-tls`; features: `native-tls`, `native-tls-vendored`, `rustls-tls` | native-tls chosen historically for misbehaving HTTPS endpoints; re-evaluate rustls default (Stage B2) |
+| HTTP server | ✅ rustls via axum-server | Implemented with `[network.http.tls]` config (enabled, cert_file, key_file) |
+| Client SDK (`reqwest 0.13`) | ✅ default `native-tls`; features: `native-tls`, `native-tls-vendored`, `rustls-tls` | Added `--insecure` flag for accepting invalid TLS certificates (self-signed certs) |
 | musl static builds | ✅ `native-tls-vendored` via `scripts/build/build-musl.sh` + `build-dist.sh` | keep as-is |
 | libp2p cluster transport | ✅ Noise (`noise::Config`) + yamux mux | encrypted but unauthenticated membership; Stage B3 adds PSK |
 | kameo remote messaging | ⚠️ rides libp2p swarm | inherits B3 protection |
-| Client TLS bypass | ⚠️ `CAMEODB_ACCEPT_INVALID_CERTS` presence-check → `danger_accept_invalid_certs(true)` | Stage A3 tightens to value-check |
+| Client TLS bypass | ✅ `--insecure` flag only | Removed `CAMEODB_ACCEPT_INVALID_CERTS` environment variable; simplified to flag-only interface |
 
 **Success Metrics:**
 - No unauthenticated write/delete path reachable in default config

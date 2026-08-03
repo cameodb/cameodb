@@ -449,6 +449,30 @@ pub struct HttpConfig {
     /// CORS allowed origins (default: ["*"])
     #[serde(default = "default_cors_allowed_origins")]
     pub cors_allowed_origins: Vec<String>,
+
+    /// TLS configuration for HTTPS (optional)
+    /// When enabled, server will use HTTPS instead of HTTP
+    #[serde(default)]
+    pub tls: TlsConfig,
+}
+
+/// TLS configuration for HTTPS
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// Enable TLS/HTTPS (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Path to TLS certificate file (PEM format)
+    /// Required when tls.enabled = true
+    #[serde(default)]
+    pub cert_file: Option<PathBuf>,
+
+    /// Path to TLS private key file (PEM format)
+    /// Required when tls.enabled = true
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
 }
 
 /// Node-level configuration
@@ -891,6 +915,40 @@ impl CameoDbConfig {
             .into());
         }
 
+        // Validate TLS configuration
+        if self.network.http.tls.enabled {
+            if self.network.http.tls.cert_file.is_none() {
+                return Err(ConfigError::NetworkConfig {
+                    message: "TLS enabled but cert_file not configured".to_string(),
+                }
+                .into());
+            }
+            if self.network.http.tls.key_file.is_none() {
+                return Err(ConfigError::NetworkConfig {
+                    message: "TLS enabled but key_file not configured".to_string(),
+                }
+                .into());
+            }
+
+            // Validate TLS files exist
+            if let Some(cert_file) = &self.network.http.tls.cert_file
+                && !cert_file.exists()
+            {
+                return Err(ConfigError::NetworkConfig {
+                    message: format!("TLS certificate file not found: {}", cert_file.display()),
+                }
+                .into());
+            }
+            if let Some(key_file) = &self.network.http.tls.key_file
+                && !key_file.exists()
+            {
+                return Err(ConfigError::NetworkConfig {
+                    message: format!("TLS key file not found: {}", key_file.display()),
+                }
+                .into());
+            }
+        }
+
         // Validate record size limit
         if self.max_record_size_mb == 0 {
             return Err(ConfigError::NetworkConfig {
@@ -982,6 +1040,7 @@ impl Default for HttpConfig {
             request_timeout_secs: default_request_timeout(),
             max_body_size_mb: 0, // derived from max_record_size_mb
             cors_allowed_origins: default_cors_allowed_origins(),
+            tls: TlsConfig::default(),
         }
     }
 }

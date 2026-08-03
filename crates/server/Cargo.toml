@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 axum = { workspace = true }
+axum-server = { workspace = true }
 futures = { workspace = true }
 kameo = { workspace = true }
 redb = { workspace = true }

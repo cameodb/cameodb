@@ -11,6 +11,10 @@ pub struct CameoClient {
 
 impl CameoClient {
     pub fn new(url: &str) -> Result<Self> {
+        Self::new_with_insecure(url, false)
+    }
+
+    pub fn new_with_insecure(url: &str, insecure: bool) -> Result<Self> {
         let base_url = Url::parse(url).context("Invalid URL")?;
 
         // Configure client for large file downloads with appropriate timeouts
@@ -19,9 +23,8 @@ impl CameoClient {
             .connect_timeout(std::time::Duration::from_secs(30))
             .pool_idle_timeout(std::time::Duration::from_secs(90));
 
-        // For external HTTPS requests (schema detection from URLs), we need to handle
-        // certificate validation more gracefully. Check if we should accept invalid certs.
-        if std::env::var("CAMEODB_ACCEPT_INVALID_CERTS").is_ok() {
+        // Check if we should accept invalid certs (--insecure flag only)
+        if insecure {
             builder = builder.danger_accept_invalid_certs(true);
         }
 
