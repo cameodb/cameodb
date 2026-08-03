@@ -21,18 +21,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     perl \
     make \
     pkg-config \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Trust corporate CA certificate (if provided)
-RUN --mount=type=secret,id=zscaler,dst=/usr/local/share/ca-certificates/zscaler.crt \
-    if [ -f /usr/local/share/ca-certificates/zscaler.crt ]; then \
-        echo "Zscaler certificate detected, adding to CA bundle..." && \
+RUN --mount=type=secret,id=corporate-ca,dst=/usr/local/share/ca-certificates/corporate-ca.crt \
+    if [ -f /usr/local/share/ca-certificates/corporate-ca.crt ]; then \
+        echo "Corporate CA certificate detected, adding to CA bundle..." && \
         mkdir -p /etc/ssl/certs && \
-        cat /usr/local/share/ca-certificates/zscaler.crt >> /etc/ssl/certs/ca-certificates.crt && \
+        cat /usr/local/share/ca-certificates/corporate-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \
         update-ca-certificates && \
         echo "CA certificates updated successfully"; \
     else \
-        echo "No Zscaler certificate provided, using system defaults"; \
+        echo "No corporate CA certificate provided, using system defaults"; \
     fi
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
@@ -97,11 +98,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     rustup target add "${TARGET_TRIPLE}" || \
     rustup component add rust-std --target "${TARGET_TRIPLE}" || ( \
         echo "rustup failed, trying manual download..."; \
-        RUST_STD_URL="https://static.rust-lang.org/dist/2026-04-16/rust-std-1.95.0-${TARGET_TRIPLE}.tar.xz"; \
+        RUST_STD_URL="https://static.rust-lang.org/dist/1.95.0/rust-std-1.95.0-${TARGET_TRIPLE}.tar.xz"; \
         curl -k -L -o /tmp/rust-std.tar.xz "${RUST_STD_URL}" && \
         mkdir -p /tmp/rust-std && \
-        tar -xf /tmp/rust-std.tar.xz -C /tmp/rust-std && \
-        /tmp/rust-std/rust-std-1.95.0-${TARGET_TRIPLE}/install.sh --prefix=$(rustup show home) && \
+        tar -xJf /tmp/rust-std.tar.xz -C /tmp/rust-std --strip-components=1 && \
+        /tmp/rust-std/install.sh --prefix=$(rustup show home) && \
         rustup target add "${TARGET_TRIPLE}"; \
     ); \
     cargo build --profile release-docker --target "${TARGET_TRIPLE}" --bin cameodb \

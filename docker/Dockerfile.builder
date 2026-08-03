@@ -15,9 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Trust corporate CA certificate if provided (for TLS-intercepting proxies)
-RUN --mount=type=secret,id=zscaler,dst=/usr/local/share/ca-certificates/zscaler.crt \
-    if [ -f /usr/local/share/ca-certificates/zscaler.crt ]; then \
-        cat /usr/local/share/ca-certificates/zscaler.crt >> /etc/ssl/certs/ca-certificates.crt && \
+RUN --mount=type=secret,id=corporate-ca,dst=/usr/local/share/ca-certificates/corporate-ca.crt \
+    if [ -f /usr/local/share/ca-certificates/corporate-ca.crt ]; then \
+        cat /usr/local/share/ca-certificates/corporate-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \
         update-ca-certificates; \
     fi
 
@@ -25,9 +25,6 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ENV CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
-
-# Use curl for rustup downloads to better handle system CA certificates
-ENV RUSTUP_USE_CURL=1
 
 RUN rustup target add x86_64-unknown-linux-musl
 RUN rustup target add aarch64-unknown-linux-musl
