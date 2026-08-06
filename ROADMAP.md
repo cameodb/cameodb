@@ -556,11 +556,16 @@ HTTP req on axum tokio worker (any core)
 - Keep `native-tls-vendored` for musl static builds regardless (OpenSSL vendored works fine there)
 - Optional mTLS for client verification later
 
-**B3 — Cluster Join Authentication** 🟠 HIGH
-- PSK for libp2p swarm (`/swarm/psk/1.0.0/` private network protocol — one-line behaviour change with `pnet` pre-shared key)
-- Config `[network.cluster] psk_file` (32-byte key, hex/base64)
-- Covers kameo remote messaging too once the swarm is private
-- Rotate story: support primary + secondary PSK during rolling upgrades
+**B3 — Cluster Join Authentication** ✅ COMPLETED
+- PSK for libp2p swarm via `pnet` (XSalsa20 private network encryption)
+- Config `[network.cluster] psk` (inline hex string) and `psk_file` (path to file)
+- CLI overrides: `--cluster-psk`, `--cluster-psk-file`; env: `CAMEODB_CLUSTER_PSK`, `CAMEODB_CLUSTER_PSK_FILE`
+- When PSK is set, TCP is wrapped with PnetConfig and QUIC is disabled (pnet only supports TCP)
+- PSK fingerprint logged at startup (not the key itself) for operational verification
+- Config validation: warns if cluster enabled without PSK; validates hex format (64 chars = 32 bytes)
+- Covers kameo remote messaging (all libp2p protocols are gated by the pnet handshake)
+- Disabled by default (backward compatible); opt-in for production clusters
+- Future: PSK rotation with primary + secondary for zero-downtime rolling upgrades
 
 ### Stage C: Defense in Depth (post-auth)
 

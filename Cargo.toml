@@ -9,7 +9,7 @@ axum = "0.8.9"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 futures = "0.3.32"
 kameo = { version = "0.22", features = ["remote", "macros"] }
-libp2p = { version = "0.56.0", features = ["tcp", "dns", "quic", "noise", "yamux", "macros", "kad", "tokio", "serde", "request-response"] }
+libp2p = { version = "0.56.0", features = ["tcp", "dns", "quic", "noise", "yamux", "macros", "kad", "tokio", "serde", "request-response", "pnet"] }
 num_cpus = "1.17"
 redb = "4.1.0"
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }

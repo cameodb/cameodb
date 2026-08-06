@@ -28,6 +28,15 @@ seed_nodes = []
 #     "/ip4/10.0.1.7/tcp/9580"
 # ]
 
+# Cluster pre-shared key (PSK) for private network encryption.
+# When set, all TCP connections are wrapped with XSalsa20 encryption.
+# Peers without the matching key cannot join the cluster.
+# QUIC is automatically disabled when PSK is enabled (pnet only supports TCP).
+# Generate with: openssl rand -hex 32
+# psk = "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890"
+# Alternatively, load from a file (useful for restricted permissions):
+# psk_file = "/etc/cameodb/cluster.psk"
+
 [storage]
 data_paths = ["./data/cameodb"]
 disk_usage_threshold_percent = 90

@@ -12,8 +12,14 @@ use anyhow::Result;
 use behaviour::{DhtBehaviour, DhtBehaviourEvent};
 use cluster::NodeIdentity;
 use futures::StreamExt;
+use libp2p::core::Transport;
+use libp2p::core::transport::upgrade::Version;
 use libp2p::{
-    Multiaddr, PeerId, SwarmBuilder, identify, identity::Keypair, kad, noise, swarm::SwarmEvent,
+    Multiaddr, PeerId, SwarmBuilder, identify,
+    identity::Keypair,
+    kad, noise,
+    pnet::{PnetConfig, PreSharedKey},
+    swarm::SwarmEvent,
     tcp, yamux,
 };
 use std::collections::HashMap;
@@ -422,27 +428,61 @@ async fn create_production_swarm(
 
     info!("🏗️  Created Kademlia DHT behaviour for peer discovery");
 
-    // Build the libp2p swarm with full transport stack including DNS
-    let mut swarm = SwarmBuilder::with_existing_identity(keypair)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default().nodelay(true),
-            noise::Config::new,
-            || {
-                let mut config = yamux::Config::default();
-                // Allow more concurrent streams for high-throughput cluster communication
-                config.set_max_num_streams(8192);
-                config
-            },
-        )?
-        .with_quic() // Add QUIC support for better connectivity
-        .with_dns()? // Enable DNS resolution for hostname-based multiaddrs
-        .with_behaviour(|_key| Ok(behaviour))?
-        .with_swarm_config(|c| {
-            c.with_idle_connection_timeout(Duration::from_secs(300))
-                .with_max_negotiating_inbound_streams(2048)
-        })
-        .build();
+    // Load pre-shared key for private network encryption, if configured.
+    // When PSK is set, we wrap TCP with PnetConfig (XSalsa20) and skip QUIC
+    // (pnet only supports TCP-based transports).
+    let psk_bytes = config.load_psk()?;
+
+    let mut swarm = if let Some(psk_bytes) = psk_bytes {
+        let psk = PreSharedKey::new(psk_bytes);
+        info!(
+            "🔐 Cluster PSK enabled — fingerprint: {} (QUIC disabled, TCP wrapped with XSalsa20)",
+            psk.fingerprint()
+        );
+        let pnet_config = PnetConfig::new(psk);
+
+        let mut yamux_config = yamux::Config::default();
+        yamux_config.set_max_num_streams(8192);
+
+        SwarmBuilder::with_existing_identity(keypair)
+            .with_tokio()
+            .with_other_transport(|kp| {
+                let tcp_transport =
+                    tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
+                        .and_then(move |socket, _| pnet_config.handshake(socket));
+                Ok(tcp_transport
+                    .upgrade(Version::V1Lazy)
+                    .authenticate(noise::Config::new(kp)?)
+                    .multiplex(yamux_config.clone()))
+            })?
+            .with_dns()?
+            .with_behaviour(|_key| Ok(behaviour))?
+            .with_swarm_config(|c| {
+                c.with_idle_connection_timeout(Duration::from_secs(300))
+                    .with_max_negotiating_inbound_streams(2048)
+            })
+            .build()
+    } else {
+        SwarmBuilder::with_existing_identity(keypair)
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default().nodelay(true),
+                noise::Config::new,
+                || {
+                    let mut config = yamux::Config::default();
+                    config.set_max_num_streams(8192);
+                    config
+                },
+            )?
+            .with_quic()
+            .with_dns()?
+            .with_behaviour(|_key| Ok(behaviour))?
+            .with_swarm_config(|c| {
+                c.with_idle_connection_timeout(Duration::from_secs(300))
+                    .with_max_negotiating_inbound_streams(2048)
+            })
+            .build()
+    };
 
     // Initialize Kameo remote registry so remote actors can be registered/looked up.
     swarm.behaviour_mut().kameo.init_global();

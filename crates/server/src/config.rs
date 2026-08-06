@@ -218,6 +218,16 @@ const OVERRIDES: &[Override] = &[
             Ok(())
         },
     },
+    Override {
+        flag: "--cluster-psk", env: "CAMEODB_CLUSTER_PSK", kind: FlagKind::Value,
+        placeholder: "<HEX>", help: "Inline hex-encoded 32-byte cluster pre-shared key",
+        apply: |c, v| { c.network.cluster.psk = Some(v.to_string()); Ok(()) },
+    },
+    Override {
+        flag: "--cluster-psk-file", env: "CAMEODB_CLUSTER_PSK_FILE", kind: FlagKind::Value,
+        placeholder: "<PATH>", help: "Path to file containing hex-encoded 32-byte cluster PSK",
+        apply: |c, v| { c.network.cluster.psk_file = Some(PathBuf::from(v)); Ok(()) },
+    },
 ];
 
 /// Configuration overrides collected from the command line.
@@ -598,6 +608,19 @@ pub struct ClusterConfig {
     /// Bootstrap peers with peer IDs (format: "/ip4/1.2.3.4/tcp/9580/p2p/12D3KooW...")
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
+
+    /// Inline pre-shared key (PSK) for cluster join authentication.
+    /// 32-byte key hex-encoded (64 characters). When set, all TCP connections
+    /// are wrapped with XSalsa20 encryption. Peers without the matching key
+    /// cannot join the cluster. QUIC is disabled when PSK is enabled.
+    #[serde(default)]
+    pub psk: Option<String>,
+
+    /// Path to a file containing the cluster PSK (same format as `psk`).
+    /// Useful for secrets management — the file can have restricted permissions.
+    /// If both `psk` and `psk_file` are set, `psk` takes precedence.
+    #[serde(default)]
+    pub psk_file: Option<PathBuf>,
 
     /// Messaging configuration
     #[serde(default)]
@@ -1014,6 +1037,46 @@ impl CameoDbConfig {
             }
         }
 
+        // Validate cluster PSK
+        if self.network.cluster.enabled
+            && self.network.cluster.psk.is_none()
+            && self.network.cluster.psk_file.is_none()
+        {
+            warn!(
+                "Cluster is enabled without a pre-shared key (psk/psk_file). \
+                 Any libp2p node on the network can join. Set psk for production clusters."
+            );
+        }
+        if let Some(ref psk) = self.network.cluster.psk {
+            let hex_str = psk.trim();
+            if hex_str.len() != 64 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(ConfigError::NetworkConfig {
+                    message: "cluster psk must be exactly 64 hex characters (32 bytes)".to_string(),
+                }
+                .into());
+            }
+        }
+        if let Some(ref psk_path) = self.network.cluster.psk_file {
+            if !psk_path.exists() {
+                return Err(ConfigError::NetworkConfig {
+                    message: format!("cluster psk_file not found: {}", psk_path.display()),
+                }
+                .into());
+            }
+            let contents =
+                std::fs::read_to_string(psk_path).map_err(|e| ConfigError::NetworkConfig {
+                    message: format!("failed to read cluster psk_file: {}", e),
+                })?;
+            let hex_str = contents.trim();
+            if hex_str.len() != 64 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(ConfigError::NetworkConfig {
+                    message: "cluster psk_file must contain exactly 64 hex characters (32 bytes)"
+                        .to_string(),
+                }
+                .into());
+            }
+        }
+
         // Validate storage configuration
         if self.storage.data_paths.is_empty() {
             return Err(ConfigError::StorageConfig {
@@ -1163,6 +1226,40 @@ impl Default for MessagingConfig {
     }
 }
 
+impl ClusterConfig {
+    /// Load and resolve the cluster pre-shared key.
+    ///
+    /// If `psk` is set, it takes precedence over `psk_file`.
+    /// Returns `None` if neither is configured.
+    /// Returns `Err` if the key is malformed (validation also runs in `validate()`,
+    /// but this provides a second gate before swarm creation).
+    pub fn load_psk(&self) -> Result<Option<[u8; 32]>> {
+        let hex_owned: String;
+        let hex_str: &str = if let Some(ref psk) = self.psk {
+            psk.trim()
+        } else if let Some(ref path) = self.psk_file {
+            let contents = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("failed to read cluster psk_file: {}", e))?;
+            hex_owned = contents.trim().to_string();
+            &hex_owned
+        } else {
+            return Ok(None);
+        };
+
+        if hex_str.len() != 64 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
+            anyhow::bail!("cluster PSK must be exactly 64 hex characters (32 bytes)");
+        }
+
+        let mut bytes = [0u8; 32];
+        for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
+            bytes[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16)
+                .map_err(|e| anyhow::anyhow!("invalid hex in cluster PSK: {}", e))?;
+        }
+
+        Ok(Some(bytes))
+    }
+}
+
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
@@ -1174,6 +1271,8 @@ impl Default for ClusterConfig {
             cluster_name: default_cluster_name(),
             listen_addrs: Vec::new(),
             bootstrap_peers: Vec::new(),
+            psk: None,
+            psk_file: None,
             messaging: MessagingConfig::default(),
         }
     }
