@@ -8,6 +8,7 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderValue, StatusCode, header},
+    middleware::{Next, from_fn},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
@@ -17,6 +18,8 @@ use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use kameo::actor::ActorRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tower_http::{
     compression::CompressionLayer, cors::CorsLayer, decompression::DecompressionLayer,
     trace::TraceLayer,
@@ -30,17 +33,43 @@ use crate::node_orchestrator::{
 };
 use storage::IndexSchema;
 
-/// Application error wrapper for consistent error handling
+/// Application error wrapper for consistent error handling.
+///
+/// `status` short-circuits the string-sniffing classification below. Handlers
+/// that already know the correct HTTP status should set it explicitly rather
+/// than relying on the error text.
 #[derive(Debug)]
-pub struct AppError(pub anyhow::Error);
+pub struct AppError {
+    pub error: anyhow::Error,
+    pub status: Option<StatusCode>,
+}
+
+impl AppError {
+    /// 400 with an explicit, client-safe message.
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self {
+            error: anyhow::anyhow!("{}", msg.into()),
+            status: Some(StatusCode::BAD_REQUEST),
+        }
+    }
+
+    /// 404 with an explicit, client-safe message.
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            error: anyhow::anyhow!("{}", msg.into()),
+            status: Some(StatusCode::NOT_FOUND),
+        }
+    }
+}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let error_msg = self.0.to_string();
+        let error_msg = self.error.to_string();
 
-        // Error classification logic
-        let (status, message) = if error_msg.contains("NotFound") || error_msg.contains("not found")
-        {
+        // An explicit status wins; otherwise fall back to classifying the text.
+        let (status, message) = if let Some(status) = self.status {
+            (status, error_msg.as_str())
+        } else if error_msg.contains("NotFound") || error_msg.contains("not found") {
             (StatusCode::NOT_FOUND, "Resource not found")
         } else if error_msg.contains("QueryParserError") || error_msg.contains("parse") {
             (StatusCode::BAD_REQUEST, "Invalid query format")
@@ -70,12 +99,53 @@ impl IntoResponse for AppError {
     }
 }
 
+/// Validate an index name for creation.
+///
+/// Rejects names that could escape the `shard_path/indices/` directory via path
+/// traversal (`..`, `/`, `\`), empty names, names exceeding 255 bytes, and names
+/// that don't start with an alphanumeric character.
+fn validate_index_name(index: &str) -> Result<(), AppError> {
+    if index.is_empty() {
+        return Err(AppError::bad_request("index name must not be empty"));
+    }
+    if index.len() > 255 {
+        return Err(AppError::bad_request(
+            "index name must not exceed 255 characters",
+        ));
+    }
+    if !index.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return Err(AppError::bad_request(
+            "index name must start with an alphanumeric character",
+        ));
+    }
+    if index.contains("..") {
+        return Err(AppError::bad_request("index name must not contain '..'"));
+    }
+    if index.contains('/') || index.contains('\\') {
+        return Err(AppError::bad_request(
+            "index name must not contain path separators",
+        ));
+    }
+    if !index
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(AppError::bad_request(
+            "index name contains invalid characters (allowed: a-z, A-Z, 0-9, _, -, .)",
+        ));
+    }
+    Ok(())
+}
+
 impl<E> From<E> for AppError
 where
     E: Into<anyhow::Error>,
 {
     fn from(err: E) -> Self {
-        Self(err.into())
+        Self {
+            error: err.into(),
+            status: None,
+        }
     }
 }
 
@@ -1276,9 +1346,58 @@ fn cameodb_syntax_reference() -> JsonValue {
 /// # Arguments
 /// * `state` - Application state with actor references
 /// * `max_body_size_mb` - Maximum request body size in MB (from config)
-pub fn create_router(state: AppState, max_body_size_mb: usize) -> (Router, McpShutdownHandle) {
+/// * `cors_allowed_origins` - List of allowed CORS origins (from config)
+/// * `max_concurrent_requests` - Maximum concurrent in-flight HTTP requests
+pub fn create_router(
+    state: AppState,
+    max_body_size_mb: usize,
+    cors_allowed_origins: &[String],
+    max_concurrent_requests: usize,
+) -> (Router, McpShutdownHandle) {
     let body_limit_bytes = max_body_size_mb * 1024 * 1024;
     let (mcp_routes, mcp_handle) = mcp_router::<AppState>();
+
+    // Concurrency limiter: rejects with 503 when too many requests are in flight.
+    let semaphore = Arc::new(Semaphore::new(max_concurrent_requests));
+    let concurrency_guard = from_fn(move |req: axum::extract::Request, next: Next| {
+        let sem = semaphore.clone();
+        async move {
+            match sem.try_acquire() {
+                Ok(_permit) => next.run(req).await,
+                Err(_) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Too many concurrent requests",
+                )
+                    .into_response(),
+            }
+        }
+    });
+
+    // Build the CORS layer from config. `CameoDbConfig::validate` has already
+    // rejected empty lists, "*" mixed with specific origins, and origins that
+    // are not valid header values, so the parse below cannot silently drop an
+    // entry and leave a deny-all policy behind.
+    let cors_layer = if cors_allowed_origins.iter().any(|o| o == "*") {
+        warn!("CORS: allowing any origin (cors_allowed_origins = [\"*\"])");
+        CorsLayer::permissive()
+    } else {
+        let origins: Vec<HeaderValue> = cors_allowed_origins
+            .iter()
+            .filter_map(|o| o.parse::<HeaderValue>().ok())
+            .collect();
+        info!(origins = ?cors_allowed_origins, "CORS: restricting to configured origins");
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::PUT,
+                axum::http::Method::PATCH,
+                axum::http::Method::DELETE,
+            ])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+    };
+
     let router = Router::new()
         .nest("/mcp", mcp_routes)
         // API routes
@@ -1311,12 +1430,19 @@ pub fn create_router(state: AppState, max_body_size_mb: usize) -> (Router, McpSh
         .route("/_cluster/health", get(health_handler))
         .fallback(fallback_handler)
         .with_state(state)
-        // Response compression first (outermost)
+        // Response compression (outermost for responses)
         .layer(CompressionLayer::new())
-        // Allow compressed requests
-        .layer(DecompressionLayer::new())
+        // Decompressed body limit — applies *after* decompression so that
+        // compression bombs (small compressed → huge decompressed) are caught.
         .layer(DefaultBodyLimit::max(body_limit_bytes))
-        .layer(CorsLayer::permissive())
+        // Allow compressed requests — decompresses before the body limit above
+        .layer(DecompressionLayer::new())
+        // Compressed-size guard — limits raw bytes on the wire to prevent
+        // bandwidth abuse even when the payload is not actually compressed.
+        .layer(DefaultBodyLimit::max(body_limit_bytes))
+        // Concurrency guard — reject excess requests with 503
+        .layer(concurrency_guard)
+        .layer(cors_layer)
         .layer(TraceLayer::new_for_http());
 
     (router, mcp_handle)
@@ -1708,8 +1834,9 @@ async fn write_stream_handler(
     let mut body_stream = body.into_data_stream();
 
     while let Some(chunk_result) = body_stream.next().await {
-        let chunk = chunk_result
-            .map_err(|e| AppError(anyhow::anyhow!("Failed to read request body chunk: {}", e)))?;
+        let chunk = chunk_result.map_err(|e| {
+            AppError::bad_request(format!("Failed to read request body chunk: {}", e))
+        })?;
 
         buf.extend_from_slice(&chunk);
 
@@ -1723,10 +1850,9 @@ async fn write_stream_handler(
 
             total_line_count += 1;
             let doc_payload: DocPayload = serde_json::from_slice(line).map_err(|e| {
-                AppError(anyhow::anyhow!(
+                AppError::bad_request(format!(
                     "Failed to parse document on line {}: {}",
-                    total_line_count,
-                    e
+                    total_line_count, e
                 ))
             })?;
             batch.push(doc_payload);
@@ -1751,10 +1877,9 @@ async fn write_stream_handler(
         if !line.is_empty() {
             total_line_count += 1;
             let doc_payload: DocPayload = serde_json::from_slice(&line).map_err(|e| {
-                AppError(anyhow::anyhow!(
+                AppError::bad_request(format!(
                     "Failed to parse document on line {}: {}",
-                    total_line_count,
-                    e
+                    total_line_count, e
                 ))
             })?;
             batch.push(doc_payload);
@@ -1769,9 +1894,7 @@ async fn write_stream_handler(
     }
 
     if total_line_count == 0 {
-        return Err(AppError(anyhow::anyhow!(
-            "No documents found in request body"
-        )));
+        return Err(AppError::bad_request("No documents found in request body"));
     }
 
     info!(
@@ -1792,7 +1915,7 @@ async fn write_stream_handler(
     });
 
     let bytes = serde_json::to_vec(&result).map_err(|e| {
-        AppError(anyhow::anyhow!(
+        AppError::from(anyhow::anyhow!(
             "Failed to serialize write stream result: {}",
             e
         ))
@@ -1869,6 +1992,7 @@ async fn create_config_handler(
     State(state): State<AppState>,
     Json(schema): Json<IndexSchema>,
 ) -> Result<Json<JsonValue>, AppError> {
+    validate_index_name(&index)?;
     info!("Create config request - index: {}", index);
 
     let client_op = ClientOp::CreateConfig { index, schema };
@@ -2056,8 +2180,10 @@ async fn update_schema_handler(
         )
         .await?;
 
+    // The stored schema is server-side data, so a decode failure here is a 500,
+    // not a client error.
     let mut schema: IndexSchema = serde_json::from_value(current_schema_result)
-        .map_err(|e| AppError(anyhow::anyhow!("Failed to parse schema: {}", e)))?;
+        .map_err(|e| AppError::from(anyhow::anyhow!("Failed to decode stored schema: {}", e)))?;
 
     // Update indexed flags for specified fields
     let mut updated_fields = Vec::new();
@@ -2073,7 +2199,7 @@ async fn update_schema_handler(
     }
 
     if !missing_fields.is_empty() {
-        return Err(AppError(anyhow::anyhow!(
+        return Err(AppError::bad_request(format!(
             "Fields not found in schema: {}",
             missing_fields.join(", ")
         )));
@@ -2117,6 +2243,29 @@ async fn delete_index_handler(
         index, params.delete_schema
     );
 
+    // Require the index to exist before deleting. A name that was never created
+    // cannot have passed `validate_index_name`, so this also rejects traversal
+    // attempts. Distinguish "absent" from "lookup failed" so that an actor
+    // timeout is not reported to the client as a missing index.
+    if let Err(e) = state
+        .router
+        .handle_client_op(ClientOp::GetConfig {
+            index: index.clone(),
+        })
+        .await
+    {
+        let msg = e.to_string();
+        return Err(if msg.contains("NotFound") || msg.contains("not found") {
+            AppError::not_found(format!("index '{}' not found", index))
+        } else {
+            AppError::from(anyhow::anyhow!(
+                "Failed to look up index '{}': {}",
+                index,
+                msg
+            ))
+        });
+    }
+
     // Use cluster coordinator for proper cluster-wide index deletion
     let delete_msg = crate::cluster_coordinator::DeleteIndexCluster {
         index: index.clone(),
@@ -2124,7 +2273,7 @@ async fn delete_index_handler(
     };
 
     let result = state.coordinator.ask(delete_msg).await.map_err(|e| {
-        AppError(anyhow::anyhow!(
+        AppError::from(anyhow::anyhow!(
             "Failed to delete index across cluster: {}",
             e
         ))
@@ -2423,5 +2572,60 @@ mod tests {
         assert_eq!(limit, None);
         assert_eq!(fields, None);
         assert_eq!(parsed_sort, None);
+    }
+}
+
+#[cfg(test)]
+mod index_name_validation_tests {
+    use super::validate_index_name;
+
+    #[test]
+    fn valid_names() {
+        assert!(validate_index_name("my-index").is_ok());
+        assert!(validate_index_name("index_123").is_ok());
+        assert!(validate_index_name("a").is_ok());
+        assert!(validate_index_name("camelCase").is_ok());
+        assert!(validate_index_name("dots.are.ok").is_ok());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(validate_index_name("").is_err());
+    }
+
+    #[test]
+    fn rejects_too_long() {
+        let long = "a".repeat(256);
+        assert!(validate_index_name(&long).is_err());
+    }
+
+    #[test]
+    fn rejects_non_alphanumeric_start() {
+        assert!(validate_index_name("_bad").is_err());
+        assert!(validate_index_name("-bad").is_err());
+        assert!(validate_index_name(".bad").is_err());
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        assert!(validate_index_name("..").is_err());
+        assert!(validate_index_name("../etc").is_err());
+        assert!(validate_index_name("a..b").is_err());
+        assert!(validate_index_name("..%2f..%2fetc").is_err());
+    }
+
+    #[test]
+    fn rejects_path_separators() {
+        assert!(validate_index_name("a/b").is_err());
+        assert!(validate_index_name("a\\b").is_err());
+        assert!(validate_index_name("/etc").is_err());
+    }
+
+    #[test]
+    fn rejects_special_chars() {
+        assert!(validate_index_name("a b").is_err());
+        assert!(validate_index_name("a;b").is_err());
+        assert!(validate_index_name("a&b").is_err());
+        assert!(validate_index_name("a|b").is_err());
     }
 }

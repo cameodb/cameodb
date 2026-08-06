@@ -384,7 +384,12 @@ async fn main() -> Result<()> {
     };
 
     // Create the HTTP router with shared state and body limit derived from max_record_size_mb
-    let (app, mcp_handle) = create_router(app_state, cameodb_config.effective_max_body_size_mb());
+    let (app, mcp_handle) = create_router(
+        app_state,
+        cameodb_config.effective_max_body_size_mb(),
+        &cameodb_config.network.http.cors_allowed_origins,
+        cameodb_config.network.http.max_concurrent_requests,
+    );
 
     // Extract HTTP configuration
     let http_config = &cameodb_config.network.http;
@@ -460,6 +465,10 @@ async fn main() -> Result<()> {
         cameodb_config.effective_max_body_size_mb(),
         cameodb_config.effective_remote_message_size_bytes() / (1024 * 1024),
         cameodb_config.effective_request_timeout_secs()
+    );
+    println!(
+        "  Max Concurrent Requests: {}",
+        cameodb_config.network.http.max_concurrent_requests
     );
     println!();
     println!("Press Ctrl+C to shutdown...");

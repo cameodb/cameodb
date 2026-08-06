@@ -1293,6 +1293,31 @@ pub enum StoreError {
 
     #[error("index not found: {0}")]
     IndexNotFound(String),
+
+    #[error("invalid index name: {0}")]
+    InvalidIndexName(String),
+}
+
+/// Resolve an index name to its on-disk directory under `indices_base`.
+///
+/// The index name must be exactly one normal path component. This is a purely
+/// lexical check — it needs no filesystem access, so it holds for indexes that
+/// do not exist yet (the case where a traversal attempt would otherwise create
+/// a directory outside the shard). Rejects `..`, `.`, absolute paths, path
+/// separators, Windows prefixes, and the empty string.
+fn resolve_index_dir(indices_base: &Path, index: &str) -> Result<PathBuf, StoreError> {
+    let mut components = Path::new(index).components();
+    let is_single_normal_component = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if !is_single_normal_component {
+        return Err(StoreError::InvalidIndexName(format!(
+            "'{}' must be a single path component without separators or '..'",
+            index
+        )));
+    }
+    Ok(indices_base.join(index))
 }
 
 /// Write-Ahead Log operations for atomic dual-write.
@@ -2510,6 +2535,16 @@ impl HybridStore {
         }
     }
 
+    /// On-disk Tantivy directory for `index`, validated to stay inside this
+    /// shard's `indices/` directory.
+    ///
+    /// Every path derived from a caller-supplied index name must go through
+    /// here rather than joining directly, so that a name containing `..` or a
+    /// path separator can never escape the shard.
+    pub fn index_dir(&self, index: &str) -> Result<PathBuf, StoreError> {
+        resolve_index_dir(&self.config.shard_path.join("indices"), index)
+    }
+
     /// Helper method: get_or_create_index
     /// Made public to allow pre-creating indexes when schema is created
     pub fn get_or_create_index(
@@ -2548,8 +2583,10 @@ impl HybridStore {
             return Ok((Arc::clone(writer.value()), fields.value().clone()));
         }
 
-        // Create index directory and Tantivy index if it doesn't exist
-        let index_path = self.config.shard_path.join("indices").join(index);
+        // Create index directory and Tantivy index if it doesn't exist.
+        // `index_dir` rejects any name that is not a single path component, so a
+        // traversal attempt cannot reach the `create_dir_all` below.
+        let index_path = self.index_dir(index)?;
         let init_start = Instant::now();
 
         // Determine schema for this index
@@ -3320,6 +3357,10 @@ impl HybridStore {
     /// Delete all data for an index using redb's efficient delete_table() function
     /// If delete_schema is true, also removes schema metadata from TABLE_SCHEMA
     pub fn delete_index_data(&self, index: &str, delete_schema: bool) -> Result<(), StoreError> {
+        // Resolve (and validate) the directory before mutating any state, so an
+        // invalid name cannot drop caches or redb tables on its way to failing.
+        let index_path = self.index_dir(index)?;
+
         // Remove from caches first
         self.writers.remove(index);
         self.readers.remove(index);
@@ -3380,9 +3421,8 @@ impl HybridStore {
         write_txn.commit()?;
 
         // Remove tantivy directory
-        let index_path = self.config.shard_path.join("indices").join(index);
         if index_path.exists() {
-            fs::remove_dir_all(index_path)?;
+            fs::remove_dir_all(&index_path)?;
         }
 
         Ok(())
@@ -3525,7 +3565,7 @@ impl HybridStore {
 
         // Slow path: load from Tantivy (source of truth), not from stored schema
         // Get the index path and open the Tantivy index directly
-        let index_path = self.config.shard_path.join("indices").join(index);
+        let index_path = self.index_dir(index)?;
 
         // Always load stored schema first (may contain non-indexed fields)
         let stored_schema = self.get_schema(index)?;
@@ -3752,7 +3792,7 @@ impl HybridStore {
         }
 
         // Slow path: Index not cached, need to open and cache it
-        let index_path = self.config.shard_path.join("indices").join(index);
+        let index_path = self.index_dir(index)?;
         if !index_path.exists() || !index_path.join("meta.json").exists() {
             return Ok(None);
         }
@@ -5375,6 +5415,67 @@ unsafe impl Send for HybridStore {}
 unsafe impl Sync for HybridStore {}
 
 #[cfg(test)]
+mod index_dir_tests {
+    use super::{StoreError, resolve_index_dir};
+    use std::path::Path;
+
+    fn base() -> &'static Path {
+        Path::new("/shard/indices")
+    }
+
+    #[test]
+    fn accepts_plain_names() {
+        assert_eq!(
+            resolve_index_dir(base(), "docs").unwrap(),
+            Path::new("/shard/indices/docs")
+        );
+        assert_eq!(
+            resolve_index_dir(base(), "my-index_2.v1").unwrap(),
+            Path::new("/shard/indices/my-index_2.v1")
+        );
+    }
+
+    /// The guard must hold without touching the filesystem: these paths do not
+    /// exist, which is exactly the case where a canonicalize-based check would
+    /// silently pass and let `create_dir_all` escape the shard.
+    #[test]
+    fn rejects_traversal_and_separators() {
+        for name in [
+            "..",
+            ".",
+            "../etc",
+            "../../etc/passwd",
+            "a/b",
+            "a/../../b",
+            "/etc",
+            "/etc/passwd",
+            "",
+            "./x",
+        ] {
+            let err =
+                resolve_index_dir(base(), name).expect_err(&format!("'{}' must be rejected", name));
+            assert!(
+                matches!(err, StoreError::InvalidIndexName(_)),
+                "'{}' produced the wrong error: {:?}",
+                name,
+                err
+            );
+        }
+    }
+
+    /// A rejected name must never yield a path outside the base, and an accepted
+    /// one must always stay directly beneath it.
+    #[test]
+    fn accepted_names_stay_within_base() {
+        for name in ["docs", "a.b", "x-1"] {
+            let path = resolve_index_dir(base(), name).unwrap();
+            assert_eq!(path.parent(), Some(base()));
+            assert!(path.starts_with(base()));
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -5469,6 +5570,73 @@ mod tests {
             "a new searcher generation must be warmed, not skipped"
         );
         assert_eq!(third.num_docs, 2, "both documents should be searchable");
+    }
+
+    /// A traversal index name must not create or remove anything outside the
+    /// shard. This exercises the real write and delete paths rather than the
+    /// validator in isolation, because the earlier canonicalize-based guard
+    /// passed its unit tests while still allowing `create_dir_all` to escape.
+    #[test]
+    fn traversal_index_name_cannot_touch_paths_outside_shard() {
+        let parent = TempDir::new().unwrap();
+        let shard_path = parent.path().join("shard");
+        std::fs::create_dir_all(&shard_path).unwrap();
+
+        // A sibling of the shard that must survive untouched.
+        let victim = parent.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("keep.txt"), b"precious").unwrap();
+
+        let config = StorageConfig {
+            shard_path: shard_path.clone(),
+            indexer_memory_budget: 32 * 1024 * 1024,
+            indexer_memory_min_mb: 16,
+            indexer_memory_max_mb: 256,
+            total_memory_limit_bytes: 2048 * 1024 * 1024,
+            memory_pressure_threshold_percent: 80,
+            indexer_num_threads: 1,
+            merge_num_threads: 1,
+            default_batch_size: 100,
+            wal_sync: true,
+        };
+        let store = HybridStore::new(config, 1).unwrap();
+
+        for name in ["../victim", "..", "../../etc", "a/b"] {
+            assert!(
+                matches!(store.index_dir(name), Err(StoreError::InvalidIndexName(_))),
+                "index_dir must reject '{}'",
+                name
+            );
+
+            // The write path creates the index directory, so it must refuse too.
+            let write = store.apply_write(
+                name,
+                WalOp::Put {
+                    id: "doc-1".to_string(),
+                    json_blob: Some(serde_json::json!({ "title": "x" })),
+                },
+            );
+            assert!(write.is_err(), "apply_write must reject '{}'", name);
+
+            // The delete path removes a directory, so it must refuse too.
+            assert!(
+                store.delete_index_data(name, true).is_err(),
+                "delete_index_data must reject '{}'",
+                name
+            );
+        }
+
+        // Nothing outside the shard was created or removed.
+        assert!(victim.join("keep.txt").exists(), "sibling file was deleted");
+        assert_eq!(
+            std::fs::read(victim.join("keep.txt")).unwrap(),
+            b"precious",
+            "sibling file was modified"
+        );
+        assert!(
+            !parent.path().join("etc").exists(),
+            "a directory was created outside the shard"
+        );
     }
 
     #[test]

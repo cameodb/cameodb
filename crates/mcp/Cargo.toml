@@ -2,7 +2,7 @@
 name = "cameodb_mcp"
 version = "0.2.3"
 edition = "2024"
-license = "FSL-1.1-Apache-2.0"
+license = "Apache-2.0"
 description = "Model Context Protocol router and transport for CameoDB"
 
 [dependencies]

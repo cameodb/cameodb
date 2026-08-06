@@ -2,7 +2,7 @@
 name = "server"
 version = "0.2.3"
 edition = "2024"
-license = "FSL-1.1-Apache-2.0"
+license = "Apache-2.0"
 description = "A high-performance distributed hybrid-search database"
 
 [[bin]]
@@ -25,10 +25,10 @@ tower = { workspace = true }
 tower-http = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
-cameodb_mcp = { path = "../mcp" }
-client = { path = "../client" }
-cluster = { path = "../cluster" }
-storage = { path = "../storage" }
+cameodb_mcp = { path = "../mcp", version = "0.2.3" }
+client = { path = "../client", version = "0.2.3" }
+cluster = { path = "../cluster", version = "0.2.3" }
+storage = { path = "../storage", version = "0.2.3" }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

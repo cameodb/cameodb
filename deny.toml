@@ -1,0 +1,57 @@
+# cargo-deny configuration
+# Run: cargo deny check
+
+feature-depth = 1
+
+[advisories]
+ignore = [
+    # hickory-proto 0.25.x vulnerabilities — transitive via libp2p 0.56.0.
+    # Fix requires hickory-proto >=0.26.1, which libp2p hasn't adopted yet.
+    { id = "RUSTSEC-2026-0118", reason = "transitive via libp2p 0.56.0; no upstream fix available" },
+    { id = "RUSTSEC-2026-0119", reason = "transitive via libp2p 0.56.0; no upstream fix available" },
+    # paste is unmaintained but pulled in transitively via libp2p → if-watch → netlink-packet-core.
+    # No actionable fix until the upstream chain replaces it.
+    { id = "RUSTSEC-2024-0436", reason = "transitive via libp2p; no upstream replacement available" },
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "Unlicense",
+    "BSL-1.0",
+    "MPL-2.0",
+    "EPL-2.0",
+    "bzip2-1.0.6",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

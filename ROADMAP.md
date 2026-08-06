@@ -433,14 +433,14 @@ HTTP req on axum tokio worker (any core)
 
 ## Phase 14: Security Hardening 🔒 IN PROGRESS
 
-**Objective**: Close the security gaps identified in the code security review (2026-07-30). Currently CameoDB has **no authentication, no authorization, permissive CORS, and unvalidated index names** reaching the filesystem. TLS is now implemented (Stage B2). This phase turns CameoDB from a trusted-LAN-only system into one that can be safely exposed to untrusted networks.
+**Objective**: Close the security gaps identified in the code security review (2026-07-30). The remaining critical gap is that CameoDB has **no authentication and no authorization** — every HTTP and MCP endpoint is open. TLS (B2), index-name validation (A1), and CORS wiring (A2) are done. This phase turns CameoDB from a trusted-LAN-only system into one that can be safely exposed to untrusted networks.
 
 **Current state (verified by audit):**
 - ✅ No hardcoded secrets, no command execution, no regex/ReDoS surface, no SSRF
 - ✅ libp2p cluster transport already uses Noise encryption
 - ⚠️ All HTTP/MCP endpoints unauthenticated (write, delete, admin included)
-- ⚠️ Index name flows unvalidated into `shard_path.join("indices").join(index)` → path traversal → arbitrary directory delete via `DELETE /api/..%2f..`
-- ⚠️ `CorsLayer::permissive()` hardcoded; configured `cors_allowed_origins` never wired
+- ✅ Index names validated at creation and resolved through `HybridStore::index_dir()`, which rejects any name that is not a single path component (Stage A1)
+- ✅ `cors_allowed_origins` wired into the router with fail-fast config validation; default remains `["*"]` (Stage A2)
 - ✅ TLS on HTTP implemented via rustls (Stage B2); default bind `0.0.0.0:9480` still plaintext unless explicitly enabled
 - ⚠️ No cluster join authentication (any reachable node can join)
 - ⚠️ No rate limiting / concurrency caps; 576MB default body limit + decompression layer = memory DoS vector
@@ -450,8 +450,8 @@ HTTP req on axum tokio worker (any core)
 
 | Order | Stage | Effort | Impact | Risk if unfixed |
 |-------|-------|--------|--------|-----------------|
-| **1** | A1: Index name validation | ~1 day | Critical | Arbitrary dir deletion (RCE-adjacent) |
-| **2** | A2: CORS config wiring | ~2 hrs | High | Drive-by browser attacks on local instances |
+| **1** | A1: Index name validation | ✅ Done | Critical | Arbitrary dir deletion (RCE-adjacent) |
+| **2** | A2: CORS config wiring | 🟡 Partial | High | Drive-by browser attacks on local instances |
 | **3** | A3: `ACCEPT_INVALID_CERTS` removal | ✅ Done | Medium | Accidental TLS bypass |
 | **4** | A4: Body limits + concurrency caps | ~1 day | High | Memory DoS / decompression bomb |
 | **5** | A5: CI security tooling (`cargo audit`, `cargo deny`) | ~2 hrs | Medium | Silent vulnerable deps |
@@ -464,32 +464,40 @@ HTTP req on axum tokio worker (any core)
 
 ### Stage A: Quick Wins (no protocol changes)
 
-**A1 — Index Name Validation** 🔴 CRITICAL
+**A1 — Index Name Validation** ✅ COMPLETED
 - Two-tier approach at the HTTP boundary (`http_server.rs`):
-  1. **Index creation** (`PUT /api/{index}/_config`): full `validate_index_name()` — reject `..` segments, path separators (`/`, `\`), empty, length > 255, must start with alphanumeric. This is the only route where a new name enters the system.
-  2. **All other routes** (search, write, bulk, schema, delete, admin commit/evict): verify index exists in the index cache — the name was already validated at creation time; no need to re-validate naming rules
-- Defense-in-depth at storage boundary (`storage/src/lib.rs`): assert the resolved path is still within `shard_path/indices/` after joining
-- Regression tests: `DELETE /api/..%2f..%2fetc` must return 400, must not touch the filesystem
+  1. **Index creation** (`PUT /api/{index}/_config`): `validate_index_name()` rejects `..`, path separators, empty, length > 255, non-alphanumeric first character, and anything outside `[A-Za-z0-9_.-]`. This is the only route where a new name enters the system.
+  2. **Delete** (`DELETE /api/{index}`): requires the index to exist; returns 404 when absent and 500 when the lookup itself fails
+- Defense-in-depth at the storage boundary: `HybridStore::index_dir()` resolves every caller-supplied name and rejects anything that is not a single normal path component. The check is **lexical**, not `canonicalize()`-based, so it also holds for indexes that do not exist yet — the case where a traversal name would otherwise reach `create_dir_all` and escape the shard. Applied to `get_or_create_index` (creates dirs), `delete_index_data` (removes dirs, validated before any mutation), and both `Index::open_in_dir` slow paths.
+- Tests: 7 unit tests on `validate_index_name`, 3 on `resolve_index_dir`, plus an end-to-end test that drives the real write and delete paths with `../victim`, `..`, `../../etc`, and `a/b` and asserts nothing outside the shard is created or removed
 
-**A2 — Wire CORS Config** 🟠 HIGH
-- Replace hardcoded `CorsLayer::permissive()` with origins from `network.http.cors_allowed_origins`
-- Default to `localhost`/`127.0.0.1` origins only when binding to loopback; require explicit `["*"]` opt-in for wildcard
-- Deny credentials with wildcard origin (per CORS spec pitfalls)
+**A2 — Wire CORS Config** � PARTIALLY COMPLETED
+- ✅ Replaced hardcoded `CorsLayer::permissive()` with origins from `network.http.cors_allowed_origins`, threaded through `create_router`
+- ✅ Explicit methods (`GET/POST/PUT/PATCH/DELETE`) and headers (`Content-Type`, `Authorization`) for the non-wildcard path
+- ✅ Credentials are never combined with a wildcard origin (`permissive()` does not set them)
+- ✅ Fail-fast validation in `CameoDbConfig::validate()`: rejects an empty list, `"*"` mixed with specific origins, origins that are not valid header values, and origins without a scheme — a typo can no longer degrade silently into deny-all
+- ✅ Effective policy is logged at startup (`warn!` for wildcard, `info!` with the origin list otherwise)
+- 📋 **Remaining**: default is still `["*"]`, so out of the box the server is permissive. Defaulting to loopback origins when `bind_address` is local is a behavioural change still to be made.
 
 **A3 — TLS Bypass Handling** ✅ COMPLETED
 - Removed `CAMEODB_ACCEPT_INVALID_CERTS` environment variable entirely
 - Replaced with `--insecure` flag: per-command for single operations, per-session for interactive REPL
 - No global TLS bypass via environment variables; must be explicitly requested via CLI flag
 
-**A4 — DoS Hardening** 🟠 HIGH
-- Lower default `max_record_size_mb` (512MB → e.g. 64MB) or document the risk prominently
-- Add `tower::limit::ConcurrencyLimitLayer` on search/stream endpoints (configurable)
-- Verify `DefaultBodyLimit` applies to the *decompressed* byte count; if not, add an explicit decompressed-size guard
+**A4 — DoS Hardening** ✅ COMPLETED
+- ✅ Lowered default `max_record_size_mb` from 512MB → 64MB; all derived limits (HTTP body, Kameo remote messaging, request timeout) scale accordingly
+- ✅ Added `max_concurrent_requests` to `HttpConfig` (default: 128) with CLI/env override (`--max-concurrent-requests` / `CAMEODB_MAX_CONCURRENT_REQUESTS`); semaphore-based concurrency guard middleware rejects excess requests with HTTP 503
+- ✅ Fixed `DefaultBodyLimit` ordering: decompressed body limit is applied *after* `DecompressionLayer` (inner) so compression bombs are caught; a second `DefaultBodyLimit` *before* decompression (outer) caps raw wire bytes
+- ✅ Config validation rejects `max_concurrent_requests = 0`
+- ✅ Startup log prints effective concurrency limit; example config updated
 
-**A5 — CI Security Tooling** 🟡 MEDIUM
-- `cargo audit` + `cargo deny check advisories bans sources` in CI (currently `cargo audit` can't even run: stale binary fails on CVSS 4.0 advisories)
-- `cargo clippy -- -D warnings` gate
-- Dependabot/Renovate for Cargo dependencies
+**A5 — CI Security Tooling** 🟡 PARTIALLY COMPLETED
+- ✅ `cargo audit` installed (v0.22.2), runs clean — 0 vulnerabilities across 588 dependencies
+- ✅ `cargo-deny` installed (v0.20.2) with `deny.toml` covering advisories, bans (wildcard deny, duplicate warn), licenses (permissive allowlist, copyleft deny), and sources (crates.io only)
+- ✅ Fixed wildcard path dependencies in `server` and `client` Cargo.toml (added explicit version constraints)
+- ✅ Fixed unparseable `FSL-1.1-Apache-2.0` license fields → `Apache-2.0` (valid SPDX; actual FSL license file remains in repo)
+- ✅ Documented 3 transitive advisories from libp2p 0.56.0 (hickory-proto vulnerabilities + unmaintained `paste`) with ignore reasons — no upstream fix available yet
+- 📋 **Remaining**: Create GitHub Actions CI workflow (`.github/workflows/ci.yml`) running `cargo audit`, `cargo deny check`, `cargo clippy -- -D warnings`, and `cargo test`; add Dependabot/Renovate config
 
 ### Stage B: Core Auth & Transport Security (the "auth project")
 

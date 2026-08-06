@@ -118,6 +118,11 @@ const OVERRIDES: &[Override] = &[
         apply: |c, v| { c.network.http.max_body_size_mb = v.parse()?; Ok(()) },
     },
     Override {
+        flag: "--max-concurrent-requests", env: "CAMEODB_MAX_CONCURRENT_REQUESTS", kind: FlagKind::Value,
+        placeholder: "<N>", help: "Max concurrent in-flight HTTP requests (default: 128)",
+        apply: |c, v| { c.network.http.max_concurrent_requests = v.parse()?; Ok(()) },
+    },
+    Override {
         flag: "--data-paths", env: "CAMEODB_DATA_PATHS", kind: FlagKind::Value,
         placeholder: "<PATHS>", help: "Colon-separated storage directories",
         apply: |c, v| { c.storage.data_paths = v.split(':').map(PathBuf::from).collect(); Ok(()) },
@@ -396,7 +401,7 @@ pub struct CameoDbConfig {
     /// Search engine configuration (Tantivy settings)
     pub search: SearchConfig,
 
-    /// Maximum single-record size in MB (default: 512).
+    /// Maximum single-record size in MB (default: 64).
     ///
     /// This is the **single source of truth** for record size limits across
     /// the entire system. On startup the following dependent limits are
@@ -449,6 +454,13 @@ pub struct HttpConfig {
     /// CORS allowed origins (default: ["*"])
     #[serde(default = "default_cors_allowed_origins")]
     pub cors_allowed_origins: Vec<String>,
+
+    /// Maximum concurrent in-flight HTTP requests (default: 128).
+    ///
+    /// Requests exceeding this limit receive HTTP 503 Service Unavailable.
+    /// This protects against connection-flooding DoS attacks.
+    #[serde(default = "default_http_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
 
     /// TLS configuration for HTTPS (optional)
     /// When enabled, server will use HTTPS instead of HTTP
@@ -957,6 +969,51 @@ impl CameoDbConfig {
             .into());
         }
 
+        // Validate concurrency limit
+        if self.network.http.max_concurrent_requests == 0 {
+            return Err(ConfigError::NetworkConfig {
+                message: "max_concurrent_requests must be positive".to_string(),
+            }
+            .into());
+        }
+
+        // Validate CORS origins. An unparseable origin would otherwise be dropped
+        // silently when building the CORS layer, turning a typo into deny-all.
+        let cors_origins = &self.network.http.cors_allowed_origins;
+        if cors_origins.is_empty() {
+            return Err(ConfigError::NetworkConfig {
+                message: "cors_allowed_origins must not be empty (use [\"*\"] to allow any origin)"
+                    .to_string(),
+            }
+            .into());
+        }
+        if cors_origins.iter().any(|o| o == "*") && cors_origins.len() > 1 {
+            return Err(ConfigError::NetworkConfig {
+                message: "cors_allowed_origins cannot mix \"*\" with specific origins".to_string(),
+            }
+            .into());
+        }
+        for origin in cors_origins {
+            if origin == "*" {
+                continue;
+            }
+            if origin.parse::<axum::http::HeaderValue>().is_err() {
+                return Err(ConfigError::NetworkConfig {
+                    message: format!("invalid CORS origin '{}': not a valid header value", origin),
+                }
+                .into());
+            }
+            if !origin.starts_with("http://") && !origin.starts_with("https://") {
+                return Err(ConfigError::NetworkConfig {
+                    message: format!(
+                        "invalid CORS origin '{}': must include scheme (http:// or https://)",
+                        origin
+                    ),
+                }
+                .into());
+            }
+        }
+
         // Validate storage configuration
         if self.storage.data_paths.is_empty() {
             return Err(ConfigError::StorageConfig {
@@ -1039,6 +1096,7 @@ impl Default for HttpConfig {
             port: default_http_port(),
             request_timeout_secs: default_request_timeout(),
             max_body_size_mb: 0, // derived from max_record_size_mb
+            max_concurrent_requests: default_http_max_concurrent_requests(),
             cors_allowed_origins: default_cors_allowed_origins(),
             tls: TlsConfig::default(),
         }
@@ -1135,7 +1193,11 @@ fn default_request_timeout() -> u64 {
 }
 
 fn default_max_record_size_mb() -> usize {
-    512
+    64
+}
+
+fn default_http_max_concurrent_requests() -> usize {
+    128
 }
 
 fn default_cors_allowed_origins() -> Vec<String> {
@@ -1417,7 +1479,7 @@ mod tests {
             vec![PathBuf::from("./data/cameodb")]
         );
         assert_eq!(config.search.indexer_memory_min_mb, 64);
-        assert_eq!(config.max_record_size_mb, 512);
+        assert_eq!(config.max_record_size_mb, 64);
         assert!(config.validate().is_ok());
     }
 
@@ -1465,7 +1527,7 @@ mod tests {
         assert_eq!(config.search.indexer_memory_min_mb, 64);
         assert_eq!(config.search.indexer_memory_max_mb, 512);
         assert_eq!(config.storage.default_batch_size, 1000);
-        assert_eq!(config.max_record_size_mb, 512);
+        assert_eq!(config.max_record_size_mb, 64);
         assert!(config.validate().is_ok());
     }
 
@@ -1509,7 +1571,7 @@ mod tests {
         assert!(sample.contains("port = 9480"));
         assert!(sample.contains("indexer_memory_min_mb = 64"));
         assert!(sample.contains("default_batch_size = 1000"));
-        assert!(sample.contains("max_record_size_mb = 512"));
+        assert!(sample.contains("max_record_size_mb = 64"));
         assert!(sample.contains("data_paths"));
     }
 
@@ -1535,14 +1597,14 @@ mod tests {
     #[test]
     fn test_derived_limits_defaults() {
         let config = CameoDbConfig::default();
-        // HTTP body: max_record_size_mb + 64 = 512 + 64 = 576
-        assert_eq!(config.effective_max_body_size_mb(), 576);
-        // Remote message: 512 MB + 25% overhead = 640 MB in bytes
+        // HTTP body: max_record_size_mb + 64 = 64 + 64 = 128
+        assert_eq!(config.effective_max_body_size_mb(), 128);
+        // Remote message: 64 MB + 25% overhead = 80 MB in bytes
         assert_eq!(
             config.effective_remote_message_size_bytes(),
-            512 * 1024 * 1024 + 512 * 1024 * 1024 / 4
+            64 * 1024 * 1024 + 64 * 1024 * 1024 / 4
         );
-        // Timeout: max(60, 512/10) = max(60, 51) = 60
+        // Timeout: max(60, 64/10) = max(60, 6) = 60
         assert_eq!(config.effective_request_timeout_secs(), 60);
     }
 
