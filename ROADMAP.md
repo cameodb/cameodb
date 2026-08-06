@@ -126,12 +126,15 @@ This document outlines the current development priorities and optimization roadm
 - ✅ **Phase 10 (Field Projection)**: Completed
 - ✅ **Phase 11 (Workflow Hot-Path Optimizations)**: All 7 steps completed
 - ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed
-- ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, and resources completed; security/docs/testing planned
-- 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f planned
+- ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, resources, and query syntax docs completed; security moved to Phase 14, streaming/docs/testing planned
+- 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f partially done (merge thread count control implemented via `IndexWriterOptions`; core pinning and per-arena stats planned)
+- 🔒 **Phase 14 (Security Hardening)**: Stage A3 (TLS bypass removal) and B2 (HTTPS/TLS) completed; A1, A2, A4, A5, B1, B3, C1–C3 planned
 
 ### **Recommended Next Steps**
-1. **Phase 13 Stage 2f**: Tantivy merge thread pinning + per-arena jemalloc stats
-2. **Phase 12 remaining**: MCP security, streaming, integration tests
+1. **Phase 14 Stage A1**: Index name validation (critical security gap)
+2. **Phase 14 Stage A2**: Wire CORS config from `cors_allowed_origins`
+3. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats
+4. **Phase 12 remaining**: MCP streaming, documentation, integration tests
 
 ---
 
@@ -174,17 +177,19 @@ This document outlines the current development priorities and optimization roadm
    - **`search_index`**: Execute full-text search on a single index
      - Parameters: `index`, `query`, `limit`, `fields` (optional projection)
      - Returns: JSON array of matching documents with scores
+     - Tool description includes full Tantivy query syntax quick reference and field-type operator matrix
    - **`search_indexes`**: Federated search across multiple indexes
      - Parameters: `indexes[]`, `query`, `limit`
      - Returns: Combined results with `_index_source` metadata and per-index field projection
    - **`get_index`**: Retrieve schema and statistics for a single index
      - Parameters: `index`
      - Returns: Complete field definitions, types, document count, size
-   - **`validate_query`**: Field-type-aware CameoDB query syntax validation, unknown field detection, structural checks (quotes/parens), fuzzy "did you mean" suggestions, and full syntax reference
+   - **`validate_query`**: Field-type-aware CameoDB query syntax validation, unknown field detection, structural checks (quotes/parens), fuzzy "did you mean" suggestions, and full syntax reference with agent pro tips
    - **`get_index_stats`**: Document counts, field distributions, aggregated stats for single or all indexes
    - **`list_indexes`**: Enumerate all available indexes with schemas
      - Parameters: none
      - Returns: All index schemas with metadata (leverages existing `/_indexes` endpoint)
+   - **MCP README** (`crates/mcp/README.md`): Full query syntax reference with operator examples and field-type compatibility table
 
 5. **Advanced MCP Features** ✅ COMPLETED
    - **Field Projection**: Auto-suggest relevant fields based on partial input
@@ -230,7 +235,7 @@ This document outlines the current development priorities and optimization roadm
 
 ---
 
-## Phase 13: Thread-Per-Core & Memory Operations 🎯 IN PROGRESS
+## Phase 13: Thread-Per-Core & Memory Operations 🎯 NEARLY COMPLETE
 
 **Objective**: Eliminate cross-core wakeups and cache thrashing on the write hot path, improve memory observability, and extract admin code into maintainable modules. Each stage is linear, flag-gated, and independently testable.
 
@@ -384,15 +389,20 @@ HTTP req on axum tokio worker (any core)
 
 ---
 
-### Stage 2f: Tantivy Merge Thread Pinning & Per-Arena Jemalloc Stats 🎯 PLANNED
+### Stage 2f: Tantivy Merge Thread Pinning & Per-Arena Jemalloc Stats 🎯 PARTIALLY DONE
 
 **Risk:** Low–Medium | **LOC:** ~80 | **Prerequisite:** Stage 2e
 
-**2f.1 — Tantivy Merge Thread Pinning:**
-- Pin Tantivy merge threads to the read core set to avoid interfering with writer threads
-- Currently merge threads run unbounded; with `merge_num_threads: 1` they still run on whatever core the OS picks
+**2f.1 — Tantivy Merge Thread Control:** ✅ COMPLETED
+- Merge thread count is now configurable via `StorageConfig.merge_num_threads` (default: 1)
+- Implemented via `tantivy::indexer::IndexWriterOptions::builder()` with explicit `num_merge_threads()`
+- Replaces Tantivy's default of 4 merge threads, preventing mmap storms on memory-constrained nodes
 
-**2f.2 — Per-Arena Jemalloc Stats:**
+**2f.2 — Tantivy Merge Thread Core Pinning:** 📋 PLANNED
+- Pin merge threads to the read core set to avoid interfering with writer threads
+- Currently merge threads run on whatever core the OS picks even with `merge_num_threads: 1`
+
+**2f.3 — Per-Arena Jemalloc Stats:** 📋 PLANNED
 - `read_jemalloc_stats()` currently reads global stats only
 - With `percpu_arena:percpu`, expose per-arena stats via `mallctl("arena.i.allocated", ...)` and `mallctl("arena.i.resident", ...)`
 - Useful for diagnosing which shard/core is consuming the most memory
@@ -409,7 +419,7 @@ HTTP req on axum tokio worker (any core)
 | **3** | 2c: Auto-purge + per-index memory | Low | ~70 | 2b | Operational safety, observability |
 | **4** | 2d: Co-locate writer pinning | Low | ~10 | 2a | Full core co-location |
 | **5** | 2e: Per-shard single-thread rt | Medium | ~150 | 2a+2d | True thread-per-core |
-| **6** | 2f: Merge pinning + per-arena stats | Low–Med | ~80 | 2e | Reduced interference, diagnostics |
+| **6** | 2f: Merge control + pinning + per-arena stats | Low–Med | ~80 | 2e | Reduced interference, diagnostics (2f.1 done; 2f.2+2f.3 planned) |
 
 **Success Metrics:**
 - Write p99 latency reduced by 20-40% under high concurrent load
@@ -421,9 +431,9 @@ HTTP req on axum tokio worker (any core)
 
 ---
 
-## Phase 14: Security Hardening 🔒 PLANNED
+## Phase 14: Security Hardening 🔒 IN PROGRESS
 
-**Objective**: Close the security gaps identified in the code security review (2026-07-30). Currently CameoDB has **no authentication, no authorization, no TLS, permissive CORS, and unvalidated index names** reaching the filesystem. This phase turns CameoDB from a trusted-LAN-only system into one that can be safely exposed to untrusted networks.
+**Objective**: Close the security gaps identified in the code security review (2026-07-30). Currently CameoDB has **no authentication, no authorization, permissive CORS, and unvalidated index names** reaching the filesystem. TLS is now implemented (Stage B2). This phase turns CameoDB from a trusted-LAN-only system into one that can be safely exposed to untrusted networks.
 
 **Current state (verified by audit):**
 - ✅ No hardcoded secrets, no command execution, no regex/ReDoS surface, no SSRF
@@ -431,10 +441,10 @@ HTTP req on axum tokio worker (any core)
 - ⚠️ All HTTP/MCP endpoints unauthenticated (write, delete, admin included)
 - ⚠️ Index name flows unvalidated into `shard_path.join("indices").join(index)` → path traversal → arbitrary directory delete via `DELETE /api/..%2f..`
 - ⚠️ `CorsLayer::permissive()` hardcoded; configured `cors_allowed_origins` never wired
-- ⚠️ No TLS on HTTP; default bind `0.0.0.0:9480`
+- ✅ TLS on HTTP implemented via rustls (Stage B2); default bind `0.0.0.0:9480` still plaintext unless explicitly enabled
 - ⚠️ No cluster join authentication (any reachable node can join)
 - ⚠️ No rate limiting / concurrency caps; 576MB default body limit + decompression layer = memory DoS vector
-- ⚠️ `CAMEODB_ACCEPT_INVALID_CERTS` presence-check disables TLS validation globally in the client
+- ✅ `CAMEODB_ACCEPT_INVALID_CERTS` removed entirely; replaced with per-command `--insecure` flag
 
 ### Execution Order (impact-per-effort ranked)
 
@@ -442,11 +452,11 @@ HTTP req on axum tokio worker (any core)
 |-------|-------|--------|--------|-----------------|
 | **1** | A1: Index name validation | ~1 day | Critical | Arbitrary dir deletion (RCE-adjacent) |
 | **2** | A2: CORS config wiring | ~2 hrs | High | Drive-by browser attacks on local instances |
-| **3** | A3: `ACCEPT_INVALID_CERTS` value check | ~30 min | Medium | Accidental TLS bypass |
+| **3** | A3: `ACCEPT_INVALID_CERTS` removal | ✅ Done | Medium | Accidental TLS bypass |
 | **4** | A4: Body limits + concurrency caps | ~1 day | High | Memory DoS / decompression bomb |
 | **5** | A5: CI security tooling (`cargo audit`, `cargo deny`) | ~2 hrs | Medium | Silent vulnerable deps |
 | **6** | B1: API key authentication | ~3–5 days | Critical | Full unauthenticated R/W/D access |
-| **7** | B2: HTTPS/TLS via rustls | ~2–3 days | High | Traffic interception |
+| **7** | B2: HTTPS/TLS via rustls | ✅ Done | High | Traffic interception |
 | **8** | B3: Cluster join secret (PSK) | ~2–3 days | High | Rogue node data access |
 | **9** | C1: MCP rate limiting + query complexity | ~2 days | Medium | Agent-driven resource exhaustion |
 | **10** | C2: Audit logging | ~2 days | Medium | No forensic trail |
@@ -455,9 +465,10 @@ HTTP req on axum tokio worker (any core)
 ### Stage A: Quick Wins (no protocol changes)
 
 **A1 — Index Name Validation** 🔴 CRITICAL
-- Add `validate_index_name()` at the HTTP boundary (`http_server.rs`) AND defense-in-depth at the storage boundary (`storage/src/lib.rs`)
-- Rules: `^[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,254}$`, reject `..` segments, reject absolute paths, reject path separators (`/`, `\`)
-- Apply to every route taking `Path(index)`: search, write, bulk, config, schema, delete, admin commit/evict
+- Two-tier approach at the HTTP boundary (`http_server.rs`):
+  1. **Index creation** (`PUT /api/{index}/_config`): full `validate_index_name()` — reject `..` segments, path separators (`/`, `\`), empty, length > 255, must start with alphanumeric. This is the only route where a new name enters the system.
+  2. **All other routes** (search, write, bulk, schema, delete, admin commit/evict): verify index exists in the index cache — the name was already validated at creation time; no need to re-validate naming rules
+- Defense-in-depth at storage boundary (`storage/src/lib.rs`): assert the resolved path is still within `shard_path/indices/` after joining
 - Regression tests: `DELETE /api/..%2f..%2fetc` must return 400, must not touch the filesystem
 
 **A2 — Wire CORS Config** 🟠 HIGH
@@ -465,9 +476,10 @@ HTTP req on axum tokio worker (any core)
 - Default to `localhost`/`127.0.0.1` origins only when binding to loopback; require explicit `["*"]` opt-in for wildcard
 - Deny credentials with wildcard origin (per CORS spec pitfalls)
 
-**A3 — Strict Env Flag for TLS Bypass** 🟡 MEDIUM
-- Change `CAMEODB_ACCEPT_INVALID_CERTS` presence-check to value-check (`== "true"`)
-- Log a loud `warn!` at client startup when active
+**A3 — TLS Bypass Handling** ✅ COMPLETED
+- Removed `CAMEODB_ACCEPT_INVALID_CERTS` environment variable entirely
+- Replaced with `--insecure` flag: per-command for single operations, per-session for interactive REPL
+- No global TLS bypass via environment variables; must be explicitly requested via CLI flag
 
 **A4 — DoS Hardening** 🟠 HIGH
 - Lower default `max_record_size_mb` (512MB → e.g. 64MB) or document the risk prominently
@@ -481,12 +493,50 @@ HTTP req on axum tokio worker (any core)
 
 ### Stage B: Core Auth & Transport Security (the "auth project")
 
-**B1 — API Key Authentication** 🔴 CRITICAL
-- Design: single `Authorization: Bearer <key>` middleware (axum `from_fn`) covering all `/api/*`, `/_admin/*`, `/_indexes`, `/mcp/*` routes; `/_cluster/health` stays open for load balancers
-- Config: `[security] api_keys = [...]` (hashed with SHA-256, constant-time compare), env `CAMEODB_API_KEY` override
-- Backward compat: auth disabled by default (trusted-LAN mode), enabled = hard requirement for non-loopback binds (fail-fast at startup if `--bind 0.0.0.0` without auth)
+**B1 — API Key Authentication with Role-Based Access** 🔴 CRITICAL
+- Design: `Authorization: Bearer <key>` middleware (axum `from_fn`) covering all `/api/*`, `/_admin/*`, `/_indexes`, `/mcp/*` routes; `/_cluster/health` stays open for load balancers
+- Three roles per API key:
+  - **Admin**: Full access — all routes including `/_admin/*` (memory, workers, purge), destructive operations (delete index, schema evolution), and all user/restricted operations
+  - **User**: Index-level CRUD — search, write, bulk ingest, schema read, index listing; no `/_admin/*` routes, no destructive operations (delete index, schema modification)
+  - **Restricted**: Read-only MCP access — `search_index`, `search_indexes`, `get_index`, `list_indexes`, `get_index_stats`, `validate_query`; designed for AI agents querying knowledge bases
+- Config:
+  ```toml
+  [security]
+  # Auth disabled by default (trusted-LAN mode)
+  enabled = false
+
+  [[security.api_keys]]
+  key = "cameo-admin-xxx"        # SHA-256 hashed, constant-time compare
+  role = "admin"
+  label = "ops-team"             # optional human-readable label for audit log
+
+  [[security.api_keys]]
+  key = "cameo-user-xxx"
+  role = "user"
+  label = "data-engineering"
+
+  [[security.api_keys]]
+  key = "cameo-agent-xxx"
+  role = "restricted"
+  label = "claude-desktop"
+  allowed_indexes = ["docs", "wiki"]  # optional index allow-list for restricted keys
+  ```
+- Env override: `CAMEODB_API_KEY` for single-key deployments (role is always resolved server-side from the key's config entry)
+- Backward compat: auth disabled by default; when enabled, fail-fast at startup if `bind = 0.0.0.0` without auth configured
 - Client SDK + CLI: `--api-key` flag, `CAMEODB_API_KEY` env, persisted per-connection in REPL
-- Admin routes (`/_admin/*`) optionally require a separate admin-scoped key
+- Route-level enforcement matrix:
+
+  | Route group | Admin | User | Restricted |
+  |-------------|-------|------|------------|
+  | `/_admin/*` (memory, workers, purge, commit, evict) | ✅ | ❌ | ❌ |
+  | `PUT /api/{index}/_config` (create index) | ✅ | ❌ | ❌ |
+  | `DELETE /api/{index}` (delete index) | ✅ | ❌ | ❌ |
+  | `PATCH /api/{index}/_schema` (schema evolution) | ✅ | ❌ | ❌ |
+  | `POST /api/{index}/write` (write) | ✅ | ✅ | ❌ |
+  | `POST /api/{index}/bulk` (bulk ingest) | ✅ | ✅ | ❌ |
+  | `GET /api/{index}/search` (search) | ✅ | ✅ | ✅ |
+  | `GET /_indexes` (list indexes) | ✅ | ✅ | ✅ |
+  | `/mcp/*` (MCP tools) | ✅ | ✅ | ✅ (respects `allowed_indexes`)
 
 **B2 — HTTPS/TLS via rustls** ✅ COMPLETED
 - Implemented axum-server with rustls for HTTPS support; config `[network.http.tls] enabled, cert_file, key_file`
@@ -507,18 +557,18 @@ HTTP req on axum tokio worker (any core)
 ### Stage C: Defense in Depth (post-auth)
 
 **C1 — MCP-Specific Limits** 🟡 MEDIUM
-- Rate limiting per session/key on MCP tool invocations
+- Rate limiting per session/key on MCP tool invocations (especially important for restricted keys used by AI agents)
 - Query complexity caps: max boolean clauses, max prefix-expansion terms, per-request timeout already exists — wire it into MCP path
-- Index-level allow-list for MCP agents (`[mcp] allowed_indexes = [...]`)
+- Index allow-list for restricted keys already covered in B1 (`allowed_indexes` per key)
 
 **C2 — Audit Logging** 🟡 MEDIUM
 - Structured `tracing` events: who (key id / peer), what (op, index), when, result
 - Append-only audit ring buffer + optional file sink; admin endpoint to query recent events
 
-**C3 — Index-Level Authorization (RBAC)** 🟢 LOWER (needed for multi-tenant)
-- Key → role → index permissions mapping (read/write/admin scopes)
+**C3 — Per-Index Role Refinement (RBAC)** 🟢 LOWER (needed for multi-tenant)
+- Extend B1's three-role model with per-index role overrides: a key with `role = "user"` could be granted `"restricted"` (read-only) on sensitive indexes
 - Enforced at `RouterActor` boundary so local + remote paths are both covered
-- Depends on B1 identity model
+- Depends on B1 identity model and route-level enforcement
 
 ### TLS Inventory (verified 2026-08-03)
 
@@ -529,7 +579,7 @@ HTTP req on axum tokio worker (any core)
 | musl static builds | ✅ `native-tls-vendored` via `scripts/build/build-musl.sh` + `build-dist.sh` | keep as-is |
 | libp2p cluster transport | ✅ Noise (`noise::Config`) + yamux mux | encrypted but unauthenticated membership; Stage B3 adds PSK |
 | kameo remote messaging | ⚠️ rides libp2p swarm | inherits B3 protection |
-| Client TLS bypass | ✅ `--insecure` flag only | Removed `CAMEODB_ACCEPT_INVALID_CERTS` environment variable; simplified to flag-only interface |
+| Client TLS bypass | ✅ `--insecure` flag only | Removed `CAMEODB_ACCEPT_INVALID_CERTS` env var; per-command or per-session (interactive REPL) via CLI flag |
 
 **Success Metrics:**
 - No unauthenticated write/delete path reachable in default config

@@ -255,6 +255,7 @@ struct InteractiveSession {
     current_url: String,
     client: CameoClient,
     index_cache: Arc<RwLock<HashMap<String, IndexMetadata>>>,
+    insecure: bool,
 }
 
 impl InteractiveSession {
@@ -264,11 +265,12 @@ impl InteractiveSession {
             current_url: initial_url,
             client,
             index_cache: Arc::new(RwLock::new(HashMap::new())),
+            insecure,
         })
     }
 
     fn reconnect(&mut self, target: &str) -> Result<()> {
-        self.reconnect_with_insecure(target, false)
+        self.reconnect_with_insecure(target, self.insecure)
     }
 
     fn reconnect_with_insecure(&mut self, target: &str, insecure: bool) -> Result<()> {
