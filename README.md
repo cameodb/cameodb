@@ -243,13 +243,21 @@ The CLI client features a robust, zero-copy ingestion pipeline that transparentl
 - **Compression:** Automatically detects and decompresses `Gzip (.gz)`, `Bzip2 (.bz2)`, `Zstd (.zst)`, `XZ (.xz)`, `LZ4 (.lz4)`, and `Deflate` formats on the fly.
 - **Sources:** Ingest data from local disk files, mounted network paths, or by streaming directly from public `HTTP/HTTPS` URLs.
 
+## 🔒 Security
+
+CameoDB includes built-in security features for production deployments:
+
+- **TLS/HTTPS**: Native HTTPS via rustls (see [TLS Configuration](#tlshttps-configuration) above)
+- **Cluster PSK**: Pre-shared key encryption for libp2p cluster traffic (XSalsa20 via `pnet`). Configure with `[network.cluster] psk` or `psk_file`. See `cameodb.example.toml` for details.
+- **Supply Chain**: Dependency auditing via `cargo audit` and `cargo deny` (config in `deny.toml`). See [Security Scripts](scripts/security/README.md) for setup.
+
+If you discover a vulnerability, please refer to our [Security Policy](.github/SECURITY.md).
+
 ## 🤝 Contributing
 
 We welcome contributions! Whether it's adding new features, fixing bugs, or improving documentation, check out our [Contributing Guidelines](.github/CONTRIBUTING.md) to get started.
 
 Please review our [Code of Conduct](.github/CODE_OF_CONDUCT.md) before participating in the community.
-
-If you discover a vulnerability, please refer to our [Security Policy](.github/SECURITY.md).
 
 ## 📄 License
 

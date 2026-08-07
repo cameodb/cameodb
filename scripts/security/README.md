@@ -1,6 +1,57 @@
 # Security Scripts
 
-Scripts for security, compliance, and supply chain management.
+Scripts and tooling for security, compliance, and supply chain management.
+
+## Dependency Auditing
+
+### cargo-audit
+
+Checks workspace dependencies against the [RustSec advisory database](https://rustsec.org/advisories/) for known vulnerabilities.
+
+**Install:**
+```bash
+cargo install cargo-audit
+```
+
+**Usage:**
+```bash
+# Audit all workspace crates
+cargo audit
+
+# Audit and exit non-zero on warnings (for CI)
+cargo audit --deny warnings
+```
+
+**Notes:**
+- Vulnerabilities in transitive dependencies without upstream fixes are documented in `deny.toml` under `[advisories] ignore` with rationale.
+- Run before releasing or when updating `Cargo.lock`.
+
+### cargo-deny
+
+Checks dependencies for advisories, license compliance, banned crates, and disallowed registry sources. Configuration lives in `deny.toml` at the workspace root.
+
+**Install:**
+```bash
+cargo install cargo-deny
+```
+
+**Usage:**
+```bash
+# Run all checks (advisories, bans, licenses, sources)
+cargo deny check
+
+# Run individual checks
+cargo deny check advisories
+cargo deny check bans
+cargo deny check licenses
+cargo deny check sources
+```
+
+**What it checks:**
+- **Advisories**: Same database as cargo-audit, plus configurable ignore list for unfixed transitive vulnerabilities
+- **Bans**: Rejects wildcard dependencies and duplicate crate versions (with allow-listed exceptions)
+- **Licenses**: Ensures all dependencies use approved licenses (configured in `deny.toml`)
+- **Sources**: Blocks dependencies from non-crates.io registries
 
 ## SBOM Generation
 

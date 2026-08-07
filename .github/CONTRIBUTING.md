@@ -126,6 +126,24 @@ Generated documentation should be deployed via CI/CD:
 - Ensure all tests pass: `cargo test --workspace`
 - Check documentation: `cargo doc --no-deps`
 
+### Supply Chain Security
+
+CameoDB uses two tools to audit dependencies for vulnerabilities and policy compliance:
+
+**cargo-audit** — checks dependencies against the RustSec advisory database:
+```bash
+cargo install cargo-audit
+cargo audit
+```
+
+**cargo-deny** — checks dependencies for advisories, license compliance, banned crates, and disallowed sources:
+```bash
+cargo install cargo-deny
+cargo deny check
+```
+
+Configuration lives in `deny.toml` at the workspace root. Run both before submitting PRs that touch `Cargo.toml` or `Cargo.lock`.
+
 ## Git Workflow
 
 ### What's Ignored
