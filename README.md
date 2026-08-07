@@ -164,16 +164,24 @@ cameodb client --interactive --connect https://localhost:9480
 cameodb client --interactive --connect https://localhost:9480 --insecure
 ```
 
-**Per-command `--insecure` for remote sources:**
+**`--insecure-source` for remote data sources:**
 ```bash
-# Load schema from external HTTPS URL with self-signed cert
-cameodb client schema detect https://external.com/schema.csv --insecure
+# Fetch a schema from an external HTTPS URL whose certificate does not validate
+cameodb client schema detect https://external.com/schema.csv --insecure-source
 
-# Load data from external HTTPS URL with self-signed cert
-cameodb client data load myindex https://external.com/data.csv --insecure
+# Same for a data load
+cameodb client data load myindex https://external.com/data.csv --insecure-source
 ```
 
-The global `--insecure` flag applies to the entire session (server connection + all commands). Per-command `--insecure` applies only to specific remote schema/data loading operations.
+The two flags are deliberately separate and neither implies the other:
+
+| Flag | Relaxes verification for |
+|------|--------------------------|
+| `--insecure` | the connection to the CameoDB server |
+| `--insecure-source` | remote schema/data source URLs only |
+
+Accepting an untrusted data source must not also stop verifying the connection carrying
+your writes, which is what a single combined flag did.
 
 ### TLS Configuration Options
 
@@ -185,10 +193,12 @@ The global `--insecure` flag applies to the entire session (server connection + 
 
 ### Security Considerations
 
-- **Certificate Validation**: Clients validate server certificates by default. Use `--insecure` flag only for development.
+- **Certificate Validation**: Clients validate server certificates by default. Use `--insecure` only for development.
+- **TLS Stack**: rustls with the `ring` provider on both sides. Outbound HTTPS from the client verifies against the OS trust store (`rustls-platform-verifier`), so a corporate CA installed system-wide is honoured. No OpenSSL, vendored or otherwise.
 - **Key Permissions**: Ensure private key files have restricted permissions (`chmod 600 key.pem`).
 - **Certificate Rotation**: Update certificates before expiration; CameoDB requires restart to load new certificates.
-- **Mutual TLS (mTLS)**: Not currently supported. All client connections are accepted if TLS handshake succeeds.
+- **Mutual TLS (mTLS)**: Not currently supported. All client connections are accepted if the TLS handshake succeeds.
+- **Verification**: `scripts/validate/tls.sh` starts a real HTTPS listener and checks that bad certificate material fails before startup completes.
 
 ### Troubleshooting TLS
 
@@ -245,11 +255,48 @@ The CLI client features a robust, zero-copy ingestion pipeline that transparentl
 
 ## 🔒 Security
 
-CameoDB includes built-in security features for production deployments:
+> **CameoDB has no authentication.** Every HTTP and MCP endpoint — including writes and
+> deletes — is available to anyone who can reach the port. Run it on a trusted network or
+> behind an authenticating proxy. Authentication is ROADMAP Phase 14 Stage B1.
 
-- **TLS/HTTPS**: Native HTTPS via rustls (see [TLS Configuration](#tlshttps-configuration) above)
-- **Cluster PSK**: Pre-shared key encryption for libp2p cluster traffic (XSalsa20 via `pnet`). Configure with `[network.cluster] psk` or `psk_file`. See `cameodb.example.toml` for details.
-- **Supply Chain**: Dependency auditing via `cargo audit` and `cargo deny` (config in `deny.toml`). See [Security Scripts](scripts/security/README.md) for setup.
+### Security profiles
+
+Declare how far a node can be reached and the server enforces the rules that go with that
+answer, refusing to start if the rest of the config contradicts it:
+
+```toml
+[node]
+profile = "internal"   # local | internal | external
+```
+
+| | `local` | `internal` | `external` |
+|---|---|---|---|
+| Reachable from | this machine only | a trusted network | untrusted networks |
+| Bind address | loopback only | any | any |
+| TLS | optional | warned if off | **required** |
+| CORS `"*"` | allowed (warned) | rejected | rejected |
+| `/_admin/*` | allowed | allowed | **must be disabled** |
+| Cluster PSK | warned | **required** | **required** |
+| Authentication | — | — | **required — so `external` cannot start yet** |
+
+Choose by who can reach the bind address, not by what the environment is for: a shared test
+box is `internal`, not `local`. Omitting `profile` is valid only for a loopback bind, which
+infers `local`; a node reachable from other hosts must state its posture. Check a config
+without starting the node:
+
+```bash
+cameodb check-config -c cameodb.toml
+```
+
+Defaults are loopback-bound with no cross-origin browser access.
+
+### Other controls
+
+- **TLS/HTTPS**: rustls with the `ring` provider (see [TLS Configuration](#tlshttps-configuration) above)
+- **Cluster PSK**: membership gate for the libp2p swarm (XSalsa20 via `pnet`), configured with `[network.cluster] psk_file` or `psk`. It controls *who may join*; the transport is already encrypted by Noise regardless. Enabling it disables QUIC, since `pnet` wraps TCP only.
+- **Request limits**: wire-level body limit, per-record cap, request timeout, and a concurrency guard that sheds with 503 while leaving `/_cluster/health` answerable.
+- **Supply Chain**: `cargo audit` and `cargo deny` (config in `deny.toml`); advisory exceptions carry review dates that `scripts/validate/deps.sh` enforces.
+- **Verification**: [`scripts/validate/`](scripts/validate/README.md) is the manual gate — there is no CI. Run it before a release and record the result in [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md).
 
 If you discover a vulnerability, please refer to our [Security Policy](.github/SECURITY.md).
 

@@ -24,6 +24,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -176,6 +177,14 @@ const OVERRIDES: &[Override] = &[
         flag: "--node-zone", env: "CAMEODB_NODE_ZONE", kind: FlagKind::Value,
         placeholder: "<ZONE>", help: "Availability zone this node reports",
         apply: |c, v| { c.node.zone = v.to_string(); Ok(()) },
+    },
+    Override {
+        flag: "--profile", env: "CAMEODB_PROFILE", kind: FlagKind::Value,
+        placeholder: "<NAME>", help: "Security posture: local, internal, or external",
+        apply: |c, v| {
+            c.node.profile = Some(crate::posture::Profile::parse(v).map_err(|e| ConfigError::NetworkConfig { message: e })?);
+            Ok(())
+        },
     },
     Override {
         flag: "--cluster-enabled", env: "CAMEODB_CLUSTER_ENABLED", kind: FlagKind::Switch,
@@ -442,7 +451,7 @@ pub struct NetworkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HttpConfig {
-    /// Bind address for HTTP server (default: "0.0.0.0")
+    /// Bind address for HTTP server (default: "127.0.0.1", loopback only)
     #[serde(default = "default_http_bind_address")]
     pub bind_address: String,
 
@@ -471,6 +480,14 @@ pub struct HttpConfig {
     /// This protects against connection-flooding DoS attacks.
     #[serde(default = "default_http_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+
+    /// Expose the `/_admin/*` endpoints (default: true).
+    ///
+    /// These allow memory purges, forced commits, and writer eviction, and are
+    /// unauthenticated like everything else. Turning them off removes the routes
+    /// entirely, so they 404 rather than merely erroring.
+    #[serde(default = "default_admin_enabled")]
+    pub admin_enabled: bool,
 
     /// TLS configuration for HTTPS (optional)
     /// When enabled, server will use HTTPS instead of HTTP
@@ -508,6 +525,15 @@ pub struct NodeConfig {
     /// Topology zone for rack/datacenter awareness (default: "default")
     #[serde(default = "default_node_zone")]
     pub zone: String,
+
+    /// Security posture preset: `local`, `internal`, or `external`.
+    ///
+    /// Declares where this node sits on the network; the rules that go with that answer
+    /// are enforced at startup (see [`crate::posture`]). When omitted, a loopback bind
+    /// infers `local` and any other bind is an error — a node reachable from other hosts
+    /// has to state its posture rather than inherit the most permissive one.
+    #[serde(default)]
+    pub profile: Option<crate::posture::Profile>,
 }
 
 /// Storage configuration for data persistence
@@ -613,7 +639,11 @@ pub struct ClusterConfig {
     /// 32-byte key hex-encoded (64 characters). When set, all TCP connections
     /// are wrapped with XSalsa20 encryption. Peers without the matching key
     /// cannot join the cluster. QUIC is disabled when PSK is enabled.
-    #[serde(default)]
+    ///
+    /// Never serialized: the value is read from config but omitted from any output, so a
+    /// config dump cannot leak it. Prefer `psk_file` — an inline key is visible in `ps`
+    /// when it arrives via `--cluster-psk`.
+    #[serde(default, skip_serializing)]
     pub psk: Option<String>,
 
     /// Path to a file containing the cluster PSK (same format as `psk`).
@@ -636,7 +666,7 @@ pub struct MessagingConfig {
     pub request_timeout_secs: u64,
 
     /// Maximum concurrent requests per peer (default: 100)
-    #[serde(default = "default_max_concurrent_requests")]
+    #[serde(default = "default_messaging_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
 
     /// Connection pool size (default: 10)
@@ -794,6 +824,17 @@ impl CameoDbConfig {
     /// Every overridable setting has both a flag and an environment variable, defined once as
     /// a pair in [`OVERRIDES`], so the two layers can never drift apart.
     pub fn load_with_cli(cli: &CliOverrides) -> Result<Self> {
+        let config = Self::load_unvalidated(cli)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Resolve the configuration from all sources without validating it.
+    ///
+    /// Only for tooling that needs to *report* on an invalid config — `check-config` has
+    /// to show which rules a bad file breaks, which it cannot do if loading refuses to
+    /// hand it over. Server startup always goes through [`Self::load_with_cli`].
+    pub fn load_unvalidated(cli: &CliOverrides) -> Result<Self> {
         // Start with defaults
         let mut config = Self::default();
 
@@ -817,9 +858,6 @@ impl CameoDbConfig {
 
         // Normalize storage paths for deterministic behavior
         config.storage.normalize_paths();
-
-        // Validate the final configuration
-        config.validate()?;
 
         Ok(config)
     }
@@ -1003,13 +1041,6 @@ impl CameoDbConfig {
         // Validate CORS origins. An unparseable origin would otherwise be dropped
         // silently when building the CORS layer, turning a typo into deny-all.
         let cors_origins = &self.network.http.cors_allowed_origins;
-        if cors_origins.is_empty() {
-            return Err(ConfigError::NetworkConfig {
-                message: "cors_allowed_origins must not be empty (use [\"*\"] to allow any origin)"
-                    .to_string(),
-            }
-            .into());
-        }
         if cors_origins.iter().any(|o| o == "*") && cors_origins.len() > 1 {
             return Err(ConfigError::NetworkConfig {
                 message: "cors_allowed_origins cannot mix \"*\" with specific origins".to_string(),
@@ -1037,41 +1068,35 @@ impl CameoDbConfig {
             }
         }
 
-        // Validate cluster PSK
-        if self.network.cluster.enabled
-            && self.network.cluster.psk.is_none()
-            && self.network.cluster.psk_file.is_none()
-        {
-            warn!(
-                "Cluster is enabled without a pre-shared key (psk/psk_file). \
-                 Any libp2p node on the network can join. Set psk for production clusters."
-            );
-        }
-        if let Some(ref psk) = self.network.cluster.psk {
-            let hex_str = psk.trim();
-            if hex_str.len() != 64 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Validate the cluster PSK by loading it through exactly the same path the swarm
+        // will use at startup. Re-implementing the format check here is what previously
+        // left three copies of the same rules free to drift apart.
+        self.network
+            .cluster
+            .load_psk()
+            .map_err(|e| ConfigError::NetworkConfig {
+                message: e.to_string(),
+            })?;
+
+        // pnet only wraps TCP, so enabling a PSK silently drops QUIC support. An address
+        // that can never be used should fail here rather than as a dial error at runtime.
+        if self.network.cluster.psk.is_some() || self.network.cluster.psk_file.is_some() {
+            let quic_addrs: Vec<&String> = self
+                .network
+                .cluster
+                .listen_addrs
+                .iter()
+                .chain(self.network.cluster.seed_nodes.iter())
+                .chain(self.network.cluster.bootstrap_peers.iter())
+                .filter(|a| a.contains("/quic"))
+                .collect();
+            if !quic_addrs.is_empty() {
                 return Err(ConfigError::NetworkConfig {
-                    message: "cluster psk must be exactly 64 hex characters (32 bytes)".to_string(),
-                }
-                .into());
-            }
-        }
-        if let Some(ref psk_path) = self.network.cluster.psk_file {
-            if !psk_path.exists() {
-                return Err(ConfigError::NetworkConfig {
-                    message: format!("cluster psk_file not found: {}", psk_path.display()),
-                }
-                .into());
-            }
-            let contents =
-                std::fs::read_to_string(psk_path).map_err(|e| ConfigError::NetworkConfig {
-                    message: format!("failed to read cluster psk_file: {}", e),
-                })?;
-            let hex_str = contents.trim();
-            if hex_str.len() != 64 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(ConfigError::NetworkConfig {
-                    message: "cluster psk_file must contain exactly 64 hex characters (32 bytes)"
-                        .to_string(),
+                    message: format!(
+                        "cluster PSK is set, which disables QUIC (pnet wraps TCP only), but these \
+                         addresses use QUIC: {:?}. Use /tcp/ addresses or remove the PSK",
+                        quic_addrs
+                    ),
                 }
                 .into());
             }
@@ -1129,7 +1154,47 @@ impl CameoDbConfig {
             .into());
         }
 
+        // Posture rules run last: the checks above establish that individual values are
+        // usable, and this decides whether the combination is allowed where this node sits.
+        self.check_posture()?;
+
         Ok(())
+    }
+
+    /// Evaluate the security posture and reject a config that contradicts its profile.
+    ///
+    /// Warnings are logged rather than returned — they describe accepted risk, and a
+    /// posture that blocked on every one of them would just teach operators to pick a
+    /// weaker profile.
+    pub fn check_posture(&self) -> Result<crate::posture::Posture> {
+        let posture = crate::posture::evaluate(self)
+            .map_err(|message| ConfigError::NetworkConfig { message })?;
+
+        for check in posture.warnings() {
+            warn!(
+                profile = %posture.profile,
+                rule = check.rule,
+                "posture: {}",
+                check.outcome.message()
+            );
+        }
+
+        let failures: Vec<String> = posture
+            .failures()
+            .map(|c| format!("[{}] {}", c.rule, c.outcome.message()))
+            .collect();
+        if !failures.is_empty() {
+            return Err(ConfigError::NetworkConfig {
+                message: format!(
+                    "security profile '{}' rejected this configuration:\n  - {}",
+                    posture.profile,
+                    failures.join("\n  - ")
+                ),
+            }
+            .into());
+        }
+
+        Ok(posture)
     }
 
     /// Generate a sample configuration file for reference
@@ -1161,6 +1226,7 @@ impl Default for HttpConfig {
             max_body_size_mb: 0, // derived from max_record_size_mb
             max_concurrent_requests: default_http_max_concurrent_requests(),
             cors_allowed_origins: default_cors_allowed_origins(),
+            admin_enabled: default_admin_enabled(),
             tls: TlsConfig::default(),
         }
     }
@@ -1171,6 +1237,7 @@ impl Default for NodeConfig {
         Self {
             label: default_node_label_opt(),
             zone: default_node_zone(),
+            profile: None,
         }
     }
 }
@@ -1217,7 +1284,7 @@ impl Default for MessagingConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_request_timeout_secs(),
-            max_concurrent_requests: default_max_concurrent_requests(),
+            max_concurrent_requests: default_messaging_max_concurrent_requests(),
             connection_pool_size: default_connection_pool_size(),
             remote_retry_attempts: default_remote_retry_attempts(),
             broadcast_timeout_secs: default_broadcast_timeout_secs(),
@@ -1226,38 +1293,109 @@ impl Default for MessagingConfig {
     }
 }
 
+/// A 32-byte cluster pre-shared key that cannot be printed or serialized by accident.
+///
+/// The key used to live in a plain `String` inside a `Debug + Serialize` struct, so any
+/// future config dump, debug log, or admin endpoint would have leaked it. Wrapping it
+/// makes the safe behaviour the default rather than something every call site has to
+/// remember, and zeroizes the bytes on drop.
+pub struct ClusterPsk([u8; 32]);
+
+impl ClusterPsk {
+    pub fn bytes(&self) -> [u8; 32] {
+        self.0
+    }
+
+    /// Short, non-reversible identifier for logs, so two nodes can be confirmed to hold
+    /// the same key without either of them printing it.
+    pub fn fingerprint(&self) -> String {
+        let digest = xxhash_rust::xxh3::xxh3_128(&self.0);
+        format!("{:032x}", digest)[..16].to_string()
+    }
+}
+
+impl fmt::Debug for ClusterPsk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ClusterPsk(<redacted:{}>)", self.fingerprint())
+    }
+}
+
+impl Drop for ClusterPsk {
+    fn drop(&mut self) {
+        // Best-effort scrub. `write_volatile` is not elided by the optimizer the way a
+        // plain assignment to a soon-to-be-dead value can be.
+        for byte in self.0.iter_mut() {
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+    }
+}
+
 impl ClusterConfig {
-    /// Load and resolve the cluster pre-shared key.
+    /// Load, validate, and decode the cluster pre-shared key.
     ///
-    /// If `psk` is set, it takes precedence over `psk_file`.
-    /// Returns `None` if neither is configured.
-    /// Returns `Err` if the key is malformed (validation also runs in `validate()`,
-    /// but this provides a second gate before swarm creation).
-    pub fn load_psk(&self) -> Result<Option<[u8; 32]>> {
-        let hex_owned: String;
-        let hex_str: &str = if let Some(ref psk) = self.psk {
-            psk.trim()
-        } else if let Some(ref path) = self.psk_file {
-            let contents = std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("failed to read cluster psk_file: {}", e))?;
-            hex_owned = contents.trim().to_string();
-            &hex_owned
-        } else {
-            return Ok(None);
+    /// The single place PSK format rules live: `validate()` calls this too, so a config
+    /// that passes validation is exactly one that the swarm can start with.
+    ///
+    /// `psk` takes precedence over `psk_file`. Returns `None` when neither is configured.
+    pub fn load_psk(&self) -> Result<Option<ClusterPsk>> {
+        let hex_str = match (&self.psk, &self.psk_file) {
+            (Some(psk), _) => psk.trim().to_string(),
+            (None, Some(path)) => {
+                if !path.exists() {
+                    anyhow::bail!("cluster psk_file not found: {}", path.display());
+                }
+                Self::warn_if_psk_file_is_readable_by_others(path);
+                std::fs::read_to_string(path)
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to read cluster psk_file {}: {}", path.display(), e)
+                    })?
+                    .trim()
+                    .to_string()
+            }
+            (None, None) => return Ok(None),
         };
 
         if hex_str.len() != 64 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
-            anyhow::bail!("cluster PSK must be exactly 64 hex characters (32 bytes)");
+            // Deliberately says nothing about the value itself — an error message is the
+            // one place a malformed secret would otherwise end up in a log.
+            anyhow::bail!(
+                "cluster PSK must be exactly 64 hex characters (32 bytes); got {} character(s). \
+                 Generate one with: openssl rand -hex 32",
+                hex_str.len()
+            );
         }
 
         let mut bytes = [0u8; 32];
-        for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
-            bytes[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16)
-                .map_err(|e| anyhow::anyhow!("invalid hex in cluster PSK: {}", e))?;
+        for (i, chunk) in hex_str.as_bytes().chunks_exact(2).enumerate() {
+            // Both bytes are ASCII hex digits per the check above, so this cannot fail.
+            let hex = std::str::from_utf8(chunk).expect("ascii hex");
+            bytes[i] = u8::from_str_radix(hex, 16).expect("validated hex digits");
         }
 
-        Ok(Some(bytes))
+        Ok(Some(ClusterPsk(bytes)))
     }
+
+    /// Warn when the key file is readable beyond its owner.
+    ///
+    /// A warning rather than an error: refusing to start over a permission bit would
+    /// strand nodes on deployments where the file is managed by an orchestrator.
+    #[cfg(unix)]
+    fn warn_if_psk_file_is_readable_by_others(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o077;
+            if mode != 0 {
+                warn!(
+                    path = %path.display(),
+                    mode = format!("{:o}", meta.permissions().mode() & 0o777),
+                    "cluster psk_file is readable by group or others; chmod 600 it"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn warn_if_psk_file_is_readable_by_others(_path: &std::path::Path) {}
 }
 
 impl Default for ClusterConfig {
@@ -1279,8 +1417,13 @@ impl Default for ClusterConfig {
 }
 
 // Default value functions for serde
+/// Loopback by default.
+///
+/// Binding every interface out of the box put an unauthenticated read/write/delete API on
+/// the network the moment the binary ran. Reaching the node from other hosts is now a
+/// deliberate act — set `bind_address` and declare a `profile` to go with it.
 fn default_http_bind_address() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
 }
 
 fn default_http_port() -> u16 {
@@ -1299,8 +1442,17 @@ fn default_http_max_concurrent_requests() -> usize {
     128
 }
 
+fn default_admin_enabled() -> bool {
+    true
+}
+
+/// No cross-origin browser access by default.
+///
+/// CORS governs browsers and nothing else, so an empty list costs API and MCP clients
+/// nothing while removing the drive-by attack surface that `["*"]` handed to any web page
+/// the operator happened to visit — which mattered because no endpoint requires auth.
 fn default_cors_allowed_origins() -> Vec<String> {
-    vec!["*".to_string()]
+    Vec::new()
 }
 
 fn default_node_label_opt() -> Option<String> {
@@ -1391,7 +1543,7 @@ fn default_request_timeout_secs() -> u64 {
     30
 }
 
-fn default_max_concurrent_requests() -> usize {
+fn default_messaging_max_concurrent_requests() -> usize {
     100
 }
 
@@ -1571,7 +1723,7 @@ mod tests {
 
         assert_eq!(config.network.http.port, 7001, "the named setting applies");
         // Neighbours in the same table, sibling sections, and whole missing sections.
-        assert_eq!(config.network.http.bind_address, "0.0.0.0");
+        assert_eq!(config.network.http.bind_address, "127.0.0.1");
         assert_eq!(config.network.cluster.cluster_port, 9580);
         assert_eq!(
             config.storage.data_paths,
@@ -1622,7 +1774,8 @@ mod tests {
     fn test_default_configuration() {
         let config = CameoDbConfig::default();
         assert_eq!(config.network.http.port, 9480);
-        assert_eq!(config.network.http.bind_address, "0.0.0.0");
+        // Loopback by default: a fresh node is not reachable off-box until asked.
+        assert_eq!(config.network.http.bind_address, "127.0.0.1");
         assert_eq!(config.search.indexer_memory_min_mb, 64);
         assert_eq!(config.search.indexer_memory_max_mb, 512);
         assert_eq!(config.storage.default_batch_size, 1000);
@@ -1747,5 +1900,140 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    /// A PSK that round-trips is the only kind the swarm can start with, and `validate()`
+    /// now shares this code path, so a config that validates is one that will boot.
+    #[test]
+    fn psk_hex_round_trips_through_load() {
+        let mut config = CameoDbConfig::default();
+        config.network.cluster.psk =
+            Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string());
+        let psk = config
+            .network
+            .cluster
+            .load_psk()
+            .expect("valid psk")
+            .expect("psk present");
+        assert_eq!(psk.bytes()[0], 0x00);
+        assert_eq!(psk.bytes()[1], 0x11);
+        assert_eq!(psk.bytes()[31], 0xff);
+    }
+
+    #[test]
+    fn psk_rejects_wrong_length_and_non_hex() {
+        let mut config = CameoDbConfig::default();
+        for bad in ["abc", &"a".repeat(63), &"a".repeat(65), &"z".repeat(64)] {
+            config.network.cluster.psk = Some(bad.to_string());
+            assert!(
+                config.network.cluster.load_psk().is_err(),
+                "'{}' must be rejected",
+                bad
+            );
+            // validate() must agree — it is the same code path, and that is the point.
+            assert!(config.validate().is_err(), "validate accepted '{}'", bad);
+        }
+    }
+
+    #[test]
+    fn psk_is_trimmed_so_a_file_with_a_trailing_newline_works() {
+        let dir = std::env::temp_dir().join(format!("cameodb-psk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("cluster.psk");
+        std::fs::write(&path, format!("{}\n", "ab".repeat(32))).expect("write psk");
+
+        let mut config = CameoDbConfig::default();
+        config.network.cluster.psk_file = Some(path.clone());
+        let psk = config
+            .network
+            .cluster
+            .load_psk()
+            .expect("valid psk file")
+            .expect("psk present");
+        assert_eq!(psk.bytes(), [0xab; 32]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The secret must not reach a log or a config dump by any ordinary route.
+    #[test]
+    fn psk_is_not_printable_or_serializable() {
+        let secret = "ab".repeat(32);
+        let mut config = CameoDbConfig::default();
+        config.network.cluster.psk = Some(secret.clone());
+
+        let serialized = toml::to_string_pretty(&config).expect("serialize");
+        assert!(
+            !serialized.contains(&secret),
+            "psk leaked into serialized config"
+        );
+
+        let psk = config.network.cluster.load_psk().unwrap().unwrap();
+        let debug = format!("{:?}", psk);
+        assert!(!debug.contains(&secret), "psk leaked via Debug: {}", debug);
+        assert!(debug.contains("redacted"), "{}", debug);
+    }
+
+    /// pnet disables QUIC, so a QUIC address alongside a PSK can never connect. Catching
+    /// it here beats a dial-time warning nobody reads.
+    #[test]
+    fn psk_with_quic_addresses_is_rejected() {
+        let mut config = CameoDbConfig::default();
+        config.network.cluster.psk = Some("ab".repeat(32));
+        config.network.cluster.seed_nodes = vec!["/ip4/10.0.0.5/udp/9580/quic-v1".to_string()];
+        let err = config.validate().expect_err("quic + psk must be rejected");
+        assert!(err.to_string().contains("QUIC"), "{}", err);
+
+        config.network.cluster.seed_nodes = vec!["/ip4/10.0.0.5/tcp/9580".to_string()];
+        assert!(config.validate().is_ok(), "tcp seed must be accepted");
+    }
+
+    /// TLS config is loaded before the banner now, but validation still has to reject the
+    /// half-configured cases up front.
+    #[test]
+    fn tls_requires_both_files_and_they_must_exist() {
+        let mut config = CameoDbConfig::default();
+        config.network.http.tls.enabled = true;
+        assert!(config.validate().is_err(), "no cert/key configured");
+
+        config.network.http.tls.cert_file = Some(PathBuf::from("/nonexistent/cert.pem"));
+        assert!(config.validate().is_err(), "no key configured");
+
+        config.network.http.tls.key_file = Some(PathBuf::from("/nonexistent/key.pem"));
+        let err = config
+            .validate()
+            .expect_err("missing files must be rejected");
+        assert!(err.to_string().contains("not found"), "{}", err);
+    }
+
+    #[test]
+    fn wildcard_cors_is_rejected_outside_dev() {
+        let mut config = CameoDbConfig::default();
+        config.node.profile = Some(crate::posture::Profile::Internal);
+        config.network.http.bind_address = "0.0.0.0".to_string();
+        config.network.http.cors_allowed_origins = vec!["*".to_string()];
+        let err = config.validate().expect_err("wildcard must be rejected");
+        assert!(err.to_string().contains("cors"), "{}", err);
+    }
+
+    /// An empty origin list used to be a config error, which pushed operators towards
+    /// "*". It is now the default and must validate.
+    #[test]
+    fn empty_cors_validates() {
+        let mut config = CameoDbConfig::default();
+        config.network.http.cors_allowed_origins = vec![];
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn profile_flag_and_env_are_parsed() {
+        let parsed = cli(&["--profile", "external"]);
+        let mut config = CameoDbConfig::default();
+        config = CameoDbConfig::apply_overrides(config, &parsed).expect("apply");
+        assert_eq!(config.node.profile, Some(crate::posture::Profile::External));
+
+        assert!(cli_help().contains("--profile"));
+        assert!(CliOverrides::parse(["--profile", "nonsense"].map(String::from)).is_ok());
+        let bad = cli(&["--profile", "nonsense"]);
+        assert!(CameoDbConfig::apply_overrides(CameoDbConfig::default(), &bad).is_err());
     }
 }

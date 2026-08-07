@@ -1,17 +1,21 @@
 # cargo-deny configuration
 # Run: cargo deny check
 
+[output]
 feature-depth = 1
 
 [advisories]
+# Each exception carries a `review-by <date>` in its reason. scripts/validate/deps.sh
+# fails once that date passes, so an exception has to be renewed deliberately instead of
+# outliving the problem it was granted for.
 ignore = [
     # hickory-proto 0.25.x vulnerabilities — transitive via libp2p 0.56.0.
     # Fix requires hickory-proto >=0.26.1, which libp2p hasn't adopted yet.
-    { id = "RUSTSEC-2026-0118", reason = "transitive via libp2p 0.56.0; no upstream fix available" },
-    { id = "RUSTSEC-2026-0119", reason = "transitive via libp2p 0.56.0; no upstream fix available" },
+    { id = "RUSTSEC-2026-0118", reason = "transitive via libp2p 0.56.0; needs hickory-proto >=0.26.1; review-by 2026-11-01" },
+    { id = "RUSTSEC-2026-0119", reason = "transitive via libp2p 0.56.0; needs hickory-proto >=0.26.1; review-by 2026-11-01" },
     # paste is unmaintained but pulled in transitively via libp2p → if-watch → netlink-packet-core.
     # No actionable fix until the upstream chain replaces it.
-    { id = "RUSTSEC-2024-0436", reason = "transitive via libp2p; no upstream replacement available" },
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained `paste`, transitive via libp2p -> if-watch; review-by 2026-11-01" },
 ]
 
 [licenses]
@@ -32,6 +36,10 @@ allow = [
     "MPL-2.0",
     "EPL-2.0",
     "bzip2-1.0.6",
+    # Mozilla's CA certificate bundle, shipped by webpki-root-certs via
+    # rustls-platform-verifier. CDLA-Permissive-2.0 is a permissive *data* licence with no
+    # copyleft or attribution burden — appropriate for a trust store, and reviewed as such.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 

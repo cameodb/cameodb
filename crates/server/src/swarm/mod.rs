@@ -431,10 +431,10 @@ async fn create_production_swarm(
     // Load pre-shared key for private network encryption, if configured.
     // When PSK is set, we wrap TCP with PnetConfig (XSalsa20) and skip QUIC
     // (pnet only supports TCP-based transports).
-    let psk_bytes = config.load_psk()?;
+    let cluster_psk = config.load_psk()?;
 
-    let mut swarm = if let Some(psk_bytes) = psk_bytes {
-        let psk = PreSharedKey::new(psk_bytes);
+    let mut swarm = if let Some(cluster_psk) = cluster_psk {
+        let psk = PreSharedKey::new(cluster_psk.bytes());
         info!(
             "🔐 Cluster PSK enabled — fingerprint: {} (QUIC disabled, TCP wrapped with XSalsa20)",
             psk.fingerprint()

@@ -2538,9 +2538,10 @@ impl HybridStore {
     /// On-disk Tantivy directory for `index`, validated to stay inside this
     /// shard's `indices/` directory.
     ///
-    /// Every path derived from a caller-supplied index name must go through
-    /// here rather than joining directly, so that a name containing `..` or a
-    /// path separator can never escape the shard.
+    /// Every path derived from an index name goes through here rather than joining
+    /// directly, so that a name containing `..` or a path separator can never escape the
+    /// shard. That includes names read back from redb or the filesystem, which are
+    /// already trusted — one construction site is what keeps the guarantee checkable.
     pub fn index_dir(&self, index: &str) -> Result<PathBuf, StoreError> {
         resolve_index_dir(&self.config.shard_path.join("indices"), index)
     }
@@ -2801,9 +2802,12 @@ impl HybridStore {
         let budget = if let Some(b) = self.budget_cache.get(index) {
             *b.value()
         } else {
-            // Fallback: calculate and cache
-            let index_path = self.config.shard_path.join("indices").join(index);
-            let b = self.config.get_optimal_memory_budget(&index_path, None);
+            // Fallback: calculate and cache. Measurement only, but the path is still
+            // built by `index_dir` so no caller-supplied name is ever joined by hand.
+            let b = match self.index_dir(index) {
+                Ok(index_path) => self.config.get_optimal_memory_budget(&index_path, None),
+                Err(_) => self.config.indexer_memory_budget,
+            };
             self.budget_cache.insert(index.to_string(), b);
             b
         };
@@ -2966,7 +2970,7 @@ impl HybridStore {
         self.smart_refresh_reader(index)?;
 
         // Refresh budget cache after commit since index size likely changed
-        let index_path = self.config.shard_path.join("indices").join(index);
+        let index_path = self.index_dir(index)?;
         let new_budget = self.config.get_optimal_memory_budget(&index_path, None);
         self.budget_cache.insert(index.to_string(), new_budget);
 
@@ -4883,8 +4887,10 @@ impl HybridStore {
             if let Some(sizes) = all_sizes.get(index_name) {
                 // Check if Tantivy index directory exists (not just if it has size)
                 // This ensures empty indexes (after schema creation) are counted
-                let index_path = self.config.shard_path.join("indices").join(index_name);
-                let tantivy_index_exists = index_path.join("meta.json").exists();
+                let tantivy_index_exists = self
+                    .index_dir(index_name)
+                    .map(|p| p.join("meta.json").exists())
+                    .unwrap_or(false);
 
                 per_index.insert(
                     index_name.clone(),
@@ -5059,8 +5065,10 @@ impl HybridStore {
             .cloned()
             .collect();
         pending_warmup.sort_by_key(|name| {
-            let index_path = self.config.shard_path.join("indices").join(name);
-            index_size_bytes(&index_path).unwrap_or(0)
+            self.index_dir(name)
+                .ok()
+                .and_then(|path| index_size_bytes(&path))
+                .unwrap_or(0)
         });
 
         let plan = WarmupPlan {
@@ -5132,7 +5140,7 @@ impl HybridStore {
     }
 
     fn measure_tantivy_bytes(&self, index_name: &str) -> Result<u64, StoreError> {
-        let index_dir = self.config.shard_path.join("indices").join(index_name);
+        let index_dir = self.index_dir(index_name)?;
         if !index_dir.exists() {
             return Ok(0);
         }

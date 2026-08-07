@@ -3,34 +3,53 @@ use reqwest::{Client, Url, header};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+/// Which TLS verification to relax, and for which connection.
+///
+/// The two are deliberately separate. They were previously one flag, so asking to accept
+/// a self-signed certificate on a *data source* also disabled verification on the
+/// connection to CameoDB itself — a wider hole than anyone asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TlsTrust {
+    /// Accept invalid certificates from the CameoDB server.
+    pub insecure_server: bool,
+    /// Accept invalid certificates from remote schema/data source URLs.
+    pub insecure_source: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CameoClient {
     base_url: Url,
     http: Client,
+    /// Separate client for fetching remote source files, so its trust settings cannot
+    /// affect requests to the CameoDB server.
+    source_http: Client,
 }
 
 impl CameoClient {
     pub fn new(url: &str) -> Result<Self> {
-        Self::new_with_insecure(url, false)
+        Self::new_with_trust(url, TlsTrust::default())
     }
 
-    pub fn new_with_insecure(url: &str, insecure: bool) -> Result<Self> {
+    pub fn new_with_trust(url: &str, trust: TlsTrust) -> Result<Self> {
         let base_url = Url::parse(url).context("Invalid URL")?;
 
         // Configure client for large file downloads with appropriate timeouts
-        let mut builder = Client::builder()
-            .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for large files
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .pool_idle_timeout(std::time::Duration::from_secs(90));
+        let build = |insecure: bool| -> Result<Client> {
+            let mut builder = Client::builder()
+                .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for large files
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .pool_idle_timeout(std::time::Duration::from_secs(90));
+            if insecure {
+                builder = builder.danger_accept_invalid_certs(true);
+            }
+            builder.build().context("Failed to build HTTP client")
+        };
 
-        // Check if we should accept invalid certs (--insecure flag only)
-        if insecure {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-
-        let http = builder.build().context("Failed to build HTTP client")?;
-
-        Ok(Self { base_url, http })
+        Ok(Self {
+            base_url,
+            http: build(trust.insecure_server)?,
+            source_http: build(trust.insecure_source)?,
+        })
     }
 
     pub async fn health(&self) -> Result<HealthResponse> {
@@ -182,6 +201,12 @@ impl CameoClient {
     /// Expose underlying HTTP client for auxiliary requests (e.g., fetching CSV schema samples)
     pub fn http(&self) -> &Client {
         &self.http
+    }
+
+    /// Client for fetching remote schema/data sources. Governed by `--insecure-source`,
+    /// never by `--insecure`.
+    pub fn source_http(&self) -> &Client {
+        &self.source_http
     }
 
     pub async fn admin_memory_stats(&self) -> Result<AdminMemoryResponse> {

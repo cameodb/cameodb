@@ -6,13 +6,23 @@ members = ["crates/*"]
 anyhow = "1.0.102"
 arc-swap = "1"
 axum = "0.8.9"
-axum-server = { version = "0.8", features = ["tls-rustls"] }
+# `tls-rustls-no-provider` deliberately avoids axum-server's `tls-rustls`, which
+# force-enables `rustls/aws-lc-rs`. libp2p-quic already enables `rustls/ring`, and
+# rustls 0.23 refuses to pick a provider when both are on — the server panicked on
+# every TLS startup. One provider (ring), installed explicitly in `main`.
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 futures = "0.3.32"
 kameo = { version = "0.22", features = ["remote", "macros"] }
 libp2p = { version = "0.56.0", features = ["tcp", "dns", "quic", "noise", "yamux", "macros", "kad", "tokio", "serde", "request-response", "pnet"] }
 num_cpus = "1.17"
 redb = "4.1.0"
-reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
+# One TLS stack for the whole workspace: rustls with the ring provider installed by
+# the binary. `rustls-no-provider` still pulls `rustls-platform-verifier`, so the OS
+# trust store (and any corporate CA added to it) is used for outbound HTTPS — that is
+# what native-tls was providing. Avoids `rustls/aws-lc-rs` (cmake/NASM) and vendored
+# OpenSSL, so musl and Windows cross-builds need no C toolchain for TLS.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
 serde-saphyr = "0.0.28"
@@ -20,7 +30,7 @@ tantivy = { version = "0.26.1", features = ["stemmer"] }
 tokio = { version = "1.52.1", features = ["full"] }
 toml = "1.1"
 tower = "0.5.3"
-tower-http = { version = "0.7.0", features = ["trace", "cors", "limit", "compression-br", "decompression-br"] }
+tower-http = { version = "0.7.0", features = ["trace", "cors", "limit", "timeout", "compression-br", "decompression-br"] }
 thiserror = "2.0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

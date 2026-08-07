@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (security)
+- **TLS never worked.** The server panicked on every HTTPS startup — `axum-server/tls-rustls`
+  force-enables `rustls/aws-lc-rs` while libp2p-quic enables `rustls/ring`, and rustls 0.23
+  refuses to choose between two providers. The panic landed after the startup banner, so a
+  failed boot looked like a successful one. Now uses `tls-rustls-no-provider` with `ring`
+  installed explicitly at the top of `main`.
+- **Streaming ingest ignored every body limit.** `DefaultBodyLimit` only constrains
+  extractors, so `POST /api/{index}/document/stream`, which takes a raw `Body`, was
+  unbounded: a 150 MB single-line request under a 1 MB configured limit was accepted and
+  drove RSS from 44 MB to 889 MB. Added `RequestBodyLimitLayer` (wire bytes) and a
+  per-record cap inside the handler.
+- **`request_timeout_secs` was never applied to HTTP.** With no timeout, the new
+  concurrency guard made denial of service *cheaper*: four uploads at 300 B/s held every
+  permit indefinitely and took the node offline, health check included. Added
+  `TimeoutLayer`, exempted `/_cluster/health` from the guard, and added `Retry-After` to
+  the 503.
+- **TLS lost graceful shutdown.** The drain signal only reached the plaintext listener, so
+  every TLS shutdown burned the full 10 s timeout and then cut in-flight requests. Now
+  driven by `axum_server::Handle`.
+- **Restricting CORS broke browser MCP clients.** `mcp-session-id` was neither an allowed
+  request header nor exposed on responses, so the Streamable HTTP transport could not work
+  from a browser once origins were restricted.
+- TLS material is loaded before storage init and before the banner, so bad certificates
+  fail early rather than mid-flight.
+
+### Added
+- **Security posture profiles.** `[node] profile = "local" | "internal" | "external"`
+  declares how far a node can be reached; the server enforces the matching rules and refuses
+  to start if the config contradicts them. Profiles assert, they never rewrite values.
+  Omitting it is valid only for a loopback bind, which infers `local`. The names describe
+  reach rather than an environment (`dev`, `staging`) because every rule keys off the bind
+  address — a lifecycle name invites picking by what the box is for and being rejected for it.
+- `cameodb check-config [-c <path>]` prints the posture matrix and exits non-zero on
+  failure — the manual equivalent of a CI gate.
+- `--profile` / `CAMEODB_PROFILE` override.
+- `[network.http] admin_enabled` (default `true`) removes the unauthenticated `/_admin/*`
+  routes entirely when disabled; required off by the `external` profile.
+- `--insecure-source` on the client, separate from `--insecure`. Accepting an untrusted
+  data source no longer disables verification on the connection to CameoDB itself.
+- [`scripts/validate/`](scripts/validate/README.md): manual validation suite (deps, unit,
+  posture, tls, remote-sources) with a single `all.sh` entry point, plus
+  [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md). There is no CI by design; this is the gate.
+
+### Changed
+- **Single TLS stack.** The client moved from native-tls/vendored OpenSSL to
+  `reqwest/rustls-no-provider`. `rustls-platform-verifier` uses the OS trust store, which
+  is what native-tls provided and what a corporate CA requires — verified against
+  `dl.cameodb.com` and other real sources. Vendored OpenSSL and `aws-lc-rs` are gone from
+  every build path, so musl and Windows cross-builds no longer need a C toolchain for TLS.
+  The `client/native-tls*` features were removed; build invocations no longer pass them.
+- **Default bind is now `127.0.0.1`** (was `0.0.0.0`). A reachable bind additionally
+  requires a declared profile.
+- **Default `cors_allowed_origins` is now `[]`** (was `["*"]`). CORS governs browsers only,
+  so this costs API and MCP clients nothing; `"*"` is accepted only under `local`. An empty
+  list is no longer a config error.
+- Cluster PSK is held in a `ClusterPsk` newtype that redacts its `Debug`, is never
+  serialized, and zeroizes on drop. Format validation lives in `load_psk()` alone, which
+  `validate()` now calls, so a config that validates is one the swarm can start with.
+  `psk_file` permissions are checked, and a PSK combined with a `/quic-v1` address is
+  rejected at config time (`pnet` wraps TCP only).
+- Every index path is built through `HybridStore::index_dir`, including internally sourced
+  names, so the traversal guarantee has one construction site.
+- Renamed the cluster messaging `default_max_concurrent_requests` to
+  `default_messaging_max_concurrent_requests` to distinguish it from the HTTP knob.
+- `deny.toml`: advisory exceptions carry `review-by` dates that `deps.sh` enforces; added
+  `CDLA-Permissive-2.0` for the Mozilla CA bundle shipped via `rustls-platform-verifier`.
+
+### Migration
+- Configs binding a non-loopback address must add `[node] profile = "..."`.
+- Configs with `cors_allowed_origins = ["*"]` must list explicit origins or use `[]`, unless
+  the profile is `local`.
+- `cameodb client ... --insecure` for a remote source URL is now `--insecure-source`.
+- Build scripts passing `--features client/native-tls-vendored` must drop the flag.
+
 ### Added
 - TLS/HTTPS support for the HTTP server via `axum-server` with rustls
   - Config: `[network.http.tls]` with `enabled`, `cert_file`, `key_file` fields

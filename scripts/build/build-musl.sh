@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build script for x86_64-unknown-linux-musl target using zigbuild
-# Uses native-tls-vendored with Zig's C compiler for maximum HTTPS compatibility
+# TLS is rustls with the ring provider (no C toolchain, no vendored OpenSSL);
+# outbound HTTPS verifies against the system trust store via rustls-platform-verifier.
 
 set -e
 
@@ -14,7 +15,7 @@ PROFILE="${1:-release}"
 export AR="zig ar"
 export RANLIB="zig ranlib"
 
-echo "Building for $TARGET with profile $PROFILE using native-tls-vendored..."
+echo "Building for $TARGET with profile $PROFILE (rustls/ring)..."
 
 # Use --profile rather than interpolating a `--$PROFILE` flag: cargo has no literal
 # `--debug` flag (debug/dev is the default with no flag at all), so a naive
@@ -23,8 +24,7 @@ echo "Building for $TARGET with profile $PROFILE using native-tls-vendored..."
 cargo zigbuild \
     --profile "$PROFILE" \
     --target "$TARGET" \
-    --no-default-features \
-    --features client/native-tls-vendored
+    --no-default-features
 
 # Cargo's built-in "dev" profile is the one exception to "output dir == profile
 # name" — it builds into a directory literally called "debug" for historical

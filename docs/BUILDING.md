@@ -4,7 +4,7 @@
 
 ### Recommended: Using the build script
 
-For musl targets, use the convenience script, which builds with `native-tls-vendored` via `cargo-zigbuild` for maximum HTTPS compatibility:
+For musl targets, use the convenience script, which builds via `cargo-zigbuild`. TLS is rustls with the `ring` provider, so no C toolchain or vendored OpenSSL is involved:
 
 ```bash
 ./scripts/build/build-musl.sh
@@ -26,8 +26,7 @@ For musl targets, use the convenience script, which builds with `native-tls-vend
 > export RANLIB="zig ranlib"
 > cargo zigbuild --release --target x86_64-unknown-linux-musl \
 >     --no-default-features \
->     --features client/native-tls-vendored
-> ```
+> > ```
 
 ### Alternative: Using rustls-tls
 
@@ -234,9 +233,9 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 Windows builds support the same TLS backends:
 
-- `native-tls` (default): Uses Windows Schannel
+- TLS is rustls with the `ring` provider on every platform; there are no TLS feature flags to choose
 - `rustls-tls`: Pure Rust TLS implementation
-- `native-tls-vendored`: Not typically needed on Windows
+- Outbound HTTPS verifies against the Windows certificate store via `rustls-platform-verifier`
 
 Example with rustls-tls:
 
@@ -273,7 +272,7 @@ docker build \
   .
 ```
 
-### Musl (static) image with Zig + native-tls-vendored
+### Musl (static) image with Zig
 
 Builds a static musl binary using Zig’s C toolchain and vendored OpenSSL:
 
@@ -290,7 +289,7 @@ docker build \
 - Use **native/glibc** for typical container runtimes where glibc is available.
 - Use **musl** when you need a fully static binary or strict MUSL environments.
 
-### Default: Using system native-tls
+### Default: rustls with the system trust store
 
 For local development on macOS/Linux:
 
@@ -304,9 +303,9 @@ Uses system TLS libraries (default feature).
 
 The `client` crate supports the following TLS backends:
 
-- `native-tls` (default): Uses system TLS (SecureTransport on macOS, OpenSSL on Linux)
+- TLS is rustls with the `ring` provider; outbound HTTPS verifies against the system trust store (Keychain on macOS, `/etc/ssl/certs` on Linux)
 - `rustls-tls`: Pure Rust TLS implementation (recommended for musl/Docker builds)
-- `native-tls-vendored`: Bundles and compiles OpenSSL from source
+- Static and musl builds need `ca-certificates` present in the image; verify with `scripts/validate/remote-sources.sh`
 
 ## Docker Build
 
@@ -452,7 +451,7 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl \
 
 ### Certificate validation errors
 
-If you encounter certificate validation errors with `rustls-tls`, the site may have unusual certificate requirements. Try `native-tls` for local development or investigate the specific certificate issue.
+Certificate validation errors usually mean the issuing CA is missing from the OS trust store — install it there (this is also what a TLS-inspecting corporate proxy requires). `--insecure-source` bypasses verification for a remote data source and should stay a development-only measure.
 
 ### Undefined symbol errors: `mallocx`, `rallocx`, `sdallocx`, `mallctl`
 
@@ -517,13 +516,11 @@ export RANLIB="zig ranlib"
 # Build hardened binary for Linux x86_64 musl target (flags in .cargo/config.toml)
 cargo zigbuild --release --target x86_64-unknown-linux-musl \
     --no-default-features \
-    --features client/native-tls-vendored
 
 # OR override with explicit RUSTFLAGS:
 RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=pie -C relro-level=full -C link-arg=-pie -C link-arg=-static -C link-arg=-Wl,-z,now -C link-arg=-Wl,-z,relro -C link-arg=-fstack-protector-strong -C link-arg=-D_FORTIFY_SOURCE=2" \
 cargo zigbuild --release --target x86_64-unknown-linux-musl \
     --no-default-features \
-    --features client/native-tls-vendored
 
 # Generate RPM package with standard naming (run from project root directory)
 cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
@@ -561,8 +558,7 @@ docker run --rm --platform linux/amd64 \
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt && \
     cargo build --release --target x86_64-unknown-linux-musl \
       --no-default-features \
-      --features client/native-tls-vendored
-  "
+    "
 
 # Generate DEB package (run on host after Docker build)
 # Use --no-build to package the existing binary without rebuilding

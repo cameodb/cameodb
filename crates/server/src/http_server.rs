@@ -7,23 +7,30 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderName, HeaderValue, StatusCode, header},
     middleware::{Next, from_fn},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
 use bytes::BytesMut;
-use cameodb_mcp::{McpBackend, McpIndexSearchRequest, McpShutdownHandle, mcp_router};
+use cameodb_mcp::{
+    MCP_SESSION_ID_HEADER, McpBackend, McpIndexSearchRequest, McpShutdownHandle, mcp_router,
+};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use kameo::actor::ActorRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use tower_http::{
     compression::CompressionLayer, cors::CorsLayer, decompression::DecompressionLayer,
-    trace::TraceLayer,
+    limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer,
 };
+
+/// Liveness endpoint path. Exempt from the concurrency guard so that an overloaded node
+/// still reports its real state instead of 503-ing its own health check.
+const HEALTH_PATH: &str = "/_cluster/health";
 use tracing::{error, info, warn};
 
 use crate::cluster_coordinator::{ClusterCoordinator, GetStatus, OperationType};
@@ -58,6 +65,14 @@ impl AppError {
         Self {
             error: anyhow::anyhow!("{}", msg.into()),
             status: Some(StatusCode::NOT_FOUND),
+        }
+    }
+
+    /// 413 with an explicit, client-safe message.
+    pub fn payload_too_large(msg: impl Into<String>) -> Self {
+        Self {
+            error: anyhow::anyhow!("{}", msg.into()),
+            status: Some(StatusCode::PAYLOAD_TOO_LARGE),
         }
     }
 }
@@ -220,6 +235,12 @@ pub struct AppState {
     pub coordinator: ActorRef<ClusterCoordinator>,
     /// Number of documents per micro-batch for NDJSON write-stream ingestion
     pub stream_batch_size: usize,
+    /// Largest accepted single record, in bytes (from `max_record_size_mb`).
+    ///
+    /// The NDJSON stream handler enforces this per line. The wire-level body limit bounds
+    /// the request as a whole, but one unterminated line could still buffer the entire
+    /// allowance in memory, so the per-record cap is what keeps peak memory bounded.
+    pub max_record_size_bytes: usize,
 }
 
 impl McpBackend for AppState {
@@ -1353,19 +1374,30 @@ pub fn create_router(
     max_body_size_mb: usize,
     cors_allowed_origins: &[String],
     max_concurrent_requests: usize,
+    request_timeout_secs: u64,
+    admin_enabled: bool,
 ) -> (Router, McpShutdownHandle) {
     let body_limit_bytes = max_body_size_mb * 1024 * 1024;
     let (mcp_routes, mcp_handle) = mcp_router::<AppState>();
 
     // Concurrency limiter: rejects with 503 when too many requests are in flight.
+    //
+    // The liveness endpoint is exempt. Sharing the semaphore with it meant a node under
+    // load answered its own health check with 503, so a load balancer would evict a node
+    // that was merely busy — turning local overload into a cluster-wide outage.
     let semaphore = Arc::new(Semaphore::new(max_concurrent_requests));
     let concurrency_guard = from_fn(move |req: axum::extract::Request, next: Next| {
         let sem = semaphore.clone();
         async move {
+            if req.uri().path() == HEALTH_PATH {
+                return next.run(req).await;
+            }
             match sem.try_acquire() {
                 Ok(_permit) => next.run(req).await,
                 Err(_) => (
                     StatusCode::SERVICE_UNAVAILABLE,
+                    // Without this, clients retry immediately and deepen the overload.
+                    [(header::RETRY_AFTER, "1")],
                     "Too many concurrent requests",
                 )
                     .into_response(),
@@ -1395,7 +1427,17 @@ pub fn create_router(
                 axum::http::Method::PATCH,
                 axum::http::Method::DELETE,
             ])
-            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+            // `mcp-session-id` is required by the MCP Streamable HTTP transport: the
+            // client sends it on every follow-up request and must be able to read it off
+            // the initialize response, so it has to be both allowed and exposed. Without
+            // that, restricting origins silently breaks every browser-based MCP client.
+            .allow_headers([
+                header::CONTENT_TYPE,
+                header::AUTHORIZATION,
+                header::ACCEPT,
+                HeaderName::from_static(MCP_SESSION_ID_HEADER),
+            ])
+            .expose_headers([HeaderName::from_static(MCP_SESSION_ID_HEADER)])
     };
 
     let router = Router::new()
@@ -1414,34 +1456,56 @@ pub fn create_router(
         .route("/api/{index}", delete(delete_index_handler))
         .route("/_indexes", get(list_indexes_handler))
         .route("/_cluster/_indexes", get(list_cluster_indexes_handler))
-        // Admin endpoints
-        .route("/_admin/memory", get(admin_memory_handler))
-        .route("/_admin/memory/purge", post(admin_memory_purge_handler))
-        .route("/_admin/workers", get(admin_workers_handler))
-        .route(
-            "/_admin/index/{index}/commit",
-            post(admin_index_commit_handler),
-        )
-        .route(
-            "/_admin/index/{index}/evict-writer",
-            post(admin_index_evict_writer_handler),
-        )
         // Health check
-        .route("/_cluster/health", get(health_handler))
-        .fallback(fallback_handler)
+        .route(HEALTH_PATH, get(health_handler))
+        .fallback(fallback_handler);
+
+    // Admin endpoints are mounted only when enabled, so a disabled admin API is absent
+    // rather than merely refusing — nothing to probe, nothing to accidentally re-enable
+    // with a misconfigured guard.
+    let router = if admin_enabled {
+        router
+            .route("/_admin/memory", get(admin_memory_handler))
+            .route("/_admin/memory/purge", post(admin_memory_purge_handler))
+            .route("/_admin/workers", get(admin_workers_handler))
+            .route(
+                "/_admin/index/{index}/commit",
+                post(admin_index_commit_handler),
+            )
+            .route(
+                "/_admin/index/{index}/evict-writer",
+                post(admin_index_evict_writer_handler),
+            )
+    } else {
+        info!("Admin API disabled: /_admin/* routes are not mounted");
+        router
+    };
+
+    let router = router
         .with_state(state)
         // Response compression (outermost for responses)
         .layer(CompressionLayer::new())
-        // Decompressed body limit — applies *after* decompression so that
-        // compression bombs (small compressed → huge decompressed) are caught.
+        // Decompressed-size limit for body *extractors* (Json/Bytes/String). Applied
+        // after DecompressionLayer so a compression bomb is measured expanded, not
+        // compressed. Note this is an extractor-level limit only — it does not count
+        // bytes off the socket, which is what RequestBodyLimitLayer below does.
         .layer(DefaultBodyLimit::max(body_limit_bytes))
         // Allow compressed requests — decompresses before the body limit above
         .layer(DecompressionLayer::new())
-        // Compressed-size guard — limits raw bytes on the wire to prevent
-        // bandwidth abuse even when the payload is not actually compressed.
-        .layer(DefaultBodyLimit::max(body_limit_bytes))
+        // Wire-level limit: counts bytes as they arrive and returns 413 once the cap is
+        // passed, regardless of how the handler consumes the body. This is the only guard
+        // that covers handlers taking a raw `Body` (the streaming ingest path), which
+        // `DefaultBodyLimit` never applied to.
+        .layer(RequestBodyLimitLayer::new(body_limit_bytes))
         // Concurrency guard — reject excess requests with 503
         .layer(concurrency_guard)
+        // Bound how long a single request may occupy a concurrency permit. Without this,
+        // `max_concurrent_requests` trickle-fed connections hold every permit forever and
+        // the limit meant to prevent a DoS becomes the mechanism for one.
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(request_timeout_secs),
+        ))
         .layer(cors_layer)
         .layer(TraceLayer::new_for_http());
 
@@ -1832,6 +1896,7 @@ async fn write_stream_handler(
     let mut batch: Vec<DocPayload> = Vec::with_capacity(batch_size);
 
     let mut body_stream = body.into_data_stream();
+    let max_record_size_bytes = state.max_record_size_bytes;
 
     while let Some(chunk_result) = body_stream.next().await {
         let chunk = chunk_result.map_err(|e| {
@@ -1839,6 +1904,17 @@ async fn write_stream_handler(
         })?;
 
         buf.extend_from_slice(&chunk);
+
+        // A line only leaves `buf` when its newline arrives, so an unterminated line would
+        // otherwise buffer the entire request allowance before any limit was consulted.
+        // Rejecting here keeps peak memory bounded by the record size, not the body size.
+        if buf.len() > max_record_size_bytes {
+            return Err(AppError::payload_too_large(format!(
+                "document on line {} exceeds the {} MB single-record limit",
+                total_line_count + 1,
+                max_record_size_bytes / (1024 * 1024)
+            )));
+        }
 
         // Process all complete lines in the buffer
         while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {

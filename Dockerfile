@@ -106,8 +106,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         rustup target add "${TARGET_TRIPLE}"; \
     ); \
     cargo build --profile release-docker --target "${TARGET_TRIPLE}" --bin cameodb \
-        --no-default-features \
-        --features client/native-tls-vendored; \
+        --no-default-features; \
     cp "/src/target/${TARGET_TRIPLE}/release-docker/cameodb" /src/cameodb;
 
 ################################################################################

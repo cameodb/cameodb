@@ -17,6 +17,7 @@ mod config;
 mod distributed;
 mod http_server;
 mod node_orchestrator;
+mod posture;
 mod remote_peer_pool;
 mod swarm;
 
@@ -54,8 +55,24 @@ const COORDINATOR_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 /// Prevents indefinite hangs from stuck resources.
 const EMERGENCY_SHUTDOWN_TIMEOUT_SECS: u64 = 120;
 
+/// Install the process-level rustls crypto provider.
+///
+/// Must run before any TLS is used, on both the server and client paths. rustls 0.23
+/// refuses to choose for itself when more than one provider feature is active in the
+/// dependency graph, and this binary links libp2p-quic (ring) alongside axum-server and
+/// reqwest; leaving the choice implicit is what made every HTTPS startup panic. `ring`
+/// is chosen over `aws-lc-rs` because it needs no C toolchain, which keeps the musl and
+/// Windows cross-builds simple.
+fn install_crypto_provider() {
+    // An error means another call won the race and a provider is already installed,
+    // which is the desired end state either way.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_crypto_provider();
+
     // Handle CLI arguments for configuration utilities and client mode
     let args: Vec<String> = std::env::args().collect();
 
@@ -91,6 +108,43 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Posture check without starting the node: the manual equivalent of a CI gate, so a
+    // config can be verified before it is deployed rather than by watching a server boot.
+    if subcommand == "check-config" {
+        let cli_overrides = config::CliOverrides::parse(args.into_iter().skip(2))?;
+        let cameodb_config = CameoDbConfig::load_unvalidated(&cli_overrides)?;
+
+        // Render the matrix before deciding, so a failure arrives with the context of
+        // everything that passed rather than as a single line.
+        let warnings = match posture::evaluate(&cameodb_config) {
+            Ok(posture) => {
+                print!("{}", posture.render());
+                posture.warnings().count()
+            }
+            Err(e) => {
+                eprintln!("Result: FAILED\n{}", e);
+                std::process::exit(1);
+            }
+        };
+
+        if let Err(e) = cameodb_config.validate() {
+            eprintln!("\nResult: FAILED\n{}", e);
+            std::process::exit(1);
+        }
+        println!(
+            "\nResult: OK{}",
+            if warnings > 0 {
+                format!(
+                    " ({} warning(s) — accepted risk for this profile)",
+                    warnings
+                )
+            } else {
+                String::new()
+            }
+        );
+        return Ok(());
+    }
+
     if args
         .iter()
         .skip(1)
@@ -101,6 +155,7 @@ async fn main() -> Result<()> {
              Usage:\n  \
              cameodb [OPTIONS]\n  \
              cameodb generate-config\n  \
+             cameodb check-config [-c <PATH>]\n  \
              cameodb client <subcommand>\n\n\
              Options:\n\
              {}\n  \
@@ -108,6 +163,7 @@ async fn main() -> Result<()> {
              -V, --version                               Show version information\n\n\
              Commands:\n  \
              generate-config  Print a sample configuration file\n  \
+             check-config     Report the security posture of a config and exit non-zero if it fails\n  \
              client           Run the bundled client CLI (health, index, search)\n\n\
              Client examples:\n  \
              cameodb client health\n  \
@@ -128,6 +184,39 @@ async fn main() -> Result<()> {
     // Load configuration: command line over environment over file over defaults.
     let cli_overrides = config::CliOverrides::parse(args.into_iter().skip(1))?;
     let cameodb_config = CameoDbConfig::load_with_cli(&cli_overrides)?;
+
+    // Load the TLS material here, before storage is opened and before the startup banner
+    // is printed. Loading it at bind time meant a bad certificate — or a missing crypto
+    // provider — surfaced as a panic *after* the banner claimed the server was up.
+    let tls_config = match &cameodb_config.network.http.tls {
+        tls if tls.enabled => {
+            let cert_file = tls
+                .cert_file
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("TLS enabled but cert_file not configured"))?;
+            let key_file = tls
+                .key_file
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("TLS enabled but key_file not configured"))?;
+            tracing::info!(
+                cert_file = %cert_file.display(),
+                key_file = %key_file.display(),
+                "Loading TLS certificate and key"
+            );
+            let loaded = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_file, key_file)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to load TLS certificate '{}' and key '{}': {}",
+                        cert_file.display(),
+                        key_file.display(),
+                        e
+                    )
+                })?;
+            Some(loaded)
+        }
+        _ => None,
+    };
 
     // Establish deterministic node identity from libp2p keypair
     let primary_path = cameodb_config
@@ -381,6 +470,7 @@ async fn main() -> Result<()> {
         router: router_actor,
         coordinator: coordinator_actor.clone(),
         stream_batch_size: cameodb_config.search.stream_batch_size,
+        max_record_size_bytes: cameodb_config.max_record_size_mb * 1024 * 1024,
     };
 
     // Create the HTTP router with shared state and body limit derived from max_record_size_mb
@@ -389,6 +479,8 @@ async fn main() -> Result<()> {
         cameodb_config.effective_max_body_size_mb(),
         &cameodb_config.network.http.cors_allowed_origins,
         cameodb_config.network.http.max_concurrent_requests,
+        cameodb_config.effective_request_timeout_secs(),
+        cameodb_config.network.http.admin_enabled,
     );
 
     // Extract HTTP configuration
@@ -471,41 +563,32 @@ async fn main() -> Result<()> {
         cameodb_config.network.http.max_concurrent_requests
     );
     println!();
+    // `validate()` already accepted this config, so this only re-renders the decision.
+    match posture::evaluate(&cameodb_config) {
+        Ok(p) => print!("🔒 {}", p.render()),
+        Err(e) => println!("🔒 Security profile: unavailable ({})", e),
+    }
+    println!();
     println!("Press Ctrl+C to shutdown...");
     println!();
 
     // Start the HTTP server with configured address
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-    let server_handle = if http_config.tls.enabled {
-        // TLS enabled: use axum-server with rustls
-        let cert_file = http_config
-            .tls
-            .cert_file
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("TLS enabled but cert_file not configured"))?;
-        let key_file = http_config
-            .tls
-            .key_file
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("TLS enabled but key_file not configured"))?;
+    // Under TLS the drain is driven by an `axum_server::Handle` rather than the oneshot,
+    // so Phase 2 of shutdown can actually finish instead of waiting out its full timeout
+    // and then cutting in-flight requests.
+    let tls_handle = tls_config.as_ref().map(|_| axum_server::Handle::new());
 
-        tracing::info!(
-            cert_file = %cert_file.display(),
-            key_file = %key_file.display(),
-            "TLS enabled, starting HTTPS server"
-        );
-
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_file, key_file)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to load TLS certificates: {}", e))?;
-
+    let server_handle = if let Some(tls_config) = tls_config {
         let addr: std::net::SocketAddr = bind_address
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid bind address {}: {}", bind_address, e))?;
+        let handle = tls_handle.clone().expect("handle created alongside config");
 
         tokio::spawn(async move {
             if let Err(e) = axum_server::bind_rustls(addr, tls_config)
+                .handle(handle)
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await
             {
@@ -631,6 +714,9 @@ async fn main() -> Result<()> {
         HTTP_DRAIN_TIMEOUT_SECS
     );
     let _ = shutdown_tx.send(());
+    if let Some(handle) = &tls_handle {
+        handle.graceful_shutdown(Some(Duration::from_secs(HTTP_DRAIN_TIMEOUT_SECS)));
+    }
     match timeout(Duration::from_secs(HTTP_DRAIN_TIMEOUT_SECS), server_handle).await {
         Ok(Ok(())) => tracing::info!("HTTP server drained successfully"),
         Ok(Err(e)) => tracing::warn!("HTTP server ended with error: {}", e),

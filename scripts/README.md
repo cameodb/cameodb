@@ -17,7 +17,7 @@ For a quick overview of all available scripts and project status:
 #### `build-musl.sh`
 **Purpose**: Local cross-compile to `x86_64-unknown-linux-musl` via `cargo-zigbuild`, without Docker
 - **Features**:
-  - Uses `native-tls-vendored` for maximum HTTPS compatibility
+  - TLS is rustls with the `ring` provider (no vendored OpenSSL, no C toolchain)
   - Exports `AR="zig ar"` / `RANLIB="zig ranlib"` so jemalloc's C build archives correctly — without this, macOS's native `ranlib` silently produces an empty `libjemalloc.a` (it can't parse the ELF objects Zig's cross-compiler emits), and the failure only surfaces later as `undefined symbol: mallocx`/`mallctl` at link time. See [docs/BUILDING.md](../../docs/BUILDING.md#building-for-x86_64-unknown-linux-musl) for the full explanation.
 - **Usage**:
   ```bash

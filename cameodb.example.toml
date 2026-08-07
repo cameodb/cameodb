@@ -2,13 +2,34 @@
 label = "cameo-node-01"
 zone = "default"
 
+# Security posture preset. Declares how far this node can be reached; the server enforces
+# the matching rules at startup and refuses to boot if the rest of this file contradicts
+# them. Verify without starting the node: `cameodb check-config -c <file>`.
+#
+#   local    reachable only from this machine; permissive CORS allowed; warnings, not errors
+#   internal reachable on a trusted network; explicit CORS origins; cluster PSK required
+#   external reachable from an untrusted network; TLS required; /_admin/* off;
+#            authentication required (not implemented yet — see ROADMAP Phase 14 B1)
+#
+# Pick by who can reach the bind address, not by what the box is for: a shared test
+# environment is "internal", not "local", however early the project.
+#
+# Omitting this is only valid for a loopback bind_address, which infers "local".
+profile = "internal"
+
 [network.http]
 bind_address = "0.0.0.0"
 port = 9480
 request_timeout_secs = 30
 max_body_size_mb = 64
 max_concurrent_requests = 128
-cors_allowed_origins = ["*"]
+# Browser origins allowed to call this node, e.g. ["https://console.example.com"].
+# Empty = no cross-origin browser access (does not affect API/MCP clients).
+# "*" is accepted only under the local profile.
+cors_allowed_origins = []
+
+# Remove the unauthenticated /_admin/* routes (memory purge, writer eviction).
+admin_enabled = true
 
 [network.cluster]
 enabled = false

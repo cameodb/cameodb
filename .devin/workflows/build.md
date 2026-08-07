@@ -10,8 +10,7 @@ cargo build --release
 
 ```bash
 cargo zigbuild --release --target x86_64-unknown-linux-musl \
-  --no-default-features \
-  --features client/native-tls-vendored
+  --no-default-features
 ```
 
 ## RPM Package Generation

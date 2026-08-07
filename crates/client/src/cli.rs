@@ -1,4 +1,4 @@
-use crate::sdk::{CameoClient, ListIndexesResponse};
+use crate::sdk::{CameoClient, ListIndexesResponse, TlsTrust};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored_json;
@@ -211,9 +211,16 @@ pub struct ClientCli {
     )]
     pub connect: String,
 
-    /// Accept invalid TLS certificates (for self-signed certs in development)
+    /// Accept invalid TLS certificates from the CameoDB server (self-signed certs in development)
     #[arg(long = "insecure", global = true)]
     pub insecure: bool,
+
+    /// Accept invalid TLS certificates when fetching remote schema/data source URLs.
+    ///
+    /// Deliberately separate from --insecure: relaxing trust for a data source must not
+    /// also relax it for the connection carrying your writes.
+    #[arg(long = "insecure-source", global = true)]
+    pub insecure_source: bool,
 }
 
 fn parse_header_with_hint(raw: &str) -> (String, Option<TantivyFieldType>) {
@@ -255,27 +262,25 @@ struct InteractiveSession {
     current_url: String,
     client: CameoClient,
     index_cache: Arc<RwLock<HashMap<String, IndexMetadata>>>,
-    insecure: bool,
+    /// Carried so that `connect <target>` mid-session keeps the trust settings the
+    /// session was started with instead of silently re-enabling verification.
+    trust: TlsTrust,
 }
 
 impl InteractiveSession {
-    fn new_with_insecure(initial_url: String, insecure: bool) -> Result<Self> {
-        let client = CameoClient::new_with_insecure(&initial_url, insecure)?;
+    fn new_with_trust(initial_url: String, trust: TlsTrust) -> Result<Self> {
+        let client = CameoClient::new_with_trust(&initial_url, trust)?;
         Ok(Self {
             current_url: initial_url,
             client,
             index_cache: Arc::new(RwLock::new(HashMap::new())),
-            insecure,
+            trust,
         })
     }
 
     fn reconnect(&mut self, target: &str) -> Result<()> {
-        self.reconnect_with_insecure(target, self.insecure)
-    }
-
-    fn reconnect_with_insecure(&mut self, target: &str, insecure: bool) -> Result<()> {
         let normalized = normalize_connect_target(target)?;
-        self.client = CameoClient::new_with_insecure(&normalized, insecure)?;
+        self.client = CameoClient::new_with_trust(&normalized, self.trust)?;
         self.current_url = normalized;
         self.clear_index_cache();
         Ok(())
@@ -1503,9 +1508,6 @@ pub enum ClientCommand {
         /// Delimiter override (default: auto-detect first line)
         #[arg(long, value_enum, default_value_t = Delimiter::Detect)]
         delimiter: Delimiter,
-        /// Accept invalid TLS certificates for remote HTTPS sources (for self-signed certs)
-        #[arg(long, default_value_t = false)]
-        insecure: bool,
     },
 
     /// Data ingestion
@@ -1523,9 +1525,6 @@ pub enum ClientCommand {
         /// Maximum documents per batch
         #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
         batch_size: usize,
-        /// Accept invalid TLS certificates for remote HTTPS sources (for self-signed certs)
-        #[arg(long, default_value_t = false)]
-        insecure: bool,
     },
 
     /// Delete an index (and optionally its schema)
@@ -1642,12 +1641,16 @@ pub async fn run_cli() -> Result<()> {
     let cli = ClientCli::parse_from(filtered_args);
 
     let normalized_connect = normalize_connect_target(&cli.connect)?;
+    let trust = TlsTrust {
+        insecure_server: cli.insecure,
+        insecure_source: cli.insecure_source,
+    };
 
     if cli.interactive {
-        return run_interactive_shell(normalized_connect, cli.insecure).await;
+        return run_interactive_shell(normalized_connect, trust).await;
     }
 
-    let client = CameoClient::new_with_insecure(&normalized_connect, cli.insecure)?;
+    let client = CameoClient::new_with_trust(&normalized_connect, trust)?;
 
     let command = cli.command.ok_or_else(|| {
         anyhow!(
@@ -1695,61 +1698,34 @@ pub async fn run_cli() -> Result<()> {
             index,
             file,
             delimiter,
-            insecure,
-        } => {
-            // Create a temporary insecure client if needed for remote HTTPS sources
-            let effective_client =
-                if insecure && (file.starts_with("http://") || file.starts_with("https://")) {
-                    CameoClient::new_with_insecure(&normalized_connect, true)?
-                } else {
-                    client
-                };
-
-            match operation {
-                SchemaOperation::Detect => {
-                    let schema_json =
-                        detect_schema_from_source(&effective_client, &file, delimiter).await?;
-                    print_json(&schema_json)?;
-                }
-                SchemaOperation::Load => {
-                    let index_name = index
+        } => match operation {
+            SchemaOperation::Detect => {
+                let schema_json = detect_schema_from_source(&client, &file, delimiter).await?;
+                print_json(&schema_json)?;
+            }
+            SchemaOperation::Load => {
+                let index_name = index
                         .as_deref()
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .ok_or_else(|| anyhow!("Index name is required for schema load. Usage: schema load <index> <file>"))?;
 
-                    let schema_json =
-                        load_schema_from_source(&effective_client, &file, delimiter).await?;
-                    effective_client
-                        .put_index_config(index_name, &schema_json)
-                        .await?;
-                    println!("Schema applied to index '{}'", index_name);
-                }
+                let schema_json = load_schema_from_source(&client, &file, delimiter).await?;
+                client.put_index_config(index_name, &schema_json).await?;
+                println!("Schema applied to index '{}'", index_name);
             }
-        }
+        },
         ClientCommand::Data {
             operation,
             index,
             file,
             delimiter,
             batch_size,
-            insecure,
-        } => {
-            // Create a temporary insecure client if needed for remote HTTPS sources
-            let effective_client =
-                if insecure && (file.starts_with("http://") || file.starts_with("https://")) {
-                    CameoClient::new_with_insecure(&normalized_connect, true)?
-                } else {
-                    client
-                };
-
-            match operation {
-                DataOperation::Load => {
-                    load_data_from_source(&effective_client, &index, &file, delimiter, batch_size)
-                        .await?;
-                }
+        } => match operation {
+            DataOperation::Load => {
+                load_data_from_source(&client, &index, &file, delimiter, batch_size).await?;
             }
-        }
+        },
         ClientCommand::Delete {
             index,
             delete_schema,
@@ -4248,7 +4224,7 @@ async fn fetch_bytes_source(client: &CameoClient, source: &str) -> Result<Vec<u8
     let raw_bytes = if is_http {
         let url = Url::parse(source).context("Invalid URL for schema source")?;
         let bytes = client
-            .http()
+            .source_http()
             .get(url)
             .send()
             .await
@@ -4265,12 +4241,12 @@ async fn fetch_bytes_source(client: &CameoClient, source: &str) -> Result<Vec<u8
     decompress_bytes(raw_bytes, compression)
 }
 
-async fn run_interactive_shell(initial_url: String, insecure: bool) -> Result<()> {
+async fn run_interactive_shell(initial_url: String, trust: TlsTrust) -> Result<()> {
     println!(
         "🛠️  CameoDB interactive client. Type 'help' for supported commands, 'exit' to quit.\n"
     );
 
-    let session = InteractiveSession::new_with_insecure(initial_url, insecure)?;
+    let session = InteractiveSession::new_with_trust(initial_url, trust)?;
     let history_path = history_file_path()?;
     let handle = tokio::runtime::Handle::current();
     session.refresh_index_cache().await;

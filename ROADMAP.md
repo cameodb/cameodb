@@ -128,13 +128,13 @@ This document outlines the current development priorities and optimization roadm
 - ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed
 - ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, resources, and query syntax docs completed; security moved to Phase 14, streaming/docs/testing planned
 - 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f partially done (merge thread count control implemented via `IndexWriterOptions`; core pinning and per-arena stats planned)
-- 🔒 **Phase 14 (Security Hardening)**: Stage A3 (TLS bypass removal) and B2 (HTTPS/TLS) completed; A1, A2, A4, A5, B1, B3, C1–C3 planned
+- 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) remains the open critical gap, design agreed 2026-08-08 and ready to implement; C1–C3 planned, C3 shrunk because B1 absorbs index scoping
 
 ### **Recommended Next Steps**
-1. **Phase 14 Stage A1**: Index name validation (critical security gap)
-2. **Phase 14 Stage A2**: Wire CORS config from `cors_allowed_origins`
-3. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats
-4. **Phase 12 remaining**: MCP streaming, documentation, integration tests
+1. **Phase 14 Stage B1**: API key authentication + index scoping — the last critical gap, and what the `external` profile is waiting on
+2. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats
+3. **Phase 12 remaining**: MCP streaming, documentation, integration tests
+4. **Phase 14 Stage C1–C3**: MCP rate limiting, audit logging, per-index role overrides (all depend on B1)
 
 ---
 
@@ -438,12 +438,12 @@ HTTP req on axum tokio worker (any core)
 **Current state (verified by audit):**
 - ✅ No hardcoded secrets, no command execution, no regex/ReDoS surface, no SSRF
 - ✅ libp2p cluster transport already uses Noise encryption
-- ⚠️ All HTTP/MCP endpoints unauthenticated (write, delete, admin included)
+- ⚠️ All HTTP/MCP endpoints unauthenticated (write, delete, admin included) — the one remaining critical gap. `/_admin/*` can now be removed entirely with `admin_enabled = false`, and the `external` profile refuses to start until B1 lands
 - ✅ Index names validated at creation and resolved through `HybridStore::index_dir()`, which rejects any name that is not a single path component (Stage A1)
-- ✅ `cors_allowed_origins` wired into the router with fail-fast config validation; default remains `["*"]` (Stage A2)
-- ✅ TLS on HTTP implemented via rustls (Stage B2); default bind `0.0.0.0:9480` still plaintext unless explicitly enabled
-- ⚠️ No cluster join authentication (any reachable node can join)
-- ⚠️ No rate limiting / concurrency caps; 576MB default body limit + decompression layer = memory DoS vector
+- ✅ `cors_allowed_origins` wired into the router with fail-fast validation; default is now `[]` (no cross-origin access) and `"*"` is local-only (Stage A2)
+- ✅ TLS on HTTP via rustls (Stage B2), verified serving; default bind is now `127.0.0.1:9480` and a reachable bind requires a declared security profile
+- ✅ Cluster join gated by an optional PSK; required by the `internal` and `external` profiles
+- ✅ Wire-level body limit, per-record cap, request timeout, and concurrency shedding, all verified live by `scripts/validate/posture.sh`
 - ✅ `CAMEODB_ACCEPT_INVALID_CERTS` removed entirely; replaced with per-command `--insecure` flag
 
 ### Execution Order (impact-per-effort ranked)
@@ -451,16 +451,22 @@ HTTP req on axum tokio worker (any core)
 | Order | Stage | Effort | Impact | Risk if unfixed |
 |-------|-------|--------|--------|-----------------|
 | **1** | A1: Index name validation | ✅ Done | Critical | Arbitrary dir deletion (RCE-adjacent) |
-| **2** | A2: CORS config wiring | 🟡 Partial | High | Drive-by browser attacks on local instances |
+| **2** | A2: CORS config wiring | ✅ Done | High | Drive-by browser attacks on local instances |
 | **3** | A3: `ACCEPT_INVALID_CERTS` removal | ✅ Done | Medium | Accidental TLS bypass |
-| **4** | A4: Body limits + concurrency caps | ~1 day | High | Memory DoS / decompression bomb |
-| **5** | A5: CI security tooling (`cargo audit`, `cargo deny`) | ~2 hrs | Medium | Silent vulnerable deps |
-| **6** | B1: API key authentication | ~3–5 days | Critical | Full unauthenticated R/W/D access |
+| **4** | A4: Body limits + concurrency caps | ✅ Done | High | Memory DoS / decompression bomb |
+| **5** | A5: Security tooling (`cargo audit`, `cargo deny`) | ✅ Done (manual) | Medium | Silent vulnerable deps |
+| **6** | B1: API key authentication + index scoping | ~1–2 weeks | Critical | Full unauthenticated R/W/D access |
 | **7** | B2: HTTPS/TLS via rustls | ✅ Done | High | Traffic interception |
-| **8** | B3: Cluster join secret (PSK) | ~2–3 days | High | Rogue node data access |
+| **8** | B3: Cluster join secret (PSK) | ✅ Done | High | Rogue node data access |
 | **9** | C1: MCP rate limiting + query complexity | ~2 days | Medium | Agent-driven resource exhaustion |
 | **10** | C2: Audit logging | ~2 days | Medium | No forensic trail |
-| **11** | C3: Index-level authorization (RBAC) | ~5+ days | Medium | Multi-tenant isolation |
+| **11** | C3: Per-index role overrides | ~2 days (was ~5+) | Medium | Multi-tenant isolation |
+
+The B1 estimate is up from the original ~3–5 days for two reasons, both decided deliberately
+(see B1 below): index scoping applies to **every** role rather than read-only keys, and MCP
+enforcement reaches per-tool and per-index rather than stopping at the path. The second is
+why C3 drops — most of what it described is B1's scoping mechanism, leaving only per-index
+*overrides* on top of it.
 
 ### Stage A: Quick Wins (no protocol changes)
 
@@ -471,89 +477,221 @@ HTTP req on axum tokio worker (any core)
 - Defense-in-depth at the storage boundary: `HybridStore::index_dir()` resolves every caller-supplied name and rejects anything that is not a single normal path component. The check is **lexical**, not `canonicalize()`-based, so it also holds for indexes that do not exist yet — the case where a traversal name would otherwise reach `create_dir_all` and escape the shard. Applied to `get_or_create_index` (creates dirs), `delete_index_data` (removes dirs, validated before any mutation), and both `Index::open_in_dir` slow paths.
 - Tests: 7 unit tests on `validate_index_name`, 3 on `resolve_index_dir`, plus an end-to-end test that drives the real write and delete paths with `../victim`, `..`, `../../etc`, and `a/b` and asserts nothing outside the shard is created or removed
 
-**A2 — Wire CORS Config** � PARTIALLY COMPLETED
+**A2 — Wire CORS Config** ✅ COMPLETED
 - ✅ Replaced hardcoded `CorsLayer::permissive()` with origins from `network.http.cors_allowed_origins`, threaded through `create_router`
 - ✅ Explicit methods (`GET/POST/PUT/PATCH/DELETE`) and headers (`Content-Type`, `Authorization`) for the non-wildcard path
 - ✅ Credentials are never combined with a wildcard origin (`permissive()` does not set them)
 - ✅ Fail-fast validation in `CameoDbConfig::validate()`: rejects an empty list, `"*"` mixed with specific origins, origins that are not valid header values, and origins without a scheme — a typo can no longer degrade silently into deny-all
 - ✅ Effective policy is logged at startup (`warn!` for wildcard, `info!` with the origin list otherwise)
-- 📋 **Remaining**: default is still `["*"]`, so out of the box the server is permissive. Defaulting to loopback origins when `bind_address` is local is a behavioural change still to be made.
+- ✅ Default is now `[]` — no cross-origin browser access. CORS governs browsers only, so this costs API and MCP clients nothing while removing the drive-by surface that mattered precisely because no endpoint requires auth
+- ✅ `"*"` is accepted only under the `local` profile; `internal` and `external` reject it
+- ✅ `mcp-session-id` and `accept` are allowed request headers and `mcp-session-id` is exposed, so restricting origins no longer breaks browser-based MCP clients — a collision between this stage and Phase 12 that the original change introduced
 
 **A3 — TLS Bypass Handling** ✅ COMPLETED
 - Removed `CAMEODB_ACCEPT_INVALID_CERTS` environment variable entirely
 - Replaced with `--insecure` flag: per-command for single operations, per-session for interactive REPL
 - No global TLS bypass via environment variables; must be explicitly requested via CLI flag
 
-**A4 — DoS Hardening** ✅ COMPLETED
+**A4 — DoS Hardening** ✅ COMPLETED (re-done; first attempt did not hold)
 - ✅ Lowered default `max_record_size_mb` from 512MB → 64MB; all derived limits (HTTP body, Kameo remote messaging, request timeout) scale accordingly
 - ✅ Added `max_concurrent_requests` to `HttpConfig` (default: 128) with CLI/env override (`--max-concurrent-requests` / `CAMEODB_MAX_CONCURRENT_REQUESTS`); semaphore-based concurrency guard middleware rejects excess requests with HTTP 503
-- ✅ Fixed `DefaultBodyLimit` ordering: decompressed body limit is applied *after* `DecompressionLayer` (inner) so compression bombs are caught; a second `DefaultBodyLimit` *before* decompression (outer) caps raw wire bytes
-- ✅ Config validation rejects `max_concurrent_requests = 0`
-- ✅ Startup log prints effective concurrency limit; example config updated
+- ✅ `DefaultBodyLimit` after `DecompressionLayer` so compression bombs are measured expanded
+- ✅ `RequestBodyLimitLayer` counts bytes on the wire. **The earlier claim that a second `DefaultBodyLimit` capped raw wire bytes was wrong**: `DefaultBodyLimit` is an extractor-level limit, so handlers taking a raw `Body` — the NDJSON streaming ingest path — were unbounded. A 150 MB single-line request under a 1 MB configured limit was accepted and drove RSS from 44 MB to 889 MB
+- ✅ Per-record cap inside `write_stream_handler`: an unterminated line can no longer buffer the whole request allowance
+- ✅ `TimeoutLayer` wired to `effective_request_timeout_secs()`. **`request_timeout_secs` was previously never applied to HTTP at all**, so the concurrency guard made a DoS *cheaper*: four trickle uploads at 300 B/s held every permit indefinitely and took the node offline, health check included
+- ✅ `/_cluster/health` exempted from the concurrency guard; 503 responses carry `Retry-After`
+- ✅ Config validation rejects `max_concurrent_requests = 0`; posture rules bound concurrency × body size jointly
+- ✅ Verified by `scripts/validate/posture.sh` (413 on both limit paths, 408 at the configured timeout, health available while saturated)
 
-**A5 — CI Security Tooling** 🟡 PARTIALLY COMPLETED
+**A5 — Security Tooling** ✅ COMPLETED (manual, by design)
 - ✅ `cargo audit` installed (v0.22.2), runs clean — 0 vulnerabilities across 588 dependencies
 - ✅ `cargo-deny` installed (v0.20.2) with `deny.toml` covering advisories, bans (wildcard deny, duplicate warn), licenses (permissive allowlist, copyleft deny), and sources (crates.io only)
 - ✅ Fixed wildcard path dependencies in `server` and `client` Cargo.toml (added explicit version constraints)
 - ✅ Fixed unparseable `FSL-1.1-Apache-2.0` license fields → `Apache-2.0` (valid SPDX; actual FSL license file remains in repo)
 - ✅ Documented 3 transitive advisories from libp2p 0.56.0 (hickory-proto vulnerabilities + unmaintained `paste`) with ignore reasons — no upstream fix available yet
-- 📋 **Remaining**: Create GitHub Actions CI workflow (`.github/workflows/ci.yml`) running `cargo audit`, `cargo deny check`, `cargo clippy -- -D warnings`, and `cargo test`; add Dependabot/Renovate config
+- ✅ `scripts/validate/deps.sh` runs `cargo fmt --check`, `cargo clippy -D warnings`, `cargo audit`, and `cargo deny check`
+- ✅ Advisory exceptions carry `review-by` dates; the script fails once one expires, so an exception cannot quietly outlive its justification
+- ✅ Added `CDLA-Permissive-2.0` to the licence allowlist (Mozilla CA bundle via `rustls-platform-verifier`), reviewed as a permissive data licence
+- **No CI by decision.** Execution is manual; [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md) is the record
 
 ### Stage B: Core Auth & Transport Security (the "auth project")
 
-**B1 — API Key Authentication with Role-Based Access** 🔴 CRITICAL
-- Design: `Authorization: Bearer <key>` middleware (axum `from_fn`) covering all `/api/*`, `/_admin/*`, `/_indexes`, `/mcp/*` routes; `/_cluster/health` stays open for load balancers
-- Three roles per API key:
-  - **Admin**: Full access — all routes including `/_admin/*` (memory, workers, purge), destructive operations (delete index, schema evolution), and all user/restricted operations
-  - **User**: Index-level CRUD — search, write, bulk ingest, schema read, index listing; no `/_admin/*` routes, no destructive operations (delete index, schema modification)
-  - **Restricted**: Read-only MCP access — `search_index`, `search_indexes`, `get_index`, `list_indexes`, `get_index_stats`, `validate_query`; designed for AI agents querying knowledge bases
-- Config:
+**B1 — API Key Authentication with Capability and Index Scoping** 🔴 CRITICAL
+
+Design agreed 2026-08-08. This replaces an earlier sketch whose route matrix did not match
+the router that exists — it named `POST /api/{index}/write`, `POST /api/{index}/bulk`, and
+`GET /api/{index}/search`, none of which are real paths, and omitted four routes entirely
+including the streaming ingest path that Stage A4 had already had to fix once. The table
+below is transcribed from `create_router` and is guarded by a test rather than by review.
+
+*Capabilities, not roles, are what routes require.* Roles are bundles of capabilities, so
+the route table stays role-agnostic and C3 can add per-index overrides without touching it.
+
+| Capability | Covers |
+|------------|--------|
+| `Read` | search, streaming search, read config, list indexes |
+| `Write` | document write, streaming ingest, bulk |
+| `IndexAdmin` | create index, schema evolution, delete index |
+| `NodeAdmin` | `/_admin/*` — memory, purge, workers, commit, evict-writer |
+
+`admin` = all four · `writer` = Read + Write · `reader` = Read.
+
+Renamed from the earlier `user` / `restricted`: those two were not on the same axis, and
+"restricted" was described as read-only *MCP* access while the same sketch also granted it
+HTTP search. Nothing has shipped with the old names.
+
+- **Transport**: `Authorization: Bearer <key>`, header-only. A key in a query parameter is a
+  non-goal — it lands in access logs and `Referer` headers.
+- **Config** — entry-level `key_hash` or `key_hash_file`, the exact `psk` / `psk_file`
+  analogue from B3: inline wins, the file is permission-checked, world-readable warns.
   ```toml
   [security]
-  # Auth disabled by default (trusted-LAN mode)
-  enabled = false
+  enabled = false                        # off by default; the posture rules decide if that is allowed
 
   [[security.api_keys]]
-  key = "cameo-admin-xxx"        # SHA-256 hashed, constant-time compare
-  role = "admin"
-  label = "ops-team"             # optional human-readable label for audit log
+  key_hash = "sha256:3f9a…"              # or: key_hash_file = "/etc/cameodb/keys/ops"
+  role  = "admin"
+  label = "ops-team"                     # audit identity, not a secret
 
   [[security.api_keys]]
-  key = "cameo-user-xxx"
-  role = "user"
-  label = "data-engineering"
-
-  [[security.api_keys]]
-  key = "cameo-agent-xxx"
-  role = "restricted"
-  label = "claude-desktop"
-  allowed_indexes = ["docs", "wiki"]  # optional index allow-list for restricted keys
+  key_hash_file = "/etc/cameodb/keys/team-a"
+  role  = "writer"
+  label = "team-a"
+  allowed_indexes = ["docs", "wiki"]     # honored for every role; omitted = all indexes
   ```
-- Env override: `CAMEODB_API_KEY` for single-key deployments (role is always resolved server-side from the key's config entry)
-- Backward compat: auth disabled by default; when enabled, fail-fast at startup if `bind = 0.0.0.0` without auth configured
-- Client SDK + CLI: `--api-key` flag, `CAMEODB_API_KEY` env, persisted per-connection in REPL
-- Route-level enforcement matrix:
+- **The config never holds a usable credential.** `cameodb keygen --role <r> [--label <l>]
+  [--allowed-indexes a,b]` mints a key, prints it once, and prints the stanza to paste.
+- **Key format is enforced at authentication time**: a presented token must match
+  `cameo_v1_<43 base64url chars>` before it is hashed. This is what makes an unsalted
+  SHA-256 defensible — a hand-chosen passphrase can never authenticate even if someone
+  pastes its digest into the config. Verification hashes the token and compares digests with
+  `subtle::ConstantTimeEq` across all entries; `sha2`, `subtle`, `zeroize`, `hex`, and `rand`
+  are already in `Cargo.lock` transitively, so `cargo deny` and `cargo audit` see nothing new.
+- **Secrets follow the `ClusterPsk` precedent**: redacted `Debug`, never serialized, scrubbed
+  on drop. `key_id` (first 8 hex of the digest) plus `label` are the log identity; the key
+  itself never reaches a log line.
+- **Env overrides**: `CAMEODB_SECURITY_ENABLED`, `CAMEODB_API_KEY_HASH`, `CAMEODB_API_KEY_ROLE`
+  for the single-key case. Note the earlier sketch gave the *server* `CAMEODB_API_KEY` — that
+  is a plaintext key, which contradicts hash-only storage, and it collides with the name the
+  *client* needs the moment both run in one compose file. `CAMEODB_API_KEY` is client-only.
+- **Backward compatibility**: auth off by default. The earlier sketch also wanted a fail-fast
+  when `bind = 0.0.0.0` without auth; dropped, because the posture rules already answer that
+  question per profile (Warn under `internal`, Fail under `external`). Two mechanisms
+  disagreeing about one condition is how this rots.
 
-  | Route group | Admin | User | Restricted |
-  |-------------|-------|------|------------|
-  | `/_admin/*` (memory, workers, purge, commit, evict) | ✅ | ❌ | ❌ |
-  | `PUT /api/{index}/_config` (create index) | ✅ | ❌ | ❌ |
-  | `DELETE /api/{index}` (delete index) | ✅ | ❌ | ❌ |
-  | `PATCH /api/{index}/_schema` (schema evolution) | ✅ | ❌ | ❌ |
-  | `POST /api/{index}/write` (write) | ✅ | ✅ | ❌ |
-  | `POST /api/{index}/bulk` (bulk ingest) | ✅ | ✅ | ❌ |
-  | `GET /api/{index}/search` (search) | ✅ | ✅ | ✅ |
-  | `GET /_indexes` (list indexes) | ✅ | ✅ | ✅ |
-  | `/mcp/*` (MCP tools) | ✅ | ✅ | ✅ (respects `allowed_indexes`)
+- **Route table — deny by default.** Classification lives in one table keyed by (method, path
+  pattern). The middleware runs *before* routing, extracts the index segment lexically, and
+  enforces capability and scope centrally, so no handler can forget to check.
 
-**B2 — HTTPS/TLS via rustls** ✅ COMPLETED
+  | Route | Requires | Index-scoped |
+  |-------|----------|--------------|
+  | `GET /_cluster/health` | public (minimal body) / `Read` (full body) | — |
+  | `POST /api/{index}/search` | `Read` | yes |
+  | `POST /api/{index}/search/stream` | `Read` | yes |
+  | `GET /api/{index}/_config` | `Read` | yes |
+  | `GET /_indexes` | `Read` | **filtered** |
+  | `GET /_cluster/_indexes` | `Read` | **filtered** |
+  | `PUT /api/{index}/document` | `Write` | yes |
+  | `POST /api/{index}/document/stream` | `Write` | yes |
+  | `POST /api/{index}/_bulk` | `Write` | yes |
+  | `PUT /api/{index}/_config` | `IndexAdmin` | yes |
+  | `PATCH /api/{index}/_schema` | `IndexAdmin` | yes |
+  | `DELETE /api/{index}` | `IndexAdmin` | yes |
+  | `GET /_admin/memory`, `POST /_admin/memory/purge`, `GET /_admin/workers` | `NodeAdmin` | — |
+  | `POST /_admin/index/{index}/commit`, `POST …/evict-writer` | `NodeAdmin` | yes |
+  | `POST\|GET\|DELETE /mcp/*` | `Read` + per-tool check inside | inside |
+  | anything else (fallback) | **deny** | — |
+
+  Consequences accepted deliberately: an unknown path answers **401 without a key and 404
+  with one**, since auth precedes routing — which also stops path-existence probing. Named
+  access to a disallowed index is **403**, while *listing* filters silently: asking by name
+  deserves an honest answer, enumeration does not.
+
+  Completeness is guarded by a test that `include_str!`s `http_server.rs`, extracts every
+  `.route("…")` literal, and fails if any lacks a classification. A new route cannot ship
+  unclassified, which a hand-maintained matrix could not promise.
+
+- **Layer placement** in the existing stack:
+  ```
+  TraceLayer → CORS → AUTH → Timeout → ConcurrencyGuard → wire body limit
+    → Decompression → extractor limit → Compression → routes
+  ```
+  Inside CORS, so browser preflight `OPTIONS` — which never carries `Authorization` — still
+  gets its headers. Outside the concurrency guard and the body limits, so a 401 flood neither
+  takes a semaphore permit nor gets its body buffered; `/_cluster/health` is exempted the way
+  the guard already exempts it. Accepted cost: rejecting before the body is read means hyper
+  drops the connection instead of reusing it.
+
+- **MCP enforcement reaches the tool, not just the path.** `/mcp` is a single JSON-RPC
+  endpoint, so path-level middleware cannot see which tool or index is in play.
+  - New `McpAuthz` trait **in the mcp crate** (`allows_index`, `has(Capability)`, `key_id`),
+    implemented by the server's auth context, so identity threads router → dispatch →
+    `McpBackend` without the mcp crate learning any server types.
+  - `tool_capability(name) -> Option<Capability>` with a deny default, so the day a write
+    tool is added it fails closed instead of inheriting `Read`.
+  - `list_indexes` filters to the caller's scope; `search_index` 403s a named disallowed
+    index; `search_indexes` 403s rather than silently returning partial results.
+  - Auth enforced on the GET (SSE) and DELETE session routes too, not only the POST. Sessions
+    record the creating `key_id` and reject a request presenting a different key.
+
+- **Client SDK + CLI**: `--api-key`, `--api-key-file`, `CAMEODB_API_KEY`; precedence inline >
+  file > env, matching the server's PSK convention. `--api-key` is documented as `ps`-visible.
+  The client **refuses to send a key to a plaintext non-loopback URL** unless `--insecure`,
+  and in the REPL `connect <different-origin>` **drops** the key rather than forwarding it —
+  the same failure the `TlsTrust` split already had to fix once.
+
+- **Posture rules** — the stubbed `auth` check becomes evaluated:
+
+  | Condition | Outcome |
+  |-----------|---------|
+  | enabled + ≥1 key | Pass — *N keys: 1 admin, 2 writer, …* |
+  | `external` + disabled | **Fail** (unchanged) |
+  | `internal` + disabled | Warn (unchanged wording) |
+  | `local` + disabled | Pass — "unauthenticated (loopback only)", mirroring how `tls` passes plaintext for `local`. A profile that warns on every boot teaches operators to ignore warnings |
+  | enabled + **0 keys** | **Fail** — every request would 401; fail loudly, not silently |
+  | enabled + no key holding `Write`/`IndexAdmin` | Warn — read-only node |
+  | enabled + TLS off + non-loopback bind | Warn under `internal` (tokens in the clear); `external` already fails on `tls` |
+  | `admin_api` rule | "reachable off-box and unauthenticated" becomes Pass once auth and an admin key exist |
+
+- **Trust boundary, stated so it is not assumed away**: enforcement is at the HTTP/MCP
+  ingress, where identity exists. Peer-to-peer traffic is kameo-over-libp2p and is trusted by
+  the B3 PSK, so **index scoping is not a defense against a rogue cluster member**. This also
+  corrects the earlier C3 sketch, which proposed enforcing at the `RouterActor` boundary —
+  that boundary is driven by peers as well as by HTTP, where no API key exists.
+
+- **Non-goals, recorded so they are not re-litigated**: no lockout or throttle on failed auth
+  (against a 256-bit key it buys nothing and is itself a DoS lever — count and log for C2);
+  no hot config reload (rotation is add-key → migrate → remove-key → restart, already better
+  than the PSK's "stop every node" gap).
+
+- **Order of work**:
+  1. `[security]` config + key types + `keygen` + posture rules + `check-config` (no enforcement yet)
+  2. Classification table + middleware + completeness test + health-response shrink
+  3. Index scoping enforcement + list filtering
+  4. MCP threading + session binding + tool capability table
+  5. Client/SDK/CLI/REPL plumbing
+  6. `scripts/validate/auth.sh` into `all.sh`; docs, example config, CHANGELOG, and the
+     RELEASE-CHECKLIST known-gap removal
+
+- **`scripts/validate/auth.sh` proves**: 401 on every classified route bare · 403 per wrong
+  role per capability class · preflight passes without a key · unknown path 401 → 404 ·
+  health minimal vs full · scoped key allowed / denied / filtered · MCP per-tool and
+  per-index, plus session binding · an unauthenticated flood does not starve authenticated
+  requests (which is what proves the layer order) · no key in any log line · `check-config`
+  fails `external` + auth-off and passes `external` + auth-on + TLS.
+
+**B2 — HTTPS/TLS via rustls** ✅ COMPLETED (the first implementation never ran)
+- **The original implementation panicked on every TLS startup** and was marked complete without a single HTTPS request being served. `axum-server/tls-rustls` force-enables `rustls/aws-lc-rs` while libp2p-quic enables `rustls/ring`; rustls 0.23 refuses to pick between two providers, and the panic landed *after* the startup banner, so it read as a healthy boot
+- Fixed by using `axum-server/tls-rustls-no-provider` and installing `ring` explicitly at the top of `main`, on both the server and client paths
+- TLS material is now loaded before storage init and before the banner, so bad certificates fail early and legibly
+- Graceful shutdown under TLS via `axum_server::Handle`; previously the drain signal only reached the plaintext listener and every TLS shutdown burned the full 10 s timeout before cutting in-flight requests
 - Implemented axum-server with rustls for HTTPS support; config `[network.http.tls] enabled, cert_file, key_file`
 - Added TLS validation to config (cert/key file existence, required fields when enabled)
 - Client-side: added `--insecure` flag for accepting invalid TLS certificates (self-signed certs in development)
 - Per-command `--insecure` for remote schema/data loading operations (fine-grained control)
 - Removed `CAMEODB_ACCEPT_INVALID_CERTS` environment variable (simplified to flag-only interface)
 - Documentation updated with TLS configuration, Linux system certificate paths, and security best practices
-- Keep `native-tls-vendored` for musl static builds regardless (OpenSSL vendored works fine there)
+- Single TLS stack across the workspace: `reqwest/rustls-no-provider` replaced native-tls, verified against `dl.cameodb.com` and other real sources. `rustls-platform-verifier` uses the OS trust store, which is what native-tls provided and what a corporate CA needs. Vendored OpenSSL is gone from every build path
 - Optional mTLS for client verification later
 
 **B3 — Cluster Join Authentication** ✅ COMPLETED
@@ -565,40 +703,51 @@ HTTP req on axum tokio worker (any core)
 - Config validation: warns if cluster enabled without PSK; validates hex format (64 chars = 32 bytes)
 - Covers kameo remote messaging (all libp2p protocols are gated by the pnet handshake)
 - Disabled by default (backward compatible); opt-in for production clusters
+- ✅ Format validation lives in `load_psk()` alone; `validate()` calls the same path, so a config that validates is one the swarm can start with
+- ✅ The key is held in a `ClusterPsk` newtype that redacts its `Debug`, is never serialized, and zeroizes on drop; `psk_file` permissions are checked and a world-readable file warns
+- ✅ A PSK combined with a `/quic-v1` address is rejected at config time rather than failing as a dial error, since `pnet` wraps TCP only
+- Wording corrected: PSK is a **membership gate**, not a confidentiality upgrade — the transport is already encrypted by Noise
 - Future: PSK rotation with primary + secondary for zero-downtime rolling upgrades
 
 ### Stage C: Defense in Depth (post-auth)
 
 **C1 — MCP-Specific Limits** 🟡 MEDIUM
-- Rate limiting per session/key on MCP tool invocations (especially important for restricted keys used by AI agents)
+- Rate limiting per session/key on MCP tool invocations (especially for `reader` keys held by AI agents)
 - Query complexity caps: max boolean clauses, max prefix-expansion terms, per-request timeout already exists — wire it into MCP path
-- Index allow-list for restricted keys already covered in B1 (`allowed_indexes` per key)
+- Per-key index scoping is covered in B1 (`allowed_indexes`, all roles), as is the failure counting this stage would rate-limit on
 
 **C2 — Audit Logging** 🟡 MEDIUM
-- Structured `tracing` events: who (key id / peer), what (op, index), when, result
+- Structured `tracing` events: who (`key_id` / `label` / peer), what (op, index), when, result
+- B1 already emits `key_id`, `role`, and `label` into the request span, so this stage is a sink rather than a re-plumbing
 - Append-only audit ring buffer + optional file sink; admin endpoint to query recent events
 
-**C3 — Per-Index Role Refinement (RBAC)** 🟢 LOWER (needed for multi-tenant)
-- Extend B1's three-role model with per-index role overrides: a key with `role = "user"` could be granted `"restricted"` (read-only) on sensitive indexes
-- Enforced at `RouterActor` boundary so local + remote paths are both covered
-- Depends on B1 identity model and route-level enforcement
+**C3 — Per-Index Role Overrides** 🟢 LOWER (needed for multi-tenant)
+- Most of what this stage originally described is B1's scoping mechanism, which now applies to every role. What remains is *overrides*: a key with `role = "writer"` granted read-only on a named sensitive index, i.e. per-index capability subtraction rather than a second allow-list
+- Enforced at B1's ingress chokepoint, **not** at the `RouterActor` boundary as first sketched — that boundary is also driven by cluster peers over kameo, where no API key exists (see the trust boundary note in B1)
+- Depends on B1's capability model and route classification table
 
-### TLS Inventory (verified 2026-08-03)
+### TLS Inventory (verified 2026-08-07)
 
 | Component | Current TLS | Notes |
 |-----------|-------------|-------|
 | HTTP server | ✅ rustls via axum-server | Implemented with `[network.http.tls]` config (enabled, cert_file, key_file) |
-| Client SDK (`reqwest 0.13`) | ✅ default `native-tls`; features: `native-tls`, `native-tls-vendored`, `rustls-tls` | Added `--insecure` flag for accepting invalid TLS certificates (self-signed certs) |
-| musl static builds | ✅ `native-tls-vendored` via `scripts/build/build-musl.sh` + `build-dist.sh` | keep as-is |
-| libp2p cluster transport | ✅ Noise (`noise::Config`) + yamux mux | encrypted but unauthenticated membership; Stage B3 adds PSK |
-| kameo remote messaging | ⚠️ rides libp2p swarm | inherits B3 protection |
-| Client TLS bypass | ✅ `--insecure` flag only | Removed `CAMEODB_ACCEPT_INVALID_CERTS` env var; per-command or per-session (interactive REPL) via CLI flag |
+| Client SDK (`reqwest 0.13`) | ✅ rustls + `ring`, OS trust store via `rustls-platform-verifier` | No TLS feature flags; `--insecure` (server) and `--insecure-source` (data sources) are separate |
+| musl static builds | ✅ rustls + `ring`; no vendored OpenSSL, no C toolchain | Image needs `ca-certificates`; verify per target with `scripts/validate/remote-sources.sh` |
+| libp2p cluster transport | ✅ Noise (`noise::Config`) + yamux mux, optional `pnet` PSK | Noise provides confidentiality; the PSK gates membership (B3). QUIC is disabled when a PSK is set |
+| kameo remote messaging | ✅ rides libp2p swarm | inherits Noise encryption and the B3 membership gate |
+| Client TLS bypass | ✅ explicit flags only | `--insecure` (server connection) and `--insecure-source` (remote sources) are independent; no env-var bypass |
 
 **Success Metrics:**
-- No unauthenticated write/delete path reachable in default config
-- Path-traversal regression tests in CI
-- `cargo audit` green in CI
-- TLS + auth enabled = zero plaintext credentials on the wire
-- Cluster rejects unknown peers without valid PSK
+- No unauthenticated write/delete path reachable once `[security] enabled = true`
+- Every route in `create_router` carries a capability classification, enforced by a test that
+  reads the router's own source — an unclassified route is denied, not allowed
+- The `external` profile starts: TLS on, auth on, `/_admin/*` off, verified by `check-config`
+- Path-traversal regression tests pass in `scripts/validate/unit.sh`
+- `cargo audit` and `cargo deny` green via `scripts/validate/deps.sh`
+- TLS + auth enabled = zero plaintext credentials on the wire; no key in any log line
+- Cluster rejects unknown peers without a valid PSK
+
+(Metrics say `scripts/validate/`, not CI: there is no CI by decision — see Stage A5 and
+[RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md).)
 
 ---

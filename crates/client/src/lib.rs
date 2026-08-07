@@ -2,4 +2,4 @@ pub mod cli;
 pub mod sdk;
 
 pub use cli::run_cli;
-pub use sdk::CameoClient;
+pub use sdk::{CameoClient, TlsTrust};

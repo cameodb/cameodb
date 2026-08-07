@@ -36,7 +36,10 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024
 const LATEST_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
 
 /// HTTP header carrying the session identifier on the Streamable HTTP transport.
-const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+///
+/// Public because the host application's CORS policy has to both allow and expose it —
+/// a browser client cannot use the transport otherwise.
+pub const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
 /// HTTP header carrying the negotiated protocol version on subsequent requests.
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
