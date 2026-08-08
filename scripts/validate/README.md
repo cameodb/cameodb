@@ -17,7 +17,8 @@ output of a run is the evidence. Paste the summary into `RELEASE-CHECKLIST.md`.
 |-------|----------------|------------------------------|
 | `deps` | fmt, clippy (`-D warnings`), `cargo audit`, `cargo deny`, advisory exceptions still in date | Needs the real dependency graph and the current advisory database |
 | `unit` | `cargo test --workspace` | — |
-| `posture` | Body limits, request timeout, concurrency shedding, health exemption, CORS headers, admin gating, preset rejections | Only fails in a real HTTP stack: a limit that covers some handlers, a guard that starves liveness, a timeout never wired into the router |
+| `posture` | Body limits, request timeout, concurrency shedding, health exemption, CORS headers, admin gating, preset rejections, `keygen` and the `[security]` section it prints | Only fails in a real HTTP stack: a limit that covers some handlers, a guard that starves liveness, a timeout never wired into the router |
+| `auth` | Every route refuses an anonymous caller; each role reaches exactly its capabilities; index scopes hold; health tells an anonymous caller less; an unauthenticated flood does not shed authenticated requests; no key reaches a log line; the bundled client authenticates from a flag, a file or the environment and refuses to carry a key over plaintext to another host | The route table is decided in unit tests. This proves the decision is *in the request path*, in the right place in the layer stack — a middleware that is correct but mounted in the wrong order passes every unit test there is |
 | `tls` | HTTPS actually serves; bad certificates fail before the banner; the TLS listener drains on shutdown | TLS shipped broken because nothing ever bound a socket — rustls panicked at first use |
 | `remote-sources` | The client's outbound HTTPS works against real hosts and still verifies certificates | Trust stores differ per target: macOS Keychain, Linux `/etc/ssl/certs`, musl containers need `ca-certificates` |
 
@@ -42,6 +43,6 @@ client moved to rustls.
 | Variable | Effect |
 |----------|--------|
 | `CAMEODB_BIN` | Binary under test (default: `target/release/cameodb`, then `target/debug/cameodb`) |
-| `POSTURE_PORT` / `TLS_PORT` | Ports for the probe servers (default 19490 / 19491) |
+| `POSTURE_PORT` / `TLS_PORT` / `AUTH_PORT` | Ports for the probe servers (default 19490 / 19491 / 19492) |
 | `REMOTE_SOURCE_1`, `REMOTE_SOURCE_2` | Override the fetched URLs for an offline network |
 | `BADSSL_URL` | Host used for the certificate-rejection check |

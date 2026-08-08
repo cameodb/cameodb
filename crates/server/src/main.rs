@@ -10,6 +10,8 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 mod admin;
+mod auth;
+mod authz;
 mod cluster_coordinator;
 mod cluster_state;
 mod cluster_state_machine;
@@ -108,9 +110,22 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Mints a key and prints the configuration that accepts it. Needs no config file and no
+    // running node — it is a hashing utility, not a server operation.
+    if subcommand == "keygen" {
+        return auth::run_keygen(args.into_iter().skip(2));
+    }
+
     // Posture check without starting the node: the manual equivalent of a CI gate, so a
     // config can be verified before it is deployed rather than by watching a server boot.
     if subcommand == "check-config" {
+        // Logs to stderr, so the matrix on stdout stays parseable. Without a subscriber the
+        // things this command exists to surface — which file was loaded, unknown settings,
+        // a world-writable key file — were being discarded.
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .init();
+
         let cli_overrides = config::CliOverrides::parse(args.into_iter().skip(2))?;
         let cameodb_config = CameoDbConfig::load_unvalidated(&cli_overrides)?;
 
@@ -156,6 +171,7 @@ async fn main() -> Result<()> {
              cameodb [OPTIONS]\n  \
              cameodb generate-config\n  \
              cameodb check-config [-c <PATH>]\n  \
+             cameodb keygen --role <admin|writer|reader>\n  \
              cameodb client <subcommand>\n\n\
              Options:\n\
              {}\n  \
@@ -164,6 +180,7 @@ async fn main() -> Result<()> {
              Commands:\n  \
              generate-config  Print a sample configuration file\n  \
              check-config     Report the security posture of a config and exit non-zero if it fails\n  \
+             keygen           Mint an API key and print the [[security.api_keys]] stanza for it\n  \
              client           Run the bundled client CLI (health, index, search)\n\n\
              Client examples:\n  \
              cameodb client health\n  \
@@ -184,6 +201,21 @@ async fn main() -> Result<()> {
     // Load configuration: command line over environment over file over defaults.
     let cli_overrides = config::CliOverrides::parse(args.into_iter().skip(1))?;
     let cameodb_config = CameoDbConfig::load_with_cli(&cli_overrides)?;
+
+    // Name every configured key once at startup. The point is the `key_id`: an audit line or
+    // a rejection carrying one has to be traceable back to a team without the key itself ever
+    // appearing in a log. `validate()` already resolved these, so this cannot fail.
+    let keyring = Arc::new(cameodb_config.security.load_keyring()?);
+    for entry in keyring.entries() {
+        tracing::info!(
+            key_id = %entry.key_id(),
+            label = %entry.label(),
+            role = %entry.role(),
+            indexes = %entry.scope_summary(),
+            auth_enabled = keyring.enabled(),
+            "🔑 API key loaded"
+        );
+    }
 
     // Load the TLS material here, before storage is opened and before the startup banner
     // is printed. Loading it at bind time meant a bad certificate — or a missing crypto
@@ -481,6 +513,7 @@ async fn main() -> Result<()> {
         cameodb_config.network.http.max_concurrent_requests,
         cameodb_config.effective_request_timeout_secs(),
         cameodb_config.network.http.admin_enabled,
+        keyring.clone(),
     );
 
     // Extract HTTP configuration

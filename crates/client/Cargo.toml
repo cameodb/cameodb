@@ -20,3 +20,13 @@ colored_json = "5.0.0"
 colored = "3.1.1"
 flate2 = "1.1.9"
 zip = "8.6"
+# Both already in the tree via the server's auth module and its transitive deps, so the
+# audit and licence surface is unchanged. sha2 computes the key_id the server logs; zeroize
+# scrubs a key from memory on drop.
+sha2 = "0.10"
+zeroize = "1.9"
+
+[dev-dependencies]
+# The binary installs the ring provider in `main.rs`; a unit test that builds a reqwest
+# Client has to do the same or reqwest panics on construction.
+rustls = { workspace = true }

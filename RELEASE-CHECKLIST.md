@@ -33,12 +33,14 @@ box is a question that has not been answered, not a formality.
 
 These are accepted, not fixed. They belong in release notes as much as here.
 
-- **No authentication anywhere.** Every HTTP and MCP endpoint is open to whoever can reach
-  the port. The `external` profile refuses to start for this reason; `internal` deployments
-  must sit behind a network boundary or an authenticating proxy. Tracked as ROADMAP
-  Phase 14 Stage B1.
-- **`/_admin/*` is unauthenticated** when enabled — memory purge, forced commit, writer
-  eviction. Set `admin_enabled = false` where the node is reachable off-box.
+- **Authentication is off by default.** A node with `[security] enabled = false` serves every
+  HTTP and MCP endpoint to whoever can reach the port, `/_admin/*` included. That is a
+  supported configuration for `local` and a warning for `internal`; `external` refuses to
+  start without keys. Enabling it is one `cameodb keygen` and one stanza.
+- **MCP is gated at the endpoint, not per tool**, and index-scoped keys are refused there
+  outright rather than filtered. An MCP client also has no way to present a key of its own.
+  `/_indexes` lists every index regardless of a key's scope — named access is refused,
+  enumeration is not yet filtered. ROADMAP Phase 14 Stage B1 steps 3–4.
 - **Cluster PSK has no rotation path.** Changing it requires stopping every node.
 - **Three transitive advisories are ignored** (`deny.toml`), all via libp2p 0.56.0.
 
@@ -57,6 +59,7 @@ Built targets: <list>
 | deps           |  |  |  |  |
 | unit           |  |  |  |  |
 | posture        |  |  |  |  |
+| auth           |  |  |  |  |
 | tls            |  |  |  |  |
 | remote-sources |  |  |  |  |
 

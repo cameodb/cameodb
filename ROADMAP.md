@@ -128,10 +128,10 @@ This document outlines the current development priorities and optimization roadm
 - ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed
 - ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, resources, and query syntax docs completed; security moved to Phase 14, streaming/docs/testing planned
 - 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f partially done (merge thread count control implemented via `IndexWriterOptions`; core pinning and per-arena stats planned)
-- 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) remains the open critical gap, design agreed 2026-08-08 and ready to implement; C1–C3 planned, C3 shrunk because B1 absorbs index scoping
+- 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) in progress — steps 1, 2 and 5 landed 2026-08-08: credential model, `keygen`, `[security]` config, enforcement at the HTTP/MCP ingress with capability and index scoping (so `external` can now start), and `--api-key` / `--api-key-file` / `CAMEODB_API_KEY` on the bundled client. Steps 3–4 remain: index list filtering and MCP per-tool authorization; C1–C3 planned, C3 shrunk because B1 absorbs index scoping
 
 ### **Recommended Next Steps**
-1. **Phase 14 Stage B1**: API key authentication + index scoping — the last critical gap, and what the `external` profile is waiting on
+1. **Phase 14 Stage B1 steps 3–4**: index list filtering, then MCP per-tool authorization and session binding — until step 4 an index-scoped key is refused at `/mcp` outright, and MCP clients have no way to present a key at all
 2. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats
 3. **Phase 12 remaining**: MCP streaming, documentation, integration tests
 4. **Phase 14 Stage C1–C3**: MCP rate limiting, audit logging, per-index role overrides (all depend on B1)
@@ -455,7 +455,7 @@ HTTP req on axum tokio worker (any core)
 | **3** | A3: `ACCEPT_INVALID_CERTS` removal | ✅ Done | Medium | Accidental TLS bypass |
 | **4** | A4: Body limits + concurrency caps | ✅ Done | High | Memory DoS / decompression bomb |
 | **5** | A5: Security tooling (`cargo audit`, `cargo deny`) | ✅ Done (manual) | Medium | Silent vulnerable deps |
-| **6** | B1: API key authentication + index scoping | ~1–2 weeks | Critical | Full unauthenticated R/W/D access |
+| **6** | B1: API key authentication + index scoping | steps 1–2 done; ~2–4 days left | Critical | Was full unauthenticated R/W/D access; now the client cannot send a key |
 | **7** | B2: HTTPS/TLS via rustls | ✅ Done | High | Traffic interception |
 | **8** | B3: Cluster join secret (PSK) | ✅ Done | High | Rogue node data access |
 | **9** | C1: MCP rate limiting + query complexity | ~2 days | Medium | Agent-driven resource exhaustion |
@@ -665,20 +665,76 @@ HTTP search. Nothing has shipped with the old names.
   than the PSK's "stop every node" gap).
 
 - **Order of work**:
-  1. `[security]` config + key types + `keygen` + posture rules + `check-config` (no enforcement yet)
-  2. Classification table + middleware + completeness test + health-response shrink
-  3. Index scoping enforcement + list filtering
-  4. MCP threading + session binding + tool capability table
-  5. Client/SDK/CLI/REPL plumbing
-  6. `scripts/validate/auth.sh` into `all.sh`; docs, example config, CHANGELOG, and the
-     RELEASE-CHECKLIST known-gap removal
+  1. ✅ **Landed 2026-08-08.** `[security]` config + key types + `keygen` + posture rules +
+     `check-config`, with no enforcement. `crates/server/src/auth.rs` holds the whole
+     credential model: `Capability` / `Role` bundles, `ApiKey` (redacted `Debug`, zeroized on
+     drop, minted from `getrandom`), `KeyDigest` (constant-time `PartialEq`), and `KeyRing`
+     with the shape gate in front of the hash. Two deviations from the sketch above, both
+     deliberate:
+     - The `auth` posture rule reports the configured keys but **still fails `external`**,
+       because the middleware does not exist yet. A posture that claimed a guarantee the
+       router does not make is the one failure mode this module exists to prevent, so the
+       `external` Fail and the `admin_api` wording flip in step 2, not here.
+     - `key_hash_file` warns when it is **writable** by group or others, not when it is
+       readable. A digest is not a secret, so a readable hash file is not a leak — but a
+       writable one lets anyone mint themselves a role, which is worse than the case
+       `psk_file` warns about.
+  2. ✅ **Landed 2026-08-08.** `crates/server/src/authz.rs`: the route table, the
+     `classify` matcher, and the `authorize` middleware, mounted inside CORS and outside the
+     timeout, the concurrency guard and both body limits. Deny by default — an unclassified
+     path needs a key like any other. Health now answers an anonymous caller with liveness
+     alone. Both posture outcomes step 1 left pending are flipped, so `external` starts for
+     the first time. Beyond the sketch:
+     - **Index scoping for named routes landed here too**, not in step 3. The middleware
+       already had the `{index}` segment in hand, and shipping a `allowed_indexes` setting
+       that parsed but did nothing would have told operators their key was scoped when it
+       was not. What remains for step 3 is *list filtering*, which is a handler change.
+     - **An index-scoped key is refused at `/mcp`.** MCP is one JSON-RPC path, so the scope
+       cannot be enforced from outside it until step 4. Refusing beats letting a scoped key
+       read every index through the side door.
+     - `scripts/validate/auth.sh` (56 checks) landed with it rather than waiting for step 6:
+       a middleware in the wrong place in the layer stack passes every unit test there is.
+  3. Index list filtering: `/_indexes` and `/_cluster/_indexes` return only the indexes a
+     key may see. Named access is already refused; enumeration is what is left.
+  4. MCP threading + session binding + tool capability table; lifts the `/mcp` refusal for
+     index-scoped keys
+  5. ✅ **Landed 2026-08-08**, taken before steps 3–4: with authentication enforced but no
+     way for `cameodb client` to present a key, enabling `[security]` locked an operator out
+     of their own tooling, which is the gap most likely to be hit first. `Credential` in
+     `crates/client/src/sdk.rs` mirrors the server's `ApiKey` (redacted `Debug`, zeroized on
+     drop, `key_id` fingerprint), and the key rides in the `http` client's default headers —
+     so every existing call site carries it and none can be forgotten — while `source_http`
+     is built without it, keeping the database key off requests to third-party data sources.
+     Four deviations from the sketch above:
+     - **Precedence is file > inline, not inline > file.** clap resolves each flag against
+       its own environment variable first, so the remaining question was only which of the
+       two wins. Preferring the file means a stale `CAMEODB_API_KEY` left exported in a shell
+       cannot silently override the key a command names explicitly.
+     - **The plaintext gate is its own flag, `--allow-plaintext-key`, not `--insecure`.**
+       `--insecure` accepts a bad certificate on a connection that is still encrypted; this
+       puts a bearer token on the wire in the clear. Folding them together would repeat the
+       exact mistake the `TlsTrust` split was made to fix. Loopback is exempt, which is what
+       keeps the single-node default usable without any flag.
+     - **`HealthResponse` had to be made partial.** Step 2 shrank the anonymous health body
+       to `status` alone, but the client's struct still required `node_id` and
+       `active_shards` — so an anonymous 200 would have failed to *parse*. A shrunk response
+       is only safe once every reader of it tolerates the shrink.
+     - **A latent bug surfaced**: the SDK asked for `/_admin/index/{index}/evict_writer`
+       while the route has always been `evict-writer`, so that command had never worked. With
+       authentication in front of the router its 404 would have become a 401 — an unrelated
+       bug wearing an auth costume. Fixed, and `auth.sh` now drives the command end to end.
+  6. Docs, CHANGELOG, and the remaining RELEASE-CHECKLIST gaps
 
-- **`scripts/validate/auth.sh` proves**: 401 on every classified route bare · 403 per wrong
-  role per capability class · preflight passes without a key · unknown path 401 → 404 ·
-  health minimal vs full · scoped key allowed / denied / filtered · MCP per-tool and
-  per-index, plus session binding · an unauthenticated flood does not starve authenticated
-  requests (which is what proves the layer order) · no key in any log line · `check-config`
-  fails `external` + auth-off and passes `external` + auth-on + TLS.
+- **`scripts/validate/auth.sh` proves** (75 checks, in `all.sh`): 401 on every classified
+  route bare · 403 per wrong role per capability class · preflight passes without a key ·
+  unknown path 401 → 404 · health minimal vs full · scoped key allowed / denied, including
+  against a percent-encoded index name · an unauthenticated flood does not shed
+  authenticated requests (which is what proves the layer order) · no key in any log line,
+  and `key_id` in place of one · `check-config` fails `external` + auth-off and passes
+  `external` + auth-on + TLS · the bundled client authenticating from a flag, a file and the
+  environment, refusing a malformed key before sending it, refusing to carry one to a
+  non-loopback plaintext host, and explaining a 401 and a 403 differently. Still to add with
+  steps 3–4: list filtering, MCP per-tool and per-index, and session binding.
 
 **B2 — HTTPS/TLS via rustls** ✅ COMPLETED (the first implementation never ran)
 - **The original implementation panicked on every TLS startup** and was marked complete without a single HTTPS request being served. `axum-server/tls-rustls` force-enables `rustls/aws-lc-rs` while libp2p-quic enables `rustls/ring`; rustls 0.23 refuses to pick between two providers, and the panic landed *after* the startup banner, so it read as a healthy boot

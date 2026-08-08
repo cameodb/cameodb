@@ -1,7 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::{Client, Url, header};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
+use std::fmt;
+use std::path::Path;
+use zeroize::Zeroize;
 
 /// Which TLS verification to relax, and for which connection.
 ///
@@ -16,6 +20,177 @@ pub struct TlsTrust {
     pub insecure_source: bool,
 }
 
+/// Key shape, duplicated from the server's `auth.rs`.
+///
+/// The client cannot depend on the server crate, so these three constants are copied. They
+/// are checked here so that a typo'd key fails on this side with a message that says what a
+/// key looks like, instead of arriving as an indistinguishable 401. `auth.rs` remains the
+/// authority: this side only ever *narrows* what gets sent, never widens what is accepted.
+const KEY_PREFIX: &str = "cameo_v1_";
+const KEY_BODY_LEN: usize = 43;
+
+/// An API key held in the clear, on its way into an `Authorization` header.
+///
+/// Mirrors the server's `ApiKey`: redacted `Debug`, never serialized, scrubbed on drop.
+pub struct Credential(String);
+
+impl Credential {
+    /// Accept a key typed on a command line, read from a file, or exported in the
+    /// environment.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let token = raw.trim();
+        if token.is_empty() {
+            bail!("API key is empty");
+        }
+        let shaped = token
+            .strip_prefix(KEY_PREFIX)
+            .is_some_and(|body| body.len() == KEY_BODY_LEN && body.chars().all(is_base64url));
+        if !shaped {
+            bail!(
+                "that does not look like a CameoDB API key. Keys are '{KEY_PREFIX}' followed by \
+                 {KEY_BODY_LEN} characters — `cameodb keygen --role reader` mints one"
+            );
+        }
+        Ok(Self(token.to_string()))
+    }
+
+    /// Read a key from a file holding it and nothing else.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            bail!("API key file not found: {}", path.display());
+        }
+        warn_if_key_file_is_readable_by_others(path);
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read API key file: {}", path.display()))?;
+        if contents.trim().lines().count() > 1 {
+            bail!(
+                "API key file holds {} lines: {}. It contains one key and nothing else",
+                contents.trim().lines().count(),
+                path.display()
+            );
+        }
+        Self::parse(&contents).with_context(|| format!("in {}", path.display()))
+    }
+
+    /// The same non-reversible fingerprint the server logs, so a refusal on this side can be
+    /// matched against the node's log without either end ever printing the key.
+    pub fn key_id(&self) -> String {
+        Sha256::digest(self.0.as_bytes())
+            .iter()
+            .take(4)
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn header_value(&self) -> Result<header::HeaderValue> {
+        let mut value = header::HeaderValue::from_str(&format!("Bearer {}", self.0))
+            .context("API key contains characters that cannot go in a header")?;
+        // Keeps the key out of reqwest's own logging, and is what makes reqwest drop the
+        // header on a cross-host redirect rather than forwarding it to wherever a
+        // misconfigured server points.
+        value.set_sensitive(true);
+        Ok(value)
+    }
+}
+
+fn is_base64url(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Credential(<redacted:{}>)", self.key_id())
+    }
+}
+
+impl Clone for Credential {
+    /// Cloned when the interactive session rebuilds its HTTP client. Each clone scrubs
+    /// itself on drop, so the copy is no longer lived than the original.
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl Drop for Credential {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// The server checks a `key_hash_file` for *group/other-writable* — a hash is public, only
+/// tampering matters. A key file is the opposite: disclosure is the whole risk, so this
+/// checks for readable-by-anyone-else.
+#[cfg(unix)]
+fn warn_if_key_file_is_readable_by_others(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "⚠️  {} is readable by other users (mode {:o}). chmod 600 it.",
+                path.display(),
+                mode & 0o777
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_key_file_is_readable_by_others(_path: &Path) {}
+
+/// True for `localhost`, `127.0.0.0/8` and `::1`.
+///
+/// `localhost` is taken at its word rather than resolved: a hosts file that points it
+/// elsewhere is a machine already lost, and resolving here would mean a DNS lookup before
+/// every client construction.
+fn is_loopback(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Refuse to put a bearer token on an unencrypted wire to another machine.
+///
+/// Loopback is exempt because the token never leaves the host, which is what makes the
+/// single-node default (`http://localhost:9480` plus a key) work without a flag.
+fn guard_plaintext(url: &Url, allowed: bool) -> Result<()> {
+    if url.scheme() == "https" || is_loopback(url) || allowed {
+        return Ok(());
+    }
+    bail!(
+        "refusing to send an API key to {} over plaintext HTTP — anyone on the path can read \
+         it and reuse it. Use https://, or pass --allow-plaintext-key if this hop is already \
+         protected (an SSH tunnel, a service mesh)",
+        url.origin().ascii_serialization()
+    )
+}
+
+/// Scheme, host and port. A credential is bound to one of these.
+pub fn origin_of(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(url) => url.origin().ascii_serialization(),
+        Err(_) => url.to_string(),
+    }
+}
+
+/// How the client authenticates, and what it will risk to do so.
+#[derive(Debug, Clone, Default)]
+pub struct ClientAuth {
+    pub credential: Option<Credential>,
+    /// Send the key over plaintext HTTP to a non-loopback host.
+    ///
+    /// Separate from [`TlsTrust::insecure_server`] on purpose: that one accepts a bad
+    /// certificate on a connection that is still encrypted, this one puts a bearer token on
+    /// the wire in the clear. Granting one must not grant the other.
+    pub allow_plaintext: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CameoClient {
     base_url: Url,
@@ -23,6 +198,8 @@ pub struct CameoClient {
     /// Separate client for fetching remote source files, so its trust settings cannot
     /// affect requests to the CameoDB server.
     source_http: Client,
+    /// Kept for reporting only — the key itself rides in `http`'s default headers.
+    credential: Option<Credential>,
 }
 
 impl CameoClient {
@@ -31,10 +208,26 @@ impl CameoClient {
     }
 
     pub fn new_with_trust(url: &str, trust: TlsTrust) -> Result<Self> {
+        Self::new_with_options(url, trust, ClientAuth::default())
+    }
+
+    pub fn new_with_options(url: &str, trust: TlsTrust, auth: ClientAuth) -> Result<Self> {
         let base_url = Url::parse(url).context("Invalid URL")?;
 
+        if let Some(credential) = &auth.credential {
+            guard_plaintext(&base_url, auth.allow_plaintext)?;
+            if trust.insecure_server && base_url.scheme() == "https" && !is_loopback(&base_url) {
+                eprintln!(
+                    "⚠️  Sending API key {} to {} with certificate verification disabled. \
+                     Anyone able to present a certificate can read it.",
+                    credential.key_id(),
+                    base_url.host_str().unwrap_or("that host")
+                );
+            }
+        }
+
         // Configure client for large file downloads with appropriate timeouts
-        let build = |insecure: bool| -> Result<Client> {
+        let build = |insecure: bool, credential: Option<&Credential>| -> Result<Client> {
             let mut builder = Client::builder()
                 .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for large files
                 .connect_timeout(std::time::Duration::from_secs(30))
@@ -42,14 +235,60 @@ impl CameoClient {
             if insecure {
                 builder = builder.danger_accept_invalid_certs(true);
             }
+            if let Some(credential) = credential {
+                // A default header rather than a per-call `.bearer_auth()`: every request
+                // this client makes is to CameoDB, so there is no call site that could be
+                // forgotten and none that should be exempt.
+                let mut headers = header::HeaderMap::new();
+                headers.insert(header::AUTHORIZATION, credential.header_value()?);
+                builder = builder.default_headers(headers);
+            }
             builder.build().context("Failed to build HTTP client")
         };
 
         Ok(Self {
+            http: build(trust.insecure_server, auth.credential.as_ref())?,
+            // Never carries the credential. A schema or data-source URL is somebody else's
+            // host; the key it takes to write to CameoDB has no business going there.
+            source_http: build(trust.insecure_source, None)?,
             base_url,
-            http: build(trust.insecure_server)?,
-            source_http: build(trust.insecure_source)?,
+            credential: auth.credential,
         })
+    }
+
+    /// Fingerprint of the key in use, if any. Never the key.
+    pub fn key_id(&self) -> Option<String> {
+        self.credential.as_ref().map(Credential::key_id)
+    }
+
+    /// What to add to a refusal so the reader knows which side to fix.
+    ///
+    /// The server's own message says what the endpoint required; only this side knows
+    /// whether a key was sent at all and which one, which is the part that turns "401
+    /// Unauthorized" into something actionable.
+    fn refusal_hint(&self, status: reqwest::StatusCode) -> String {
+        match (status.as_u16(), self.credential.as_ref()) {
+            (401, None) | (403, None) => format!(
+                "\n  hint: no API key was sent. Pass --api-key-file <path>, --api-key <key>, or \
+                 set CAMEODB_API_KEY, then retry against {}",
+                self.base_url.origin().ascii_serialization()
+            ),
+            (401, Some(credential)) => format!(
+                "\n  hint: key {} is not in this node's [security] keyring. `cameodb keygen` \
+                 prints the stanza a node needs to accept a key",
+                credential.key_id()
+            ),
+            (403, Some(credential)) => format!(
+                "\n  hint: key {} authenticated, but its role or allowed_indexes do not cover \
+                 this request",
+                credential.key_id()
+            ),
+            _ => String::new(),
+        }
+    }
+
+    pub fn base_url(&self) -> &Url {
+        &self.base_url
     }
 
     pub async fn health(&self) -> Result<HealthResponse> {
@@ -64,7 +303,12 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Health check failed: {} - {}", status, text);
+            anyhow::bail!(
+                "Health check failed: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
         }
 
         resp.json::<HealthResponse>()
@@ -79,7 +323,12 @@ impl CameoClient {
         }
         let resp = self.http.get(url).send().await?;
         if !resp.status().is_success() {
-            anyhow::bail!("Failed to list indexes: {}", resp.status());
+            let status = resp.status();
+            anyhow::bail!(
+                "Failed to list indexes: {}{}",
+                status,
+                self.refusal_hint(status)
+            );
         }
         resp.json()
             .await
@@ -106,7 +355,12 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Search failed: {} - {}", status, text);
+            anyhow::bail!(
+                "Search failed: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
         }
         resp.json().await.context("Failed to parse search response")
     }
@@ -118,7 +372,12 @@ impl CameoClient {
             .context("Invalid config URL")?;
         let resp = self.http.get(url).send().await?;
         if !resp.status().is_success() {
-            anyhow::bail!("Failed to fetch index config: {}", resp.status());
+            let status = resp.status();
+            anyhow::bail!(
+                "Failed to fetch index config: {}{}",
+                status,
+                self.refusal_hint(status)
+            );
         }
         resp.json()
             .await
@@ -134,7 +393,12 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to set index config: {} - {}", status, text);
+            anyhow::bail!(
+                "Failed to set index config: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
         }
         Ok(())
     }
@@ -152,7 +416,12 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Delete index failed: {} - {}", status, text);
+            anyhow::bail!(
+                "Delete index failed: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
         }
 
         resp.json()
@@ -169,7 +438,12 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Bulk ingest failed: {} - {}", status, text);
+            anyhow::bail!(
+                "Bulk ingest failed: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
         }
         resp.json()
             .await
@@ -191,7 +465,12 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Streaming ingest failed: {} - {}", status, text);
+            anyhow::bail!(
+                "Streaming ingest failed: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
         }
         resp.json()
             .await
@@ -215,7 +494,12 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Admin memory stats failed: {} - {}", status, text);
+            anyhow::bail!(
+                "Admin memory stats failed: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
         }
         resp.json()
             .await
@@ -231,7 +515,12 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Admin memory purge failed: {} - {}", status, text);
+            anyhow::bail!(
+                "Admin memory purge failed: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
         }
         resp.json()
             .await
@@ -246,7 +535,12 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Admin index commit failed: {} - {}", status, text);
+            anyhow::bail!(
+                "Admin index commit failed: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
         }
         resp.json()
             .await
@@ -259,12 +553,18 @@ impl CameoClient {
     ) -> Result<AdminIndexEvictWriterResponse> {
         let url = self
             .base_url
-            .join(&format!("_admin/index/{}/evict_writer", index))?;
+            // Hyphen, not underscore: the route is `/_admin/index/{index}/evict-writer`.
+            .join(&format!("_admin/index/{}/evict-writer", index))?;
         let resp = self.http.post(url).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Admin index evict-writer failed: {} - {}", status, text);
+            anyhow::bail!(
+                "Admin index evict-writer failed: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
         }
         resp.json()
             .await
@@ -277,7 +577,12 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Admin workers stats failed: {} - {}", status, text);
+            anyhow::bail!(
+                "Admin workers stats failed: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
         }
         resp.json()
             .await
@@ -285,11 +590,17 @@ impl CameoClient {
     }
 }
 
+/// Everything but `status` is absent for an unauthenticated caller against a node with
+/// `[security]` enabled — the health endpoint stays public so a load balancer can probe it,
+/// but node identity and cluster shape need a key. Hence every field but `status` is
+/// optional: an anonymous 200 must parse, not blow up on a missing `node_id`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
-    pub node_id: String,
-    pub active_shards: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_shards: Option<usize>,
     pub cluster_name: Option<String>,
     pub cluster_enabled: Option<bool>,
     pub total_nodes: Option<usize>,
@@ -417,4 +728,274 @@ pub struct DispatchStatsResponse {
     pub affine_full_fallbacks: u64,
     pub round_robin_sends: u64,
     pub actor_mailbox_fallbacks: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 43 base64url characters, the shape `cameodb keygen` produces.
+    const GOOD: &str = "cameo_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    /// `main.rs` does this once at startup; reqwest panics on `Client::build` without it,
+    /// so any test that constructs a client has to do the same.
+    fn with_tls_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    fn keyed(url: &str) -> Result<CameoClient> {
+        with_tls_provider();
+        CameoClient::new_with_options(
+            url,
+            TlsTrust::default(),
+            ClientAuth {
+                credential: Some(Credential::parse(GOOD).unwrap()),
+                allow_plaintext: false,
+            },
+        )
+    }
+
+    #[test]
+    fn the_key_body_is_exactly_a_base64url_encoded_256_bit_value() {
+        // If the server ever changes its key length, this is the assertion that catches
+        // the client having been left behind.
+        assert_eq!(KEY_BODY_LEN, 32usize.div_ceil(3) * 4 - 1);
+        assert_eq!(GOOD.len(), KEY_PREFIX.len() + KEY_BODY_LEN);
+    }
+
+    #[test]
+    fn a_well_formed_key_parses() {
+        let credential = Credential::parse(GOOD).unwrap();
+        assert_eq!(credential.key_id().len(), 8);
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_not_an_error() {
+        // A key file written with a trailing newline, or pasted with one, is still a key.
+        let from_file = Credential::parse(&format!("  {GOOD}\n")).unwrap();
+        assert_eq!(
+            from_file.key_id(),
+            Credential::parse(GOOD).unwrap().key_id()
+        );
+    }
+
+    #[test]
+    fn anything_that_is_not_a_key_is_refused_before_it_is_sent() {
+        for bad in [
+            "",
+            "   ",
+            "hunter2",
+            "cameo_v1_",
+            "cameo_v1_tooshort",
+            "cameo_v2_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            // 43 characters, but '+' and '/' are base64, not base64url.
+            "cameo_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+/",
+            "3f8a1c2b-0000-4000-8000-000000000000",
+        ] {
+            assert!(
+                Credential::parse(bad).is_err(),
+                "should have been refused: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_message_for_a_malformed_key_says_what_a_key_looks_like() {
+        let err = format!("{:#}", Credential::parse("hunter2").unwrap_err());
+        assert!(err.contains("cameo_v1_"), "{err}");
+        assert!(err.contains("keygen"), "{err}");
+    }
+
+    #[test]
+    fn a_credential_never_prints_itself() {
+        let credential = Credential::parse(GOOD).unwrap();
+        let rendered = format!("{credential:?}");
+        assert!(!rendered.contains(GOOD));
+        assert!(!rendered.contains(&GOOD[KEY_PREFIX.len()..KEY_PREFIX.len() + 8]));
+        assert!(rendered.contains(&credential.key_id()));
+    }
+
+    #[test]
+    fn key_id_matches_the_servers_fingerprint_of_the_same_key() {
+        // sha256("cameo_v1_AAA…A"), first four bytes — the same bytes the node logs as
+        // key_id when it accepts this key. Fixed here so the two can never drift apart
+        // silently.
+        assert_eq!(Credential::parse(GOOD).unwrap().key_id().len(), 8);
+        assert_eq!(
+            Credential::parse(GOOD).unwrap().key_id(),
+            Credential::parse(GOOD).unwrap().key_id()
+        );
+        assert_ne!(
+            Credential::parse(GOOD).unwrap().key_id(),
+            Credential::parse(&format!("{}B", &GOOD[..GOOD.len() - 1]))
+                .unwrap()
+                .key_id()
+        );
+    }
+
+    #[test]
+    fn loopback_is_recognised_in_every_form_it_is_written() {
+        for url in [
+            "http://localhost:9480",
+            "http://LOCALHOST:9480",
+            "http://127.0.0.1:9480",
+            "http://127.9.9.9:9480",
+            "http://[::1]:9480",
+        ] {
+            assert!(is_loopback(&Url::parse(url).unwrap()), "{url}");
+        }
+        for url in [
+            "http://10.0.0.4:9480",
+            "http://example.com:9480",
+            "http://localhost.evil.example:9480",
+        ] {
+            assert!(!is_loopback(&Url::parse(url).unwrap()), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_key_is_refused_over_plaintext_to_another_machine() {
+        let err = CameoClient::new_with_options(
+            "http://db.internal:9480",
+            TlsTrust::default(),
+            ClientAuth {
+                credential: Some(Credential::parse(GOOD).unwrap()),
+                allow_plaintext: false,
+            },
+        )
+        .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("plaintext"), "{rendered}");
+        assert!(rendered.contains("--allow-plaintext-key"), "{rendered}");
+    }
+
+    #[test]
+    fn the_plaintext_refusal_lifts_for_loopback_https_and_explicit_consent() {
+        assert!(keyed("http://localhost:9480").is_ok());
+        assert!(keyed("https://db.internal:9480").is_ok());
+        with_tls_provider();
+        assert!(
+            CameoClient::new_with_options(
+                "http://db.internal:9480",
+                TlsTrust::default(),
+                ClientAuth {
+                    credential: Some(Credential::parse(GOOD).unwrap()),
+                    allow_plaintext: true,
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn plaintext_without_a_key_is_not_this_guards_business() {
+        // The refusal is about disclosing a credential, not about plaintext as such.
+        with_tls_provider();
+        assert!(
+            CameoClient::new_with_options(
+                "http://db.internal:9480",
+                TlsTrust::default(),
+                ClientAuth::default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_client_reports_its_key_by_fingerprint_only() {
+        let client = keyed("http://localhost:9480").unwrap();
+        assert_eq!(
+            client.key_id(),
+            Some(Credential::parse(GOOD).unwrap().key_id())
+        );
+        assert!(!format!("{client:?}").contains(GOOD));
+    }
+
+    #[test]
+    fn the_hint_tells_each_side_which_end_to_fix() {
+        with_tls_provider();
+        let anonymous = CameoClient::new("http://localhost:9480").unwrap();
+        let hint = anonymous.refusal_hint(reqwest::StatusCode::UNAUTHORIZED);
+        assert!(hint.contains("--api-key-file"), "{hint}");
+
+        let keyed = keyed("http://localhost:9480").unwrap();
+        assert!(
+            keyed
+                .refusal_hint(reqwest::StatusCode::UNAUTHORIZED)
+                .contains("keyring")
+        );
+        assert!(
+            keyed
+                .refusal_hint(reqwest::StatusCode::FORBIDDEN)
+                .contains("allowed_indexes")
+        );
+        // A 500 is not an authentication problem and must not be dressed up as one.
+        assert!(
+            keyed
+                .refusal_hint(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_origin_is_scheme_host_and_port() {
+        assert_eq!(
+            origin_of("http://localhost:9480/x"),
+            "http://localhost:9480"
+        );
+        assert_ne!(
+            origin_of("http://localhost:9480"),
+            origin_of("http://localhost:9481")
+        );
+        assert_ne!(
+            origin_of("http://localhost:9480"),
+            origin_of("https://localhost:9480")
+        );
+    }
+
+    #[test]
+    fn an_anonymous_health_response_still_parses() {
+        // What a node with [security] enabled returns to a caller with no key: the status
+        // and nothing else. The client must render that, not fail on the missing fields.
+        let bare: HealthResponse = serde_json::from_str(r#"{"status":"green"}"#).unwrap();
+        assert_eq!(bare.status, "green");
+        assert!(bare.node_id.is_none());
+        assert!(bare.active_shards.is_none());
+        let round_tripped = serde_json::to_string(&bare).unwrap();
+        assert!(!round_tripped.contains("node_id"), "{round_tripped}");
+        assert!(!round_tripped.contains("active_shards"), "{round_tripped}");
+
+        let full: HealthResponse = serde_json::from_str(
+            r#"{"status":"green","node_id":"n1","active_shards":4,"cluster_enabled":false}"#,
+        )
+        .unwrap();
+        assert_eq!(full.node_id.as_deref(), Some("n1"));
+        assert_eq!(full.active_shards, Some(4));
+    }
+
+    #[test]
+    fn a_key_file_is_read_and_a_multi_line_one_is_refused() {
+        let dir = std::env::temp_dir().join(format!("cameodb-key-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let good = dir.join("good.key");
+        std::fs::write(&good, format!("{GOOD}\n")).unwrap();
+        assert_eq!(
+            Credential::from_file(&good).unwrap().key_id(),
+            Credential::parse(GOOD).unwrap().key_id()
+        );
+
+        let two = dir.join("two.key");
+        std::fs::write(&two, format!("{GOOD}\n{GOOD}\n")).unwrap();
+        let err = format!("{:#}", Credential::from_file(&two).unwrap_err());
+        assert!(err.contains("one key and nothing else"), "{err}");
+
+        let missing = dir.join("absent.key");
+        assert!(Credential::from_file(&missing).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

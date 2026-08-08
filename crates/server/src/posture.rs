@@ -17,6 +17,7 @@ use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::auth::Capability;
 use crate::config::CameoDbConfig;
 
 /// Where this node sits on the network.
@@ -215,9 +216,13 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
                  cert_file and key_file"
                     .to_string(),
             ),
+            (Profile::Internal, false) if config.security.enabled => Outcome::Warn(
+                "plaintext HTTP on a network-reachable bind; every API key travels in the clear \
+                 and can be replayed by anyone on the path"
+                    .to_string(),
+            ),
             (Profile::Internal, false) => Outcome::Warn(
-                "plaintext HTTP on a network-reachable bind; traffic and any future API key \
-                 travel in the clear"
+                "plaintext HTTP on a network-reachable bind; traffic travels in the clear"
                     .to_string(),
             ),
             (Profile::Local, false) => Outcome::Pass("plaintext (loopback only)".to_string()),
@@ -247,15 +252,26 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
         },
     );
 
+    // Resolved once, read by two rules. Doing the file reads here, rather than leaving them
+    // to startup, is what makes `check-config` the one place an operator learns everything
+    // wrong with their `[security]` section: reporting "3 keys" while a `key_hash_file` is
+    // unreadable would be worse than being slow.
+    let keyring = config.security.load_keyring();
+    let admin_key_exists = keyring
+        .as_ref()
+        .is_ok_and(|ring| ring.enabled() && ring.holds(Capability::NodeAdmin));
+
     // --- Admin endpoints --------------------------------------------------------
     push(
         "admin_api",
         match (profile, http.admin_enabled) {
             (Profile::External, true) => Outcome::Fail(
                 "profile 'external' requires admin endpoints to be disabled: they allow memory \
-                 purges and writer eviction with no authentication. Set \
-                 [network.http] admin_enabled = false"
+                 purges and writer eviction. Set [network.http] admin_enabled = false"
                     .to_string(),
+            ),
+            (_, true) if !loopback && admin_key_exists => Outcome::Pass(
+                "/_admin/* reachable off-box, gated on a key holding node-admin".to_string(),
             ),
             (_, true) if !loopback => {
                 Outcome::Warn("/_admin/* is reachable off-box and unauthenticated".to_string())
@@ -284,22 +300,61 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
     );
 
     // --- Authentication ---------------------------------------------------------
-    // Stated as a rule rather than a roadmap entry: the gap is the same either way, but
-    // this way a deployment cannot claim a posture the code does not implement.
     push(
         "auth",
-        match profile {
-            Profile::External => Outcome::Fail(
-                "profile 'external' requires authentication, which is not implemented yet \
-                 (ROADMAP Phase 14 Stage B1). Until it lands, do not expose this node to an \
-                 untrusted network — terminate at an authenticating proxy and run 'internal'"
+        match &keyring {
+            Err(e) => Outcome::Fail(format!("[security] is unusable: {:#}", e)),
+            Ok(ring) if !ring.enabled() => match profile {
+                Profile::External => Outcome::Fail(
+                    "profile 'external' requires authentication. Set [security] enabled = true \
+                     and configure at least one key with `cameodb keygen --role admin`"
+                        .to_string(),
+                ),
+                Profile::Internal => Outcome::Warn(
+                    "all HTTP and MCP endpoints are unauthenticated; anyone who can reach the \
+                     port can read, write, and delete"
+                        .to_string(),
+                ),
+                // Pass, not Warn: this mirrors how `tls` passes plaintext on loopback. A
+                // profile that warns on every boot only teaches operators to ignore warnings.
+                Profile::Local => Outcome::Pass("unauthenticated (loopback only)".to_string()),
+            },
+            Ok(ring) if ring.is_empty() => Outcome::Fail(
+                "[security] enabled = true but no keys are configured, so nothing could ever \
+                 authenticate and every request would be refused. Mint one with `cameodb keygen \
+                 --role admin`, or set enabled = false"
                     .to_string(),
             ),
-            _ => Outcome::Warn(
-                "all HTTP and MCP endpoints are unauthenticated; anyone who can reach the port \
-                 can read, write, and delete"
-                    .to_string(),
-            ),
+            Ok(ring) => {
+                // Two things a working configuration can still be wrong about. Both are
+                // reported as clauses on one line rather than as separate rules, because
+                // they describe the same subject — the keys this node holds.
+                let mut notes = Vec::new();
+                if !ring.holds(Capability::Write) && !ring.holds(Capability::IndexAdmin) {
+                    notes.push("no key holds write or index-admin, so this node is read-only");
+                }
+                let scoped = ring.index_scoped_count();
+                let scoped_note;
+                if scoped > 0 {
+                    scoped_note = format!(
+                        "{} index-scoped key(s) are refused at /mcp until per-tool scoping \
+                         lands (ROADMAP Phase 14 Stage B1 step 4)",
+                        scoped
+                    );
+                    notes.push(&scoped_note);
+                }
+
+                let message = if notes.is_empty() {
+                    format!("{} enforced on every route", ring.summary())
+                } else {
+                    format!("{} enforced; {}", ring.summary(), notes.join("; "))
+                };
+                if notes.is_empty() {
+                    Outcome::Pass(message)
+                } else {
+                    Outcome::Warn(message)
+                }
+            }
         },
     );
 
@@ -434,6 +489,161 @@ mod tests {
         assert!(failed.contains(&"tls"), "{:?}", failed);
         assert!(failed.contains(&"admin_api"), "{:?}", failed);
         assert!(failed.contains(&"auth"), "{:?}", failed);
+    }
+
+    /// The `auth` outcome for a config, by rule name.
+    fn auth_outcome(config: &CameoDbConfig) -> Outcome {
+        evaluate(config)
+            .unwrap()
+            .checks
+            .into_iter()
+            .find(|c| c.rule == "auth")
+            .unwrap()
+            .outcome
+    }
+
+    fn with_key(config: &mut CameoDbConfig, role: crate::auth::Role) {
+        config.security.enabled = true;
+        config.security.api_keys.push(crate::auth::ApiKeyConfig {
+            key_hash: Some(format!("sha256:{}", "ab".repeat(32))),
+            role: Some(role),
+            label: Some(format!("{role}-key")),
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn unauthenticated_loopback_passes_but_a_reachable_node_does_not() {
+        // Local passes rather than warns, deliberately: a profile that warns on every boot
+        // trains operators to stop reading warnings.
+        assert!(matches!(
+            auth_outcome(&config_for(Some(Profile::Local), "127.0.0.1")),
+            Outcome::Pass(_)
+        ));
+
+        let mut internal = config_for(Some(Profile::Internal), "0.0.0.0");
+        internal.network.http.cors_allowed_origins = vec![];
+        assert!(matches!(auth_outcome(&internal), Outcome::Warn(_)));
+
+        let mut external = config_for(Some(Profile::External), "0.0.0.0");
+        external.network.http.cors_allowed_origins = vec![];
+        assert!(auth_outcome(&external).is_fail());
+    }
+
+    #[test]
+    fn auth_enabled_without_a_key_refuses_to_start() {
+        // Every request would be rejected. Failing here is louder than failing per request.
+        let mut c = config_for(Some(Profile::Local), "127.0.0.1");
+        c.security.enabled = true;
+        let outcome = auth_outcome(&c);
+        assert!(outcome.is_fail(), "{:?}", outcome);
+        assert!(outcome.message().contains("no keys"), "{:?}", outcome);
+    }
+
+    #[test]
+    fn a_broken_security_section_fails_the_rule_rather_than_being_reported_as_keys() {
+        let mut c = config_for(Some(Profile::Local), "127.0.0.1");
+        c.security.enabled = true;
+        c.security.api_keys.push(crate::auth::ApiKeyConfig {
+            key_hash: Some("not-a-digest".to_string()),
+            role: Some(crate::auth::Role::Admin),
+            ..Default::default()
+        });
+        let outcome = auth_outcome(&c);
+        assert!(outcome.is_fail(), "{:?}", outcome);
+        assert!(outcome.message().contains("unusable"), "{:?}", outcome);
+    }
+
+    #[test]
+    fn configured_keys_pass_and_unblock_the_external_profile() {
+        let mut c = config_for(Some(Profile::Local), "127.0.0.1");
+        with_key(&mut c, crate::auth::Role::Admin);
+        let outcome = auth_outcome(&c);
+        assert!(matches!(outcome, Outcome::Pass(_)), "{:?}", outcome);
+        assert!(
+            outcome.message().contains("1 key (1 admin)"),
+            "{:?}",
+            outcome
+        );
+
+        // `external` was blocked on this rule from the day the profile existed. With keys,
+        // TLS and the admin API off, nothing is left to block it.
+        let mut external = config_for(Some(Profile::External), "0.0.0.0");
+        external.network.http.cors_allowed_origins = vec![];
+        external.network.http.admin_enabled = false;
+        external.network.http.tls.enabled = true;
+        with_key(&mut external, crate::auth::Role::Admin);
+        let posture = evaluate(&external).unwrap();
+        assert_eq!(posture.failures().count(), 0, "{}", posture.render());
+    }
+
+    #[test]
+    fn a_read_only_key_ring_is_called_out() {
+        let mut c = config_for(Some(Profile::Local), "127.0.0.1");
+        with_key(&mut c, crate::auth::Role::Reader);
+        let outcome = auth_outcome(&c);
+        assert!(matches!(outcome, Outcome::Warn(_)), "{:?}", outcome);
+        assert!(outcome.message().contains("read-only"), "{:?}", outcome);
+    }
+
+    #[test]
+    fn an_index_scoped_key_is_reported_because_mcp_refuses_it() {
+        // Surprising behaviour has to be discoverable before an agent is handed the key,
+        // not after its first MCP call is refused.
+        let mut c = config_for(Some(Profile::Local), "127.0.0.1");
+        c.security.enabled = true;
+        c.security.api_keys.push(crate::auth::ApiKeyConfig {
+            key_hash: Some(format!("sha256:{}", "cd".repeat(32))),
+            role: Some(crate::auth::Role::Admin),
+            allowed_indexes: Some(vec!["docs".to_string()]),
+            ..Default::default()
+        });
+        let outcome = auth_outcome(&c);
+        assert!(matches!(outcome, Outcome::Warn(_)), "{:?}", outcome);
+        assert!(outcome.message().contains("/mcp"), "{:?}", outcome);
+    }
+
+    #[test]
+    fn an_admin_key_settles_the_off_box_admin_api_warning() {
+        let admin_api = |c: &CameoDbConfig| {
+            evaluate(c)
+                .unwrap()
+                .checks
+                .into_iter()
+                .find(|k| k.rule == "admin_api")
+                .unwrap()
+                .outcome
+        };
+        let mut c = config_for(Some(Profile::Internal), "0.0.0.0");
+        c.network.http.cors_allowed_origins = vec![];
+        c.network.http.admin_enabled = true;
+        assert!(matches!(admin_api(&c), Outcome::Warn(_)));
+
+        with_key(&mut c, crate::auth::Role::Admin);
+        assert!(
+            matches!(admin_api(&c), Outcome::Pass(_)),
+            "{:?}",
+            admin_api(&c)
+        );
+    }
+
+    #[test]
+    fn plaintext_warning_names_the_keys_once_there_are_any() {
+        let tls = |c: &CameoDbConfig| {
+            evaluate(c)
+                .unwrap()
+                .checks
+                .into_iter()
+                .find(|k| k.rule == "tls")
+                .unwrap()
+                .outcome
+        };
+        let mut c = config_for(Some(Profile::Internal), "0.0.0.0");
+        c.network.http.cors_allowed_origins = vec![];
+        assert!(!tls(&c).message().contains("API key"));
+
+        with_key(&mut c, crate::auth::Role::Writer);
+        assert!(tls(&c).message().contains("API key"), "{:?}", tls(&c));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::sdk::{CameoClient, ListIndexesResponse, TlsTrust};
+use crate::sdk::{CameoClient, ClientAuth, Credential, ListIndexesResponse, TlsTrust, origin_of};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored_json;
@@ -221,6 +221,49 @@ pub struct ClientCli {
     /// also relax it for the connection carrying your writes.
     #[arg(long = "insecure-source", global = true)]
     pub insecure_source: bool,
+
+    /// Path to a file holding one API key. Preferred over --api-key: a path is not visible
+    /// in `ps` and does not land in shell history.
+    #[arg(long = "api-key-file", env = "CAMEODB_API_KEY_FILE", global = true)]
+    pub api_key_file: Option<PathBuf>,
+
+    /// API key to present to the server.
+    ///
+    /// On most systems the full command line of a running process is readable by other
+    /// users, so prefer CAMEODB_API_KEY or --api-key-file for anything but a scratch node.
+    #[arg(
+        long = "api-key",
+        env = "CAMEODB_API_KEY",
+        hide_env_values = true,
+        global = true
+    )]
+    pub api_key: Option<String>,
+
+    /// Send the API key over plaintext HTTP to a host that is not loopback.
+    ///
+    /// Deliberately separate from --insecure, which accepts a bad certificate on a
+    /// connection that is still encrypted. This one puts a bearer token on the wire in the
+    /// clear; only pass it when something else already protects the hop.
+    #[arg(long = "allow-plaintext-key", global = true)]
+    pub allow_plaintext_key: bool,
+}
+
+/// Resolve the key from the four places it may come from.
+///
+/// A file beats an inline key, and clap has already resolved each flag against its
+/// environment variable. So: `--api-key-file` > `CAMEODB_API_KEY_FILE` > `--api-key` >
+/// `CAMEODB_API_KEY`. Preferring the file means an exported `CAMEODB_API_KEY` left over from
+/// another session cannot quietly override the key a command names explicitly.
+fn resolve_credential(cli: &ClientCli) -> Result<Option<Credential>> {
+    if let Some(path) = &cli.api_key_file {
+        return Credential::from_file(path).map(Some);
+    }
+    match cli.api_key.as_deref() {
+        Some(raw) => Credential::parse(raw)
+            .context("--api-key / CAMEODB_API_KEY")
+            .map(Some),
+        None => Ok(None),
+    }
 }
 
 fn parse_header_with_hint(raw: &str) -> (String, Option<TantivyFieldType>) {
@@ -265,22 +308,43 @@ struct InteractiveSession {
     /// Carried so that `connect <target>` mid-session keeps the trust settings the
     /// session was started with instead of silently re-enabling verification.
     trust: TlsTrust,
+    /// The key the session was started with, kept whole across reconnects.
+    auth: ClientAuth,
+    /// The origin that key was given for. `connect` elsewhere drops it; `connect` back
+    /// restores it, which is why the credential is kept rather than discarded outright.
+    key_origin: String,
 }
 
 impl InteractiveSession {
-    fn new_with_trust(initial_url: String, trust: TlsTrust) -> Result<Self> {
-        let client = CameoClient::new_with_trust(&initial_url, trust)?;
+    fn new_with_trust(initial_url: String, trust: TlsTrust, auth: ClientAuth) -> Result<Self> {
+        let client = CameoClient::new_with_options(&initial_url, trust, auth.clone())?;
         Ok(Self {
+            key_origin: origin_of(&initial_url),
             current_url: initial_url,
             client,
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             trust,
+            auth,
         })
     }
 
     fn reconnect(&mut self, target: &str) -> Result<()> {
         let normalized = normalize_connect_target(target)?;
-        self.client = CameoClient::new_with_trust(&normalized, self.trust)?;
+        let mut auth = self.auth.clone();
+
+        // A key authenticates you to one node. Carrying it to whatever host is typed next
+        // would hand it to that host, which is how a mistyped `connect` becomes a leak.
+        if auth.credential.is_some() && origin_of(&normalized) != self.key_origin {
+            auth.credential = None;
+            println!(
+                "🔑 Key not sent to {} — it is bound to {}. Start the client with --api-key \
+                 against that origin to authenticate there.",
+                origin_of(&normalized),
+                self.key_origin
+            );
+        }
+
+        self.client = CameoClient::new_with_options(&normalized, self.trust, auth)?;
         self.current_url = normalized;
         self.clear_index_cache();
         Ok(())
@@ -1645,12 +1709,16 @@ pub async fn run_cli() -> Result<()> {
         insecure_server: cli.insecure,
         insecure_source: cli.insecure_source,
     };
+    let auth = ClientAuth {
+        credential: resolve_credential(&cli)?,
+        allow_plaintext: cli.allow_plaintext_key,
+    };
 
     if cli.interactive {
-        return run_interactive_shell(normalized_connect, trust).await;
+        return run_interactive_shell(normalized_connect, trust, auth).await;
     }
 
-    let client = CameoClient::new_with_trust(&normalized_connect, trust)?;
+    let client = CameoClient::new_with_options(&normalized_connect, trust, auth)?;
 
     let command = cli.command.ok_or_else(|| {
         anyhow!(
@@ -4241,12 +4309,24 @@ async fn fetch_bytes_source(client: &CameoClient, source: &str) -> Result<Vec<u8
     decompress_bytes(raw_bytes, compression)
 }
 
-async fn run_interactive_shell(initial_url: String, trust: TlsTrust) -> Result<()> {
-    println!(
-        "🛠️  CameoDB interactive client. Type 'help' for supported commands, 'exit' to quit.\n"
-    );
+async fn run_interactive_shell(
+    initial_url: String,
+    trust: TlsTrust,
+    auth: ClientAuth,
+) -> Result<()> {
+    println!("🛠️  CameoDB interactive client. Type 'help' for supported commands, 'exit' to quit.");
+    match &auth.credential {
+        // Which key, so a session against a node with several keys is not a guess. The
+        // fingerprint matches what the node logs when it accepts the key.
+        Some(credential) => println!(
+            "🔑 Authenticating to {} with key {}.\n",
+            origin_of(&initial_url),
+            credential.key_id()
+        ),
+        None => println!(),
+    }
 
-    let session = InteractiveSession::new_with_trust(initial_url, trust)?;
+    let session = InteractiveSession::new_with_trust(initial_url, trust, auth)?;
     let history_path = history_file_path()?;
     let handle = tokio::runtime::Handle::current();
     session.refresh_index_cache().await;

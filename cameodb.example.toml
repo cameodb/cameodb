@@ -9,7 +9,7 @@ zone = "default"
 #   local    reachable only from this machine; permissive CORS allowed; warnings, not errors
 #   internal reachable on a trusted network; explicit CORS origins; cluster PSK required
 #   external reachable from an untrusted network; TLS required; /_admin/* off;
-#            authentication required (not implemented yet — see ROADMAP Phase 14 B1)
+#            authentication required
 #
 # Pick by who can reach the bind address, not by what the box is for: a shared test
 # environment is "internal", not "local", however early the project.
@@ -28,13 +28,32 @@ max_concurrent_requests = 128
 # "*" is accepted only under the local profile.
 cors_allowed_origins = []
 
-# Remove the unauthenticated /_admin/* routes (memory purge, writer eviction).
+# Mount the /_admin/* routes (memory purge, writer eviction). Off removes them entirely
+# rather than refusing them. When [security] is enabled they require a node-admin key.
 admin_enabled = true
+
+# Authentication. Off by default; when on, every route except /_cluster/health requires
+# `Authorization: Bearer <key>`. Only digests are stored here, so this file never holds a
+# usable credential — mint keys with `cameodb keygen --role <admin|writer|reader>`, which
+# prints the key once and the stanza to paste.
+[security]
+enabled = false
+
+# [[security.api_keys]]
+# key_hash = "sha256:…"                 # or: key_hash_file = "/etc/cameodb/keys/ops"
+# role = "admin"                        # admin | writer | reader
+# label = "ops-team"                    # audit identity in logs; not a secret
+#
+# [[security.api_keys]]
+# key_hash_file = "/etc/cameodb/keys/team-a"
+# role = "writer"
+# label = "team-a"
+# allowed_indexes = ["docs", "wiki"]    # honored for every role; omit to allow all
 
 [network.cluster]
 enabled = false
 bind_address = "0.0.0.0"
-port = 9580
+cluster_port = 9580
 cluster_name = "cameodb-cluster"
 
 # Seed nodes for initial discovery (2-3 nodes recommended)

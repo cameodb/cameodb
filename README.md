@@ -255,9 +255,49 @@ The CLI client features a robust, zero-copy ingestion pipeline that transparentl
 
 ## 🔒 Security
 
-> **CameoDB has no authentication.** Every HTTP and MCP endpoint — including writes and
-> deletes — is available to anyone who can reach the port. Run it on a trusted network or
-> behind an authenticating proxy. Authentication is ROADMAP Phase 14 Stage B1.
+### Authentication
+
+Off by default; when enabled, every route except liveness requires
+`Authorization: Bearer <key>`. Keys are minted by the server and stored only as SHA-256
+digests, so a leaked config file contains nothing that can authenticate:
+
+```bash
+cameodb keygen --role writer --label team-a --allowed-indexes docs,wiki
+```
+
+The key is printed once to stdout and the `[[security.api_keys]]` stanza to stderr. Three
+roles bundle four capabilities — `admin` (everything), `writer` (read and write), `reader`
+(read only) — and `allowed_indexes` restricts a key to named indexes for every role.
+
+```toml
+[security]
+enabled = true
+
+[[security.api_keys]]
+key_hash = "sha256:…"          # or key_hash_file = "/etc/cameodb/keys/team-a"
+role = "writer"
+label = "team-a"
+allowed_indexes = ["docs", "wiki"]
+```
+
+The bundled client presents a key three ways. A file or the environment is preferred over
+`--api-key`, whose value is visible in `ps` on most systems:
+
+```bash
+cameodb client --api-key-file ~/.cameodb/team-a.key list indexes
+export CAMEODB_API_KEY="cameo_v1_…"     # or CAMEODB_API_KEY_FILE
+cameodb client search docs "invoice"
+```
+
+The client will not send a key over plaintext HTTP to anything but loopback — pass
+`--allow-plaintext-key` when the hop is already protected by a tunnel or a mesh. In the
+interactive shell, a key is bound to the origin it was given for: `connect` elsewhere drops
+it rather than handing your credential to whatever host was typed, and `connect` back
+restores it.
+
+Not yet: MCP tools cannot present a key, index-scoped keys are refused at `/mcp`, and
+`/_indexes` lists every index rather than the permitted ones (ROADMAP Phase 14 Stage B1
+steps 3–4).
 
 ### Security profiles
 
@@ -277,7 +317,7 @@ profile = "internal"   # local | internal | external
 | CORS `"*"` | allowed (warned) | rejected | rejected |
 | `/_admin/*` | allowed | allowed | **must be disabled** |
 | Cluster PSK | warned | **required** | **required** |
-| Authentication | — | — | **required — so `external` cannot start yet** |
+| Authentication | optional | warned if off | **required** |
 
 Choose by who can reach the bind address, not by what the environment is for: a shared test
 box is `internal`, not `local`. Omitting `profile` is valid only for a loopback bind, which

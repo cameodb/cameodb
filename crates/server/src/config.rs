@@ -45,6 +45,9 @@ pub enum ConfigError {
     #[error("Network configuration error: {message}")]
     NetworkConfig { message: String },
 
+    #[error("Security configuration error: {message}")]
+    SecurityConfig { message: String },
+
     #[error("{message}\n\nRun `cameodb --help` for the list of options.")]
     CommandLine { message: String },
 }
@@ -183,6 +186,27 @@ const OVERRIDES: &[Override] = &[
         placeholder: "<NAME>", help: "Security posture: local, internal, or external",
         apply: |c, v| {
             c.node.profile = Some(crate::posture::Profile::parse(v).map_err(|e| ConfigError::NetworkConfig { message: e })?);
+            Ok(())
+        },
+    },
+    Override {
+        flag: "--security-enabled", env: "CAMEODB_SECURITY_ENABLED", kind: FlagKind::Switch,
+        placeholder: "", help: "Require an API key on HTTP and MCP requests",
+        apply: |c, v| { c.security.enabled = parse_bool(v); Ok(()) },
+    },
+    // A *hash*, never a key: the server has no use for a key and nothing that holds one can
+    // leak it. This is also why there is no `CAMEODB_API_KEY` here — that name belongs to
+    // the client, and the two would collide the first time both ran in one compose file.
+    Override {
+        flag: "--api-key-hash", env: "CAMEODB_API_KEY_HASH", kind: FlagKind::Value,
+        placeholder: "<SHA256>", help: "Single API key digest, 'sha256:<hex>' from `cameodb keygen`",
+        apply: |c, v| { c.security.override_key_mut().key_hash = Some(v.to_string()); Ok(()) },
+    },
+    Override {
+        flag: "--api-key-role", env: "CAMEODB_API_KEY_ROLE", kind: FlagKind::Value,
+        placeholder: "<ROLE>", help: "Role for --api-key-hash: admin, writer, or reader",
+        apply: |c, v| {
+            c.security.override_key_mut().role = Some(crate::auth::Role::parse(v).map_err(|e| ConfigError::SecurityConfig { message: e })?);
             Ok(())
         },
     },
@@ -329,23 +353,41 @@ fn unrecognized_keys(content: &str) -> Vec<String> {
     };
     // The schema is the serialized default config: exactly the set of keys that mean
     // something, derived from the structs themselves rather than a hand-maintained list.
-    let Ok(schema) = toml::Value::try_from(CameoDbConfig::default()) else {
+    //
+    // Serialized as JSON rather than TOML because `None` becomes `null` and therefore still
+    // *appears*. A TOML schema silently drops every optional setting that happens to default
+    // to unset, so `node.profile`, `tls.cert_file`, `tls.key_file` and `cluster.psk_file`
+    // were each reported as a typo to anyone who set them — the opposite of this function's
+    // job.
+    let Ok(schema) = serde_json::to_value(CameoDbConfig::default()) else {
         return Vec::new();
     };
 
     let mut unknown = Vec::new();
     collect_unrecognized(&parsed, &schema, "", &mut unknown);
+    unknown.retain(|key| !NEVER_SERIALIZED_SETTINGS.contains(&key.as_str()));
     unknown
 }
 
+/// Settings a config file may set that no serialization can contain, and which therefore
+/// cannot appear in the schema above.
+///
+/// One entry, and it earns it: the cluster PSK is `skip_serializing` precisely so that no
+/// config dump can leak it, which also means the schema cannot see it.
+const NEVER_SERIALIZED_SETTINGS: &[&str] = &["network.cluster.psk"];
+
 /// Walk `parsed` against `schema`, recording paths absent from the schema.
+///
+/// Only tables are recursed into. Arrays of tables — `[[security.api_keys]]` — are checked
+/// for existence but not for the keys inside them, which is why every field of an entry is
+/// optional and validated by name in [`crate::auth::SecurityConfig::load_keyring`].
 fn collect_unrecognized(
     parsed: &toml::Value,
-    schema: &toml::Value,
+    schema: &serde_json::Value,
     prefix: &str,
     unknown: &mut Vec<String>,
 ) {
-    let (Some(parsed), Some(schema)) = (parsed.as_table(), schema.as_table()) else {
+    let (Some(parsed), Some(schema)) = (parsed.as_table(), schema.as_object()) else {
         return;
     };
 
@@ -419,6 +461,10 @@ pub struct CameoDbConfig {
 
     /// Search engine configuration (Tantivy settings)
     pub search: SearchConfig,
+
+    /// Authentication: API keys, their roles, and their index scopes.
+    #[serde(default)]
+    pub security: crate::auth::SecurityConfig,
 
     /// Maximum single-record size in MB (default: 64).
     ///
@@ -1212,6 +1258,7 @@ impl Default for CameoDbConfig {
             network: NetworkConfig::default(),
             storage: StorageConfig::default(),
             search: SearchConfig::default(),
+            security: crate::auth::SecurityConfig::default(),
             max_record_size_mb: default_max_record_size_mb(),
         }
     }

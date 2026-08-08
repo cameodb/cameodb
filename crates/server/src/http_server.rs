@@ -4,7 +4,7 @@
 //! using Axum web framework with streaming support.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderName, HeaderValue, StatusCode, header},
@@ -30,9 +30,10 @@ use tower_http::{
 
 /// Liveness endpoint path. Exempt from the concurrency guard so that an overloaded node
 /// still reports its real state instead of 503-ing its own health check.
-const HEALTH_PATH: &str = "/_cluster/health";
+pub const HEALTH_PATH: &str = "/_cluster/health";
 use tracing::{error, info, warn};
 
+use crate::authz::Authz;
 use crate::cluster_coordinator::{ClusterCoordinator, GetStatus, OperationType};
 use crate::node_orchestrator::{
     AdminIndexCommitReport, AdminIndexEvictWriterReport, AdminMemoryReport, ClientOp, DocPayload,
@@ -1376,6 +1377,7 @@ pub fn create_router(
     max_concurrent_requests: usize,
     request_timeout_secs: u64,
     admin_enabled: bool,
+    keyring: Arc<crate::auth::KeyRing>,
 ) -> (Router, McpShutdownHandle) {
     let body_limit_bytes = max_body_size_mb * 1024 * 1024;
     let (mcp_routes, mcp_handle) = mcp_router::<AppState>();
@@ -1505,6 +1507,14 @@ pub fn create_router(
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(request_timeout_secs),
+        ))
+        // Authentication and authorization. Inside CORS, so a browser preflight — which
+        // never carries `Authorization` — still gets its headers; outside everything below,
+        // so a flood of unauthenticated requests neither takes a concurrency permit nor has
+        // a body buffered on its behalf.
+        .layer(axum::middleware::from_fn_with_state(
+            keyring,
+            crate::authz::authorize,
         ))
         .layer(cors_layer)
         .layer(TraceLayer::new_for_http());
@@ -2147,8 +2157,22 @@ async fn admin_workers_handler(
     Ok(Json(state.router.admin_worker_stats()?))
 }
 
-/// Handler for cluster health check
-async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResponse>, AppError> {
+/// Handler for cluster health check.
+///
+/// The only public route, and therefore the only one where the response has to depend on who
+/// is asking. An anonymous caller gets liveness and nothing else: node identity, cluster
+/// size, peer counts and index counts are a free reconnaissance report for anyone who can
+/// reach the port, and a load balancer needs none of it. Presenting any valid key — every
+/// role holds `Read` — restores the full body.
+///
+/// A missing [`Authz`] extension means the auth layer is not in the stack, and the minimal
+/// body is the right answer to that too.
+async fn health_handler(
+    State(state): State<AppState>,
+    authz: Option<Extension<Authz>>,
+) -> Result<Response, AppError> {
+    let identified = authz.is_some_and(|Extension(authz)| authz.is_identified());
+
     // Query cluster status from coordinator
     let cluster_status = match state.coordinator.ask(GetStatus).await {
         Ok(status) => Some(status),
@@ -2157,6 +2181,17 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
             None
         }
     };
+
+    let status = cluster_status
+        .as_ref()
+        .map(|s| s.health.clone())
+        .unwrap_or_else(|| "green".to_string());
+
+    if !identified {
+        // Still the *real* status, not a constant: a health check that cannot go yellow is
+        // not a health check, and this is what a load balancer reads.
+        return Ok(Json(serde_json::json!({ "status": status })).into_response());
+    }
 
     // Get basic shard count and node info from orchestrator
     let shard_count = state.router.shard_count().await;
@@ -2210,10 +2245,7 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
     };
 
     let response = HealthResponse {
-        status: cluster_status
-            .as_ref()
-            .map(|s| s.health.clone())
-            .unwrap_or_else(|| "green".to_string()),
+        status,
         node_id,
         node_name,
         cluster_name: cluster_status.as_ref().map(|s| s.cluster_name.clone()),
@@ -2229,7 +2261,7 @@ async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResp
         routing_updates: cluster_status.as_ref().map(|s| s.routing_updates),
     };
 
-    Ok(Json(response))
+    Ok(Json(response).into_response())
 }
 
 /// Handler for schema updates (maintenance API)

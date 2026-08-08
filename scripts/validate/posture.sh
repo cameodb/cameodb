@@ -253,5 +253,78 @@ seed_nodes = ["/ip4/10.0.0.5/udp/9580/quic-v1"]
 data_paths = ["$WORK/data"]
 EOF
 )"
+reject_case "authentication enabled with no keys" "$(cat <<EOF
+[node]
+profile = "local"
+[security]
+enabled = true
+[storage]
+data_paths = ["$WORK/data"]
+EOF
+)"
+reject_case "api key with a hash but no role" "$(cat <<EOF
+[node]
+profile = "local"
+[security]
+enabled = true
+[[security.api_keys]]
+key_hash = "sha256:$(printf 'ab%.0s' {1..32})"
+[storage]
+data_paths = ["$WORK/data"]
+EOF
+)"
+reject_case "api key hash that is not a sha256 digest" "$(cat <<EOF
+[node]
+profile = "local"
+[security]
+enabled = true
+[[security.api_keys]]
+key_hash = "hunter2"
+role = "admin"
+[storage]
+data_paths = ["$WORK/data"]
+EOF
+)"
+
+section "keygen"
+# The one code path that ever sees a key. stdout must be the key and nothing else, so that
+# piping it into a secret store cannot capture stray guidance along with it.
+KEY="$("$BIN" keygen --role writer --label validate 2>"$WORK/keygen.err")"
+if [[ "$KEY" =~ ^cameo_v1_[A-Za-z0-9_-]{43}$ ]]; then
+    pass "keygen prints one well-formed key on stdout"
+else
+    fail "keygen prints one well-formed key on stdout" "$KEY"
+fi
+if grep -q "$KEY" "$WORK/keygen.err"; then
+    fail "the key never appears in the guidance" "keygen echoed the key to stderr as well"
+else
+    pass "the key never appears in the guidance"
+fi
+
+# The stanza keygen prints has to be one check-config accepts — otherwise the tool hands
+# operators a config that does not load.
+KEYGEN_HASH="$(grep -o 'sha256:[0-9a-f]\{64\}' "$WORK/keygen.err" | head -1)"
+cat > "$WORK/keygen.toml" <<EOF
+[node]
+profile = "local"
+[security]
+enabled = true
+[[security.api_keys]]
+key_hash = "$KEYGEN_HASH"
+role = "writer"
+label = "validate"
+[storage]
+data_paths = ["$WORK/data"]
+EOF
+if "$BIN" check-config -c "$WORK/keygen.toml" > "$WORK/keygen.check" 2>&1; then
+    pass "the stanza keygen prints is one check-config accepts"
+else
+    fail "the stanza keygen prints is one check-config accepts" "$(cat "$WORK/keygen.check")"
+fi
+if grep -q "$KEY" "$WORK/keygen.check"; then
+    fail "no key reaches the posture report" "$(cat "$WORK/keygen.check")"
+else
+    pass "no key reaches the posture report"
+fi
 
 summary

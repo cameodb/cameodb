@@ -735,12 +735,15 @@ dependencies = [
  "dirs",
  "flate2",
  "reqwest",
+ "rustls",
  "rustyline",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "storage",
  "tokio",
  "uuid",
+ "zeroize",
  "zip",
 ]
 
@@ -4294,6 +4297,7 @@ dependencies = [
  "arc-swap",
  "axum",
  "axum-server",
+ "base64",
  "bytes",
  "cameodb_mcp",
  "chrono",
@@ -4301,6 +4305,8 @@ dependencies = [
  "cluster",
  "core_affinity",
  "futures",
+ "getrandom 0.3.4",
+ "hex",
  "http-body-util",
  "kameo",
  "libc",
@@ -4312,7 +4318,9 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "serde_json",
+ "sha2 0.10.9",
  "storage",
+ "subtle",
  "tempfile",
  "thiserror 2.0.19",
  "tikv-jemalloc-sys",
@@ -4328,6 +4336,7 @@ dependencies = [
  "uuid",
  "xxhash-rust",
  "yamux 0.14.0",
+ "zeroize",
 ]
 
 [[package]]
