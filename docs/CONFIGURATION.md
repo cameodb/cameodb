@@ -7,6 +7,7 @@ This guide covers comprehensive configuration management for CameoDB, including 
 - [Quick Start](#quick-start)
 - [Configuration Sources](#configuration-sources)
 - [Configuration Reference](#configuration-reference)
+- [Security and Posture](#security-and-posture)
 - [Environment Variables](#environment-variables)
 - [Multi-Disk Setup](#multi-disk-setup)
 - [Performance Tuning](#performance-tuning)
@@ -176,14 +177,144 @@ enabled = true
 bind_address = "0.0.0.0"
 
 # Cluster communication port (default: 9580)
-port = 9580
+# Note the name: `port` under [network.cluster] is not a recognised key and is ignored.
+cluster_port = 9580
 
 # Cluster name for isolation (default: "cameodb-cluster")
 cluster_name = "cameodb-cluster"
 
 # Seed nodes for initial discovery
 seed_nodes = ["10.0.1.5:9580", "10.0.1.6:9580"]
+
+# Pre-shared key for the private peer-to-peer network (libp2p pnet), on top of the Noise
+# encryption every connection already gets. Without it, anyone who can reach the cluster
+# port can join the swarm. Required by the internal and external profiles.
+# Exactly 64 hex characters: openssl rand -hex 32
+psk_file = "/etc/cameodb/cluster.psk"     # or psk = "…" / CAMEODB_CLUSTER_PSK
 ```
+
+Every node in a cluster must carry the same PSK; there is no rotation path short of stopping
+every node. Cluster peers are trusted by this key, which is why API-key index scoping is
+enforced at the HTTP/MCP ingress and is **not** a defense against a compromised peer.
+
+## Security and Posture
+
+Two independent settings: `[node] profile` declares how far this node can be reached and is
+enforced as a set of assertions, and `[security]` decides who may call it.
+
+### Security profiles (`[node] profile`)
+
+The profile is not a preset that rewrites your config — it is a claim the rest of the config
+has to be consistent with. A node whose settings contradict its profile **refuses to start**.
+
+```toml
+[node]
+profile = "internal"   # local | internal | external
+```
+
+| | `local` | `internal` | `external` |
+|---|---|---|---|
+| Reachable from | this machine only | a trusted network | untrusted networks |
+| Bind address | loopback only | any | any |
+| TLS | optional | warned if off | **required** |
+| CORS `"*"` | allowed (warned) | rejected | rejected |
+| `/_admin/*` | allowed | allowed | **must be disabled** |
+| Cluster PSK | warned | **required** | **required** |
+| Authentication | optional | warned if off | **required** |
+
+Choose by who can reach the bind address, not by what the environment is for — a shared test
+box is `internal`, not `local`. Omitting `profile` is valid only for a loopback bind, which
+infers `local`; a node reachable from other hosts must state its posture.
+
+Check a config without starting the node:
+
+```bash
+cameodb check-config -c /etc/cameodb/cameodb.toml
+```
+
+It prints one line per rule (`pass` / `warn` / `fail`) and exits non-zero on any failure, so
+it works as a pre-flight step in a deploy script.
+
+### Authentication (`[security]`)
+
+Off by default. When enabled, every route except liveness requires
+`Authorization: Bearer <key>`; see [API Reference](API_REFERENCE.md#capability-required-per-endpoint) for the
+capability each endpoint needs.
+
+```toml
+[security]
+# Enforce authentication on every route (default: false)
+enabled = true
+
+[[security.api_keys]]
+# The SHA-256 digest of the key — never the key itself
+key_hash = "sha256:1db44a37dcf74ef70439a8887862839803d9686a41fe7c9d75d8fdfa0c72cdb1"
+# admin (everything) | writer (read + write) | reader (read only)
+role = "writer"
+# Audit identity used in logs. Not a secret, not a credential.
+label = "team-a"
+# Optional: restrict this key to these indexes, for any role
+allowed_indexes = ["docs", "wiki"]
+
+[[security.api_keys]]
+# Or keep the digest out of the config file entirely
+key_hash_file = "/etc/cameodb/keys/agent"
+role = "reader"
+label = "agent"
+```
+
+Only digests are stored, so a leaked config file contains nothing that can authenticate. A
+key that is lost is replaced, not recovered.
+
+Roles bundle four capabilities:
+
+| Role | `read` | `write` | `index-admin` | `node-admin` |
+|------|:---:|:---:|:---:|:---:|
+| `admin` | ✅ | ✅ | ✅ | ✅ |
+| `writer` | ✅ | ✅ | | |
+| `reader` | ✅ | | | |
+
+`allowed_indexes` applies on top of the role and holds everywhere a key can reach: naming
+another index is refused, and `/_indexes`, the MCP catalog and the MCP resource list return
+only the indexes that key may see.
+
+The config is validated even when `enabled = false`, so a key stanza cannot be wrong in a way
+you only discover on the day you turn authentication on. These all refuse to start:
+
+- `enabled = true` with no keys — every request would be refused
+- a `key_hash` with no `role`
+- a hash that is not `sha256:<64 hex>`
+- two entries with the same hash — one key cannot hold two roles
+- `allowed_indexes = []`, which reads as "no restriction" but means "no index at all"
+
+### Minting keys
+
+```bash
+# Print the key to stdout and the config stanza to stderr
+cameodb keygen --role writer --label team-a --allowed-indexes docs,wiki
+
+# Or write both files directly (created 0600, never overwritten)
+cameodb keygen --role reader --label agent \
+  --key-out ~/.cameodb/agent.key \          # for the client's --api-key-file
+  --hash-out /etc/cameodb/keys/agent         # for key_hash_file above
+```
+
+Keys are `cameo_v1_` followed by 43 characters — 256 bits from the OS. Anything else is
+rejected before it is hashed, so a passphrase or a UUID can never authenticate regardless of
+what digest is configured.
+
+If the node runs as its own user, `chown` any `key_hash_file` to it: the file is read at
+startup. CameoDB warns if a `key_hash_file` is writable by group or others — a digest is not
+secret, but a writable one lets anyone mint themselves a role.
+
+### Rotation
+
+Keys are read once at startup; there is no hot reload. Rotating is therefore:
+
+1. `cameodb keygen` a replacement and add it as a second `[[security.api_keys]]` entry
+2. Restart, so the node accepts both
+3. Move clients across
+4. Remove the old entry and restart again
 
 ## Environment Variables
 
@@ -201,6 +332,16 @@ CameoDB supports environment variable overrides for all major settings. Prefix v
 - `CAMEODB_CLUSTER_BIND_ADDRESS`: Cluster bind address
 - `CAMEODB_CLUSTER_NAME`: Cluster name
 - `CAMEODB_SEED_NODES`: Comma-separated list of seed nodes
+- `CAMEODB_CLUSTER_PSK`, `CAMEODB_CLUSTER_PSK_FILE`: Cluster pre-shared key, or a file holding it
+
+### Security Configuration
+- `CAMEODB_SECURITY_ENABLED`: Enforce authentication (`true`/`false`)
+- `CAMEODB_API_KEY_HASH`: A single key digest, for a node configured entirely from the environment
+- `CAMEODB_API_KEY_ROLE`: The role for `CAMEODB_API_KEY_HASH` (required with it)
+- `CAMEODB_PROFILE`: Security profile (`local`/`internal`/`external`)
+
+There is deliberately no `CAMEODB_API_KEY` on the server: a node never needs a key in the
+clear, only digests. That variable is read by the **client**.
 
 ### Storage Configuration
 - `CAMEODB_DATA_PATHS`: Colon-separated list of data paths
@@ -318,13 +459,35 @@ search_threads = 32
 [node]
 label = "cameo-prod-01"
 zone = "us-east-1a"
+# Required for a non-loopback bind. "external" is the strictest: TLS, authentication and
+# admin endpoints off are all enforced, and the node refuses to start without them.
+profile = "external"
 
 [network.http]
 port = 9480
 bind_address = "0.0.0.0"
 request_timeout_secs = 60
 max_body_size_mb = 50
-cors_allowed_origins = []  # Disable in production for security
+cors_allowed_origins = []  # "*" is rejected by internal and external
+admin_enabled = false      # required off by the external profile
+
+[network.http.tls]
+enabled = true
+cert_file = "/etc/cameodb/certs/cert.pem"
+key_file = "/etc/cameodb/certs/key.pem"
+
+[security]
+enabled = true
+
+[[security.api_keys]]
+key_hash_file = "/etc/cameodb/keys/ops"   # cameodb keygen --role admin --hash-out …
+role = "admin"
+label = "ops"
+
+[[security.api_keys]]
+key_hash_file = "/etc/cameodb/keys/ingest"
+role = "writer"
+label = "ingest"
 
 [storage]
 data_paths = ["/data/cameodb"]  # Dedicated data volume
@@ -345,8 +508,19 @@ default_search_limit = 10
 
 [network.cluster]
 enabled = true
+cluster_port = 9580
 cluster_name = "cameodb-production"
 seed_nodes = ["10.0.1.5:9580", "10.0.1.6:9580"]
+# Required by internal and external whenever the cluster is enabled: without it, anyone who
+# can reach the cluster port can join the swarm. Generate with `openssl rand -hex 32`.
+psk_file = "/etc/cameodb/cluster.psk"
+```
+
+Verify it before the service starts — this config refuses to boot if any of the above is
+missing or inconsistent:
+
+```bash
+cameodb check-config -c /etc/cameodb/cameodb.toml
 ```
 
 ### System Requirements
@@ -437,7 +611,8 @@ RUST_LOG=debug cargo run --release --bin cameodb
 
 ```bash
 ./scripts/setup/config-manager.sh generate
-# Edit data_paths, memory limits, and security settings
+# Edit data_paths, memory limits, and the [security] section — a non-loopback bind needs a
+# declared profile, and internal/external both require decisions about TLS and keys
 ```
 
 ### High-Performance

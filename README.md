@@ -59,7 +59,7 @@ CameoDB supports native HTTPS via rustls for encrypted client connections. This 
 
 ### Quick Start with TLS
 
-1. **Generate a self-signed certificate** (for testing/development):
+1. **Generate a self-signed certificate** (for development or a test node — nothing verifies it, so both ends have to be yours):
 ```bash
 # Create a self-signed certificate and private key
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes \
@@ -160,7 +160,7 @@ When connecting to a TLS-enabled CameoDB server:
 # Interactive CLI with HTTPS
 cameodb client --interactive --connect https://localhost:9480
 
-# For self-signed certificates (development only)
+# Only for a self-signed certificate you issued yourself, on a node you control
 cameodb client --interactive --connect https://localhost:9480 --insecure
 ```
 
@@ -193,7 +193,7 @@ your writes, which is what a single combined flag did.
 
 ### Security Considerations
 
-- **Certificate Validation**: Clients validate server certificates by default. Use `--insecure` only for development.
+- **Certificate Validation**: Clients validate server certificates by default. `--insecure` accepts an unverified certificate, so use it only for a certificate you issued yourself on a node you control — never to work around a validation failure you did not expect.
 - **TLS Stack**: rustls with the `ring` provider on both sides. Outbound HTTPS from the client verifies against the OS trust store (`rustls-platform-verifier`), so a corporate CA installed system-wide is honoured. No OpenSSL, vendored or otherwise.
 - **Key Permissions**: Ensure private key files have restricted permissions (`chmod 600 key.pem`).
 - **Certificate Rotation**: Update certificates before expiration; CameoDB requires restart to load new certificates.
@@ -269,6 +269,15 @@ The key is printed once to stdout and the `[[security.api_keys]]` stanza to stde
 roles bundle four capabilities — `admin` (everything), `writer` (read and write), `reader`
 (read only) — and `allowed_indexes` restricts a key to named indexes for every role.
 
+`--key-out` and `--hash-out` write the two files the rest of the design already expects,
+created `0600` and never overwritten:
+
+```bash
+cameodb keygen --role writer --label team-a \
+  --key-out ~/.cameodb/team-a.key \        # for the client's --api-key-file
+  --hash-out /etc/cameodb/keys/team-a       # for the config's key_hash_file
+```
+
 ```toml
 [security]
 enabled = true
@@ -293,16 +302,20 @@ The client will not send a key over plaintext HTTP to anything but loopback — 
 `--allow-plaintext-key` when the hop is already protected by a tunnel or a mesh. In the
 interactive shell, a key is bound to the origin it was given for: `connect` elsewhere drops
 it rather than handing your credential to whatever host was typed, and `connect` back
-restores it.
+restores it. `key file <path>`, `key show` and `key clear` change the credential mid-session.
 
 Scoping holds everywhere a key can reach, not only where it names an index: `/_indexes` and
 the MCP catalog list only the indexes a key may see, each MCP tool is checked against the
 capability it needs and the index it names, and an MCP session may only be continued by the
 key that opened it.
 
+`tools/list` advertises only the tools a caller could actually call, so an agent is never
+offered one that will be refused.
+
 Not yet: an MCP client presents its key as an HTTP header, so a client that cannot set one
-cannot authenticate. Every MCP tool today is a read — the capability table denies by
-default, so a write tool added later fails closed until it is classified.
+cannot authenticate. Keys are read at startup — adding or revoking one means add, migrate,
+remove, restart. Every MCP tool today is a read; the capability table denies by default, so
+a write tool added later fails closed until it is classified.
 
 ### Security profiles
 
@@ -324,10 +337,14 @@ profile = "internal"   # local | internal | external
 | Cluster PSK | warned | **required** | **required** |
 | Authentication | optional | warned if off | **required** |
 
-Choose by who can reach the bind address, not by what the environment is for: a shared test
-box is `internal`, not `local`. Omitting `profile` is valid only for a loopback bind, which
-infers `local`; a node reachable from other hosts must state its posture. Check a config
-without starting the node:
+Choose by who can reach the bind address, not by what the environment is for. The names are
+deliberately not `dev` / `staging` / `prod`: every rule keys off the bind address, so a
+lifecycle name invites picking by what the box is *for* and being rejected for it. A test node
+other people can reach is `internal`; `local` means loopback and nothing else, whether it is
+running a test suite or a production single-node deployment on the same host as its client.
+
+Omitting `profile` is valid only for a loopback bind, which infers `local`; a node reachable
+from other hosts must state its posture. Check a config without starting the node:
 
 ```bash
 cameodb check-config -c cameodb.toml

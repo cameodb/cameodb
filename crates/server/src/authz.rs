@@ -202,18 +202,6 @@ impl Authz {
             _ => None,
         }
     }
-
-    /// The caller's index scope, or `None` when every index is in reach.
-    ///
-    /// `Anonymous` maps to "unrestricted" rather than "nothing", which is safe only because
-    /// an anonymous caller cannot reach any route that lists indexes — `/_cluster/health` is
-    /// the sole public route, and it names no index.
-    pub fn index_scope(&self) -> Option<&KeyEntry> {
-        match self {
-            Authz::Key(entry) if entry.is_index_scoped() => Some(entry),
-            _ => None,
-        }
-    }
 }
 
 /// The same identity, in the vocabulary the mcp crate understands.
@@ -229,7 +217,11 @@ impl McpAuthz for Authz {
 
     fn allows_index(&self, index: &str) -> bool {
         match self {
-            Authz::Disabled | Authz::Anonymous => true,
+            Authz::Disabled => true,
+            // The MCP door requires `Read`, so an anonymous caller never gets here. Denying
+            // anyway costs nothing and means the guarantee does not depend on that argument
+            // staying true.
+            Authz::Anonymous => false,
             Authz::Key(entry) => entry.allows_index(index),
         }
     }
@@ -242,9 +234,9 @@ impl McpAuthz for Authz {
             McpCapability::NodeAdmin => Capability::NodeAdmin,
         };
         match self {
-            // Auth off: nothing to enforce. Anonymous never reaches MCP — the door requires
-            // `Read` — so the arm exists to be total, not to be used.
-            Authz::Disabled | Authz::Anonymous => true,
+            // Auth off: nothing to enforce.
+            Authz::Disabled => true,
+            Authz::Anonymous => false,
             Authz::Key(entry) => entry.has(capability),
         }
     }
@@ -260,10 +252,16 @@ impl McpAuthz for Authz {
 /// it `index`. Both are accepted, and an entry with **neither** is dropped — a listing whose
 /// shape has changed underneath this function must lose entries, not leak them.
 pub fn filter_index_listing(value: &mut serde_json::Value, authz: &Authz) {
-    let Some(entry) = authz.index_scope() else {
-        return;
-    };
-    retain_indexes(value, &|index| entry.allows_index(index));
+    match authz {
+        // Nothing to enforce: no key means no scope.
+        Authz::Disabled => {}
+        // Deny, not "unrestricted". No listing route is `Public`, so this is unreachable
+        // today — which is exactly why it must not be the permissive branch. The day one is
+        // made public, an anonymous caller gets an empty list rather than the catalogue.
+        Authz::Anonymous => retain_indexes(value, &|_| false),
+        Authz::Key(entry) if !entry.is_index_scoped() => {}
+        Authz::Key(entry) => retain_indexes(value, &|index| entry.allows_index(index)),
+    }
 }
 
 /// The same filtering for an MCP caller.
@@ -364,6 +362,35 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Decide a single request. Split out from the layer so it is testable without a server.
+/// How many unauthenticated requests have been refused since startup.
+///
+/// Process-wide rather than threaded through the middleware state: there is one ingress per
+/// process, and the thing being bounded is log volume, which is also process-wide.
+static UNAUTHENTICATED_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the `n`th refusal gets a line of its own.
+///
+/// An unauthenticated request is cheap to send and, until now, wrote a `warn!` each time —
+/// so anyone who could reach the port could fill the disk with a loop. Logging the first few,
+/// then powers of two, then every hundred thousand keeps the signal (something is probing)
+/// and drops the volume: a million attempts produce about thirty lines instead of a million.
+/// The periodic floor exists because powers of two alone go silent for ever-longer stretches
+/// — at a billion the next one is a billion away.
+///
+/// Only the *unauthenticated* refusals are thinned. A 403 needs a valid key first, so its
+/// volume is bounded by someone who already holds credentials — which is precisely the event
+/// worth keeping one line per.
+fn should_log_refusal(n: u64) -> bool {
+    n <= 3 || n.is_power_of_two() || n.is_multiple_of(100_000)
+}
+
+/// Count a refusal and report the running total when this one is worth a line.
+fn note_unauthenticated_refusal() -> Option<u64> {
+    let count = UNAUTHENTICATED_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    should_log_refusal(count).then_some(count)
+}
+
 fn decide(
     keyring: &KeyRing,
     method: &str,
@@ -382,7 +409,12 @@ fn decide(
         return match classified.as_ref().map(|c| c.access) {
             Some(Access::Public) => Ok(Authz::Anonymous),
             _ => {
-                debug!(%method, %path, "auth: request carried no API key");
+                if let Some(total) = note_unauthenticated_refusal() {
+                    warn!(
+                        %method, %path, refused_so_far = total,
+                        "auth: refused a request carrying no API key"
+                    );
+                }
                 Err(Refusal::unauthorized(
                     "this endpoint requires an API key: Authorization: Bearer <key>",
                 ))
@@ -391,7 +423,12 @@ fn decide(
     };
 
     let Some(entry) = keyring.authenticate(token) else {
-        warn!(%method, %path, "auth: rejected an unrecognised API key");
+        if let Some(total) = note_unauthenticated_refusal() {
+            warn!(
+                %method, %path, refused_so_far = total,
+                "auth: rejected an unrecognised API key"
+            );
+        }
         return Err(Refusal::unauthorized(
             "the API key presented is not recognised",
         ));
@@ -959,11 +996,50 @@ mod tests {
             "indexes": [{"name": "docs"}, {"name": "payroll"}],
             "total_indexes": 2,
         });
-        for authz in [Authz::Disabled, Authz::Anonymous, scoped_as(None)] {
+        for authz in [Authz::Disabled, scoped_as(None)] {
             let mut listing = full.clone();
             filter_index_listing(&mut listing, &authz);
             assert_eq!(listing, full, "{authz:?} should see everything");
         }
+    }
+
+    #[test]
+    fn the_refusal_log_thins_out_instead_of_growing_without_bound() {
+        // A loop of unauthenticated requests must not be a way to fill the disk. What has to
+        // survive the thinning is the fact that probing is happening, not every instance.
+        let logged = (1..=1_000_000u64)
+            .filter(|n| should_log_refusal(*n))
+            .count();
+        assert!(logged < 40, "{logged} lines for a million attempts");
+
+        // The first few always, so a misconfigured client is diagnosable immediately.
+        for n in 1..=3 {
+            assert!(should_log_refusal(n), "{n}");
+        }
+        assert!(should_log_refusal(4));
+        assert!(!should_log_refusal(5));
+        // And it never goes silent: there is always another line coming.
+        assert!((1_000_001..=1_100_000u64).any(should_log_refusal));
+    }
+
+    #[test]
+    fn an_anonymous_caller_is_denied_rather_than_left_unrestricted() {
+        // Unreachable today: no listing route and no MCP route is `Public`. The point is that
+        // the guarantee should not rest on that — a route reclassified later must not turn
+        // this into the catalogue for anyone who can reach the port.
+        let mut listing = serde_json::json!({
+            "indexes": [{"name": "docs"}, {"name": "payroll"}],
+            "total_indexes": 2,
+        });
+        filter_index_listing(&mut listing, &Authz::Anonymous);
+        assert_eq!(listing["indexes"].as_array().unwrap().len(), 0);
+        assert_eq!(listing["total_indexes"], 0);
+
+        assert!(!McpAuthz::allows_index(&Authz::Anonymous, "docs"));
+        assert!(!Authz::Anonymous.has(McpCapability::Read));
+        // Auth off is the one case that is genuinely unrestricted.
+        assert!(McpAuthz::allows_index(&Authz::Disabled, "docs"));
+        assert!(Authz::Disabled.has(McpCapability::NodeAdmin));
     }
 
     #[test]

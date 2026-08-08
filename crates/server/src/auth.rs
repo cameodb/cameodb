@@ -447,6 +447,42 @@ impl SecurityConfig {
 /// and grant yourself a role, which is worse than either. Warn rather than refuse, for the
 /// same reason the PSK check does: refusing over a permission bit would strand deployments
 /// whose secrets are managed by an orchestrator.
+/// Write `contents` to a file that must not already exist, readable only by its owner.
+///
+/// `create_new` rather than a check-then-write: it is atomic, and it means the answer to
+/// "what if the file is already there" is decided by the kernel rather than by a race. The
+/// mode is set at creation, so there is no window in which the file exists with a wider one.
+fn write_new_secret_file(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::AlreadyExists => anyhow::anyhow!(
+            "{} already exists. Refusing to overwrite it — remove it deliberately, or write \
+             to a new path",
+            path.display()
+        ),
+        _ => anyhow::anyhow!("cannot create {}: {err}", path.display()),
+    })?;
+    writeln!(file, "{contents}").with_context(|| format!("cannot write {}", path.display()))?;
+
+    #[cfg(not(unix))]
+    eprintln!(
+        "⚠️  {} was created without restricting its permissions — this platform has no mode \
+         to set. Restrict it yourself.",
+        path.display()
+    );
+
+    Ok(())
+}
+
 fn read_key_hash_file(path: &Path) -> Result<String> {
     if !path.exists() {
         bail!("file not found: {}", path.display());
@@ -622,20 +658,29 @@ cameodb keygen — mint an API key
 
 Usage:
   cameodb keygen --role <admin|writer|reader> [--label <NAME>] [--allowed-indexes <A,B>]
+                 [--key-out <PATH>] [--hash-out <PATH>]
 
 Options:
   --role <ROLE>             admin (everything), writer (read and write), reader (read only)
   --label <NAME>            Audit identity for logs — a team or service name, not a secret
   --allowed-indexes <A,B>   Restrict this key to these indexes (default: every index)
+  --key-out <PATH>          Write the key to PATH (mode 0600) instead of stdout.
+                            For `client --api-key-file`.
+  --hash-out <PATH>         Write the digest to PATH (mode 0600), for `key_hash_file`.
   -h, --help                Show this message
 
-The key is printed to stdout and everything else to stderr, so redirecting stdout captures
-just the key. It is not stored anywhere: only its SHA-256 digest goes into the config, and
-a lost key is replaced rather than recovered.";
+Without --key-out the key is printed to stdout and everything else to stderr, so redirecting
+stdout captures just the key. Either way it is stored nowhere else: only its SHA-256 digest
+belongs in the config, and a lost key is replaced rather than recovered.
+
+Neither --key-out nor --hash-out will overwrite an existing file — replacing a key in place
+is how a working node stops working.";
 
     let mut role: Option<Role> = None;
     let mut label: Option<String> = None;
     let mut allowed_indexes: Option<Vec<String>> = None;
+    let mut key_out: Option<PathBuf> = None;
+    let mut hash_out: Option<PathBuf> = None;
 
     let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
@@ -674,6 +719,8 @@ a lost key is replaced rather than recovered.";
                 }
                 allowed_indexes = Some(parsed);
             }
+            "--key-out" => key_out = Some(PathBuf::from(value("--key-out")?)),
+            "--hash-out" => hash_out = Some(PathBuf::from(value("--hash-out")?)),
             other => bail!("unknown option: {other}\n\n{USAGE}"),
         }
     }
@@ -700,7 +747,17 @@ a lost key is replaced rather than recovered.";
         bail!("internal error: a freshly minted key does not verify against its own digest");
     }
 
-    println!("{}", key.expose());
+    // Files first. A key printed and then not written is a key the operator has to notice
+    // was never saved; a key written and then printed is at worst printed twice.
+    if let Some(path) = &hash_out {
+        write_new_secret_file(path, &digest.to_config_value())
+            .with_context(|| format!("--hash-out {}", path.display()))?;
+    }
+    match &key_out {
+        Some(path) => write_new_secret_file(path, key.expose())
+            .with_context(|| format!("--key-out {}", path.display()))?,
+        None => println!("{}", key.expose()),
+    }
 
     let mut stanza = String::new();
     stanza.push_str("  [[security.api_keys]]\n");
@@ -714,23 +771,46 @@ a lost key is replaced rather than recovered.";
         stanza.push_str(&format!("  allowed_indexes = [{}]\n", list.join(", ")));
     }
 
+    let whereabouts = match &key_out {
+        Some(path) => format!("The key was written to {} (mode 0600).", path.display()),
+        None => "The key above was printed to stdout and is not stored anywhere. Copy it now."
+            .to_string(),
+    };
+
+    // What to put in the config: the file that was just written, if there is one, or the
+    // literal hash and the command to put it in a file.
+    let config_advice = match &hash_out {
+        Some(path) => format!(
+            "  [[security.api_keys]]\n  \
+             key_hash_file = \"{}\"\n  \
+             role = \"{role}\"\n\n\
+             If the node runs as another user, chown that file to it — the server reads it at \
+             startup.\n",
+            path.display(),
+            role = role,
+        ),
+        None => format!(
+            "{stanza}\n\
+             Or keep the hash out of the config file:\n\n  \
+             cameodb keygen --role {role} --hash-out /etc/cameodb/keys/{file}\n\n  \
+             [[security.api_keys]]\n  \
+             key_hash_file = \"/etc/cameodb/keys/{file}\"\n  \
+             role = \"{role}\"\n",
+            stanza = stanza,
+            role = role,
+            file = label.as_deref().unwrap_or("cameodb"),
+        ),
+    };
+
     eprintln!(
-        "\nThe key above was printed to stdout and is not stored anywhere. Copy it now.\n\n\
+        "\n{whereabouts}\n\n\
          Add to cameodb.toml:\n\n  \
          [security]\n  \
          enabled = true\n\n\
-         {stanza}\n\
-         Or keep the hash out of the config file:\n\n  \
-         (umask 077; printf '%s\\n' '{hash}' > /etc/cameodb/keys/{file})\n\n  \
-         [[security.api_keys]]\n  \
-         key_hash_file = \"/etc/cameodb/keys/{file}\"\n  \
-         role = \"{role}\"\n\n\
-         Note: requests are not checked against this yet — the middleware is ROADMAP Phase 14\n\
-         Stage B1 step 2. `cameodb check-config` already validates and reports the stanza.",
-        stanza = stanza,
-        hash = digest.to_config_value(),
-        file = label.as_deref().unwrap_or("cameodb"),
-        role = role,
+         {config_advice}\n\
+         `cameodb check-config` reports what the node will enforce with this key in place.",
+        whereabouts = whereabouts,
+        config_advice = config_advice,
     );
 
     Ok(())

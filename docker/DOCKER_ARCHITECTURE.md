@@ -56,10 +56,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Corporate CA certificate support (Zscaler)
-RUN --mount=type=secret,id=zscaler,dst=/usr/local/share/ca-certificates/Zscaler.crt \
-    if [ -f /usr/local/share/ca-certificates/Zscaler.crt ]; then \
-        cat /usr/local/share/ca-certificates/Zscaler.crt >> /etc/ssl/certs/ca-certificates.crt && \
+# Corporate CA certificate support (any TLS-intercepting proxy: Zscaler, Netskope, …)
+RUN --mount=type=secret,id=corporate-ca,dst=/usr/local/share/ca-certificates/corporate-ca.crt \
+    if [ -f /usr/local/share/ca-certificates/corporate-ca.crt ]; then \
+        cat /usr/local/share/ca-certificates/corporate-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \
         update-ca-certificates; \
     fi
 

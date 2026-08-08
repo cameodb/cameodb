@@ -35,7 +35,12 @@ admin_enabled = true
 # Authentication. Off by default; when on, every route except /_cluster/health requires
 # `Authorization: Bearer <key>`. Only digests are stored here, so this file never holds a
 # usable credential — mint keys with `cameodb keygen --role <admin|writer|reader>`, which
-# prints the key once and the stanza to paste.
+# prints the key once and the stanza to paste. Add --hash-out <path> and --key-out <path> to
+# write the digest and the key as 0600 files instead of copying them by hand.
+#
+# A key is scoped by its role and, optionally, by allowed_indexes — which holds through
+# enumeration too: /_indexes and the MCP catalog return only what a key may see. MCP is
+# authorized per tool and per index, and a session belongs to the key that opened it.
 [security]
 enabled = false
 

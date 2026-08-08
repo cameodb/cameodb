@@ -1,7 +1,9 @@
 [node]
 label = "cameodb"
 zone = "default"
-# Security posture: dev (loopback only) | internal (trusted network) | exposed (untrusted).
+# Security posture: local (loopback only) | internal (trusted network) | external (untrusted).
+# Describes reach, not a lifecycle stage — pick by who can reach bind_address below, not by
+# whether this node is for development, testing or production.
 # Enforced at startup; run `cameodb check-config` to see the resolved rules.
 profile = "internal"
 
@@ -11,10 +13,12 @@ port = 9480
 request_timeout_secs = 30
 max_body_size_mb = 64
 # Browser origins allowed to call this node. Empty means no cross-origin access, which
-# is what API and MCP clients want; "*" is rejected outside the dev profile.
+# is what API and MCP clients want; "*" is rejected outside the local profile.
 cors_allowed_origins = []
 max_concurrent_requests = 128
-# /_admin/* is unauthenticated; keep it off where the node is reachable off-box.
+# Mount the /_admin/* routes. They are unauthenticated unless [security] is enabled, in
+# which case they require a key holding node-admin. Keep them off where the node is
+# reachable off-box and authentication is not on.
 admin_enabled = true
 
 [network.cluster]

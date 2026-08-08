@@ -7,7 +7,7 @@ services:
       context: ..
       dockerfile: Dockerfile
       secrets:
-        - zscaler
+        - corporate-ca
     image: cameodb:latest
     container_name: cameodb-node1
     user: "65532:65532"
@@ -54,7 +54,7 @@ services:
       context: ..
       dockerfile: Dockerfile
       secrets:
-        - zscaler
+        - corporate-ca
     image: cameodb:latest
     container_name: cameodb-node2
     user: "65532:65532"
@@ -102,7 +102,7 @@ services:
       context: ..
       dockerfile: Dockerfile
       secrets:
-        - zscaler
+        - corporate-ca
     image: cameodb:latest
     container_name: cameodb-node3
     user: "65532:65532"
@@ -188,5 +188,14 @@ networks:
         - subnet: 172.20.0.0/16
 
 secrets:
-  zscaler:
-    file: /usr/local/share/ca-certificates/Zscaler.crt
+  # Must be named `corporate-ca`: that is the secret id the Dockerfile mounts. A mismatch is
+  # silent — the build simply reports "No corporate CA certificate provided" and produces an
+  # image that cannot reach a TLS-intercepting proxy.
+  #
+  # Behind a TLS-intercepting proxy, point CAMEODB_CA_CERT at your CA file (Zscaler,
+  # Netskope, an internal root, …):
+  #   CAMEODB_CA_CERT=/usr/local/share/ca-certificates/corporate-ca.crt docker compose build
+  # The default is /dev/null, so a build with no corporate CA needs nothing set: the mount
+  # succeeds, the file is empty, and the Dockerfile skips it.
+  corporate-ca:
+    file: ${CAMEODB_CA_CERT:-/dev/null}

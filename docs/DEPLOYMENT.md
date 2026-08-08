@@ -203,6 +203,103 @@ docker-compose logs -f
 docker-compose down -v
 ```
 
+## 🔐 Securing a Deployment
+
+Authentication is off by default, and a `local` node is allowed to stay that way. Anything
+reachable from another host should not.
+
+### Before you start the node
+
+```bash
+cameodb check-config -c /etc/cameodb/cameodb.toml
+```
+
+One line per rule, non-zero exit on any failure — run it in the deploy step, before the
+service starts. A node whose config contradicts its `[node] profile` refuses to boot rather
+than starting in a posture you did not ask for; `external` will not start without TLS,
+authentication, and `/_admin/*` disabled. See
+[Configuration → Security and Posture](CONFIGURATION.md#security-and-posture).
+
+### Key material on disk
+
+```bash
+sudo install -d -o cameodb -g cameodb -m 700 /etc/cameodb/keys
+
+# Writes the digest for the server, and the key for whoever will use it.
+# Both 0600; neither is ever overwritten.
+sudo -u cameodb cameodb keygen --role writer --label ingest \
+  --hash-out /etc/cameodb/keys/ingest \
+  --key-out /tmp/ingest.key
+
+# Hand /tmp/ingest.key to its owner over a channel you trust, then remove it.
+```
+
+```toml
+[security]
+enabled = true
+
+[[security.api_keys]]
+key_hash_file = "/etc/cameodb/keys/ingest"
+role = "writer"
+label = "ingest"
+```
+
+| File | Mode | Owner | Why |
+|------|------|-------|-----|
+| `/etc/cameodb/keys/*` | `600` | the service user | Read at startup. A digest is not secret, but a **writable** one lets anyone mint themselves a role — CameoDB warns if group or others can write it |
+| `/etc/cameodb/cameodb.toml` | `640` | root:cameodb | Holds digests and paths, never a key |
+| A client's key file | `600` | the human or service using it | This one *is* the credential. The client warns if anyone else can read it |
+
+Only digests ever reach the server. A key exists in the clear exactly twice: on the terminal
+that minted it, and wherever its holder stores it.
+
+### Configuring from the environment
+
+For a node whose config comes from a secret manager rather than a file, one key can be
+supplied entirely through the environment:
+
+```ini
+# /etc/cameodb/cameodb.env  (0640 root:cameodb)
+CAMEODB_SECURITY_ENABLED=true
+CAMEODB_API_KEY_HASH=sha256:1db44a37dcf74ef70439a8887862839803d9686a41fe7c9d75d8fdfa0c72cdb1
+CAMEODB_API_KEY_ROLE=admin
+```
+
+```ini
+# systemctl edit cameodb
+[Service]
+EnvironmentFile=/etc/cameodb/cameodb.env
+```
+
+There is no `CAMEODB_API_KEY` on the server side on purpose: a node never needs a key in the
+clear. That variable belongs to the client.
+
+### Rotation
+
+Keys are read once at startup — there is no hot reload, and no way to revoke a key without a
+restart. Plan for two restarts:
+
+1. `keygen` the replacement and add it as a second `[[security.api_keys]]` entry
+2. Restart — the node now accepts both keys
+3. Move clients across
+4. Remove the old entry and restart again
+
+Rolling this across a cluster is a rolling restart, one node at a time; a node with the new
+key configured still accepts the old one until step 4.
+
+### What this does not cover
+
+Worth stating plainly before you rely on it:
+
+- **Cluster peers are trusted by the PSK, not by API keys.** Peer-to-peer traffic is
+  kameo-over-libp2p with Noise, and `allowed_indexes` is not a defense against a compromised
+  cluster member — it is enforced at the HTTP/MCP ingress, where identity exists.
+- **The cluster PSK has no rotation path.** Changing it means stopping every node.
+- **No lockout or throttle on failed authentication.** Against a 256-bit key it buys nothing
+  and is itself a denial-of-service lever. Refusals are counted and logged instead.
+- **An MCP client authenticates with an HTTP header or not at all.** No OAuth flow, no
+  per-client credential issuance.
+
 ## 🐧 Production Deployment with systemd
 
 CameoDB ships with a systemd service file (`crates/server/cameodb.service`) configured for production workloads with jemalloc memory tuning.
@@ -237,6 +334,9 @@ Environment=MALLOC_CONF=background_thread:true,percpu_arena:percpu,oversize_thre
 CameoDB exposes memory management endpoints for runtime diagnostics and manual intervention:
 
 ```bash
+# On a node with authentication enabled these need a key holding node-admin,
+# which in practice means an admin key: -H "Authorization: Bearer $CAMEODB_API_KEY"
+
 # Get process + jemalloc memory statistics
 curl -s http://localhost:9480/_admin/memory
 
@@ -247,7 +347,14 @@ curl -s -X POST http://localhost:9480/_admin/memory/purge
 curl -s -X POST 'http://localhost:9480/_admin/memory/purge?force=true'
 ```
 
+Or through the client, which reads `CAMEODB_API_KEY` / `--api-key-file` itself:
+
+```bash
+cameodb client admin memory stats
+cameodb client admin memory purge --force
+```
+
 These endpoints are useful after large bulk ingestions to verify memory has been returned to the OS, or during memory pressure investigations.
 
-For more details, see the [Docker README](docker/README.md), which includes the latest swarm environment variables and configuration guidance.
+For more details, see the [Docker README](../docker/README.md), which includes the latest swarm environment variables and configuration guidance.
 

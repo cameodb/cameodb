@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed (security)
+- **Corporate CA certificates were silently dropped by both compose files.** The `zscaler` →
+  `corporate-ca` rename reached the Dockerfiles but not `docker-compose.yml`,
+  `docker-compose-cluster.yml` or `docs/BUILDING.md`, and a secret id that does not match the
+  one the Dockerfile mounts fails without an error — the build reports "No corporate CA
+  certificate provided" and produces an image that cannot reach a TLS-intercepting proxy. All
+  of them now use `corporate-ca`, sourced from `CAMEODB_CA_CERT` (default `/dev/null`, so a
+  build with no corporate CA needs nothing set). `scripts/build/docker-push.sh` reads the same
+  variable; its hardcoded path had also disagreed with the one the docs told you to use.
+- **The shipped Docker config could not start.** It declared no `[node] profile` while binding
+  `0.0.0.0`, which the posture check refuses rather than guessing at — so the example config
+  failed the gate the same release added. Now `profile = "internal"`, which is what a published
+  container port actually is, with `cors_allowed_origins = []` to match.
+- **`port` under `[network.cluster]` was silently ignored.** The field is `cluster_port`, and
+  unrecognised keys were not reported, so every shipped config and the configuration guide set
+  a cluster port that had no effect.
+- **Unrecognised-key detection reported every `Option` field as a typo.** The schema it
+  compared against was built by serializing to TOML, which drops `None`, so `node.profile`,
+  `tls.cert_file`, `tls.key_file` and `cluster.psk_file` were all flagged as unknown settings.
 - **TLS never worked.** The server panicked on every HTTPS startup — `axum-server/tls-rustls`
   force-enables `rustls/aws-lc-rs` while libp2p-quic enables `rustls/ring`, and rustls 0.23
   refuses to choose between two providers. The panic landed after the startup banner, so a
@@ -33,6 +51,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail early rather than mid-flight.
 
 ### Added
+- **API key authentication.** Off by default. With `[security] enabled = true`, every route
+  except `/_cluster/health` requires `Authorization: Bearer <key>`. Keys are `cameo_v1_`
+  followed by 256 bits of OS entropy; the config stores only `sha256:<hex>`, compared in
+  constant time, so a leaked config file holds nothing that can authenticate. The key-shape
+  check runs before hashing, which is what makes an unsalted digest defensible: a passphrase
+  or a UUID can never authenticate regardless of what digest is configured.
+  - `cameodb keygen --role <admin|writer|reader>` mints one, printing the key to stdout and
+    the config stanza to stderr. `--key-out` / `--hash-out` write the two files instead —
+    `0600`, never overwriting an existing one.
+  - Three roles bundle four capabilities: `admin` (all), `writer` (read + write), `reader`
+    (read). `allowed_indexes` restricts a key to named indexes for any role.
+  - Authorization is one route table and one middleware in front of the router, mounted
+    inside CORS and outside the timeout, concurrency guard and body limits — a refused
+    request takes no permit and buffers no body. Deny by default: an unclassified path needs
+    a key like any other, so no handler can forget to check because no handler checks. Unit
+    tests read the router's own source and fail the build if a route has no row.
+  - Scoping holds through enumeration, not only when an index is named: `/_indexes`,
+    `/_cluster/_indexes`, the MCP catalog and the MCP resource list return only what a key
+    may see, counts included.
+  - MCP is authorized per tool and per index, not just at the endpoint, with a capability
+    table that denies by default. Sessions are bound to the key that opened them on all three
+    verbs, and `tools/list` advertises only what the caller could call.
+  - An anonymous caller gets `{"status": …}` from the health endpoint and nothing more. Node
+    identity and cluster shape are free reconnaissance for anyone who can reach the port.
+  - `--api-key`, `--api-key-file` and `CAMEODB_API_KEY` on the client, with the key in the
+    HTTP client's default headers so no call site can omit it — and never on the client used
+    for remote data sources. `--allow-plaintext-key` is deliberately separate from
+    `--insecure`: one accepts a bad certificate on an encrypted connection, the other puts a
+    bearer token on the wire in the clear. In the REPL a key is bound to its origin, and
+    `key file <path>` / `key show` / `key clear` change it mid-session.
+  - Rotation is add key → restart → migrate clients → remove key → restart. Keys are read at
+    startup; there is no hot reload, and no lockout on failed authentication (against a
+    256-bit key it buys nothing and is itself a denial-of-service lever).
 - **Security posture profiles.** `[node] profile = "local" | "internal" | "external"`
   declares how far a node can be reached; the server enforces the matching rules and refuses
   to start if the config contradicts them. Profiles assert, they never rewrite values.
@@ -47,7 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--insecure-source` on the client, separate from `--insecure`. Accepting an untrusted
   data source no longer disables verification on the connection to CameoDB itself.
 - [`scripts/validate/`](scripts/validate/README.md): manual validation suite (deps, unit,
-  posture, tls, remote-sources) with a single `all.sh` entry point, plus
+  posture, auth, tls, remote-sources) with a single `all.sh` entry point, plus
   [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md). There is no CI by design; this is the gate.
 
 ### Changed

@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Trust corporate CA certificate if provided (for TLS-intercepting proxies)
 RUN --mount=type=secret,id=corporate-ca,dst=/usr/local/share/ca-certificates/corporate-ca.crt \
-    if [ -f /usr/local/share/ca-certificates/corporate-ca.crt ]; then \
+    if [ -s /usr/local/share/ca-certificates/corporate-ca.crt ]; then \
         cat /usr/local/share/ca-certificates/corporate-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \
         update-ca-certificates; \
     fi

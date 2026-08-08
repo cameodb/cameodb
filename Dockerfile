@@ -26,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # 2. Trust corporate CA certificate (if provided)
 RUN --mount=type=secret,id=corporate-ca,dst=/usr/local/share/ca-certificates/corporate-ca.crt \
-    if [ -f /usr/local/share/ca-certificates/corporate-ca.crt ]; then \
+    if [ -s /usr/local/share/ca-certificates/corporate-ca.crt ]; then \
         echo "Corporate CA certificate detected, adding to CA bundle..." && \
         mkdir -p /etc/ssl/certs && \
         cat /usr/local/share/ca-certificates/corporate-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \

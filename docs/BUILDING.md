@@ -259,6 +259,31 @@ cargo xwin build --release --target x86_64-pc-windows-msvc \
 
 ## Docker builds
 
+### Corporate CA certificates
+
+Behind a TLS-intercepting proxy, the build needs your CA or `cargo fetch` fails on every
+crates.io request. It is passed as a BuildKit secret named **`corporate-ca`** — the id the
+Dockerfile mounts, and a mismatched name fails silently, reporting "No corporate CA
+certificate provided" and producing an image that cannot reach the proxy.
+
+```bash
+export CAMEODB_CA_CERT=/usr/local/share/ca-certificates/corporate-ca.crt
+```
+
+`scripts/build/docker-push.sh` reads the same variable, defaulting to
+`/var/tmp/buildkit-ca/corporate-ca.crt`.
+
+The examples below use that variable. Without a corporate CA, use `/dev/null` — the build
+skips an empty file rather than special-casing it:
+
+```bash
+export CAMEODB_CA_CERT=/dev/null
+```
+
+The secret is mounted into the build stage only and never reaches the runtime image. Compose
+does this for you: `docker compose build` reads `CAMEODB_CA_CERT` and defaults it to
+`/dev/null`.
+
 ### Native (glibc) image (Apple Silicon host)
 
 Uses host glibc toolchain; no Zig/OpenSSL vendoring needed:
@@ -268,7 +293,7 @@ docker build \
   --build-arg TARGET_ABI=gnu \
   --build-arg USE_ZIG=false \
   -t cameodb:latest \
-  --secret id=zscaler,src=/usr/local/share/ca-certificates/Zscaler.crt \
+  --secret id=corporate-ca,src=$CAMEODB_CA_CERT \
   .
 ```
 
@@ -281,7 +306,7 @@ docker build \
   --build-arg TARGET_ABI=musl \
   --build-arg USE_ZIG=true \
   -t cameodb:latest \
-  --secret id=zscaler,src=/usr/local/share/ca-certificates/Zscaler.crt \
+  --secret id=corporate-ca,src=$CAMEODB_CA_CERT \
   .
 ```
 
@@ -347,7 +372,7 @@ docker buildx build \
   --platform linux/amd64,linux/arm64 \
   --build-arg TARGET_ABI=musl \
   -t goranc/cameodb:latest \
-  --secret id=zscaler,src=/tmp/buildkit-ca/zscaler.crt \
+  --secret id=corporate-ca,src=$CAMEODB_CA_CERT \
   --push \
   .
 ```
@@ -357,7 +382,7 @@ docker buildx build \
 docker build \
   --build-arg TARGET_ABI=musl \
   -t goranc/cameodb:latest \
-  --secret id=zscaler,src=/tmp/buildkit-ca/zscaler.crt \
+  --secret id=corporate-ca,src=$CAMEODB_CA_CERT \
   .
 ```
 
@@ -549,12 +574,12 @@ docker buildx build --platform linux/amd64 \
 # Then use it for fast builds:
 docker run --rm --platform linux/amd64 \
   -v "$PWD":/workspace -w /workspace \
-  -v /tmp/buildkit-ca/zscaler.crt:/usr/local/share/ca-certificates/zscaler.crt:ro \
+  -v $CAMEODB_CA_CERT:/usr/local/share/ca-certificates/corporate-ca.crt:ro \
   -e CC_x86_64_unknown_linux_musl=musl-gcc \
   -e AR_x86_64_unknown_linux_musl=ar \
   -e RANLIB_x86_64_unknown_linux_musl=ranlib \
   cameo-builder bash -c "
-    cat /usr/local/share/ca-certificates/zscaler.crt >> /etc/ssl/certs/ca-certificates.crt && \
+    cat /usr/local/share/ca-certificates/corporate-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt && \
     cargo build --release --target x86_64-unknown-linux-musl \
       --no-default-features \

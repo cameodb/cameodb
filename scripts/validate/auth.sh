@@ -155,6 +155,11 @@ check_eq "an unrecognised key is 401, not 403" "401" \
     "$(code 'cameo_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' "$BASE/_indexes")"
 check_eq "a key-shaped string is not enough" "401" \
     "$(code 'hunter2' "$BASE/_indexes")"
+# Even on the one public route. A presented credential that is not recognised is refused
+# rather than quietly downgraded to anonymous — otherwise a typo'd key reads as no key, and
+# the caller gets a thinner answer with no hint as to why.
+check_eq "an unrecognised key is refused even on a public route" "401" \
+    "$(code 'cameo_v1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' "$BASE/_cluster/health")"
 
 section "roles reach exactly their capabilities"
 # Create the index first, with the only key that may: a write to an index that does not
@@ -317,6 +322,15 @@ if grep -q 'Unsupported MCP tool' <<< "$out"; then
     pass "an unknown tool is refused, not dispatched"
 else
     fail "an unknown tool is refused, not dispatched" "$out"
+fi
+
+# The catalogue is filtered the same way the calls are: advertising a tool the dispatcher
+# would refuse invites an agent to plan around it and fail mid-task.
+out="$(rpc "$READER_KEY" '{"jsonrpc":"2.0","id":8,"method":"tools/list","params":{}}')"
+if grep -q 'search_index' <<< "$out"; then
+    pass "a reader is offered the read tools"
+else
+    fail "a reader is offered the read tools" "$out"
 fi
 
 section "MCP sessions belong to one key"
@@ -498,6 +512,55 @@ if grep -q "$READER_KEY" "$WORK/c.out"; then
     fail "the client never echoes a key"
 else
     pass "the client never echoes a key"
+fi
+
+# `key_hash_file` and `--api-key-file` both existed before keygen could write either, so the
+# operator created the files and got the modes right by hand — then got warned about it.
+"$BIN" keygen --role reader --label filed \
+    --key-out "$WORK/filed.key" --hash-out "$WORK/filed.hash" > /dev/null 2>&1
+if [ -f "$WORK/filed.key" ] && [ -f "$WORK/filed.hash" ]; then
+    pass "keygen writes a key file and a hash file"
+else
+    fail "keygen writes a key file and a hash file"
+fi
+for f in filed.key filed.hash; do
+    mode="$(stat -f '%OLp' "$WORK/$f" 2>/dev/null || stat -c '%a' "$WORK/$f")"
+    check_eq "keygen creates $f as 0600" "600" "$mode"
+done
+# The key must not also reach stdout: written and printed is two places to leak from.
+if "$BIN" keygen --role reader --key-out "$WORK/quiet.key" 2>/dev/null | grep -q 'cameo_v1_'; then
+    fail "--key-out keeps the key off stdout"
+else
+    pass "--key-out keeps the key off stdout"
+fi
+# Replacing a key in place is how a working node stops working.
+if "$BIN" keygen --role reader --key-out "$WORK/filed.key" > /dev/null 2>&1; then
+    fail "keygen refuses to overwrite an existing key file"
+else
+    pass "keygen refuses to overwrite an existing key file"
+fi
+# The file keygen wrote is a credential the client reads and sends. This node does not hold
+# its hash, so the expected answer is "not in the keyring" — which is exactly what proves the
+# file was read, parsed and presented rather than rejected locally.
+out="$("${CLIENT[@]}" --api-key-file "$WORK/filed.key" list indexes 2>&1)"
+if grep -q 'not in this node' <<< "$out"; then
+    pass "a key file from keygen is read and presented"
+else
+    fail "a key file from keygen is read and presented" "$out"
+fi
+# And the hash it wrote is the form the config takes, so the pair closes the loop.
+if grep -q '^sha256:[0-9a-f]\{64\}$' "$WORK/filed.hash"; then
+    pass "the hash file holds exactly a key_hash value"
+else
+    fail "the hash file holds exactly a key_hash value" "$(cat "$WORK/filed.hash")"
+fi
+
+out="$("${CLIENT[@]}" --api-key "$READER_KEY" --api-key-file "$WORK/reader.key" \
+    list indexes 2>&1)"
+if grep -q 'using the file' <<< "$out"; then
+    pass "naming both a key and a key file says which one won"
+else
+    fail "naming both a key and a key file says which one won" "$out"
 fi
 
 section "unknown paths"

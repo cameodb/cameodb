@@ -256,6 +256,14 @@ pub struct ClientCli {
 /// another session cannot quietly override the key a command names explicitly.
 fn resolve_credential(cli: &ClientCli) -> Result<Option<Credential>> {
     if let Some(path) = &cli.api_key_file {
+        // Silently preferring one of two keys is how someone spends an afternoon wondering
+        // which identity their command ran as.
+        if cli.api_key.is_some() {
+            eprintln!(
+                "⚠️  Both an API key and a key file were given; using the file {}.",
+                path.display()
+            );
+        }
         return Credential::from_file(path).map(Some);
     }
     match cli.api_key.as_deref() {
@@ -354,6 +362,28 @@ impl InteractiveSession {
         &self.client
     }
 
+    /// Present a key to the origin this session is connected to.
+    ///
+    /// Without this, `connect` to another origin dropped the key — correctly — and the only
+    /// way back was restarting the client. The new key is bound to the current origin, the
+    /// same as one passed on the command line.
+    fn set_credential(&mut self, credential: Option<Credential>) -> Result<()> {
+        let auth = ClientAuth {
+            credential,
+            allow_plaintext: self.auth.allow_plaintext,
+        };
+        self.client = CameoClient::new_with_options(&self.current_url, self.trust, auth.clone())?;
+        self.key_origin = origin_of(&self.current_url);
+        self.auth = auth;
+        self.clear_index_cache();
+        Ok(())
+    }
+
+    /// The key in use for the current origin, if any.
+    fn key_id(&self) -> Option<String> {
+        self.client.key_id()
+    }
+
     fn index_cache_handle(&self) -> Arc<RwLock<HashMap<String, IndexMetadata>>> {
         Arc::clone(&self.index_cache)
     }
@@ -422,6 +452,10 @@ impl InteractiveSession {
                 host.bold().green()
             )
         }
+    }
+
+    fn origin(&self) -> String {
+        origin_of(&self.current_url)
     }
 
     fn display_host(&self) -> String {
@@ -941,7 +975,7 @@ impl IndexCompleter {
     fn command_suggestions(&self, prefix: &str) -> Vec<Pair> {
         let commands = vec![
             "health", "list", "search", "schema", "data", "delete", "admin", "connect", "conn",
-            "exit", "quit", "help",
+            "exit", "quit", "help", "key",
         ];
         commands
             .into_iter()
@@ -4393,7 +4427,7 @@ fn interactive_loop(
 
         if matches!(input.as_str(), "help" | "\\h") {
             println!(
-                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  admin memory stats\n  admin memory purge [--force]\n  admin index <name> commit\n  admin index <name> evict-writer\n  admin workers\n  connect <host[:port]>\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
+                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  admin memory stats\n  admin memory purge [--force]\n  admin index <name> commit\n  admin index <name> evict-writer\n  admin workers\n  connect <host[:port]>\n  key file <path>\n  key <api-key>\n  key show | key clear\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
             );
             continue;
         }
@@ -4648,6 +4682,42 @@ async fn dispatch_interactive_command(
             let result = session.client().delete_index(index, delete_schema).await?;
             print_json(&result)?;
             session.refresh_index_cache().await;
+        }
+        "key" => {
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            let (subcommand, argument) = match rest.split_once(char::is_whitespace) {
+                Some((head, tail)) => (head.trim(), tail.trim()),
+                None => (rest.trim(), ""),
+            };
+            match subcommand {
+                "" | "show" => match session.key_id() {
+                    Some(key_id) => println!("🔑 Using key {key_id} for {}", session.origin()),
+                    None => println!("No key in use for {}", session.origin()),
+                },
+                "clear" => {
+                    session.set_credential(None)?;
+                    println!("Key cleared.");
+                }
+                "file" => {
+                    if argument.is_empty() {
+                        return Err(anyhow!("Usage: key file <path>"));
+                    }
+                    let credential = Credential::from_file(Path::new(argument))?;
+                    let key_id = credential.key_id();
+                    session.set_credential(Some(credential))?;
+                    println!("🔑 Using key {key_id} for {}", session.origin());
+                    session.refresh_index_cache().await;
+                }
+                // The key itself, typed at a prompt. It lands in the shell history file, which
+                // is why `key file <path>` is offered first in the help text.
+                candidate => {
+                    let credential = Credential::parse(candidate)?;
+                    let key_id = credential.key_id();
+                    session.set_credential(Some(credential))?;
+                    println!("🔑 Using key {key_id} for {}", session.origin());
+                    session.refresh_index_cache().await;
+                }
+            }
         }
         "connect" | "conn" => {
             let target = parts.collect::<Vec<_>>().join(" ");

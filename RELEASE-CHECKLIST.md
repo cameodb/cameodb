@@ -40,6 +40,13 @@ These are accepted, not fixed. They belong in release notes as much as here.
 - **An MCP client authenticates with an HTTP header or not at all.** The key travels as
   `Authorization: Bearer`, so an MCP client that cannot set a header cannot reach an
   authenticated node. There is no OAuth flow and no per-client credential issuance.
+- **API keys are read at startup.** Adding or revoking one is add → restart → migrate
+  clients → remove → restart. No hot reload, and no lockout or throttle on failed
+  authentication (against a 256-bit key it buys nothing and is itself a DoS lever — refusals
+  are counted and logged instead).
+- **Cluster peers are trusted by the PSK, not by API keys.** `allowed_indexes` is enforced at
+  the HTTP/MCP ingress, where identity exists; it is not a defense against a compromised
+  cluster member.
 - **Cluster PSK has no rotation path.** Changing it requires stopping every node.
 - **Three transitive advisories are ignored** (`deny.toml`), all via libp2p 0.56.0.
 

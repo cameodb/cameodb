@@ -1,13 +1,43 @@
 [node]
 label = "cameodb-docker-node"
 zone = "default"
+# Declare how far this node can be reached: local | internal | external.
+# The profile is asserted, not applied — a config that contradicts it refuses to start.
+# A published port on a shared host is "internal" at least; only a machine nobody else can
+# reach is "local". `cameodb check-config -c /etc/cameodb/cameodb.toml` reports the rules.
+#
+# "internal" and not "local": a published container port is reachable from the host's
+# network, so this node cannot claim to be loopback-only. A node with no profile and a
+# non-loopback bind refuses to start rather than guessing.
+profile = "internal"
 
 [network.http]
 bind_address = "0.0.0.0"
 port = 9480
 request_timeout_secs = 30
 max_body_size_mb = 64
-cors_allowed_origins = ["*"]
+# Empty means no browser origin is allowed, which is what a node with no web UI wants.
+# The "internal" and "external" profiles both reject "*". Name the origins that need it:
+#   cors_allowed_origins = ["https://app.example.com"]
+cors_allowed_origins = []
+
+# Authentication. Off by default; every route except /_cluster/health requires
+# `Authorization: Bearer <key>` once enabled. Required by the "external" profile.
+#
+#   1. Mint a key and write its digest where the container can read it:
+#        cameodb keygen --role admin --label ops \
+#          --hash-out ./docker/config/keys/ops --key-out ~/.cameodb/ops.key
+#   2. Mount the directory read-only (see docker-compose.yml) and uncomment below.
+#   3. Use it:  cameodb client --api-key-file ~/.cameodb/ops.key list indexes
+#
+# [security]
+# enabled = true
+#
+# [[security.api_keys]]
+# key_hash_file = "/etc/cameodb/keys/ops"
+# role = "admin"                         # admin | writer | reader
+# label = "ops"
+# # allowed_indexes = ["docs"]           # optional: restrict this key to named indexes
 
 [network.cluster]
 enabled = false

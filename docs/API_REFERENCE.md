@@ -2,6 +2,74 @@
 
 CameoDB provides a comprehensive REST API for document management, search, and system administration.
 
+### 🔐 Authentication
+
+Authentication is **off by default**. With `[security] enabled = true`
+([configuration](CONFIGURATION.md#authentication-security)), every route below except the
+health check requires a key:
+
+```bash
+curl -H "Authorization: Bearer cameo_v1_…" http://localhost:9480/_indexes
+```
+
+The header is the only accepted place for a key — a query parameter is not a credential and is
+refused. Refusals are:
+
+| Status | Meaning |
+|--------|---------|
+| `401 Unauthorized` | No key, or a key this node does not know. Carries `WWW-Authenticate: Bearer realm="cameodb"` |
+| `403 Forbidden` | Authenticated, but the role or `allowed_indexes` do not cover this request |
+
+Both return `{"error": …, "message": …}`. An unknown path answers `401` without a key and
+`404` with one, so path probing tells an unauthenticated caller nothing.
+
+#### Capability required per endpoint
+
+| Method | Path | Capability |
+|--------|------|-----------|
+| `GET` | `/_cluster/health` | none (public) |
+| `POST` | `/api/{index}/search` | `read` |
+| `POST` | `/api/{index}/search/stream` | `read` |
+| `GET` | `/api/{index}/_config` | `read` |
+| `GET` | `/_indexes` | `read` |
+| `GET` | `/_cluster/_indexes` | `read` |
+| `PUT` | `/api/{index}/document` | `write` |
+| `POST` | `/api/{index}/document/stream` | `write` |
+| `POST` | `/api/{index}/_bulk` | `write` |
+| `PUT` | `/api/{index}/_config` | `index-admin` |
+| `PATCH` | `/api/{index}/_schema` | `index-admin` |
+| `DELETE` | `/api/{index}` | `index-admin` |
+| `GET` | `/_admin/memory` | `node-admin` |
+| `POST` | `/_admin/memory/purge` | `node-admin` |
+| `GET` | `/_admin/workers` | `node-admin` |
+| `POST` | `/_admin/index/{index}/commit` | `node-admin` |
+| `POST` | `/_admin/index/{index}/evict-writer` | `node-admin` |
+| `POST` `GET` `DELETE` | `/mcp` | `read` at the endpoint, then per tool |
+| `GET` `POST` | `/mcp/sse` | `read` at the endpoint, then per tool |
+| `POST` | `/mcp/messages` | `read` at the endpoint, then per tool |
+
+Roles bundle these: `admin` holds all four, `writer` holds `read` and `write`, `reader` holds
+`read`. Where a path contains `{index}`, a key restricted with `allowed_indexes` is refused
+unless that index is in its list.
+
+**Health is the one public route, and its body depends on who is asking.** An anonymous
+caller gets liveness only; presenting any valid key returns the full body:
+
+```bash
+# anonymous
+{"status":"green"}
+
+# with a key
+{"status":"green","node_id":"…","active_shards":4,"cluster_enabled":false,…}
+```
+
+Node identity and cluster shape are free reconnaissance for anyone who can reach the port, and
+a load balancer needs neither.
+
+**Listings are filtered, not refused.** `/_indexes` and `/_cluster/_indexes` return only the
+indexes the key may see, with `total_indexes` adjusted to match — a count over a shorter list
+would itself disclose how many were withheld.
+
 ### 🔍 Search Operations
 
 #### Standard Search

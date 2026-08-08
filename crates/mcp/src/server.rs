@@ -989,7 +989,7 @@ where
         // --- Tools ---
         "tools/list" => Some(success_response(
             request.id,
-            json!({ "tools": mcp_tools() }),
+            json!({ "tools": visible_tools(authz) }),
         )),
         "tools/call" => Some(
             match serde_json::from_value::<ToolCallParams>(request.params) {
@@ -1112,6 +1112,23 @@ where
         // Unreachable: `tool_capability` above rejects anything not in this match.
         other => Err(format!("Unsupported MCP tool: {other}")),
     }
+}
+
+/// The tools this caller could actually call.
+///
+/// Advertising a tool that [`call_tool`] will refuse invites an agent to plan around it and
+/// then fail mid-task. A tool with no row in the capability table is not advertised either —
+/// the deny default applies to the catalogue as much as to the call.
+fn visible_tools(authz: &McpAuthzRef) -> Vec<JsonValue> {
+    mcp_tools()
+        .into_iter()
+        .filter(|tool| {
+            tool.get("name")
+                .and_then(|name| name.as_str())
+                .and_then(tool_capability)
+                .is_some_and(|capability| authz.has(capability))
+        })
+        .collect()
 }
 
 /// Refuse a tool call that names an index outside the caller's scope.
@@ -1505,5 +1522,33 @@ mod tests {
             state.claim_session(&session, Some("aabbccdd")).await,
             SessionAccess::Granted
         );
+    }
+
+    /// A caller holding nothing at all.
+    struct NoCapabilities;
+
+    impl McpAuthz for NoCapabilities {
+        fn key_id(&self) -> Option<String> {
+            None
+        }
+
+        fn allows_index(&self, _index: &str) -> bool {
+            false
+        }
+
+        fn has(&self, _capability: McpCapability) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn the_catalogue_only_advertises_tools_the_caller_could_call() {
+        let reader: McpAuthzRef = Arc::new(Scoped("docs"));
+        assert_eq!(visible_tools(&reader).len(), mcp_tools().len());
+
+        // Nothing held, nothing offered. Advertising a tool that the dispatcher will refuse
+        // invites an agent to plan around it and fail mid-task.
+        let nobody: McpAuthzRef = Arc::new(NoCapabilities);
+        assert!(visible_tools(&nobody).is_empty());
     }
 }

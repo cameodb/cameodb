@@ -47,6 +47,43 @@ docker-compose -f docker-compose-cluster.yml up -d
 - **Data Persistence**: Each node's data is stored in a separate subdirectory within `data/cameodb/`.
 - **Swarm Configuration**: Update the `CAMEODB_CLUSTER_NAME`, `CAMEODB_CLUSTER_PORT`, `CAMEODB_SEED_NODES`, and `CAMEODB_CLUSTER_ENABLED` environment variables to reflect your deployment topology.
 
+## Security
+
+The containers ship **unauthenticated**, with `profile = "internal"` — honest about a
+published port being reachable from your network, and it is what makes `check-config` pass.
+Every HTTP and MCP endpoint is open to whoever can reach the port, `/_admin/*` included.
+
+Turning that on is one command and one stanza:
+
+```bash
+# Digest for the node, key for whoever will use it. Both files are created 0600.
+mkdir -p config/keys
+cameodb keygen --role admin --label ops   --hash-out config/keys/ops   --key-out ~/.cameodb/ops.key
+
+# The container runs as uid 65532 and reads the digest at startup
+chown 65532:65532 config/keys/ops
+```
+
+Then uncomment the `[security]` block in [`cameodb-docker.toml`](cameodb-docker.toml) and the
+key volume in [`docker-compose.yml`](docker-compose.yml), and restart. Verify before you do:
+
+```bash
+docker compose run --rm cameodb check-config --config /etc/cameodb/cameodb.toml
+cameodb client --api-key-file ~/.cameodb/ops.key list indexes
+```
+
+Only the SHA-256 digest is ever mounted into the container. A single key can also be supplied
+entirely through the environment with `CAMEODB_SECURITY_ENABLED`, `CAMEODB_API_KEY_HASH` and
+`CAMEODB_API_KEY_ROLE` — there is deliberately no server-side `CAMEODB_API_KEY`, since a node
+needs digests and never keys.
+
+`/_cluster/health` stays public either way, so health probes and load balancers need no
+credential. For the cluster compose file, mount the same digest into every node: a key is
+accepted by the node it is configured on, and NGINX will route you to any of them.
+
+See [Configuration → Security and Posture](../docs/CONFIGURATION.md#security-and-posture) and
+[Deployment → Securing a Deployment](../docs/DEPLOYMENT.md#-securing-a-deployment).
+
 ## Building Docker Images
 
 ### Quick Build (Local Development)
@@ -85,11 +122,14 @@ Build for multiple platforms (amd64 + arm64) and push to DockerHub:
   ```
 
 **Behind Corporate Firewall:**
-If you need a custom BuildKit image with CA certificates, place your certificate at:
+The build needs your CA certificate or `cargo fetch` fails on every crates.io request. Place
+it at the default path, or point `CAMEODB_CA_CERT` at it:
 ```bash
-/tmp/buildkit-ca/zscaler.crt
+/var/tmp/buildkit-ca/corporate-ca.crt        # picked up automatically
+CAMEODB_CA_CERT=/path/to/ca.crt ./scripts/build/docker-push.sh --no-push
 ```
-The script will automatically use it if present.
+It is passed to the build as the `corporate-ca` secret — mounted into the build stage only,
+never into the runtime image — and skipped when the file is absent or empty.
 
 ### Manual Build (Advanced)
 

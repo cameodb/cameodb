@@ -128,13 +128,12 @@ This document outlines the current development priorities and optimization roadm
 - ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed
 - ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, resources, and query syntax docs completed; security moved to Phase 14, streaming/docs/testing planned
 - 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f partially done (merge thread count control implemented via `IndexWriterOptions`; core pinning and per-arena stats planned)
-- 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) steps 1–5 landed 2026-08-08: credential model, `keygen`, `[security]` config, enforcement at the HTTP/MCP ingress with capability and index scoping (so `external` can now start), `--api-key` / `--api-key-file` / `CAMEODB_API_KEY` on the bundled client, index list filtering, and MCP per-tool authorization with sessions bound to their key. Step 6 (docs/CHANGELOG) remains; C1–C3 planned, C3 shrunk because B1 absorbs index scoping
+- 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) complete, landed 2026-08-08 — steps 1–5 plus hardening (6a) and documentation (6b): credential model, `keygen`, `[security]` config, enforcement at the HTTP/MCP ingress with capability and index scoping (so `external` can now start), `--api-key` / `--api-key-file` / `CAMEODB_API_KEY` on the bundled client, index list filtering, and MCP per-tool authorization with sessions bound to their key. C1–C3 planned, C3 shrunk because B1 absorbs index scoping
 
 ### **Recommended Next Steps**
-1. **Phase 14 Stage B1 step 6**: CHANGELOG entry and the remaining docs — the enforcement work is done and validated, what is left is the record of it
+1. **Phase 14 Stage C1–C3**: MCP rate limiting, audit logging, per-index role overrides — B1 is complete (steps 1–5 plus the 6a hardening and 6b documentation passes)
 2. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats
 3. **Phase 12 remaining**: MCP streaming, documentation, integration tests
-4. **Phase 14 Stage C1–C3**: MCP rate limiting, audit logging, per-index role overrides (all depend on B1)
 
 ---
 
@@ -742,9 +741,45 @@ HTTP search. Nothing has shipped with the old names.
        while the route has always been `evict-writer`, so that command had never worked. With
        authentication in front of the router its 404 would have become a 401 — an unrelated
        bug wearing an auth costume. Fixed, and `auth.sh` now drives the command end to end.
-  6. Docs, CHANGELOG, and the remaining RELEASE-CHECKLIST gaps
+  6a. ✅ **Landed 2026-08-08.** Hardening found by auditing what steps 1–5 left:
+     - `keygen --key-out` / `--hash-out` write the two files the design already assumed an
+       operator would create by hand — `0600`, `create_new` so neither is ever overwritten,
+       and files written before anything is printed. Closes the loop between `keygen`,
+       `key_hash_file` and `--api-key-file`.
+     - `Authz::Anonymous` now **denies** in both places it was permissive (the `McpAuthz`
+       impl and index-listing filter). Unreachable today because no MCP or listing route is
+       `Public` — which is why it must not be the permissive branch, since reclassifying one
+       later would silently open it.
+     - The unauthenticated-refusal log is thinned to the first few, then powers of two, then
+       every hundred thousand. It was one `warn!` per request, so anyone who could reach the
+       port could fill the disk with a loop. A 403 still gets a line each: it needs a valid
+       key first, so its volume is bounded by someone who already holds credentials.
+     - `tools/list` is filtered by capability, and a tool with no row is not advertised —
+       the deny default applies to the catalogue as much as to the call.
+     - REPL `key file <path>` / `key <api-key>` / `key show` / `key clear`, so `connect`
+       dropping a key is no longer a dead end that needs a restart.
+     - The client says which credential won when both `--api-key` and `--api-key-file` are
+       given, instead of silently preferring the file.
+     - Fixed a stale line in `keygen`'s own guidance claiming requests were not yet checked.
+  6b. ✅ **Landed 2026-08-08.** The docs tree had never mentioned authentication; only the
+     README had. Added `## Security and Posture` to `docs/CONFIGURATION.md` (profiles,
+     `[security]`, roles × capabilities, key minting, file modes, rotation, and the cluster
+     PSK, which was also undocumented), a `### Authentication` section to
+     `docs/API_REFERENCE.md` with the capability required per endpoint and what 401 vs 403
+     mean, `## Securing a Deployment` to `docs/DEPLOYMENT.md`, a `## Security` section to
+     `docker/README.md`, commented key material in the docker config, compose file and
+     systemd unit, and the CHANGELOG entry. Two **examples that could not start** were fixed
+     rather than documented around:
+     - `docker/cameodb-docker.toml` declared no `profile` while binding `0.0.0.0`, so it
+       failed the posture gate the previous commit added. Now `internal` — what a published
+       container port actually is — with `cors_allowed_origins = []` to match.
+     - The recommended production config in `docs/CONFIGURATION.md` had the same problem and
+       enabled the cluster with no PSK. Rewritten as an `external` node with TLS, two keys and
+       a PSK, then verified to pass `check-config` with zero warnings.
+     The systemd unit gained `ExecStartPre=cameodb check-config`, so a node refuses to start
+     in a posture its config does not satisfy before the port ever opens.
 
-- **`scripts/validate/auth.sh` proves** (101 checks, in `all.sh`): 401 on every classified
+- **`scripts/validate/auth.sh` proves** (111 checks, in `all.sh`): 401 on every classified
   route bare · 403 per wrong role per capability class · preflight passes without a key ·
   unknown path 401 → 404 · health minimal vs full · scoped key allowed / denied, including
   against a percent-encoded index name · an unauthenticated flood does not shed

@@ -7,9 +7,9 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-      # This injects the secret into the build stage only
+      # Injects the CA into the build stage only; see the secrets block below
       secrets:
-        - zscaler
+        - corporate-ca
     
     ports:
       - "9480:9480"
@@ -20,6 +20,11 @@ services:
 
     environment:
       - RUST_LOG=info
+      # Authentication can also be configured entirely from the environment, for one key:
+      #   - CAMEODB_SECURITY_ENABLED=true
+      #   - CAMEODB_API_KEY_HASH=sha256:…
+      #   - CAMEODB_API_KEY_ROLE=admin
+      # There is no CAMEODB_API_KEY here on purpose — a node needs digests, never keys.
       
     # RUNTIME VOLUMES
     # Note: No certificates here. Only Config and Data.
@@ -30,7 +35,15 @@ services:
       # 2. Data: Project Root/data/cameodb -> Container
       - ../data/cameodb:/data/cameodb
 
+      # 3. Key digests, if [security] is enabled in the config above.
+      #    Only SHA-256 digests live here, never a key. Create them with:
+      #      cameodb keygen --role admin --label ops --hash-out ./docker/config/keys/ops
+      #    The files must be readable by uid 65532 (the nonroot user below).
+      # - ../docker/config/keys:/etc/cameodb/keys:ro
+
         
+    # /_cluster/health is the one route that stays public with authentication enabled, so a
+    # health probe needs no credential either way.
     healthcheck:
       test: ["CMD", "/usr/local/bin/cameodb", "--version"]
       interval: 30s
@@ -38,7 +51,17 @@ services:
       retries: 3
 
 # SECRET DEFINITION
-# This points to the file on your HOST machine.
+# Points to a file on your HOST machine, mounted into the build stage only — it never
+# reaches the runtime image.
 secrets:
-  zscaler:
-    file: /usr/local/share/ca-certificates/Zscaler.crt
+  # Must be named `corporate-ca`: that is the secret id the Dockerfile mounts. A mismatch is
+  # silent — the build simply reports "No corporate CA certificate provided" and produces an
+  # image that cannot reach a TLS-intercepting proxy.
+  #
+  # Behind a TLS-intercepting proxy, point CAMEODB_CA_CERT at your CA file (Zscaler,
+  # Netskope, an internal root, …):
+  #   CAMEODB_CA_CERT=/usr/local/share/ca-certificates/corporate-ca.crt docker compose build
+  # The default is /dev/null, so a build with no corporate CA needs nothing set: the mount
+  # succeeds, the file is empty, and the Dockerfile skips it.
+  corporate-ca:
+    file: ${CAMEODB_CA_CERT:-/dev/null}
