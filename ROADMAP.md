@@ -128,10 +128,10 @@ This document outlines the current development priorities and optimization roadm
 - ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed
 - ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, resources, and query syntax docs completed; security moved to Phase 14, streaming/docs/testing planned
 - 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f partially done (merge thread count control implemented via `IndexWriterOptions`; core pinning and per-arena stats planned)
-- 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) in progress — steps 1, 2 and 5 landed 2026-08-08: credential model, `keygen`, `[security]` config, enforcement at the HTTP/MCP ingress with capability and index scoping (so `external` can now start), and `--api-key` / `--api-key-file` / `CAMEODB_API_KEY` on the bundled client. Steps 3–4 remain: index list filtering and MCP per-tool authorization; C1–C3 planned, C3 shrunk because B1 absorbs index scoping
+- 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) steps 1–5 landed 2026-08-08: credential model, `keygen`, `[security]` config, enforcement at the HTTP/MCP ingress with capability and index scoping (so `external` can now start), `--api-key` / `--api-key-file` / `CAMEODB_API_KEY` on the bundled client, index list filtering, and MCP per-tool authorization with sessions bound to their key. Step 6 (docs/CHANGELOG) remains; C1–C3 planned, C3 shrunk because B1 absorbs index scoping
 
 ### **Recommended Next Steps**
-1. **Phase 14 Stage B1 steps 3–4**: index list filtering, then MCP per-tool authorization and session binding — until step 4 an index-scoped key is refused at `/mcp` outright, and MCP clients have no way to present a key at all
+1. **Phase 14 Stage B1 step 6**: CHANGELOG entry and the remaining docs — the enforcement work is done and validated, what is left is the record of it
 2. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats
 3. **Phase 12 remaining**: MCP streaming, documentation, integration tests
 4. **Phase 14 Stage C1–C3**: MCP rate limiting, audit logging, per-index role overrides (all depend on B1)
@@ -694,10 +694,29 @@ HTTP search. Nothing has shipped with the old names.
        read every index through the side door.
      - `scripts/validate/auth.sh` (56 checks) landed with it rather than waiting for step 6:
        a middleware in the wrong place in the layer stack passes every unit test there is.
-  3. Index list filtering: `/_indexes` and `/_cluster/_indexes` return only the indexes a
-     key may see. Named access is already refused; enumeration is what is left.
-  4. MCP threading + session binding + tool capability table; lifts the `/mcp` refusal for
-     index-scoped keys
+  3. ✅ **Landed 2026-08-08.** `filter_index_listing` in `authz.rs` narrows a listing to
+     the caller's scope, applied by `/_indexes` and `/_cluster/_indexes`. The cluster
+     response repeats every index name under each node that answered, with its own count, so
+     the filter recurses and rewrites both — a top-level-only filter would have leaked the
+     same names one level down. An entry whose shape it does not recognise is **dropped**:
+     if the listing changes underneath it, the failure has to be a missing row, not a leak.
+  4. ✅ **Landed 2026-08-08.** `McpAuthz` / `McpCapability` / `McpAuthzRef` in the mcp
+     crate, implemented by the server for `Authz`, so identity reaches the dispatcher without
+     the mcp crate learning a server type. `tool_capability` denies by default and is held to
+     `mcp_tools()` by a completeness test. `call_tool` checks the capability *before* parsing
+     arguments, then the named index; `search_indexes` refuses the whole call rather than
+     narrowing it, because partial results that look complete are worse than an error.
+     Sessions are bound to the `key_id` that created them on all three verbs. The `/mcp`
+     refusal for index-scoped keys is gone, and with it the posture note that advertised it.
+     Two deviations from the sketch:
+     - **Backend methods take the caller only where they enumerate.** Methods that *name*
+       their index are checked once in `call_tool`; `list_indexes`, `get_index_stats`,
+       `list_resources` and `read_resource` take an `McpAuthzRef`, because only the
+       implementation knows which part of its response is a list of index names.
+     - **`read_resource` checks the scope itself.** A URI like
+       `cameodb://indexes/payroll/schema` is a read of `payroll`, and only the host knows
+       that. Not being *offered* a URI is not the same as being refused it, so both are
+       tested.
   5. ✅ **Landed 2026-08-08**, taken before steps 3–4: with authentication enforced but no
      way for `cameodb client` to present a key, enabling `[security]` locked an operator out
      of their own tooling, which is the gap most likely to be hit first. `Credential` in
@@ -725,7 +744,7 @@ HTTP search. Nothing has shipped with the old names.
        bug wearing an auth costume. Fixed, and `auth.sh` now drives the command end to end.
   6. Docs, CHANGELOG, and the remaining RELEASE-CHECKLIST gaps
 
-- **`scripts/validate/auth.sh` proves** (75 checks, in `all.sh`): 401 on every classified
+- **`scripts/validate/auth.sh` proves** (101 checks, in `all.sh`): 401 on every classified
   route bare · 403 per wrong role per capability class · preflight passes without a key ·
   unknown path 401 → 404 · health minimal vs full · scoped key allowed / denied, including
   against a percent-encoded index name · an unauthenticated flood does not shed
@@ -733,8 +752,11 @@ HTTP search. Nothing has shipped with the old names.
   and `key_id` in place of one · `check-config` fails `external` + auth-off and passes
   `external` + auth-on + TLS · the bundled client authenticating from a flag, a file and the
   environment, refusing a malformed key before sending it, refusing to carry one to a
-  non-loopback plaintext host, and explaining a 401 and a 403 differently. Still to add with
-  steps 3–4: list filtering, MCP per-tool and per-index, and session binding.
+  non-loopback plaintext host, and explaining a 401 and a 403 differently · `/_indexes` and
+  `/_cluster/_indexes` filtered to a key's scope, count included · every MCP tool that names
+  an index refused off-scope, the catalog and the resource list filtered, a resource URI
+  refused when read directly, an unknown tool refused rather than dispatched · an MCP session
+  refused to any key but the one that opened it, on POST, GET and DELETE.
 
 **B2 — HTTPS/TLS via rustls** ✅ COMPLETED (the first implementation never ran)
 - **The original implementation panicked on every TLS startup** and was marked complete without a single HTTPS request being served. `axum-server/tls-rustls` force-enables `rustls/aws-lc-rs` while libp2p-quic enables `rustls/ring`; rustls 0.23 refuses to pick between two providers, and the panic landed *after* the startup banner, so it read as a healthy boot

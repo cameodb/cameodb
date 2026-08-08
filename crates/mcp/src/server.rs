@@ -90,7 +90,7 @@ impl McpTransportState {
 
     /// Create a new Streamable HTTP session (no SSE push channel) and return its id.
     /// The id is a cryptographically random UUID per the MCP spec recommendation.
-    async fn create_session(&self) -> String {
+    async fn create_session(&self, key_id: Option<String>) -> String {
         let session_id = Uuid::new_v4().to_string();
         let mut inner = self.inner.lock().await;
         inner.sessions.insert(
@@ -98,15 +98,58 @@ impl McpTransportState {
             McpSession {
                 sender: None,
                 last_activity: std::time::Instant::now(),
+                key_id,
             },
         );
         session_id
     }
 
-    /// Remove a session by id. Returns `true` if a session was removed.
-    async fn remove_session(&self, session_id: &str) -> bool {
+    /// Remove a session by id, if `key_id` is the key that created it.
+    async fn remove_session(&self, session_id: &str, key_id: Option<&str>) -> SessionAccess {
         let mut inner = self.inner.lock().await;
-        inner.sessions.remove(session_id).is_some()
+        match inner.sessions.get(session_id) {
+            None => SessionAccess::Unknown,
+            Some(session) if session.owned_by(key_id) => {
+                inner.sessions.remove(session_id);
+                SessionAccess::Granted
+            }
+            Some(_) => SessionAccess::WrongKey,
+        }
+    }
+
+    /// Check that `key_id` may act on `session_id`, refreshing its activity clock if so.
+    async fn claim_session(&self, session_id: &str, key_id: Option<&str>) -> SessionAccess {
+        let mut inner = self.inner.lock().await;
+        match inner.sessions.get_mut(session_id) {
+            None => SessionAccess::Unknown,
+            Some(session) if session.owned_by(key_id) => {
+                session.last_activity = std::time::Instant::now();
+                SessionAccess::Granted
+            }
+            Some(_) => SessionAccess::WrongKey,
+        }
+    }
+}
+
+/// The outcome of presenting a session id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionAccess {
+    Granted,
+    /// No such session. Not an authorization failure — a session may simply have expired,
+    /// and each transport already has its own answer for that.
+    Unknown,
+    /// The session exists and belongs to a different key.
+    WrongKey,
+}
+
+impl McpSession {
+    /// A session created by an identified caller may only be continued by that same caller.
+    /// One created without identity (auth off) is not bound to anyone.
+    fn owned_by(&self, key_id: Option<&str>) -> bool {
+        match &self.key_id {
+            None => true,
+            Some(owner) => key_id == Some(owner.as_str()),
+        }
     }
 }
 
@@ -138,6 +181,102 @@ struct McpSession {
     /// returned inline on the POST request.
     sender: Option<mpsc::UnboundedSender<Event>>,
     last_activity: std::time::Instant,
+    /// The key that created this session, if the host identified one.
+    ///
+    /// A session id travels in a header and names a conversation the server keeps state
+    /// for. Without this, learning someone else's session id would be enough to continue
+    /// their conversation.
+    key_id: Option<String>,
+}
+
+/// What an MCP operation requires of its caller.
+///
+/// Mirrors the host's capability set one for one. The mcp crate keeps its own copy because
+/// it must not depend on the server crate — the host maps between them in its [`McpAuthz`]
+/// implementation, which is the single place the two vocabularies meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpCapability {
+    Read,
+    Write,
+    IndexAdmin,
+    NodeAdmin,
+}
+
+impl McpCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            McpCapability::Read => "read",
+            McpCapability::Write => "write",
+            McpCapability::IndexAdmin => "index-admin",
+            McpCapability::NodeAdmin => "node-admin",
+        }
+    }
+}
+
+/// The caller, as much of them as this crate needs to know.
+///
+/// Implemented by the host so identity reaches the tool dispatcher without this crate
+/// learning any of the host's types. `/mcp` is a single JSON-RPC path, so path-level
+/// middleware cannot see which tool or index is in play — everything below the transport
+/// has to ask.
+pub trait McpAuthz: Send + Sync + 'static {
+    /// Non-reversible fingerprint of the key, for session binding and log lines. `None`
+    /// when the host does not identify callers.
+    fn key_id(&self) -> Option<String>;
+
+    /// Whether this caller may touch `index`.
+    fn allows_index(&self, index: &str) -> bool;
+
+    /// Whether this caller holds `capability`.
+    fn has(&self, capability: McpCapability) -> bool;
+}
+
+/// How identity is carried through the transport. Cheap to clone into a spawned task.
+pub type McpAuthzRef = Arc<dyn McpAuthz>;
+
+/// The caller when the host has no authorization layer in front of this router.
+///
+/// A permissive default is correct only because the host decides whether it is used: with
+/// `[security]` off there is no identity to enforce, and with it on the middleware always
+/// supplies a real one.
+#[derive(Debug, Clone, Copy)]
+pub struct McpUnrestricted;
+
+impl McpAuthz for McpUnrestricted {
+    fn key_id(&self) -> Option<String> {
+        None
+    }
+
+    fn allows_index(&self, _index: &str) -> bool {
+        true
+    }
+
+    fn has(&self, _capability: McpCapability) -> bool {
+        true
+    }
+}
+
+/// What a tool requires, or `None` if it is not a tool this server knows.
+///
+/// **Deny by default.** A tool added to [`mcp_tools`] without a row here cannot be called at
+/// all, which is the failure that gets noticed; inheriting `Read` from its neighbours is the
+/// failure that does not. `every_advertised_tool_has_a_capability` keeps the two in step.
+pub fn tool_capability(name: &str) -> Option<McpCapability> {
+    match name {
+        "search_index" | "search_indexes" | "get_index" | "list_indexes" | "validate_query"
+        | "get_index_stats" => Some(McpCapability::Read),
+        _ => None,
+    }
+}
+
+/// The caller for a request the host did not identify.
+fn unrestricted() -> McpAuthzRef {
+    Arc::new(McpUnrestricted)
+}
+
+/// The caller a request carries, or the unrestricted one if the host inserted none.
+fn caller(authz: Option<Extension<McpAuthzRef>>) -> McpAuthzRef {
+    authz.map_or_else(unrestricted, |Extension(authz)| authz)
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +312,13 @@ pub struct McpIndexSearchRequest {
     pub sort: Option<SortSpec>,
 }
 
+/// The operations MCP exposes, implemented by the host.
+///
+/// Methods that **name** their index take no caller: [`call_tool`] has the name in hand and
+/// refuses a disallowed one before dispatching, so the check happens once rather than in
+/// every implementation. Methods that **enumerate** indexes, or that resolve a name from a
+/// URI, take an [`McpAuthzRef`] — only the implementation knows which part of its response
+/// is a list of index names.
 pub trait McpBackend: Clone + Send + Sync + 'static {
     fn search_index(
         &self,
@@ -190,7 +336,7 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
 
     fn get_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, String>>;
 
-    fn list_indexes(&self) -> BoxFuture<'_, Result<JsonValue, String>>;
+    fn list_indexes(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>>;
 
     fn validate_query(
         &self,
@@ -199,11 +345,19 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
         query: Option<String>,
     ) -> BoxFuture<'_, Result<JsonValue, String>>;
 
-    fn get_index_stats(&self, index: Option<String>) -> BoxFuture<'_, Result<JsonValue, String>>;
+    fn get_index_stats(
+        &self,
+        index: Option<String>,
+        authz: McpAuthzRef,
+    ) -> BoxFuture<'_, Result<JsonValue, String>>;
 
-    fn list_resources(&self) -> BoxFuture<'_, Result<JsonValue, String>>;
+    fn list_resources(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>>;
 
-    fn read_resource(&self, uri: String) -> BoxFuture<'_, Result<JsonValue, String>>;
+    fn read_resource(
+        &self,
+        uri: String,
+        authz: McpAuthzRef,
+    ) -> BoxFuture<'_, Result<JsonValue, String>>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -321,15 +475,24 @@ where
             post(
                 |State(app_state): State<S>,
                  Extension(state): Extension<McpTransportState>,
+                 authz: Option<Extension<McpAuthzRef>>,
                  headers: HeaderMap,
                  Json(payload): Json<JsonValue>| async move {
-                    process_streamable_http(app_state, state, headers, payload).await
+                    process_streamable_http(app_state, state, caller(authz), headers, payload).await
                 },
             )
-            .get(streamable_listen_handler)
+            .get(
+                |Extension(state): Extension<McpTransportState>,
+                 authz: Option<Extension<McpAuthzRef>>,
+                 headers: HeaderMap| async move {
+                    streamable_listen_handler(state, caller(authz), headers).await
+                },
+            )
             .delete(
-                |Extension(state): Extension<McpTransportState>, headers: HeaderMap| async move {
-                    streamable_delete_handler(state, headers).await
+                |Extension(state): Extension<McpTransportState>,
+                 authz: Option<Extension<McpAuthzRef>>,
+                 headers: HeaderMap| async move {
+                    streamable_delete_handler(state, caller(authz), headers).await
                 },
             ),
         )
@@ -337,9 +500,17 @@ where
         // compatibility with already-configured clients.
         .route(
             "/sse",
-            get(mcp_sse_handler).post(
-                |State(app_state): State<S>, Json(payload): Json<JsonValue>| async move {
-                    process_mcp_http_message(app_state, payload).await
+            get(
+                |Extension(state): Extension<McpTransportState>,
+                 authz: Option<Extension<McpAuthzRef>>| async move {
+                    mcp_sse_handler(state, caller(authz)).await
+                },
+            )
+            .post(
+                |State(app_state): State<S>,
+                 authz: Option<Extension<McpAuthzRef>>,
+                 Json(payload): Json<JsonValue>| async move {
+                    process_mcp_http_message(app_state, caller(authz), payload).await
                 },
             ),
         )
@@ -349,8 +520,9 @@ where
                 |State(app_state): State<S>,
                  Query(query): Query<MessageQuery>,
                  Extension(state): Extension<McpTransportState>,
+                 authz: Option<Extension<McpAuthzRef>>,
                  Json(payload): Json<JsonValue>| async move {
-                    process_mcp_message(app_state, query, state, payload).await
+                    process_mcp_message(app_state, query, state, caller(authz), payload).await
                 },
             ),
         )
@@ -360,7 +532,8 @@ where
 }
 
 async fn mcp_sse_handler(
-    Extension(state): Extension<McpTransportState>,
+    state: McpTransportState,
+    authz: McpAuthzRef,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (session_id, rx) = {
         let mut inner = state.inner.lock().await;
@@ -369,9 +542,12 @@ async fn mcp_sse_handler(
         let (tx, rx) = mpsc::unbounded_channel();
         let now = std::time::Instant::now();
 
+        // Legacy SSE session ids are sequential, so the next one is guessable. Binding the
+        // session to its creator is what stops that from being useful.
         let session = McpSession {
             sender: Some(tx.clone()),
             last_activity: now,
+            key_id: authz.key_id(),
         };
 
         inner.sessions.insert(session_id.clone(), session);
@@ -439,16 +615,20 @@ async fn process_mcp_message<B: McpBackend>(
     app_state: B,
     query: MessageQuery,
     state: McpTransportState,
+    authz: McpAuthzRef,
     payload: JsonValue,
 ) -> impl IntoResponse {
-    let session = {
-        let mut inner = state.inner.lock().await;
-        if let Some(session) = inner.sessions.get_mut(&query.session_id) {
-            session.last_activity = std::time::Instant::now();
-            Some(session.clone())
-        } else {
-            None
+    let key_id = authz.key_id();
+    let session = match state
+        .claim_session(&query.session_id, key_id.as_deref())
+        .await
+    {
+        SessionAccess::Granted => {
+            let inner = state.inner.lock().await;
+            inner.sessions.get(&query.session_id).cloned()
         }
+        SessionAccess::WrongKey => return session_refusal(&query.session_id).into_response(),
+        SessionAccess::Unknown => None,
     };
 
     match session {
@@ -459,7 +639,7 @@ async fn process_mcp_message<B: McpBackend>(
             // Spawn background task to process message asynchronously
             tokio::spawn(async move {
                 let maybe_response = match parse_json_rpc_request(payload) {
-                    Ok(request) => handle_rpc_request(app_state, request).await,
+                    Ok(request) => handle_rpc_request(app_state, request, &authz).await,
                     Err(err) => Some(error_response(
                         None,
                         -32600,
@@ -497,10 +677,11 @@ async fn process_mcp_message<B: McpBackend>(
 
 async fn process_mcp_http_message<B: McpBackend>(
     app_state: B,
+    authz: McpAuthzRef,
     payload: JsonValue,
 ) -> impl IntoResponse {
     match parse_json_rpc_request(payload) {
-        Ok(request) => match handle_rpc_request(app_state, request).await {
+        Ok(request) => match handle_rpc_request(app_state, request, &authz).await {
             Some(response) => (StatusCode::OK, Json(response)).into_response(),
             None => StatusCode::NO_CONTENT.into_response(),
         },
@@ -528,9 +709,19 @@ async fn process_mcp_http_message<B: McpBackend>(
 async fn process_streamable_http<B: McpBackend>(
     app_state: B,
     state: McpTransportState,
+    authz: McpAuthzRef,
     headers: HeaderMap,
     payload: JsonValue,
 ) -> Response {
+    // A session id names server-side state. Continuing someone else's conversation needs
+    // more than knowing its id.
+    let key_id = authz.key_id();
+    if let Some(session_id) = session_id_of(&headers)
+        && state.claim_session(session_id, key_id.as_deref()).await == SessionAccess::WrongKey
+    {
+        return session_refusal(session_id).into_response();
+    }
+
     // Validate the protocol version header if present (spec: 400 if unsupported).
     if let Some(version) = headers
         .get(MCP_PROTOCOL_VERSION_HEADER)
@@ -552,11 +743,11 @@ async fn process_streamable_http<B: McpBackend>(
         payload.get("method").and_then(|method| method.as_str()) == Some("initialize");
 
     match parse_json_rpc_request(payload) {
-        Ok(request) => match handle_rpc_request(app_state, request).await {
+        Ok(request) => match handle_rpc_request(app_state, request, &authz).await {
             Some(response) => {
                 if is_initialize {
                     // Establish a session and advertise it via the MCP-Session-Id header.
-                    let session_id = state.create_session().await;
+                    let session_id = state.create_session(key_id).await;
                     let mut response_headers = HeaderMap::new();
                     if let Ok(value) = HeaderValue::from_str(&session_id) {
                         response_headers
@@ -587,12 +778,46 @@ async fn process_streamable_http<B: McpBackend>(
 /// Opens a server-to-client SSE stream. CameoDB does not currently initiate
 /// server-side requests, so this stream only emits keep-alive comments to hold
 /// the connection open, satisfying clients that establish a listening channel.
-async fn streamable_listen_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+async fn streamable_listen_handler(
+    state: McpTransportState,
+    authz: McpAuthzRef,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(session_id) = session_id_of(&headers) {
+        let key_id = authz.key_id();
+        if state.claim_session(session_id, key_id.as_deref()).await == SessionAccess::WrongKey {
+            return session_refusal(session_id).into_response();
+        }
+    }
+
     let stream = futures::stream::pending::<Result<Event, Infallible>>();
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response()
+}
+
+fn session_id_of(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(MCP_SESSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+}
+
+/// A session that exists but belongs to someone else.
+///
+/// 403 rather than 404: the caller is authenticated and the session is real, so pretending
+/// it does not exist would send a well-behaved client into a reconnect loop.
+fn session_refusal(session_id: &str) -> impl IntoResponse {
+    debug!(session_id = %session_id, "MCP session presented by a different key");
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "Forbidden",
+            "message": "this MCP session belongs to a different key",
+        })),
     )
 }
 
@@ -601,20 +826,24 @@ async fn streamable_listen_handler() -> Sse<impl Stream<Item = Result<Event, Inf
 /// Explicitly terminates the session identified by the `MCP-Session-Id` header.
 /// Returns `200 OK` if removed, `404 Not Found` if unknown, `400 Bad Request`
 /// if the header is missing.
-async fn streamable_delete_handler(state: McpTransportState, headers: HeaderMap) -> StatusCode {
-    match headers
-        .get(MCP_SESSION_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-    {
-        Some(session_id) => {
-            if state.remove_session(session_id).await {
-                info!(session_id = %session_id, "MCP Streamable HTTP session terminated");
-                StatusCode::OK
-            } else {
-                StatusCode::NOT_FOUND
-            }
+async fn streamable_delete_handler(
+    state: McpTransportState,
+    authz: McpAuthzRef,
+    headers: HeaderMap,
+) -> Response {
+    let Some(session_id) = session_id_of(&headers) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    let key_id = authz.key_id();
+    match state.remove_session(session_id, key_id.as_deref()).await {
+        SessionAccess::Granted => {
+            info!(session_id = %session_id, "MCP Streamable HTTP session terminated");
+            StatusCode::OK.into_response()
         }
-        None => StatusCode::BAD_REQUEST,
+        SessionAccess::Unknown => StatusCode::NOT_FOUND.into_response(),
+        // Ending someone else's session is a denial of service, not a courtesy.
+        SessionAccess::WrongKey => session_refusal(session_id).into_response(),
     }
 }
 
@@ -645,7 +874,11 @@ fn error_response(id: Option<JsonValue>, code: i64, message: String) -> JsonValu
     })
 }
 
-async fn handle_rpc_request<S>(backend: S, request: JsonRpcRequest) -> Option<JsonValue>
+async fn handle_rpc_request<S>(
+    backend: S,
+    request: JsonRpcRequest,
+    authz: &McpAuthzRef,
+) -> Option<JsonValue>
 where
     S: McpBackend,
 {
@@ -683,13 +916,16 @@ where
         }
 
         // --- Resources ---
-        "resources/list" => Some(match backend.list_resources().await {
+        "resources/list" => Some(match backend.list_resources(authz.clone()).await {
             Ok(resources) => success_response(request.id, json!({ "resources": resources })),
             Err(err) => error_response(request.id, -32603, err),
         }),
         "resources/read" => Some(
             match serde_json::from_value::<ReadResourceArgs>(request.params) {
-                Ok(params) => match backend.read_resource(params.uri.clone()).await {
+                Ok(params) => match backend
+                    .read_resource(params.uri.clone(), authz.clone())
+                    .await
+                {
                     Ok(content) => success_response(
                         request.id,
                         json!({
@@ -757,7 +993,7 @@ where
         )),
         "tools/call" => Some(
             match serde_json::from_value::<ToolCallParams>(request.params) {
-                Ok(params) => match call_tool(backend, params).await {
+                Ok(params) => match call_tool(backend, params, authz).await {
                     Ok(result) => success_response(
                         request.id,
                         json!({
@@ -795,14 +1031,32 @@ where
     }
 }
 
-async fn call_tool<S>(backend: S, params: ToolCallParams) -> Result<JsonValue, String>
+async fn call_tool<S>(
+    backend: S,
+    params: ToolCallParams,
+    authz: &McpAuthzRef,
+) -> Result<JsonValue, String>
 where
     S: McpBackend,
 {
+    // Capability before arguments: an unknown tool and a forbidden one both stop here, so a
+    // tool that was never classified cannot be reached by naming it.
+    let Some(required) = tool_capability(&params.name) else {
+        return Err(format!("Unsupported MCP tool: {}", params.name));
+    };
+    if !authz.has(required) {
+        return Err(format!(
+            "tool '{}' requires the '{}' capability, which this key does not hold",
+            params.name,
+            required.as_str()
+        ));
+    }
+
     match params.name.as_str() {
         "search_index" => {
             let args: SearchIndexArgs = serde_json::from_value(params.arguments)
                 .map_err(|err| format!("Invalid search_index arguments: {err}"))?;
+            check_index(authz, &args.index)?;
             backend
                 .search_index(
                     McpIndexSearchRequest {
@@ -818,6 +1072,11 @@ where
         "search_indexes" => {
             let args: SearchIndexesArgs = serde_json::from_value(params.arguments)
                 .map_err(|err| format!("Invalid search_indexes arguments: {err}"))?;
+            // Refuse the whole call rather than quietly dropping the indexes this key may
+            // not read: partial results that look complete are worse than an error.
+            for request in &args.indexes {
+                check_index(authz, &request.index)?;
+            }
             backend
                 .search_indexes(args.indexes, args.query, args.limit)
                 .await
@@ -825,12 +1084,17 @@ where
         "get_index" => {
             let args: GetIndexArgs = serde_json::from_value(params.arguments)
                 .map_err(|err| format!("Invalid get_index arguments: {err}"))?;
+            check_index(authz, &args.index)?;
             backend.get_index(args.index).await
         }
-        "list_indexes" => backend.list_indexes().await,
+        "list_indexes" => backend.list_indexes(authz.clone()).await,
         "validate_query" => {
             let args: ValidateQueryArgs = serde_json::from_value(params.arguments)
                 .map_err(|err| format!("Invalid validate_query arguments: {err}"))?;
+            // Validation reports an index's field names, so it is a read of that index.
+            if let Some(index) = &args.index {
+                check_index(authz, index)?;
+            }
             backend
                 .validate_query(args.index, args.partial_field, args.query)
                 .await
@@ -838,9 +1102,24 @@ where
         "get_index_stats" => {
             let args: GetIndexStatsArgs = serde_json::from_value(params.arguments)
                 .map_err(|err| format!("Invalid get_index_stats arguments: {err}"))?;
-            backend.get_index_stats(args.index).await
+            // With no index named this aggregates across the catalogue, which the backend
+            // filters to the caller's scope.
+            if let Some(index) = &args.index {
+                check_index(authz, index)?;
+            }
+            backend.get_index_stats(args.index, authz.clone()).await
         }
+        // Unreachable: `tool_capability` above rejects anything not in this match.
         other => Err(format!("Unsupported MCP tool: {other}")),
+    }
+}
+
+/// Refuse a tool call that names an index outside the caller's scope.
+fn check_index(authz: &McpAuthzRef, index: &str) -> Result<(), String> {
+    if authz.allows_index(index) {
+        Ok(())
+    } else {
+        Err(format!("this key is not permitted on index '{index}'"))
     }
 }
 
@@ -1075,4 +1354,156 @@ fn mcp_tools() -> Vec<JsonValue> {
             }
         }),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A caller scoped to one index, holding only `Read`.
+    struct Scoped(&'static str);
+
+    impl McpAuthz for Scoped {
+        fn key_id(&self) -> Option<String> {
+            Some("aabbccdd".to_string())
+        }
+
+        fn allows_index(&self, index: &str) -> bool {
+            index == self.0
+        }
+
+        fn has(&self, capability: McpCapability) -> bool {
+            capability == McpCapability::Read
+        }
+    }
+
+    fn advertised_tool_names() -> Vec<String> {
+        mcp_tools()
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(|name| name.as_str()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn every_advertised_tool_has_a_capability() {
+        // The guarantee the table cannot make for itself. A tool added to `mcp_tools`
+        // without a row fails here rather than becoming uncallable at runtime — and, more
+        // importantly, a *write* tool added later cannot quietly inherit `Read`.
+        let unclassified: Vec<String> = advertised_tool_names()
+            .into_iter()
+            .filter(|name| tool_capability(name).is_none())
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "advertised but unclassified tools: {unclassified:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_tool_is_denied_rather_than_defaulted() {
+        assert_eq!(tool_capability("drop_everything"), None);
+        assert_eq!(tool_capability(""), None);
+        // Case matters: a lookup that normalised would let `Search_Index` through a table
+        // written in lower case.
+        assert_eq!(tool_capability("SEARCH_INDEX"), None);
+    }
+
+    #[test]
+    fn the_current_tools_are_all_reads() {
+        for name in advertised_tool_names() {
+            assert_eq!(
+                tool_capability(&name),
+                Some(McpCapability::Read),
+                "{name} is not a read; it needs its own row and a look at what else changed"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrestricted_caller_holds_everything() {
+        let authz = McpUnrestricted;
+        assert!(authz.allows_index("payroll"));
+        for capability in [
+            McpCapability::Read,
+            McpCapability::Write,
+            McpCapability::IndexAdmin,
+            McpCapability::NodeAdmin,
+        ] {
+            assert!(authz.has(capability));
+        }
+        assert_eq!(authz.key_id(), None);
+    }
+
+    #[test]
+    fn a_named_index_outside_the_scope_is_refused() {
+        let authz: McpAuthzRef = Arc::new(Scoped("docs"));
+        assert!(check_index(&authz, "docs").is_ok());
+        let err = check_index(&authz, "payroll").unwrap_err();
+        assert!(err.contains("payroll"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_session_belongs_to_the_key_that_created_it() {
+        let state = McpTransportState::default();
+        let session = state.create_session(Some("aabbccdd".to_string())).await;
+
+        assert_eq!(
+            state.claim_session(&session, Some("aabbccdd")).await,
+            SessionAccess::Granted
+        );
+        assert_eq!(
+            state.claim_session(&session, Some("11223344")).await,
+            SessionAccess::WrongKey
+        );
+        // No key at all is not a way around the binding.
+        assert_eq!(
+            state.claim_session(&session, None).await,
+            SessionAccess::WrongKey
+        );
+        assert_eq!(
+            state.claim_session("never-existed", Some("aabbccdd")).await,
+            SessionAccess::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn another_key_cannot_end_someone_elses_session() {
+        let state = McpTransportState::default();
+        let session = state.create_session(Some("aabbccdd".to_string())).await;
+
+        assert_eq!(
+            state.remove_session(&session, Some("11223344")).await,
+            SessionAccess::WrongKey
+        );
+        // Still there: a refused delete must not have deleted anything.
+        assert_eq!(
+            state.claim_session(&session, Some("aabbccdd")).await,
+            SessionAccess::Granted
+        );
+        assert_eq!(
+            state.remove_session(&session, Some("aabbccdd")).await,
+            SessionAccess::Granted
+        );
+        assert_eq!(
+            state.claim_session(&session, Some("aabbccdd")).await,
+            SessionAccess::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_created_without_identity_is_bound_to_nobody() {
+        // Auth off: there is no key to bind to, and binding to "no key" would lock out the
+        // caller that created the session.
+        let state = McpTransportState::default();
+        let session = state.create_session(None).await;
+        assert_eq!(
+            state.claim_session(&session, None).await,
+            SessionAccess::Granted
+        );
+        assert_eq!(
+            state.claim_session(&session, Some("aabbccdd")).await,
+            SessionAccess::Granted
+        );
+    }
 }

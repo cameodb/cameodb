@@ -326,22 +326,12 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
                     .to_string(),
             ),
             Ok(ring) => {
-                // Two things a working configuration can still be wrong about. Both are
-                // reported as clauses on one line rather than as separate rules, because
-                // they describe the same subject — the keys this node holds.
+                // What a working configuration can still be wrong about, reported as a
+                // clause on one line rather than as a rule of its own: it describes the same
+                // subject, the keys this node holds.
                 let mut notes = Vec::new();
                 if !ring.holds(Capability::Write) && !ring.holds(Capability::IndexAdmin) {
                     notes.push("no key holds write or index-admin, so this node is read-only");
-                }
-                let scoped = ring.index_scoped_count();
-                let scoped_note;
-                if scoped > 0 {
-                    scoped_note = format!(
-                        "{} index-scoped key(s) are refused at /mcp until per-tool scoping \
-                         lands (ROADMAP Phase 14 Stage B1 step 4)",
-                        scoped
-                    );
-                    notes.push(&scoped_note);
                 }
 
                 let message = if notes.is_empty() {
@@ -587,9 +577,10 @@ mod tests {
     }
 
     #[test]
-    fn an_index_scoped_key_is_reported_because_mcp_refuses_it() {
-        // Surprising behaviour has to be discoverable before an agent is handed the key,
-        // not after its first MCP call is refused.
+    fn a_scoped_key_no_longer_needs_a_warning_of_its_own() {
+        // It did while MCP refused index-scoped keys outright. Now the scope is enforced
+        // per tool, so a scoped key is an ordinary key and reporting it as a caveat would
+        // be teaching operators to ignore the line.
         let mut c = config_for(Some(Profile::Local), "127.0.0.1");
         c.security.enabled = true;
         c.security.api_keys.push(crate::auth::ApiKeyConfig {
@@ -599,8 +590,8 @@ mod tests {
             ..Default::default()
         });
         let outcome = auth_outcome(&c);
-        assert!(matches!(outcome, Outcome::Warn(_)), "{:?}", outcome);
-        assert!(outcome.message().contains("/mcp"), "{:?}", outcome);
+        assert!(matches!(outcome, Outcome::Pass(_)), "{:?}", outcome);
+        assert!(!outcome.message().contains("/mcp"), "{:?}", outcome);
     }
 
     #[test]

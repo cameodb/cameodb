@@ -295,9 +295,14 @@ interactive shell, a key is bound to the origin it was given for: `connect` else
 it rather than handing your credential to whatever host was typed, and `connect` back
 restores it.
 
-Not yet: MCP tools cannot present a key, index-scoped keys are refused at `/mcp`, and
-`/_indexes` lists every index rather than the permitted ones (ROADMAP Phase 14 Stage B1
-steps 3–4).
+Scoping holds everywhere a key can reach, not only where it names an index: `/_indexes` and
+the MCP catalog list only the indexes a key may see, each MCP tool is checked against the
+capability it needs and the index it names, and an MCP session may only be continued by the
+key that opened it.
+
+Not yet: an MCP client presents its key as an HTTP header, so a client that cannot set one
+cannot authenticate. Every MCP tool today is a read — the capability table denies by
+default, so a write tool added later fails closed until it is classified.
 
 ### Security profiles
 

@@ -572,18 +572,6 @@ impl KeyRing {
         self.entries.iter().any(|entry| entry.has(capability))
     }
 
-    /// How many keys are restricted to named indexes.
-    ///
-    /// Reported by the posture check because an index-scoped key is currently refused at
-    /// `/mcp` (see [`crate::authz::Access::Mcp`]), which is worth knowing before an agent
-    /// is handed one rather than after.
-    pub fn index_scoped_count(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|entry| entry.is_index_scoped())
-            .count()
-    }
-
     /// `3 keys (1 admin, 2 reader)` — for the posture matrix and the startup banner.
     pub fn summary(&self) -> String {
         let counts: Vec<String> = Role::ALL

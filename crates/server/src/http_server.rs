@@ -14,7 +14,8 @@ use axum::{
 };
 use bytes::BytesMut;
 use cameodb_mcp::{
-    MCP_SESSION_ID_HEADER, McpBackend, McpIndexSearchRequest, McpShutdownHandle, mcp_router,
+    MCP_SESSION_ID_HEADER, McpAuthzRef, McpBackend, McpIndexSearchRequest, McpShutdownHandle,
+    mcp_router,
 };
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use kameo::actor::ActorRef;
@@ -33,7 +34,7 @@ use tower_http::{
 pub const HEALTH_PATH: &str = "/_cluster/health";
 use tracing::{error, info, warn};
 
-use crate::authz::Authz;
+use crate::authz::{Authz, retain_visible_indexes};
 use crate::cluster_coordinator::{ClusterCoordinator, GetStatus, OperationType};
 use crate::node_orchestrator::{
     AdminIndexCommitReport, AdminIndexEvictWriterReport, AdminMemoryReport, ClientOp, DocPayload,
@@ -566,16 +567,22 @@ impl McpBackend for AppState {
         })
     }
 
-    fn list_indexes(&self) -> BoxFuture<'_, Result<JsonValue, String>> {
+    /// The MCP index catalogue, filtered to what the caller may see.
+    ///
+    /// The tool dispatcher refuses a *named* index outside the caller's scope; this is the
+    /// enumeration half, and it is also what `get_index_stats` and `list_resources` are
+    /// built on, so filtering here covers all three.
+    fn list_indexes(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>> {
         let state = self.clone();
         Box::pin(async move {
-            let listing = state
+            let mut listing = state
                 .router
                 .handle_client_op(ClientOp::ListIndexes {
                     include_data_size: false,
                 })
                 .await
                 .map_err(|err| err.to_string())?;
+            retain_visible_indexes(&mut listing, authz.as_ref());
 
             let indexes = listing
                 .get("indexes")
@@ -688,7 +695,11 @@ impl McpBackend for AppState {
         })
     }
 
-    fn get_index_stats(&self, index: Option<String>) -> BoxFuture<'_, Result<JsonValue, String>> {
+    fn get_index_stats(
+        &self,
+        index: Option<String>,
+        authz: McpAuthzRef,
+    ) -> BoxFuture<'_, Result<JsonValue, String>> {
         let state = self.clone();
         Box::pin(async move {
             if let Some(index_name) = index {
@@ -706,7 +717,9 @@ impl McpBackend for AppState {
                 }));
             }
 
-            let listing = state.list_indexes().await?;
+            // Already scoped: the aggregate is over the indexes this caller can see, so
+            // the totals it reports do not count documents it cannot read.
+            let listing = state.list_indexes(authz).await?;
             let indexes = listing
                 .get("indexes")
                 .and_then(|value| value.as_array())
@@ -743,10 +756,12 @@ impl McpBackend for AppState {
         })
     }
 
-    fn list_resources(&self) -> BoxFuture<'_, Result<JsonValue, String>> {
+    fn list_resources(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>> {
         let state = self.clone();
         Box::pin(async move {
-            let listing = state.list_indexes().await?;
+            // Every per-index resource URI below is derived from this listing, so a scoped
+            // caller is never handed a URI it would be refused for.
+            let listing = state.list_indexes(authz).await?;
             let indexes = listing
                 .get("indexes")
                 .and_then(|value| value.as_array())
@@ -787,16 +802,31 @@ impl McpBackend for AppState {
         })
     }
 
-    fn read_resource(&self, uri: String) -> BoxFuture<'_, Result<JsonValue, String>> {
+    /// A resource URI names an index, so this is the one place the mcp crate cannot check
+    /// the scope for us: only the host knows that `cameodb://indexes/payroll/schema` is a
+    /// read of `payroll`.
+    fn read_resource(
+        &self,
+        uri: String,
+        authz: McpAuthzRef,
+    ) -> BoxFuture<'_, Result<JsonValue, String>> {
         let state = self.clone();
         Box::pin(async move {
             if uri == "cameodb://indexes" {
-                return state.list_indexes().await;
+                return state.list_indexes(authz).await;
             }
 
             let resource = uri
                 .strip_prefix("cameodb://indexes/")
                 .ok_or_else(|| format!("Unsupported resource URI: {uri}"))?;
+
+            let index_name = resource
+                .strip_suffix("/schema")
+                .or_else(|| resource.strip_suffix("/stats"))
+                .unwrap_or(resource);
+            if !authz.allows_index(index_name) {
+                return Err(format!("this key is not permitted on index '{index_name}'"));
+            }
 
             if let Some(index_name) = resource.strip_suffix("/schema") {
                 let details = state.get_index(index_name.to_string()).await?;
@@ -804,7 +834,9 @@ impl McpBackend for AppState {
             }
 
             if let Some(index_name) = resource.strip_suffix("/stats") {
-                return state.get_index_stats(Some(index_name.to_string())).await;
+                return state
+                    .get_index_stats(Some(index_name.to_string()), authz)
+                    .await;
             }
 
             state.get_index(resource.to_string()).await
@@ -1724,9 +1756,13 @@ async fn search_handler(
 }
 
 /// Handler for listing all indexes across the cluster
+///
+/// Same filtering as [`list_indexes_handler`], and it has to reach further: the cluster
+/// listing repeats every index name under each node it contacted.
 async fn list_cluster_indexes_handler(
     State(state): State<AppState>,
     Query(params): Query<ListIndexesQuery>,
+    authz: Option<Extension<Authz>>,
 ) -> Result<Json<JsonValue>, AppError> {
     info!("List cluster indexes request");
 
@@ -1734,10 +1770,13 @@ async fn list_cluster_indexes_handler(
         include_data_size: params.include_data_size(),
     };
 
-    let result = state
+    let mut result = state
         .router
         .route_and_handle(client_op, None, OperationType::Read)
         .await?;
+    if let Some(Extension(authz)) = authz {
+        crate::authz::filter_index_listing(&mut result, &authz);
+    }
     Ok(Json(result))
 }
 
@@ -2107,9 +2146,13 @@ async fn get_config_handler(
 }
 
 /// Handler for listing all available indexes
+///
+/// Filtered to the caller's scope: a key restricted to named indexes is already refused when
+/// it addresses another one, so enumeration is the only way left to learn the names.
 async fn list_indexes_handler(
     State(state): State<AppState>,
     Query(params): Query<ListIndexesQuery>,
+    authz: Option<Extension<Authz>>,
 ) -> Result<Json<JsonValue>, AppError> {
     info!("List indexes request");
 
@@ -2117,10 +2160,13 @@ async fn list_indexes_handler(
         include_data_size: params.include_data_size(),
     };
 
-    let result = state
+    let mut result = state
         .router
         .route_and_handle(client_op, None, OperationType::Read)
         .await?;
+    if let Some(Extension(authz)) = authz {
+        crate::authz::filter_index_listing(&mut result, &authz);
+    }
     Ok(Json(result))
 }
 

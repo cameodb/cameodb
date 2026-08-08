@@ -37,10 +37,9 @@ These are accepted, not fixed. They belong in release notes as much as here.
   HTTP and MCP endpoint to whoever can reach the port, `/_admin/*` included. That is a
   supported configuration for `local` and a warning for `internal`; `external` refuses to
   start without keys. Enabling it is one `cameodb keygen` and one stanza.
-- **MCP is gated at the endpoint, not per tool**, and index-scoped keys are refused there
-  outright rather than filtered. An MCP client also has no way to present a key of its own.
-  `/_indexes` lists every index regardless of a key's scope — named access is refused,
-  enumeration is not yet filtered. ROADMAP Phase 14 Stage B1 steps 3–4.
+- **An MCP client authenticates with an HTTP header or not at all.** The key travels as
+  `Authorization: Bearer`, so an MCP client that cannot set a header cannot reach an
+  authenticated node. There is no OAuth flow and no per-client credential issuance.
 - **Cluster PSK has no rotation path.** Changing it requires stopping every node.
 - **Three transitive advisories are ignored** (`deny.toml`), all via libp2p 0.56.0.
 

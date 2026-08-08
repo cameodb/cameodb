@@ -187,15 +187,162 @@ check_eq "and on the admin routes that name one"  "403" "$(code "$SCOPED_KEY" -X
 check_eq "an encoded index name does not slip past" "403" \
     "$(code "$SCOPED_KEY" -X POST "$BASE/api/%64ocs/search" -H "$json" -d "$QUERY")"
 
+section "index enumeration"
+# A second index the scoped key may not touch. Named access to it is already refused; what
+# is being checked here is that its *name* does not come back in a listing either.
+check_eq "admin creates a second index" "200" \
+    "$(code "$ADMIN_KEY" -X PUT "$BASE/api/payroll/_config" -H "$json" \
+        -d '{"name":"payroll","fields":{"title":{"field_type":"text","indexed":true,"stored":true}}}')"
+
+admin_list="$(curl -s -m 10 -H "Authorization: Bearer $ADMIN_KEY" "$BASE/_indexes")"
+scoped_list="$(curl -s -m 10 -H "Authorization: Bearer $SCOPED_KEY" "$BASE/_indexes")"
+if grep -q 'payroll' <<< "$admin_list"; then
+    pass "an unscoped key still sees every index"
+else
+    fail "an unscoped key still sees every index" "$admin_list"
+fi
+if grep -q 'payroll' <<< "$scoped_list"; then
+    fail "/_indexes hides indexes outside a key's scope" "$scoped_list"
+else
+    pass "/_indexes hides indexes outside a key's scope"
+fi
+if grep -q 'docs' <<< "$scoped_list"; then
+    pass "/_indexes still shows the indexes in scope"
+else
+    fail "/_indexes still shows the indexes in scope" "$scoped_list"
+fi
+# The count is part of the disclosure: "2 indexes" over a list of one says how many were
+# withheld.
+if grep -q '"total_indexes":[[:space:]]*1' <<< "$scoped_list"; then
+    pass "the index count matches the filtered list"
+else
+    fail "the index count matches the filtered list" "$scoped_list"
+fi
+
+cluster_list="$(curl -s -m 10 -H "Authorization: Bearer $SCOPED_KEY" "$BASE/_cluster/_indexes")"
+# The cluster listing repeats every name under each node that answered, so filtering the
+# top-level array alone would leak the same names one level down.
+if grep -q 'payroll' <<< "$cluster_list"; then
+    fail "/_cluster/_indexes filters at every level" "$cluster_list"
+else
+    pass "/_cluster/_indexes filters at every level"
+fi
+
 section "MCP"
 MCP_INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}'
 mcp_accept='accept: application/json, text/event-stream'
 check_eq "a reader key reaches MCP" "200" \
     "$(code "$READER_KEY" -X POST "$BASE/mcp" -H "$json" -H "$mcp_accept" -d "$MCP_INIT")"
-# Until per-tool scoping lands (B1 step 4) an index-scoped key would escape its scope
-# through MCP, so it is refused at the door instead.
-check_eq "an index-scoped key is refused at MCP" "403" \
+# The door only asks for Read. An index-scoped key gets in and is held to its scope per
+# tool, which is what step 4 replaced the blanket refusal with.
+check_eq "an index-scoped key now reaches MCP" "200" \
     "$(code "$SCOPED_KEY" -X POST "$BASE/mcp" -H "$json" -H "$mcp_accept" -d "$MCP_INIT")"
+
+# rpc <key> <json> — body of a single JSON-RPC call.
+rpc() {
+    local key="$1" body="$2"
+    curl -s -m 20 -H "Authorization: Bearer $key" -H "$json" -H "$mcp_accept" \
+        -X POST "$BASE/mcp" -d "$body"
+}
+tool() {
+    printf '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"%s","arguments":%s}}' \
+        "$1" "$2"
+}
+
+out="$(rpc "$SCOPED_KEY" "$(tool search_index '{"index":"docs","query":"probe"}')")"
+if grep -q '"error"' <<< "$out"; then
+    fail "a scoped key may use a tool on its own index" "$out"
+else
+    pass "a scoped key may use a tool on its own index"
+fi
+
+for probe in \
+    'search_index|{"index":"payroll","query":"x"}' \
+    'get_index|{"index":"payroll"}' \
+    'get_index_stats|{"index":"payroll"}' \
+    'validate_query|{"index":"payroll","query":"x"}' \
+    'search_indexes|{"indexes":[{"index":"docs"},{"index":"payroll"}],"query":"x"}'
+do
+    name="${probe%%|*}"; args="${probe#*|}"
+    out="$(rpc "$SCOPED_KEY" "$(tool "$name" "$args")")"
+    if grep -q "not permitted on index 'payroll'" <<< "$out"; then
+        pass "$name refuses an index outside the scope"
+    else
+        fail "$name refuses an index outside the scope" "$out"
+    fi
+done
+
+# A federated search naming one allowed and one forbidden index fails as a whole. Partial
+# results that look complete are worse than an error.
+out="$(rpc "$SCOPED_KEY" "$(tool search_indexes '{"indexes":[{"index":"docs"},{"index":"payroll"}],"query":"x"}')")"
+if grep -q '"results"' <<< "$out"; then
+    fail "a federated search is refused rather than silently narrowed" "$out"
+else
+    pass "a federated search is refused rather than silently narrowed"
+fi
+
+out="$(rpc "$SCOPED_KEY" "$(tool list_indexes '{}')")"
+if grep -q 'payroll' <<< "$out"; then
+    fail "the MCP catalog is filtered to the scope" "$out"
+else
+    pass "the MCP catalog is filtered to the scope"
+fi
+if grep -q 'docs' <<< "$out"; then
+    pass "the MCP catalog still lists what is in scope"
+else
+    fail "the MCP catalog still lists what is in scope" "$out"
+fi
+
+out="$(rpc "$SCOPED_KEY" '{"jsonrpc":"2.0","id":4,"method":"resources/list","params":{}}')"
+if grep -q 'payroll' <<< "$out"; then
+    fail "resource URIs are not handed out for indexes off-scope" "$out"
+else
+    pass "resource URIs are not handed out for indexes off-scope"
+fi
+
+# Not being *offered* a URI is not the same as being refused it. The resource route resolves
+# a name from the URI, so it has to check as well.
+for uri in "cameodb://indexes/payroll" "cameodb://indexes/payroll/schema" "cameodb://indexes/payroll/stats"; do
+    out="$(rpc "$SCOPED_KEY" "$(printf '{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"%s"}}' "$uri")")"
+    if grep -q "not permitted on index 'payroll'" <<< "$out"; then
+        pass "reading $uri directly is refused"
+    else
+        fail "reading $uri directly is refused" "$out"
+    fi
+done
+
+# Deny by default: a tool with no row in the capability table cannot be called by naming it.
+out="$(rpc "$ADMIN_KEY" "$(tool delete_everything '{}')")"
+if grep -q 'Unsupported MCP tool' <<< "$out"; then
+    pass "an unknown tool is refused, not dispatched"
+else
+    fail "an unknown tool is refused, not dispatched" "$out"
+fi
+
+section "MCP sessions belong to one key"
+SESSION="$(curl -s -D - -o /dev/null -m 20 -H "Authorization: Bearer $READER_KEY" -H "$json" \
+    -H "$mcp_accept" -X POST "$BASE/mcp" -d "$MCP_INIT" \
+    | grep -i '^mcp-session-id:' | tr -d '\r' | awk '{print $2}')"
+if [ -n "$SESSION" ]; then
+    pass "initialize issues a session id"
+else
+    fail "initialize issues a session id"
+fi
+
+session_header="mcp-session-id: $SESSION"
+PING='{"jsonrpc":"2.0","id":7,"method":"ping","params":{}}'
+check_eq "the creating key may continue its session" "200" \
+    "$(code "$READER_KEY" -X POST "$BASE/mcp" -H "$json" -H "$mcp_accept" -H "$session_header" -d "$PING")"
+# A session id travels in a header and names server-side state. Knowing one must not be
+# enough to continue somebody else's conversation.
+check_eq "another key may not continue it" "403" \
+    "$(code "$ADMIN_KEY" -X POST "$BASE/mcp" -H "$json" -H "$mcp_accept" -H "$session_header" -d "$PING")"
+check_eq "another key may not listen on it" "403" \
+    "$(code "$ADMIN_KEY" "$BASE/mcp" -H "$mcp_accept" -H "$session_header")"
+check_eq "another key may not end it" "403" \
+    "$(code "$ADMIN_KEY" -X DELETE "$BASE/mcp" -H "$session_header")"
+check_eq "the creating key may end it" "200" \
+    "$(code "$READER_KEY" -X DELETE "$BASE/mcp" -H "$session_header")"
 
 section "health"
 check_eq "health answers without a key" "200" "$(code '' "$BASE/_cluster/health")"

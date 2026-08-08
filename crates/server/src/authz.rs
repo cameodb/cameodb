@@ -28,6 +28,8 @@ use axum::{
 };
 use tracing::{debug, warn};
 
+use cameodb_mcp::server::{McpAuthz, McpAuthzRef, McpCapability};
+
 use crate::auth::{Capability, KeyEntry, KeyRing};
 
 /// What a route requires of its caller.
@@ -42,9 +44,9 @@ pub enum Access {
     /// The MCP endpoint: `Read` at the door, and per-tool checks inside it.
     ///
     /// A single JSON-RPC path cannot be classified per operation from the outside, so the
-    /// tool capability table lives in the dispatcher (ROADMAP Phase 14 Stage B1 step 4).
-    /// Until it lands, an index-scoped key is refused here outright: letting it through
-    /// would let it read indexes it is not scoped to, which is worse than not working.
+    /// capability a tool needs and the index it names are decided in the dispatcher, from
+    /// the identity this middleware attaches. Everything below the door is
+    /// [`cameodb_mcp::server::tool_capability`] and [`McpAuthz`].
     Mcp,
 }
 
@@ -200,6 +202,106 @@ impl Authz {
             _ => None,
         }
     }
+
+    /// The caller's index scope, or `None` when every index is in reach.
+    ///
+    /// `Anonymous` maps to "unrestricted" rather than "nothing", which is safe only because
+    /// an anonymous caller cannot reach any route that lists indexes — `/_cluster/health` is
+    /// the sole public route, and it names no index.
+    pub fn index_scope(&self) -> Option<&KeyEntry> {
+        match self {
+            Authz::Key(entry) if entry.is_index_scoped() => Some(entry),
+            _ => None,
+        }
+    }
+}
+
+/// The same identity, in the vocabulary the mcp crate understands.
+///
+/// `/mcp` is one path, so the middleware can only check `Read` at the door; which tool and
+/// which index are visible solely to the dispatcher. This is the one place the two
+/// capability vocabularies meet, which is why the mapping is exhaustive rather than a
+/// catch-all — a capability added to either side has to be mapped here to compile.
+impl McpAuthz for Authz {
+    fn key_id(&self) -> Option<String> {
+        Authz::key_id(self)
+    }
+
+    fn allows_index(&self, index: &str) -> bool {
+        match self {
+            Authz::Disabled | Authz::Anonymous => true,
+            Authz::Key(entry) => entry.allows_index(index),
+        }
+    }
+
+    fn has(&self, capability: McpCapability) -> bool {
+        let capability = match capability {
+            McpCapability::Read => Capability::Read,
+            McpCapability::Write => Capability::Write,
+            McpCapability::IndexAdmin => Capability::IndexAdmin,
+            McpCapability::NodeAdmin => Capability::NodeAdmin,
+        };
+        match self {
+            // Auth off: nothing to enforce. Anonymous never reaches MCP — the door requires
+            // `Read` — so the arm exists to be total, not to be used.
+            Authz::Disabled | Authz::Anonymous => true,
+            Authz::Key(entry) => entry.has(capability),
+        }
+    }
+}
+
+/// Remove indexes the caller may not see from a listing response, in place.
+///
+/// Named access is refused by [`decide`] before a handler runs; this is the other half —
+/// enumeration. Without it a key scoped to one index still learns every index name, and the
+/// names alone (`payroll`, `incidents-2026`) are worth having.
+///
+/// The two listing shapes differ: `/_indexes` names an entry `name`, the MCP catalog names
+/// it `index`. Both are accepted, and an entry with **neither** is dropped — a listing whose
+/// shape has changed underneath this function must lose entries, not leak them.
+pub fn filter_index_listing(value: &mut serde_json::Value, authz: &Authz) {
+    let Some(entry) = authz.index_scope() else {
+        return;
+    };
+    retain_indexes(value, &|index| entry.allows_index(index));
+}
+
+/// The same filtering for an MCP caller.
+///
+/// Two entry points rather than one because the two sides carry identity in different types:
+/// HTTP handlers hold an [`Authz`], the MCP backend holds the trait object the mcp crate
+/// gave it. Both narrow to the same predicate over the same response shapes.
+pub fn retain_visible_indexes(value: &mut serde_json::Value, authz: &dyn McpAuthz) {
+    retain_indexes(value, &|index| authz.allows_index(index));
+}
+
+fn retain_indexes(value: &mut serde_json::Value, allowed: &dyn Fn(&str) -> bool) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(indexes) = object.get_mut("indexes").and_then(|v| v.as_array_mut()) {
+        indexes.retain(|item| entry_index_name(item).is_some_and(allowed));
+        let remaining = indexes.len();
+        // The count has to follow the list. A response saying "4 indexes" above a list of
+        // one is both wrong and a disclosure of the number withheld.
+        if object.contains_key("total_indexes") {
+            object.insert("total_indexes".to_string(), remaining.into());
+        }
+    }
+
+    // The cluster listing repeats the names under each node, with its own count.
+    if let Some(nodes) = object.get_mut("nodes").and_then(|v| v.as_array_mut()) {
+        for node in nodes.iter_mut() {
+            retain_indexes(node, allowed);
+        }
+    }
+}
+
+fn entry_index_name(item: &serde_json::Value) -> Option<&str> {
+    item.get("name")
+        .or_else(|| item.get("index"))
+        .and_then(|value| value.as_str())
 }
 
 /// A refusal, rendered the way the rest of the API renders errors.
@@ -320,23 +422,11 @@ fn decide(
         )));
     }
 
-    if classified.access == Access::Mcp && entry.is_index_scoped() {
-        warn!(
-            key_id = %entry.key_id(), label = %entry.label(),
-            "auth: refused, an index-scoped key cannot use MCP yet"
-        );
-        return Err(Refusal::forbidden(
-            "this key is restricted to specific indexes, and MCP cannot yet enforce that \
-             restriction per tool (ROADMAP Phase 14 Stage B1 step 4). Use the HTTP API, or \
-             issue an unscoped key",
-        ));
-    }
-
     if let Some(index) = classified.index
         && !entry.allows_index(index)
     {
-        // Named access gets an honest answer. Enumeration does not — filtering, not 403, is
-        // what `/_indexes` will do (step 3), so a scoped key cannot map what it cannot read.
+        // Named access gets an honest answer. Enumeration does not — `/_indexes` filters
+        // rather than refusing, so a scoped key cannot map what it is not allowed to read.
         warn!(
             key_id = %entry.key_id(), label = %entry.label(),
             %method, %path, %index,
@@ -373,6 +463,16 @@ pub async fn authorize(
             // Every request that reaches a handler carries its identity, including the
             // anonymous and auth-disabled cases. A handler asking "who is this?" always gets
             // an answer, so none of them has to guess what a missing extension means.
+            //
+            // MCP needs the same identity behind a trait the mcp crate owns, since it cannot
+            // see this one. Allocated only for the routes that can use it.
+            if matches!(
+                classify(&method, &path).map(|c| c.access),
+                Some(Access::Mcp)
+            ) {
+                let handle: McpAuthzRef = Arc::new(authz.clone());
+                req.extensions_mut().insert(handle);
+            }
             req.extensions_mut().insert(authz);
             next.run(req).await
         }
@@ -646,16 +746,23 @@ mod tests {
     }
 
     #[test]
-    fn an_index_scoped_key_cannot_reach_mcp_until_it_can_be_enforced_there() {
+    fn an_index_scoped_key_reaches_mcp_and_arrives_carrying_its_scope() {
+        // The door only asks for `Read`. The scope is enforced per tool and per index by the
+        // dispatcher, from exactly this identity — so what matters here is that a scoped key
+        // is let through *and* that what it hands over still knows what it is scoped to.
         let (scoped, scoped_config) = key_for(Role::Reader, Some(vec!["docs"]));
         let (open, open_config) = key_for(Role::Reader, None);
         let ring = ring(vec![scoped_config, open_config]);
 
-        assert_eq!(
-            status_of(&decide(&ring, "POST", "/mcp", &headers_with(Some(&scoped)))),
-            Some(StatusCode::FORBIDDEN)
-        );
-        assert!(decide(&ring, "POST", "/mcp", &headers_with(Some(&open))).is_ok());
+        let authz = decide(&ring, "POST", "/mcp", &headers_with(Some(&scoped))).unwrap();
+        assert!(McpAuthz::allows_index(&authz, "docs"));
+        assert!(!McpAuthz::allows_index(&authz, "payroll"));
+        assert!(authz.has(McpCapability::Read));
+        assert!(!authz.has(McpCapability::Write));
+        assert_eq!(McpAuthz::key_id(&authz), Authz::key_id(&authz));
+
+        let open = decide(&ring, "POST", "/mcp", &headers_with(Some(&open))).unwrap();
+        assert!(McpAuthz::allows_index(&open, "payroll"));
     }
 
     #[test]
@@ -774,5 +881,101 @@ mod tests {
             Some(Access::Needs(Capability::IndexAdmin))
         );
         assert!(classify("PATCH", "/api/docs/_config").is_none());
+    }
+
+    /// An [`Authz`] holding a key scoped to `indexes`.
+    fn scoped_as(indexes: Option<Vec<&str>>) -> Authz {
+        let (key, config) = key_for(Role::Reader, indexes);
+        let keyring = ring(vec![config]);
+        Authz::Key(keyring.authenticate(key.expose()).unwrap())
+    }
+
+    #[test]
+    fn a_scoped_key_sees_only_its_own_indexes_in_a_listing() {
+        let mut listing = serde_json::json!({
+            "indexes": [
+                {"name": "docs", "document_count": 3},
+                {"name": "payroll", "document_count": 9},
+                {"name": "incidents", "document_count": 1},
+            ],
+            "total_indexes": 3,
+            "node_id": "n1",
+        });
+        filter_index_listing(&mut listing, &scoped_as(Some(vec!["docs"])));
+
+        let names: Vec<&str> = listing["indexes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect();
+        assert_eq!(names, ["docs"]);
+        // The count follows the list: "3" over one row would disclose how many were withheld.
+        assert_eq!(listing["total_indexes"], 1);
+        // Everything that is not an index name is left alone.
+        assert_eq!(listing["node_id"], "n1");
+    }
+
+    #[test]
+    fn the_mcp_catalog_shape_is_filtered_too() {
+        // `/_indexes` calls an entry `name`; the MCP catalog calls it `index`.
+        let mut listing = serde_json::json!({
+            "indexes": [
+                {"index": "docs", "stats": {}},
+                {"index": "payroll", "stats": {}},
+            ],
+            "total_indexes": 2,
+        });
+        filter_index_listing(&mut listing, &scoped_as(Some(vec!["docs"])));
+        assert_eq!(listing["indexes"].as_array().unwrap().len(), 1);
+        assert_eq!(listing["indexes"][0]["index"], "docs");
+    }
+
+    #[test]
+    fn the_cluster_listing_is_filtered_under_every_node_as_well() {
+        // The names appear twice: once merged at the top, once per node that answered.
+        let mut listing = serde_json::json!({
+            "indexes": [{"name": "docs"}, {"name": "payroll"}],
+            "total_indexes": 2,
+            "nodes_contacted": 2,
+            "nodes": [
+                {"node_id": "n1", "indexes": [{"name": "docs"}, {"name": "payroll"}], "total_indexes": 2, "total_shards": 4},
+                {"node_id": "n2", "indexes": [{"name": "payroll"}], "total_indexes": 1, "total_shards": 2},
+            ],
+        });
+        filter_index_listing(&mut listing, &scoped_as(Some(vec!["docs"])));
+
+        assert_eq!(listing["total_indexes"], 1);
+        assert_eq!(listing["nodes"][0]["indexes"].as_array().unwrap().len(), 1);
+        assert_eq!(listing["nodes"][0]["total_indexes"], 1);
+        assert_eq!(listing["nodes"][1]["indexes"].as_array().unwrap().len(), 0);
+        assert_eq!(listing["nodes"][1]["total_indexes"], 0);
+        assert!(!serde_json::to_string(&listing).unwrap().contains("payroll"));
+    }
+
+    #[test]
+    fn an_unscoped_caller_sees_the_listing_untouched() {
+        let full = serde_json::json!({
+            "indexes": [{"name": "docs"}, {"name": "payroll"}],
+            "total_indexes": 2,
+        });
+        for authz in [Authz::Disabled, Authz::Anonymous, scoped_as(None)] {
+            let mut listing = full.clone();
+            filter_index_listing(&mut listing, &authz);
+            assert_eq!(listing, full, "{authz:?} should see everything");
+        }
+    }
+
+    #[test]
+    fn an_entry_whose_shape_is_unrecognised_is_dropped_not_kept() {
+        // If the listing shape changes underneath this function, the failure has to be
+        // "an index vanished from a list", not "a scoped key saw everything".
+        let mut listing = serde_json::json!({
+            "indexes": [{"name": "docs"}, {"identifier": "payroll"}, "docs", 7],
+            "total_indexes": 4,
+        });
+        filter_index_listing(&mut listing, &scoped_as(Some(vec!["docs"])));
+        assert_eq!(listing["indexes"].as_array().unwrap().len(), 1);
+        assert_eq!(listing["total_indexes"], 1);
     }
 }
