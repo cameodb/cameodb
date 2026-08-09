@@ -58,7 +58,12 @@ summary() {
     return 0
 }
 
-repo_root() { git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel; }
+# Falls back to walking up from this file when git is unavailable — artifact.sh is meant to
+# be runnable inside a bare Linux container, which has readelf but no git and no checkout.
+repo_root() {
+    git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null && return 0
+    ( cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd )
+}
 
 # Locate the cameodb binary, preferring an explicit override.
 cameodb_bin() {

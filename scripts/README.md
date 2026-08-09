@@ -15,17 +15,22 @@ For a quick overview of all available scripts and project status:
 ### � `build/` - Build and Distribution
 
 #### `build-musl.sh`
-**Purpose**: Local cross-compile to `x86_64-unknown-linux-musl` via `cargo-zigbuild`, without Docker
+**Purpose**: Build a fully static Linux binary (musl) — no interpreter, no `NEEDED` entries, runs on `gcr.io/distroless/static`
 - **Features**:
+  - Builds in a Linux container matching the target architecture by default, which is the same toolchain the `Dockerfile` uses and therefore matches the published image. Falls back to `cargo-zigbuild` when Docker is unavailable, or with `BUILD_WITH=zig`
+  - **The two methods do not produce the same artifact.** Zig's linker does not advertise `-static-pie`, so rustc falls back to `-static` with only a warning: still fully static, but not position-independent. Prefer the container path for anything you ship
+  - Checks the result with `validate/artifact.sh` rather than assuming the flags took
   - TLS is rustls with the `ring` provider (no vendored OpenSSL, no C toolchain)
-  - Exports `AR="zig ar"` / `RANLIB="zig ranlib"` so jemalloc's C build archives correctly — without this, macOS's native `ranlib` silently produces an empty `libjemalloc.a` (it can't parse the ELF objects Zig's cross-compiler emits), and the failure only surfaces later as `undefined symbol: mallocx`/`mallctl` at link time. See [docs/BUILDING.md](../../docs/BUILDING.md#building-for-x86_64-unknown-linux-musl) for the full explanation.
+  - Under the zig path, exports `AR="zig ar"` / `RANLIB="zig ranlib"` so jemalloc's C build archives correctly — without this, macOS's native `ranlib` silently produces an empty `libjemalloc.a` (it can't parse the ELF objects Zig's cross-compiler emits), and the failure only surfaces later as `undefined symbol: mallocx`/`mallctl` at link time. See [docs/BUILDING.md](../../docs/BUILDING.md) for the full explanation
 - **Usage**:
   ```bash
-  ./scripts/build/build-musl.sh                # release build (default)
-  ./scripts/build/build-musl.sh dev            # dev/debug build (binary lands in target/.../debug/)
-  ./scripts/build/build-musl.sh release-docker # this repo's thin-LTO profile
+  ./scripts/build/build-musl.sh                    # release, x86_64
+  ./scripts/build/build-musl.sh release aarch64    # release, aarch64
+  ./scripts/build/build-musl.sh release both       # both architectures
+  ./scripts/build/build-musl.sh dev                # dev build (binary lands in target/.../debug/)
+  BUILD_WITH=zig ./scripts/build/build-musl.sh     # force the no-Docker path
   ```
-- **Prerequisites**: `zig` and `cargo-zigbuild` (`brew install zig && cargo install cargo-zigbuild`)
+- **Prerequisites**: Docker; or `zig` and `cargo-zigbuild` (`brew install zig && cargo install cargo-zigbuild`) for the fallback. A cross-architecture container build runs emulated and is slow
 - **Audience**: Developers building/testing Linux binaries locally on macOS
 
 #### `docker-push.sh`

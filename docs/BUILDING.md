@@ -1,52 +1,96 @@
 # Cross-Compilation Build Guide
 
-## Building for x86_64-unknown-linux-musl
+## Building static Linux binaries (musl)
 
-### Recommended: Using the build script
-
-For musl targets, use the convenience script, which builds via `cargo-zigbuild`. TLS is rustls with the `ring` provider, so no C toolchain or vendored OpenSSL is involved:
+Linux ships as a fully static musl binary: no interpreter, no `NEEDED` entries, no libc or
+libgcc to match on the host. It runs on `gcr.io/distroless/static`, which contains nothing
+but the binary.
 
 ```bash
-./scripts/build/build-musl.sh
+./scripts/build/build-musl.sh                  # release, x86_64
+./scripts/build/build-musl.sh release aarch64
+./scripts/build/build-musl.sh release both
 ```
 
-**Benefits:**
-- ✅ Works with all HTTPS sites (Vercel, etc.)
-- ✅ Zig provides complete C toolchain (no glibc/musl compatibility issues)
-- ✅ Self-contained binary
-- ✅ Same approach used in Docker builds
-- ✅ Sets `AR`/`RANLIB` to Zig's archiver — see the warning below
+The script picks a build method, then checks the artifact it produced:
 
-**How it works:** Zig's C compiler provides a complete libc implementation that's compatible with musl, avoiding the glibc symbol issues that occur with traditional cross-compilation.
+| Method | When | Result |
+|---|---|---|
+| **container** | Docker available (the default) | static-pie on x86_64, RELRO, BIND_NOW. Same toolchain the `Dockerfile` uses, so it matches the published image |
+| **zigbuild** | no Docker, or `BUILD_WITH=zig` | fully static, but **not PIE on either architecture** |
+
+Prefer the container path for anything you ship. Zig's linker does not advertise
+`-static-pie`, and rustc responds by falling back to `-static` with only a warning — the
+binary is still completely static, it just loads at a fixed address. Convenient for local
+testing; not a release artifact.
+
+Whichever path runs, verify rather than assume:
+
+```bash
+./scripts/validate/artifact.sh target/x86_64-unknown-linux-musl/release/cameodb
+```
+
+That check is the point of this section. Every property here is silently droppable — by the
+linker, by a target default, by a `RUSTFLAGS` that overrides `.cargo/config.toml` — and
+"we passed the flag" is a different claim from "the binary has the property".
+
+### Page size on aarch64
+
+`.cargo/config.toml` sets `JEMALLOC_SYS_WITH_LG_PAGE = "12"`, fixing jemalloc's page size at
+4 KiB when it is compiled. jemalloc refuses to start when the runtime page size is *larger*
+than the one it was built for, and while every x86_64 Linux uses 4 KiB pages, aarch64 kernels
+also ship with 16 KiB and 64 KiB — RHEL and its derivatives use 64 KiB on aarch64. A binary
+built with this value aborts at startup there, which is the opposite of what shipping static
+is for.
+
+Building with `LG_PAGE = "16"` would run everywhere at the cost of coarser allocation
+granularity on 4 KiB hosts. The value has been left at 12 deliberately, because it is correct
+for every platform currently targeted; change it before shipping aarch64 packages to distros
+you do not control.
+
+### PIE on aarch64 is not available
+
+`x86_64-unknown-linux-musl` defaults to static-pie and gets full ASLR.
+`aarch64-unknown-linux-musl` defaults to `-no-pie`, and that default is load-bearing: forcing
+`-C link-arg=-static-pie` links successfully and then segfaults before `main`. Verified
+2026-08-09 against a hello-world crate with no dependencies, so it is the toolchain rather
+than anything CameoDB links.
+
+aarch64 release binaries therefore load at a fixed address. `artifact.sh` reports this as a
+SKIP rather than a failure; if it ever starts passing, the toolchain has been fixed and
+`.cargo/config.toml` should add the flag back.
+
+### How the container path works
+
+Native `rustc` and `lld` inside a Linux image, with the cargo registry and a Docker volume
+for the target directory mounted in, so nothing root-owned lands in the working tree. Only
+the finished binary is copied back out.
+
+### How the zigbuild path works
+
+Zig's C compiler provides a complete libc implementation compatible with musl, avoiding the
+glibc symbol issues of traditional cross-compilation, and it cross-compiles from macOS with
+no Linux toolchain installed. TLS is rustls with the `ring` provider, so no C toolchain or
+vendored OpenSSL is involved either way.
 
 > **⚠️ If you run `cargo zigbuild` directly instead of the script**, you must export `AR="zig ar"` and `RANLIB="zig ranlib"` first. Any target using `target_env = "musl"` pulls in `tikv-jemallocator`/`tikv-jemalloc-sys`, which compile jemalloc's C sources via `configure`/`make`. That build step never sets `AR`/`RANLIB` itself, so without the exports it silently falls back to macOS's native `ar`/`ranlib`. Those tools don't understand the ELF `.o` files Zig's cross-compiler produces — `ranlib` prints `warning: archive member '...' not a mach-o file` and drops every unrecognized member while rebuilding the archive's symbol index, leaving a valid but **empty** `libjemalloc.a` (just a `__.SYMDEF` header, no object code). The failure only shows up later, at link time, as `undefined symbol: mallocx` / `rallocx` / `sdallocx` / `mallctl` — misleading because the actual defect is in an archiving step several layers upstream of the link error.
 >
 > ```bash
 > export AR="zig ar"
 > export RANLIB="zig ranlib"
-> cargo zigbuild --release --target x86_64-unknown-linux-musl \
->     --no-default-features \
-> > ```
+> cargo zigbuild --release --target x86_64-unknown-linux-musl --no-default-features
+> ```
 
-### Alternative: Using rustls-tls
+### On `--no-default-features`
 
-For faster builds with pure Rust TLS:
+The build commands carry it and it currently does nothing: no crate in this workspace
+declares a `[features]` section, and the flag applies to workspace members rather than to
+their dependencies. It is kept so that adding an opt-in feature later does not silently
+change what release builds contain.
 
-```bash
-export AR="zig ar"
-export RANLIB="zig ranlib"
-cargo zigbuild --release --target x86_64-unknown-linux-musl \
-    --no-default-features \
-    --features client/rustls-tls
-```
-
-**Pros:**
-- Faster compilation
-- Pure Rust (no C dependencies)
-- Smaller binary size
-
-**Cons:**
-- May have certificate validation issues with some sites
+TLS is not a feature either. It is rustls with the `ring` provider, unconditionally, with
+outbound HTTPS verified against the system trust store through `rustls-platform-verifier` —
+there is no OpenSSL path to select and nothing to vendor.
 
 ## Building for native macOS/Linux (glibc)
 

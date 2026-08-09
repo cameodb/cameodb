@@ -137,8 +137,16 @@ logs/
 
 # Runtime and cache directories
 .cache/
-.cargo/
 .rustup/
+
+# .cargo/config.toml is build configuration, not a cache: it carries the musl link and
+# hardening flags and jemalloc's page size. Ignoring the whole directory meant a fresh clone
+# silently built release binaries with none of them. Credentials stay ignored.
+#
+# `.cargo/*` rather than `.cargo/` on purpose — git does not descend into an excluded
+# directory, so a negation cannot re-include a file underneath one.
+.cargo/*
+!.cargo/config.toml
 
 # Backup files
 *.orig

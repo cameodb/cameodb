@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-ALL_SUITES=(deps unit posture auth tls remote-sources)
+ALL_SUITES=(deps unit posture auth tls remote-sources artifact)
 SUITES=("${@:-}")
 [ -z "${SUITES[0]:-}" ] && SUITES=("${ALL_SUITES[@]}")
 

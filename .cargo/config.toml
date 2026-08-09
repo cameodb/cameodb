@@ -1,0 +1,59 @@
+# .cargo/config.toml
+
+# Linux ships as a fully static musl binary: no interpreter, no NEEDED entries, nothing to
+# match on the host. Verify with `scripts/validate/artifact.sh` rather than trusting these
+# flags to have taken — rustc drops link arguments the linker will not accept with only a
+# warning, which is what `cargo zigbuild` triggers (see docs/BUILDING.md).
+#
+# The two targets are deliberately NOT identical, and the difference is not an oversight:
+#
+#   x86_64  static-pie, which rustc already defaults to here. Full ASLR.
+#   aarch64 static, not PIE. rustc defaults this target to `-no-pie` because static-pie is
+#           broken on aarch64-musl — forcing it with `-C link-arg=-static-pie` links fine and
+#           then segfaults before `main`, verified 2026-08-09 on a hello-world crate with no
+#           dependencies at all, so it is the toolchain and not anything CameoDB links. The
+#           consequence is that aarch64 release binaries load at a fixed address. Re-test
+#           before assuming it is still true; the check in artifact.sh is where to record it.
+[target.x86_64-unknown-linux-musl]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "relocation-model=pie",
+    "-C", "relro-level=full",
+    "-C", "link-arg=-Wl,-z,now",
+    "-C", "link-arg=-Wl,-z,relro",
+    "-C", "link-arg=-fstack-protector-strong",
+    "-C", "link-arg=-D_FORTIFY_SOURCE=2",
+]
+
+# No `relocation-model=pie` here: see above. The rest still applies.
+[target.aarch64-unknown-linux-musl]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "relro-level=full",
+    "-C", "link-arg=-Wl,-z,relro",
+    "-C", "link-arg=-fstack-protector-strong",
+    "-C", "link-arg=-D_FORTIFY_SOURCE=2",
+]
+
+# jemalloc's page size is fixed at compile time, and it refuses to start when the runtime
+# page size is larger than the one it was built for. 12 (4 KiB) matches every x86_64 Linux
+# and the common aarch64 configuration, but aarch64 kernels also ship with 16 KiB and 64 KiB
+# pages — a static binary built with this value aborts at startup on those hosts, which is
+# the opposite of what shipping static is for. See docs/BUILDING.md ("Page size on aarch64").
+[env]
+JEMALLOC_SYS_WITH_LG_PAGE = "12"
+
+[target.'cfg(windows)']
+rustflags = [
+    "-C", "link-arg=/SDL",
+    "-C", "link-arg=/DYNAMICBASE",
+    "-C", "link-arg=/HIGHENTROPYVA", 
+    "-C", "link-arg=/NXCOMPAT",
+    "-C", "link-arg=/GUARD:CF",
+    "-C", "control-flow-guard"
+]
+
+# Build cache optimizations
+[build]
+jobs = 8
+incremental = true
