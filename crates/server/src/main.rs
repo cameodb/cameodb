@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 mod admin;
+mod audit;
 mod auth;
 mod authz;
 mod cluster_coordinator;
@@ -502,6 +503,10 @@ async fn main() -> Result<()> {
         shard_placement,
     );
 
+    // Started before the router, so the writer thread is already draining when the first
+    // request arrives rather than being spun up on the request path.
+    let audit_sink = audit::AuditSink::start(&cameodb_config.security.audit);
+
     let app_state = AppState {
         router: router_actor,
         coordinator: coordinator_actor.clone(),
@@ -510,6 +515,7 @@ async fn main() -> Result<()> {
         tool_limiter: std::sync::Arc::new(ratelimit::ToolRateLimiter::new(
             cameodb_config.security.limits.clone(),
         )),
+        audit: Arc::clone(&audit_sink),
     };
 
     // Create the HTTP router with shared state and body limit derived from max_record_size_mb
@@ -815,6 +821,11 @@ async fn main() -> Result<()> {
             COORDINATOR_SHUTDOWN_TIMEOUT_SECS
         ),
     }
+
+    // Last, after every other subsystem has had its say, so their final refusals and
+    // rollups are in the trail rather than lost with the process. On a busy ingest node the
+    // open rollup window is every write of the last ten seconds.
+    audit_sink.shutdown();
 
     // Final emergency timeout check
     let shutdown_elapsed = shutdown_start.elapsed();

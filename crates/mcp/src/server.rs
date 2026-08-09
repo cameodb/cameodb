@@ -227,6 +227,19 @@ pub trait McpAuthz: Send + Sync + 'static {
     /// Whether this caller may touch `index`.
     fn allows_index(&self, index: &str) -> bool;
 
+    /// The human name the operator gave this key, if any.
+    ///
+    /// Defaulted rather than required: it is used only to make an audit line readable, and a
+    /// host that has no such notion should not be forced to invent one.
+    fn label(&self) -> Option<String> {
+        None
+    }
+
+    /// The caller's role, named as the host names it.
+    fn role(&self) -> Option<String> {
+        None
+    }
+
     /// Whether this caller holds `capability`.
     fn has(&self, capability: McpCapability) -> bool;
 }
@@ -371,6 +384,36 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
     fn check_tool_rate(&self, _authz: McpAuthzRef, _tool: &str) -> RateLimitVerdict {
         RateLimitVerdict::Allow
     }
+
+    /// A tool call happened. Keep a record of it, or do not.
+    ///
+    /// Called once per `tools/call` after the outcome is known, including the calls that
+    /// were refused — a refusal is the record most worth having.
+    ///
+    /// This exists because the HTTP layer cannot see through `POST /mcp`: from outside, a
+    /// thousand searches across a hundred indexes are a thousand identical lines. Which tool
+    /// and which index are visible only here, which is the same reason [`McpAuthz`] and
+    /// [`check_tool_rate`](McpBackend::check_tool_rate) are here. What is *kept* — whether
+    /// query text is retained at all, where the record goes — stays entirely with the host.
+    /// The default keeps nothing, so every existing implementation is unchanged.
+    fn record_tool_call(&self, _authz: McpAuthzRef, _call: ToolCall<'_>) {}
+}
+
+/// What a tool call did, for [`McpBackend::record_tool_call`].
+///
+/// Borrowed rather than owned: on a host that keeps no record this must cost nothing, and a
+/// struct of `String`s would allocate on every call to build something immediately dropped.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolCall<'a> {
+    pub tool: &'a str,
+    /// The index the call named, when it named one. `search_indexes` names several and they
+    /// arrive comma-joined — the record is for a human reading a trail, not for a parser.
+    pub index: Option<&'a str>,
+    /// The query text as sent. Passed regardless of whether the host will keep it; deciding
+    /// that is the host's business, and this crate holds no policy about PII.
+    pub query: Option<&'a str>,
+    /// `None` when the tool ran. Otherwise why it did not — a refusal or a failure.
+    pub error: Option<&'a str>,
 }
 
 /// The host's answer to [`McpBackend::check_tool_rate`].
@@ -1022,43 +1065,82 @@ where
                 // the capability check and the tool body: a caller being rate limited should
                 // not learn, from the shape of the refusal, which tools it would otherwise
                 // be allowed to run.
-                Ok(params) => match backend.check_tool_rate(Arc::clone(authz), &params.name) {
-                    RateLimitVerdict::Deny { retry_after_secs } => success_response(
-                        request.id,
-                        json!({
-                            "content": [{
-                                "type": "text",
-                                "text": format!(
-                                    "Rate limit exceeded for tool '{}'. Retry after {retry_after_secs}s.",
-                                    params.name
+                Ok(params) => {
+                    // Read off the raw arguments rather than threaded out of `call_tool`,
+                    // which has a differently-shaped struct per tool. Every tool that names
+                    // an index calls the field `index` (or `indexes`), so one reader covers
+                    // all of them and a tool added later is described without being edited
+                    // into this match.
+                    let subject = tool_subject(&params.arguments);
+                    // Owned, because `params` moves into `call_tool` below and the record is
+                    // written after it returns.
+                    let query = params
+                        .arguments
+                        .get("query")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string);
+                    match backend.check_tool_rate(Arc::clone(authz), &params.name) {
+                        RateLimitVerdict::Deny { retry_after_secs } => {
+                            backend.record_tool_call(
+                                Arc::clone(authz),
+                                ToolCall {
+                                    tool: &params.name,
+                                    index: subject.as_deref(),
+                                    query: query.as_deref(),
+                                    error: Some("rate limit exceeded"),
+                                },
+                            );
+                            success_response(
+                                request.id,
+                                json!({
+                                    "content": [{
+                                        "type": "text",
+                                        "text": format!(
+                                            "Rate limit exceeded for tool '{}'. Retry after {retry_after_secs}s.",
+                                            params.name
+                                        ),
+                                    }],
+                                    "isError": true,
+                                }),
+                            )
+                        }
+                        RateLimitVerdict::Allow => {
+                            let tool = params.name.clone();
+                            let outcome = call_tool(&backend, params, authz).await;
+                            backend.record_tool_call(
+                                Arc::clone(authz),
+                                ToolCall {
+                                    tool: &tool,
+                                    index: subject.as_deref(),
+                                    query: query.as_deref(),
+                                    error: outcome.as_ref().err().map(String::as_str),
+                                },
+                            );
+                            match outcome {
+                                Ok(result) => success_response(
+                                    request.id,
+                                    json!({
+                                        "content": [{
+                                            "type": "text",
+                                            "text": json_to_pretty_string(&result),
+                                        }],
+                                        "isError": false,
+                                    }),
                                 ),
-                            }],
-                            "isError": true,
-                        }),
-                    ),
-                    RateLimitVerdict::Allow => match call_tool(backend, params, authz).await {
-                        Ok(result) => success_response(
-                            request.id,
-                            json!({
-                                "content": [{
-                                    "type": "text",
-                                    "text": json_to_pretty_string(&result),
-                                }],
-                                "isError": false,
-                            }),
-                        ),
-                        Err(err) => success_response(
-                            request.id,
-                            json!({
-                                "content": [{
-                                    "type": "text",
-                                    "text": err,
-                                }],
-                                "isError": true,
-                            }),
-                        ),
-                    },
-                },
+                                Err(err) => success_response(
+                                    request.id,
+                                    json!({
+                                        "content": [{
+                                            "type": "text",
+                                            "text": err,
+                                        }],
+                                        "isError": true,
+                                    }),
+                                ),
+                            }
+                        }
+                    }
+                }
                 Err(err) => error_response(
                     request.id,
                     -32602,
@@ -1076,7 +1158,7 @@ where
 }
 
 async fn call_tool<S>(
-    backend: S,
+    backend: &S,
     params: ToolCallParams,
     authz: &McpAuthzRef,
 ) -> Result<JsonValue, String>
@@ -1173,6 +1255,29 @@ fn visible_tools(authz: &McpAuthzRef) -> Vec<JsonValue> {
                 .is_some_and(|capability| authz.has(capability))
         })
         .collect()
+}
+
+/// Which index or indexes a call is about, read from its raw arguments.
+///
+/// One reader for every tool rather than a match over the per-tool argument structs, because
+/// the field name is a convention the tool schemas already keep: `index` for the tools that
+/// name one, `indexes` for the federated search that names several. A tool added later is
+/// described by this without anyone remembering to edit it — and if it followed neither
+/// convention the answer is `None`, which is the honest result rather than a wrong one.
+fn tool_subject(arguments: &JsonValue) -> Option<String> {
+    if let Some(index) = arguments.get("index").and_then(JsonValue::as_str) {
+        return Some(index.to_string());
+    }
+    let entries = arguments.get("indexes")?.as_array()?;
+    let names: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            // `search_indexes` accepts both a bare name and an object naming one.
+            JsonValue::String(name) => Some(name.as_str()),
+            other => other.get("index").and_then(JsonValue::as_str),
+        })
+        .collect();
+    (!names.is_empty()).then(|| names.join(","))
 }
 
 /// Refuse a tool call that names an index outside the caller's scope.

@@ -38,6 +38,12 @@ cors_allowed_origins = []
 # role = "admin"                         # admin | writer | reader
 # label = "ops"
 # # allowed_indexes = ["docs"]           # optional: restrict this key to named indexes
+#
+# # Audit trail. Point `file` at a mounted volume — a container's own filesystem is exactly
+# # as durable as the container, and the trail is worth keeping past it.
+# [security.audit]
+# enabled = true
+# file = "/data/audit/audit.jsonl"
 
 [network.cluster]
 enabled = false

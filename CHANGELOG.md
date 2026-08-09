@@ -64,6 +64,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mcp` crate stays free of deployment opinions exactly as it does for authorization. Nine
   tests: six over the bucket arithmetic, three driving a real node over HTTP to prove the
   config actually reaches the dispatcher.
+- **An audit trail** (`[security.audit]`, Phase 14 C2). Refusals have always been logged, so
+  a node could say who it turned away — but successful access was a `debug!` line, which
+  meant it could not say who legitimately read which index. That is the question an incident
+  asks, and it now has an answer.
+  The design's one non-obvious decision is **detail for reads, totals for writes**. A
+  knowledge base ingests far more than it retrieves, so at the measured ~6 900 writes/s a
+  record per write would bury the handful of reads worth looking at; writes fold into a
+  per-key, per-index count flushed on an interval, while reads, MCP tool calls and admin
+  actions keep a line each. The same rule keeps the trail from becoming a denial-of-service
+  lever: a refusal of a *valid* key is listed, since its volume is bounded by the credentials
+  in circulation, but a refusal of an unidentified caller is counted, since its volume is
+  chosen by whoever can reach the port.
+  Nothing touches the request path — emitting is a timestamp and a non-blocking hand-off to a
+  dedicated OS thread rather than a tokio task, so the trail keeps draining while the runtime
+  is saturated. A full queue drops the record, counts it, and writes a `gap` record naming
+  the loss, because a trail that quietly skips entries lies about what it contains.
+  Two sinks: a bounded in-memory ring served by `GET /_admin/audit` (node-admin, and reading
+  it is itself audited), and an optional rotating JSON Lines file. Every record is also a
+  `tracing` event on the target `cameodb::audit`, so an existing log collector gets it
+  without a second path being configured. No key ever appears in a record — the `key_id` is
+  the digest prefix minted for exactly this — and a test asserts it for accepted and rejected
+  tokens alike. `record_query_text` is off by default and documented as keeping *data*: a
+  search for a person's name records that name.
+  MCP needed its own hook (`McpBackend::record_tool_call`), because from the HTTP layer every
+  agent call is `POST /mcp` and which tool and index are in play exist only inside the
+  dispatcher — the same host-owns-the-policy split used for authorization and rate limiting.
+  Off by default, with a posture row that says so. 14 unit tests and 9 integration tests
+  against a real node with three keys.
 - **Integration tests for the server, which had none.** `crates/server` carried 160 unit
   tests and zero end-to-end coverage: it is a binary-only crate, so `tests/` has no library
   to link against, and a `NodeOrchestrator` needs a data directory, threads and a socket

@@ -247,6 +247,8 @@ pub struct AppState {
     /// Per-key budget for MCP tool calls. Shared across every request, because a rate limit
     /// that reset per connection would not be one.
     pub tool_limiter: Arc<ToolRateLimiter>,
+    /// Where the audit trail goes. Inert unless `[security.audit]` turned it on.
+    pub audit: Arc<crate::audit::AuditSink>,
 }
 
 impl McpBackend for AppState {
@@ -869,6 +871,36 @@ impl McpBackend for AppState {
             }
         }
     }
+
+    /// Keep one line per tool call.
+    ///
+    /// Every MCP tool is a read, and reads are the class this trail exists to make visible:
+    /// the HTTP gate has already recorded that somebody POSTed to `/mcp`, which answers
+    /// nothing. This is where "which index, which tool, and did it work" is written down.
+    ///
+    /// Unlike the HTTP path there is no rollup, because there is nothing to roll up — an
+    /// agent's tool calls are counted in hundreds, not in the hundreds of thousands that
+    /// make per-event ingest records untenable.
+    fn record_tool_call(&self, authz: McpAuthzRef, call: cameodb_mcp::ToolCall<'_>) {
+        if !self.audit.is_enabled() {
+            return;
+        }
+        let record = crate::audit::AuditRecord::mcp_tool(call.tool)
+            .with_identity(authz.key_id(), authz.label(), authz.role())
+            .with_index(call.index.map(str::to_string))
+            // Gated here rather than in the mcp crate: whether a query is data worth keeping
+            // is a deployment question, and the protocol layer holds no opinion about it.
+            .with_query(
+                self.audit
+                    .records_query_text()
+                    .then(|| call.query.map(str::to_string))
+                    .flatten(),
+            );
+        self.audit.record(match call.error {
+            None => record.succeeded(),
+            Some(error) => record.refused(error),
+        });
+    }
 }
 
 fn resource_descriptor(uri: String, name: String, description: String) -> JsonValue {
@@ -1440,6 +1472,9 @@ pub fn create_router(
 ) -> (Router, McpShutdownHandle) {
     let body_limit_bytes = max_body_size_mb * 1024 * 1024;
     let (mcp_routes, mcp_handle) = mcp_router::<AppState>();
+    // The gate writes to the same sink the handlers do, so a request produces one record
+    // whichever layer had the last word about it.
+    let audit = Arc::clone(&state.audit);
 
     // Concurrency limiter: rejects with 503 when too many requests are in flight.
     //
@@ -1529,6 +1564,7 @@ pub fn create_router(
             .route("/_admin/memory", get(admin_memory_handler))
             .route("/_admin/memory/purge", post(admin_memory_purge_handler))
             .route("/_admin/workers", get(admin_workers_handler))
+            .route("/_admin/audit", get(admin_audit_handler))
             .route(
                 "/_admin/index/{index}/commit",
                 post(admin_index_commit_handler),
@@ -1572,7 +1608,7 @@ pub fn create_router(
         // so a flood of unauthenticated requests neither takes a concurrency permit nor has
         // a body buffered on its behalf.
         .layer(axum::middleware::from_fn_with_state(
-            keyring,
+            crate::authz::GateState { keyring, audit },
             crate::authz::authorize,
         ))
         .layer(cors_layer)
@@ -1752,7 +1788,7 @@ async fn search_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
     Json(payload): Json<SearchPayload>,
-) -> Result<Json<JsonValue>, AppError> {
+) -> Result<Response, AppError> {
     // Parse query string for embedded limit/return/sort keywords
     let (cleaned_query, parsed_limit, parsed_fields, parsed_sort) =
         parse_query_keywords(&payload.query);
@@ -1769,6 +1805,13 @@ async fn search_handler(
         index, cleaned_query, final_limit, final_fields
     );
 
+    // Only the audit layer wants this, and only when configured to keep it — a clone of
+    // every query string on every search would otherwise be pure cost.
+    let audited_query = state
+        .audit
+        .records_query_text()
+        .then(|| cleaned_query.clone());
+
     let client_op = ClientOp::Search {
         index,
         query: cleaned_query,
@@ -1781,7 +1824,17 @@ async fn search_handler(
         .router
         .route_and_handle(client_op, None, OperationType::Read)
         .await?;
-    Ok(Json(result))
+
+    // Handed to the auth middleware on the way out. It writes the request's single audit
+    // record and cannot read a body — by the time it runs again this handler has consumed
+    // it — so the one thing it cannot discover for itself travels on the response.
+    let mut response = Json(result).into_response();
+    if let Some(query) = audited_query {
+        response
+            .extensions_mut()
+            .insert(crate::authz::AuditedQuery(query));
+    }
+    Ok(response)
 }
 
 /// Handler for listing all indexes across the cluster
@@ -2230,6 +2283,37 @@ async fn admin_workers_handler(
     State(state): State<AppState>,
 ) -> Result<Json<WorkerPoolReport>, AppError> {
     Ok(Json(state.router.admin_worker_stats()?))
+}
+
+/// `GET /_admin/audit?limit=N` — the most recent audit records, newest first.
+///
+/// The point of a live view rather than only a file: the question "who has been reading the
+/// payroll index" gets an answer from a node that may not have a file sink configured, and
+/// gets it without shell access to wherever that file lives.
+///
+/// `dropped` is reported alongside the records because a trail that lost entries has to say
+/// so where it is *read*, not only where it is written — an operator scrolling this endpoint
+/// would otherwise have no way to know the window they are looking at is incomplete.
+async fn admin_audit_handler(
+    State(state): State<AppState>,
+    Query(params): Query<AuditQueryParams>,
+) -> Json<JsonValue> {
+    // Bounded regardless of what was asked for: this response is built in memory, and an
+    // admin endpoint that will serialize an unbounded slice on request is a way to make a
+    // node fall over using a credential that was only meant to inspect it.
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let records = state.audit.recent(limit);
+    Json(serde_json::json!({
+        "enabled": state.audit.is_enabled(),
+        "dropped": state.audit.dropped(),
+        "count": records.len(),
+        "records": records,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditQueryParams {
+    limit: Option<usize>,
 }
 
 /// Handler for cluster health check.

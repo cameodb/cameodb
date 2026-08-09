@@ -30,7 +30,19 @@ use tracing::{debug, warn};
 
 use cameodb_mcp::server::{McpAuthz, McpAuthzRef, McpCapability};
 
+use crate::audit::{AuditRecord, AuditSink};
 use crate::auth::{Capability, KeyEntry, KeyRing};
+
+/// What the gate needs: the keys it checks against, and the trail it writes to.
+///
+/// One struct rather than two pieces of middleware state because both are read on the same
+/// request and neither is useful without the other — the trail's whole content is what the
+/// key ring decided.
+#[derive(Clone)]
+pub struct GateState {
+    pub keyring: Arc<KeyRing>,
+    pub audit: Arc<AuditSink>,
+}
 
 /// What a route requires of its caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +112,9 @@ const ROUTES: &[RouteRule] = &[
     rule("GET",    "/_admin/memory",                    Access::Needs(Capability::NodeAdmin)),
     rule("POST",   "/_admin/memory/purge",              Access::Needs(Capability::NodeAdmin)),
     rule("GET",    "/_admin/workers",                   Access::Needs(Capability::NodeAdmin)),
+    // Reading the audit trail is itself an audited, node-admin action: the log of who read
+    // what is exactly the thing a compromised key would want to read, and then edit.
+    rule("GET",    "/_admin/audit",                     Access::Needs(Capability::NodeAdmin)),
     rule("POST",   "/_admin/index/{index}/commit",      Access::Needs(Capability::NodeAdmin)),
     rule("POST",   "/_admin/index/{index}/evict-writer",Access::Needs(Capability::NodeAdmin)),
 
@@ -202,6 +217,17 @@ impl Authz {
             _ => None,
         }
     }
+
+    /// Everything about the caller the audit trail is allowed to keep.
+    ///
+    /// Empty for `Disabled` and `Anonymous`, which is the honest answer: on a node that
+    /// identifies nobody, a record claiming an identity would be a fiction.
+    fn identity(&self) -> Identity {
+        match self {
+            Authz::Key(entry) => Identity::of(entry),
+            _ => Identity::default(),
+        }
+    }
 }
 
 /// The same identity, in the vocabulary the mcp crate understands.
@@ -223,6 +249,20 @@ impl McpAuthz for Authz {
             // staying true.
             Authz::Anonymous => false,
             Authz::Key(entry) => entry.allows_index(index),
+        }
+    }
+
+    fn label(&self) -> Option<String> {
+        match self {
+            Authz::Key(entry) => Some(entry.label().to_string()),
+            _ => None,
+        }
+    }
+
+    fn role(&self) -> Option<String> {
+        match self {
+            Authz::Key(entry) => Some(entry.role().to_string()),
+            _ => None,
         }
     }
 
@@ -308,6 +348,34 @@ struct Refusal {
     status: StatusCode,
     error: &'static str,
     message: String,
+    /// Who was turned away, when that is known.
+    ///
+    /// A 403 has a valid key behind it, and *that* is the refusal worth attributing — "this
+    /// key reached for an index it does not hold" is the shape of both a misconfiguration
+    /// and a compromised credential. A 401 has no identity by definition, so this is `None`
+    /// and the audit trail counts it rather than naming it.
+    identity: Option<Identity>,
+}
+
+/// The attributable part of a caller, copied out of the key entry.
+///
+/// Owned strings rather than a borrow of the entry: it outlives the decision, travelling
+/// into a refusal and then into an audit record.
+#[derive(Debug, Clone, Default)]
+struct Identity {
+    key_id: Option<String>,
+    label: Option<String>,
+    role: Option<String>,
+}
+
+impl Identity {
+    fn of(entry: &KeyEntry) -> Self {
+        Self {
+            key_id: Some(entry.key_id()),
+            label: Some(entry.label().to_string()),
+            role: Some(entry.role().to_string()),
+        }
+    }
 }
 
 impl Refusal {
@@ -316,6 +384,7 @@ impl Refusal {
             status: StatusCode::UNAUTHORIZED,
             error: "Unauthorized",
             message: message.into(),
+            identity: None,
         }
     }
 
@@ -324,7 +393,13 @@ impl Refusal {
             status: StatusCode::FORBIDDEN,
             error: "Forbidden",
             message: message.into(),
+            identity: None,
         }
+    }
+
+    fn by(mut self, entry: &KeyEntry) -> Self {
+        self.identity = Some(Identity::of(entry));
+        self
     }
 }
 
@@ -456,7 +531,8 @@ fn decide(
             "role '{}' does not hold the '{}' capability this endpoint requires",
             entry.role(),
             required.as_str()
-        )));
+        ))
+        .by(&entry));
     }
 
     if let Some(index) = classified.index
@@ -469,10 +545,10 @@ fn decide(
             %method, %path, %index,
             "auth: refused, index is outside this key's scope"
         );
-        return Err(Refusal::forbidden(format!(
-            "this key is not permitted on index '{}'",
-            index
-        )));
+        return Err(
+            Refusal::forbidden(format!("this key is not permitted on index '{}'", index))
+                .by(&entry),
+        );
     }
 
     Ok(Authz::Key(entry))
@@ -484,36 +560,125 @@ fn decide(
 /// Inside CORS so a browser preflight — which never carries `Authorization` — still gets its
 /// headers; outside the rest so a flood of unauthenticated requests takes no concurrency
 /// permit and has no body buffered on its behalf.
-pub async fn authorize(
-    State(keyring): State<Arc<KeyRing>>,
-    mut req: Request,
-    next: Next,
-) -> Response {
+pub async fn authorize(State(gate): State<GateState>, mut req: Request, next: Next) -> Response {
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
-    match decide(&keyring, &method, &path, req.headers()) {
+    // Read off the socket, not off a header. `X-Forwarded-For` is written by the client, so
+    // a caller who could set what the audit log says about them could also set it to
+    // somebody else — behind a proxy this records the proxy, which is at least true.
+    let peer = gate.audit.is_enabled().then(|| {
+        req.extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|info| info.0.ip().to_string())
+    });
+    match decide(&gate.keyring, &method, &path, req.headers()) {
         Ok(authz) => {
             // Off at the default level, and the first thing worth turning on when an
             // operator asks who called what. The `key_id` is the whole point of minting one:
             // it ties a request to a key without the key appearing anywhere.
             debug!(key_id = ?authz.key_id(), %method, %path, "auth: authorized");
+            let classified = classify(&method, &path);
             // Every request that reaches a handler carries its identity, including the
             // anonymous and auth-disabled cases. A handler asking "who is this?" always gets
             // an answer, so none of them has to guess what a missing extension means.
             //
             // MCP needs the same identity behind a trait the mcp crate owns, since it cannot
             // see this one. Allocated only for the routes that can use it.
-            if matches!(
-                classify(&method, &path).map(|c| c.access),
-                Some(Access::Mcp)
-            ) {
+            if matches!(classified.as_ref().map(|c| c.access), Some(Access::Mcp)) {
                 let handle: McpAuthzRef = Arc::new(authz.clone());
                 req.extensions_mut().insert(handle);
             }
+            let identity = authz.identity();
+            let index = classified
+                .as_ref()
+                .and_then(|c| c.index)
+                .map(str::to_string);
+            let access = classified.map(|c| c.access);
             req.extensions_mut().insert(authz);
-            next.run(req).await
+
+            let response = next.run(req).await;
+
+            // *After* the handler, so the record carries what actually happened rather than
+            // only what was permitted. A 200 and a 500 on the same authorized route are
+            // different facts, and only one of them means the caller got the data.
+            if gate.audit.is_enabled() {
+                let status = response.status().as_u16();
+                let record = AuditRecord::http(&method, &path)
+                    .with_identity(identity.key_id, identity.label, identity.role)
+                    .with_peer(peer.flatten())
+                    .with_index(index)
+                    // A handler that knows more than the route does — the query text of a
+                    // search — leaves it on the response for exactly this.
+                    .with_query(
+                        response
+                            .extensions()
+                            .get::<AuditedQuery>()
+                            .map(|q| q.0.clone()),
+                    )
+                    .allowed(status);
+                match rollup_name(access, true, true) {
+                    Some(event) => gate.audit.record_rolled(record.with_event(event)),
+                    None => gate.audit.record(record),
+                }
+            }
+            response
         }
-        Err(refusal) => refusal.into_response(),
+        Err(refusal) => {
+            if gate.audit.is_enabled() {
+                let identity = refusal.identity.clone().unwrap_or_default();
+                let identified = identity.key_id.is_some();
+                let index = classify(&method, &path)
+                    .and_then(|c| c.index)
+                    .map(str::to_string);
+                let record = AuditRecord::http(&method, &path)
+                    .with_identity(identity.key_id, identity.label, identity.role)
+                    .with_peer(peer.flatten())
+                    .with_index(index)
+                    .denied(refusal.status.as_u16(), refusal.message.clone());
+                match rollup_name(None, false, identified) {
+                    Some(event) => gate.audit.record_rolled(record.with_event(event)),
+                    None => gate.audit.record(record),
+                }
+            }
+            refusal.into_response()
+        }
+    }
+}
+
+/// A search's query text, left on the response by the handler that parsed it.
+///
+/// The middleware is the only place a request becomes one audit record, and it cannot read
+/// a body — by the time it runs again the handler has consumed it. Rather than add a second
+/// emit point (and with it the chance of one request producing two lines, or none), a
+/// handler with more to say attaches it here and the single record picks it up.
+#[derive(Clone)]
+pub struct AuditedQuery(pub String);
+
+/// Which events are counted rather than listed, and under what name.
+///
+/// `None` means "keep this one verbatim". The rule is a volume rule with a security
+/// justification, not a preference:
+///
+/// - **Writes** are the bulk of a knowledge base's traffic by orders of magnitude. One line
+///   each buries everything else; a per-key, per-index total answers "how much did this key
+///   ingest into that index" without the firehose.
+/// - **Public routes** are health checks. A load balancer polling once a second is not an
+///   access to anybody's data and should not out-produce the events that are.
+/// - **Unauthenticated refusals** are the one class an outsider controls the volume of, so
+///   listing them individually hands a stranger the ability to fill the disk. This is the
+///   same reasoning that already thins their `warn!` lines in [`should_log_refusal`].
+///
+/// Everything else — every read, every admin action, and every refusal of a *valid* key —
+/// keeps its own line. Those are bounded by the number of credentials in circulation, which
+/// is a number the operator chose.
+fn rollup_name(access: Option<Access>, allowed: bool, identified: bool) -> Option<&'static str> {
+    if !allowed {
+        return (!identified).then_some("auth_denied_stats");
+    }
+    match access {
+        Some(Access::Public) => Some("public_stats"),
+        Some(Access::Needs(Capability::Write)) => Some("write_stats"),
+        _ => None,
     }
 }
 

@@ -425,6 +425,97 @@ Points worth knowing:
 
 Off by default: an upgrade must not start refusing calls a deployment used to serve.
 
+### The audit trail (`[security.audit]`)
+
+```toml
+[security.audit]
+enabled = false                            # off by default
+file = "/var/log/cameodb/audit.jsonl"      # optional; without it the trail is memory-only
+buffer_capacity = 2048                     # records kept for /_admin/audit
+queue_capacity = 8192                      # hand-off depth to the writer thread
+max_file_bytes = 104857600                 # rotate past 100 MiB
+max_files = 5                              # audit.jsonl.1 … .5, oldest discarded
+record_query_text = false                  # see the warning below
+rollup_secs = 10                           # how often counted totals are flushed
+```
+
+Authentication decides *who*, `allowed_indexes` decides *what*, `[security.limits]` decides
+*how often*. None of them keeps a record. Without this section a node can tell you it turned
+somebody away — refusals have always been logged — but not who legitimately read which index,
+which is the question an incident actually asks.
+
+**Detail for reads, totals for writes.** A knowledge base ingests far more than it retrieves,
+so a record per write would bury the handful of reads worth looking at. Writes are folded
+into a per-key, per-index count flushed every `rollup_secs`; reads keep a line each:
+
+```json
+{"ts":"2026-08-09T14:22:31.118Z","event":"http","outcome":"allowed","key_id":"k_7f3a",
+ "label":"analyst","role":"reader","peer":"10.0.4.19","method":"POST",
+ "path":"/api/customers/search","index":"customers","status":200}
+{"ts":"2026-08-09T14:22:40.000Z","event":"write_stats","key_id":"k_1c8e","label":"ingest",
+ "role":"writer","index":"docs","ops":48213,"errors":2,"window_start":"2026-08-09T14:22:30.000Z"}
+```
+
+| `event` | What it is | Detail or total |
+|---|---|---|
+| `http` | One request through the API | Detail |
+| `mcp_tool` | One MCP tool call — which tool, which index | Detail |
+| `write_stats` | Writes by one key to one index in a window | Total |
+| `public_stats` | Health checks, which are not an access to anyone's data | Total |
+| `auth_denied_stats` | Refusals of callers who presented no key | Total |
+| `gap` | Records lost to a full queue, and how many | — |
+
+Refusals of a **valid** key always keep their own line: that is bounded by the credentials in
+circulation, and "this key reached for an index it does not hold" is the shape of both a
+misconfiguration and a compromised credential. Refusals of an *unidentified* caller are
+counted instead, because their volume is chosen by whoever can reach the port — listing them
+individually would hand a stranger a way to fill the disk.
+
+Points worth knowing:
+
+- **Never on the request path.** Emitting is a timestamp and a non-blocking hand-off; the
+  file writing, rotation and serialization happen on a dedicated thread. A slow disk cannot
+  become a slow node.
+- **Loss is admitted.** If the queue fills, the record is dropped, counted, and a `gap`
+  record naming the number lost is written. `/_admin/audit` reports the running total, so an
+  operator reading the trail can see the window is incomplete.
+- **No key is ever written.** The `key_id` is a digest prefix minted for exactly this: it
+  ties a line to a credential without the credential appearing. There is no code path that
+  can put a token in a record, and a test asserts it for accepted *and* rejected tokens.
+- **`peer` is the socket address**, not `X-Forwarded-For`. That header is written by the
+  client, so trusting it would let a caller choose what the trail says about them. Behind a
+  proxy this records the proxy, which is at least true.
+- **Reading the trail takes `node-admin`** and is itself recorded, refusals included.
+
+> **`record_query_text` keeps data, not just metadata.** A search for a person's name records
+> that name, so a trail turned on to answer "who read the customer index" starts accumulating
+> the customers who were looked up. Off by default; when you turn it on, treat the audit file
+> as sensitive as the index it describes. It covers `POST /api/{index}/search` and MCP tool
+> calls.
+
+### Reading it back
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_KEY" 'http://localhost:9480/_admin/audit?limit=200'
+```
+
+Answers `{enabled, dropped, count, records}` with the newest first, capped at 1000. The
+endpoint needs `[network.http] admin_enabled = true`. It reads the in-memory ring, so it
+works without a file sink — and dies with the process, which is what the file is for.
+
+```bash
+# Who read the payroll index?
+jq -c 'select(.index=="payroll" and .outcome=="allowed")' /var/log/cameodb/audit.jsonl
+
+# What did each key ingest?
+jq -s 'map(select(.event=="write_stats")) | group_by(.label)
+       | map({key: .[0].label, ops: map(.ops) | add})' /var/log/cameodb/audit.jsonl
+```
+
+Every record is also emitted as a `tracing` event on the target `cameodb::audit`, so a
+deployment already shipping logs to a collector gets the trail without configuring a second
+path — and can route or silence it independently of everything else the node says.
+
 ### Minting keys
 
 ```bash

@@ -281,6 +281,41 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
         },
     );
 
+    // --- Audit trail ------------------------------------------------------------
+    // A warning rather than a failure even on `external`. A node that refused to start
+    // because it kept no record would push operators toward a weaker profile, which costs
+    // more than the missing trail; and unlike TLS, its absence endangers nothing in flight.
+    // What it costs is the ability to answer questions *afterwards*, which is why the
+    // message says what cannot be answered rather than that a setting is off.
+    let audit = &config.security.audit;
+    push(
+        "audit_trail",
+        match (profile, audit.enabled, audit.file.is_some()) {
+            (_, true, true) => Outcome::Pass(format!(
+                "audit trail to {}",
+                audit
+                    .file
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            )),
+            (Profile::External, true, false) => Outcome::Warn(
+                "audit trail is in-memory only; it is lost on restart and cannot be read after \
+                 a crash. Set [security.audit] file to keep one"
+                    .to_string(),
+            ),
+            (_, true, false) => {
+                Outcome::Pass("audit trail enabled (in-memory, /_admin/audit)".to_string())
+            }
+            (Profile::External, false, _) => Outcome::Warn(
+                "no audit trail: this node cannot say who read which index. Set \
+                 [security.audit] enabled = true"
+                    .to_string(),
+            ),
+            (_, false, _) => Outcome::Pass("audit trail disabled".to_string()),
+        },
+    );
+
     // --- Cluster membership -----------------------------------------------------
     let has_psk = cluster.psk.is_some() || cluster.psk_file.is_some();
     push(

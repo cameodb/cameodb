@@ -1233,6 +1233,14 @@ impl CameoDbConfig {
             .into());
         }
 
+        // A trail configured into uselessness — a zero-length buffer, a zero-slot queue —
+        // is caught here rather than discovered empty during the incident it was turned on
+        // for.
+        self.security
+            .audit
+            .validate()
+            .map_err(|message| ConfigError::SecurityConfig { message })?;
+
         // Posture rules run last: the checks above establish that individual values are
         // usable, and this decides whether the combination is allowed where this node sits.
         self.check_posture()?;

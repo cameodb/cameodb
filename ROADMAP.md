@@ -237,6 +237,46 @@ round-robin regardless, while pinning the driving worker costs 11% and half agai
 
 Both flags stay off, now for a reason that has survived a test designed to overturn it.
 
+### **What the audit trail costs, measured**
+
+Recorded 2026-08-10 — and **not on the rig every other figure here comes from**. This ran
+natively on the macOS development host, so the absolute numbers are not comparable to
+anything else in this document; only the two arms are comparable to each other.
+
+`--mode write --concurrency 64 --duration 20`, security off in both arms so the only variable
+is the trail, three repeats each, arms alternated, host otherwise idle.
+
+| `[security.audit]` | Repeats (ok/s) | Median | Within-arm spread |
+|---|---|---|---|
+| `enabled = false` | 1 803, 1 637, 1 695 | 1 695 | 10.1% |
+| `enabled = true`, file sink | 1 753, 1 740, 1 610 | 1 740 | 8.9% |
+
+**The cost is below this measurement's noise floor.** The arms overlap completely and the
+median difference (+2.7%) runs the *wrong way* — the audited arm was nominally faster, which
+is a statement about the spread and not about auditing. What can be claimed is bounded: on
+this host, at this sample size, a difference large enough to matter would have shown, and did
+not. That is not the same as "free", and this is three repeats on a laptop.
+
+The design predicts as much. A write costs one `Instant`, one timestamp format and a
+`try_send` on the emitting side; the record is then folded into a `HashMap` entry rather than
+serialized, so the per-write work never includes the JSON. The 44 171 writes of one run
+produced **three lines**:
+
+```json
+{"event":"write_stats","index":"bench","ops":16821,"errors":0,"window_start":"…07.212Z"}
+{"event":"write_stats","index":"bench","ops":15498,"errors":0,"window_start":"…16.737Z"}
+{"event":"write_stats","index":"bench","ops":11852,"errors":0,"window_start":"…26.749Z"}
+```
+
+while the `PUT /_config`, the commit, the two `/_admin/workers` polls and the `DELETE` each
+kept their own. That ratio — five figures of ingest against a handful of lines — is the whole
+argument for rolling writes up, and it is what the file actually contains.
+
+Not measured, and worth knowing before trusting the above: the read path, where a record *is*
+serialized per request; and the trail under a workload heavy enough to overrun the queue,
+which is the case the `gap` record exists for. Both want the open-loop generator that item 4
+already blocks on.
+
 ### **Mixed read/write load, measured**
 
 Recorded 2026-08-10, same rig. **Every performance number this repository had published
@@ -714,8 +754,8 @@ check should become a Linux validation-suite check rather than a one-off.
 | **6** | B1: API key authentication + index scoping | steps 1–2 done; ~2–4 days left | Critical | Was full unauthenticated R/W/D access; now the client cannot send a key |
 | **7** | B2: HTTPS/TLS via rustls | ✅ Done | High | Traffic interception |
 | **8** | B3: Cluster join secret (PSK) | ✅ Done | High | Rogue node data access |
-| **9** | C1: MCP rate limiting + query complexity | ~2 days | Medium | Agent-driven resource exhaustion |
-| **10** | C2: Audit logging | ~2 days | Medium | No forensic trail |
+| **9** | C1: MCP rate limiting + query complexity | ✅ Done (caps deferred) | Medium | Agent-driven resource exhaustion |
+| **10** | C2: Audit logging | ✅ Done | Medium | No forensic trail |
 | **11** | C3: Per-index role overrides | ~2 days (was ~5+) | Medium | Multi-tenant isolation |
 
 The B1 estimate is up from the original ~3–5 days for two reasons, both decided deliberately
@@ -1101,10 +1141,45 @@ HTTP search. Nothing has shipped with the old names.
   `parse_query_lenient` call sites in `crates/storage/src/lib.rs` are where a cap would go
 - Per-key index scoping is covered in B1 (`allowed_indexes`, all roles), as is the failure counting this stage would rate-limit on
 
-**C2 — Audit Logging** 🟡 MEDIUM
-- Structured `tracing` events: who (`key_id` / `label` / peer), what (op, index), when, result
-- B1 already emits `key_id`, `role`, and `label` into the request span, so this stage is a sink rather than a re-plumbing
-- Append-only audit ring buffer + optional file sink; admin endpoint to query recent events
+**C2 — Audit Logging** ✅ COMPLETED
+- `[security.audit]`, off by default. The prediction that this stage would be "a sink rather
+  than a re-plumbing" held: [`decide`](crates/server/src/authz.rs) already resolved `key_id`,
+  `label`, `role` and index at one chokepoint, and nothing about that had to move
+- **Detail for reads, totals for writes** — the one design decision that was *not* obvious.
+  A knowledge base ingests far more than it retrieves (the working assumption is ~100k:1), so
+  at the measured ~6 900 writes/s a record per write buries the handful of reads worth
+  looking at. Writes fold into a per-key, per-index count flushed every `rollup_secs`; reads,
+  MCP tool calls and admin actions keep a line each
+- The same rule keeps the trail from being a DoS lever. A refusal of a **valid** key is
+  listed — its volume is bounded by the credentials in circulation, and it is the shape of
+  both a misconfiguration and a stolen key. A refusal of an *unidentified* caller is counted,
+  because its volume is chosen by anyone who can reach the port. This is the same reasoning
+  that already thins those `warn!` lines in `should_log_refusal`
+- Off the request path entirely: a timestamp and a non-blocking hand-off to a dedicated OS
+  thread — not a tokio task, so the trail keeps draining while the runtime is saturated,
+  which is when it matters most. A full queue drops, counts, and writes a `gap` record naming
+  the loss; silent loss would make the file lie about what it contains
+- Two sinks: a bounded in-memory ring served by `GET /_admin/audit` (node-admin, and reading
+  it is itself audited), and an optional rotating JSON Lines file. Also emitted on the
+  `tracing` target `cameodb::audit`, so an existing log collector gets it for free
+- `record_query_text` is off by default and documented as keeping *data*, not metadata: a
+  search for a person's name records that name
+- A redb table was considered and rejected — it would couple the trail to the storage engine
+  being healthy, which is precisely when it is needed, and put a WAL fsync on the request path
+- MCP needed its own hook (`McpBackend::record_tool_call`): from the HTTP layer every agent
+  call is `POST /mcp`, and which tool and index are in play exist only inside the dispatcher.
+  Same host-owns-the-policy split as B1 and C1 — the mcp crate keeps no deployment opinions
+- 14 unit tests over the rollup, ring, rotation and drop accounting; 9 integration tests
+  driving a real node with three keys (`crates/server/tests/audit_trail.rs`), including that
+  no key — accepted or rejected — ever reaches the trail
+- Costs nothing measurable on the write path: three repeats each way, audit off vs on with a
+  file sink, and the arms overlap completely (see "What the audit trail costs, measured").
+  The claim is bounded rather than absolute — that is three repeats on a laptop, and the read
+  path, where a record really is serialized per request, was not measured
+- 💭 **Not done, and deliberately:** no query interface beyond "most recent N", no
+  retention policy beyond file rotation, no signing or tamper-evidence. The first is what a
+  log collector is for; the last would need a threat model where the node itself is
+  untrusted, which is not the one this stage was written against
 
 **C3 — Per-Index Role Overrides** 🟢 LOWER (needed for multi-tenant)
 - Most of what this stage originally described is B1's scoping mechanism, which now applies to every role. What remains is *overrides*: a key with `role = "writer"` granted read-only on a named sensitive index, i.e. per-index capability subtraction rather than a second allow-list

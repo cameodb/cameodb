@@ -65,6 +65,21 @@ enabled = false
 # tool_calls_per_minute = 120           # 0 (default) disables limiting entirely
 # tool_call_burst = 30                  # spendable at once; 0 means one minute's worth
 
+# Audit trail — who read what. Refusals have always been logged; without this a node cannot
+# say who legitimately read which index, which is the question an incident asks. Reads and
+# MCP tool calls keep a line each; writes are counted per key and index, because a knowledge
+# base ingests far more than it retrieves and one line per write buries everything else.
+# Never on the request path: a dedicated thread does the writing. Read it back with
+# GET /_admin/audit (node-admin), or from the file with jq.
+# [security.audit]
+# enabled = true
+# file = "/var/log/cameodb/audit.jsonl"  # optional; without it the trail dies with the node
+# buffer_capacity = 2048                 # records kept for /_admin/audit
+# max_file_bytes = 104857600             # rotate past 100 MiB, keeping max_files generations
+# max_files = 5
+# rollup_secs = 10                       # how often counted totals are flushed
+# record_query_text = false              # a search for a name RECORDS that name — see docs
+
 [network.cluster]
 enabled = false
 bind_address = "0.0.0.0"

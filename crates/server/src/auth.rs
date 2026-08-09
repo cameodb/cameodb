@@ -307,6 +307,12 @@ pub struct SecurityConfig {
     /// authenticated identity: the thing being metered is a *key*, and a key is this
     /// section's subject. Inert by default.
     pub limits: crate::ratelimit::McpLimitsConfig,
+
+    /// `[security.audit]` — what the node keeps about who called it.
+    ///
+    /// Here for the same reason as `limits`: the record it writes is *about a key*, so it
+    /// belongs to the section that defines keys. Off by default.
+    pub audit: crate::audit::AuditConfig,
 }
 
 /// One `[[security.api_keys]]` entry, exactly as written.
