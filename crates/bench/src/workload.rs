@@ -350,6 +350,16 @@ pub fn print_worker_delta(before: &AdminWorkersResponse, after: &AdminWorkersRes
         }
     );
 
+    // Concurrency, as the pool actually used it. `in_flight` at the end of a run is a
+    // sample rather than a mean, but a pool pinned at its ceiling reads very differently
+    // from one sitting at zero, and the capacity beside it says which.
+    let busy: Vec<String> = after
+        .workers
+        .iter()
+        .map(|worker| format!("{}/{}", worker.in_flight, worker.in_flight_capacity))
+        .collect();
+    println!("  in flight:       {}", busy.join(" "));
+
     let d = &after.dispatch;
     let b = &before.dispatch;
     println!(

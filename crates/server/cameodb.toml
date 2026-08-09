@@ -48,6 +48,12 @@ default_batch_size = 2000
 num_shards_init = 4
 max_shards_per_node = 8
 
+# CPU affinity. Writer pinning is neutral and on; the other two measured as regressions
+# and are off — see docs/CONFIGURATION.md before changing them.
+writer_core_affinity = true
+shard_affine_dispatch = false
+worker_core_affinity = false
+
 [search]
 indexer_memory_min_mb = 32
 indexer_memory_max_mb = 512

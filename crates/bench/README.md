@@ -84,6 +84,25 @@ until 5 seconds after the last write. Two consequences for reading results:
   matchable by content — real behaviour, not an artifact, but do not read it as a
   search-recall measurement.
 
+## What it was first used for
+
+Deciding whether to recommend the CPU affinity flags. The answer was no, and the run is
+worth repeating as a template: one arm per config, three repeats each, every arm from an
+empty data volume, node in a Linux container because pinning is a no-op on macOS, and
+`/_admin/workers` checked afterwards so "pinned" means observed rather than requested.
+
+| Arm | write ok/s @c16 | write p90 | search ok/s @c16 | search p99 |
+|---|---|---|---|---|
+| `writer_core_affinity` only (default) | 3 375 | 6.63ms | 5 055 | 8.3ms |
+| `+ shard_affine_dispatch` | 2 797 | 10.15ms | 4 850 | 8.9ms |
+| `+ worker_core_affinity` | 2 815 | 9.94ms | 4 320 | 16.5ms |
+
+The worker-pool section is what turned a regression into an explanation. `jobs per worker`
+showed the pool shrinking from 16 workers to 8 when the flags went on, and the container
+sitting at ~135% CPU of 800% available said the workers were waiting rather than computing —
+so halving them halved what the node had in flight. Neither number is in the latency block;
+both were necessary. See `docs/CONFIGURATION.md` for the full write-up.
+
 ## What it does not measure
 
 Closed-loop: `--concurrency` workers each issue one request, wait for the answer, and issue

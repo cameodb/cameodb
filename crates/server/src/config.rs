@@ -615,29 +615,49 @@ pub struct StorageConfig {
     #[serde(default = "default_max_shards_per_node")]
     pub max_shards_per_node: usize,
 
-    /// Pin per-shard writer threads to a CPU core (default: false).
-    /// When enabled, each shard's writer thread is pinned to a deterministic
-    /// CPU core derived from `xxh3(shard_id) % num_cores`, improving cache
-    /// locality and reducing cross-core wakeups under heavy write load.
+    /// Pin per-shard writer threads to a CPU core (default: true).
+    /// Each shard's writer thread is pinned to the core matching its placement
+    /// ordinal, so a shard keeps its redb and tantivy structures cache-hot on one
+    /// core. Measured neutral on throughput and latency, and it is what gives the
+    /// two flags below something to align to; no reason to turn it off.
+    /// A no-op on platforms that cannot pin (macOS), where it is reported as
+    /// requested-but-refused rather than silently ignored.
     #[serde(default = "default_writer_core_affinity")]
     pub writer_core_affinity: bool,
 
     /// Enable shard-affine worker dispatch (default: false).
-    /// When enabled, operations targeting the same shard are routed to the same
-    /// orchestrator worker, reducing cross-core wakeups when writer pinning is
-    /// also enabled. Uses `xxh3(shard_id) % worker_count` for deterministic
-    /// worker selection. Falls back to round-robin for scatter-gather ops.
+    /// Routes operations for a shard to the worker whose index matches that
+    /// shard's placement ordinal, so the op and the writer it hands off to share
+    /// a core. Scatter-gather operations still dispatch round-robin.
+    ///
+    /// **Measured a regression twice; leave it off.** On an 8-core Linux node with
+    /// 8 shards it cost 13-20% of write throughput and roughly doubled write p90.
+    /// That was first blamed on workers running one operation at a time, halved by
+    /// the `worker_count` this flag forces down to `cores`. Workers now carry eight
+    /// each, and re-measuring changed nothing: still 24% off write throughput at
+    /// concurrency 64, with every affine repeat below every default repeat.
+    ///
+    /// The cause is the constraint itself. A job for shard S may only run on worker
+    /// `S % worker_count`, so any instantaneous skew across shards leaves workers
+    /// idle while their neighbours queue; round-robin cannot be unlucky that way.
+    /// Neutral for searches, which dispatch round-robin regardless.
     #[serde(default = "default_shard_affine_dispatch")]
     pub shard_affine_dispatch: bool,
 
-    /// Pin orchestrator worker tasks to CPU cores as dedicated OS threads
+    /// Pin orchestrator workers to CPU cores as dedicated OS threads
     /// (default: false). Requires `shard_affine_dispatch = true` AND
     /// `writer_core_affinity = true` to take effect; otherwise silently no-op.
     ///
-    /// When enabled, each worker runs on its own `tokio::current_thread` runtime
-    /// pinned to `core_ids[worker_id]`. Combined with hash-aligned dispatch
-    /// (Stage 2d) this guarantees worker and writer for the same shard land on
-    /// the same CPU core, maximizing cache locality.
+    /// Each worker runs on its own `tokio::current_thread` runtime pinned to
+    /// `core_for(worker_id)`, which together with the dispatch flag puts the worker
+    /// and the writer for the same shard on one core.
+    ///
+    /// **Measured a regression; leave it off.** It adds nothing to the write cost
+    /// of `shard_affine_dispatch` above, and takes a further 11% off search
+    /// throughput with p99 up by half (6 326 -> 5 618 ok/s, 5.75ms -> 8.62ms on an
+    /// 8-core node) — searches are CPU-heavy and fan out across every shard, so
+    /// confining the driving worker to one core hurts. Re-confirmed after workers
+    /// gained per-operation concurrency; that changed neither figure.
     #[serde(default = "default_worker_core_affinity")]
     pub worker_core_affinity: bool,
 }
@@ -1789,6 +1809,70 @@ mod tests {
             CameoDbConfig::default().search.supervisor_timeout_secs,
             5,
             "the documented default and the code's default have to agree"
+        );
+    }
+
+    /// Every config file this repository ships, relative to `crates/server`.
+    const SHIPPED_CONFIGS: &[&str] = &[
+        "cameodb.toml",
+        "../../cameodb.example.toml",
+        "../../docker/cameodb-docker.toml",
+    ];
+
+    fn shipped(path: &str) -> String {
+        let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+        std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("{}: {e}", full.display()))
+    }
+
+    /// A shipped config that does not parse, or that names a setting no field claims, is a
+    /// typo nobody notices until a deployment silently runs on defaults.
+    #[test]
+    fn every_shipped_config_parses_with_no_unrecognized_keys() {
+        for path in SHIPPED_CONFIGS {
+            let content = shipped(path);
+            toml::from_str::<CameoDbConfig>(&content)
+                .unwrap_or_else(|e| panic!("{path} does not parse: {e}"));
+            assert_eq!(
+                unrecognized_keys(&content),
+                Vec::<String>::new(),
+                "{path} names settings no field claims"
+            );
+        }
+    }
+
+    /// The affinity flags went missing from every shipped config once already, which is how
+    /// they stayed unmeasured for a whole phase. A flag that is off by default and absent
+    /// from the file is a flag nobody knows exists.
+    #[test]
+    fn every_shipped_config_states_the_affinity_flags() {
+        for path in SHIPPED_CONFIGS {
+            let content = shipped(path);
+            for flag in [
+                "writer_core_affinity",
+                "shard_affine_dispatch",
+                "worker_core_affinity",
+            ] {
+                assert!(
+                    content
+                        .lines()
+                        .any(|line| line.trim_start().starts_with(flag)),
+                    "{path} never sets {flag}"
+                );
+            }
+        }
+    }
+
+    /// Both measured as regressions on 2026-08-09 and again on 2026-08-10 after workers
+    /// gained per-operation concurrency — the change that was supposed to redeem them. See
+    /// ROADMAP "Worker concurrency, measured".
+    #[test]
+    fn the_measured_affinity_flags_default_off() {
+        let storage = CameoDbConfig::default().storage;
+        assert!(!storage.shard_affine_dispatch);
+        assert!(!storage.worker_core_affinity);
+        assert!(
+            storage.writer_core_affinity,
+            "writer pinning measured neutral and is what the others align to"
         );
     }
 

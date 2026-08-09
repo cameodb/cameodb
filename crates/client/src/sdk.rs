@@ -774,8 +774,14 @@ pub struct WorkerStatsResponse {
     pub target_core_id: Option<usize>,
     /// Core it is actually pinned to; absent when the pin was refused or never requested.
     pub core_id: Option<usize>,
+    /// Jobs queued for this worker but not started.
     pub queue_depth: usize,
     pub queue_capacity: usize,
+    /// Operations started and not yet answered. A deep `queue_depth` beside a low
+    /// `in_flight` means the worker's concurrency limit is the constraint; the reverse means
+    /// the shards are.
+    pub in_flight: usize,
+    pub in_flight_capacity: usize,
     pub jobs_completed: u64,
 }
 

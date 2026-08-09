@@ -105,6 +105,26 @@ const WARM_REQUEST_CAPACITY: usize = 64;
 /// while workers are dispatching to shard writer threads.
 const ORCHESTRATOR_WORKER_QUEUE_CAPACITY: usize = SHARD_WRITER_CHANNEL_CAPACITY * 4;
 
+/// Operations one worker may have in flight at once. Total in-flight is this times
+/// `worker_count`.
+///
+/// A worker used to run exactly one, which made `worker_count` the node's whole operation
+/// concurrency — far below what the machine could carry, because an operation is mostly spent
+/// awaiting a shard writer rather than on CPU. This is the width of that pipeline.
+///
+/// **Eight because eight measured best**, not because it is a round number. Swept 1/2/4/8/16
+/// on an 8-core Linux node with 8 shards at concurrency 64, three repeats each (ROADMAP
+/// "Worker concurrency, measured"): throughput climbs 4 178 → 7 118 ok/s from 1 to 8, then
+/// *falls* to 6 444 at 16, and every width-8 repeat beat every width-16 repeat. Past the
+/// point where every shard writer already has work queued, more in-flight operations only
+/// move the queue from the channel into memory — latency and resident bytes, no throughput.
+///
+/// It is a constant rather than config because the useful value follows the shape of the
+/// pipeline — one writer thread per shard, serialising — rather than anything a deployment
+/// knows about itself. The number to watch instead is `in_flight` against
+/// `in_flight_capacity` on `/_admin/workers`.
+const ORCHESTRATOR_WORKER_MAX_IN_FLIGHT: usize = 8;
+
 /// Type alias for routing results to reduce complexity
 type RoutingResult = Result<(DocPayload, Option<String>, Option<Uuid>), OrchestratorError>;
 
@@ -1005,9 +1025,6 @@ pub enum OrchestratorJob {
     Shutdown,
 }
 
-/// Shared worker loop body used by both the default tokio-task spawn and the
-/// pinned OS-thread spawn (Stage 2e). Exits cleanly when receiving `Shutdown`
-/// or when the channel is closed.
 /// The cores this process may actually use, resolved once at startup.
 ///
 /// Two sources disagree, and both matter. `core_affinity::get_core_ids()` enumerates the
@@ -1202,26 +1219,78 @@ impl ShardPlacement {
     }
 }
 
-async fn orchestrator_worker_loop(
+/// A worker carries several operations at once, up to `max_in_flight`.
+///
+/// It used to await `execute` inline, which made `worker_count` the node's operation
+/// concurrency — and an operation is mostly spent *awaiting* the shard writer rather than
+/// burning CPU, so the pool sat idle while requests queued. Worth +65-70% write throughput
+/// and −64% on p90 at concurrency 64 on an 8-core node (ROADMAP "Worker concurrency,
+/// measured").
+///
+/// The win is a saturation fix and nothing more: where `worker_count` already covers what
+/// the client has outstanding, the same sweep is flat. It was also expected to redeem
+/// shard-affine dispatch, whose regression had been blamed on this loop halving the node's
+/// concurrency — it did not, and that flag stays off for a different reason.
+///
+/// The permit is acquired **before** `recv`, so a worker only pulls a job it has capacity to
+/// start. That keeps the mpsc channel as the backpressure signal it already was: a saturated
+/// worker stops draining, its queue fills, and `try_send_affine` falls through to a neighbour
+/// exactly as before. Spawning first and bounding later would drain the queue instantly and
+/// turn a bounded channel into an unbounded task pile.
+///
+/// Operations for one shard can now overlap inside a worker. Nothing regresses: they still
+/// serialise at that shard's single writer thread, and concurrent requests never had a
+/// cross-request ordering guarantee — round-robin dispatch already spread one shard's writes
+/// across every worker in the pool.
+///
+/// `run_op` is how an accepted job becomes an answer — in production a call into
+/// [`OrchestratorEngine::execute`]. It is a parameter rather than the engine itself so the
+/// properties above can be tested against an operation whose timing the test controls;
+/// nothing here depends on what the operation does, only on how many may run at once.
+async fn orchestrator_worker_loop<F, Fut>(
     mut rx: mpsc::Receiver<OrchestratorJob>,
-    engine: Arc<OrchestratorEngine>,
+    run_op: F,
     worker_id: usize,
     counters: Option<Arc<WorkerCounters>>,
-) {
+    max_in_flight: usize,
+) where
+    F: Fn(Box<ClientOp>, Option<Uuid>) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = WorkerOutcome> + Send + 'static,
+{
+    let width = max_in_flight.max(1);
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(width));
     loop {
+        // Never closed while the loop runs, so this only fails if the semaphore is dropped.
+        let Ok(permit) = Arc::clone(&in_flight).acquire_owned().await else {
+            break;
+        };
+
         match rx.recv().await {
             Some(OrchestratorJob::Execute {
                 op,
                 affinity_shard,
                 reply,
             }) => {
-                let result = engine.execute(*op, affinity_shard).await;
-                // Send result back; ignore error if caller dropped the receiver
-                let _ = reply.send(result);
+                let run_op = run_op.clone();
+                let counters = counters.clone();
                 if let Some(c) = &counters {
                     c.queue_depth.fetch_sub(1, AtomicOrdering::Relaxed);
-                    c.jobs_completed.fetch_add(1, AtomicOrdering::Relaxed);
+                    c.in_flight.fetch_add(1, AtomicOrdering::Relaxed);
                 }
+                // On the pinned path this spawns onto the worker's own current_thread
+                // runtime, so the operation stays on that core and pinning still means what
+                // it says. On the default path it spawns onto the shared multi-threaded
+                // runtime, where a worker is an admission-control unit rather than a place.
+                tokio::spawn(async move {
+                    let result = run_op(op, affinity_shard).await;
+                    // Ignore the error: the caller may have given up and dropped the receiver.
+                    let _ = reply.send(result);
+                    if let Some(c) = &counters {
+                        c.in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
+                        c.jobs_completed.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    drop(permit);
+                });
             }
             Some(OrchestratorJob::Shutdown) => {
                 debug!(
@@ -1236,13 +1305,32 @@ async fn orchestrator_worker_loop(
             }
         }
     }
+
+    // Drain before returning. Operations run as spawned tasks now, and on the pinned path
+    // this function is the argument to `block_on` — returning drops the worker's
+    // current_thread runtime, which cancels every task still on it. That would abandon
+    // accepted writes at shutdown and hand their callers a dropped oneshot instead of an
+    // answer. Reacquiring the full width waits for exactly the in-flight set, because a
+    // permit comes back only when its task has replied.
+    let _ = in_flight.acquire_many(width as u32).await;
+    debug!(
+        worker_id = worker_id,
+        "Orchestrator worker drained in-flight operations"
+    );
 }
 
 /// Per-worker atomic counters — updated on the send and receive hot paths.
 #[derive(Debug)]
 struct WorkerCounters {
-    /// Current number of jobs waiting in this worker's mpsc channel.
+    /// Jobs sitting in this worker's mpsc channel, not yet started. Incremented on send,
+    /// decremented when the worker picks the job up — so it is queueing against
+    /// `queue_capacity`, and `in_flight` is the work actually running.
     queue_depth: AtomicUsize,
+    /// Operations this worker has started and not yet answered, bounded by the worker's
+    /// in-flight limit. The pair (`queue_depth`, `in_flight`) separates "waiting for a
+    /// worker" from "waiting on a shard" — a deep queue beside a low `in_flight` means the
+    /// limit is too tight, the reverse means the shards are the constraint.
+    in_flight: AtomicUsize,
     /// Total jobs completed by this worker since startup.
     jobs_completed: AtomicU64,
     /// Core this worker is actually pinned to, or [`UNPINNED`]. Written once by the worker
@@ -1254,6 +1342,7 @@ impl Default for WorkerCounters {
     fn default() -> Self {
         Self {
             queue_depth: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
             jobs_completed: AtomicU64::new(0),
             pinned_core: AtomicI64::new(UNPINNED),
         }
@@ -1286,6 +1375,11 @@ pub struct WorkerStats {
     pub core_id: Option<usize>,
     pub queue_depth: usize,
     pub queue_capacity: usize,
+    /// Operations started and not yet answered. Sits against `in_flight_capacity`.
+    #[serde(default)]
+    pub in_flight: usize,
+    #[serde(default)]
+    pub in_flight_capacity: usize,
     pub jobs_completed: u64,
 }
 
@@ -1539,6 +1633,8 @@ impl OrchestratorWorkerTx {
                     core_id,
                     queue_depth: counters.queue_depth.load(AtomicOrdering::Relaxed),
                     queue_capacity: self.per_worker_queue_capacity,
+                    in_flight: counters.in_flight.load(AtomicOrdering::Relaxed),
+                    in_flight_capacity: ORCHESTRATOR_WORKER_MAX_IN_FLIGHT,
                     jobs_completed: counters.jobs_completed.load(AtomicOrdering::Relaxed),
                 }
             })
@@ -5463,16 +5559,28 @@ impl NodeOrchestrator {
 
         // Worker count: min(local_shards * 2, cpu_cores * 2), minimum 1.
         //
-        // When shard-affine dispatch and writer pinning are both on, `worker_count` is
-        // forced to the core budget so that worker `i` and the writer for the shard with
-        // ordinal `i` land on the same core. One worker per core is the deliberate ceiling:
-        // enough to avoid context switching between them, not so many that the pool
-        // oversubscribes the machine.
-        //
         // Note this is not capped at `local_shards`. Only *writes* are shard-affine; searches
         // dispatch round-robin across the whole pool, so workers past the shard count are
         // far from idle. Writes cannot use more workers than there are shards in any case —
         // each shard has one writer thread that serialises them.
+        //
+        // When shard-affine dispatch and writer pinning are both on, `worker_count` is
+        // forced to the core budget so that worker `i` and the writer for the shard with
+        // ordinal `i` land on the same core.
+        //
+        // That alignment is measurably a loss, which is why `shard_affine_dispatch` defaults
+        // off — see the flag's documentation in `config.rs`. Halving the pool here is the
+        // cost, and it is *this line*, not thread placement, that the measurement blames.
+        //
+        // It was first blamed on the serial worker loop, on the theory that halving
+        // `worker_count` halved the node's operation concurrency. That theory has since been
+        // tested and is wrong: a worker now carries `ORCHESTRATOR_WORKER_MAX_IN_FLIGHT`
+        // operations, so the affine pool holds 8 x 8 = 64 in flight against the round-robin
+        // pool's 128, and affine dispatch still cost 24% of write throughput at concurrency
+        // 64 (ROADMAP "Worker concurrency, measured"). What remains is the constraint itself:
+        // a job for shard S may only run on worker `S % worker_count`, so an instantaneous
+        // skew across shards leaves some workers idle while others queue. Round-robin has no
+        // such constraint and needs no luck.
         let cpu_cores = self.core_layout.budget();
         let local_shards = self.shards.len();
         let aligned =
@@ -5513,6 +5621,12 @@ impl NodeOrchestrator {
             worker_txs.push(tx);
             let engine = Arc::clone(&engine);
             let counters = Arc::clone(&worker_stats[worker_id]);
+            // What the worker does with a job it has admitted. Cloned per operation, so it
+            // holds an `Arc` rather than borrowing the engine.
+            let run_op = move |op: Box<ClientOp>, affinity_shard: Option<Uuid>| {
+                let engine = Arc::clone(&engine);
+                async move { engine.execute(*op, affinity_shard).await }
+            };
 
             if let Some(target_core) = pin_workers
                 .then(|| self.core_layout.core_for(worker_id))
@@ -5560,9 +5674,10 @@ impl NodeOrchestrator {
                             .expect("Failed to build orchestrator worker runtime");
                         rt.block_on(orchestrator_worker_loop(
                             rx,
-                            engine,
+                            run_op,
                             worker_id,
                             Some(counters),
+                            ORCHESTRATOR_WORKER_MAX_IN_FLIGHT,
                         ));
                     })
                     .expect("Failed to spawn orchestrator worker thread");
@@ -5571,9 +5686,10 @@ impl NodeOrchestrator {
                 // Default path: tokio task on main multi-threaded runtime.
                 tokio::spawn(orchestrator_worker_loop(
                     rx,
-                    engine,
+                    run_op,
                     worker_id,
                     Some(counters),
+                    ORCHESTRATOR_WORKER_MAX_IN_FLIGHT,
                 ));
             }
         }
@@ -7375,6 +7491,184 @@ mod tests {
             WorkerOutcome::Done(result) => {
                 panic!("bulk write should defer to the actor, got {result:?}")
             }
+        }
+    }
+
+    /// A worker operation whose future is boxed so the runner closures below can be named in
+    /// a return type. The loop never inspects the op, only how many are running.
+    type TestOp = std::pin::Pin<Box<dyn std::future::Future<Output = WorkerOutcome> + Send>>;
+
+    fn placeholder_op() -> Box<ClientOp> {
+        Box::new(ClientOp::Write {
+            index: "bench".to_string(),
+            id: "d1".to_string(),
+            routing_key: None,
+            doc: json!({"title": "Dune"}),
+        })
+    }
+
+    /// A runner that holds each operation for `hold` and records the high-water mark of how
+    /// many were running at once. That mark is the whole subject of per-worker concurrency
+    /// and is not observable from outside the loop any other way.
+    fn recording_runner(
+        hold: Duration,
+        live: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    ) -> impl Fn(Box<ClientOp>, Option<Uuid>) -> TestOp + Clone {
+        move |_op, _shard| {
+            let live = Arc::clone(&live);
+            let peak = Arc::clone(&peak);
+            Box::pin(async move {
+                let now = live.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                peak.fetch_max(now, AtomicOrdering::Relaxed);
+                tokio::time::sleep(hold).await;
+                live.fetch_sub(1, AtomicOrdering::Relaxed);
+                WorkerOutcome::Done(Ok(json!({"ok": true})))
+            })
+        }
+    }
+
+    async fn submit(
+        tx: &mpsc::Sender<OrchestratorJob>,
+    ) -> tokio::sync::oneshot::Receiver<WorkerOutcome> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        tx.send(OrchestratorJob::Execute {
+            op: placeholder_op(),
+            affinity_shard: None,
+            reply,
+        })
+        .await
+        .expect("the worker channel is open");
+        answer
+    }
+
+    /// The point of the whole change: a worker carries several operations at once. The loop
+    /// used to await `execute` inline, which pinned this peak at 1 however many jobs were
+    /// queued — and that, not thread placement, is what made shard-affine dispatch a
+    /// measured 13-20% write regression, because enabling it halves `worker_count`.
+    #[tokio::test]
+    async fn a_worker_runs_several_operations_at_once() {
+        let (tx, rx) = mpsc::channel(16);
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(orchestrator_worker_loop(
+            rx,
+            recording_runner(
+                Duration::from_millis(50),
+                Arc::clone(&live),
+                Arc::clone(&peak),
+            ),
+            0,
+            None,
+            4,
+        ));
+
+        let mut answers = Vec::new();
+        for _ in 0..4 {
+            answers.push(submit(&tx).await);
+        }
+        for answer in answers {
+            answer.await.expect("every operation is answered");
+        }
+
+        assert_eq!(
+            peak.load(AtomicOrdering::Relaxed),
+            4,
+            "four jobs and a width of four should have overlapped; a peak of 1 means the \
+             loop went back to awaiting each operation inline"
+        );
+    }
+
+    /// The other half of the contract. Width is an admission limit, not a suggestion: past
+    /// the point where every shard writer already has work queued, more in-flight operations
+    /// only move the queue from the channel into memory.
+    #[tokio::test]
+    async fn a_worker_never_exceeds_its_width() {
+        let (tx, rx) = mpsc::channel(16);
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(orchestrator_worker_loop(
+            rx,
+            recording_runner(
+                Duration::from_millis(20),
+                Arc::clone(&live),
+                Arc::clone(&peak),
+            ),
+            0,
+            None,
+            2,
+        ));
+
+        let mut answers = Vec::new();
+        for _ in 0..8 {
+            answers.push(submit(&tx).await);
+        }
+        for answer in answers {
+            answer.await.expect("every operation is answered");
+        }
+
+        assert_eq!(
+            peak.load(AtomicOrdering::Relaxed),
+            2,
+            "a width of two must never run three at once"
+        );
+    }
+
+    /// Shutdown must answer what it already accepted.
+    ///
+    /// This mirrors the pinned path deliberately: there the loop is the argument to
+    /// `block_on` on the worker's own `current_thread` runtime, so *returning* from it drops
+    /// that runtime and cancels every task still on it. Operations run as spawned tasks now,
+    /// so without the drain a shutdown mid-flight abandons accepted writes and hands their
+    /// callers a dropped channel instead of an answer. A plain `#[tokio::test]` would not
+    /// catch it — the test runtime outlives the loop and the tasks would finish anyway.
+    #[test]
+    fn shutdown_answers_operations_it_already_accepted() {
+        let (tx, rx) = mpsc::channel::<OrchestratorJob>(16);
+
+        // The first operation is quick and the rest are slow, so the loop is guaranteed to
+        // read `Shutdown` — which needs a freed permit — while three are still running. With
+        // one uniform duration the whole batch finishes together and the test proves nothing.
+        let seq = Arc::new(AtomicUsize::new(0));
+        let runner = move |_op: Box<ClientOp>, _shard: Option<Uuid>| -> TestOp {
+            let nth = seq.fetch_add(1, AtomicOrdering::Relaxed);
+            Box::pin(async move {
+                let hold = if nth == 0 { 10 } else { 200 };
+                tokio::time::sleep(Duration::from_millis(hold)).await;
+                WorkerOutcome::Done(Ok(json!({"nth": nth})))
+            })
+        };
+
+        let worker = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("worker runtime");
+            rt.block_on(orchestrator_worker_loop(rx, runner, 0, None, 4));
+        });
+
+        let mut answers = Vec::new();
+        for _ in 0..4 {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            tx.blocking_send(OrchestratorJob::Execute {
+                op: placeholder_op(),
+                affinity_shard: None,
+                reply,
+            })
+            .expect("the worker channel is open");
+            answers.push(answer);
+        }
+        tx.blocking_send(OrchestratorJob::Shutdown)
+            .expect("the worker channel is open");
+        drop(tx);
+
+        worker.join().expect("the worker thread exits cleanly");
+
+        for (nth, answer) in answers.into_iter().enumerate() {
+            assert!(
+                answer.blocking_recv().is_ok(),
+                "operation {nth} was accepted and then abandoned at shutdown"
+            );
         }
     }
 

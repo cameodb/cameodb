@@ -58,12 +58,27 @@ default_batch_size = 5000
 num_shards_init = 4
 max_shards_per_node = 8
 
+# CPU affinity. Writer pinning is neutral and on; the other two measured as regressions
+# and are off — see docs/CONFIGURATION.md before changing them. All three are no-ops
+# unless the container can actually see the cores it is pinning to, so check
+# `GET /_admin/workers` rather than assuming: it reports the outcome, not the request.
+writer_core_affinity = true
+shard_affine_dispatch = false
+worker_core_affinity = false
+
 [search]
 indexer_memory_min_mb = 32
 indexer_memory_max_mb = 512
 total_memory_limit_mb = 4096
 memory_pressure_threshold_percent = 80
-search_threads = 16
+# Concurrent searches allowed on the read pool. Keep this at or below the core count the
+# container is actually given: reads share cores with the pinned shard writers, and letting
+# more searches run than there are cores costs the write path far more than it gains the
+# read path. This file shipped 16 against a typical 4-8 core container; measured on an
+# 8-core node under mixed read/write load, 16 was worse than 8 on every axis — search p99
+# 15.44ms vs 13.46ms, write throughput 1 776 vs 1 895 ok/s, and run-to-run spread several
+# times wider. See docs/CONFIGURATION.md.
+search_threads = 8
 enable_streaming_search = true
 max_concurrent_shard_searches = 32
 max_concurrent_remote_searches = 8
