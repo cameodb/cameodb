@@ -132,19 +132,30 @@ For a quick overview of all available scripts and project status:
 - **Requirements**: CameoDB must be running or script will start it
 - **Audience**: Developers, QA, CI/CD pipelines
 
-#### `load-test.sh [port] [users] [requests_per_user]`
-**Purpose**: Performance and load testing with detailed metrics
-- **Features**:
-  - Concurrent write and search load testing
-  - Detailed performance metrics (avg/min/max/95th percentile)
-  - Configurable user count and request volume
-  - Response time analysis and error tracking
+#### `load-test.sh [port] [users] [requests_per_user]` — ⚠️ smoke test only
+**Purpose**: Rough concurrent-load smoke test
+- **Do not use its numbers.** It forks `curl` per request and times it in bash, so at any
+  real concurrency the latencies it reports are process spawn and connection setup, not
+  CameoDB. Use `cameodb-bench` for anything you intend to compare or record.
 - **Usage**:
   ```bash
   ./scripts/testing/load-test.sh                    # Default: 10 users, 50 requests each
-  ./scripts/testing/load-test.sh 9480 20 100        # 20 users, 100 requests each
   ```
 - **Output**: Creates test data in 'loadtest' index
+
+#### `cameodb-bench` — the latency harness
+**Purpose**: Percentile latency for writes and searches, plus worker-pool placement
+- **Usage**:
+  ```bash
+  cargo run -p bench -- --url http://localhost:9480 --mode mixed --concurrency 8 --duration 30
+  ```
+- **Reports**: p50/p90/p95/p99/p99.9 for writes and searches, the node's own `took_ms`
+  beside the client-observed figure (the gap is queueing), and per-worker job counts,
+  core placement and dispatch counters over the measured window
+- **Caveat**: closed-loop — compare runs at equal `--concurrency`, and run it off-box when
+  the numbers matter, or the generator competes for the cores under test
+- **Source**: [crates/bench](../crates/bench/README.md), which doubles as a worked example
+  of the client SDK
 - **Audience**: Performance engineers, DevOps
 
 ### 📊 `data/` - Data Management
@@ -230,7 +241,7 @@ cargo build --release               # Build project
 #### Development Testing
 ```bash
 ./examples/data/sample-data.sh       # Load test data
-./scripts/testing/load-test.sh      # Performance testing
+cargo run -p bench -- --duration 30  # Performance testing (percentiles)
 ./scripts/ops/health-check.sh       # System health
 ```
 

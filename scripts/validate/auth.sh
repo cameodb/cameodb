@@ -523,9 +523,16 @@ if [ -f "$WORK/filed.key" ] && [ -f "$WORK/filed.hash" ]; then
 else
     fail "keygen writes a key file and a hash file"
 fi
+# GNU form first, BSD second. The other order looks equivalent and is not: GNU stat reads
+# `-f` as "filesystem", takes the format string as a filename, prints the *file's* filesystem
+# info to stdout and still exits 0 for the operand that existed — so the fallback never fires
+# and the captured mode is a paragraph of text. macOS stat rejects `-c` cleanly, with an
+# empty stdout and a non-zero status, which is what makes this order safe on both.
+file_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%OLp' "$1"
+}
 for f in filed.key filed.hash; do
-    mode="$(stat -f '%OLp' "$WORK/$f" 2>/dev/null || stat -c '%a' "$WORK/$f")"
-    check_eq "keygen creates $f as 0600" "600" "$mode"
+    check_eq "keygen creates $f as 0600" "600" "$(file_mode "$WORK/$f")"
 done
 # The key must not also reach stdout: written and printed is two places to leak from.
 if "$BIN" keygen --role reader --key-out "$WORK/quiet.key" 2>/dev/null | grep -q 'cameo_v1_'; then

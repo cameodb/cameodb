@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Writes to an index with no schema returned 500.** The worker pool's engine holds `ArcSwap`
+  snapshots, so it can read a schema but not evolve one — that needs the actor. It signalled
+  this by returning a sentinel error, and the caller, which had already moved the op into the
+  worker job, had nothing left to retry with and surfaced the sentinel to the client instead.
+  Since a new index has an empty schema, *every* first write to an index failed. The engine
+  now hands the op back (`WorkerOutcome::UseActor`) and the caller retries it on the actor,
+  with no clone on the fast path. Creating an index by writing to it works again.
+- **Auto-created indexes were write-only.** Fields inferred when an index is first written
+  were marked non-indexed, so documents went in and nothing but `id` could find them again —
+  permanently, because a tantivy schema is fixed at index creation and nothing promotes a
+  field afterwards. Fields discovered at creation are now indexed (and, as before, not
+  stored: hits are rebuilt from redb). Fields that arrive later stay unindexed, which is the
+  only thing tantivy allows; they exist for redb/tantivy schema parity. The bundled client
+  already applied this rule before PUTting a detected schema, so `cameodb data load` was
+  unaffected — the two now agree instead of one compensating for the other.
+- **The initial schema was never persisted, and fields past the sampling limit were dropped.**
+  Sampling filled the in-memory schema, which made the evolution stage — the only thing that
+  wrote to storage — decide there was nothing new, so the storage layer re-derived its own
+  schema from the document. Two more places recomputed "is this initial creation?" from
+  `fields.is_empty()` *after* sampling had filled it, reading false on exactly the call where
+  it was true; one of them selected a validator that does not report new fields, so a field
+  first appearing past document 200 of a bulk load never reached the schema at all.
+
+### Added
+- **`cameodb-bench`, a latency harness** (`crates/bench`, not shipped). Reports
+  p50/p90/p95/p99/p99.9 for writes and searches, the node's own `took_ms` beside the
+  client-observed figure so the gap shows queueing rather than query cost, and per-worker job
+  counts, core placement and dispatch counters over the measured window. Closed-loop, and it
+  says so: compare runs at equal concurrency rather than reading the percentiles as an SLA.
+  `scripts/testing/load-test.sh` remains as a smoke test but is now marked not to be quoted —
+  it forks `curl` per request and times it in bash, so its latencies are process spawn.
+  The harness doubles as a worked example of the client SDK: it depends on `client` and never
+  on the server crate, and issues no request the SDK cannot express. `--mode bulk` measures
+  batched ingest per request and reports docs/s, which on a 4-shard node showed batching
+  worth ~9× at 50 documents per request and ~24× at 500 against one-per-request writes.
+- **`CameoClient::write_document`.** Writing one document was reachable over HTTP but absent
+  from the SDK, so any consumer needing it had to hand-roll the request.
+
+### Changed
+- **Shard-affine dispatch no longer collides.** Worker selection and writer-thread pinning
+  both hashed the shard id, and the hash domain (the shard set) is smaller than the core
+  count: with the shipped defaults — 4 shards, 8 cores — 40 affine writes reached 3 of 8
+  workers and two shards' writer threads shared a core. Both now derive from a dense
+  per-shard ordinal, so the same run reaches one worker per shard with one writer per core.
+  Searches are unaffected; they round-robin the whole pool as before.
+- **Worker sizing and thread pinning count the same cores.** Sizing read
+  `available_parallelism()` while pinning indexed `core_affinity::get_core_ids()`. Under a
+  cgroup CPU quota those disagree — `docker --cpus=4` on a 32-core host reports 4 and 32 —
+  so the co-location the design exists for silently stopped holding. A single `CoreLayout`
+  now reconciles them.
+- **Keyed operations skip the coordinator.** Every write and every search took a mailbox
+  round trip to a single actor to ask where to route, in front of a worker pool built to
+  avoid exactly that. A keyed operation whose shard is local is now decided from the
+  published routing ring and shard placement, both already in hand. Unkeyed operations
+  (searches) still ask — that decision depends on cluster size.
+- **`GET /_admin/workers` reports pinning outcomes, not requests.** It previously showed
+  `pinned: true` and a `core_id` per worker on hosts where every `set_for_current` call had
+  failed, which is every call on macOS. `pinned` is replaced by `pinning_requested` plus
+  `pinned_workers`; `hash_aligned` is now `core_aligned` (there is no hash any more); each
+  worker carries both `target_core_id` and the `core_id` it actually took; and a new `shards`
+  section reports per-shard ordinal, requested core, taken core, and whether the shard is
+  serving.
+- **`[search] supervisor_timeout_secs` was silently ignored.** The idle-commit supervisor read
+  `CAMEODB_SUPERVISOR_TIMEOUT_SECS` from the environment directly rather than from the config,
+  so the setting in a config file and the `--supervisor-timeout-secs` flag both did nothing —
+  the environment variable appeared to work only because it bypassed the config system
+  entirely. It now comes from the config, which still maps that variable onto the field, so
+  the env var keeps working and the file and flag start working. Its doc comment also claimed
+  a default of 10 while the code used 5; the code was right.
+- **The client SDK's worker-report type went stale when the node's field names changed.**
+  `AdminWorkersResponse` still required `pinned` and `hash_aligned`, so `cameodb client admin
+  workers` would have failed to parse a report from the node it shipped with. Every field is
+  now `#[serde(default)]`: a client and a node version independently, and a renamed or added
+  counter should degrade to a zero rather than take down the whole report. Covered by tests
+  that parse both the current payload and a sparse one.
+- **`scripts/validate/auth.sh` file-mode checks were broken on Linux.** They tried BSD `stat -f`
+  first and fell back to GNU `stat -c`, but GNU `stat` reads `-f` as "filesystem", takes the
+  format string as a filename, still exits 0 for the operand that existed, and returns a
+  paragraph of filesystem info — so the fallback never fired and the comparison failed against
+  files that were correctly 0600. Order reversed; macOS rejects `-c` cleanly, which is what
+  makes GNU-first safe on both.
+- **Hot-path logging moved to `debug`.** One search at `RUST_LOG=info` emitted seven lines —
+  two per-request routing lines from the coordinator, a handler line carrying the caller's
+  query text, and one `No tantivy reader found` warning *per shard* for the normal case of an
+  index with no commits. A write and a search now emit none.
+
 ### Fixed (security)
 - **Corporate CA certificates were silently dropped by both compose files.** The `zscaler` →
   `corporate-ca` rename reached the Dockerfiles but not `docker-compose.yml`,

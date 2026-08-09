@@ -127,13 +127,16 @@ This document outlines the current development priorities and optimization roadm
 - ✅ **Phase 11 (Workflow Hot-Path Optimizations)**: All 7 steps completed
 - ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed
 - ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, resources, and query syntax docs completed; security moved to Phase 14, streaming/docs/testing planned
-- 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f partially done (merge thread count control implemented via `IndexWriterOptions`; core pinning and per-arena stats planned)
+- 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f partially done (merge thread count control implemented via `IndexWriterOptions`; core pinning and per-arena stats planned). Shard placement reworked 2026-08-08: dense ordinals replace `xxh3(shard_id) % n` on both the dispatch and writer-pinning sides, and a single `CoreLayout` reconciles `get_core_ids()` with `available_parallelism()`. `/_admin/workers` reports the pin outcome per worker and per shard, not the request. **Verified on Linux (aarch64 container, 8 cores) 2026-08-08: 8/8 workers pinned to their target cores and all four writer threads to cores 0–3, confirmed independently against `Cpus_allowed_list` in `/proc/<pid>/task/*/status` — one CPU per worker thread, one per writer, no collisions.** Pinning is a no-op on macOS, so it must be validated on Linux; the whole suite passes there too.
 - 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) complete, landed 2026-08-08 — steps 1–5 plus hardening (6a) and documentation (6b): credential model, `keygen`, `[security]` config, enforcement at the HTTP/MCP ingress with capability and index scoping (so `external` can now start), `--api-key` / `--api-key-file` / `CAMEODB_API_KEY` on the bundled client, index list filtering, and MCP per-tool authorization with sessions bound to their key. C1–C3 planned, C3 shrunk because B1 absorbs index scoping
 
 ### **Recommended Next Steps**
-1. **Phase 14 Stage C1–C3**: MCP rate limiting, audit logging, per-index role overrides — B1 is complete (steps 1–5 plus the 6a hardening and 6b documentation passes)
-2. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats
-3. **Phase 12 remaining**: MCP streaming, documentation, integration tests
+1. ~~**A latency harness.**~~ ✅ Landed 2026-08-09 as `cameodb-bench` (`crates/bench`): percentiles for writes and searches, the node's `took_ms` beside the client-observed figure, and the worker-pool delta over the measured window. Closed-loop, so runs are comparable at equal concurrency rather than being an SLA. Phase 13's "write p99 reduced by 20-40%" is now measurable — **but not yet measured**: no before/after run has been recorded, and the flags whose effect it would show are still off by default (step 2)
+2. **Document and default the affinity flags.** `shard_affine_dispatch` and `worker_core_affinity` are absent from every shipped config and from `docs/CONFIGURATION.md`, and both default `false` — so Stages 2a/2d/2e are code no deployment runs. Hold the "turn these on" recommendation until step 1 can justify it
+3. **Take unkeyed searches off the coordinator.** A keyed write now resolves locally from the published ring and shard placement, but a search still pays a mailbox round trip to a single actor because the decision depends on cluster size, which the router has no cheap way to know. Needs the node count published alongside the ring
+4. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats — the largest and least certain of these, and the one that most needs step 1 first
+5. **Phase 14 Stage C1–C3**: MCP rate limiting, audit logging, per-index role overrides — B1 is complete (steps 1–5 plus the 6a hardening and 6b documentation passes)
+6. **Phase 12 remaining**: MCP streaming, documentation, integration tests
 
 ---
 
@@ -289,7 +292,7 @@ HTTP req on axum tokio worker (any core)
 **Implementation:**
 - Add `affinity_shard: Option<Uuid>` to `OrchestratorJob::Execute`
 - Add `try_send_affine(&self, job, shard_id: Option<Uuid>)` to `OrchestratorWorkerTx`
-  - When `shard_id` is `Some`, route to `workers[xxh3(shard_id) % worker_count]`
+  - When `shard_id` is `Some`, route to `workers[ordinal(shard_id) % worker_count]`
   - Fall through to neighboring workers on `Full` (preserve throughput)
   - When `shard_id` is `None` (broadcast/scatter), fall back to round-robin
 - In `handle_client_op`, extract routing key from `ClientOp::Write` before dispatch
@@ -337,20 +340,24 @@ HTTP req on axum tokio worker (any core)
 
 ---
 
-### Stage 2d: Co-Locate Writer Pinning with Worker Hash ✅ DONE
+### Stage 2d: Co-Locate Writer Pinning with Worker Placement ✅ DONE
 
 **Risk:** Low | **LOC:** ~15 | **Prerequisite:** Stage 2a
 
-**Goal:** Ensure the writer thread for shard X uses the same hash bucket as the worker that handles shard X's operations.
+**Goal:** Ensure the writer thread for shard X lands on the same core as the worker that handles shard X's operations.
 
 **Implementation (delivered):**
 - In `NodeOrchestrator::spawn_worker_pool`, when `shard_affine_dispatch && writer_core_affinity` are both enabled, force `worker_count = cpu_cores`.
-- This makes `xxh3(shard_id) % worker_count == xxh3(shard_id) % num_cores`, so for any shard S: the worker handling S dispatches into the writer pinned on the matching core.
-- Tokio worker tasks aren't OS-pinned, but the scheduler keeps frequently-running tasks near their last core under sustained load — co-locating dispatch with writer thread on the same hash bucket maximizes that locality.
+- Worker and writer both derive from the shard's dense ordinal, so for any shard S the worker handling S dispatches into the writer pinned on the matching core.
+- Tokio worker tasks aren't OS-pinned, but the scheduler keeps frequently-running tasks near their last core under sustained load — co-locating dispatch with the writer thread maximizes that locality.
 - Behind a config gate: default behavior (either flag off) preserves the existing `min(local_shards * 2, cpu_cores * 2)` worker sizing.
 
-**Deferred to Stage 2e:**
-- Explicit `CoreLayout` struct (`reserved`, `per_shard`, `read_pool` cores) becomes valuable only when workers are pinned as dedicated OS threads with single-thread runtimes (Stage 2e). For pure hash alignment, the implicit `% cpu_cores` math is sufficient.
+**Superseded (2026-08-08):** originally hashed — `xxh3(shard_id) % worker_count` against
+`xxh3(shard_id) % num_cores`. Both sides agreed, but the hash domain is the shard set, which
+is smaller than the core count, so it collided: measured with the shipped defaults (4 shards,
+8 cores), 40 affine writes reached 3 of 8 workers and two shards' writers shared a core.
+Replaced by `ShardPlacement`, which assigns a dense ordinal per shard. Same guarantee, no
+collisions — the same run now reaches 4 of 4 possible workers, one writer per core.
 
 ---
 
@@ -366,13 +373,13 @@ HTTP req on axum tokio worker (any core)
 - When all three flags are on, `spawn_worker_pool`:
   - Sizes `worker_count = num_cores` (inherited from Stage 2d alignment).
   - Spawns each worker as a dedicated `std::thread::Builder` thread named `orch-worker-N`.
-  - Pins the OS thread to `core_ids[worker_id % num_cores]` via `core_affinity::set_for_current`.
+  - Pins the OS thread to `CoreLayout::core_for(worker_id)` via `core_affinity::set_for_current`.
   - Runs an isolated `tokio::runtime::Builder::new_current_thread()` runtime with `max_blocking_threads(4)` (kept tiny because search delegates to the shared `read_runtime` and writes go through the pinned writer thread).
   - Falls back gracefully on macOS / when pinning fails (logged, runs unpinned on a dedicated thread).
 - `NodeOrchestrator.worker_threads: Vec<std::thread::JoinHandle<()>>` stores handles; `shutdown_worker_pool` sends shutdown messages then joins them via `spawn_blocking`.
 
 **Why minimal:**
-- No new `[runtime]` config section — just one boolean. Reserved-core layout (`CoreLayout` from the original plan) deferred until a concrete need.
+- No new `[runtime]` config section — just one boolean. A `CoreLayout` now exists, but only as the single source of which cores this process may use (`get_core_ids()` reconciled with `available_parallelism()`, so a cgroup CPU quota cannot make worker sizing and pin targets count different cores). Splitting it into reserved / per-shard / read-pool sets is still deferred — that is Stage 2f.2's work.
 - No changes to `OrchestratorJob`, `OrchestratorWorkerTx`, `OrchestratorEngine`, `RouterActor`, `MicroshardActor`, or `engine.execute()` body — they work identically across both runtimes.
 - The shared `read_runtime` continues handling all heavy I/O, preserving search throughput.
 
@@ -382,30 +389,96 @@ HTTP req on axum tokio worker (any core)
 
 **Edge cases handled:**
 1. Broadcast/scatter — `affinity_shard = None`, falls through to round-robin send across pinned workers.
-2. Dynamic shard creation — workers already cover all cores; hash determines the new shard's worker.
+2. Dynamic shard creation — workers already cover all cores; the new shard takes the next ordinal, which determines its worker.
 3. `current_thread` runtime — fine because the worker only awaits channels and delegates blocking work elsewhere.
 4. Shutdown — JoinHandles ensure runtimes drop before the orchestrator returns.
 
 ---
 
-### Stage 2f: Tantivy Merge Thread Pinning & Per-Arena Jemalloc Stats 🎯 PARTIALLY DONE
+### Stage 2f: CPU Arenas & Per-Arena Jemalloc Stats 🎯 PARTIALLY DONE
 
-**Risk:** Low–Medium | **LOC:** ~80 | **Prerequisite:** Stage 2e
+**Risk:** Medium | **LOC:** ~250 | **Prerequisite:** Stage 2e, plus a latency harness for the parts whose value is unproven
 
 **2f.1 — Tantivy Merge Thread Control:** ✅ COMPLETED
-- Merge thread count is now configurable via `StorageConfig.merge_num_threads` (default: 1)
+- Merge thread count is configurable via `StorageConfig.merge_num_threads` (default: **2**)
 - Implemented via `tantivy::indexer::IndexWriterOptions::builder()` with explicit `num_merge_threads()`
-- Replaces Tantivy's default of 4 merge threads, preventing mmap storms on memory-constrained nodes
+- Replaces Tantivy's default of 4 merge threads, preventing mmap storms on memory-constrained nodes. Two rather than one is deliberate: it leaves headroom to merge in parallel under load instead of serialising compaction behind a single thread
+- Note the count is **per open index**, so merge threads scale with how many indices are open, not with shard count
 
-**2f.2 — Tantivy Merge Thread Core Pinning:** 📋 PLANNED
-- Pin merge threads to the read core set to avoid interfering with writer threads
-- Currently merge threads run on whatever core the OS picks even with `merge_num_threads: 1`
+**2f.2 — CPU Arenas for Write / Read / Merge:** 📋 PLANNED — analysed 2026-08-08, not implemented
+
+Design investigation, measured on Linux (aarch64 container, 8 cores, 4 shards × 4 indexes,
+all affinity flags on). The observations below come from `Cpus_allowed_list` in
+`/proc/<pid>/task/*/status`, not from what the process reports about itself.
+
+**The defect this fixes already exists, and enabling `writer_core_affinity` is what causes
+it.** Linux threads inherit their creator's affinity mask, and tantivy spawns its threads
+from whichever thread happens to build the `IndexWriter` or drive the commit:
+
+| Index created by | `merge_thread_*` | `segment_updater` | `thrd-tantivy-index*` |
+|---|---|---|---|
+| `PUT _config` (unpinned thread) | `0-7` | `0-7` | **single core** |
+| a write (pinned writer thread) | **single core** | **single core** | **single core** |
+
+So an index created by writing to it — the normal path — gets its two merge threads confined
+to the *same single core as the writer they contend with*, making `merge_num_threads = 2` two
+threads timesharing one core. Indexer threads are confined in both cases, because
+`prepare_commit` calls `add_indexing_worker` on every commit and that runs on our pinned
+writer thread. Nothing in CameoDB asks for this; it is inheritance, unnoticed.
+
+**Mechanism available.** Tantivy builds its merge pool via `ThreadPoolBuilder` with no
+`start_handler` and exposes no hook to supply one, so those threads cannot be pinned
+directly. Inheritance is the lever, and it suffices because we own both creation sites:
+`IndexWriter` construction (spawns `segment_updater` + merge pool eagerly) and
+`prepare_commit` (respawns indexer threads). Set the creating thread's mask, create, restore.
+`core_affinity::set_for_current` takes a single core and cannot express a set, so this needs
+`libc::sched_setaffinity` with `CPU_SET` — `libc` is already a direct dependency of the
+server crate.
+
+**Proposed layout.** `CoreLayout` splits into two disjoint sets, sized from config with
+`0 = auto`: a **write arena** of `clamp(local_shards, 1, cores - max(1, cores/4))` cores (one
+core per shard is the ceiling that matters — a shard's writes serialise on one writer
+thread), and a **read/merge arena** of the remainder.
+
+| Threads | Arena | How |
+|---|---|---|
+| `orch-worker-N`, `writer-shard-*` | write, single core each | as today, indexed within the arena |
+| `thrd-tantivy-index*` | write arena (all its cores) | widen the writer's mask around `commit()`, restore after |
+| `merge_thread_*`, `segment_updater` | read/merge arena | set mask before constructing the `IndexWriter`, restore after |
+| `cameodb-read` blocking pool | read arena | tokio `on_thread_start` |
+| `warmup-shard-*` | read arena | at thread start |
+| global rayon | read arena | build the global pool explicitly with a `start_handler` |
+
+**Oversubscription is the point, not a limitation.** Arenas are affinity *masks*, not
+reservations, so `shards × indexes` threads share an arena's cores and the kernel timeshares
+them. What an arena guarantees is the negative: nothing in it can preempt a writer core.
+Note that arenas bound *where* threads run, not *how many* — thread count is
+`shards × open_indexes × (1 + merge_num_threads + indexer_num_threads)`, which was 64 tantivy
+threads (98 total) at 4 shards × 4 indexes. The only lever on the count is
+`merge_num_threads`; tantivy has no shared merge executor across `IndexWriter`s.
+
+**Expected impact.** Certain: removes the confinement above, restoring the meaning of
+`merge_num_threads`. Likely: better write tail latency under merge pressure, since compaction
+can no longer preempt a writer mid-commit. Uncertain and deliberately not predicted: whether
+disjoint arenas beat free OS scheduling on aggregate throughput — reserving cores leaves some
+idle at low load while others queue, which typically helps p99 and can cost p50. That
+uncertainty is why the latency harness comes first.
+
+**Bonus for 2f.3.** With `percpu_arena:percpu`, confining thread populations to disjoint core
+sets also separates their jemalloc arenas, making per-arena stats attributable to write
+versus read work instead of an undifferentiated total.
+
+**Risks.** Linux-only; macOS keeps the current no-op, so the platforms genuinely differ. Mask
+save/restore around `IndexWriter` creation needs a drop guard. Below ~4 cores the split
+degenerates and should be disabled. It depends on tantivy internals (eager pool construction,
+commit-time worker respawn) that are not part of its public contract, so the `/proc` affinity
+check should become a Linux validation-suite check rather than a one-off.
 
 **2f.3 — Per-Arena Jemalloc Stats:** 📋 PLANNED
 - `read_jemalloc_stats()` currently reads global stats only
 - With `percpu_arena:percpu`, expose per-arena stats via `mallctl("arena.i.allocated", ...)` and `mallctl("arena.i.resident", ...)`
 - Useful for diagnosing which shard/core is consuming the most memory
-- Requires Stage 2e (CoreLayout) to map arena IDs to shard/core
+- Requires 2f.2's core sets to map arena IDs to shard/core
 
 ---
 
@@ -418,7 +491,7 @@ HTTP req on axum tokio worker (any core)
 | **3** | 2c: Auto-purge + per-index memory | Low | ~70 | 2b | Operational safety, observability |
 | **4** | 2d: Co-locate writer pinning | Low | ~10 | 2a | Full core co-location |
 | **5** | 2e: Per-shard single-thread rt | Medium | ~150 | 2a+2d | True thread-per-core |
-| **6** | 2f: Merge control + pinning + per-arena stats | Low–Med | ~80 | 2e | Reduced interference, diagnostics (2f.1 done; 2f.2+2f.3 planned) |
+| **6** | 2f: CPU arenas + per-arena stats | Medium | ~250 | 2e + harness | Merge threads stop sharing the writer's core; diagnostics (2f.1 done; 2f.2 analysed, 2f.3 planned) |
 
 **Success Metrics:**
 - Write p99 latency reduced by 20-40% under high concurrent load

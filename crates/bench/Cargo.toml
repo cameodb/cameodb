@@ -1,0 +1,23 @@
+[package]
+name = "bench"
+version = "0.2.3"
+edition = "2024"
+license = "MIT"
+# Not a shipped artifact. `scripts/build/build-dist.sh` packages the `cameodb` binary by
+# name, so this never lands in a release; keeping it in the workspace means it has to keep
+# compiling against the SDK, which is most of its value as an example.
+publish = false
+
+[[bin]]
+name = "cameodb-bench"
+path = "src/main.rs"
+
+[dependencies]
+# The SDK, taken as a dependency exactly the way anything outside this repo would take it.
+# Nothing here reaches into the server crate — if a workload cannot be expressed through
+# `client`, that is a gap in the SDK, not a reason to bypass it.
+client = { path = "../client", version = "0.2.3" }
+anyhow.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+rustls = { workspace = true }

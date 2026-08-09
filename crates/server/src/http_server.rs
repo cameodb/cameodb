@@ -32,7 +32,7 @@ use tower_http::{
 /// Liveness endpoint path. Exempt from the concurrency guard so that an overloaded node
 /// still reports its real state instead of 503-ing its own health check.
 pub const HEALTH_PATH: &str = "/_cluster/health";
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::authz::{Authz, retain_visible_indexes};
 use crate::cluster_coordinator::{ClusterCoordinator, GetStatus, OperationType};
@@ -1735,7 +1735,9 @@ async fn search_handler(
     let final_fields = payload.fields.or(parsed_fields);
     let final_sort = payload.sort.or(parsed_sort);
 
-    info!(
+    // `debug`, not `info`: one formatted line per search at the level operators run, and it
+    // puts the caller's query text in the log — the request span already carries the route.
+    debug!(
         "Search request - index: {}, query: {}, limit: {:?}, fields: {:?}",
         index, cleaned_query, final_limit, final_fields
     );
@@ -1837,7 +1839,7 @@ async fn write_handler(
     State(state): State<AppState>,
     Json(payload): Json<DocPayload>,
 ) -> Result<Json<JsonValue>, AppError> {
-    info!("Write request - index: {}, doc_id: {}", index, payload.id);
+    debug!("Write request - index: {}, doc_id: {}", index, payload.id);
 
     let DocPayload {
         id,

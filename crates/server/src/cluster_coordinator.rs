@@ -923,8 +923,10 @@ impl ClusterCoordinator {
         // operation_type reserved for future policy; currently unused
         let _ = operation_type;
 
-        // Debug logging for troubleshooting
-        info!(
+        // Per-request, so `debug` rather than `info`: at the level operators actually run,
+        // this line and the decision below were two formatted log writes on every write and
+        // every search, plus a `{:?}` of the routing key.
+        debug!(
             "RouteOperation: routing_key={:?}, ring_size={}, shard_assignments={}, expected_nodes={}",
             routing_key,
             self.ring.len(),
@@ -943,10 +945,10 @@ impl ClusterCoordinator {
             if let Some(shard_id) = self.route_for_key(&key) {
                 if let Some(owner_node) = self.shard_owner(&shard_id) {
                     if owner_node == self.cluster.local_node_id {
-                        info!(%shard_id, "RouteOperation: routing locally by key");
+                        debug!(%shard_id, "RouteOperation: routing locally by key");
                         return RoutingDecision::Local;
                     } else if let Some(addr) = self.node_address(&owner_node) {
-                        info!(%shard_id, node = %owner_node, addr = %addr, "RouteOperation: routing remote by key");
+                        debug!(%shard_id, node = %owner_node, addr = %addr, "RouteOperation: routing remote by key");
                         return RoutingDecision::Remote {
                             node_id: owner_node,
                             peer_addr: addr,
@@ -969,7 +971,7 @@ impl ClusterCoordinator {
                 // For single-node clusters, route locally instead of broadcasting
                 // This handles cases where shards haven't been registered yet
                 if self.expected_nodes.len() <= 1 {
-                    info!("RouteOperation: single-node cluster detected, routing locally");
+                    debug!("RouteOperation: single-node cluster detected, routing locally");
                     return RoutingDecision::Local;
                 }
 
@@ -980,11 +982,11 @@ impl ClusterCoordinator {
         // For single-node clusters, route locally instead of broadcasting
         // This handles operations without routing keys (like some admin operations)
         if self.expected_nodes.len() <= 1 {
-            info!("RouteOperation: single-node cluster with no routing key, routing locally");
+            debug!("RouteOperation: single-node cluster with no routing key, routing locally");
             return RoutingDecision::Local;
         }
 
-        info!("RouteOperation: no routing_key provided, broadcasting");
+        debug!("RouteOperation: no routing_key provided, broadcasting");
         RoutingDecision::Broadcast
     }
 }

@@ -785,7 +785,15 @@ pub struct SearchConfig {
     #[serde(default = "default_search_limit")]
     pub default_search_limit: usize,
 
-    /// Supervisor idle timeout in seconds before auto-commit (default: 10)
+    /// Seconds of write inactivity on an index before it is committed anyway (default: 5).
+    ///
+    /// The safety net under the operation-count threshold. Writes are committed once enough
+    /// have accumulated, which is what keeps steady ingest cheap; a trickle that never
+    /// reaches the threshold would otherwise stay uncommitted — and therefore unsearchable —
+    /// until the next write arrived. This bounds that window.
+    ///
+    /// Lower it to make small writes visible to search sooner, at the cost of more frequent
+    /// commits and the segment churn that follows.
     #[serde(default = "default_supervisor_timeout_secs")]
     pub supervisor_timeout_secs: u64,
 
@@ -798,9 +806,14 @@ pub struct SearchConfig {
     #[serde(default = "default_indexer_num_threads")]
     pub indexer_num_threads: usize,
 
-    /// Number of background merge (compaction) threads per IndexWriter (default: 1).
-    /// Tantivy default is 4, but on memory-constrained nodes with many indices
-    /// this causes mmap storms. Scale up on nodes with ample RAM.
+    /// Number of background merge (compaction) threads per IndexWriter (default: 2).
+    ///
+    /// Tantivy's own default is 4, which on memory-constrained nodes with many indices
+    /// causes mmap storms. Two rather than one leaves headroom to merge in parallel while
+    /// the node is under load, instead of serialising compaction behind a single thread.
+    ///
+    /// Note this is *per open index*, so the thread count grows with how many indices are
+    /// open, not with shard count. Scale up on nodes with ample RAM and few indices.
     #[serde(default = "default_merge_num_threads")]
     pub merge_num_threads: usize,
 }
@@ -1757,6 +1770,26 @@ mod tests {
 
         unsafe { std::env::remove_var("CAMEODB_HTTP_PORT") };
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A setting reaching the config struct is not the same as it reaching the code that
+    /// acts on it. The supervisor read `CAMEODB_SUPERVISOR_TIMEOUT_SECS` from the
+    /// environment directly, so this field was populated and then ignored — the file and the
+    /// `--supervisor-timeout-secs` flag did nothing, and only the env var appeared to work.
+    #[test]
+    fn the_supervisor_timeout_is_configurable_from_the_file() {
+        let config: CameoDbConfig = toml::from_str(
+            "[search]\n\
+             supervisor_timeout_secs = 30\n",
+        )
+        .expect("partial config");
+
+        assert_eq!(config.search.supervisor_timeout_secs, 30);
+        assert_eq!(
+            CameoDbConfig::default().search.supervisor_timeout_secs,
+            5,
+            "the documented default and the code's default have to agree"
+        );
     }
 
     /// The long-standing contract: name only what you are changing.

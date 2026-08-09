@@ -3965,7 +3965,9 @@ impl HybridStore {
         let (reader, fields) = match self.get_reader(index)? {
             Some(r) => r,
             None => {
-                warn!(index = %index, "No tantivy reader found for index");
+                // Normal for an index with no commits yet, and emitted once per shard per
+                // search — four lines for one query against an empty index at `warn`.
+                debug!(index = %index, "No tantivy reader found for index");
                 return Ok((Vec::new(), 0));
             }
         };

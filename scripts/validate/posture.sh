@@ -68,6 +68,90 @@ else
 fi
 
 status() { curl -s -o /dev/null -w '%{http_code}' -m 30 "$@"; }
+body() { curl -s -m 30 "$@"; }
+
+section "writes that grow the schema"
+# The worker pool's engine holds ArcSwap snapshots, so it can read a schema but not evolve
+# one — that needs the actor. It signals this by handing the op back, and the caller has to
+# retry it there. When that retry was missing, every write to an index with no schema (which
+# is every index on first use) came back as a 500. Nothing caught it because the rest of the
+# suite creates the schema with PUT _config before it writes.
+json='content-type: application/json'
+check_eq "a write to an index with no schema is accepted" "200" \
+    "$(status -X PUT "$BASE/api/autoschema/document" -H "$json" \
+        -d '{"id":"a1","doc":{"id":"a1","title":"first"}}')"
+
+# The actor evolves the schema and publishes it into the same ArcSwap the engine reads, so
+# the next write takes the fast path. That it also succeeds is the point: a retry that only
+# worked once would mean the schema never reached the engine.
+check_eq "the next write to that index is accepted" "200" \
+    "$(status -X PUT "$BASE/api/autoschema/document" -H "$json" \
+        -d '{"id":"a2","doc":{"id":"a2","title":"second"}}')"
+
+# A document carrying an unknown field needs the schema to grow again, mid-life this time.
+check_eq "a write that adds a new field is accepted" "200" \
+    "$(status -X PUT "$BASE/api/autoschema/document" -H "$json" \
+        -d '{"id":"a3","doc":{"id":"a3","title":"third","author":"ada"}}')"
+
+if body "$BASE/api/autoschema/_config" | grep -q '"author"'; then
+    pass "the new field reached the stored schema"
+else
+    fail "the new field reached the stored schema" "$(body "$BASE/api/autoschema/_config")"
+fi
+
+# Accepting the write is not the same as keeping it. Commit, then read one back.
+status -X POST "$BASE/_admin/index/autoschema/commit" > /dev/null
+if body -X POST "$BASE/api/autoschema/search" -H "$json" -d '{"query":"id:a1"}' \
+    | grep -q '"first"'; then
+    pass "a document written before the schema existed is retrievable"
+else
+    fail "a document written before the schema existed is retrievable" \
+        "$(body -X POST "$BASE/api/autoschema/search" -H "$json" -d '{"query":"id:a1"}')"
+fi
+
+# A tantivy schema is fixed when the index is created, so fields inferred at that moment are
+# the only ones that can ever be searchable. Leaving them non-indexed produced an index you
+# could write to and then only query by id.
+if body -X POST "$BASE/api/autoschema/search" -H "$json" -d '{"query":"title:first"}' \
+    | grep -q '"a1"'; then
+    pass "a field inferred at index creation is searchable"
+else
+    fail "a field inferred at index creation is searchable" \
+        "$(body -X POST "$BASE/api/autoschema/search" -H "$json" -d '{"query":"title:first"}')"
+fi
+
+# The other half of the rule, asserted so it stays deliberate: a field that arrives after the
+# index exists cannot be added to tantivy's schema, so it is carried for redb parity only.
+if body "$BASE/api/autoschema/_config" \
+    | grep -o '"author":{[^}]*}' | grep -q '"indexed":false'; then
+    pass "a field added after creation is carried unindexed"
+else
+    fail "a field added after creation is carried unindexed" \
+        "$(body "$BASE/api/autoschema/_config")"
+fi
+
+# Type inference samples the first 200 documents. A field that first appears past that point
+# is found by validation instead, and it is still part of the same initial creation — so it
+# has to be indexed too, or one load would produce two classes of field.
+awk 'BEGIN{
+    printf "["
+    for (i = 0; i < 250; i++) {
+        if (i) printf ","
+        printf "{\"id\":\"b%d\",\"doc\":{\"id\":\"b%d\",\"title\":\"doc %d\"", i, i, i
+        if (i >= 220) printf ",\"late\":\"past the sampling limit\""
+        printf "}}"
+    }
+    printf "]"
+}' > "$WORK/bulk.json"
+status -X POST "$BASE/api/sampled/_bulk" -H "$json" --data-binary @"$WORK/bulk.json" > /dev/null
+status -X POST "$BASE/_admin/index/sampled/commit" > /dev/null
+if body -X POST "$BASE/api/sampled/search" -H "$json" -d '{"query":"late:sampling","limit":1}' \
+    | grep -q '"total_hits":30'; then
+    pass "a field first seen past the sampling limit is still indexed"
+else
+    fail "a field first seen past the sampling limit is still indexed" \
+        "$(body "$BASE/api/sampled/_config")"
+fi
 
 section "request body limits"
 # One record over the per-record cap, delivered as a single unterminated line. This is the
@@ -186,6 +270,50 @@ if [ "$elapsed" -le 12 ]; then
 else
     fail "shutdown completed promptly" "took ${elapsed}s"
 fi
+
+section "idle-commit timeout is configurable"
+# A write is committed either once enough operations accumulate or after the index has been
+# idle for `supervisor_timeout_secs` — and until it commits, the document is not searchable.
+# A single write never reaches the operation threshold, so this measures the timeout alone.
+#
+# The setting reached the config struct for a long time and was then ignored: the supervisor
+# read CAMEODB_SUPERVISOR_TIMEOUT_SECS from the environment directly, so the config file and
+# the --supervisor-timeout-secs flag did nothing. A unit test on the config cannot catch that
+# — only starting a node and watching when the document appears can.
+sed -i.bak 's/^admin_enabled = false/admin_enabled = true/' "$WORK/node.toml"
+printf '\n[search]\nsupervisor_timeout_secs = 1\n' >> "$WORK/node.toml"
+"$BIN" --config "$WORK/node.toml" > "$WORK/server3.log" 2>&1 &
+SERVER_PID=$!
+if wait_for_http "$BASE/_cluster/health" 40; then
+    # Query an ordinary indexed field, not `id`. An `id:` lookup is answered without going
+    # through a committed tantivy segment, so it is visible immediately and would pass this
+    # check no matter what the timeout did — as it did when this was first written.
+    status -X PUT "$BASE/api/idle/document" -H "$json" \
+        -d '{"id":"i1","doc":{"id":"i1","title":"zebracrossing"}}' > /dev/null
+
+    # The window has to be tight enough to tell the configured 1s from the 5s default, or
+    # this passes whether or not the setting is honoured. 3s leaves margin over 1s and
+    # refuses 5s.
+    found=""
+    for _ in $(seq 1 12); do
+        if body -X POST "$BASE/api/idle/search" -H "$json" -d '{"query":"title:zebracrossing"}' \
+            | grep -q '"i1"'; then
+            found=yes
+            break
+        fi
+        sleep 0.25
+    done
+
+    if [ -n "$found" ]; then
+        pass "a lone write becomes searchable on the configured 1s idle timeout"
+    else
+        fail "a lone write becomes searchable on the configured 1s idle timeout" \
+            "not searchable within 3s — the configured timeout is ignored and the 5s default is in force"
+    fi
+else
+    fail "server restarts with a configured idle timeout" "$(tail -20 "$WORK/server3.log")"
+fi
+stop_server "$SERVER_PID"; SERVER_PID=""
 
 section "posture rejections"
 # The presets have to refuse the combinations they claim to refuse.

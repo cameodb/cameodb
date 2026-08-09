@@ -429,6 +429,47 @@ impl CameoClient {
             .context("Failed to parse delete index response")
     }
 
+    /// Write a single document.
+    ///
+    /// `routing_key` decides which shard owns the document; passing `None` lets the node
+    /// default it to `id`, which keeps the write a unicast to one shard rather than a
+    /// broadcast. Pass one explicitly to co-locate related documents on a shard.
+    ///
+    /// For loading many documents, prefer [`Self::bulk_index`] or
+    /// [`Self::stream_index_ndjson`] — one request per document spends most of its time on
+    /// round trips. This exists for the case where a single write is the actual operation,
+    /// and for measuring what one write costs.
+    pub async fn write_document(
+        &self,
+        index: &str,
+        id: &str,
+        doc: &JsonValue,
+        routing_key: Option<&str>,
+    ) -> Result<JsonValue> {
+        let url = self
+            .base_url
+            .join(&format!("api/{}/document", index))
+            .context("Invalid document URL")?;
+
+        let mut payload = serde_json::json!({ "id": id, "doc": doc });
+        if let Some(key) = routing_key {
+            payload["routing_key"] = JsonValue::String(key.to_string());
+        }
+
+        let resp = self.http.put(url).json(&payload).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Write failed: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
+        }
+        resp.json().await.context("Failed to parse write response")
+    }
+
     pub async fn bulk_index(&self, index: &str, batch: &[JsonValue]) -> Result<JsonValue> {
         let url = self
             .base_url
@@ -704,25 +745,55 @@ pub struct AdminIndexEvictWriterResponse {
     pub errors: Vec<ShardError>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Every field is `#[serde(default)]` on purpose. This type is deserialized from a *node*,
+/// which may be a different version than the client — a released client has to keep working
+/// against a node that has added or renamed a field, and a missing counter is better
+/// reported as zero than as a parse failure that hides the whole report.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AdminWorkersResponse {
-    pub pinned: bool,
-    pub hash_aligned: bool,
+    /// Pinned worker threads were requested and the platform could enumerate cores.
+    pub pinning_requested: bool,
+    /// Workers whose pin actually took. Zero alongside `pinning_requested` means every
+    /// request was refused — macOS, or a cpuset excluding the target cores.
+    pub pinned_workers: usize,
+    /// `worker_count` was aligned to the core budget so a worker and the writer for the
+    /// shard with the matching ordinal share a core.
+    pub core_aligned: bool,
     pub worker_count: usize,
     pub workers: Vec<WorkerStatsResponse>,
+    pub shards: Vec<ShardPlacementResponse>,
     pub dispatch: DispatchStatsResponse,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WorkerStatsResponse {
     pub id: usize,
+    /// Core this worker was asked to pin to.
+    pub target_core_id: Option<usize>,
+    /// Core it is actually pinned to; absent when the pin was refused or never requested.
     pub core_id: Option<usize>,
     pub queue_depth: usize,
     pub queue_capacity: usize,
     pub jobs_completed: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Where one shard sits in the worker pool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShardPlacementResponse {
+    pub shard_id: String,
+    /// `ordinal % worker_count` is the worker handling this shard's writes.
+    pub ordinal: usize,
+    /// False means the shard holds an ordinal but never started.
+    pub serving: bool,
+    pub target_core_id: Option<usize>,
+    pub core_id: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DispatchStatsResponse {
     pub affine_sends: u64,
     pub affine_full_fallbacks: u64,
@@ -733,6 +804,57 @@ pub struct DispatchStatsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The node's `/_admin/workers` payload, as the server serializes it today. Pinned here
+    /// because the client and the node version independently: renaming a field on the server
+    /// silently broke `cameodb admin workers` once already, and nothing noticed because the
+    /// validation suite reads that endpoint with `curl`, not with this type.
+    #[test]
+    fn the_worker_report_parses_as_the_node_sends_it() {
+        let body = serde_json::json!({
+            "pinning_requested": true,
+            "pinned_workers": 8,
+            "core_aligned": true,
+            "worker_count": 8,
+            "workers": [
+                {"id": 0, "target_core_id": 0, "core_id": 0, "queue_depth": 1,
+                 "queue_capacity": 512, "jobs_completed": 42}
+            ],
+            "shards": [
+                {"shard_id": "0d43c3c7-ef3f-4334-aef6-88a98375483a", "ordinal": 0,
+                 "serving": true, "target_core_id": 0, "core_id": 0}
+            ],
+            "dispatch": {"affine_sends": 40, "affine_full_fallbacks": 0,
+                         "round_robin_sends": 24, "actor_mailbox_fallbacks": 0}
+        });
+
+        let report: AdminWorkersResponse = serde_json::from_value(body).unwrap();
+        assert!(report.pinning_requested);
+        assert_eq!(report.pinned_workers, 8);
+        assert_eq!(report.workers[0].core_id, Some(0));
+        assert_eq!(report.shards[0].ordinal, 0);
+        assert!(report.shards[0].serving);
+        assert_eq!(report.dispatch.affine_sends, 40);
+    }
+
+    /// A node that has not pinned anything omits `core_id` entirely, and an older or newer
+    /// node may omit fields this client knows about. Neither is a parse error.
+    #[test]
+    fn a_worker_report_from_a_different_node_version_still_parses() {
+        let body = serde_json::json!({
+            "worker_count": 2,
+            "workers": [{"id": 0, "queue_depth": 0, "queue_capacity": 512,
+                         "jobs_completed": 7}],
+            "dispatch": {"round_robin_sends": 7}
+        });
+
+        let report: AdminWorkersResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(report.worker_count, 2);
+        assert!(!report.pinning_requested, "absent means not requested");
+        assert_eq!(report.workers[0].core_id, None, "absent means not pinned");
+        assert!(report.shards.is_empty());
+        assert_eq!(report.dispatch.round_robin_sends, 7);
+    }
 
     /// 43 base64url characters, the shape `cameodb keygen` produces.
     const GOOD: &str = "cameo_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";

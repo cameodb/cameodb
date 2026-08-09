@@ -53,7 +53,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+    atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
 };
 use std::time::{Duration, Instant};
 
@@ -498,12 +498,11 @@ pub fn orchestrator_remote_name(node_id: &Uuid) -> String {
 /// 1. Sample up to SCHEMA_SAMPLE_LIMIT documents (200, same as client)
 /// 2. Evolve schema incrementally using storage layer's evolve_from_document
 /// 3. Storage layer handles type compatibility and evolution rules
-/// 4. Returns merged schema with best-guess field types
+/// 4. Mark what came out of it indexed — see [`mark_initial_fields_indexed`]
 ///
 /// Usage:
 /// - Only used during initial schema creation (empty schema)
 /// - Existing schema evolution continues to use current logic
-/// - Maintains backward compatibility with existing behavior
 fn enhanced_schema_sampling(docs: &[DocPayload], sample_limit: usize) -> IndexSchema {
     let mut schema = IndexSchema::default();
     let mut sampled = 0usize;
@@ -519,6 +518,11 @@ fn enhanced_schema_sampling(docs: &[DocPayload], sample_limit: usize) -> IndexSc
         sampled += 1;
     }
 
+    // `evolve_from_document` builds fields through `FieldDef::new_non_indexed`, which is the
+    // right default for its usual caller but not here: this schema is about to *create* the
+    // tantivy index, so it is the one moment fields can still be made searchable.
+    mark_initial_fields_indexed(&mut schema);
+
     tracing::info!(
         sampled_docs = sampled,
         total_docs = docs.len(),
@@ -527,6 +531,33 @@ fn enhanced_schema_sampling(docs: &[DocPayload], sample_limit: usize) -> IndexSc
     );
 
     schema
+}
+
+/// Make every non-shadow field of a not-yet-created index searchable.
+///
+/// The split between creation and evolution is forced by tantivy, not chosen: a tantivy
+/// `Schema` is fixed at `Index::create_in_dir`, and the storage layer builds it from
+/// whatever `IndexSchema` is persisted at that moment. A field marked `indexed` after the
+/// index exists gets no field handle, so the write path skips it and the field is searchable
+/// only by rebuilding the index. Fields discovered *later* are therefore deliberately
+/// non-indexed: they exist to keep the redb and tantivy views of a document consistent.
+///
+/// Fields discovered *now* have no such excuse — this is the last moment they can be indexed
+/// at all, so they are. `stored` stays off for everything but `id`: hits are reconstructed
+/// from redb, and storing field values in tantivy as well would duplicate the corpus.
+///
+/// This is the same rule the bundled client applies before it PUTs a detected schema, which
+/// is why `cameodb data load` produces searchable indexes and a plain HTTP write did not.
+fn mark_initial_fields_indexed(schema: &mut IndexSchema) {
+    for (name, field_def) in schema.fields.iter_mut() {
+        // Shadow fields preserve an original field name for query mapping and are never
+        // indexed or stored — leave them exactly as they are.
+        if field_def.is_shadow {
+            continue;
+        }
+        field_def.indexed = true;
+        field_def.stored = name == "id";
+    }
 }
 
 // ============================================================================
@@ -614,19 +645,24 @@ pub struct NodeConfig {
     pub default_batch_size: usize,
     /// Number of indexing worker threads per tantivy IndexWriter (default: 1)
     pub indexer_num_threads: usize,
-    /// Number of background merge (compaction) threads per IndexWriter (default: 1)
+    /// Number of background merge (compaction) threads per IndexWriter (default: 2)
     pub merge_num_threads: usize,
     /// Timeout in seconds for writer thread to drain pending commands during shutdown
     /// Increased from 10s to 30s to handle large coalesced batches
     pub writer_shutdown_timeout_secs: u64,
-    /// Pin per-shard writer threads to a CPU core derived from `xxh3(shard_id) % num_cores`.
+    /// Seconds of write inactivity on an index before its supervisor commits it.
+    ///
+    /// The safety net under the operation-count threshold: writes that stop short of the
+    /// threshold would otherwise sit uncommitted and unsearchable until the next write.
+    pub supervisor_timeout_secs: u64,
+    /// Pin per-shard writer threads to the core given by the shard's dense ordinal.
     /// Improves cache locality and reduces cross-core wakeups under heavy write load.
     /// Default: false (no pinning, OS scheduler decides).
     pub writer_core_affinity: bool,
     /// Enable shard-affine worker dispatch (default: false).
     /// When enabled, operations targeting the same shard are routed to the same
-    /// orchestrator worker via `xxh3(shard_id) % worker_count`, reducing cross-core
-    /// wakeups when writer pinning is also enabled.
+    /// orchestrator worker via the shard's ordinal, reducing cross-core wakeups when
+    /// writer pinning is also enabled.
     pub shard_affine_dispatch: bool,
 
     /// Pin orchestrator worker tasks to CPU cores as dedicated OS threads (Stage 2e).
@@ -652,6 +688,7 @@ impl Default for NodeConfig {
             indexer_num_threads: 1,
             merge_num_threads: 2,
             writer_shutdown_timeout_secs: 30,
+            supervisor_timeout_secs: 5,
             writer_core_affinity: true,
             shard_affine_dispatch: false,
             worker_core_affinity: false,
@@ -927,6 +964,32 @@ pub enum StorageCommand {
     Shutdown,
 }
 
+/// What a worker did with an op.
+///
+/// The engine cannot serve every op — schema evolution and bulk writes need `&mut
+/// NodeOrchestrator`. Rather than signalling that with a sentinel error, which leaves the
+/// caller holding nothing to retry with, [`WorkerOutcome::UseActor`] sends the op itself
+/// home. The caller moved the op into the job, so this is the only way it can get it back
+/// without cloning every document on the way in.
+pub enum WorkerOutcome {
+    /// The engine handled it. Success or failure, this is the client's answer.
+    Done(Result<JsonValue, OrchestratorError>),
+    /// The engine declined; retry this op on the actor mailbox.
+    UseActor(Box<ClientOp>),
+}
+
+/// The engine's verdict on a single write, before it becomes a [`WorkerOutcome`].
+enum WriteOutcome {
+    Done(JsonValue),
+    /// The schema has to grow first. Carries back the parts of `ClientOp::Write` that
+    /// `engine_write` consumed, so `execute` can rebuild the op — `index` it still owns.
+    NeedsActor {
+        id: String,
+        routing_key: Option<String>,
+        doc: JsonValue,
+    },
+}
+
 /// A job dispatched to the orchestrator worker pool.
 /// Workers execute the operation on shared state and send the result
 /// back via the oneshot channel, bypassing the actor mailbox.
@@ -937,7 +1000,7 @@ pub enum OrchestratorJob {
         /// a worker determined by `xxh3(shard_id) % worker_count`. Passed to
         /// `engine.execute()` so `engine_write` can skip the redundant ring lookup.
         affinity_shard: Option<Uuid>,
-        reply: tokio::sync::oneshot::Sender<Result<JsonValue, OrchestratorError>>,
+        reply: tokio::sync::oneshot::Sender<WorkerOutcome>,
     },
     Shutdown,
 }
@@ -945,6 +1008,200 @@ pub enum OrchestratorJob {
 /// Shared worker loop body used by both the default tokio-task spawn and the
 /// pinned OS-thread spawn (Stage 2e). Exits cleanly when receiving `Shutdown`
 /// or when the channel is closed.
+/// The cores this process may actually use, resolved once at startup.
+///
+/// Two sources disagree, and both matter. `core_affinity::get_core_ids()` enumerates the
+/// cores a thread can be pinned to; `available_parallelism()` respects a cgroup CPU quota
+/// that pinning cannot see. Under `docker --cpus=4` on a 32-core host the first reports 32
+/// and the second 4 — and the worker pool used to size itself from one while writer pinning
+/// indexed into the other, so the co-location the whole design exists for quietly stopped
+/// holding. Resolving both here once means every placement decision counts the same cores.
+#[derive(Clone, Debug)]
+pub struct CoreLayout {
+    /// How many cores this process may use. Sizes the worker pool, and is meaningful even
+    /// where pinning is unsupported.
+    budget: usize,
+    /// Cores that can actually be pinned to, capped to `budget`. Empty when the platform
+    /// cannot enumerate them, in which case every pinning path degrades to unpinned.
+    cores: Vec<core_affinity::CoreId>,
+}
+
+impl CoreLayout {
+    fn detect() -> Self {
+        let budget = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1);
+        let mut cores = core_affinity::get_core_ids().unwrap_or_default();
+        // A quota-limited process is told it has fewer cores than it can see. Honour the
+        // smaller number: pinning threads across cores the scheduler will not give us time
+        // on spreads the work without spreading the CPU.
+        cores.truncate(budget);
+        Self { budget, cores }
+    }
+
+    /// Cores available for sizing decisions.
+    fn budget(&self) -> usize {
+        self.budget
+    }
+
+    /// The core an ordinal maps to, or `None` when pinning is unavailable here.
+    fn core_for(&self, ordinal: usize) -> Option<core_affinity::CoreId> {
+        if self.cores.is_empty() {
+            None
+        } else {
+            Some(self.cores[ordinal % self.cores.len()])
+        }
+    }
+
+    fn pinning_available(&self) -> bool {
+        !self.cores.is_empty()
+    }
+}
+
+/// Dense, stable placement of this node's shards.
+///
+/// A shard is given an ordinal the first time it appears and keeps it for the life of the
+/// process. That ordinal — not `xxh3(shard_id)` — chooses both the worker that handles the
+/// shard's writes and the core its writer thread is pinned to, which is what makes the two
+/// agree.
+///
+/// Hashing was the original scheme and it collides: the hash domain is the shard set, which
+/// is smaller than the core count. Measured with the shipped defaults — 4 shards, 8 cores —
+/// 40 affine writes reached 3 of 8 workers, five of them idle by construction. Ordinals
+/// reach exactly `min(shards, workers)`, which is the real ceiling anyway: each shard has
+/// one writer thread that serialises its writes, so a shard cannot use more than one worker
+/// no matter how the mapping is drawn.
+///
+/// Ordinals are assigned in the order shards appear rather than by sorting the set, because
+/// a writer thread pins itself when its shard starts. Re-sorting on every membership change
+/// would leave already-pinned writers on cores that no longer match their worker.
+#[derive(Clone, Debug, Default)]
+pub struct ShardPlacement {
+    slots: HashMap<Uuid, ShardSlot>,
+    /// Shards actually serving on this node. A superset relationship with `slots` is the
+    /// point: an ordinal is handed out before a shard starts, because its writer thread pins
+    /// itself as it spawns, but the shard only becomes routable once it is in the shard map.
+    /// A shard that fails to hydrate, or that the `max_shards` cap turns away, keeps its
+    /// ordinal and never becomes live — claiming it locally would route writes to a shard
+    /// this node cannot serve.
+    live: HashSet<Uuid>,
+    next: usize,
+}
+
+/// A shard's place in the pool, and where its writer thread actually ended up.
+#[derive(Clone, Debug)]
+struct ShardSlot {
+    ordinal: usize,
+    /// Core the writer thread was asked to take. `None` when pinning is off or the platform
+    /// cannot enumerate cores.
+    target_core: Option<usize>,
+    /// Core the writer thread reports it is running on, or [`UNPINNED`] if the request was
+    /// refused. Shared with the thread, which writes it once at startup — a request is not
+    /// an outcome, and on macOS every request is refused.
+    pinned_core: Arc<AtomicI64>,
+}
+
+/// `pinned_core` sentinel: this thread is not pinned to anything.
+const UNPINNED: i64 = -1;
+
+/// What a shard's writer thread should pin to, and where it reports what happened.
+#[derive(Clone, Debug)]
+pub struct WriterPin {
+    target: Option<core_affinity::CoreId>,
+    outcome: Arc<AtomicI64>,
+}
+
+impl WriterPin {
+    /// Pin the calling thread, and record where it actually landed.
+    fn apply(&self, shard_id: Uuid) {
+        let Some(target) = self.target else {
+            return;
+        };
+        if core_affinity::set_for_current(target) {
+            self.outcome
+                .store(target.id as i64, AtomicOrdering::Relaxed);
+            info!(
+                shard_id = %shard_id,
+                core_id = target.id,
+                "Writer thread pinned to CPU core"
+            );
+        } else if cfg!(target_os = "macos") {
+            // `set_for_current` is a no-op on macOS; not a fault worth warning on.
+            info!(
+                shard_id = %shard_id,
+                core_id = target.id,
+                "CPU pinning not supported on macOS; writer thread continuing unpinned"
+            );
+        } else {
+            warn!(
+                shard_id = %shard_id,
+                core_id = target.id,
+                "Failed to pin writer thread to CPU core (continuing unpinned)"
+            );
+        }
+    }
+}
+
+impl ShardPlacement {
+    /// Give `shard` its slot, or return the one it already has.
+    ///
+    /// Idempotent on purpose: a shard that starts twice keeps the core its writer already
+    /// pinned to, and keeps reporting through the same cell.
+    fn assign(&mut self, shard: Uuid, layout: &CoreLayout, pin_writers: bool) -> ShardSlot {
+        if let Some(slot) = self.slots.get(&shard) {
+            return slot.clone();
+        }
+        let ordinal = self.next;
+        self.next += 1;
+        let target_core = pin_writers.then(|| layout.core_for(ordinal)).flatten();
+        let slot = ShardSlot {
+            ordinal,
+            target_core: target_core.map(|core| core.id),
+            pinned_core: Arc::new(AtomicI64::new(UNPINNED)),
+        };
+        self.slots.insert(shard, slot.clone());
+        slot
+    }
+
+    /// Mark a shard as serving. Called once it is in the shard map and can take work.
+    fn activate(&mut self, shard: Uuid) {
+        self.live.insert(shard);
+    }
+
+    fn ordinal(&self, shard: &Uuid) -> Option<usize> {
+        self.slots.get(shard).map(|slot| slot.ordinal)
+    }
+
+    /// Whether this node serves the shard. The routing ring names a shard for a key; this
+    /// answers whether that shard lives here, which is the whole of a local routing
+    /// decision.
+    fn is_local(&self, shard: &Uuid) -> bool {
+        self.live.contains(shard)
+    }
+
+    /// Per-shard placement for `/_admin/workers`, ordered by ordinal so the report reads as
+    /// the pool is laid out.
+    fn report(&self) -> Vec<ShardPlacementStats> {
+        let mut shards: Vec<ShardPlacementStats> = self
+            .slots
+            .iter()
+            .map(|(shard_id, slot)| ShardPlacementStats {
+                shard_id: shard_id.to_string(),
+                ordinal: slot.ordinal,
+                serving: self.live.contains(shard_id),
+                target_core_id: slot.target_core,
+                core_id: match slot.pinned_core.load(AtomicOrdering::Relaxed) {
+                    UNPINNED => None,
+                    core => Some(core as usize),
+                },
+            })
+            .collect();
+        shards.sort_by_key(|shard| shard.ordinal);
+        shards
+    }
+}
+
 async fn orchestrator_worker_loop(
     mut rx: mpsc::Receiver<OrchestratorJob>,
     engine: Arc<OrchestratorEngine>,
@@ -982,12 +1239,25 @@ async fn orchestrator_worker_loop(
 }
 
 /// Per-worker atomic counters — updated on the send and receive hot paths.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct WorkerCounters {
     /// Current number of jobs waiting in this worker's mpsc channel.
     queue_depth: AtomicUsize,
     /// Total jobs completed by this worker since startup.
     jobs_completed: AtomicU64,
+    /// Core this worker is actually pinned to, or [`UNPINNED`]. Written once by the worker
+    /// thread itself, because only it can find out whether the pin was accepted.
+    pinned_core: AtomicI64,
+}
+
+impl Default for WorkerCounters {
+    fn default() -> Self {
+        Self {
+            queue_depth: AtomicUsize::new(0),
+            jobs_completed: AtomicU64::new(0),
+            pinned_core: AtomicI64::new(UNPINNED),
+        }
+    }
 }
 
 /// Dispatch-level counters across the entire worker pool.
@@ -1007,11 +1277,34 @@ struct DispatchCounters {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerStats {
     pub id: usize,
+    /// Core this worker was asked to pin to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_core_id: Option<usize>,
+    /// Core it is actually pinned to. Absent when the pin was refused or never requested —
+    /// the two are not the same thing, and only this one is evidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub core_id: Option<usize>,
     pub queue_depth: usize,
     pub queue_capacity: usize,
     pub jobs_completed: u64,
+}
+
+/// Where one shard sits in the pool, for the `/_admin/workers` endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardPlacementStats {
+    pub shard_id: String,
+    /// Dense ordinal. `ordinal % worker_count` is the worker that handles this shard's
+    /// writes, which is what makes worker and writer land together.
+    pub ordinal: usize,
+    /// Whether the shard started and is taking work. False means it holds an ordinal but
+    /// failed to hydrate.
+    pub serving: bool,
+    /// Core this shard's writer thread was asked to pin to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_core_id: Option<usize>,
+    /// Core the writer thread is actually pinned to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core_id: Option<usize>,
 }
 
 /// Snapshot of the dispatch counters for the `/_admin/workers` endpoint.
@@ -1026,10 +1319,19 @@ pub struct DispatchStats {
 /// Full worker pool report returned by `GET /_admin/workers`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerPoolReport {
-    pub pinned: bool,
-    pub hash_aligned: bool,
+    /// Config asked for pinned worker threads and the platform could enumerate cores.
+    pub pinning_requested: bool,
+    /// Workers whose pin actually took. Zero alongside `pinning_requested` means the
+    /// platform refused every one — macOS, or a cpuset that excludes the target cores.
+    /// This field, not `pinning_requested`, is the evidence that pinning is in effect.
+    pub pinned_workers: usize,
+    /// `worker_count` was aligned to the core budget so worker `i` and the writer for the
+    /// shard with ordinal `i` share a core.
+    pub core_aligned: bool,
     pub worker_count: usize,
     pub workers: Vec<WorkerStats>,
+    /// Per-shard placement: ordinal, requested core, and the core actually taken.
+    pub shards: Vec<ShardPlacementStats>,
     pub dispatch: DispatchStats,
 }
 
@@ -1048,12 +1350,15 @@ pub struct OrchestratorWorkerTx {
     dispatch_stats: Arc<DispatchCounters>,
     /// Per-worker channel capacity (same for all workers).
     per_worker_queue_capacity: usize,
-    /// Whether workers are pinned to dedicated OS threads.
-    pinned: bool,
-    /// Whether worker_count was aligned to num_cores for hash co-location.
-    hash_aligned: bool,
-    /// Core IDs used for pinning (empty if not pinned).
-    core_ids: Vec<core_affinity::CoreId>,
+    /// Whether pinned worker threads were requested and the platform could enumerate
+    /// cores. Whether they took is per-thread, and lives in `WorkerCounters::pinned_core`.
+    pinning_requested: bool,
+    /// Whether worker_count was aligned to the core budget for writer co-location.
+    core_aligned: bool,
+    /// Core layout used for pinning and for reporting which core a worker sits on.
+    core_layout: CoreLayout,
+    /// Shard ordinals — the map from a shard to the worker that owns its writes.
+    placement: Arc<ArcSwap<ShardPlacement>>,
 }
 
 impl OrchestratorWorkerTx {
@@ -1061,9 +1366,10 @@ impl OrchestratorWorkerTx {
         workers: Vec<mpsc::Sender<OrchestratorJob>>,
         worker_stats: Arc<Vec<Arc<WorkerCounters>>>,
         per_worker_queue_capacity: usize,
-        pinned: bool,
-        hash_aligned: bool,
-        core_ids: Vec<core_affinity::CoreId>,
+        pinning_requested: bool,
+        core_aligned: bool,
+        core_layout: CoreLayout,
+        placement: Arc<ArcSwap<ShardPlacement>>,
     ) -> Self {
         Self {
             workers: Arc::new(workers),
@@ -1071,9 +1377,10 @@ impl OrchestratorWorkerTx {
             worker_stats,
             dispatch_stats: Arc::new(DispatchCounters::default()),
             per_worker_queue_capacity,
-            pinned,
-            hash_aligned,
-            core_ids,
+            pinning_requested,
+            core_aligned,
+            core_layout,
+            placement,
         }
     }
 
@@ -1136,16 +1443,16 @@ impl OrchestratorWorkerTx {
             return Err(Box::new(mpsc::error::TrySendError::Closed(job)));
         }
 
-        let is_affine = shard_id.is_some();
-        let start = match shard_id {
-            Some(sid) => {
-                // Deterministic worker selection: same shard → same worker
-                (xxh3_64(sid.as_bytes()) as usize) % self.workers.len()
-            }
-            None => {
-                // No affinity hint — fall back to round-robin
-                self.next_worker.fetch_add(1, AtomicOrdering::Relaxed)
-            }
+        // Deterministic worker selection: same shard → same worker, via the shard's dense
+        // ordinal. A shard with no ordinal is one this node does not own — nothing to be
+        // affine to — so it round-robins like an unkeyed job.
+        let affine_start = shard_id
+            .and_then(|sid| self.placement.load().ordinal(&sid))
+            .map(|ordinal| ordinal % self.workers.len());
+        let is_affine = affine_start.is_some();
+        let start = match affine_start {
+            Some(start) => start,
+            None => self.next_worker.fetch_add(1, AtomicOrdering::Relaxed),
         };
 
         let mut saw_full = false;
@@ -1211,19 +1518,24 @@ impl OrchestratorWorkerTx {
 
     /// Produce a snapshot of all worker and dispatch counters for `/_admin/workers`.
     pub fn snapshot(&self) -> WorkerPoolReport {
-        let core_ids_slice: &[core_affinity::CoreId] = &self.core_ids;
-        let workers = self
+        let workers: Vec<WorkerStats> = self
             .worker_stats
             .iter()
             .enumerate()
             .map(|(id, counters)| {
-                let core_id = if core_ids_slice.is_empty() {
-                    None
-                } else {
-                    Some(core_ids_slice[id % core_ids_slice.len()].id)
+                // What was asked for, and what the thread reports it got. They differ
+                // wherever `set_for_current` is refused, which is every call on macOS.
+                let target_core_id = self
+                    .pinning_requested
+                    .then(|| self.core_layout.core_for(id).map(|core| core.id))
+                    .flatten();
+                let core_id = match counters.pinned_core.load(AtomicOrdering::Relaxed) {
+                    UNPINNED => None,
+                    core => Some(core as usize),
                 };
                 WorkerStats {
                     id,
+                    target_core_id,
                     core_id,
                     queue_depth: counters.queue_depth.load(AtomicOrdering::Relaxed),
                     queue_capacity: self.per_worker_queue_capacity,
@@ -1231,6 +1543,10 @@ impl OrchestratorWorkerTx {
                 }
             })
             .collect();
+        let pinned_workers = workers
+            .iter()
+            .filter(|worker| worker.core_id.is_some())
+            .count();
 
         let dispatch = DispatchStats {
             affine_sends: self
@@ -1252,10 +1568,12 @@ impl OrchestratorWorkerTx {
         };
 
         WorkerPoolReport {
-            pinned: self.pinned,
-            hash_aligned: self.hash_aligned,
+            pinning_requested: self.pinning_requested,
+            pinned_workers,
+            core_aligned: self.core_aligned,
             worker_count: self.workers.len(),
             workers,
+            shards: self.placement.load().report(),
             dispatch,
         }
     }
@@ -1394,34 +1712,48 @@ impl OrchestratorEngine {
     }
 
     /// Execute a ClientOp on the shared engine state.
-    /// Returns `Ok(result)` for ops handled by the engine, or an error
-    /// with `ErrorKind::Unsupported` for ops that must go through the actor mailbox.
+    ///
+    /// The engine holds `ArcSwap` snapshots, so it can read a schema but never evolve one —
+    /// that needs `&mut NodeOrchestrator` for `staged_schema_validation`. Anything it cannot
+    /// serve comes back as [`WorkerOutcome::UseActor`] **carrying the op**, so the caller can
+    /// retry it on the actor. Handing the op back rather than signalling with an error is
+    /// what keeps the fast path free of a defensive clone: on the path that succeeds, the
+    /// document moves into the `WriteRequest`; on the path that defers, it moves into the
+    /// reconstructed op. Neither copies.
     ///
     /// `affinity_shard` is a pre-resolved shard hint from shard-affine dispatch.
     /// When `Some`, `engine_write` skips the redundant ring lookup.
-    pub async fn execute(
-        &self,
-        op: ClientOp,
-        affinity_shard: Option<Uuid>,
-    ) -> Result<JsonValue, OrchestratorError> {
+    pub async fn execute(&self, op: ClientOp, affinity_shard: Option<Uuid>) -> WorkerOutcome {
         match op {
             ClientOp::Write {
                 index,
                 id,
                 routing_key,
                 doc,
-            } => {
-                self.engine_write(&index, id, routing_key, doc, affinity_shard)
-                    .await
-            }
-            ClientOp::BulkWrite { index, docs } => self.engine_bulk_write(&index, docs).await,
+            } => match self
+                .engine_write(&index, id, routing_key, doc, affinity_shard)
+                .await
+            {
+                Ok(WriteOutcome::Done(value)) => WorkerOutcome::Done(Ok(value)),
+                Ok(WriteOutcome::NeedsActor {
+                    id,
+                    routing_key,
+                    doc,
+                }) => WorkerOutcome::UseActor(Box::new(ClientOp::Write {
+                    index,
+                    id,
+                    routing_key,
+                    doc,
+                })),
+                Err(err) => WorkerOutcome::Done(Err(err)),
+            },
             ClientOp::Search {
                 index,
                 query,
                 limit,
                 fields,
                 sort,
-            } => {
+            } => WorkerOutcome::Done(
                 self.engine_search(
                     &index,
                     &query,
@@ -1429,8 +1761,8 @@ impl OrchestratorEngine {
                     fields.as_deref(),
                     sort.as_ref(),
                 )
-                .await
-            }
+                .await,
+            ),
             ClientOp::Stream {
                 index,
                 query,
@@ -1439,29 +1771,31 @@ impl OrchestratorEngine {
                 sort,
             } => {
                 let search_limit = limit.unwrap_or(self.default_search_limit);
-                self.engine_search(
-                    &index,
-                    &query,
-                    search_limit,
-                    fields.as_deref(),
-                    sort.as_ref(),
+                WorkerOutcome::Done(
+                    self.engine_search(
+                        &index,
+                        &query,
+                        search_limit,
+                        fields.as_deref(),
+                        sort.as_ref(),
+                    )
+                    .await,
                 )
-                .await
             }
-            // Config/metadata ops are lightweight — route through actor mailbox
-            _ => Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Operation not supported by worker pool; use actor mailbox",
-            ))),
+            // Bulk writes need `staged_schema_validation`, parallel routing and remote
+            // forwarding; config and metadata ops are lightweight and rare. Both belong on
+            // the actor, which owns the state they touch.
+            other => WorkerOutcome::UseActor(Box::new(other)),
         }
     }
 
     /// Fast-path single document write.
     ///
-    /// Handles the common case where the schema is mature (no evolution needed):
-    /// validates the document, routes to the correct shard, and dispatches the write.
-    /// For schema evolution (rare), returns `ErrorKind::Unsupported` so the caller
-    /// can fall back to the actor mailbox which has access to `staged_schema_validation`.
+    /// Handles the case where the schema already covers the document: validates it, routes
+    /// it to the correct shard and dispatches the write. When the schema has to grow —
+    /// a new index, or a document carrying a field the schema does not know — returns
+    /// [`WriteOutcome::NeedsActor`] holding the parts of the op back, since evolution needs
+    /// `staged_schema_validation` and therefore `&mut NodeOrchestrator`.
     async fn engine_write(
         &self,
         index: &str,
@@ -1469,7 +1803,7 @@ impl OrchestratorEngine {
         routing_key: Option<String>,
         doc: JsonValue,
         affinity_shard: Option<Uuid>,
-    ) -> Result<JsonValue, OrchestratorError> {
+    ) -> Result<WriteOutcome, OrchestratorError> {
         let shards = self.shards.load();
         if shards.is_empty() {
             return Err(OrchestratorError::Io(std::io::Error::new(
@@ -1540,40 +1874,24 @@ impl OrchestratorEngine {
                 };
 
                 return match shard.handle_write(req).await {
-                    Ok(seq) => Ok(serde_json::json!({
+                    Ok(seq) => Ok(WriteOutcome::Done(serde_json::json!({
                         "id": id, "result": "created", "version": seq,
                         "shard_id": target.to_string()
-                    })),
+                    }))),
                     Err(e) => Err(e),
                 };
             }
-            // needs_evolution == true: fall back to actor mailbox
+            // needs_evolution == true: fall through and hand the op back.
         }
 
-        // Slow path: schema evolution needed — signal caller to use actor mailbox
-        Err(OrchestratorError::Io(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "SCHEMA_EVOLUTION_NEEDED",
-        )))
-    }
-
-    /// Bulk write via the engine.
-    ///
-    /// Bulk writes involve complex schema validation, parallel routing, remote forwarding,
-    /// and parallel shard processing. These are delegated to the actor mailbox which has
-    /// access to the full `NodeOrchestrator` state.
-    async fn engine_bulk_write(
-        &self,
-        _index: &str,
-        _docs: Vec<DocPayload>,
-    ) -> Result<JsonValue, OrchestratorError> {
-        // Bulk writes require staged_schema_validation, parallel_local_shard_processing,
-        // and remote forwarding — all of which need full NodeOrchestrator access.
-        // Signal caller to route through actor mailbox.
-        Err(OrchestratorError::Io(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "BULK_WRITE_USE_ACTOR",
-        )))
+        // The schema is empty (a new index) or the document carries fields it does not
+        // describe. Either way this write has to grow the schema, which only the actor can
+        // do — give the caller back everything it needs to retry there.
+        Ok(WriteOutcome::NeedsActor {
+            id,
+            routing_key,
+            doc,
+        })
     }
 
     /// Parallel scatter-gather search across all local shards.
@@ -1736,8 +2054,13 @@ pub struct MicroshardActor {
     total_shards: usize,
     /// Writer thread shutdown timeout in seconds.
     writer_shutdown_timeout_secs: u64,
-    /// Pin the per-shard writer thread to a deterministic CPU core for cache locality.
-    writer_core_affinity: bool,
+    /// Seconds of write inactivity before this shard's supervisor commits an index.
+    supervisor_timeout_secs: u64,
+    /// Where this shard's writer thread should pin, resolved from the shard's ordinal by the
+    /// orchestrator, plus the cell the thread reports its actual core through. Resolving the
+    /// target upstream is what keeps a writer on the same core as the worker that feeds it:
+    /// both come from one ordinal and one layout.
+    writer_pin: WriterPin,
 }
 
 impl std::fmt::Debug for MicroshardActor {
@@ -1751,16 +2074,38 @@ impl std::fmt::Debug for MicroshardActor {
     }
 }
 
+/// What a shard needs to know about the node it is part of.
+///
+/// Grouped rather than passed as five more positional arguments: they are all decided by the
+/// orchestrator at spawn time, they travel together, and at the call site
+/// `ShardRuntime { supervisor_timeout_secs, .. }` says what it is where a bare `5` would not.
+#[derive(Clone, Debug)]
+pub struct ShardRuntime {
+    /// Hits returned when a query names no limit.
+    pub default_search_limit: usize,
+    /// The shared read pool. `None` falls back to tokio's generic blocking pool.
+    pub read_pool_handle: Option<tokio::runtime::Handle>,
+    /// Shards on this node, for per-shard memory budgeting.
+    pub total_shards: usize,
+    /// How long to let the writer thread drain on shutdown.
+    pub writer_shutdown_timeout_secs: u64,
+    /// Write inactivity before an index is committed anyway.
+    pub supervisor_timeout_secs: u64,
+    /// Where the writer thread pins, and where it reports what happened.
+    pub writer_pin: WriterPin,
+}
+
 impl MicroshardActor {
-    pub fn new(
-        shard_id: Uuid,
-        storage_config: StorageConfig,
-        default_search_limit: usize,
-        read_pool_handle: Option<tokio::runtime::Handle>,
-        total_shards: usize,
-        writer_shutdown_timeout_secs: u64,
-        writer_core_affinity: bool,
-    ) -> Self {
+    pub fn new(shard_id: Uuid, storage_config: StorageConfig, runtime: ShardRuntime) -> Self {
+        let ShardRuntime {
+            default_search_limit,
+            read_pool_handle,
+            total_shards,
+            writer_shutdown_timeout_secs,
+            supervisor_timeout_secs,
+            writer_pin,
+        } = runtime;
+
         Self {
             shard_id,
             store: None,
@@ -1773,7 +2118,8 @@ impl MicroshardActor {
             read_pool_handle,
             total_shards,
             writer_shutdown_timeout_secs,
-            writer_core_affinity,
+            supervisor_timeout_secs,
+            writer_pin,
         }
     }
 
@@ -1894,60 +2240,17 @@ impl MicroshardActor {
         let writer_store = store_arc;
         let shutdown = self.shutdown_notify.clone();
         let writer_shard_id = self.shard_id;
-        let pin_core = self.writer_core_affinity;
+        let writer_pin = self.writer_pin.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("writer-shard-{}", writer_shard_id))
             .spawn(move || {
-                // Optionally pin this writer thread to a deterministic CPU core
-                // derived from `xxh3(shard_id) % num_cores`. This improves cache
-                // locality for redb/tantivy data structures and reduces cross-core
-                // wakeups on the write hot path.
-                if pin_core {
-                    if let Some(core_ids) = core_affinity::get_core_ids()
-                        && !core_ids.is_empty()
-                    {
-                        let hash = xxh3_64(writer_shard_id.as_bytes()) as usize;
-                        let core_idx = hash % core_ids.len();
-                        let target = core_ids[core_idx];
-                        if core_affinity::set_for_current(target) {
-                            info!(
-                                shard_id = %writer_shard_id,
-                                core_id = target.id,
-                                num_cores = core_ids.len(),
-                                "Writer thread pinned to CPU core"
-                            );
-                        } else {
-                            // CPU pinning is not supported on macOS, so log as info instead of warn
-                            if cfg!(target_os = "macos") {
-                                info!(
-                                    shard_id = %writer_shard_id,
-                                    core_id = target.id,
-                                    "CPU pinning not supported on macOS; writer thread continuing unpinned"
-                                );
-                            } else {
-                                warn!(
-                                    shard_id = %writer_shard_id,
-                                    core_id = target.id,
-                                    "Failed to pin writer thread to CPU core (continuing unpinned)"
-                                );
-                            }
-                        }
-                    } else {
-                        // CPU pinning is not supported on macOS, so log as info instead of warn
-                        if cfg!(target_os = "macos") {
-                            info!(
-                                shard_id = %writer_shard_id,
-                                "CPU pinning not supported on macOS; writer thread continuing unpinned"
-                            );
-                        } else {
-                            warn!(
-                                shard_id = %writer_shard_id,
-                                "core_affinity::get_core_ids() returned None/empty; writer thread unpinned"
-                            );
-                        }
-                    }
-                }
+                // Pin to the core the orchestrator picked from this shard's ordinal — the
+                // same ordinal that chooses the worker feeding this thread, so the two land
+                // together. Improves cache locality for the redb and tantivy structures this
+                // thread owns, and removes a cross-core wakeup per write. Reports back
+                // whether it took, so `/_admin/workers` can show the outcome.
+                writer_pin.apply(writer_shard_id);
 
                 info!(shard_id = %writer_shard_id, "Writer thread started (write coalescing enabled)");
 
@@ -2480,12 +2783,13 @@ impl MicroshardActor {
             // Larger buffer to avoid dropping reset signals during bursts
             let (tx, mut rx) = mpsc::channel(64);
             let index_clone = index.clone();
-            // Read supervisor timeout from environment variable or use default
-            let supervisor_timeout_secs = std::env::var("CAMEODB_SUPERVISOR_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5); // Default to 5 seconds
-            let timeout_dur = Duration::from_secs(supervisor_timeout_secs); // Configurable timeout to allow batch processing to complete
+            // From the node config. This used to read `CAMEODB_SUPERVISOR_TIMEOUT_SECS`
+            // directly, which meant `[search] supervisor_timeout_secs` in a config file and
+            // `--supervisor-timeout-secs` on the command line were both silently ignored —
+            // the environment variable worked only because it bypassed the config system
+            // entirely. The config layer still maps that variable onto this field, so the
+            // env var keeps working; the file and the flag now work too.
+            let timeout_dur = Duration::from_secs(self.supervisor_timeout_secs);
             let supervisors_arc = self.supervisors.clone();
 
             tokio::spawn(async move {
@@ -2817,6 +3121,9 @@ pub struct RouterActor {
     remote_peer_pool: Arc<RemotePeerPool>,
     /// Shard-affine dispatch configuration and shared routing ring.
     shard_affine: ShardAffineConfig,
+    /// This node's shards, published lock-free. Lets a keyed operation be recognised as
+    /// local without asking the coordinator — see `route_and_handle`.
+    placement: Arc<ArcSwap<ShardPlacement>>,
 }
 
 /// Configuration for shard-affine worker dispatch.
@@ -2861,6 +3168,7 @@ impl RouterActor {
         worker_tx: Option<OrchestratorWorkerTx>,
         remote_peer_pool: Arc<RemotePeerPool>,
         shard_affine: ShardAffineConfig,
+        placement: Arc<ArcSwap<ShardPlacement>>,
     ) -> Self {
         Self {
             orchestrator,
@@ -2876,6 +3184,7 @@ impl RouterActor {
             worker_tx,
             remote_peer_pool,
             shard_affine,
+            placement,
         }
     }
 
@@ -2928,22 +3237,11 @@ impl RouterActor {
                     Ok(()) => {
                         // Await worker result
                         return match reply_rx.await {
-                            Ok(result) => {
-                                // Check if engine signaled fallback to actor
-                                if let Err(OrchestratorError::Io(io_err)) = &result
-                                    && io_err.kind() == std::io::ErrorKind::Unsupported
-                                {
-                                    let msg = io_err.to_string();
-                                    if msg == "SCHEMA_EVOLUTION_NEEDED"
-                                        || msg == "BULK_WRITE_USE_ACTOR"
-                                    {
-                                        return Err(OrchestratorError::Io(std::io::Error::other(
-                                            "Schema evolution required; retry via actor",
-                                        )));
-                                    }
-                                }
-                                result
-                            }
+                            Ok(WorkerOutcome::Done(result)) => result,
+                            // The engine declined and handed the op back. Retrying it here
+                            // is the whole point of the fast/slow split: the actor owns the
+                            // `&mut` state that schema evolution and bulk writes need.
+                            Ok(WorkerOutcome::UseActor(op)) => self.ask_orchestrator(*op).await,
                             Err(_) => Err(OrchestratorError::Io(std::io::Error::other(
                                 "Worker dropped reply channel",
                             ))),
@@ -3041,6 +3339,21 @@ impl RouterActor {
         }
     }
 
+    /// Answer "this node owns the key" from published state, or `None` to ask the
+    /// coordinator.
+    ///
+    /// Deliberately conservative: it returns `Some` only for a key whose owning shard is on
+    /// this node. An unkeyed operation is a scatter-gather whose answer depends on how many
+    /// nodes are in the cluster, which is the coordinator's to know, so it is left alone.
+    fn resolve_local(&self, routing_key: Option<&str>) -> Option<RoutingDecision> {
+        let key = routing_key?;
+        let shard = self.shard_affine.routing_ring.load().get_owner(key)?;
+        self.placement
+            .load()
+            .is_local(&shard)
+            .then_some(RoutingDecision::Local)
+    }
+
     /// Route via ClusterCoordinator then handle locally (remote/broadcast stubbed).
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn route_and_handle(
@@ -3063,13 +3376,27 @@ impl RouterActor {
         // remote, streaming-buffered), so strip that metadata here before returning.
         let is_search = matches!(op, ClientOp::Search { .. } | ClientOp::Stream { .. });
 
-        let decision = self
-            .coordinator
-            .ask(RouteOperation {
-                routing_key,
-                operation_type,
-            })
-            .await;
+        // Resolve locally before asking anyone. The ring and the shard placement are both
+        // published lock-free and already in hand, and between them they answer the only
+        // question `decide_route` asks for a keyed operation: which shard owns this key, and
+        // is that shard mine? Asking the coordinator instead costs a mailbox round trip to a
+        // single actor on every write — a cross-core wakeup and a serialisation point in
+        // front of a worker pool built to avoid exactly that.
+        //
+        // Only a definite local answer is taken here. Anything else — an empty ring, a key
+        // no shard claims, a shard on another node — still goes to the coordinator, which
+        // knows about peers and addresses and is the only thing that can decide those.
+        let decision = match self.resolve_local(routing_key.as_deref()) {
+            Some(local) => Ok(local),
+            None => {
+                self.coordinator
+                    .ask(RouteOperation {
+                        routing_key,
+                        operation_type,
+                    })
+                    .await
+            }
+        };
 
         let mut result = match decision {
             Ok(RoutingDecision::Local) => self.handle_client_op(op).await,
@@ -4119,6 +4446,12 @@ pub struct NodeOrchestrator {
     /// Wrapped in Arc so it can be shared with the OrchestratorEngine worker pool
     /// and the RouterActor for shard-affine dispatch.
     shared_routing_ring: Arc<ArcSwap<ConsistentRing>>,
+    /// Cores this process may use, resolved once. Sizes the worker pool and places both
+    /// workers and writer threads, so all of them count the same cores.
+    core_layout: CoreLayout,
+    /// Shard ordinals, published lock-free. Read by the dispatcher to pick a shard's worker
+    /// and by the router to answer "is this shard mine?" without a coordinator round trip.
+    placement: Arc<ArcSwap<ShardPlacement>>,
     /// Per-index schema cache to avoid repeated metadata reads (lock-free via ArcSwap).
     /// Wrapped in Arc so it can be shared with the OrchestratorEngine worker pool.
     schema_cache: Arc<ArcSwap<HashMap<String, Arc<IndexSchema>>>>,
@@ -4275,16 +4608,26 @@ impl NodeOrchestrator {
                 }
             }
 
+            // Persist before the write reaches a shard. Sampling has already put these
+            // fields into `schema_cache`, so validation below finds nothing new and the
+            // evolution stage — which is the only other thing that persists — never runs.
+            // Left in memory, this schema would die here and the storage layer would derive
+            // its own from the document, as non-indexed fields, permanently: the tantivy
+            // schema is fixed when the first write creates the index.
+            if sampled_field_count > 0 {
+                Self::persist_schema_to_stores(index, schema_cache, &self.shards).await?;
+            }
+
             tracing::info!(
                 index = %index,
                 sampled_fields = sampled_field_count,
-                "Enhanced sampling merged for initial schema creation"
+                "Enhanced sampling merged and persisted for initial schema creation"
             );
         }
 
         // Stage 1: Parallel validation (read-only)
         let validation_results = self
-            .parallel_validate_schema(index, docs, schema_cache)
+            .parallel_validate_schema(index, docs, schema_cache, is_initial_creation)
             .await?;
 
         // Stage 2: Aggregate results and identify evolution needs
@@ -4310,13 +4653,20 @@ impl NodeOrchestrator {
             }
         }
 
-        // Stage 3: Sequential schema evolution (only if needed)
+        // Stage 3: Sequential schema evolution (only if needed).
+        //
+        // `is_initial_creation` is passed down rather than recomputed there: sampling above
+        // has already put fields into `schema_cache`, so `fields.is_empty()` no longer
+        // answers the question. Without this, a field that first appears past the sampling
+        // limit would be treated as a later addition and left non-indexed — two classes of
+        // field out of one load.
         if summary.evolution_needed && !summary.all_new_fields.is_empty() {
             self.evolve_schema_sequential(
                 index,
                 schema_cache,
                 &summary.all_new_fields,
                 &self.shards,
+                is_initial_creation,
             )
             .await?;
         }
@@ -4334,18 +4684,23 @@ impl NodeOrchestrator {
     }
 
     /// Parallel schema validation (read-only, no mutations)
+    ///
+    /// `is_initial_creation` comes from the caller, for the same reason it does in
+    /// `evolve_schema_sequential`: sampling has already filled `schema_cache`, so deriving
+    /// it here from `fields.is_empty()` reads false on exactly the call where it is true.
+    /// That matters because the fast validator does not report new fields — a field that
+    /// first appears past the sampling limit would go unnoticed and never reach the schema.
     async fn parallel_validate_schema(
         &self,
         _index: &str,
         docs: &[DocPayload],
         schema_cache: &IndexSchema,
+        is_initial_creation: bool,
     ) -> Result<Vec<SchemaValidationResult>, OrchestratorError> {
         tracing::debug!(
             "Using parallel Rayon validation for {} documents",
             docs.len()
         );
-
-        let is_initial_creation = schema_cache.fields.is_empty();
 
         // Small batches validate inline. Offloading them costs two thread hops (onto this
         // worker's blocking pool, then a rayon fan-out onto the global rayon pool, which is
@@ -4614,117 +4969,55 @@ impl NodeOrchestrator {
         }
     }
 
-    /// Optimized schema evolution for batch processing
+    /// Add the fields validation discovered to the schema.
+    ///
+    /// `is_initial_creation` decides whether they are searchable, and comes from the caller
+    /// rather than from `schema_cache.fields.is_empty()` — by the time this runs, sampling
+    /// may already have populated the cache. See [`mark_initial_fields_indexed`] for why the
+    /// two cases differ.
     async fn evolve_schema_sequential(
         &self,
         index: &str,
         schema_cache: &mut IndexSchema,
         new_fields: &std::collections::HashSet<(String, TantivyFieldType)>,
         shards: &HashMap<Uuid, MicroshardActor>,
+        is_initial_creation: bool,
     ) -> Result<(), OrchestratorError> {
-        let is_initial_creation = schema_cache.fields.is_empty();
+        // Only fields the schema does not already describe.
+        let fields_to_add: Vec<_> = new_fields
+            .iter()
+            .filter(|(field_name, _)| !schema_cache.fields.contains_key(field_name))
+            .collect();
 
-        // For initial creation with many fields, do optimized batch processing
-        if is_initial_creation && new_fields.len() > 10 {
-            tracing::debug!(
-                index = %index,
-                fields_count = new_fields.len(),
-                "Optimized initial schema creation with batch field addition"
-            );
-
-            // Add all fields at once for better performance
-            let indexed = true; // All fields indexed in initial creation
-            for (field_name, field_type) in new_fields {
-                if !schema_cache.fields.contains_key(field_name) {
-                    let mut new_field = FieldDef::new(field_name.clone(), field_type.clone());
-                    new_field.indexed = indexed;
-                    schema_cache.fields.insert(field_name.clone(), new_field);
-                }
-            }
-
-            tracing::info!(
-                index = %index,
-                total_fields = schema_cache.fields.len(),
-                "Initial schema created with batch optimization"
-            );
-        } else {
-            // Filter only truly new fields to avoid redundant work
-            let fields_to_add: Vec<_> = new_fields
-                .iter()
-                .filter(|(field_name, _)| !schema_cache.fields.contains_key(field_name))
-                .collect();
-
-            if fields_to_add.is_empty() {
-                return Ok(());
-            }
-
-            tracing::debug!(
-                index = %index,
-                fields_count = fields_to_add.len(),
-                is_initial_creation = is_initial_creation,
-                "Batch adding new fields to schema"
-            );
-
-            // Batch add all fields at once for better performance
-            let indexed = is_initial_creation; // All fields indexed in initial creation
-            for (field_name, field_type) in &fields_to_add {
-                let mut new_field = FieldDef::new(field_name.clone(), field_type.clone());
-                new_field.indexed = indexed;
-                schema_cache.fields.insert(field_name.clone(), new_field);
-            }
-
-            tracing::info!(
-                index = %index,
-                fields_count = fields_to_add.len(),
-                "Schema evolution completed - batch added fields"
-            );
+        if fields_to_add.is_empty() {
+            return Ok(());
         }
+
+        tracing::debug!(
+            index = %index,
+            fields_count = fields_to_add.len(),
+            is_initial_creation = is_initial_creation,
+            "Batch adding new fields to schema"
+        );
+
+        for (field_name, field_type) in &fields_to_add {
+            // `FieldDef::new` already applies the storage rule — only `id` is stored in
+            // tantivy, everything else is reconstructed from redb.
+            let mut new_field = FieldDef::new(field_name.clone(), field_type.clone());
+            new_field.indexed = is_initial_creation;
+            schema_cache.fields.insert(field_name.clone(), new_field);
+        }
+
+        tracing::info!(
+            index = %index,
+            fields_count = fields_to_add.len(),
+            is_initial_creation = is_initial_creation,
+            "Schema evolution completed - batch added fields"
+        );
 
         // Persist updated schema to storage if changed
         if !new_fields.is_empty() {
-            let index_name = index.to_string();
-            let schema_clone = schema_cache.clone();
-
-            // Collect all stores from local shards
-            let stores: Vec<Arc<HybridStore>> = shards
-                .values()
-                .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
-                .collect();
-
-            if stores.is_empty() {
-                return Err(OrchestratorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "No local stores available to persist schema",
-                )));
-            }
-
-            // Persist to all stores concurrently
-            let handles: Vec<_> = stores
-                .into_iter()
-                .map(|store| {
-                    let idx = index_name.clone();
-                    let sch = schema_clone.clone();
-                    tokio::task::spawn_blocking(move || store.store_schema_and_cache(&idx, &sch))
-                })
-                .collect();
-
-            // Await all results
-            for handle in handles {
-                handle
-                    .await
-                    .map_err(|e| {
-                        OrchestratorError::Io(std::io::Error::other(format!(
-                            "Failed to spawn schema update task: {}",
-                            e
-                        )))
-                    })?
-                    .map_err(|e| {
-                        OrchestratorError::Io(std::io::Error::other(format!(
-                            "Failed to store schema: {}",
-                            e
-                        )))
-                    })?;
-            }
+            Self::persist_schema_to_stores(index, schema_cache, shards).await?;
 
             if is_initial_creation {
                 tracing::info!(
@@ -4740,6 +5033,60 @@ impl NodeOrchestrator {
                     "Schema evolved with new fields"
                 );
             }
+        }
+
+        Ok(())
+    }
+
+    /// Write a schema to every local shard's store, and its cache with it.
+    ///
+    /// The storage layer derives its own schema from documents as they are written, using
+    /// non-indexed fields — correct for a field arriving at a live index, wrong for the
+    /// first write, which is what creates the tantivy index. Persisting here first means
+    /// storage finds the fields already described and evolves types against them instead of
+    /// inventing its own definitions.
+    async fn persist_schema_to_stores(
+        index: &str,
+        schema: &IndexSchema,
+        shards: &HashMap<Uuid, MicroshardActor>,
+    ) -> Result<(), OrchestratorError> {
+        let stores: Vec<Arc<HybridStore>> = shards
+            .values()
+            .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
+            .collect();
+
+        if stores.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No local stores available to persist schema",
+            )));
+        }
+
+        let index_name = index.to_string();
+        let handles: Vec<_> = stores
+            .into_iter()
+            .map(|store| {
+                let idx = index_name.clone();
+                let sch = schema.clone();
+                tokio::task::spawn_blocking(move || store.store_schema_and_cache(&idx, &sch))
+            })
+            .collect();
+
+        for handle in handles {
+            handle
+                .await
+                .map_err(|e| {
+                    OrchestratorError::Io(std::io::Error::other(format!(
+                        "Failed to spawn schema update task: {}",
+                        e
+                    )))
+                })?
+                .map_err(|e| {
+                    OrchestratorError::Io(std::io::Error::other(format!(
+                        "Failed to store schema: {}",
+                        e
+                    )))
+                })?;
         }
 
         Ok(())
@@ -5037,6 +5384,8 @@ impl NodeOrchestrator {
             routing_ring: ConsistentRing::new(),
             coordinator: None,
             shared_routing_ring: Arc::new(ArcSwap::from_pointee(ConsistentRing::new())),
+            core_layout: CoreLayout::detect(),
+            placement: Arc::new(ArcSwap::from_pointee(ShardPlacement::default())),
             schema_cache: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             fingerprint_index: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             default_search_limit,
@@ -5075,6 +5424,11 @@ impl NodeOrchestrator {
         Arc::clone(&self.shared_routing_ring)
     }
 
+    /// Returns a clone of the published shard placement, for dispatch and local routing.
+    pub fn shard_placement(&self) -> Arc<ArcSwap<ShardPlacement>> {
+        Arc::clone(&self.placement)
+    }
+
     /// Build the shared `OrchestratorEngine` and spawn the worker pool.
     ///
     /// Must be called **after** `hydrate_existing_shards` and `set_coordinator`
@@ -5109,15 +5463,17 @@ impl NodeOrchestrator {
 
         // Worker count: min(local_shards * 2, cpu_cores * 2), minimum 1.
         //
-        // Stage 2c — hash-space alignment: when shard-affine dispatch AND writer
-        // core pinning are both enabled, force `worker_count == cpu_cores` so that
-        // `xxh3(shard_id) % worker_count` (dispatch) and `xxh3(shard_id) % cpu_cores`
-        // (writer pinning) produce the SAME bucket. Then for any shard S, the worker
-        // handling S dispatches into the writer pinned on the matching core, giving
-        // the OS scheduler the best chance to keep the worker task near that core.
-        let cpu_cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        // When shard-affine dispatch and writer pinning are both on, `worker_count` is
+        // forced to the core budget so that worker `i` and the writer for the shard with
+        // ordinal `i` land on the same core. One worker per core is the deliberate ceiling:
+        // enough to avoid context switching between them, not so many that the pool
+        // oversubscribes the machine.
+        //
+        // Note this is not capped at `local_shards`. Only *writes* are shard-affine; searches
+        // dispatch round-robin across the whole pool, so workers past the shard count are
+        // far from idle. Writes cannot use more workers than there are shards in any case —
+        // each shard has one writer thread that serialises them.
+        let cpu_cores = self.core_layout.budget();
         let local_shards = self.shards.len();
         let aligned =
             self.config.shard_affine_dispatch && self.config.writer_core_affinity && cpu_cores > 0;
@@ -5135,22 +5491,16 @@ impl NodeOrchestrator {
             worker_count = worker_count,
             local_shards = local_shards,
             cpu_cores = cpu_cores,
-            hash_aligned = aligned,
+            core_aligned = aligned,
             queue_capacity = ORCHESTRATOR_WORKER_QUEUE_CAPACITY,
             per_worker_queue_capacity = per_worker_queue_capacity,
             "Spawning orchestrator worker pool"
         );
 
-        // Stage 2e — true OS-thread pinning gate. Only active when all three
-        // affinity flags are on AND we successfully retrieved core_ids. Falls
-        // back to plain tokio::spawn otherwise.
-        let pin_workers = aligned && self.config.worker_core_affinity;
-        let core_ids: Option<Vec<core_affinity::CoreId>> = if pin_workers {
-            let ids = core_affinity::get_core_ids().unwrap_or_default();
-            if ids.is_empty() { None } else { Some(ids) }
-        } else {
-            None
-        };
+        // True OS-thread pinning gate: all three affinity flags on, and a platform that can
+        // enumerate cores. Falls back to plain tokio::spawn otherwise.
+        let pin_workers =
+            aligned && self.config.worker_core_affinity && self.core_layout.pinning_available();
         let worker_stats: Arc<Vec<Arc<WorkerCounters>>> = Arc::new(
             (0..worker_count)
                 .map(|_| Arc::new(WorkerCounters::default()))
@@ -5164,14 +5514,21 @@ impl NodeOrchestrator {
             let engine = Arc::clone(&engine);
             let counters = Arc::clone(&worker_stats[worker_id]);
 
-            if let Some(ids) = core_ids.as_ref() {
+            if let Some(target_core) = pin_workers
+                .then(|| self.core_layout.core_for(worker_id))
+                .flatten()
+            {
                 // Pinned path: dedicated OS thread + current_thread runtime
-                let target_core = ids[worker_id % ids.len()];
                 let handle = std::thread::Builder::new()
                     .name(format!("orch-worker-{}", worker_id))
                     .spawn(move || {
-                        // Pin this OS thread to the target core (best-effort).
+                        // Pin this OS thread to the target core (best-effort) and record
+                        // what happened — only this thread can find out, and asking for a
+                        // core is not the same as getting it.
                         if core_affinity::set_for_current(target_core) {
+                            counters
+                                .pinned_core
+                                .store(target_core.id as i64, AtomicOrdering::Relaxed);
                             info!(
                                 worker_id = worker_id,
                                 core_id = target_core.id,
@@ -5227,7 +5584,8 @@ impl NodeOrchestrator {
             per_worker_queue_capacity,
             pin_workers,
             aligned,
-            core_ids.unwrap_or_default(),
+            self.core_layout.clone(),
+            Arc::clone(&self.placement),
         );
         self.engine = Some(engine);
         self.worker_count = tx.len();
@@ -5289,13 +5647,51 @@ impl NodeOrchestrator {
         }
     }
 
+    /// Give a shard its ordinal and publish the result.
+    ///
+    /// Called as each shard starts, before it can receive work. Ordinals only ever grow, so
+    /// this is safe to call again for a shard that already has one — which matters because a
+    /// writer thread pins itself using the ordinal it was given and cannot be re-pinned.
+    ///
+    /// Returns where the shard's writer thread should pin, and the cell it reports back
+    /// through.
+    fn place_shard(&mut self, shard_id: Uuid) -> WriterPin {
+        let mut placement = (**self.placement.load()).clone();
+        let slot = placement.assign(
+            shard_id,
+            &self.core_layout,
+            self.config.writer_core_affinity,
+        );
+        self.placement.store(Arc::new(placement));
+
+        WriterPin {
+            target: slot.target_core.map(|id| core_affinity::CoreId { id }),
+            outcome: slot.pinned_core,
+        }
+    }
+
+    /// Publish a shard as serving, once it is in the shard map.
+    ///
+    /// Separate from [`Self::place_shard`] because the two happen at different moments: the
+    /// ordinal is needed before the shard starts, to pin its writer thread, but routing must
+    /// not claim the shard until it can actually take work.
+    fn activate_shard(&mut self, shard_id: Uuid) {
+        let mut placement = (**self.placement.load()).clone();
+        placement.activate(shard_id);
+        self.placement.store(Arc::new(placement));
+    }
+
     /// Scans the storage directory for existing shard folders and hydrates them with
     /// bounded concurrency. The bottleneck is redb::Builder::create() which does heavy
     /// disk I/O (WAL replay, compaction). Running all shards simultaneously causes I/O
     /// contention that makes each open 10-100× slower. A semaphore limits how many shards
     /// open their redb databases concurrently.
     async fn hydrate_existing_shards(&mut self) -> Result<(), OrchestratorError> {
-        let existing_shards = self.discover_existing_shards()?;
+        let mut existing_shards = self.discover_existing_shards()?;
+        // Sorted so ordinals — and therefore worker and core placement — come out the same
+        // on every restart. Directory order does not promise that, and a benchmark that
+        // cannot reproduce its own thread placement is hard to read.
+        existing_shards.sort();
         info!("Found {} existing shards", existing_shards.len());
 
         // Limit concurrent shard initialization to reduce disk I/O contention.
@@ -5322,13 +5718,16 @@ impl NodeOrchestrator {
         // Create tasks for all shards — semaphore gates actual execution
         let total_shards = existing_shards.len();
         let writer_shutdown_timeout_secs = self.config.writer_shutdown_timeout_secs;
-        let writer_core_affinity = self.config.writer_core_affinity;
+        let supervisor_timeout_secs = self.config.supervisor_timeout_secs;
         for &shard_id in &existing_shards {
             let shard_path = self.deterministic_shard_directory(shard_id);
             let storage_config = self.create_shard_storage_config(shard_id, shard_path);
             let default_search_limit = self.default_search_limit;
             let read_handle = self.read_runtime.as_ref().map(|rt| rt.handle().clone());
             let sem = Arc::clone(&semaphore);
+            // Placed here rather than inside the task: hydration runs concurrently, and an
+            // ordinal handed out in completion order would not survive a restart.
+            let writer_core = self.place_shard(shard_id);
 
             let task = tokio::spawn(async move {
                 // Acquire semaphore permit before starting heavy I/O
@@ -5339,11 +5738,14 @@ impl NodeOrchestrator {
                 let mut microshard = MicroshardActor::new(
                     shard_id,
                     storage_config,
-                    default_search_limit,
-                    read_handle,
-                    total_shards,
-                    writer_shutdown_timeout_secs,
-                    writer_core_affinity,
+                    ShardRuntime {
+                        default_search_limit,
+                        read_pool_handle: read_handle,
+                        total_shards,
+                        writer_shutdown_timeout_secs,
+                        supervisor_timeout_secs,
+                        writer_pin: writer_core,
+                    },
                 );
 
                 match microshard.start().await {
@@ -5368,6 +5770,7 @@ impl NodeOrchestrator {
                     if self.shards.len() < self.config.max_shards {
                         self.shards.insert(shard_id, microshard);
                         self.register_shard_for_routing(shard_id);
+                        self.activate_shard(shard_id);
                     }
                 }
                 Ok(Ok((_, None))) => {
@@ -5529,20 +5932,25 @@ impl NodeOrchestrator {
         let storage_config = self.create_shard_storage_config(shard_id, shard_path.clone());
         let read_handle = self.read_runtime.as_ref().map(|rt| rt.handle().clone());
         let total_shards = self.shards.len() + 1; // Current + new shard
+        let writer_core = self.place_shard(shard_id);
         let mut microshard = MicroshardActor::new(
             shard_id,
             storage_config,
-            self.default_search_limit,
-            read_handle,
-            total_shards,
-            self.config.writer_shutdown_timeout_secs,
-            self.config.writer_core_affinity,
+            ShardRuntime {
+                default_search_limit: self.default_search_limit,
+                read_pool_handle: read_handle,
+                total_shards,
+                writer_shutdown_timeout_secs: self.config.writer_shutdown_timeout_secs,
+                supervisor_timeout_secs: self.config.supervisor_timeout_secs,
+                writer_pin: writer_core,
+            },
         );
         microshard.start().await?;
 
         // Add to shards map
         self.shards.insert(shard_id, microshard);
         self.register_shard_for_routing(shard_id);
+        self.activate_shard(shard_id);
         if let Err(err) = self.register_shard_with_coordinator(shard_id).await {
             warn!(%shard_id, error = %err, "Failed to register new shard with coordinator");
         }
@@ -6911,6 +7319,342 @@ impl Drop for NodeOrchestrator {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An engine with no shards and no coordinator. Enough to exercise `execute`'s dispatch
+    /// table, which decides what the worker pool will and will not serve before any shard,
+    /// schema or store is touched.
+    fn bare_engine() -> OrchestratorEngine {
+        OrchestratorEngine {
+            shards: ArcSwap::from_pointee(HashMap::new()),
+            routing_ring: Arc::new(ArcSwap::from_pointee(ConsistentRing::new())),
+            schema_cache: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            fingerprint_index: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            coordinator: None,
+            identity: NodeIdentity::new(),
+            default_search_limit: 10,
+            max_concurrent_shard_searches: 4,
+            remote_peer_pool: Arc::new(RemotePeerPool::new()),
+        }
+    }
+
+    /// The engine cannot evolve a schema — it holds snapshots, not `&mut NodeOrchestrator`.
+    /// What matters is that declining returns the *op*, not a sentinel error: the caller
+    /// moved the op into the job and has nothing left to retry with otherwise. A write to an
+    /// index with no schema used to reach the client as a 500.
+    #[tokio::test]
+    async fn an_op_the_engine_declines_comes_back_whole() {
+        let engine = bare_engine();
+
+        let outcome = engine
+            .execute(
+                ClientOp::BulkWrite {
+                    index: "books".to_string(),
+                    docs: vec![DocPayload {
+                        id: "b1".to_string(),
+                        routing_key: None,
+                        doc: json!({"title": "Dune"}),
+                    }],
+                },
+                None,
+            )
+            .await;
+
+        match outcome {
+            WorkerOutcome::UseActor(op) => match *op {
+                ClientOp::BulkWrite { index, docs } => {
+                    assert_eq!(index, "books");
+                    assert_eq!(
+                        docs.len(),
+                        1,
+                        "the documents have to survive the round trip"
+                    );
+                    assert_eq!(docs[0].doc, json!({"title": "Dune"}));
+                }
+                other => panic!("the op came back as a different op: {other:?}"),
+            },
+            WorkerOutcome::Done(result) => {
+                panic!("bulk write should defer to the actor, got {result:?}")
+            }
+        }
+    }
+
+    /// The defect that made shard-affine dispatch worth avoiding: `xxh3(shard) % workers`
+    /// draws from a domain smaller than the pool, so most workers never see a write. With
+    /// the shipped defaults — 4 shards, 8 workers — a measured run reached 3 of 8. Ordinals
+    /// reach every worker up to the shard count, which is the real ceiling: one writer
+    /// thread per shard serialises that shard's writes regardless.
+    #[test]
+    fn every_shard_gets_its_own_worker_until_the_pool_runs_out() {
+        let mut placement = ShardPlacement::default();
+        let layout = CoreLayout::detect();
+        let shards: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        for &shard in &shards {
+            placement.assign(shard, &layout, false);
+        }
+
+        let workers = 8;
+        let assigned: HashSet<usize> = shards
+            .iter()
+            .map(|shard| placement.ordinal(shard).unwrap() % workers)
+            .collect();
+
+        assert_eq!(
+            assigned.len(),
+            shards.len(),
+            "four shards must reach four distinct workers, not collide onto fewer"
+        );
+    }
+
+    /// More shards than workers is the normal steady state; they have to wrap evenly rather
+    /// than pile onto one worker.
+    #[test]
+    fn shards_past_the_worker_count_wrap_evenly() {
+        let mut placement = ShardPlacement::default();
+        let layout = CoreLayout::detect();
+        let shards: Vec<Uuid> = (0..16).map(|_| Uuid::new_v4()).collect();
+        for &shard in &shards {
+            placement.assign(shard, &layout, false);
+        }
+
+        let workers = 8;
+        let mut per_worker = vec![0usize; workers];
+        for shard in &shards {
+            per_worker[placement.ordinal(shard).unwrap() % workers] += 1;
+        }
+
+        assert!(
+            per_worker.iter().all(|count| *count == 2),
+            "16 shards over 8 workers should be 2 each, got {per_worker:?}"
+        );
+    }
+
+    /// A writer thread pins itself using the ordinal it was given at startup and cannot be
+    /// re-pinned afterwards. Assigning ordinals from a set that gets re-sorted on every
+    /// membership change would strand those threads, so an ordinal is fixed for the process.
+    #[test]
+    fn an_ordinal_survives_later_shards_arriving() {
+        let mut placement = ShardPlacement::default();
+        let layout = CoreLayout::detect();
+        let first = Uuid::new_v4();
+        let ordinal = placement.assign(first, &layout, false).ordinal;
+
+        for _ in 0..5 {
+            placement.assign(Uuid::new_v4(), &layout, false);
+        }
+        // A shard that starts twice — a restarted actor, a repeated registration — keeps the
+        // core its writer already pinned to.
+        assert_eq!(placement.assign(first, &layout, false).ordinal, ordinal);
+        assert_eq!(placement.ordinal(&first), Some(ordinal));
+    }
+
+    /// Local routing reads this to skip the coordinator, so a shard that is not ours must
+    /// never look like one that is — including a shard that got an ordinal on its way to
+    /// starting and then failed to hydrate. Routing writes at it would send them to a shard
+    /// this node cannot serve, where the coordinator would have found the real owner.
+    #[test]
+    fn placement_claims_only_shards_that_actually_started() {
+        let mut placement = ShardPlacement::default();
+        let layout = CoreLayout::detect();
+        let serving = Uuid::new_v4();
+        let failed_to_hydrate = Uuid::new_v4();
+
+        placement.assign(serving, &layout, false);
+        placement.activate(serving);
+        placement.assign(failed_to_hydrate, &layout, false);
+
+        assert!(placement.is_local(&serving));
+        assert!(
+            !placement.is_local(&failed_to_hydrate),
+            "an ordinal is not a claim; only a started shard is"
+        );
+        assert!(!placement.is_local(&Uuid::new_v4()));
+        assert!(
+            placement.ordinal(&failed_to_hydrate).is_some(),
+            "the ordinal is still spent — reusing it would move a live writer's core"
+        );
+    }
+
+    /// Asking for a core is not the same as getting one — `set_for_current` is a no-op on
+    /// macOS and can be refused by a cpuset on Linux. The report used to show the request as
+    /// though it were the result, which made it useless as evidence for exactly the thing it
+    /// exists to show.
+    #[test]
+    fn a_requested_core_is_not_reported_as_a_taken_one() {
+        let mut placement = ShardPlacement::default();
+        let layout = CoreLayout::detect();
+        let shard = Uuid::new_v4();
+
+        let slot = placement.assign(shard, &layout, true);
+        placement.activate(shard);
+
+        let before = &placement.report()[0];
+        assert_eq!(
+            before.core_id, None,
+            "nothing has pinned yet, so no core is taken"
+        );
+        if layout.pinning_available() {
+            assert!(
+                before.target_core_id.is_some(),
+                "but one was requested, and that has to be visible too"
+            );
+        }
+
+        // Stand in for the writer thread reporting success.
+        slot.pinned_core.store(3, AtomicOrdering::Relaxed);
+
+        let after = &placement.report()[0];
+        assert_eq!(after.core_id, Some(3));
+        assert!(after.serving);
+    }
+
+    /// A shard that never started still holds its ordinal, and the report has to say so
+    /// rather than quietly omitting it — an unexplained gap in the ordinals is exactly the
+    /// kind of thing an operator needs to see.
+    #[test]
+    fn the_report_shows_a_shard_that_holds_an_ordinal_without_serving() {
+        let mut placement = ShardPlacement::default();
+        let layout = CoreLayout::detect();
+        let serving = Uuid::new_v4();
+        let stalled = Uuid::new_v4();
+
+        placement.assign(serving, &layout, true);
+        placement.activate(serving);
+        placement.assign(stalled, &layout, true);
+
+        let report = placement.report();
+        assert_eq!(report.len(), 2, "both shards appear");
+        assert_eq!(report[0].ordinal, 0, "report is ordered by ordinal");
+        assert_eq!(report[1].ordinal, 1);
+        assert!(report[0].serving);
+        assert!(!report[1].serving);
+    }
+
+    /// Pinning off means no core was requested, so nothing should imply one was.
+    #[test]
+    fn no_core_is_requested_when_pinning_is_off() {
+        let mut placement = ShardPlacement::default();
+        let shard = Uuid::new_v4();
+        placement.assign(shard, &CoreLayout::detect(), false);
+
+        let report = placement.report();
+        assert_eq!(report[0].target_core_id, None);
+        assert_eq!(report[0].core_id, None);
+    }
+
+    /// A quota-limited process sees more cores than it may use. Placing threads across cores
+    /// the scheduler will not schedule spreads the work without spreading the CPU, and it is
+    /// how worker and writer placement stopped agreeing in the first place.
+    #[test]
+    fn the_core_layout_never_exceeds_the_cpu_budget() {
+        let layout = CoreLayout::detect();
+
+        assert!(layout.budget() >= 1);
+        assert!(
+            layout.cores.len() <= layout.budget(),
+            "pinnable cores ({}) must not exceed the budget ({})",
+            layout.cores.len(),
+            layout.budget()
+        );
+        if layout.pinning_available() {
+            // Ordinals past the end wrap rather than falling off it.
+            assert!(layout.core_for(layout.cores.len() * 3 + 1).is_some());
+        } else {
+            assert!(layout.core_for(0).is_none());
+        }
+    }
+
+    fn payload(id: &str, doc: JsonValue) -> DocPayload {
+        DocPayload {
+            id: id.to_string(),
+            routing_key: None,
+            doc,
+        }
+    }
+
+    /// A tantivy schema is fixed when the index is created, so initial creation is the only
+    /// chance to make a field searchable. Sampling used to leave everything non-indexed,
+    /// which produced write-only indexes: documents went in, and nothing but `id` could
+    /// find them again.
+    #[test]
+    fn fields_inferred_when_the_index_is_created_are_searchable() {
+        let schema = enhanced_schema_sampling(
+            &[payload(
+                "d1",
+                json!({"id": "d1", "title": "hello", "year": 2024}),
+            )],
+            SCHEMA_SAMPLE_LIMIT,
+        );
+
+        for name in ["title", "year"] {
+            let field = schema
+                .fields
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} should have been inferred"));
+            assert!(field.indexed, "{name} has to be searchable");
+            assert!(!field.stored, "only id belongs in tantivy's stored fields");
+        }
+    }
+
+    /// Hits are rebuilt from redb, so storing values in tantivy too would keep a second copy
+    /// of the corpus. Nothing inferred is stored — and `id` is not inferred at all:
+    /// `evolve_field` refuses to touch it, and the storage layer seeds the canonical
+    /// definition when it creates the index.
+    #[test]
+    fn nothing_inferred_is_stored_in_tantivy() {
+        let schema = enhanced_schema_sampling(
+            &[payload("d1", json!({"id": "d1", "title": "hello"}))],
+            SCHEMA_SAMPLE_LIMIT,
+        );
+
+        assert!(
+            !schema.fields.contains_key("id"),
+            "id is seeded by the storage layer, not inferred"
+        );
+        assert!(
+            schema.fields.values().all(|field| !field.stored),
+            "an inferred field is indexed, never stored"
+        );
+    }
+
+    /// Shadow fields exist to map a query written against the original field name onto the
+    /// canonical `id`. Indexing one would put a second copy of the ids in the index.
+    #[test]
+    fn a_shadow_field_survives_initial_creation_untouched() {
+        let mut schema = IndexSchema::default();
+        schema.add_shadow_field("sha1".to_string(), TantivyFieldType::Text);
+        schema.fields.insert(
+            "title".to_string(),
+            FieldDef::new_non_indexed("title".to_string(), &json!("hello")),
+        );
+
+        mark_initial_fields_indexed(&mut schema);
+
+        let shadow = &schema.fields["sha1"];
+        assert!(!shadow.indexed, "a shadow field is never indexed");
+        assert!(!shadow.stored, "a shadow field is never stored");
+        assert!(schema.fields["title"].indexed, "ordinary fields still are");
+    }
+
+    /// Metadata ops are never dispatched to the pool today, but if one ever is, it must be
+    /// handed to the actor rather than answered with an error — the same contract.
+    #[tokio::test]
+    async fn a_metadata_op_defers_rather_than_failing() {
+        let engine = bare_engine();
+
+        let outcome = engine
+            .execute(
+                ClientOp::GetConfig {
+                    index: "books".to_string(),
+                },
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(outcome, WorkerOutcome::UseActor(op) if matches!(*op, ClientOp::GetConfig { .. })),
+            "a metadata op must be deferred to the actor, carrying its own op"
+        );
+    }
 
     #[test]
     fn test_apply_field_projection_single_field() {

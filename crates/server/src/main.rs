@@ -275,6 +275,7 @@ async fn main() -> Result<()> {
         indexer_num_threads: cameodb_config.search.indexer_num_threads,
         merge_num_threads: cameodb_config.search.merge_num_threads,
         writer_shutdown_timeout_secs: 30,
+        supervisor_timeout_secs: cameodb_config.search.supervisor_timeout_secs,
         writer_core_affinity: cameodb_config.storage.writer_core_affinity,
         shard_affine_dispatch: cameodb_config.storage.shard_affine_dispatch,
         worker_core_affinity: cameodb_config.storage.worker_core_affinity,
@@ -381,6 +382,7 @@ async fn main() -> Result<()> {
     orchestrator.spawn_worker_pool();
     let worker_tx = orchestrator.worker_tx();
     let shared_routing_ring = orchestrator.shared_routing_ring();
+    let shard_placement = orchestrator.shard_placement();
 
     // NOW spawn the NodeOrchestrator as an actor (after all setup is done)
     let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
@@ -496,6 +498,7 @@ async fn main() -> Result<()> {
             routing_ring: shared_routing_ring,
             enabled: cameodb_config.storage.shard_affine_dispatch,
         },
+        shard_placement,
     );
 
     let app_state = AppState {
