@@ -45,8 +45,136 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   worth ~9× at 50 documents per request and ~24× at 500 against one-per-request writes.
 - **`CameoClient::write_document`.** Writing one document was reachable over HTTP but absent
   from the SDK, so any consumer needing it had to hand-roll the request.
+- **Every shipped config is now parsed by a test**, and asserted to name no setting no field
+  claims and to state all three affinity flags. Nothing checked the files this repository
+  ships, which is how two flags stayed missing from all of them for a whole phase.
+- **Rate limiting for MCP tool calls** (`[security.limits]`, Phase 14 C1). Authentication
+  answers *who* and `allowed_indexes` answers *what*; neither has anything to say about
+  **how often**. The caller that matters here is not an attacker but a legitimate `reader`
+  key held by an agent that loops on `search_indexes` — every call authorized, and each one
+  fanning out across every shard.
+  A token bucket per key, because agent traffic is bursty and a fixed window either refuses
+  the flurry or never bites. Charged before the tool runs *and* before the per-tool
+  capability check, so a rate-limited caller cannot infer which tools it would otherwise be
+  allowed to call. The budget is shared across tools: it bounds what a key costs the node,
+  not how often it may call one thing. Refusals name a retry delay and come back as an MCP
+  tool error rather than a transport failure, since the request was well-formed and the tool
+  simply did not run.
+  Off by default. The policy lives in the server crate behind a `McpBackend` hook, so the
+  `mcp` crate stays free of deployment opinions exactly as it does for authorization. Nine
+  tests: six over the bucket arithmetic, three driving a real node over HTTP to prove the
+  config actually reaches the dispatcher.
+- **Integration tests for the server, which had none.** `crates/server` carried 160 unit
+  tests and zero end-to-end coverage: it is a binary-only crate, so `tests/` has no library
+  to link against, and a `NodeOrchestrator` needs a data directory, threads and a socket
+  before it does anything — which is why every existing test covers a pure helper.
+  `crates/server/tests/node_http_api.rs` starts the built binary as a subprocess on a free
+  port with a temporary data directory and drives it through the shipped SDK, so the config
+  loader, the routes and the client are the ones that actually ship. Six tests covering
+  startup from a config file, write-then-read by id, commit-then-search by content, index
+  creation via the listing, and the two contracts below.
+  Writing them immediately turned up an API sharp edge worth pinning: `write_document` takes
+  an `id` parameter but the document body must *also* contain `id`, and omitting it answers
+  **500 Internal Server Error** for what is plainly a client error. Both that and the fact
+  that searching an unknown index returns an empty result rather than failing are now tests,
+  so neither can change silently.
+- **`scripts/validate/artifact.sh`**, checking what a Linux release binary actually links
+  against: no interpreter, no `NEEDED` entries, and the hardening that is supposed to be
+  there. Every one of those properties is silently droppable — rustc falls back from
+  `-static-pie` to `-static` with a warning when the linker refuses it — so "we passed the
+  flag" and "the binary has the property" needed to become different claims. Runs in a
+  container when the host has no `readelf`, and starts the binary when the host can execute
+  it. Wired into `all.sh`.
 
 ### Changed
+- **An orchestrator worker carries eight operations at once instead of one.** The worker loop
+  awaited `execute` inline, which made `worker_count` the node's entire operation concurrency
+  — and an operation is mostly spent *awaiting* a shard writer rather than burning CPU, so
+  the pool sat idle while requests queued. Worth **+65-70% write throughput (4 178 → 6 901-
+  7 118 ok/s across two measurement sets) and −64% on p90 (29.30ms → 10.45ms)** on an 8-core
+  node at concurrency 64. The width is a constant, not a setting: swept 1/2/4/8/16,
+  throughput peaks at 8 and *falls* at 16, with every width-8 repeat beating every width-16
+  repeat.
+  Read it as a saturation fix. At concurrency 16 against the default 16-worker pool the same
+  sweep is flat, because even one operation per worker already covers what the client has
+  outstanding; the win starts where demand exceeds `worker_count`.
+  The permit is taken *before* the receive, so a saturated worker stops draining its channel
+  and the existing backpressure — queue fills, dispatch falls through to a neighbour — works
+  unchanged. Shutdown now waits for accepted operations to answer: on the pinned path the
+  loop is the argument to `block_on`, so returning would drop the worker's runtime and cancel
+  in-flight work, handing those callers a dropped channel instead of a reply.
+- **The affinity flags were re-measured and still lose — the previous explanation was
+  wrong.** Their regression had been blamed on the serial worker loop above, on the theory
+  that halving `worker_count` halved the node's concurrency. With workers eight operations
+  wide, `shard_affine_dispatch` still costs 24% of write throughput at concurrency 64, and
+  default's worst repeat beat every affinity repeat. The surviving cause is the constraint
+  itself: a shard's jobs may only run on `S % worker_count`, so skew idles workers while
+  their neighbours queue, and round-robin cannot be unlucky that way. Searches confirm it
+  from the other side — affine dispatch is neutral for them (they dispatch round-robin
+  anyway) while worker pinning costs 11% and half again on p99. No default changed; what
+  changed is that the recorded reason is now one that survived a test meant to overturn it.
+- **`docker/cameodb-docker.toml` shipped `search_threads = 16`** — double the code default,
+  on containers typically given 4-8 cores. It now ships the default 8, with the sizing rule
+  written next to it. The read pool shares cores with the pinned shard writers, so allowing
+  more concurrent searches than there are cores moves queueing from the pool into the kernel
+  and charges the write path for it. Measured on an 8-core node under simultaneous read and
+  write load, 16 was worse than 8 on every axis — search p99 15.44ms vs 13.46ms, write
+  throughput 1 776 vs 1 895 ok/s — and several times less predictable run to run.
+- **Mixed read/write load is now measured, and documented.** Every performance figure this
+  project had published was taken with writes alone or searches alone. Run together on an
+  8-core node, each drops by roughly half (writes 4 074 -> 1 776 ok/s, searches 5 880 ->
+  3 284) **while one and a half cores sit idle** — so the loss is not capacity.
+  It is also not core placement, which is worth stating because the obvious fix is to
+  isolate readers from writers: unpinning the shard writers changes nothing (1 758 vs
+  1 776 ok/s), and partitioning cores would take them from searches, the only CPU-bound
+  party here, to give them to writers that spend their time blocked in `fsync`. What the
+  measurement does show is the cost of a durable commit tripling under read load —
+  ~4.6ms to ~12.5ms — because segment reads contend with WAL fsync for IO and page cache.
+  `wal_sync = false` recovers +86% of write throughput under the same load.
+  Recorded in ROADMAP "Mixed read/write load, measured".
+  A **bounded linger before commit was built to exploit this and then removed**: the writer
+  already merges every queued write into one transaction, but commits whatever is queued at
+  that instant — about 2.5 writes — so waiting briefly for more looked like free
+  amortisation. Measured at 200/500/1000µs against a no-linger control, it produced nothing
+  distinguishable from noise at c16 or c64. The arithmetic explains it: only ~0.05 writes
+  arrive at a given shard during a 200µs window (~0.18 at c64), and a closed-loop client
+  cannot issue the next write until this one is answered — so the writer would wait for
+  writes that cannot arrive until it stops waiting. The negative result and its precondition
+  (an open-loop load generator) are recorded rather than the code.
+- **`build-musl.sh` builds in a container by default, and both architectures.** It was
+  x86_64-only and always used `cargo zigbuild`, which produces a *less* hardened binary than
+  the published image: zig's linker does not advertise `-static-pie`, so rustc silently falls
+  back to `-static` and the result is fully static but loads at a fixed address. The script
+  now prefers a Linux container matching the target architecture — the same toolchain the
+  Dockerfile uses — takes an arch argument (`x86_64` | `aarch64` | `both`), keeps zigbuild as
+  the no-Docker fallback, and checks what it produced instead of assuming. Documented, with
+  the aarch64 caveats, in `docs/BUILDING.md`.
+- **`.cargo/config.toml` is tracked.** `.gitignore` excluded the whole `.cargo/` directory, so
+  the file carrying the musl link flags, the hardening flags and jemalloc's page size existed
+  only on machines that happened to have it: a fresh clone built release binaries with none
+  of them, silently, and nothing in the tree said so. Now only credentials are ignored.
+- **`.cargo/config.toml` covers `aarch64-unknown-linux-musl`**, which had no section at all
+  and so got none of the hardening x86_64 gets. It deliberately does *not* set
+  `relocation-model=pie`: static-pie is broken on that target — forcing it links and then
+  segfaults before `main`, on a hello-world crate with no dependencies — which is why rustc
+  defaults it to `-no-pie`. aarch64 binaries load at a fixed address as a result; the reason
+  is recorded next to the flags and reported as a SKIP by `artifact.sh` so it resurfaces if
+  the toolchain is ever fixed. Also documents that `JEMALLOC_SYS_WITH_LG_PAGE = "12"` fixes
+  jemalloc to 4 KiB pages, which aborts at startup on aarch64 hosts configured with 16 KiB or
+  64 KiB pages — fine for the platforms currently targeted, a decision to revisit before
+  shipping aarch64 packages to distros outside them.
+- **The CPU affinity flags are documented, and the recommendation is to leave them off.**
+  `shard_affine_dispatch` and `worker_core_affinity` were absent from every shipped config
+  and from `docs/CONFIGURATION.md`; both are now stated explicitly, with what they cost.
+  Measured with `cameodb-bench` on an 8-core Linux node, 8 shards, three repeats per arm:
+  shard-affine dispatch costs 13–20% of write throughput at concurrency 8, 16 and 32 and
+  roughly doubles write p90; pinning the workers on top adds nothing to writes and takes a
+  further 15% off search throughput with p99 roughly doubled. The cause is not the pinning —
+  a worker awaits each operation inline, so `worker_count` is the node's operation
+  concurrency, and enabling affinity forces it from `min(shards × 2, cores × 2)` down to
+  `cores` while an operation is mostly spent waiting on a shard writer rather than on CPU.
+  `writer_core_affinity` measured neutral and stays on. No default changed; what changed is
+  that the choice is now visible and evidenced rather than an unexercised flag.
 - **Shard-affine dispatch no longer collides.** Worker selection and writer-thread pinning
   both hashed the shard id, and the hash domain (the shard set) is smaller than the core
   count: with the shipped defaults — 4 shards, 8 cores — 40 affine writes reached 3 of 8

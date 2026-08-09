@@ -127,16 +127,200 @@ This document outlines the current development priorities and optimization roadm
 - ✅ **Phase 11 (Workflow Hot-Path Optimizations)**: All 7 steps completed
 - ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed
 - ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, resources, and query syntax docs completed; security moved to Phase 14, streaming/docs/testing planned
-- 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f partially done (merge thread count control implemented via `IndexWriterOptions`; core pinning and per-arena stats planned). Shard placement reworked 2026-08-08: dense ordinals replace `xxh3(shard_id) % n` on both the dispatch and writer-pinning sides, and a single `CoreLayout` reconciles `get_core_ids()` with `available_parallelism()`. `/_admin/workers` reports the pin outcome per worker and per shard, not the request. **Verified on Linux (aarch64 container, 8 cores) 2026-08-08: 8/8 workers pinned to their target cores and all four writer threads to cores 0–3, confirmed independently against `Cpus_allowed_list` in `/proc/<pid>/task/*/status` — one CPU per worker thread, one per writer, no collisions.** Pinning is a no-op on macOS, so it must be validated on Linux; the whole suite passes there too.
+- 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f partially done (merge thread count control implemented via `IndexWriterOptions`; core pinning and per-arena stats planned). Shard placement reworked 2026-08-08: dense ordinals replace `xxh3(shard_id) % n` on both the dispatch and writer-pinning sides, and a single `CoreLayout` reconciles `get_core_ids()` with `available_parallelism()`. `/_admin/workers` reports the pin outcome per worker and per shard, not the request. **Verified on Linux (aarch64 container, 8 cores) 2026-08-08: 8/8 workers pinned to their target cores and all four writer threads to cores 0–3, confirmed independently against `Cpus_allowed_list` in `/proc/<pid>/task/*/status` — one CPU per worker thread, one per writer, no collisions.** Pinning is a no-op on macOS, so it must be validated on Linux; the whole suite passes there too. **Measured 2026-08-09 and re-measured 2026-08-10 (see "Worker concurrency, measured"): Stages 2d and 2e cost throughput rather than gaining it, and both flags stay off. The first diagnosis blamed the per-worker serial loop from Stage 2; that loop is gone as of 2026-08-10 and the flags still lose, so the cause is the affine constraint itself — a shard's jobs may only run on one worker, and skew leaves workers idle.**
 - 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) complete, landed 2026-08-08 — steps 1–5 plus hardening (6a) and documentation (6b): credential model, `keygen`, `[security]` config, enforcement at the HTTP/MCP ingress with capability and index scoping (so `external` can now start), `--api-key` / `--api-key-file` / `CAMEODB_API_KEY` on the bundled client, index list filtering, and MCP per-tool authorization with sessions bound to their key. C1–C3 planned, C3 shrunk because B1 absorbs index scoping
 
 ### **Recommended Next Steps**
-1. ~~**A latency harness.**~~ ✅ Landed 2026-08-09 as `cameodb-bench` (`crates/bench`): percentiles for writes and searches, the node's `took_ms` beside the client-observed figure, and the worker-pool delta over the measured window. Closed-loop, so runs are comparable at equal concurrency rather than being an SLA. Phase 13's "write p99 reduced by 20-40%" is now measurable — **but not yet measured**: no before/after run has been recorded, and the flags whose effect it would show are still off by default (step 2)
-2. **Document and default the affinity flags.** `shard_affine_dispatch` and `worker_core_affinity` are absent from every shipped config and from `docs/CONFIGURATION.md`, and both default `false` — so Stages 2a/2d/2e are code no deployment runs. Hold the "turn these on" recommendation until step 1 can justify it
-3. **Take unkeyed searches off the coordinator.** A keyed write now resolves locally from the published ring and shard placement, but a search still pays a mailbox round trip to a single actor because the decision depends on cluster size, which the router has no cheap way to know. Needs the node count published alongside the ring
-4. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats — the largest and least certain of these, and the one that most needs step 1 first
-5. **Phase 14 Stage C1–C3**: MCP rate limiting, audit logging, per-index role overrides — B1 is complete (steps 1–5 plus the 6a hardening and 6b documentation passes)
-6. **Phase 12 remaining**: MCP streaming, documentation, integration tests
+1. ~~**A latency harness.**~~ ✅ Landed 2026-08-09 as `cameodb-bench` (`crates/bench`): percentiles for writes and searches, the node's `took_ms` beside the client-observed figure, and the worker-pool delta over the measured window. Closed-loop, so runs are comparable at equal concurrency rather than being an SLA
+2. ~~**Document and default the affinity flags.**~~ ✅ Landed 2026-08-09, and the answer was *no*: see "The affinity flags, measured" below. Both stay `false`, now present and explained in `cameodb.example.toml`, `crates/server/cameodb.toml`, `docker/cameodb-docker.toml` and `docs/CONFIGURATION.md`
+3. ~~**Give a worker more than one operation at a time.**~~ ✅ Landed 2026-08-10. A worker now carries up to 8 operations, bounded by a semaphore acquired *before* the receive so the channel stays the backpressure signal. Worth **+65-70% write throughput and −64% on p90** where the pool is the constraint, and nothing where it is not — see "Worker concurrency, measured". It did *not* redeem the affinity flags, which was the other reason to do it
+4. ~~**A bounded linger before the writer commits.**~~ ❌ Built and rejected 2026-08-10 — no measurable gain at any concurrency tested, and the arrival arithmetic says there cannot be one against a closed-loop client. Removed; the reasoning is recorded in "Mixed read/write load, measured" so it is not rebuilt. **An open-loop load generator is the prerequisite for revisiting it** — and is worth having anyway, since every number in this document is closed-loop
+5. **The cost of a durable commit under read load.** What the linger was meant to paper over, still open: a commit costs ~12.5ms with searches running against ~4.6ms without, and `wal_sync = false` recovers +86% of write throughput. The lever is the fsync itself — WAL device and placement, or a durability level between "every commit" and "none" — not how the writer groups writes
+6. **Take unkeyed searches off the coordinator.** A keyed write now resolves locally from the published ring and shard placement, but a search still pays a mailbox round trip to a single actor because the decision depends on cluster size, which the router has no cheap way to know. Needs the node count published alongside the ring
+7. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats. No longer blocked behind step 3 — but the evidence against it got stronger, not weaker. Per-arena jemalloc stats are worth having on their own; more *pinning* now has two independent measurements saying it does not pay, and should not be attempted without a specific hypothesis neither of them covers
+8. **Phase 14 Stage C1–C3**: MCP rate limiting, audit logging, per-index role overrides — B1 is complete (steps 1–5 plus the 6a hardening and 6b documentation passes)
+9. **Phase 12 remaining**: MCP streaming, documentation, integration tests
+
+### **The affinity flags, measured**
+
+Recorded 2026-08-09 with `cameodb-bench` against a Linux node in a container (aarch64,
+8 cores, 8 shards, `wal_sync = true`), client on the host, three repeats per arm, medians.
+Every arm ran from an empty data volume.
+
+| Arm | write ok/s @c16 | write p90 | write p99 | search ok/s @c16 | search p99 |
+|---|---|---|---|---|---|
+| no affinity at all | 3 339 | 6.57ms | 11.59ms | — | — |
+| `writer_core_affinity` only (the default) | 3 375 | 6.63ms | 11.12ms | 5 055 | 8.3ms |
+| `+ shard_affine_dispatch` | 2 797 | 10.15ms | 17.39ms | 4 850 | 8.9ms |
+| `+ worker_core_affinity` | 2 815 | 9.94ms | 18.90ms | 4 320 | 16.5ms |
+
+The write regression held at concurrency 8, 16 and 32 — 13% to 20% — so it is not an artifact
+of one operating point. Pinning was confirmed to have actually taken effect in each arm via
+`/_admin/workers` (8/8 workers on their target cores, writers on cores 0–7), not assumed.
+
+**Stages 2d and 2e are a loss as built, and the reason is Stage 2's worker loop, not the
+pinning.** A worker awaits `execute` inline, so it carries exactly one operation; enabling
+affine dispatch forces `worker_count` from `min(shards × 2, cores × 2)` down to `cores`, which
+halves the node's in-flight operations. That would be fine if workers were CPU-bound, but an
+operation is mostly spent awaiting the shard writer — the node sat at ~135% CPU of 800%
+available during the write runs. Affine assignment also loads workers unevenly where
+round-robin does not, which is why the loss persists even at concurrency 8 where 8 workers
+should be enough. Searches fail differently: they *are* CPU-heavy (~530% during search runs)
+and fan out across every shard, so pinning the driving worker to one core is a plain loss.
+
+Writer pinning itself is free — neutral against no affinity at all — and is what gives the
+other two something to align to, so it stays on.
+
+The dense-ordinal placement work was still worth doing: it is what makes the flags
+measurable at all, and `xxh3`-based placement was strictly worse than what was measured here
+(it left cores empty).
+
+> **Superseded in part, 2026-08-10.** The closing prediction here — that the flags would pay
+> off once a worker could carry several operations — was tested and is wrong. The diagnosis
+> of *why* the flags lose was incomplete rather than the measurement: see "Worker
+> concurrency, measured" below.
+
+### **Worker concurrency, measured**
+
+Recorded 2026-08-10 with `cameodb-bench`, same rig as above (Linux container, aarch64,
+8 cores, 8 shards, `wal_sync = true`), client on the host, three repeats per point, medians,
+every run from an empty data volume. The host was otherwise idle — a first attempt at this
+sweep ran while the machine was compiling and produced nothing but noise.
+
+**How wide should a worker be?** `default.toml`, single writes, concurrency 64:
+
+| width | write ok/s | p50 | p90 | p99 |
+|---|---|---|---|---|
+| 1 (the old inline loop) | 4 178 | 11.32ms | 29.30ms | 81.75ms |
+| 2 | 5 438 | 9.26ms | 18.61ms | 78.78ms |
+| 4 | 6 826 | 7.58ms | 11.25ms | 77.08ms |
+| **8 (chosen)** | **7 118** | 7.68ms | **10.45ms** | 61.53ms |
+| 16 | 6 444 | 7.97ms | 11.42ms | 88.44ms |
+
+**+70% throughput and p90 down 64%** against the pre-change baseline, and the curve turns
+over rather than flattening: every width-8 repeat beat every width-16 repeat, and width 8's
+worst repeat beat width 4's median. Eight is a measured peak, not the largest value tried.
+
+The width-8 point was then re-measured on the final build — constant compiled in, sweep hook
+removed, worker loop refactored to take its operation runner as a parameter — and came back
+at **6 901 ok/s median over six runs** (5 690 … 7 079) against the sweep's 7 118 over three.
+That is +65% rather than +70% on the same baseline. The two sets overlap and the spread is
+wider than the gap, so this is not evidence of a cost in the refactor; it is the honest width
+of the measurement. Quote the range, not the best number in it.
+
+The control matters as much as the sweep. At **concurrency 16 the same widths are flat**
+(4 293 / 3 906 / 4 023 / 4 156 ok/s, within run-to-run spread), and they should be: the
+default pool is 16 workers, so even at width 1 the node can hold every request a closed-loop
+client at c16 has outstanding. Width only buys anything once demand exceeds `worker_count`.
+Read that as the scope of the win — this is a saturation fix, not a free speed-up.
+
+**The affinity flags were re-measured at width 8, and they still lose.** This is the part
+that did not go as predicted:
+
+| Arm | write ok/s @c64 | write p99 | search ok/s @c16 | search p99 |
+|---|---|---|---|---|
+| default (writer pinning only) | 7 118 | 61.53ms | 6 326 | 5.75ms |
+| `+ shard_affine_dispatch` | 5 393 | 141.62ms | 6 298 | 5.78ms |
+| `+ worker_core_affinity` | 6 735 | 92.78ms | 5 618 | 8.62ms |
+
+Affine dispatch costs 24% of write throughput with a worker eight operations wide, and the
+separation is clean: default's *worst* repeat (6 995) beat every affinity repeat. The affine
+and pinned write arms are noisier than the default one and their ranges overlap, so the
+ordering *between* them is not resolved here — only that both sit below the default.
+
+So the earlier diagnosis was half right. Halving `worker_count` did hurt, but it was never
+the whole story, and the surviving cause is the constraint itself: a job for shard S may only
+run on worker `S % worker_count`, so any instantaneous skew across shards leaves workers idle
+while their neighbours queue. Round-robin cannot be unlucky that way. Searches confirm the
+split from the other side — affine dispatch is *neutral* for them, because searches dispatch
+round-robin regardless, while pinning the driving worker costs 11% and half again on p99.
+
+Both flags stay off, now for a reason that has survived a test designed to overturn it.
+
+### **Mixed read/write load, measured**
+
+Recorded 2026-08-10, same rig. **Every performance number this repository had published
+until now was taken with writes alone or searches alone.** Running them together is a
+different machine, and the question it answers — should reads and writes be isolated onto
+separate cores? — could not have been answered by any earlier arm.
+
+| workload | alone @c16 | in mixed @c16 | change |
+|---|---|---|---|
+| writes | 4 074 ok/s, p99 8.5ms | 1 776 ok/s, p99 27.0ms | **−56%, p99 3.2x** |
+| searches | 5 880 ok/s, p99 6.5ms | 3 284 ok/s, p99 15.4ms | −44%, p99 2.4x |
+
+Container CPU during the mixed runs sat at **~620% of 800% — one and a half to two cores
+idle** while both workloads lost roughly half their throughput. Work is being lost, not
+shared, so there is real headroom here.
+
+**It is not a core-contention problem, and core isolation would not fix it.** Three results
+say so, and the first was a hypothesis this section set out to confirm:
+
+- **Unpinning the writers changed nothing** (1 758 vs 1 776 ok/s). The theory was that a
+  pinned writer returning from fsync cannot resume until *its* core is free, even with other
+  cores idle. Measured, and false.
+- **Capping the read pool helps a little, consistently**: `search_threads` 16 -> 6 moved
+  search p99 15.44 -> 12.49ms and write p99 27.0 -> 23.1ms, and collapsed run-to-run spread
+  from 1 477-1 853 to 1 837-1 842. `= 8`, the code default, lands between the two. Bounded
+  read concurrency is the mechanism this design already chose over partitioning, and it
+  works — modestly.
+- **The write path is waiting on disk, not CPU.** With `wal_sync = false` under the same
+  mixed load, writes go 1 837 -> 3 416 ok/s (+86%), write p99 23.1 -> 12.1ms, and CPU rises
+  to ~724% as searches finally start competing for cores in earnest.
+
+Partitioning cores would take cores from searches — the one workload here that *is*
+CPU-bound, drawing ~600% of 800% on its own — to give them to writers that need ~127% and
+spend most of it blocked in `fsync`. That is the same trade `worker_core_affinity` already
+lost by 11%.
+
+**What actually limits mixed writes is the cost of each commit.** The shard writer already
+coalesces: it drains every queued command and merges same-index writes into one redb
+transaction, so one fsync serves the whole group. Measured mean group size:
+
+| case | write ok/s | mean coalesced group | implied cost per commit |
+|---|---|---|---|
+| pure write @c64 | 6 669 | 4.49 | ~5.4ms |
+| pure write @c16 | 4 165 | 2.40 | ~4.6ms |
+| mixed @c16 | 1 597 | 2.49 | **~12.5ms** |
+
+Coalescing does not degrade under mixed load — 2.49 against 2.40. The *commit* gets three
+times more expensive, because tantivy segment reads contend with WAL fsync for IO and page
+cache. And the group cannot grow to absorb it: the writer commits whatever is queued at that
+instant, and at concurrency 16 across 8 shards only about two writes are ever in flight per
+shard.
+
+The obvious response is a **bounded linger before commit** — wait a short, capped interval
+for more writes rather than committing the two already queued, amortising a 12.5ms fsync
+over 8 writes instead of 2.5.
+
+**It was built and measured on 2026-08-10, and it does not pay. The code was removed.**
+Lingering only when the instant drain already found company (so an isolated write never
+waits), swept at 200µs / 500µs / 1000µs against a 0µs control, three repeats at c16 mixed
+and c16 pure, then six at c64 where it had the best chance:
+
+| linger | mixed write ok/s @c16 | pure write ok/s @c16 | pure write ok/s @c64 (n=6) |
+|---|---|---|---|
+| 0 (control) | 1 851 | 4 272 | 6 435 |
+| 200µs | 1 938 | 4 429 | 6 803 |
+| 500µs | 1 782 | 4 299 | — |
+| 1000µs | 1 718 | 4 348 | — |
+
+Every arm has a bad repeat and the between-arm gaps are smaller than the within-arm scatter;
+at c64 the two distributions overlap almost entirely and the 200µs arm owns the single worst
+run of the twelve. Nothing here is resolvable.
+
+The arithmetic says why, and it is the useful part. At c16 the node writes ~1 850/s across 8
+shards — 231/s per shard, so **0.046 writes arrive at a shard during a 200µs window**; at
+c64 it is still only ~0.18. Worse, the bench client is closed-loop, so it cannot issue the
+next write until the current one is answered: the writer would be waiting for writes that
+cannot arrive until it commits and replies. **The linger waits on itself.**
+
+A linger can only work where many independent clients hold requests outstanding at once —
+an open-loop arrival process. Do not rebuild it from the reasoning above without first
+having a workload generator that can produce one; against this harness it is untestable, and
+against a closed-loop client it is provably useless. The remaining honest levers on mixed
+write cost are the fsync itself (device, `wal_sync`, WAL placement) rather than how the
+writer groups.
 
 ---
 
@@ -897,9 +1081,24 @@ HTTP search. Nothing has shipped with the old names.
 
 ### Stage C: Defense in Depth (post-auth)
 
-**C1 — MCP-Specific Limits** 🟡 MEDIUM
-- Rate limiting per session/key on MCP tool invocations (especially for `reader` keys held by AI agents)
-- Query complexity caps: max boolean clauses, max prefix-expansion terms, per-request timeout already exists — wire it into MCP path
+**C1 — MCP-Specific Limits** ✅ COMPLETED (rate limiting; complexity caps deferred)
+- ✅ **Rate limiting landed 2026-08-10.** `[security.limits]`, a token bucket per key, off by
+  default. Enforced in the `tools/call` arm *before* the capability check, so a refusal does
+  not leak which tools the key could otherwise call, and the budget is shared across tools
+  because what it bounds is the node's cost, not any one tool's frequency. Metered by
+  `key_id` rather than by session: a session id is chosen by the caller's host, so metering
+  per session would let an agent reset its own limit by reconnecting. Policy lives in the
+  server crate behind a `McpBackend` hook — the `mcp` crate keeps no deployment opinions,
+  the same split B1 used for authorization. Nine tests, three of them end to end
+  (`crates/server/tests/mcp_rate_limit.rs`)
+- 💭 **Query complexity caps — deferred, not planned.** Max boolean clauses, max
+  prefix-expansion terms, and wiring the existing per-request timeout into the MCP path.
+  Judged unnecessary at this stage of the auth module: rate limiting already bounds what a
+  key costs the node per unit time, which is the resource-exhaustion risk C1 was written
+  for, and a per-request timeout already exists on the HTTP path. A single expensive query
+  is a different and much narrower problem than a loop of ordinary ones. Revisit if a
+  workload appears where one query — not a stream of them — is the threat; the two
+  `parse_query_lenient` call sites in `crates/storage/src/lib.rs` are where a cap would go
 - Per-key index scoping is covered in B1 (`allowed_indexes`, all roles), as is the failure counting this stage would rate-limit on
 
 **C2 — Audit Logging** 🟡 MEDIUM

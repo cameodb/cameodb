@@ -20,6 +20,7 @@ mod distributed;
 mod http_server;
 mod node_orchestrator;
 mod posture;
+mod ratelimit;
 mod remote_peer_pool;
 mod swarm;
 
@@ -506,6 +507,9 @@ async fn main() -> Result<()> {
         coordinator: coordinator_actor.clone(),
         stream_batch_size: cameodb_config.search.stream_batch_size,
         max_record_size_bytes: cameodb_config.max_record_size_mb * 1024 * 1024,
+        tool_limiter: std::sync::Arc::new(ratelimit::ToolRateLimiter::new(
+            cameodb_config.security.limits.clone(),
+        )),
     };
 
     // Create the HTTP router with shared state and body limit derived from max_record_size_mb

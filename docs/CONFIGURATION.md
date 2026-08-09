@@ -160,11 +160,116 @@ max_shards_per_node = 8
 
 # Pin each shard's writer thread to a dedicated CPU core (default: true)
 writer_core_affinity = true
+
+# Route a shard's operations to one worker (default: false)
+shard_affine_dispatch = false
+
+# Pin each orchestrator worker to its own core (default: false)
+worker_core_affinity = false
 ```
 
-#### Core Pinning (`writer_core_affinity`)
+#### CPU affinity
 
-When enabled, each shard's dedicated writer thread is pinned to a CPU core determined by `xxh3_64(shard_uuid) % num_cores`. This keeps redb/tantivy data structures cache-hot and reduces scheduling jitter on the write hot path. Zero behavioral change when disabled (OS scheduler manages thread placement).
+Three flags, and only the first is on. All three place threads by a shard's **placement
+ordinal** — a dense counter assigned when the shard is first seen, so shard ordinals are
+`0, 1, 2, …` and map onto cores without collisions. Placement is not a hash of the shard
+UUID; a hash leaves cores empty and doubles up on others.
+
+The core budget is `min(get_core_ids().len(), available_parallelism())`, so a container with
+a CPU quota pins within the quota rather than to cores the scheduler will never give it.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `writer_core_affinity` | `true` | Each shard's writer thread pinned to `core[ordinal]` |
+| `shard_affine_dispatch` | `false` | Operations for a shard go to `worker[ordinal]` |
+| `worker_core_affinity` | `false` | Each worker is an OS thread pinned to `core[worker_id]` |
+
+The last two compose: `worker_core_affinity` requires the other two and is otherwise a
+silent no-op.
+
+**Turning the last two on makes things slower.** Measured with `cameodb-bench` on an
+8-core aarch64 Linux node, 8 shards, three repeats per arm, medians:
+
+| Arm | write ok/s @16 | write p90 | search ok/s @16 | search p99 |
+|---|---|---|---|---|
+| no affinity at all | 3 339 | 6.57ms | — | — |
+| `writer_core_affinity` only (default) | 3 375 | 6.63ms | 5 055 | 8.3ms |
+| `+ shard_affine_dispatch` | 2 797 | 10.15ms | 4 850 | 8.9ms |
+| `+ worker_core_affinity` | 2 815 | 9.94ms | 4 320 | 16.5ms |
+
+Writer pinning is free — neutral against no affinity at all, and it is what gives the other
+two something to align to. Shard-affine dispatch costs 13–20% of write throughput at every
+concurrency tested (8, 16 and 32) and roughly doubles write p90. Pinning the workers on top
+adds nothing to writes and takes a further 15% off search, with p99 roughly doubled.
+
+The cause is not the pinning, and it is worth being precise about what it *is*, because the
+first answer turned out to be incomplete.
+
+Enabling affine dispatch forces `worker_count` down from `min(shards × 2, cores × 2)` to
+`cores`. At the time of that first run a worker awaited each operation inline, so halving the
+pool halved the node's operation concurrency, and that looked like the whole explanation. It
+was testable, and it was tested: a worker now carries eight operations at once, and the flags
+were re-measured on the same rig (2026-08-10, concurrency 64, where the pool is actually the
+constraint).
+
+| Arm | write ok/s @64 | write p99 | search ok/s @16 | search p99 |
+|---|---|---|---|---|
+| `writer_core_affinity` only (default) | 7 118 | 61.53ms | 6 326 | 5.75ms |
+| `+ shard_affine_dispatch` | 5 393 | 141.62ms | 6 298 | 5.78ms |
+| `+ worker_core_affinity` | 6 735 | 92.78ms | 5 618 | 8.62ms |
+
+Affine dispatch still costs 24% of write throughput, and the default arm's worst repeat beat
+every affinity repeat. What remains is the constraint itself: a job for shard S may only run
+on worker `S % worker_count`, so any instantaneous skew across shards leaves workers idle
+while their neighbours queue — round-robin cannot be unlucky that way. Searches show the same
+thing from the other side: affine dispatch is *neutral* for them, because searches dispatch
+round-robin regardless, while confining the driving worker to one core costs 11% and half
+again on p99 (searches are CPU-heavy and fan out across every shard).
+
+So leave them off. Two independent measurements now say so, the second designed to overturn
+the first.
+
+### Sizing the read pool
+
+`search_threads` bounds how many searches may run at once. It is the mechanism this design
+uses instead of partitioning cores between readers and writers, and it is the one knob in
+this area that measurably helps.
+
+Keep it **at or below the number of cores the node actually has** — in a container, the
+cores the container is given, not the host's. Reads share cores with the pinned shard
+writers; allowing more concurrent searches than there are cores does not create throughput,
+it moves queueing out of the pool and into the kernel scheduler, where the write path pays
+for it too.
+
+Measured on an 8-core node under simultaneous read and write load:
+
+| `search_threads` | write ok/s | write p99 | search ok/s | search p99 |
+|---|---|---|---|---|
+| 16 (2x cores) | 1 776 | 27.0ms | 3 284 | 15.44ms |
+| 8 (= cores, the default) | 1 895 | 22.3ms | 3 329 | 13.46ms |
+| 6 | 1 837 | 23.1ms | 3 434 | 12.49ms |
+
+Oversizing was worse on every axis, and it was also far less *predictable*: run-to-run write
+throughput spread 1 477-1 853 at 16 against 1 837-1 842 at 6. `docker/cameodb-docker.toml`
+shipped 16 and now ships the default 8.
+
+### What mixed read/write load costs
+
+Worth knowing before you size anything from the numbers above them: run searches and writes
+at the same time and both drop by roughly half — writes 4 074 -> 1 776 ok/s, searches
+5 880 -> 3 284, on a node with one and a half cores still idle. The cause is not core
+contention (unpinning the writers changes nothing) but the cost of a durable commit: with
+searches running, a WAL fsync competes with tantivy segment reads for IO and page cache, and
+the per-commit cost roughly triples. Setting `wal_sync = false` recovers most of the write
+throughput, at the durability cost that implies.
+
+Plan capacity from a mixed measurement, not from a single-workload one.
+
+Pinning is a no-op on macOS. It is reported as requested-and-refused rather than silently
+ignored: `GET /_admin/workers` returns `pinning_requested`, `pinned_workers` and a
+`target_core_id`/`core_id` pair per worker, so a config that asked for pinning and did not
+get it is visible. Check that endpoint rather than assuming a flag took effect — this is
+how the table above was produced.
 
 ### Cluster Configuration
 
@@ -287,6 +392,39 @@ you only discover on the day you turn authentication on. These all refuse to sta
 - two entries with the same hash — one key cannot hold two roles
 - `allowed_indexes = []`, which reads as "no restriction" but means "no index at all"
 
+### Rate limiting MCP tool calls (`[security.limits]`)
+
+```toml
+[security.limits]
+tool_calls_per_minute = 120   # 0 (the default) disables limiting entirely
+tool_call_burst = 30          # spendable at once; 0 means one minute's worth
+```
+
+Authentication answers *who*, and `allowed_indexes` answers *what*. Neither says anything
+about **how often**, and the caller this matters for is not an attacker: it is a legitimate
+`reader` key held by an agent that decides to call `search_indexes` in a loop. Every one of
+those calls is authorized, and a search fans out across every shard, so the loop costs the
+node far more than it costs the agent.
+
+A token bucket rather than a fixed window. Agent traffic is bursty by nature — a plan, then
+a flurry of lookups, then a pause — and a fixed window either refuses the flurry or is set
+so loose it never bites. The bucket lets the burst through and meters the sustained rate.
+
+Points worth knowing:
+
+- **Metered per key**, so one noisy agent cannot refuse another. With `[security]` off there
+  is no identity to meter, and every caller shares a single bucket.
+- **Charged before the tool runs**, and before the per-tool capability check — so being rate
+  limited never reveals which tools a key would otherwise be allowed to call.
+- **The budget is shared across tools.** It bounds what a key costs the node, not how often
+  it may call any one thing.
+- **A refusal names a wait**: `Rate limit exceeded for tool 'x'. Retry after Ns.`, returned
+  as an MCP tool error (`isError: true`) rather than a transport failure, because the
+  request was well-formed and the tool simply did not run. Agents that are given a number
+  back off correctly; ones told only "too many requests" usually retry immediately.
+
+Off by default: an upgrade must not start refusing calls a deployment used to serve.
+
 ### Minting keys
 
 ```bash
@@ -387,6 +525,8 @@ max_shards_per_node = 50
 [search]
 indexer_memory_max_mb = 512
 total_memory_limit_mb = 4096
+# Sized for a host with at least this many cores — see "Sizing the read pool" below.
+# Exceeding the core count costs the write path more than it gains the read path.
 search_threads = 16
 ```
 
@@ -417,6 +557,9 @@ total_memory_limit_mb = 8192
 
 # Aggressive memory usage
 memory_pressure_threshold_percent = 90
+# Assumes >= 16 cores. This is a ceiling on concurrent searches, not a throughput dial:
+# past the core count it buys queueing in the kernel instead of queueing in the pool, and
+# the write path pays for it. See "Sizing the read pool".
 search_threads = 16
 default_batch_size = 2000
 ```
@@ -497,6 +640,8 @@ wal_segment_size_mb = 128
 default_batch_size = 1000
 max_shards_per_node = 20
 writer_core_affinity = true
+shard_affine_dispatch = false   # measured a regression; see "CPU affinity" above
+worker_core_affinity = false    # ditto
 
 [search]
 indexer_memory_min_mb = 64

@@ -55,6 +55,16 @@ enabled = false
 # label = "team-a"
 # allowed_indexes = ["docs", "wiki"]    # honored for every role; omit to allow all
 
+# What one caller may spend on MCP tool calls. Off by default.
+#
+# Aimed at a legitimate key held by an AI agent that loops: every call is authorized, and
+# the capability model has nothing to say about how often. A token bucket, so a burst is
+# allowed through and the sustained rate is metered — which is the shape agent traffic
+# actually has. Metered per key, so one noisy agent cannot refuse another.
+# [security.limits]
+# tool_calls_per_minute = 120           # 0 (default) disables limiting entirely
+# tool_call_burst = 30                  # spendable at once; 0 means one minute's worth
+
 [network.cluster]
 enabled = false
 bind_address = "0.0.0.0"
@@ -90,7 +100,21 @@ wal_segment_size_mb = 64
 default_batch_size = 5000
 num_shards_init = 4
 max_shards_per_node = 8
+
+# Pin each shard's writer thread to the core matching its placement ordinal, keeping that
+# shard's redb and tantivy structures cache-hot. Measured neutral; a no-op on macOS.
 writer_core_affinity = true
+
+# The two flags below are measured regressions on an 8-core node. They are here so the
+# choice is visible rather than hidden in a default. Leave them false unless you are
+# measuring them yourself with `cameodb-bench`. See docs/CONFIGURATION.md.
+#
+# Route a shard's operations to the worker with the same ordinal: -13 to -20% write
+# throughput, write p90 roughly doubled.
+shard_affine_dispatch = false
+# Additionally pin each worker to its own core: -15% search throughput, search p99 roughly
+# doubled. Requires both flags above to have any effect.
+worker_core_affinity = false
 
 [search]
 indexer_memory_min_mb = 32

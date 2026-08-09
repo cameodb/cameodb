@@ -3,6 +3,7 @@
 //! Provides REST API endpoints for distributed hybrid-search operations
 //! using Axum web framework with streaming support.
 
+use crate::ratelimit::ToolRateLimiter;
 use axum::{
     Extension, Json, Router,
     body::Body,
@@ -15,7 +16,7 @@ use axum::{
 use bytes::BytesMut;
 use cameodb_mcp::{
     MCP_SESSION_ID_HEADER, McpAuthzRef, McpBackend, McpIndexSearchRequest, McpShutdownHandle,
-    mcp_router,
+    RateLimitVerdict, mcp_router,
 };
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use kameo::actor::ActorRef;
@@ -243,6 +244,9 @@ pub struct AppState {
     /// the request as a whole, but one unterminated line could still buffer the entire
     /// allowance in memory, so the per-record cap is what keeps peak memory bounded.
     pub max_record_size_bytes: usize,
+    /// Per-key budget for MCP tool calls. Shared across every request, because a rate limit
+    /// that reset per connection would not be one.
+    pub tool_limiter: Arc<ToolRateLimiter>,
 }
 
 impl McpBackend for AppState {
@@ -841,6 +845,29 @@ impl McpBackend for AppState {
 
             state.get_index(resource.to_string()).await
         })
+    }
+
+    /// Charge one token against the calling key's budget.
+    ///
+    /// Attributed by `key_id`, not by session: a session id is chosen by the caller's host
+    /// and a new one is a header away, so metering per session would let an agent reset its
+    /// own limit by reconnecting. The key is the thing an operator issued and can revoke.
+    fn check_tool_rate(&self, authz: McpAuthzRef, tool: &str) -> RateLimitVerdict {
+        match self.tool_limiter.check(authz.key_id().as_deref()) {
+            crate::ratelimit::Verdict::Allow => RateLimitVerdict::Allow,
+            crate::ratelimit::Verdict::Deny { retry_after_secs } => {
+                // Worth a line each: this needs a valid key, so its volume is bounded by
+                // someone who already holds credentials — the same reasoning that keeps a
+                // 403 unthinned in `authz`.
+                warn!(
+                    key_id = authz.key_id().unwrap_or_else(|| "-".to_string()),
+                    tool = tool,
+                    retry_after_secs = retry_after_secs,
+                    "MCP tool call refused: rate limit exceeded"
+                );
+                RateLimitVerdict::Deny { retry_after_secs }
+            }
+        }
     }
 }
 

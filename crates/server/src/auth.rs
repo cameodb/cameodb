@@ -300,6 +300,13 @@ pub struct SecurityConfig {
     /// override stays distinguishable from a file entry when either is reported in an error.
     #[serde(skip)]
     pub override_key: Option<ApiKeyConfig>,
+
+    /// `[security.limits]` — what a caller may spend on MCP tool calls.
+    ///
+    /// Under `[security]` rather than a section of its own because it is enforced against an
+    /// authenticated identity: the thing being metered is a *key*, and a key is this
+    /// section's subject. Inert by default.
+    pub limits: crate::ratelimit::McpLimitsConfig,
 }
 
 /// One `[[security.api_keys]]` entry, exactly as written.
@@ -835,6 +842,7 @@ mod tests {
             enabled: true,
             api_keys: vec![entry(&key.digest().to_config_value(), Role::Writer)],
             override_key: None,
+            ..Default::default()
         };
         let ring = config.load_keyring().unwrap();
 
@@ -867,6 +875,7 @@ mod tests {
             enabled: true,
             api_keys: vec![entry(&digest.to_config_value(), Role::Admin)],
             override_key: None,
+            ..Default::default()
         };
         let ring = config.load_keyring().unwrap();
         assert!(ring.authenticate(passphrase).is_none());
@@ -926,6 +935,7 @@ mod tests {
                 ..Default::default()
             }],
             override_key: None,
+            ..Default::default()
         };
         assert!(
             no_role
@@ -943,6 +953,7 @@ mod tests {
                 ..Default::default()
             }],
             override_key: None,
+            ..Default::default()
         };
         let err = no_hash.load_keyring().unwrap_err().to_string();
         assert!(err.contains("key_hash"), "{err}");
@@ -957,6 +968,7 @@ mod tests {
             enabled: true,
             api_keys: vec![entry(&hash, Role::Reader), entry(&hash, Role::Admin)],
             override_key: None,
+            ..Default::default()
         };
         let err = config.load_keyring().unwrap_err().to_string();
         assert!(err.contains("already configured"), "{err}");
@@ -971,6 +983,7 @@ mod tests {
                 ..entry(&KeyDigest::of_token("x").to_config_value(), Role::Reader)
             }],
             override_key: None,
+            ..Default::default()
         };
         let err = config.load_keyring().unwrap_err().to_string();
         assert!(err.contains("allowed_indexes"), "{err}");
@@ -983,6 +996,7 @@ mod tests {
             enabled: false,
             api_keys: vec![entry("not-a-hash", Role::Admin)],
             override_key: None,
+            ..Default::default()
         };
         assert!(config.load_keyring().is_err());
     }
@@ -1010,6 +1024,7 @@ mod tests {
             enabled: true,
             api_keys: keys,
             override_key: None,
+            ..Default::default()
         }
         .load_keyring()
         .unwrap();
@@ -1027,6 +1042,7 @@ mod tests {
                 Role::Reader,
             )],
             override_key: None,
+            ..Default::default()
         }
         .load_keyring()
         .unwrap();
@@ -1042,6 +1058,7 @@ mod tests {
             enabled: true,
             api_keys: vec![entry(&digest.to_config_value(), Role::Reader)],
             override_key: None,
+            ..Default::default()
         }
         .load_keyring()
         .unwrap();
@@ -1067,6 +1084,7 @@ mod tests {
                 ..Default::default()
             }],
             override_key: None,
+            ..Default::default()
         };
         let ring = config.load_keyring().unwrap();
         assert_eq!(ring.entries()[0].role(), Role::Admin);
@@ -1092,6 +1110,7 @@ mod tests {
                 ..Default::default()
             }],
             override_key: None,
+            ..Default::default()
         };
         let err = format!("{:#}", config.load_keyring().unwrap_err());
         assert!(err.contains("/nonexistent/cameodb/key"), "{err}");
@@ -1109,6 +1128,7 @@ mod tests {
                 ..Default::default()
             }],
             override_key: None,
+            ..Default::default()
         };
         let ring = config.load_keyring().unwrap();
         assert_eq!(ring.entries()[0].key_id(), inline.key_id());

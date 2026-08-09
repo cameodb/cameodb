@@ -358,6 +358,31 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
         uri: String,
         authz: McpAuthzRef,
     ) -> BoxFuture<'_, Result<JsonValue, String>>;
+
+    /// May this caller invoke another tool right now?
+    ///
+    /// Asked once per `tools/call`, before the tool runs and before its arguments are
+    /// interpreted, so a refused call costs a hash lookup rather than a search.
+    ///
+    /// The policy lives in the host for the same reason authorization does: this crate
+    /// speaks MCP and must not acquire opinions about how a deployment is configured. It
+    /// asks the question; the host answers it. The default allows everything, so a host that
+    /// configures no limits — and every existing implementation of this trait — is unchanged.
+    fn check_tool_rate(&self, _authz: McpAuthzRef, _tool: &str) -> RateLimitVerdict {
+        RateLimitVerdict::Allow
+    }
+}
+
+/// The host's answer to [`McpBackend::check_tool_rate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitVerdict {
+    Allow,
+    /// Refused. `retry_after_secs` is what the caller is told to wait — an agent that gets a
+    /// number can back off correctly, where one that gets "too many requests" will usually
+    /// retry immediately and make it worse.
+    Deny {
+        retry_after_secs: u64,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -993,27 +1018,46 @@ where
         )),
         "tools/call" => Some(
             match serde_json::from_value::<ToolCallParams>(request.params) {
-                Ok(params) => match call_tool(backend, params, authz).await {
-                    Ok(result) => success_response(
+                // Checked here rather than inside `call_tool` so the refusal precedes both
+                // the capability check and the tool body: a caller being rate limited should
+                // not learn, from the shape of the refusal, which tools it would otherwise
+                // be allowed to run.
+                Ok(params) => match backend.check_tool_rate(Arc::clone(authz), &params.name) {
+                    RateLimitVerdict::Deny { retry_after_secs } => success_response(
                         request.id,
                         json!({
                             "content": [{
                                 "type": "text",
-                                "text": json_to_pretty_string(&result),
-                            }],
-                            "isError": false,
-                        }),
-                    ),
-                    Err(err) => success_response(
-                        request.id,
-                        json!({
-                            "content": [{
-                                "type": "text",
-                                "text": err,
+                                "text": format!(
+                                    "Rate limit exceeded for tool '{}'. Retry after {retry_after_secs}s.",
+                                    params.name
+                                ),
                             }],
                             "isError": true,
                         }),
                     ),
+                    RateLimitVerdict::Allow => match call_tool(backend, params, authz).await {
+                        Ok(result) => success_response(
+                            request.id,
+                            json!({
+                                "content": [{
+                                    "type": "text",
+                                    "text": json_to_pretty_string(&result),
+                                }],
+                                "isError": false,
+                            }),
+                        ),
+                        Err(err) => success_response(
+                            request.id,
+                            json!({
+                                "content": [{
+                                    "type": "text",
+                                    "text": err,
+                                }],
+                                "isError": true,
+                            }),
+                        ),
+                    },
                 },
                 Err(err) => error_response(
                     request.id,

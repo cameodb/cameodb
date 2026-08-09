@@ -66,6 +66,9 @@ tikv-jemalloc-sys = { version = "0.7", features = ["stats"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Integration tests drive the built binary over HTTP. The SDK covers the REST surface, but
+# MCP is JSON-RPC over POST and has no SDK method, so those tests speak it directly.
+reqwest = { workspace = true }
 
 [package.metadata.generate-rpm]
 release = "1"

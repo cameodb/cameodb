@@ -613,6 +613,7 @@ mod tests {
             enabled: true,
             api_keys: entries,
             override_key: None,
+            ..Default::default()
         }
         .load_keyring()
         .unwrap()

@@ -4325,6 +4325,7 @@ dependencies = [
  "num_cpus",
  "rayon",
  "redb",
+ "reqwest",
  "rustls",
  "serde",
  "serde-saphyr",
