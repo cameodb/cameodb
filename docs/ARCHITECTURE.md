@@ -1,6 +1,6 @@
 # Distributed Hybrid-Search Database: Architecture Design Document
 
-**Version:** 0.2.2
+**Version:** 0.3.0
 **Stack:** Rust, Kameo (Actors), Tokio, Redb, Tantivy, Axum, Libp2p
 **Crates:** `server`, `storage`, `cluster`, `client`, `mcp`
 
@@ -337,9 +337,9 @@ CameoDB is designed as a **distributed, shared-nothing cluster**:
 
 For a detailed walkthrough of the node-side actors, routing decisions, remote flows, and metadata persistence, see:
 
-- [`crates/server/README.md`](crates/server/README.md)
+- [`docs/README.md`](README.md) — a worked distributed search, ingress to owner node and back
 
-## � Operation Routing Workflows
+## 🔀 Operation Routing Workflows
 
 Every client request follows the same top-level path: **HTTP handler → RouterActor → ClusterCoordinator routing decision → execute**. The routing decision determines whether the operation runs locally, is forwarded to a single remote node (unicast), or is fanned out to all nodes (broadcast).
 

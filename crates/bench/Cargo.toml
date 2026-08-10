@@ -1,6 +1,6 @@
 [package]
 name = "bench"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 # Not a shipped artifact. `scripts/build/build-dist.sh` packages the `cameodb` binary by
@@ -16,7 +16,7 @@ path = "src/main.rs"
 # The SDK, taken as a dependency exactly the way anything outside this repo would take it.
 # Nothing here reaches into the server crate — if a workload cannot be expressed through
 # `client`, that is a gap in the SDK, not a reason to bypass it.
-client = { path = "../client", version = "0.2.3" }
+client = { path = "../client", version = "0.3.0" }
 anyhow.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }

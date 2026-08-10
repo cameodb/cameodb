@@ -23,10 +23,10 @@ Build multi-platform images (amd64 + arm64) and push to DockerHub:
 ./scripts/build/docker-push.sh
 
 # Build + push with version tag
-./scripts/build/docker-push.sh 0.2.2
+./scripts/build/docker-push.sh 0.3.0
 
 # Build only (no push) for testing
-./scripts/build/docker-push.sh 0.2.2 --no-push
+./scripts/build/docker-push.sh 0.3.0 --no-push
 ```
 
 **Prerequisites:**
@@ -69,7 +69,7 @@ brew install syft  # macOS
 ```bash
 # From Docker image (default)
 ./scripts/security/generate-sbom.sh                    # latest tag
-./scripts/security/generate-sbom.sh 0.2.2               # specific version
+./scripts/security/generate-sbom.sh 0.3.0               # specific version
 
 # From native binary (M1 Mac, Linux)
 cargo build --release
@@ -287,6 +287,45 @@ restart. Plan for two restarts:
 Rolling this across a cluster is a rolling restart, one node at a time; a node with the new
 key configured still accepts the old one until step 4.
 
+### The audit trail
+
+Off by default. Turned on, it answers who read which index and how much each key wrote —
+which is the question an incident asks and the one nothing else here can answer.
+
+```toml
+[security.audit]
+enabled = true
+file = "/var/log/cameodb/audit.jsonl"
+max_file_bytes = 104857600      # rotate past 100 MiB
+max_files = 5                   # keep .1 … .5, oldest deleted
+```
+
+Operational points:
+
+- **The file is written by the node**, which creates the parent directory if needed and
+  rotates in place. It needs write access to that directory as the user the service runs as
+  — for the packaged systemd unit that is `cameodb`, so `install -d -o cameodb -g cameodb
+  /var/log/cameodb` before first start.
+- **Do not point `logrotate` at it.** Rotation is internal, by size; an external rotator that
+  renames the active file leaves the node writing to a file nobody can find until restart.
+- **In a container, put it on a mounted volume.** A path inside the container's own
+  filesystem is exactly as durable as the container.
+- **Budget for volume by shape, not by request rate.** Reads and admin actions cost a line
+  each; writes are counted per key and index per `rollup_secs`, so ingest volume barely moves
+  the file. A read-heavy deployment is the one to size for.
+- **Without `file`, the trail is memory only** — `buffer_capacity` records, readable at
+  `GET /_admin/audit`, gone on restart.
+- **Watch `dropped`.** `GET /_admin/audit` reports a running total of records lost to a full
+  writer queue; non-zero means the trail has gaps, and a `gap` record marks each one. It
+  should be zero.
+
+Every record is also emitted on the `tracing` target `cameodb::audit`, so a deployment
+already shipping logs can route the trail with `RUST_LOG=warn,cameodb::audit=info` and skip
+the file entirely.
+
+Settings reference: [CONFIGURATION.md](CONFIGURATION.md). Record shapes and the endpoint:
+[API_REFERENCE.md](API_REFERENCE.md).
+
 ### What this does not cover
 
 Worth stating plainly before you rely on it:
@@ -297,6 +336,8 @@ Worth stating plainly before you rely on it:
 - **The cluster PSK has no rotation path.** Changing it means stopping every node.
 - **No lockout or throttle on failed authentication.** Against a 256-bit key it buys nothing
   and is itself a denial-of-service lever. Refusals are counted and logged instead.
+- **The audit trail is not tamper-evident.** It is a file the node writes; nothing signs or
+  chains the records. Ship it off the node if you need it to survive the node.
 - **An MCP client authenticates with an HTTP header or not at all.** No OAuth flow, no
   per-client credential issuance.
 

@@ -2,7 +2,7 @@
   <h1>CameoDB</h1>
   <p><strong>A high-performance, distributed hybrid-search database built in Rust.</strong></p>
   
-  [![Rust](https://img.shields.io/badge/rust-1.80%2B-blue.svg)](https://www.rust-lang.org)
+  [![Rust](https://img.shields.io/badge/rust-1.85%2B-blue.svg)](https://www.rust-lang.org)
   [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 </div>
 
@@ -53,7 +53,7 @@ docker run -it --rm \
 
 For more deployment options (Docker Compose, multi-node clusters), see the [Deployment Guide](docs/DEPLOYMENT.md).
 
-## � TLS/HTTPS Configuration
+## 🔐 TLS/HTTPS Configuration
 
 CameoDB supports native HTTPS via rustls for encrypted client connections. This is essential for production deployments where data security is required.
 
@@ -212,7 +212,7 @@ openssl rsa -in key.pem -check -noout   # Validate private key
 
 **Client certificate verification failed**: Use `--insecure` flag for self-signed certificates, or add the CA certificate to your system's trust store.
 
-## �� Documentation
+## 📚 Documentation
 
 Dive deeper into CameoDB's architecture and APIs:
 
@@ -220,6 +220,10 @@ Dive deeper into CameoDB's architecture and APIs:
 - 🏗️ **[Architecture & Routing](docs/ARCHITECTURE.md)**: How the distributed leaderless routing works under the hood.
 - ⚙️ **[Configuration Guide](docs/CONFIGURATION.md)**: Adjusting shard counts, cache sizes, and swarm ports.
 - 📦 **[Building & Packaging](docs/BUILDING.md)**: Instructions for compiling cross-platform binaries and generating RPM/DEB packages.
+- 💻 **[Development Setup](docs/DEVELOPMENT.md)**: Getting a clean macOS or Linux machine ready to build, test and validate CameoDB.
+- 🚢 **[Deployment](docs/DEPLOYMENT.md)**: Running CameoDB as a service, in containers, and as a cluster.
+- 🧭 **[Architecture Decisions](docs/ADR.md)**: Why the system is shaped the way it is.
+- 🧪 **[Scripts](scripts/README.md)**: Build, setup, validation and testing scripts, and what each one checks.
 - 📊 **[Data Ingestion Examples](examples/README.md)**: Sample python scripts and datasets (TED Talks, Book Summaries) to try out right away.
 
 ## 🛠️ Single Binary Architecture

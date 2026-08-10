@@ -619,3 +619,72 @@ let spawn_time = start.elapsed();
 - **Type Safety**: Compiler prevents most mistakes
 - **Tooling**: Lints and runtime checks (future)
 - **Training**: Team education on async/blocking patterns
+
+---
+
+## ADR 004: Cluster Lifecycle - Event-Driven, Zero Polling
+
+### Status
+Accepted (December 2025). Migrated here 2026-08-10 from `docs/DEVELOPMENT.md`, which was
+replaced by a development-environment guide.
+
+### Context
+Cluster state was previously advanced by a mixture of membership events and time-based
+checks. Kameo's actor model is inherently message-driven, and mixing the two meant a state
+transition could be caused by a message, by a timeout, or by a race between them — with no
+way to tell which afterwards.
+
+### Decision
+Eliminate all background polling and timeout-based state management. Cluster state changes
+occur only on membership events: `PeerDiscovered`, `PeerLost`, `MergeRemoteShards`.
+
+### Rationale
+- Polling contradicts the actor model the rest of the system is built on.
+- Time-based transitions introduce non-determinism and race conditions.
+- Every state change gets an exact cause: the message that triggered it.
+
+### Implementation
+- Metadata persistence is inline with the state change, not a periodic snapshot.
+- Node state is `Active` / `Inactive`; cluster state is `Active` / `Degraded` / `Failed`.
+- Booting from a snapshot marks expected peers `Inactive`; they become `Active` as they join.
+- `metadata.redb` stores cluster config, shard assignments, the node registry, and ring
+  snapshots. Restoring a serialized ring rather than rebuilding it makes boot markedly
+  faster on a cluster of any size.
+
+### Consequences
+Purely reactive coordination, with no background task to reason about. The cost is that a
+node learns about a peer only when an event says so — there is no sweep that would notice a
+silent failure the transport did not report.
+
+---
+
+## ADR 005: State Reconciliation - Remote Reports Are the Truth
+
+### Status
+Accepted (December 2025). Migrated here 2026-08-10 from `docs/DEVELOPMENT.md`.
+
+### Context
+A snapshot loaded at boot describes the topology as it was at the last shutdown. Peers may
+have taken writes, migrated shards, or changed metadata since. Both sources are plausible
+and they can disagree.
+
+### Decision
+Remote node reports are the source of truth. The snapshot supplies *expectations* to compare
+against, never an override.
+
+### Rationale
+A stale snapshot that wins would resurrect a topology no node still holds. Comparing rather
+than overriding turns the disagreement into information: drift, migration and inconsistency
+all become visible instead of being silently resolved the wrong way.
+
+### Implementation
+- On boot, expected shards are loaded from the snapshot into `expected_shards`.
+- On `MergeRemoteShards`, expected and actual are compared and categorised as matched,
+  changed, added or missing.
+- Discrepancies are logged in detail; the remote node's reported state is always accepted.
+- Confirmed shards are removed from `expected_shards`; what remains is still expected.
+
+### Consequences
+Cluster state converges to distributed reality with a record of every difference. Divergence
+is reported rather than blocking convergence, so a node never refuses to join over a
+disagreement it can describe.

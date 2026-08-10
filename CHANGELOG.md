@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-10
+
+The authentication release. A node can now require a credential on every route, decide what
+that credential may do and which indexes it may touch, meter what it costs, and keep a record
+of what it did — none of which existed in 0.2.x. Alongside it, the write path was measured
+and reworked rather than tuned by assumption.
+
+Headline changes, each detailed below: API key authentication with capabilities and per-key
+index scoping (enforced at one ingress chokepoint, MCP included), HTTPS via rustls, a cluster
+pre-shared key, security posture profiles that refuse to start a misconfigured node, MCP tool
+rate limiting, an audit trail, and +65-70% write throughput from letting a worker carry more
+than one operation at a time.
+
+**Upgrading from 0.2.x:** nothing is required — authentication, TLS, rate limiting and the
+audit trail are all off by default, and a 0.2.x config file still loads. To turn security on,
+start from `cameodb keygen` and `cameodb check-config`; see
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md) and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
 ### Fixed
 - **Writes to an index with no schema returned 500.** The worker pool's engine holds `ArcSwap`
   snapshots, so it can read a schema but not evolve one — that needs the actor. It signalled

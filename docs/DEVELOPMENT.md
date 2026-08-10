@@ -1,177 +1,206 @@
-# CameoDB Distributed Implementation Plan
+# Development Environment
 
-## Current Baseline (Completed)
+Getting a clean macOS or Linux machine ready to build, test and validate CameoDB.
 
-### Networking & Swarm (Phase 1-2)
-- **Networking**: Custom `DhtBehaviour` (Kameo remote behaviour + Kademlia + keep-alive) with TCP/QUIC/Noise/Yamux transport stack and metrics-aware runtime task implemented in `swarm/mod.rs`.
-- **Swarm lifecycle**: `init_distributed_swarm` returns `SwarmStartup` + `SwarmRuntimeHandle`; graceful shutdown supported via `watch::Sender`.
-- **Configuration**: `ClusterConfig` exposes `cluster_port`, `seed_nodes`, optional `cluster_nodes`, and all critical values can be overridden via `CAMEODB_*` environment variables (used by Docker Compose).
-- **DistributedCluster**: Initializes the swarm, retains runtime handle, logs cluster status, and seeds `peer_nodes` from seed_nodes configuration.
-- **Documentation & Compose**: README/docker guides updated for Kademlia-only discovery; no mDNS dependency remains.
+> Looking for the cluster implementation plan that used to live here? Its two standing
+> decisions became [ADR 004](ADR.md) and [ADR 005](ADR.md); the phase checklists are in
+> [ROADMAP.md](../ROADMAP.md).
 
-### Cluster Coordination (Phase 3-6)
-- **ClusterCoordinator Actor**: Wraps `DistributedCluster`, manages cluster state machine, shard assignments, and consistent hash ring.
-- **Topology & Peer Tracking**: Swarm events (`RoutingUpdated`, `PeerDiscovered`, `PeerLost`) forwarded to coordinator; peer map and counters tracked.
-- **Shard Registration**: `NodeOrchestrator` registers local shards with coordinator; ring rebuilt on topology changes.
-- **Router Integration**: HTTP handlers communicate with coordinator for routing decisions.
+## What you need
 
-### Actor System (Phase 4.5)
-- **NodeOrchestrator Actor**: Eliminated `Arc<RwLock<>>` pattern; clean actor hierarchy: HTTP → RouterActor → NodeOrchestrator → MicroshardActors.
-- **Message-driven operations**: All orchestrator operations handled via Kameo messages.
+| Tool | Why | Required? |
+|---|---|---|
+| **Rust 1.85+** | The workspace is `edition = "2024"`. Older toolchains fail while *parsing* `Cargo.toml`, with an error that does not mention the version | **Yes** |
+| **A C toolchain** | Linking. Xcode Command Line Tools on macOS; `build-essential` or equivalent on Linux | **Yes** |
+| `jq` | Every validation and testing script parses JSON with it | **Yes** |
+| `curl` | Same. Preinstalled on macOS and most Linux | **Yes** |
+| `cargo-audit`, `cargo-deny` | The supply-chain half of `scripts/validate/deps.sh`. **Without them that suite SKIPs both and still reports success** — the gate passes without ever having run | Strongly recommended |
+| `openssl` | `scripts/validate/tls.sh` generates a throwaway certificate; the suite skips without it | For TLS validation |
+| **Docker** | musl release builds (the container path is the one that matches the published image), and the multi-node compose files | For releases and cluster work |
+| `zig`, `cargo-zigbuild` | The no-Docker fallback for musl cross-compilation | Optional |
+| **Python 3.9+** | `examples/ingest_*.py` and the sample-data scripts | For the examples |
 
-### Remote Actor Distribution (Phase 7-7.5)
-- **Remote actor registry**: NodeOrchestrator registered as `orchestrator-{node_id}`; MicroshardActor naming ready.
-- **Node Identity**: Extended with a configurable `Node Label` for human-readable identification in logs and dashboards.
-- **Remote operation forwarding**: `RouterActor::try_remote` uses `RemoteActorRef::lookup` for cross-node operations.
-- **Broadcast/scatter-gather**: Fan-out to multiple nodes with result aggregation for searches and writes. Aggregation now supports a configurable `default_search_limit`.
+Nothing in the build needs OpenSSL as a *library*: TLS is rustls with the `ring` provider,
+so there is no C crypto dependency and nothing to vendor.
 
-### Event-Driven Cluster Metadata (Phase 8.5 - Completed)
-- **Pure event-driven persistence**: Removed background polling; cluster state transitions and metadata persistence triggered only by actor messages (`PeerDiscovered`, `PeerLost`, `MergeRemoteShards`).
-- **Simplified state machine**: `ClusterState` reduced to `Active`, `Degraded`, `Failed` with reactive evaluation on membership events.
-- **Persistent metadata storage**: `metadata.redb` stores cluster config, shard assignments, node registry, and **ring snapshots**.
-- **Ring Snapshot Optimization**: `ConsistentRing` is serialized and persisted on topology changes, allowing 10-40x faster boot by skipping ring rebuilds (restored directly from snapshot).
-- **State reconciliation**: On boot, compare expected shards from snapshot vs actual remote node reports; log discrepancies (matched/changed/added/missing); update local state with remote truth; persist reconciled topology.
-- **Zero-polling architecture**: Full alignment with Kameo actor model—no timeouts, no background tasks, purely message-driven cluster lifecycle.
+## macOS, from a clean machine
 
-## Guiding Principles
+Written against Apple Silicon; the commands are identical on Intel.
 
-1. **Actor-first design**: All distributed coordination must flow through Kameo actors to preserve isolation, avoid manual locking, and leverage remote actor features.
-2. **Blocking I/O offloading**: Every redb/tantivy access remains behind `tokio::task::spawn_blocking`.
-3. **Strong typing & observability**: Prefer structured enums/structs over ad-hoc JSON, and emit tracing metrics for cluster visibility.
+```bash
+# 1. Compiler and linker
+xcode-select --install                     # skip if `xcode-select -p` already prints a path
 
-## Active Roadmap (Actor-Oriented)
+# 2. Homebrew, if you do not have it
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-### Phase 7 – Distributed Query & Write Completion
-- [x] **Timeout & retry configuration**: Plumbed remote ask/tell timeouts, broadcast fan-out limits, and retry policies from `ClusterConfig.messaging` into RouterActor/Coordinator.
-- [x] **Routing verification tests**: Unit/property tests covering `RouteOperation` outcomes (empty ring, unknown owner/address, happy path) plus ring-distribution checks across multiple node identities.
-- [ ] **Error enrichment**: Add node/shard metadata to all remote error replies for better debugging.
-- [ ] **Telemetry**: Expose scatter-gather success/failure counters, latency histograms for remote operations.
-- [x] **Blocking I/O audit**: Final verification that every redb/tantivy access stays inside `tokio::task::spawn_blocking`. (Found violation: `ClusterCoordinator::persist_snapshot` is blocking; FIXED).
+# 3. Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
 
-### Phase 8 – Testing & Validation
-- [ ] **Multi-node Docker testing**: Validate event-driven persistence and state reconciliation with 3-5 node cluster.
-- [ ] **Bootstrap & recovery scenarios**: Test node joins/leaves, crash recovery, snapshot-based restart.
-- [ ] **Reconciliation edge cases**: Test snapshot mismatch scenarios (missing shards, changed metadata, new shards).
-- [ ] **Remote actor reliability**: Registry naming/lookup tests, fallback to local-only when remoting unavailable.
-- [ ] **Performance baselines**: Measure boot time, ring rebuild time, reconciliation overhead for various cluster sizes.
+# 4. Everything else
+brew install jq openssl
+cargo install cargo-audit cargo-deny       # a few minutes; they compile from source
 
-### Phase 9 – Cluster Metadata Persistence Enhancements
+# 5. Optional, for cross-compiling Linux binaries without Docker
+brew install zig
+cargo install cargo-zigbuild
+rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
 
-#### 9.1 Cluster State History Tracking (Medium Priority)
-**Goal**: Audit trail for cluster state transitions and failure forensics.
+# 6. Docker Desktop, if you will build release artifacts or run a cluster
+#    https://www.docker.com/products/docker-desktop/
+```
 
-**Implementation:**
-- New table `TABLE_STATE_HISTORY` storing `ClusterStateTransition` events.
-- Record every state change with: `from_state`, `to_state`, `timestamp`, `trigger` (e.g., "PeerLost(node-B)").
-- Expose via query API for dashboards and SLA reporting.
+Then check the machine before trusting it:
 
-**Benefits:**
-- ✅ Cluster health audit trail for debugging
-- ✅ SLA tracking (uptime, degradation duration)
-- ✅ Forensics: "What happened before the crash?"
-- ✅ Export to Prometheus/Grafana for monitoring
+```bash
+./scripts/setup/install-deps.sh
+```
 
-**When to Implement:** For production monitoring and operations
+It verifies each prerequisite, reports what is missing with the command that installs it, and
+builds the workspace. Anything it calls *optional* is genuinely optional — you can develop,
+test and run a node without Docker.
 
-**Status:** Design complete, awaiting operational requirements
+## Linux, from a clean machine
 
----
+```bash
+sudo apt-get update && sudo apt-get install -y build-essential pkg-config jq curl openssl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh && source "$HOME/.cargo/env"
+cargo install cargo-audit cargo-deny
+./scripts/setup/install-deps.sh
+```
 
-#### 9.2 Health Metrics Persistence (Low-Medium Priority)
-**Goal**: Track cluster capacity and availability over time.
+Substitute `dnf`/`yum`/`pacman` as appropriate; `install-deps.sh` recognises all four.
 
-**Implementation:**
-- New table `TABLE_HEALTH_METRICS` storing periodic snapshots of:
-  - Active/expected node counts
-  - Active/total shard counts
-  - Write/read availability flags (using `can_accept_writes()`, `is_failed()` helpers)
-  - Timestamp for trend analysis
-- Record on state transitions or periodic snapshots (every 60s).
+## Build, test, validate
 
-**Benefits:**
-- ✅ Capacity planning and growth tracking
-- ✅ Availability SLAs ("99.9% write availability last month")
-- ✅ Trend analysis to detect degradation patterns
-- ✅ Alerting on repeated failures
+```bash
+cargo build --release            # target/release/cameodb, plus the bundled client
+cargo test --workspace           # unit tests and the integration suites
+./scripts/validate/all.sh        # the gate: deps, unit, posture, auth, tls, remote-sources, artifact
+```
 
-**When to Implement:** For production operations and capacity planning
+`validate/all.sh` builds a release binary and drives a real node — expect a few minutes on a
+first run. Read its summary rather than only its exit code: a suite that **SKIPs** is a check
+that did not run, and the most common cause is a missing `cargo-audit` or `cargo-deny`.
 
-**Status:** Helper methods exist, awaiting metrics integration
+Run a subset by name, or a suite on its own:
 
----
+```bash
+./scripts/validate/all.sh posture tls    # named suites only
+./scripts/validate/auth.sh               # ~111 checks against a live node with real keys
+CAMEODB_BIN=/path/to/cameodb ./scripts/validate/all.sh   # test a binary you did not just build
+```
 
-#### 9.3 GetClusterSnapshot Query API (Medium Priority)
-**Goal**: Operational visibility and backup/restore capabilities.
+What each suite proves, and why none of them could be a unit test, is tabulated in
+[scripts/validate/README.md](../scripts/validate/README.md).
 
-**Implementation:**
-- ✅ Implemented `GetClusterSnapshot` message handler in Coordinator.
-- ✅ Implemented `ClusterSnapshot` struct with config, shards, nodes, and ring.
-- Pending: Expose via HTTP endpoint `GET /cluster/snapshot` (currently internal only).
-- Use for admin dashboards, backup operations, troubleshooting.
+## Running a node
 
-**Benefits:**
-- ✅ Complete cluster state visibility in one query
-- ✅ Backup/restore entire topology
-- ✅ Integration with external monitoring tools
-- ✅ Troubleshooting aid (inspect ring, shards, nodes)
+```bash
+cargo run --release --bin cameodb                      # ./cameodb.toml, or built-in defaults
+cargo run --release --bin cameodb -- -c path/to.toml   # explicit config
+./target/release/cameodb generate-config > cameodb.toml
+./target/release/cameodb check-config -c cameodb.toml  # posture report, no server started
+```
 
-**When to Implement:** When building admin/ops tools
+Config resolution, highest precedence first: command-line options, `CAMEODB_*` environment
+variables, the config file, then defaults. The file itself is found via `-c`, then
+`CAMEODB_CONFIG`, then `./cameodb.toml`, `./config/cameodb.toml`,
+`/etc/cameodb/cameodb.toml`, `/etc/cameodb/config.toml`.
 
-**Status:** Core logic implemented, HTTP endpoint pending
+Then, in another shell:
 
----
+```bash
+./scripts/testing/test-api.sh        # exercises the HTTP surface
+./scripts/ops/health-check.sh        # health, memory, worker pool
+./examples/data/sample-data.sh       # 100 sample documents
+cargo run --release --bin cameodb -- client health
+```
 
-### Phase 10 – Operational Enhancements
-- [ ] **Admin HTTP endpoints**: Query coordinator for peer/shard state, health metrics, state history.
-- [ ] **Dynamic configuration**: Update seed nodes, discovery policies, or shard assignments via actor commands.
-- [ ] **Graceful drains**: Coordinator notifies peers before shutdown; migrate shards or mark as leaving.
-- [ ] **Monitoring integration**: Export cluster metrics to Prometheus; create Grafana dashboards.
-- [ ] **CLI tooling**: Command-line interface for cluster inspection, manual recovery operations.
+Full settings reference: [CONFIGURATION.md](CONFIGURATION.md). Endpoint reference:
+[API_REFERENCE.md](API_REFERENCE.md).
 
+## Where macOS differs from where it runs
 
-## Key Architectural Decisions
+Your development machine cannot exercise several things production depends on. Knowing which
+saves a day of chasing a difference that is not a bug:
 
-### Event-Driven Cluster Lifecycle (December 2025)
-**Decision**: Eliminate all background polling and timeout-based state management.
+- **Core pinning is a no-op.** macOS exposes no thread-affinity API, so `core_affinity` fails
+  silently and `/_admin/workers` reports every worker unpinned. Stage 1/2d/2e behaviour has
+  to be validated on Linux — see the ROADMAP note recording exactly that.
+- **jemalloc is not used.** It is gated to `target_env = "musl"` and Linux-gnu, and the
+  `#[global_allocator]` is `#[cfg(target_os = "linux")]`. macOS builds use the system
+  allocator, so `/_admin/memory` reports no jemalloc block and the `JEMALLOC_SYS_WITH_LG_PAGE`
+  pin in `.cargo/config.toml` is inert here. (That matters on Apple Silicon, whose 16 KiB
+  pages would otherwise collide with a jemalloc compiled for 4 KiB.)
+- **Static musl binaries cannot be produced natively.** Use Docker or zigbuild; see below.
+- **`scripts/validate/artifact.sh` SKIPs** without a Linux binary under `target/`, and needs
+  `readelf` or Docker to inspect one.
 
-**Rationale:**
-- Kameo actor model is inherently message-driven; polling contradicts this pattern.
-- Time-based transitions introduce non-determinism and race conditions.
-- Event-driven approach provides exact causality: every state change has a clear trigger message.
+## Cross-compiling Linux binaries
 
-**Implementation:**
-- Cluster state transitions occur only on membership events: `PeerDiscovered`, `PeerLost`.
-- Metadata persistence triggered inline with state changes—no periodic snapshots.
-- Node state simplified to Active/Inactive; cluster state simplified to Active/Degraded/Failed.
-- Boot with snapshot marks expected peers as Inactive; transitions to Active as they join.
+```bash
+./scripts/build/build-musl.sh                  # release, x86_64
+./scripts/build/build-musl.sh release aarch64
+./scripts/build/build-musl.sh release both
+./scripts/validate/artifact.sh target/aarch64-unknown-linux-musl/release/cameodb
+```
 
-**Result:** Zero-polling, purely reactive cluster coordination aligned with actor system principles.
+The script prefers a Linux container matching the target architecture, falling back to
+`cargo-zigbuild` when Docker is unavailable or with `BUILD_WITH=zig`. **The two paths do not
+produce the same artifact** — zig's linker does not advertise `-static-pie`, so the binary is
+static but not position-independent. Prefer the container path for anything you ship.
 
----
+On Apple Silicon, `aarch64` builds in a native container and `x86_64` builds under emulation,
+which is markedly slower. Build the architecture you are testing and leave `both` for release
+day. Full detail, including the `AR`/`RANLIB` trap when invoking `cargo zigbuild` by hand, is
+in [BUILDING.md](BUILDING.md).
 
-### State Reconciliation Strategy (December 2025)
-**Decision**: Remote node reports are source of truth; snapshot provides expectations for comparison.
+## Workspace layout
 
-**Rationale:**
-- Snapshot may be stale (node had more writes since last shutdown).
-- Detect data drift, shard migrations, or inconsistencies.
-- Log discrepancies for operational visibility without blocking convergence.
+| Crate | Contents |
+|---|---|
+| `crates/server` | The `cameodb` binary: HTTP, MCP, orchestrator, auth, config. Binary-only, so its `tests/` drive the built binary as a subprocess |
+| `crates/client` | The `CameoClient` SDK, and the `cameodb client` CLI |
+| `crates/storage` | The redb + tantivy hybrid store |
+| `crates/cluster` | Consistent-hash ring, identity, membership |
+| `crates/mcp` | The MCP protocol layer. Deliberately holds no deployment policy — the server crate supplies authorization, rate limiting and audit through trait hooks |
+| `crates/bench` | `cameodb-bench`, the latency harness. Not shipped |
 
-**Implementation:**
-- On boot: load expected shards from snapshot into `expected_shards` map.
-- On `MergeRemoteShards`: compare expected vs actual, categorize as matched/changed/added/missing.
-- Log detailed reconciliation results; always accept remote node's reported state.
-- Remove confirmed shards from `expected_shards`; track remaining expectations.
+## Common tasks
 
-**Result:** Cluster state converges to distributed reality with full audit trail of differences.
+| Task | Command |
+|---|---|
+| Fast type-check | `cargo check --workspace` |
+| Lint as the gate does | `cargo clippy --workspace --all-targets -- -D warnings` |
+| Format | `cargo fmt --all` |
+| One test by name | `cargo test -p server --bin cameodb <substring>` |
+| Integration suite only | `cargo test -p server --test audit_trail` |
+| Log level | `RUST_LOG=debug cargo run --bin cameodb` |
+| Audit trail only | `RUST_LOG=warn,cameodb::audit=info` |
+| Benchmark | `cargo run --release -p bench -- --mode write --concurrency 64` |
+| What scripts exist | `./scripts/setup/dev-info.sh` |
 
----
+## Troubleshooting
 
-## Supporting Tasks & References
+**`feature edition2024 is required` / errors parsing `Cargo.toml`** — the toolchain predates
+1.85. `rustup update stable`.
 
-- **Multi-node Docker testing**: Primary validation target for event-driven persistence and state reconciliation.
-- **Integration tests**: Spin multiple nodes, assert bootstrap dialing, verify routing decisions, test crash recovery.
-- **Documentation**: Keep README/docker guides synchronized with actor responsibilities and cluster lifecycle.
-- **Performance benchmarking**: Establish baselines for boot time, reconciliation overhead, ring rebuild performance.
+**`linker 'cc' not found`** on macOS — Xcode Command Line Tools are missing.
+`xcode-select --install`.
 
-This plan maintains Kademlia networking while fully embracing Kameo's actor model for distributed coordination, ensuring safe concurrency, event-driven semantics, and a clear path to production-grade cluster operations.
+**`undefined symbol: mallocx` / `mallctl`** when cross-compiling — you invoked
+`cargo zigbuild` directly without `AR="zig ar"` and `RANLIB="zig ranlib"`. Use
+`build-musl.sh`, which sets both. The full explanation is in [BUILDING.md](BUILDING.md).
+
+**`validate/all.sh` says all checks passed but reports SKIPs** — read the SKIP lines. The
+usual pair is `cargo audit` and `cargo deny`, and until they are installed nothing has
+checked your dependencies for advisories or licence violations.
+
+**Tests fail on ports** — the integration suites bind ephemeral ports and start real nodes.
+A previous run killed mid-test can leave a `cameodb` process holding a data directory:
+`pkill -f 'target/debug/cameodb'`.
+
+**Builds feel slow** — `.cargo/config.toml` sets `jobs = 8`. On a machine with more cores,
+raise it or remove the line to use the default.

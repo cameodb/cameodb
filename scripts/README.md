@@ -12,7 +12,7 @@ For a quick overview of all available scripts and project status:
 
 ## Directory Structure & Scripts
 
-### � `build/` - Build and Distribution
+### 📦 `build/` - Build and Distribution
 
 #### `build-musl.sh`
 **Purpose**: Build a fully static Linux binary (musl) — no interpreter, no `NEEDED` entries, runs on `gcr.io/distroless/static`
@@ -21,7 +21,7 @@ For a quick overview of all available scripts and project status:
   - **The two methods do not produce the same artifact.** Zig's linker does not advertise `-static-pie`, so rustc falls back to `-static` with only a warning: still fully static, but not position-independent. Prefer the container path for anything you ship
   - Checks the result with `validate/artifact.sh` rather than assuming the flags took
   - TLS is rustls with the `ring` provider (no vendored OpenSSL, no C toolchain)
-  - Under the zig path, exports `AR="zig ar"` / `RANLIB="zig ranlib"` so jemalloc's C build archives correctly — without this, macOS's native `ranlib` silently produces an empty `libjemalloc.a` (it can't parse the ELF objects Zig's cross-compiler emits), and the failure only surfaces later as `undefined symbol: mallocx`/`mallctl` at link time. See [docs/BUILDING.md](../../docs/BUILDING.md) for the full explanation
+  - Under the zig path, exports `AR="zig ar"` / `RANLIB="zig ranlib"` so jemalloc's C build archives correctly — without this, macOS's native `ranlib` silently produces an empty `libjemalloc.a` (it can't parse the ELF objects Zig's cross-compiler emits), and the failure only surfaces later as `undefined symbol: mallocx`/`mallctl` at link time. See [docs/BUILDING.md](../docs/BUILDING.md) for the full explanation
 - **Usage**:
   ```bash
   ./scripts/build/build-musl.sh                    # release, x86_64
@@ -43,7 +43,7 @@ For a quick overview of all available scripts and project status:
 - **Usage**:
   ```bash
   ./scripts/build/docker-push.sh               # Build + push latest
-  ./scripts/build/docker-push.sh 0.2.2         # Build + push version tag
+  ./scripts/build/docker-push.sh 0.3.0         # Build + push version tag
   ./scripts/build/docker-push.sh --no-push     # Local build only
   ```
 - **Audience**: DevOps, release engineers, CI/CD
@@ -82,7 +82,7 @@ For a quick overview of all available scripts and project status:
 - **Prerequisites**: syft 1.42.3+ (`brew install syft`)
 - **Audience**: Security engineers, compliance teams
 
-###  �️ `setup/` - Development Environment Setup
+### 🛠️ `setup/` - Development Environment Setup
 
 #### `install-deps.sh`
 **Purpose**: Automated setup of CameoDB development environment

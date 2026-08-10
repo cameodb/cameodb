@@ -6,28 +6,38 @@ box is a question that has not been answered, not a formality.
 
 ## Procedure
 
-1. **Build every target you intend to ship.**
+1. **Set the version.** Every crate under `crates/` carries its own `version`, and the
+   internal path dependencies pin it too — a bump touches both in each manifest, then
+   `cargo check --workspace` to refresh `Cargo.lock`. Confirm with
+   `cargo run --bin cameodb -- --version`, which reads `CARGO_PKG_VERSION` and is the only
+   place the number is observable at runtime.
+   ```bash
+   grep -rn '^version = ' crates/*/Cargo.toml     # all six must agree
+   ```
+2. **Move `[Unreleased]` to the new version in `CHANGELOG.md`**, dated, with a fresh empty
+   `[Unreleased]` above it.
+3. **Build every target you intend to ship.**
    ```bash
    cargo build --release
    scripts/build/build-musl.sh          # static Linux
    scripts/build/build-dist.sh          # packages
    ```
-2. **Run the validation suite** on the host build.
+4. **Run the validation suite** on the host build.
    ```bash
    scripts/validate/all.sh
    ```
-3. **Run `remote-sources` on every other target.** It is the only suite whose result does
+5. **Run `remote-sources` on every other target.** It is the only suite whose result does
    not transfer between platforms — the trust store differs (macOS Keychain, Linux
    `/etc/ssl/certs`, musl containers need `ca-certificates`). See
    [scripts/validate/README.md](scripts/validate/README.md).
-4. **Review the advisory exceptions.** `deps.sh` fails once a `review-by` date in
+6. **Review the advisory exceptions.** `deps.sh` fails once a `review-by` date in
    `deny.toml` has passed. Renewing one means checking for an upstream fix first, not
    moving the date.
-5. **Confirm the posture of the configs you ship or document.**
+7. **Confirm the posture of the configs you ship or document.**
    ```bash
    cameodb check-config -c cameodb.example.toml
    ```
-6. **Record the outcome below**, including anything skipped and why.
+8. **Record the outcome below**, including anything skipped and why.
 
 ## Known gaps carried into every release
 
@@ -48,6 +58,10 @@ These are accepted, not fixed. They belong in release notes as much as here.
   the HTTP/MCP ingress, where identity exists; it is not a defense against a compromised
   cluster member.
 - **Cluster PSK has no rotation path.** Changing it requires stopping every node.
+- **The audit trail is off by default, and is not tamper-evident.** With
+  `[security.audit] enabled = false` a node keeps no record of who read what. Turned on, it
+  is a file the node writes — nothing signs or chains the records, so ship it off the node if
+  it needs to survive the node.
 - **Three transitive advisories are ignored** (`deny.toml`), all via libp2p 0.56.0.
 
 ---
@@ -68,6 +82,7 @@ Built targets: <list>
 | auth           |  |  |  |  |
 | tls            |  |  |  |  |
 | remote-sources |  |  |  |  |
+| artifact       |  |  |  |  |
 
 Advisory exceptions reviewed: <ids and their review-by dates>
 Skipped checks and why:

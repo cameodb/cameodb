@@ -17,7 +17,7 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl \
 
 ```bash
 cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
-  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm \
+  -o target/x86_64-unknown-linux-musl/release/cameodb-0.3.0-1.x86_64.rpm \
   --set-metadata 'package.name="cameodb"'
 ```
 
@@ -25,7 +25,7 @@ cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-re
 
 ```bash
 cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl -p server \
-  --output target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb
+  --output target/x86_64-unknown-linux-musl/release/cameodb_0.3.0_amd64.deb
 ```
 
 ## Cosign Signing
@@ -45,11 +45,11 @@ cosign sign-blob \
 ### Sign RPM package
 cosign sign-blob \
   --key /usr/local/share/ca-certificates/cosign.key \
-  --bundle target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm.bundle \
-  target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm
+  --bundle target/x86_64-unknown-linux-musl/release/cameodb-0.3.0-1.x86_64.rpm.bundle \
+  target/x86_64-unknown-linux-musl/release/cameodb-0.3.0-1.x86_64.rpm
 
 ### Sign DEB package
 cosign sign-blob \
   --key /usr/local/share/ca-certificates/cosign.key \
-  --bundle target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb.bundle \
-  target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb
+  --bundle target/x86_64-unknown-linux-musl/release/cameodb_0.3.0_amd64.deb.bundle \
+  target/x86_64-unknown-linux-musl/release/cameodb_0.3.0_amd64.deb

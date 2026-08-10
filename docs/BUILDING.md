@@ -571,7 +571,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 # Generate RPM package (run from project root directory)
 cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
-  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm \
+  -o target/x86_64-unknown-linux-musl/release/cameodb-0.3.0-1.x86_64.rpm \
   --set-metadata 'package.name="cameodb"'
 ```
 
@@ -593,11 +593,11 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl \
 
 # Generate RPM package with standard naming (run from project root directory)
 cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
-  -o target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm \
+  -o target/x86_64-unknown-linux-musl/release/cameodb-0.3.0-1.x86_64.rpm \
   --set-metadata 'package.name="cameodb"'
 
 # The RPM package will be available at:
-# target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm
+# target/x86_64-unknown-linux-musl/release/cameodb-0.3.0-1.x86_64.rpm
 ```
 
 **Option 3: DEB Package Generation (Ubuntu/Debian)**
@@ -638,11 +638,11 @@ cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl -p server
 
 # With custom output path (follows DEB naming standards)
 cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl -p server \
-  --output target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb
+  --output target/x86_64-unknown-linux-musl/release/cameodb_0.3.0_amd64.deb
 
 # The DEB package will be available at:
-# target/x86_64-unknown-linux-musl/debian/cameodb_0.2.2_amd64.deb
-# OR with custom output: target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb
+# target/x86_64-unknown-linux-musl/debian/cameodb_0.3.0_amd64.deb
+# OR with custom output: target/x86_64-unknown-linux-musl/release/cameodb_0.3.0_amd64.deb
 ```
 
 **Option 4: Automated Build Script (Recommended for CI/CD)**
@@ -685,13 +685,13 @@ cosign sign-blob \
 
 cosign sign-blob \
   --key /usr/local/share/ca-certificates/cosign.key \
-  --bundle target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm.bundle \
-  target/x86_64-unknown-linux-musl/release/cameodb-0.2.2-1.x86_64.rpm
+  --bundle target/x86_64-unknown-linux-musl/release/cameodb-0.3.0-1.x86_64.rpm.bundle \
+  target/x86_64-unknown-linux-musl/release/cameodb-0.3.0-1.x86_64.rpm
 
 cosign sign-blob \
   --key /usr/local/share/ca-certificates/cosign.key \
-  --bundle target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb.bundle \
-  target/x86_64-unknown-linux-musl/release/cameodb_0.2.2_amd64.deb
+  --bundle target/x86_64-unknown-linux-musl/release/cameodb_0.3.0_amd64.deb.bundle \
+  target/x86_64-unknown-linux-musl/release/cameodb_0.3.0_amd64.deb
 ```
 
 **Verification example:**
@@ -755,13 +755,13 @@ Hardening flags explained:
 **For RPM-based systems (RHEL, CentOS, Fedora):**
 ```bash
 # Verify RPM package before installation
-rpm -qpi cameodb-0.2.2-1.x86_64.rpm
+rpm -qpi cameodb-0.3.0-1.x86_64.rpm
 
 # Check package contents
-rpm -qpl cameodb-0.2.2-1.x86_64.rpm
+rpm -qpl cameodb-0.3.0-1.x86_64.rpm
 
 # Install the RPM package
-sudo rpm -i cameodb-0.2.2-1.x86_64.rpm
+sudo rpm -i cameodb-0.3.0-1.x86_64.rpm
 
 # Start and enable the service
 sudo systemctl daemon-reload
@@ -772,13 +772,13 @@ sudo systemctl start cameodb
 **For DEB-based systems (Ubuntu, Debian):**
 ```bash
 # Verify DEB package before installation
-dpkg -I cameodb_0.2.2_amd64.deb
+dpkg -I cameodb_0.3.0_amd64.deb
 
 # Check package contents
-dpkg -c cameodb_0.2.2_amd64.deb
+dpkg -c cameodb_0.3.0_amd64.deb
 
 # Install the DEB package
-sudo dpkg -i cameodb_0.2.2_amd64.deb
+sudo dpkg -i cameodb_0.3.0_amd64.deb
 
 # Start and enable the service
 sudo systemctl daemon-reload

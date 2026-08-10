@@ -126,9 +126,9 @@ This document outlines the current development priorities and optimization roadm
 - ✅ **Phase 10 (Field Projection)**: Completed
 - ✅ **Phase 11 (Workflow Hot-Path Optimizations)**: All 7 steps completed
 - ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed
-- ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, resources, and query syntax docs completed; security moved to Phase 14, streaming/docs/testing planned
+- ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, resources, and query syntax docs completed; security moved to Phase 14. Integration testing is no longer absent — `crates/server/tests/mcp_rate_limit.rs` and the MCP cases in `crates/server/tests/audit_trail.rs` drive `tools/call` against a real node over JSON-RPC — but streaming and the MCP-specific documentation pass remain
 - 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f partially done (merge thread count control implemented via `IndexWriterOptions`; core pinning and per-arena stats planned). Shard placement reworked 2026-08-08: dense ordinals replace `xxh3(shard_id) % n` on both the dispatch and writer-pinning sides, and a single `CoreLayout` reconciles `get_core_ids()` with `available_parallelism()`. `/_admin/workers` reports the pin outcome per worker and per shard, not the request. **Verified on Linux (aarch64 container, 8 cores) 2026-08-08: 8/8 workers pinned to their target cores and all four writer threads to cores 0–3, confirmed independently against `Cpus_allowed_list` in `/proc/<pid>/task/*/status` — one CPU per worker thread, one per writer, no collisions.** Pinning is a no-op on macOS, so it must be validated on Linux; the whole suite passes there too. **Measured 2026-08-09 and re-measured 2026-08-10 (see "Worker concurrency, measured"): Stages 2d and 2e cost throughput rather than gaining it, and both flags stay off. The first diagnosis blamed the per-worker serial loop from Stage 2; that loop is gone as of 2026-08-10 and the flags still lose, so the cause is the affine constraint itself — a shard's jobs may only run on one worker, and skew leaves workers idle.**
-- 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) complete, landed 2026-08-08 — steps 1–5 plus hardening (6a) and documentation (6b): credential model, `keygen`, `[security]` config, enforcement at the HTTP/MCP ingress with capability and index scoping (so `external` can now start), `--api-key` / `--api-key-file` / `CAMEODB_API_KEY` on the bundled client, index list filtering, and MCP per-tool authorization with sessions bound to their key. C1–C3 planned, C3 shrunk because B1 absorbs index scoping
+- 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) complete, landed 2026-08-08 — steps 1–5 plus hardening (6a) and documentation (6b): credential model, `keygen`, `[security]` config, enforcement at the HTTP/MCP ingress with capability and index scoping (so `external` can now start), `--api-key` / `--api-key-file` / `CAMEODB_API_KEY` on the bundled client, index list filtering, and MCP per-tool authorization with sessions bound to their key. C1 (MCP rate limiting) completed 2026-08-10 and C2 (audit trail) completed 2026-08-10 — `[security.limits]` and `[security.audit]`, both off by default, with `GET /_admin/audit` for reading the trail back. **C3 is the only stage still open**, and it shrank because B1 absorbed index scoping
 
 ### **Recommended Next Steps**
 1. ~~**A latency harness.**~~ ✅ Landed 2026-08-09 as `cameodb-bench` (`crates/bench`): percentiles for writes and searches, the node's `took_ms` beside the client-observed figure, and the worker-pool delta over the measured window. Closed-loop, so runs are comparable at equal concurrency rather than being an SLA
@@ -138,8 +138,8 @@ This document outlines the current development priorities and optimization roadm
 5. **The cost of a durable commit under read load.** What the linger was meant to paper over, still open: a commit costs ~12.5ms with searches running against ~4.6ms without, and `wal_sync = false` recovers +86% of write throughput. The lever is the fsync itself — WAL device and placement, or a durability level between "every commit" and "none" — not how the writer groups writes
 6. **Take unkeyed searches off the coordinator.** A keyed write now resolves locally from the published ring and shard placement, but a search still pays a mailbox round trip to a single actor because the decision depends on cluster size, which the router has no cheap way to know. Needs the node count published alongside the ring
 7. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats. No longer blocked behind step 3 — but the evidence against it got stronger, not weaker. Per-arena jemalloc stats are worth having on their own; more *pinning* now has two independent measurements saying it does not pay, and should not be attempted without a specific hypothesis neither of them covers
-8. **Phase 14 Stage C1–C3**: MCP rate limiting, audit logging, per-index role overrides — B1 is complete (steps 1–5 plus the 6a hardening and 6b documentation passes)
-9. **Phase 12 remaining**: MCP streaming, documentation, integration tests
+8. **Phase 14 Stage C3**: per-index role overrides — capability *subtraction* on a named index, on top of B1's scoping. The only security stage left; C1 and C2 landed 2026-08-10, and it matters only for multi-tenant deployments
+9. **Phase 12 remaining**: MCP streaming and the documentation pass. Integration tests are no longer part of this item — `tools/call` is now driven end to end against a real node by the C1 and C2 suites
 
 ### **The affinity flags, measured**
 
@@ -751,12 +751,12 @@ check should become a Linux validation-suite check rather than a one-off.
 | **3** | A3: `ACCEPT_INVALID_CERTS` removal | ✅ Done | Medium | Accidental TLS bypass |
 | **4** | A4: Body limits + concurrency caps | ✅ Done | High | Memory DoS / decompression bomb |
 | **5** | A5: Security tooling (`cargo audit`, `cargo deny`) | ✅ Done (manual) | Medium | Silent vulnerable deps |
-| **6** | B1: API key authentication + index scoping | steps 1–2 done; ~2–4 days left | Critical | Was full unauthenticated R/W/D access; now the client cannot send a key |
+| **6** | B1: API key authentication + index scoping | ✅ Done | Critical | Was full unauthenticated R/W/D access |
 | **7** | B2: HTTPS/TLS via rustls | ✅ Done | High | Traffic interception |
 | **8** | B3: Cluster join secret (PSK) | ✅ Done | High | Rogue node data access |
 | **9** | C1: MCP rate limiting + query complexity | ✅ Done (caps deferred) | Medium | Agent-driven resource exhaustion |
 | **10** | C2: Audit logging | ✅ Done | Medium | No forensic trail |
-| **11** | C3: Per-index role overrides | ~2 days (was ~5+) | Medium | Multi-tenant isolation |
+| **11** | C3: Per-index role overrides | ~2 days (was ~5+), **the only stage left** | Medium | Multi-tenant isolation |
 
 The B1 estimate is up from the original ~3–5 days for two reasons, both decided deliberately
 (see B1 below): index scoping applies to **every** role rather than read-only keys, and MCP

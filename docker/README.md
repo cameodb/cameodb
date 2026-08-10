@@ -107,10 +107,10 @@ Build for multiple platforms (amd64 + arm64) and push to DockerHub:
 ../scripts/build/docker-push.sh
 
 # Build + push with specific version
-../scripts/build/docker-push.sh 0.2.2
+../scripts/build/docker-push.sh 0.3.0
 
 # Build only (no push) for testing multi-platform builds
-../scripts/build/docker-push.sh 0.2.2 --no-push
+../scripts/build/docker-push.sh 0.3.0 --no-push
 ```
 
 **Prerequisites:**
@@ -145,7 +145,7 @@ docker buildx build \
   --builder cameo-builder \
   --platform linux/amd64,linux/arm64 \
   -t goranc/cameodb:latest \
-  -t goranc/cameodb:0.2.2 \
+  -t goranc/cameodb:0.3.0 \
   --push \
   ..
 ```

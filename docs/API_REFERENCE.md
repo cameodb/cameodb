@@ -1,4 +1,4 @@
-## �📡 HTTP API Reference
+# 📡 HTTP API Reference
 
 CameoDB provides a comprehensive REST API for document management, search, and system administration.
 
@@ -42,6 +42,7 @@ Both return `{"error": …, "message": …}`. An unknown path answers `401` with
 | `GET` | `/_admin/memory` | `node-admin` |
 | `POST` | `/_admin/memory/purge` | `node-admin` |
 | `GET` | `/_admin/workers` | `node-admin` |
+| `GET` | `/_admin/audit` | `node-admin` |
 | `POST` | `/_admin/index/{index}/commit` | `node-admin` |
 | `POST` | `/_admin/index/{index}/evict-writer` | `node-admin` |
 | `POST` `GET` `DELETE` | `/mcp` | `read` at the endpoint, then per tool |
@@ -549,12 +550,12 @@ curl -s -X POST http://localhost:9480/_admin/index/books/commit
 Evict the index writer from cache for the given index, freeing its memory.
 
 ```bash
-POST /_admin/index/{index}/evict_writer
+POST /_admin/index/{index}/evict-writer
 ```
 
 **Example:**
 ```bash
-curl -s -X POST http://localhost:9480/_admin/index/books/evict_writer
+curl -s -X POST http://localhost:9480/_admin/index/books/evict-writer
 ```
 
 **Response:**
@@ -568,3 +569,69 @@ curl -s -X POST http://localhost:9480/_admin/index/books/evict_writer
 }
 ```
 
+#### Audit Trail
+Return the most recent audit records, newest first. Requires `[security.audit] enabled = true`;
+on a node without it, `records` is empty and `enabled` is `false`.
+
+```bash
+GET /_admin/audit?limit=<1..1000>       # default 100
+```
+
+**Example:**
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_KEY" \
+  'http://localhost:9480/_admin/audit?limit=50'
+```
+
+**Response:**
+```json
+{
+  "enabled": true,
+  "dropped": 0,
+  "count": 3,
+  "records": [
+    {
+      "ts": "2026-08-10T09:14:02.331Z",
+      "event": "http",
+      "outcome": "allowed",
+      "key_id": "k_1c8e",
+      "label": "analyst",
+      "role": "reader",
+      "peer": "10.0.4.19",
+      "method": "POST",
+      "path": "/api/customers/search",
+      "index": "customers",
+      "status": 200
+    },
+    {
+      "ts": "2026-08-10T09:14:00.000Z",
+      "event": "write_stats",
+      "outcome": "allowed",
+      "key_id": "k_7f3a",
+      "label": "ingest-pipeline",
+      "role": "writer",
+      "index": "docs",
+      "ops": 48213,
+      "errors": 2,
+      "window_start": "2026-08-10T09:13:50.000Z"
+    },
+    {
+      "ts": "2026-08-10T09:13:58.104Z",
+      "event": "mcp_tool",
+      "outcome": "denied",
+      "key_id": "k_1c8e",
+      "label": "analyst",
+      "role": "reader",
+      "tool": "search_index",
+      "index": "payroll",
+      "reason": "this key is not permitted on index 'payroll'"
+    }
+  ]
+}
+```
+
+`dropped` is the running count of records lost to a full writer queue since the node started;
+a non-zero value means the window shown is incomplete. Reads, MCP tool calls, admin actions
+and refusals of a valid key are recorded individually; writes, health checks and
+unauthenticated refusals arrive as counted `*_stats` records. Reading this endpoint is itself
+recorded. Field-by-field detail is in [CONFIGURATION.md](CONFIGURATION.md).

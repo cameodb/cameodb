@@ -63,7 +63,7 @@ Generates Software Bill of Materials (SBOM) in both SPDX and CycloneDX formats u
 ```bash
 # From Docker image (default) - outputs to scripts/security/
 ./scripts/security/generate-sbom.sh
-./scripts/security/generate-sbom.sh 0.2.2
+./scripts/security/generate-sbom.sh 0.3.0
 
 # From native binary
 ./scripts/security/generate-sbom.sh --native
