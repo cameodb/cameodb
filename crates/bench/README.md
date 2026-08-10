@@ -137,6 +137,6 @@ example meets `CameoClient` on the second screen instead of a derive macro.
 
 ## Not shipped
 
-`publish = false`, and `scripts/build/build-dist.sh` packages the `cameodb` binary by name.
+`publish = false`, and `scripts/build/build-packages.sh` packages the `cameodb` binary by name.
 Keeping the crate in the workspace means it has to keep compiling against the SDK, which is
 most of its value as an example — an SDK change that breaks a consumer breaks the build here.

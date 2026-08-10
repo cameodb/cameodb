@@ -3,7 +3,7 @@ name = "bench"
 version = "0.3.0"
 edition = "2024"
 license = "MIT"
-# Not a shipped artifact. `scripts/build/build-dist.sh` packages the `cameodb` binary by
+# Not a shipped artifact. `scripts/build/build-packages.sh` packages the `cameodb` binary by
 # name, so this never lands in a release; keeping it in the workspace means it has to keep
 # compiling against the SDK, which is most of its value as an example.
 publish = false

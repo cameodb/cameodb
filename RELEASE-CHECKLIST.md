@@ -50,7 +50,7 @@ box is a question that has not been answered, not a formality.
 9. **Sign, checksum and publish.** Signing verifies each signature against the published
    public key as it goes; publishing is a dry run until `--commit`.
    ```bash
-   COSIGN_PASSWORD=… scripts/release/release.sh --stage sign
+   scripts/release/release.sh --stage sign
    scripts/release/publish.sh              # review the add/replace report
    scripts/release/publish.sh --commit
    ```

@@ -35,7 +35,7 @@ produced by the pipeline in [scripts/release/](../../scripts/release/README.md):
 ```bash
 scripts/release/release.sh --stage build,sbom    # binaries, DEB, RPM, SPDX, CycloneDX
 #   ... build cameodb.exe on the Windows machine → dist/<version>/windows/
-COSIGN_PASSWORD=… scripts/release/release.sh --stage sign
+scripts/release/release.sh --stage sign
 scripts/release/publish.sh                       # dry run
 scripts/release/publish.sh --commit              # copy into cameodb-web
 ```

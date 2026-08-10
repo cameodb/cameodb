@@ -21,7 +21,7 @@ The version is read from `crates/*/Cargo.toml` and never passed as an argument.
 ```bash
 scripts/release/release.sh --stage build,sbom    # binaries, DEB, RPM, SPDX, CycloneDX
 #   ... build cameodb.exe on the Windows machine → dist/<version>/windows/
-COSIGN_PASSWORD=… scripts/release/release.sh --stage sign
+scripts/release/release.sh --stage sign
 scripts/release/publish.sh                       # dry run: add / same / replace report
 scripts/release/publish.sh --commit
 ```
@@ -71,7 +71,7 @@ debugging; use the pipeline for releases.
   ```
 - **Audience**: DevOps, release engineers, CI/CD
 
-#### `build-dist.sh`
+#### `build-packages.sh`
 **Purpose**: Cross-compilation build script for binaries and packages
 - **Features**:
   - Persistent Docker caching for fast rebuilds
@@ -80,9 +80,9 @@ debugging; use the pipeline for releases.
   - Corporate CA certificate handling
 - **Usage**:
   ```bash
-  ./scripts/build/build-dist.sh              # Build amd64
-  ./scripts/build/build-dist.sh arm64        # Build arm64
-  ./scripts/build/build-dist.sh amd64 arm64  # Build both
+  ./scripts/build/build-packages.sh              # Build amd64
+  ./scripts/build/build-packages.sh arm64        # Build arm64
+  ./scripts/build/build-packages.sh amd64 arm64  # Build both
   ```
 - **Outputs**: Binary, DEB package, RPM package
 - **Audience**: DevOps, release engineers

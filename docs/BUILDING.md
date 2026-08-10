@@ -618,51 +618,53 @@ cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl -p server \
 # OR with custom output: target/x86_64-unknown-linux-musl/release/cameodb_${VERSION}_amd64.deb
 ```
 
-**Option 4: Automated Build Script (Recommended for CI/CD)**
+**Option 4: Automated Build Script** — packages only; see `scripts/release/` for a release
 ```bash
 # Use the optimized build script with persistent caching
 # This script handles both RPM and DEB package generation in one run
-./scripts/build/build-dist.sh
+./scripts/build/build-packages.sh
 ```
 
-The `build-dist.sh` script provides:
+The `build-packages.sh` script provides:
 - **Persistent Docker volumes** for cargo registry and target cache (dramatic speed improvements on subsequent builds)
 - **Corporate CA certificate handling** for network trust
 - **Automatic binary stripping** via Cargo profile optimization
 - **Both RPM and DEB package generation** in a single run
 - **Colored output and progress indicators**
 
-**Prerequisites for build-dist.sh:**
+**Prerequisites for build-packages.sh:**
 ```bash
-# Make the script executable
-chmod +x build-dist.sh
-
 # Ensure Docker buildx builder is running
 docker buildx ls
 ```
 
 ### Signing Release Artifacts
 
-Cosign 2.x defaults to the new bundle format. Generate one `.bundle` file per artifact and ship it together with the binary and `cosign.pub` so downstream users can verify releases.
+> For a release, `scripts/release/release.sh --stage sign` does all of this: one `.bundle` per
+> artifact, each verified with `cosign verify-blob` before the release proceeds. The commands
+> below are the per-artifact mechanics.
+
+One `.bundle` file per artifact, shipped alongside the binary together with `cosign.pub` so
+downstream users can verify. The key is read from `COSIGN_KEY`, default `~/.cosign/cosign.key`.
 
 ```bash
-cosign sign-blob \
-  --key /usr/local/share/ca-certificates/cosign.key \
+cosign sign-blob --yes \
+  --key ~/.cosign/cosign.key \
   --bundle target/release/cameodb.bundle \
   target/release/cameodb
 
-cosign sign-blob \
-  --key /usr/local/share/ca-certificates/cosign.key \
+cosign sign-blob --yes \
+  --key ~/.cosign/cosign.key \
   --bundle target/x86_64-unknown-linux-musl/release/cameodb.bundle \
   target/x86_64-unknown-linux-musl/release/cameodb
 
-cosign sign-blob \
-  --key /usr/local/share/ca-certificates/cosign.key \
+cosign sign-blob --yes \
+  --key ~/.cosign/cosign.key \
   --bundle target/x86_64-unknown-linux-musl/release/cameodb-${VERSION}-1.x86_64.rpm.bundle \
   target/x86_64-unknown-linux-musl/release/cameodb-${VERSION}-1.x86_64.rpm
 
-cosign sign-blob \
-  --key /usr/local/share/ca-certificates/cosign.key \
+cosign sign-blob --yes \
+  --key ~/.cosign/cosign.key \
   --bundle target/x86_64-unknown-linux-musl/release/cameodb_${VERSION}_amd64.deb.bundle \
   target/x86_64-unknown-linux-musl/release/cameodb_${VERSION}_amd64.deb
 ```

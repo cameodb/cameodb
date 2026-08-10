@@ -39,13 +39,13 @@ Build optimized binaries and packages using Docker:
 
 ```bash
 # Build for amd64 (default)
-./scripts/build/build-dist.sh
+./scripts/build/build-packages.sh
 
 # Build for arm64
-./scripts/build/build-dist.sh arm64
+./scripts/build/build-packages.sh arm64
 
 # Build for both architectures
-./scripts/build/build-dist.sh amd64 arm64
+./scripts/build/build-packages.sh amd64 arm64
 ```
 
 **Outputs:**

@@ -3,9 +3,9 @@
 # Builds binary + DEB/RPM packages for the specified architecture
 #
 # Usage:
-#   ./scripts/build/build-dist.sh              # Build amd64 (default)
-#   ./scripts/build/build-dist.sh arm64        # Build arm64
-#   ./scripts/build/build-dist.sh amd64 arm64  # Build both architectures
+#   ./scripts/build/build-packages.sh              # Build amd64 (default)
+#   ./scripts/build/build-packages.sh arm64        # Build arm64
+#   ./scripts/build/build-packages.sh amd64 arm64  # Build both architectures
 #
 # Can be run from any directory (auto-detects project root)
 

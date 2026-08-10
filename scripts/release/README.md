@@ -9,7 +9,7 @@ scripts/release/release.sh --stage sbom          # SPDX + CycloneDX
 
 #   ... build cameodb.exe on the Windows machine and copy it into dist/<version>/windows/
 
-COSIGN_PASSWORD=… scripts/release/release.sh --stage sign
+scripts/release/release.sh --stage sign           # see COSIGN_PASSWORD below
 scripts/release/publish.sh                       # dry run — shows what would change
 scripts/release/publish.sh --commit              # copy into cameodb-web
 ```
@@ -21,7 +21,7 @@ build tree that may have been cleaned in between.
 ## The version is read from the tree
 
 `crates/*/Cargo.toml` is the only source. `lib.sh` refuses to run if the six crates disagree,
-and no stage accepts a version argument. This is what went wrong before: `build-dist.sh`
+and no stage accepts a version argument. This is what went wrong before: `build-packages.sh`
 carried `VERSION="0.2.3"` as a literal, so a 0.3.0 tree produced `cameodb_0.2.3_amd64.deb`
 whose binary answered `--version` with 0.3.0 — and that pair is what is published today.
 
@@ -56,7 +56,7 @@ the container path.** The zigbuild path always fails the PIE check — zig's lin
 for rehearsing the pipeline, not for shipping.
 
 The DEB and RPM wrap that same binary via `--no-build`. They are not rebuilt.
-`scripts/build/build-dist.sh` rebuilds under `release-docker` (thin LTO, 4 codegen units)
+`scripts/build/build-packages.sh` rebuilds under `release-docker` (thin LTO, 4 codegen units)
 instead, which meant the binary inside the packages was a different, less-optimized artifact
 than the standalone binary published beside it — indistinguishable afterwards, since both
 report the same `--version`.
@@ -102,35 +102,31 @@ SBOMs are signed too. They are security documents served over the same channel a
 binaries, and leaving them unsigned makes the one file describing the release contents the
 one file nobody can authenticate.
 
-#### Running it unattended
+#### Key and password
 
-Export `COSIGN_PASSWORD`. That is the whole requirement, and it works with **any** password:
+The signing key is read from `COSIGN_KEY`, default `~/.cosign/cosign.key`. Keep it at mode 600
+in a directory at mode 700 that holds nothing else — not alongside CA certificates, which is a
+directory something eventually treats as certs-to-distribute.
 
-```bash
-COSIGN_PASSWORD='the real one' scripts/release/release.sh --stage sign
-```
-
-An empty password is *not* needed for automation and is not a shortcut to it — `COSIGN_PASSWORD=""`
-and `COSIGN_PASSWORD='secret'` are equally unattended. What an empty password changes is only
-that the key file stops being protected at rest: anyone who can read
-`/usr/local/share/ca-certificates/cosign.key` can then sign releases as you.
-
-There is also no way to empty the password on the existing key. cosign has no re-encrypt or
-change-password command, and `import-key-pair` accepts a plain PEM key, not a
-`ENCRYPTED SIGSTORE PRIVATE KEY`, which cosign will not export. Switching to an empty password
-therefore means `generate-key-pair`, i.e. a **new key and a new `cosign.pub`** — and the
-currently published 0.2.3 bundles verify against the current one (checked: `Verified OK`). Every
-already-published signature would stop verifying the moment that file is replaced.
-
-If the goal is not typing the password, keep the key as it is and source it from somewhere:
+cosign asks for the key password once per invocation, and there is one invocation per artifact,
+so `COSIGN_PASSWORD` has to be in the environment for the stage to run unattended. Any value
+works, including an empty one where the key has no password — `sign.sh` defaults it to empty
+when it is unset, and prints which case applies.
 
 ```bash
+scripts/release/release.sh --stage sign
+
 COSIGN_PASSWORD="$(security find-generic-password -s cosign-cameodb -w)" \
   scripts/release/release.sh --stage sign
 ```
 
-`sign.sh` reports which of the three states it is in, and distinguishes "set to empty" from
-"not set" — an empty password is a valid configuration, so it is not treated as absent.
+#### Rotating the key invalidates published signatures
+
+`downloads/cosign.pub` is a single unversioned file, and the currently published 0.2.3 bundles
+verify against it. Replacing it — a new key, a move to KMS — silently breaks every signature
+already published. If that day comes, publish the public key version-stamped as well
+(`cosign-0.3.0.pub`) and keep the old ones. `publish.sh` never touches `cosign.pub`, so nothing
+here will overwrite it by accident.
 
 #### cosign v3 always writes to the transparency log
 
@@ -164,9 +160,9 @@ publish if any staged artifact lacks a `.bundle`.
 |---|---|---|
 | `CAMEODB_VERSION` | from `crates/*/Cargo.toml` | override for a test run |
 | `CAMEODB_WEB` | `/Users/gc/code/cameodb-web/public/downloads` | publish target |
-| `COSIGN_KEY` | `/usr/local/share/ca-certificates/cosign.key` | signing key |
+| `COSIGN_KEY` | `~/.cosign/cosign.key` | signing key |
 | `COSIGN_PUB` | `$CAMEODB_WEB/cosign.pub` | key signatures are verified against |
-| `COSIGN_PASSWORD` | — | export it, or answer one prompt per artifact |
+| `COSIGN_PASSWORD` | empty | key password; any value, empty included |
 | `LINUX_ARCHS` | `x86_64` | `x86_64`, `aarch64`, or both space-separated |
 | `BUILD_WITH` | `auto` | `container` (required for releases) or `zig` |
 
@@ -225,6 +221,6 @@ silently ship without it.
 ## Relationship to the rest of `scripts/`
 
 This pipeline calls `build/build-musl.sh` and reuses `validate/artifact.sh` through it. It does
-not call `build/build-dist.sh` — that script's container-rebuild path is the one this pipeline
+not call `build/build-packages.sh` — that script's container-rebuild path is the one this pipeline
 deliberately replaces, though its hardcoded version has been fixed since it is still reachable
 by hand. Run `validate/all.sh` before releasing; see [RELEASE-CHECKLIST.md](../../RELEASE-CHECKLIST.md).

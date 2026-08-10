@@ -4,7 +4,7 @@
 # Everything the stages disagree about is decided here exactly once: the version, where
 # artifacts are staged, what a Linux architecture is called in three different naming
 # conventions, and which external tools have to exist. A stage that needed its own copy of
-# any of those is how `build-dist.sh` came to ship 0.2.3-labelled packages out of a 0.3.0
+# any of those is how `build-packages.sh` came to ship 0.2.3-labelled packages out of a 0.3.0
 # tree, so there are no per-stage constants below this file.
 
 set -uo pipefail
@@ -49,7 +49,10 @@ DIST="$PROJECT_ROOT/dist/$VERSION"
 # Where the published tree lives. Overridable so a dry run can be pointed at a scratch copy.
 WEB_ROOT="${CAMEODB_WEB:-/Users/gc/code/cameodb-web/public/downloads}"
 
-COSIGN_KEY="${COSIGN_KEY:-/usr/local/share/ca-certificates/cosign.key}"
+# A directory that exists for nothing else, at mode 700. The key used to sit in
+# /usr/local/share/ca-certificates/, which is where build-packages.sh and docker-push.sh read the
+# corporate CA from: a directory something will eventually treat as certs-to-distribute.
+COSIGN_KEY="${COSIGN_KEY:-$HOME/.cosign/cosign.key}"
 # The public half is whatever downloaders will actually fetch, so verification uses that copy
 # rather than a local one — it checks the key users get, not the key we still have.
 COSIGN_PUB="${COSIGN_PUB:-$WEB_ROOT/cosign.pub}"

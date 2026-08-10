@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stage 3 — sign every staged artifact with cosign, then verify each signature.
 #
-#   COSIGN_PASSWORD=... scripts/release/sign.sh
+#   scripts/release/sign.sh            # COSIGN_PASSWORD from the environment, or empty
 #
 # Produces <artifact>.bundle next to each artifact, in the same sigstore bundle format the
 # currently published .bundle files use (v0.3, with a Rekor transparency-log entry).
@@ -30,19 +30,19 @@ section "sign $VERSION"
 info "key    $COSIGN_KEY"
 info "pubkey $COSIGN_PUB"
 
-# cosign prompts for the key password on every single invocation, and there is one invocation
-# per artifact. Exporting COSIGN_PASSWORD is what makes the stage unattended — with any
-# password, not only an empty one.
+# cosign prompts for the key password on every invocation, and there is one invocation per
+# artifact — so without COSIGN_PASSWORD in the environment a release is eight or ten identical
+# prompts. Default it to empty so the stage runs unattended; override for a key that has one.
 #
-# `${VAR+set}` rather than `${VAR:-}`: an empty password is a legitimate configuration, and
-# testing for non-emptiness would report a correctly-configured empty-password key as unset and
-# claim cosign is about to prompt when it is not.
+# `${VAR+set}` rather than `${VAR:-}`: empty is a legitimate value here, and testing for
+# non-emptiness cannot tell "deliberately empty" from "not configured".
 if [ -z "${COSIGN_PASSWORD+set}" ]; then
-    warn "COSIGN_PASSWORD is not set — cosign will prompt once per artifact"
+    export COSIGN_PASSWORD=""
+    info "password  COSIGN_PASSWORD unset, defaulted to empty"
 elif [ -z "$COSIGN_PASSWORD" ]; then
-    info "password  empty (unattended; the key on disk is unprotected)"
+    info "password  COSIGN_PASSWORD is empty"
 else
-    info "password  from COSIGN_PASSWORD (unattended)"
+    info "password  from COSIGN_PASSWORD"
 fi
 
 [ "$(staged_artifacts | wc -l | tr -d ' ')" -gt 0 ] || die "no artifacts staged under $DIST"
