@@ -30,6 +30,14 @@ require_tool cargo
 require_tool cargo-deb "cargo install cargo-deb"
 require_tool cargo-generate-rpm "cargo install cargo-generate-rpm"
 
+# Checked here rather than in the per-architecture loop below, which runs after the macOS build:
+# a release build that cannot reach Docker should say so before spending minutes on a binary it
+# is going to abandon.
+if [ "$ALLOW_UNHARDENED" -eq 0 ]; then
+    [ "${BUILD_WITH:-auto}" = "zig" ] && die "BUILD_WITH=zig cannot produce a static-pie binary; unset it to use the container path, or pass --allow-unhardened for a test run"
+    docker info > /dev/null 2>&1 || die "Docker is not running — the container path is required for a release build (or pass --allow-unhardened)"
+fi
+
 section "release $VERSION"
 info "staging into $DIST"
 
@@ -86,8 +94,7 @@ for arch in $LINUX_ARCHS; do
         step "scripts/build/build-musl.sh release $arch"
         scripts/build/build-musl.sh release "$arch" || warn "artifact validation reported failures"
     else
-        [ "${BUILD_WITH:-auto}" = "zig" ] && die "BUILD_WITH=zig cannot produce a static-pie binary; unset it to use the container path, or pass --allow-unhardened for a test run"
-        docker info > /dev/null 2>&1 || die "Docker is not running — the container path is required for a release build (or pass --allow-unhardened)"
+        # BUILD_WITH and Docker were checked before the macOS build.
         step "scripts/build/build-musl.sh release $arch"
         scripts/build/build-musl.sh release "$arch"
     fi

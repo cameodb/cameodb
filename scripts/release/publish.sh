@@ -112,6 +112,11 @@ for platform in mac linux windows; do
     [ -d "$DIST/$platform" ] || continue
     for f in "$DIST/$platform"/*; do
         [ -f "$f" ] || continue
+        # `*.version` is the record of what the Windows machine reported, used by the build
+        # stage to check the staged .exe. It is not an artifact: `staged_artifacts` excludes it,
+        # so it carries no signature and no checksum, and publishing it would put the one
+        # unsigned, unhashed file in the download directory next to the signed ones.
+        case "$f" in *.version) continue ;; esac
         copy_one "$f" "$WEB_ROOT/$platform/$(basename "$f")"
     done
 done

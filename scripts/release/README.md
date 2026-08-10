@@ -21,9 +21,10 @@ build tree that may have been cleaned in between.
 ## The version is read from the tree
 
 `crates/*/Cargo.toml` is the only source. `lib.sh` refuses to run if the six crates disagree,
-and no stage accepts a version argument. This is what went wrong before: `build-packages.sh`
-carried `VERSION="0.2.3"` as a literal, so a 0.3.0 tree produced `cameodb_0.2.3_amd64.deb`
-whose binary answered `--version` with 0.3.0 — and that pair is what is published today.
+and no stage accepts a version argument. `build-packages.sh` previously carried
+`VERSION="0.2.3"` as a literal, so it named its packages 0.2.3 regardless of the tree it was
+run against: at 0.3.0 it would have produced a `cameodb_0.2.3_amd64.deb` whose binary answers
+`--version` with 0.3.0, and nothing downstream compares the two.
 
 Override for a test run with `CAMEODB_VERSION=…`.
 
@@ -36,6 +37,7 @@ dist/0.3.0/
   linux/cameodb_0.3.0_amd64.deb     + .bundle .sha256
   linux/cameodb-0.3.0-1.x86_64.rpm  + .bundle .sha256
   windows/cameodb.exe               + .bundle .sha256    built elsewhere, dropped in
+  windows/cameodb.exe.version                            optional, not published
   cameodb.spdx.json                 + .bundle .sha256
   cameodb.cyclonedx.json            + .bundle .sha256
   SHA256SUMS                                             whole release in one `shasum -c`
@@ -75,12 +77,13 @@ Both flags are load-bearing, and they are not interchangeable — `--select-cata
 only tags, never cataloger names, and syft re-adds the `file` cataloger by default unless
 told otherwise. The result is ~580 cargo packages in about 1MB.
 
-For comparison, the SBOM published today was a plain `syft dir:.`: 30MB, an SPDX `name` field
-reading `/Users/gc/code/cameodb`, 147k individual file entries, and among its 882 "packages"
-ten copies each of `actions/setup-node` and `actions/checkout` scavenged from workflow files
-under the tree. None of that describes the shipped binary; a consumer scanning it for CVEs was
-matching against a laptop. The stage now asserts the package count against `Cargo.lock` and
-greps its own output for `$HOME`, so a cataloger rename cannot quietly restore the old scan.
+For comparison, the SBOM shipped before this stage existed came from a plain `syft dir:.`: 30MB,
+an SPDX `name` field reading `/Users/gc/code/cameodb`, 147k individual file entries, and among
+its 882 "packages" ten copies each of `actions/setup-node` and `actions/checkout` scavenged from
+workflow files under the tree. None of that described the shipped binary; a consumer scanning it
+for CVEs was matching against a laptop. The stage now asserts the package count against
+`Cargo.lock` and greps its own output for `$HOME`, so a cataloger rename cannot quietly restore
+the old scan.
 
 > The Rust binaries carry no embedded dependency list, so syft cannot derive components from
 > the artifact itself. Building with [`cargo auditable`](https://github.com/rust-secure-code/cargo-auditable)
@@ -90,7 +93,7 @@ greps its own output for `$HOME`, so a cataloger rename cannot quietly restore t
 
 ### sign
 
-`cosign sign-blob --key … --bundle <artifact>.bundle`, matching the sigstore bundle v0.3
+`cosign sign-blob --yes --key … --bundle <artifact>.bundle`, matching the sigstore bundle v0.3
 format already published, with a Rekor transparency-log entry.
 
 Every signature is verified immediately with `cosign verify-blob` against
@@ -122,9 +125,9 @@ COSIGN_PASSWORD="$(security find-generic-password -s cosign-cameodb -w)" \
 
 #### Rotating the key invalidates published signatures
 
-`downloads/cosign.pub` is a single unversioned file, and the currently published 0.2.3 bundles
-verify against it. Replacing it — a new key, a move to KMS — silently breaks every signature
-already published. If that day comes, publish the public key version-stamped as well
+`downloads/cosign.pub` is a single unversioned file that every published `.bundle` verifies
+against. Replacing it — a new key, a move to KMS — silently breaks every signature already
+published. If that day comes, publish the public key version-stamped as well
 (`cosign-0.3.0.pub`) and keep the old ones. `publish.sh` never touches `cosign.pub`, so nothing
 here will overwrite it by accident.
 
@@ -139,20 +142,24 @@ rehearsed offline against a throwaway key without publishing entries to that log
 Writes `<artifact>.sha256` as `<hash>  <basename>`, plus an aggregate `SHA256SUMS`, and
 verifies the aggregate against the staged files before going further.
 
-The published `.sha256` files currently contain an absolute path:
+Earlier releases published a `.sha256` holding an absolute path:
 
 ```
 a319fd07…  /Users/gc/code/cameodb-web/public/downloads/linux/cameodb
 ```
 
-which leaks the signing machine's layout and makes `shasum -c cameodb.sha256` fail for every
-downloader, since that directory does not exist on their machine. A bare basename verifies
-from the download directory, which is where anyone would actually run it.
+which leaked the signing machine's layout and made `shasum -c cameodb.sha256` fail for every
+downloader, since that directory does not exist on their machine. A bare basename verifies from
+the download directory, which is where anyone would actually run it.
 
 Then it copies into `cameodb-web/public/downloads/`. **Dry run by default** — it writes into
 another repository's live tree, so it reports each file as `add`, `same` or `replace`, showing
-the old and new size and hash for a replacement. `--commit` performs the copy. It refuses to
-publish if any staged artifact lacks a `.bundle`.
+the old and new size and hash for a replacement. `--commit` performs the copy.
+
+It refuses to publish a release that is unsigned — any staged artifact without a `.bundle` — or
+one staged with `--allow-unhardened`, which the build stage records in `dist/<version>/.unhardened`
+because an unhardened binary signs and checksums exactly as cleanly as a hardened one. Nothing is
+ever deleted: version-stamped files from earlier releases are listed as stale and left in place.
 
 ## Environment
 
