@@ -12,6 +12,29 @@ For a quick overview of all available scripts and project status:
 
 ## Directory Structure & Scripts
 
+### 🚀 `release/` - Release pipeline
+
+**Start here for anything that will be published.** Four stages — build, sbom, sign, publish —
+that turn a clean tree into signed, checksummed artifacts in `cameodb-web/public/downloads/`.
+The version is read from `crates/*/Cargo.toml` and never passed as an argument.
+
+```bash
+scripts/release/release.sh --stage build,sbom    # binaries, DEB, RPM, SPDX, CycloneDX
+#   ... build cameodb.exe on the Windows machine → dist/<version>/windows/
+COSIGN_PASSWORD=… scripts/release/release.sh --stage sign
+scripts/release/publish.sh                       # dry run: add / same / replace report
+scripts/release/publish.sh --commit
+```
+
+- **Prerequisites**: Docker (required — the zigbuild path cannot produce a static-pie binary
+  and the build stage refuses it), plus `syft`, `cosign`, `cargo-deb`, `cargo-generate-rpm`, `jq`
+- **Audience**: release engineers
+- **Details**: [release/README.md](release/README.md), and
+  [RELEASE-CHECKLIST.md](../RELEASE-CHECKLIST.md) for the surrounding procedure
+
+The scripts below are the underlying mechanics. Use them directly for local builds and
+debugging; use the pipeline for releases.
+
 ### 📦 `build/` - Build and Distribution
 
 #### `build-musl.sh`

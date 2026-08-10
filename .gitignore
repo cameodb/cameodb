@@ -75,23 +75,30 @@ Thumbs.db
 *.pdb
 
 # Python
+#
+# The directory patterns below are anchored with a leading slash so they match Python
+# packaging output at the project root and nothing else. Unanchored, `build/` also matched
+# `scripts/build/`, which quietly excluded build-dist.sh and docker-push.sh: both were
+# documented in scripts/README.md and neither existed in a fresh clone. This is the same
+# failure the `.cargo/*` note below describes — a directory excluded here is not descended
+# into, so nothing underneath it can be negated back in.
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
+/build/
+/develop-eggs/
+/dist/
+/downloads/
+/eggs/
+/.eggs/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
 *.egg-info/
 .installed.cfg
 *.egg

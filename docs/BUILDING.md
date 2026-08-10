@@ -275,19 +275,9 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 ### TLS Configuration for Windows
 
-Windows builds support the same TLS backends:
-
 - TLS is rustls with the `ring` provider on every platform; there are no TLS feature flags to choose
-- `rustls-tls`: Pure Rust TLS implementation
 - Outbound HTTPS verifies against the Windows certificate store via `rustls-platform-verifier`
-
-Example with rustls-tls:
-
-```bash
-cargo xwin build --release --target x86_64-pc-windows-msvc \
-    --no-default-features \
-    --features client/rustls-tls
-```
+- No C toolchain is involved, so a Windows cross-build needs nothing extra for TLS
 
 ### Windows-specific Considerations
 
@@ -343,7 +333,7 @@ docker build \
 
 ### Musl (static) image with Zig
 
-Builds a static musl binary using Zig’s C toolchain and vendored OpenSSL:
+Builds a static musl binary using Zig’s C toolchain; TLS is rustls, so nothing is vendored:
 
 ```bash
 docker build \
@@ -358,7 +348,7 @@ docker build \
 - Use **native/glibc** for typical container runtimes where glibc is available.
 - Use **musl** when you need a fully static binary or strict MUSL environments.
 
-### Default: rustls with the system trust store
+### Local development build
 
 For local development on macOS/Linux:
 
@@ -366,14 +356,11 @@ For local development on macOS/Linux:
 cargo build --release
 ```
 
-Uses system TLS libraries (default feature).
+## TLS Configuration
 
-## Feature Configuration
-
-The `client` crate supports the following TLS backends:
+There is nothing to configure and no backend to select — see [On `--no-default-features`](#on---no-default-features).
 
 - TLS is rustls with the `ring` provider; outbound HTTPS verifies against the system trust store (Keychain on macOS, `/etc/ssl/certs` on Linux)
-- `rustls-tls`: Pure Rust TLS implementation (recommended for musl/Docker builds)
 - Static and musl builds need `ca-certificates` present in the image; verify with `scripts/validate/remote-sources.sh`
 
 ## Docker Build
@@ -387,7 +374,7 @@ The Dockerfile builds secure, non-root Docker images for both `amd64` and `arm64
 - **✅ Multi-architecture**: Supports `linux/amd64` and `linux/arm64`
 - **✅ Static musl builds**: Fully static binaries for portability
 - **✅ Distroless runtime**: Minimal attack surface, no shell
-- **✅ OpenSSL vendoring**: No external TLS dependencies
+- **✅ Pure-Rust TLS**: rustls with the `ring` provider; no OpenSSL to vendor or link
 
 #### Build Configuration:
 
@@ -444,7 +431,7 @@ docker build \
 - **Distroless base**: Minimal runtime, no package manager or shell
 - **Static linking**: No runtime dependencies, works across Linux distributions
 - **Multi-arch**: Single image supports both Intel and ARM platforms
-- **OpenSSL vendored**: No external TLS library dependencies
+- **Pure-Rust TLS**: rustls with the `ring` provider; no external TLS library dependencies
 
 #### Verification:
 
@@ -502,22 +489,6 @@ rustflags = [
 
 ## Troubleshooting
 
-### OpenSSL linking errors with musl
-
-If you see errors like:
-```
-undefined reference to `__isoc23_strtol'
-```
-
-This is a glibc/musl compatibility issue with vendored OpenSSL. Use `rustls-tls` instead:
-```bash
-export AR="zig ar"
-export RANLIB="zig ranlib"
-cargo zigbuild --release --target x86_64-unknown-linux-musl \
-    --no-default-features \
-    --features client/rustls-tls
-```
-
 ### Certificate validation errors
 
 Certificate validation errors usually mean the issuing CA is missing from the OS trust store — install it there (this is also what a TLS-inspecting corporate proxy requires). `--insecure-source` bypasses verification for a remote data source and should stay a development-only measure.
@@ -535,17 +506,22 @@ You ran `cargo zigbuild` directly without exporting `AR`/`RANLIB` first (see the
 find target -name "libjemalloc.a" -exec ls -la {} \;
 ```
 
-### OpenSSL not found during cross-compilation
-
-If you see:
-```
-Could not find directory of OpenSSL installation
-```
-
-Either use `rustls-tls` (recommended) or install OpenSSL development packages for your target platform.
 ## 📦 RPM Package Building
 
+> **For an actual release, use [scripts/release/](../scripts/release/README.md) instead of the
+> commands below.** It derives the version from the manifests, wraps the same binary it
+> publishes standalone, and signs and checksums the result. The commands here are the
+> underlying mechanics, useful for building a one-off package or debugging the pipeline.
+
 CameoDB supports building RPM packages for x86_64 Linux distributions using cargo-zigbuild for cross-compilation.
+
+Every command below uses `$VERSION`. Derive it from the manifests rather than typing it — a
+literal version in a build command is how `cameodb_0.2.3_amd64.deb` came to be built from a
+0.3.0 tree, containing a binary that answers `0.3.0` to `--version`:
+
+```bash
+VERSION=$(grep -m1 '^version = ' crates/server/Cargo.toml | sed 's/^version = "//; s/"$//')
+```
 
 ### Prerequisites
 
@@ -571,7 +547,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 # Generate RPM package (run from project root directory)
 cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
-  -o target/x86_64-unknown-linux-musl/release/cameodb-0.3.0-1.x86_64.rpm \
+  -o target/x86_64-unknown-linux-musl/release/cameodb-${VERSION}-1.x86_64.rpm \
   --set-metadata 'package.name="cameodb"'
 ```
 
@@ -583,21 +559,19 @@ export AR="zig ar"
 export RANLIB="zig ranlib"
 
 # Build hardened binary for Linux x86_64 musl target (flags in .cargo/config.toml)
-cargo zigbuild --release --target x86_64-unknown-linux-musl \
-    --no-default-features \
+cargo zigbuild --release --target x86_64-unknown-linux-musl --no-default-features
 
 # OR override with explicit RUSTFLAGS:
 RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=pie -C relro-level=full -C link-arg=-pie -C link-arg=-static -C link-arg=-Wl,-z,now -C link-arg=-Wl,-z,relro -C link-arg=-fstack-protector-strong -C link-arg=-D_FORTIFY_SOURCE=2" \
-cargo zigbuild --release --target x86_64-unknown-linux-musl \
-    --no-default-features \
+cargo zigbuild --release --target x86_64-unknown-linux-musl --no-default-features
 
 # Generate RPM package with standard naming (run from project root directory)
 cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-req disabled \
-  -o target/x86_64-unknown-linux-musl/release/cameodb-0.3.0-1.x86_64.rpm \
+  -o target/x86_64-unknown-linux-musl/release/cameodb-${VERSION}-1.x86_64.rpm \
   --set-metadata 'package.name="cameodb"'
 
 # The RPM package will be available at:
-# target/x86_64-unknown-linux-musl/release/cameodb-0.3.0-1.x86_64.rpm
+# target/x86_64-unknown-linux-musl/release/cameodb-${VERSION}-1.x86_64.rpm
 ```
 
 **Option 3: DEB Package Generation (Ubuntu/Debian)**
@@ -625,8 +599,7 @@ docker run --rm --platform linux/amd64 \
   cameo-builder bash -c "
     cat /usr/local/share/ca-certificates/corporate-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt && \
-    cargo build --release --target x86_64-unknown-linux-musl \
-      --no-default-features \
+    cargo build --release --target x86_64-unknown-linux-musl --no-default-features
     "
 
 # Generate DEB package (run on host after Docker build)
@@ -638,11 +611,11 @@ cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl -p server
 
 # With custom output path (follows DEB naming standards)
 cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl -p server \
-  --output target/x86_64-unknown-linux-musl/release/cameodb_0.3.0_amd64.deb
+  --output target/x86_64-unknown-linux-musl/release/cameodb_${VERSION}_amd64.deb
 
 # The DEB package will be available at:
-# target/x86_64-unknown-linux-musl/debian/cameodb_0.3.0_amd64.deb
-# OR with custom output: target/x86_64-unknown-linux-musl/release/cameodb_0.3.0_amd64.deb
+# target/x86_64-unknown-linux-musl/debian/cameodb_${VERSION}_amd64.deb
+# OR with custom output: target/x86_64-unknown-linux-musl/release/cameodb_${VERSION}_amd64.deb
 ```
 
 **Option 4: Automated Build Script (Recommended for CI/CD)**
@@ -685,13 +658,13 @@ cosign sign-blob \
 
 cosign sign-blob \
   --key /usr/local/share/ca-certificates/cosign.key \
-  --bundle target/x86_64-unknown-linux-musl/release/cameodb-0.3.0-1.x86_64.rpm.bundle \
-  target/x86_64-unknown-linux-musl/release/cameodb-0.3.0-1.x86_64.rpm
+  --bundle target/x86_64-unknown-linux-musl/release/cameodb-${VERSION}-1.x86_64.rpm.bundle \
+  target/x86_64-unknown-linux-musl/release/cameodb-${VERSION}-1.x86_64.rpm
 
 cosign sign-blob \
   --key /usr/local/share/ca-certificates/cosign.key \
-  --bundle target/x86_64-unknown-linux-musl/release/cameodb_0.3.0_amd64.deb.bundle \
-  target/x86_64-unknown-linux-musl/release/cameodb_0.3.0_amd64.deb
+  --bundle target/x86_64-unknown-linux-musl/release/cameodb_${VERSION}_amd64.deb.bundle \
+  target/x86_64-unknown-linux-musl/release/cameodb_${VERSION}_amd64.deb
 ```
 
 **Verification example:**
@@ -755,13 +728,13 @@ Hardening flags explained:
 **For RPM-based systems (RHEL, CentOS, Fedora):**
 ```bash
 # Verify RPM package before installation
-rpm -qpi cameodb-0.3.0-1.x86_64.rpm
+rpm -qpi cameodb-${VERSION}-1.x86_64.rpm
 
 # Check package contents
-rpm -qpl cameodb-0.3.0-1.x86_64.rpm
+rpm -qpl cameodb-${VERSION}-1.x86_64.rpm
 
 # Install the RPM package
-sudo rpm -i cameodb-0.3.0-1.x86_64.rpm
+sudo rpm -i cameodb-${VERSION}-1.x86_64.rpm
 
 # Start and enable the service
 sudo systemctl daemon-reload
@@ -772,13 +745,13 @@ sudo systemctl start cameodb
 **For DEB-based systems (Ubuntu, Debian):**
 ```bash
 # Verify DEB package before installation
-dpkg -I cameodb_0.3.0_amd64.deb
+dpkg -I cameodb_${VERSION}_amd64.deb
 
 # Check package contents
-dpkg -c cameodb_0.3.0_amd64.deb
+dpkg -c cameodb_${VERSION}_amd64.deb
 
 # Install the DEB package
-sudo dpkg -i cameodb_0.3.0_amd64.deb
+sudo dpkg -i cameodb_${VERSION}_amd64.deb
 
 # Start and enable the service
 sudo systemctl daemon-reload

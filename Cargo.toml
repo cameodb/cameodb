@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# `cargo run` has two candidates across the workspace — `cameodb` (crates/server) and
+# `cameodb-bench` (crates/bench) — and refuses to guess. The server is the product, so
+# it is the default package for bare `cargo run` / `cargo build`. Everything that needs
+# the whole workspace already says so explicitly (`--workspace`, `-p bench`).
+default-members = ["crates/server"]
 
 [workspace.dependencies]
 anyhow = "1.0.102"

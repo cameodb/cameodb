@@ -1,6 +1,9 @@
 #!/bin/bash
-# Generate SBOM for CameoDB using syft 1.42.3
-# Outputs both SPDX JSON and CycloneDX JSON formats for public distribution
+# Generate SBOM for CameoDB using syft
+# Outputs both SPDX JSON and CycloneDX JSON formats
+#
+# For a release, use scripts/release/sbom.sh instead — it writes into the release staging tree
+# and asserts the scope afterwards. This script is for ad-hoc SBOMs, notably of a Docker image.
 #
 # Usage:
 #   ./scripts/security/generate-sbom.sh                   # Generate SBOMs from Docker image (latest)
@@ -149,14 +152,34 @@ generate_native_sbom() {
 
 generate_source_sbom() {
     echo -e "${BLUE}Generating SBOMs from source code (Cargo.lock)...${NC}"
-    
+
+    # Scoped to Cargo.lock, which is what "from source code" is supposed to mean. A plain
+    # `syft dir:.` produces a 30MB document whose SPDX `name` is the absolute scan path, which
+    # lists 147k individual files, and whose packages include GitHub Actions scavenged from
+    # workflow files under the tree — none of which describes the shipped binary. That document
+    # was published. Both flags are needed and they are not interchangeable:
+    # --select-catalogers takes only tags (never names), and syft re-adds the `file` cataloger
+    # by default, which is the entire 30MB.
+    # "latest" is a Docker tag, not a version — in source mode read the real one.
+    local source_version="$VERSION"
+    if [[ "$source_version" == "latest" ]]; then
+        source_version="$(grep -m1 '^version = ' "$PROJECT_ROOT/crates/server/Cargo.toml" | sed 's/^version = "//; s/"$//')"
+    fi
+
+    local scope=(
+        --override-default-catalogers rust-cargo-lock-cataloger
+        --select-catalogers -file
+        --source-name cameodb
+        --source-version "$source_version"
+    )
+
     # Generate SPDX format
     echo -e "${BLUE}  → Generating SPDX...${NC}"
-    syft dir:"$PROJECT_ROOT" -o "spdx-json=$SPDX_FILE"
-    
+    syft dir:"$PROJECT_ROOT" "${scope[@]}" -o "spdx-json=$SPDX_FILE"
+
     # Generate CycloneDX format
     echo -e "${BLUE}  → Generating CycloneDX...${NC}"
-    syft dir:"$PROJECT_ROOT" -o "cyclonedx-json=$CYCLONEDX_FILE"
+    syft dir:"$PROJECT_ROOT" "${scope[@]}" -o "cyclonedx-json=$CYCLONEDX_FILE"
 }
 
 # Main execution

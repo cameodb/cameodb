@@ -16,12 +16,14 @@ box is a question that has not been answered, not a formality.
    ```
 2. **Move `[Unreleased]` to the new version in `CHANGELOG.md`**, dated, with a fresh empty
    `[Unreleased]` above it.
-3. **Build every target you intend to ship.**
+3. **Build and describe every target you intend to ship.**
    ```bash
-   cargo build --release
-   scripts/build/build-musl.sh          # static Linux
-   scripts/build/build-dist.sh          # packages
+   scripts/release/release.sh --stage build,sbom
    ```
+   Stages artifacts under `dist/<version>/` and reads the version from the manifests, so the
+   filenames cannot disagree with what the binary reports. Docker must be running: the
+   zigbuild path cannot produce a static-pie binary and `build.sh` refuses to use it for a
+   release. See [scripts/release/README.md](scripts/release/README.md).
 4. **Run the validation suite** on the host build.
    ```bash
    scripts/validate/all.sh
@@ -33,11 +35,28 @@ box is a question that has not been answered, not a formality.
 6. **Review the advisory exceptions.** `deps.sh` fails once a `review-by` date in
    `deny.toml` has passed. Renewing one means checking for an upstream fix first, not
    moving the date.
-7. **Confirm the posture of the configs you ship or document.**
+7. **Confirm the posture of the configs you ship or document.** Two files matter: the example
+   in the repo root, and `crates/server/cameodb.toml`, which is what both the DEB and the RPM
+   install to `/etc/cameodb/cameodb.toml`.
    ```bash
    cameodb check-config -c cameodb.example.toml
+   cameodb check-config -c crates/server/cameodb.toml
    ```
-8. **Record the outcome below**, including anything skipped and why.
+8. **Build Windows on the Windows machine** and copy the result into the staging tree, which
+   is where the sign stage will look for it.
+   ```
+   dist/<version>/windows/cameodb.exe
+   ```
+9. **Sign, checksum and publish.** Signing verifies each signature against the published
+   public key as it goes; publishing is a dry run until `--commit`.
+   ```bash
+   COSIGN_PASSWORD=… scripts/release/release.sh --stage sign
+   scripts/release/publish.sh              # review the add/replace report
+   scripts/release/publish.sh --commit
+   ```
+10. **Commit the web project.** `publish.sh` only copies files; the `cameodb-web` checkout is
+    left dirty for review.
+11. **Record the outcome below**, including anything skipped and why.
 
 ## Known gaps carried into every release
 

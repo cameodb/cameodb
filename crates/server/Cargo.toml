@@ -122,9 +122,14 @@ search capabilities, and modern Rust performance optimizations."""
 depends = ""
 section = "database"
 priority = "optional"
+# Same config the RPM installs, not ../../cameodb.example.toml. The example file is written for
+# running from a checkout — `data_paths = ["./data/cameodb"]` — and cameodb.service sets
+# `User=cameodb` with no WorkingDirectory, so systemd starts it from `/`. The DEB therefore
+# installed a config pointing at /data/cameodb, which the unprivileged user cannot create,
+# while both maintainer scripts prepare /var/lib/cameodb. cameodb.toml uses that absolute path.
 assets = [
     ["target/release/cameodb", "usr/local/bin/", "755"],
-    ["../../cameodb.example.toml", "etc/cameodb/cameodb.toml", "644"],
+    ["cameodb.toml", "etc/cameodb/cameodb.toml", "644"],
     ["cameodb.service", "lib/systemd/system/", "644"]
 ]
 conf-files = ["etc/cameodb/cameodb.toml"]
