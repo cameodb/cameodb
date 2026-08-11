@@ -186,9 +186,42 @@ rollup_secs = 1
         body["records"].as_array().cloned().unwrap_or_default()
     }
 
+    /// The trail, re-read until `want` holds, or until the deadline — in which case the last
+    /// trail seen is returned so the caller's own assertion produces the message.
+    ///
+    /// A record is written *after* the response it describes has been built, so any single read
+    /// races the writer. A fixed sleep only widens that window rather than closing it: each test
+    /// here runs a real server as a child process, and a `cargo test --workspace` run keeps
+    /// enough of them in flight that reads came back with an empty trail. Polling waits exactly
+    /// as long as it has to, so the checks are neither flaky nor padded with a constant chosen
+    /// for the slowest machine anyone might run them on.
+    async fn trail_until(&self, want: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let trail = self.trail().await;
+            if want(&trail) || Instant::now() >= deadline {
+                return trail;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// The trail as it was written to disk.
     fn trail_file(&self) -> String {
         std::fs::read_to_string(&self.audit_file).unwrap_or_default()
+    }
+
+    /// The trail file, re-read until `want` holds or the deadline passes. Same reasoning as
+    /// [`Self::trail_until`]; the file sink is flushed on the same path as the ring.
+    async fn trail_file_until(&self, want: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let contents = self.trail_file();
+            if want(&contents) || Instant::now() >= deadline {
+                return contents;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -269,7 +302,13 @@ async fn a_read_is_attributed_to_the_key_that_made_it() {
     let (status, _) = node.get("/_indexes", Some(&node.reader_key)).await;
     assert_eq!(status, 200);
 
-    let trail = node.trail().await;
+    let trail = node
+        .trail_until(|t| {
+            records_of(t, "http")
+                .iter()
+                .any(|r| r["path"] == "/_indexes")
+        })
+        .await;
     let read = records_of(&trail, "http")
         .into_iter()
         .find(|r| r["path"] == "/_indexes")
@@ -303,10 +342,21 @@ async fn no_key_ever_appears_in_the_trail() {
         Some("cameo_v1_notarealkeynotarealkeynotarealkey000"),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let file = node.trail_file();
-    let endpoint = serde_json::to_string(&node.trail().await).expect("serialize trail");
+    // Absence is the assertion, so waiting for the records to exist is what keeps this from
+    // passing against an empty trail.
+    let file = node
+        .trail_file_until(|c| c.contains("/_indexes") && c.contains("auth_denied"))
+        .await;
+    let trail = node
+        .trail_until(|t| {
+            records_of(t, "http")
+                .iter()
+                .any(|r| r["path"] == "/_indexes")
+                && !records_of(t, "auth_denied_stats").is_empty()
+        })
+        .await;
+    let endpoint = serde_json::to_string(&trail).expect("serialize trail");
     for (name, key) in [
         ("admin", &node.admin_key),
         ("reader", &node.reader_key),
@@ -338,10 +388,20 @@ async fn writes_are_counted_while_reads_are_listed() {
         assert!(status < 400, "write {i} failed with {status}");
     }
     node.search("docs", "id:d1", &node.reader_key).await;
-    // Past one rollup window, so the counts have been flushed.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let trail = node.trail().await;
+    // `rollup_secs = 1`, so the counts appear once a window closes. Wait for all sixty to be
+    // accounted for rather than for a duration, and sum across lines: on a loaded machine sixty
+    // writes can take longer than a window, which splits them across two — a scheduling detail,
+    // not a change in what the rollup does.
+    let trail = node
+        .trail_until(|t| {
+            records_of(t, "write_stats")
+                .iter()
+                .filter_map(|r| r["ops"].as_u64())
+                .sum::<u64>()
+                == 60
+        })
+        .await;
 
     let per_write: Vec<&Value> = records_of(&trail, "http")
         .into_iter()
@@ -353,15 +413,24 @@ async fn writes_are_counted_while_reads_are_listed() {
         per_write.len()
     );
 
+    // Counted, not listed: what matters is that every write is accounted for and that sixty of
+    // them did not become sixty lines. Pinning it to exactly one line asserted that the writes
+    // fit inside one rollup window, which is a property of the machine rather than of the code.
     let stats = records_of(&trail, "write_stats");
+    let counted: u64 = stats.iter().filter_map(|r| r["ops"].as_u64()).sum();
     assert_eq!(
-        stats.len(),
-        1,
-        "sixty writes to one index by one key are one line, got {stats:#?}"
+        counted, 60,
+        "every write must be counted exactly once, got {stats:#?}"
     );
-    assert_eq!(stats[0]["ops"], 60);
-    assert_eq!(stats[0]["index"], "docs");
-    assert_eq!(stats[0]["label"], "ingest");
+    assert!(
+        stats.len() < 60,
+        "sixty writes to one index by one key must not become sixty lines, got {}",
+        stats.len()
+    );
+    for line in &stats {
+        assert_eq!(line["index"], "docs");
+        assert_eq!(line["label"], "ingest");
+    }
 
     let searches: Vec<&Value> = records_of(&trail, "http")
         .into_iter()
@@ -389,9 +458,16 @@ async fn a_refused_key_is_named_but_an_anonymous_flood_is_only_counted() {
         let (status, _) = node.get("/_indexes", None).await;
         assert_eq!(status, 401, "no key, no answer");
     }
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-
-    let trail = node.trail().await;
+    let trail = node
+        .trail_until(|t| {
+            records_of(t, "http")
+                .iter()
+                .any(|r| r["outcome"] == "denied")
+                && records_of(t, "auth_denied_stats")
+                    .iter()
+                    .any(|r| r["ops"] == 5)
+        })
+        .await;
 
     let denial = records_of(&trail, "http")
         .into_iter()
@@ -431,9 +507,17 @@ async fn reading_the_trail_needs_node_admin_and_is_itself_recorded() {
     assert_eq!(status, 403, "a reader must not be able to read the trail");
 
     // The admin's first read cannot appear in its own response — the record is written after
-    // the response is built — so it is the second call that proves it happened.
-    node.trail().await;
-    let trail = node.trail().await;
+    // the response is built — so it takes a later call to see it.
+    let trail = node
+        .trail_until(|t| {
+            let http = records_of(t, "http");
+            http.iter()
+                .any(|r| r["path"] == "/_admin/audit" && r["outcome"] == "allowed")
+                && http
+                    .iter()
+                    .any(|r| r["path"] == "/_admin/audit" && r["outcome"] == "denied")
+        })
+        .await;
     assert!(
         records_of(&trail, "http")
             .iter()
@@ -457,7 +541,11 @@ async fn query_text_is_kept_only_when_configured() {
 
     let quiet = TestNode::start("").await;
     quiet.search("docs", secret, &quiet.reader_key).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for the search's own record, so the absence of the query text is evidence rather
+    // than a trail that had not been written yet.
+    quiet
+        .trail_file_until(|c| c.contains("/api/docs/search"))
+        .await;
     assert!(
         !quiet.trail_file().contains(secret),
         "query text must not be recorded by default:\n{}",
@@ -466,8 +554,9 @@ async fn query_text_is_kept_only_when_configured() {
 
     let loud = TestNode::start("record_query_text = true").await;
     loud.search("docs", secret, &loud.reader_key).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let recorded = loud.trail().await;
+    let recorded = loud
+        .trail_until(|t| t.iter().any(|r| r["query"].as_str() == Some(secret)))
+        .await;
     assert!(
         recorded.iter().any(|r| r["query"].as_str() == Some(secret)),
         "record_query_text = true must keep the query, got {recorded:#?}"
@@ -501,7 +590,9 @@ async fn an_mcp_tool_call_records_the_tool_and_the_index() {
         resp.status()
     );
 
-    let trail = node.trail().await;
+    let trail = node
+        .trail_until(|t| !records_of(t, "mcp_tool").is_empty())
+        .await;
     let call = records_of(&trail, "mcp_tool")
         .into_iter()
         .next()
@@ -546,7 +637,9 @@ async fn an_mcp_tool_refused_for_scope_is_recorded_with_its_reason() {
         .await
         .expect("mcp post");
 
-    let trail = node.trail().await;
+    let trail = node
+        .trail_until(|t| !records_of(t, "mcp_tool").is_empty())
+        .await;
     let call = records_of(&trail, "mcp_tool")
         .into_iter()
         .next()
@@ -569,9 +662,10 @@ async fn the_file_sink_is_valid_json_lines() {
     let node = TestNode::start("").await;
     node.get("/_indexes", Some(&node.reader_key)).await;
     node.write("docs", "d1").await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let contents = node.trail_file();
+    let contents = node
+        .trail_file_until(|c| c.contains("/_indexes") && c.contains("write"))
+        .await;
     assert!(!contents.is_empty(), "the file sink wrote nothing");
     for line in contents.lines() {
         let parsed: Value =
