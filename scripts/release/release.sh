@@ -74,8 +74,28 @@ done
 
 section "pipeline complete"
 info "staged at $DIST"
-case ",$STAGES," in
-    *,publish,*) ;;
-    *,sign,*)    info "next: scripts/release/publish.sh          # dry run, then --commit" ;;
-    *)           info "next: drop the Windows .exe into $DIST/windows/, then --stage sign,publish" ;;
-esac
+
+# What is still pending, in pipeline order: everything after the last stage that just ran. A
+# stage earlier than that one is assumed to have run in a previous invocation — the tree is the
+# state, and re-running build to satisfy the hint would discard it. Deriving this rather than
+# printing a fixed line is the point: `--stage build` used to be told to go to `sign,publish`,
+# which skips sbom entirely and publishes a release with no SBOM in it.
+_todo=""
+for _canon in build sbom sign publish; do
+    case ",$STAGES," in
+        *",$_canon,"*) _todo="" ;;
+        *)             _todo="${_todo:+$_todo,}$_canon" ;;
+    esac
+done
+
+if [ -n "$_todo" ]; then
+    # publish alone is worth naming directly: it is a dry run until --commit, and the hint is the
+    # only place that says so.
+    if [ "$_todo" = "publish" ]; then
+        info "next: scripts/release/publish.sh          # dry run, then --commit"
+    elif case ",$_todo," in *,sign,*) true ;; *) false ;; esac && [ ! -f "$DIST/windows/cameodb.exe" ]; then
+        info "next: drop the Windows .exe into $DIST/windows/, then --stage $_todo"
+    else
+        info "next: scripts/release/release.sh --stage $_todo"
+    fi
+fi
