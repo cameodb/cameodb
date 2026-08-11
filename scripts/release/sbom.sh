@@ -26,6 +26,8 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+[ $# -eq 0 ] || reject_unknown_arg "$1"
+
 cd "$PROJECT_ROOT"
 
 require_tool syft "brew install syft"

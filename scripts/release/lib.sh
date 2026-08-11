@@ -79,6 +79,15 @@ require_tool() {
     command -v "$1" > /dev/null 2>&1 || die "$1 not installed${2:+ — $2}"
 }
 
+# Each stage script runs standalone as well as under release.sh, which invites passing
+# release.sh's flags to a stage — `build.sh --stage sbom`. Ignoring the flag runs a full
+# rebuild and looks precisely like `--stage` being broken, so every stage refuses an argument
+# it does not implement rather than proceeding with a different meaning than the one typed.
+reject_unknown_arg() {
+    die "unknown argument '$1' to $(basename "$0") — stage selection belongs to the driver:
+  scripts/release/release.sh --stage build|sbom|sign|publish"
+}
+
 # Every file in the staging tree that is a release artifact, i.e. the things that get signed
 # and hashed. Signatures and checksums are themselves in the tree, so they are excluded by
 # extension rather than by trying to remember what was added when.

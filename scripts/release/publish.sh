@@ -19,7 +19,12 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 COMMIT=0
-[ "${1:-}" = "--commit" ] && COMMIT=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --commit) COMMIT=1; shift ;;
+        *) reject_unknown_arg "$1" ;;
+    esac
+done
 
 [ -d "$DIST" ] || die "nothing staged at $DIST — run scripts/release/build.sh first"
 refuse_if_unhardened

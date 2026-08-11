@@ -114,3 +114,61 @@ Signed off by:
 ## History
 
 <!-- Newest first. Append a filled-in template per release. -->
+
+## v0.3.0 — 2026-08-11
+
+Commit: f1285de
+Built targets: macOS arm64, x86_64-unknown-linux-musl (binary + `cameodb_0.3.0_amd64.deb` +
+`cameodb-0.3.0-1.x86_64.rpm`), x86_64 Windows
+
+Validation suite, host build (macOS arm64), 2026-08-11 10:51:16 → 10:53:21:
+
+```
+binary: /Users/gc/code/cameodb/target/release/cameodb
+
+  PASS deps
+  PASS unit
+  PASS posture
+  PASS auth
+  PASS tls
+  PASS remote-sources
+  PASS artifact
+```
+
+That binary is byte-identical to the staged `dist/0.3.0/mac/cameodb`
+(sha256 `26e5c1a2c1e0e441eb83aab5565667ae0d9c90b6b229f57da1782262b870b1a8`), so the result
+describes the artifact that ships, not a neighbouring build of it.
+
+| Suite | Host build | musl | windows | notes |
+|-------|-----------|------|---------|-------|
+| deps           | PASS | n/a  | n/a  | workspace-wide, not per-target |
+| unit           | PASS | —    | —    | |
+| posture        | PASS | —    | —    | |
+| auth           | PASS | —    | —    | includes the credential-leak regression probe added in 6303ec1 |
+| tls            | PASS | —    | —    | |
+| remote-sources | PASS | —    | —    | **outstanding on musl and Windows** — trust store differs per platform, so this result does not transfer (procedure step 5) |
+| artifact       | PASS | —    | —    | host run; the musl binary passed `artifact.sh` inside `build-musl.sh` as a build gate |
+
+Advisory exceptions reviewed: RUSTSEC-2026-0118, RUSTSEC-2026-0119 (hickory-proto 0.25.x,
+transitive via libp2p 0.56.0, needs hickory-proto >=0.26.1), RUSTSEC-2024-0436 (`paste`
+unmaintained, transitive via libp2p → if-watch). All three review-by 2026-11-01, so none was
+renewed for this release.
+
+Skipped checks and why:
+- `remote-sources` on musl and Windows — not yet run. Required before publishing.
+- `check-config` on the two shipped configs (procedure step 7) — not yet recorded.
+
+Not yet done, release is incomplete:
+- **`dist/0.3.0/windows/cameodb.exe` predates the credential fix and must be rebuilt.** It was
+  copied here 2026-08-11 00:08, and 6303ec1 — which stops the API key being sent to
+  user-supplied source hosts — was committed at 10:09 the same day, so the staged `.exe` cannot
+  contain it. The `cameodb` binary carries the client CLI, so this affects `schema detect` and
+  `data load` on Windows. The macOS and musl artifacts were rebuilt after the fix (10:45,
+  10:50) and are unaffected.
+- `--stage sbom` and `--stage sign` have run — `dist/0.3.0/` holds both SBOMs and a verified
+  `.bundle` per artifact — but `windows/cameodb.exe.bundle` signs the stale executable above.
+  Rebuilding the `.exe` invalidates that bundle and its `.sha256`; re-run `--stage sign`.
+- `publish.sh` has not been committed, and `cameodb-web` has not been updated.
+
+Known gaps acknowledged: yes
+Signed off by:

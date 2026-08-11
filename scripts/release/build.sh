@@ -22,7 +22,12 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 ALLOW_UNHARDENED=0
-[ "${1:-}" = "--allow-unhardened" ] && ALLOW_UNHARDENED=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --allow-unhardened) ALLOW_UNHARDENED=1; shift ;;
+        *) reject_unknown_arg "$1" ;;
+    esac
+done
 
 cd "$PROJECT_ROOT"
 
