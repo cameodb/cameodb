@@ -169,6 +169,7 @@ ever deleted: version-stamped files from earlier releases are listed as stale an
 | `CAMEODB_WEB` | `/Users/gc/code/cameodb-web/public/downloads` | publish target |
 | `COSIGN_KEY` | `~/.cosign/cosign.key` | signing key |
 | `COSIGN_PUB` | `$CAMEODB_WEB/cosign.pub` | key signatures are verified against |
+| `COSIGN_PUB_URL` | `https://dl.cameodb.com/cosign.pub` | public URL for that key, named in `MANIFEST.txt` |
 | `COSIGN_PASSWORD` | empty | key password; any value, empty included |
 | `LINUX_ARCHS` | `x86_64` | `x86_64`, `aarch64`, or both space-separated |
 | `BUILD_WITH` | `auto` | `container` (required for releases) or `zig` |

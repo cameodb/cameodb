@@ -56,6 +56,10 @@ COSIGN_KEY="${COSIGN_KEY:-$HOME/.cosign/cosign.key}"
 # The public half is whatever downloaders will actually fetch, so verification uses that copy
 # rather than a local one — it checks the key users get, not the key we still have.
 COSIGN_PUB="${COSIGN_PUB:-$WEB_ROOT/cosign.pub}"
+# Where a downloader fetches that same key from. The manifest names this rather than the local
+# path: a reader of MANIFEST.txt is on their own machine, so a path under /Users/ is both
+# unusable to them and a disclosure of the maintainer's layout.
+COSIGN_PUB_URL="${COSIGN_PUB_URL:-https://dl.cameodb.com/cosign.pub}"
 
 # Linux architectures to build. x86_64 alone by default: that is what
 # downloads/linux/ currently publishes, and adding a second arch changes public filenames.

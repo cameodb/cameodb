@@ -59,12 +59,22 @@ ok "SHA256SUMS verifies"
 # question it answers — which commit produced the binary a user downloaded — is asked months
 # later, when the tree has moved on.
 MANIFEST="$DIST/MANIFEST.txt"
+
+# The manifest tells a downloader that the key at COSIGN_PUB_URL verifies these signatures, so
+# that claim has to hold. dl.cameodb.com serves $WEB_ROOT/cosign.pub, so the key sign.sh verified
+# against must be that same file — otherwise the release is signed by a key nobody can fetch.
+if ! cmp -s "$COSIGN_PUB" "$WEB_ROOT/cosign.pub"; then
+    die "$COSIGN_PUB differs from $WEB_ROOT/cosign.pub, which is what $COSIGN_PUB_URL serves —
+     the manifest would point downloaders at a key these signatures do not verify against"
+fi
+
 {
     printf 'CameoDB %s\n' "$VERSION"
     printf 'commit    %s%s\n' "$(git -C "$PROJECT_ROOT" rev-parse HEAD)" \
         "$([ -n "$(git -C "$PROJECT_ROOT" status --porcelain)" ] && printf ' (dirty at build time)')"
     printf 'built     %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    printf 'signed by %s\n' "$COSIGN_PUB"
+    printf 'signed by %s\n' "$COSIGN_PUB_URL"
+    printf 'verify    cosign verify-blob --key cosign.pub --bundle <artifact>.bundle <artifact>\n'
     printf '\n%-52s %10s  %s\n' 'artifact' 'size' 'signed'
     while IFS= read -r f; do
         printf '%-52s %10s  %s\n' "$(rel_to_dist "$f")" \

@@ -4,14 +4,14 @@ Model Context Protocol (MCP) server implementation for CameoDB, enabling AI agen
 
 ## Overview
 
-The `cameodb_mcp` crate provides a standards-compliant MCP server that exposes CameoDB's search capabilities as tools for AI agents. It implements the [Model Context Protocol](https://modelcontextprotocol.io) specification (version 2024-11-05) using HTTP/SSE transport.
+The `cameodb_mcp` crate provides a standards-compliant MCP server that exposes CameoDB's search capabilities as tools for AI agents. It implements the [Model Context Protocol](https://modelcontextprotocol.io) specification, negotiating `2025-06-18` by default and accepting `2025-03-26` and `2024-11-05` from clients that ask for them, over Streamable HTTP and the legacy HTTP+SSE transport.
 
 ### Architecture
 
 - **Shared-Port Design**: MCP endpoints are nested under `/mcp` in the main CameoDB HTTP server
 - **No Separate Process**: Runs in the same binary as CameoDB, sharing the same `AppState` and actor system
-- **Transport**: HTTP/SSE with strict MCP spec compliance (2024-11-05)
-- **Protocol**: JSON-RPC 2.0 over SSE with proper event types
+- **Transport**: Streamable HTTP (2025-03-26+) on `/mcp`, plus legacy HTTP+SSE (2024-11-05) for already-configured clients
+- **Protocol**: JSON-RPC 2.0, negotiated at `initialize` — `2025-06-18`, `2025-03-26`, or `2024-11-05`
 - **Session Management**: Automatic session registry with 5-minute timeout cleanup
 - **Asynchronous Processing**: Non-blocking POST requests with background task execution
 
@@ -24,7 +24,7 @@ The `cameodb_mcp` crate provides a standards-compliant MCP server that exposes C
 - ✅ **Federated Search** across multiple indexes
 - ✅ **Per-Index Field Projection** for efficient data retrieval
 - ✅ **Read-Only Operations** (all tools are annotated as `readOnlyHint: true`)
-- ✅ **MCP Spec Compliant** (2024-11-05) with proper SSE event handling
+- ✅ **MCP Spec Compliant** (2025-06-18, negotiable down to 2024-11-05) with proper SSE event handling
 - ✅ **Asynchronous Processing** - non-blocking POST with 202 Accepted response
 - ✅ **Automatic Session Cleanup** with configurable timeout (5 minutes)
 - ✅ **Self-Contained Schema Discovery** — every index response includes per-field query hints
@@ -589,15 +589,17 @@ npx @modelcontextprotocol/inspector http://localhost:9480/mcp/sse
 
 The MCP server supports multiple HTTP transport modes for maximum client compatibility:
 
-- **SSE Endpoint**: `GET /mcp/sse` — Establishes SSE connection and emits `endpoint` event
-- **Message Endpoint**: `POST /mcp/messages?session_id={id}` — Receives JSON-RPC messages for SSE sessions (returns `202 Accepted`)
-- **Direct HTTP Endpoint**: `POST /mcp` — Processes JSON-RPC requests directly and returns JSON-RPC responses inline
+- **Streamable HTTP** (2025-03-26+): `POST /mcp` — Processes a JSON-RPC message and returns the response inline; `initialize` also returns an `MCP-Session-Id` header. `GET /mcp` — Opens the server-to-client SSE stream (keep-alive only; CameoDB initiates no server-side requests). `DELETE /mcp` — Terminates the session named by `MCP-Session-Id`
+- **SSE Endpoint** (legacy, 2024-11-05): `GET /mcp/sse` — Establishes SSE connection and emits `endpoint` event
+- **Message Endpoint** (legacy): `POST /mcp/messages?session_id={id}` — Receives JSON-RPC messages for SSE sessions (returns `202 Accepted`)
 - **Compatibility Endpoint**: `POST /mcp/sse` — Accepts direct JSON-RPC requests for clients that are hard-coded to post to the SSE path
 - **OpenAI ChatGPT Compatible**: The same POST protocol (`POST /mcp` or `POST /mcp/sse`) works for OpenAI ChatGPT-type requests, enabling support for a wider range of AI clients and different implementation approaches
 
 ### MCP Specification Compliance
 
-The implementation follows the official MCP HTTP/SSE transport specification (version 2024-11-05) for SSE clients, while also exposing a compatibility-oriented direct HTTP JSON-RPC transport for clients that do not implement the split SSE handshake.
+The implementation follows the official MCP Streamable HTTP transport specification (2025-03-26 onwards) and keeps the older HTTP+SSE transport (2024-11-05) for clients already configured against it.
+
+The protocol version is negotiated on `initialize`: the server echoes the client's requested version when it is one of `2025-06-18`, `2025-03-26` or `2024-11-05`, and otherwise answers with `2025-06-18`. On the Streamable HTTP endpoint, an `MCP-Protocol-Version` request header outside that set is rejected with `400 Bad Request`.
 
 #### SSE Handshake
 1. Client connects to `/mcp/sse`
@@ -610,10 +612,12 @@ The implementation follows the official MCP HTTP/SSE transport specification (ve
 3. Server processes message in background task
 4. Server sends response as `message` event: `event: message\ndata: {json-rpc-response}`
 
-#### Direct HTTP JSON-RPC Compatibility
+#### Streamable HTTP
 1. Client POSTs a JSON-RPC request to `/mcp`
 2. Server processes the request immediately
-3. Server returns the JSON-RPC response in the HTTP response body
+3. Server returns the JSON-RPC response in the HTTP response body — for `initialize`, with an `MCP-Session-Id` header the client replays on later requests
+4. Messages that produce no reply (notifications, responses) return `202 Accepted`
+5. `GET /mcp` opens the listening SSE stream; `DELETE /mcp` ends the session
 
 For compatibility with some MCP client integrations, `POST /mcp/sse` is also accepted and handled the same way as `POST /mcp`.
 
