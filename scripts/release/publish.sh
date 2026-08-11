@@ -116,7 +116,10 @@ for platform in mac linux windows; do
         # stage to check the staged .exe. It is not an artifact: `staged_artifacts` excludes it,
         # so it carries no signature and no checksum, and publishing it would put the one
         # unsigned, unhashed file in the download directory next to the signed ones.
-        case "$f" in *.version) continue ;; esac
+        # `.DS_Store` for the same reason: `staged_artifacts` skips it, so it would arrive
+        # unsigned and unhashed. Finder creates them in any directory it is pointed at, and one
+        # was already published under downloads/windows/.
+        case "$f" in *.version | */.DS_Store) continue ;; esac
         copy_one "$f" "$WEB_ROOT/$platform/$(basename "$f")"
     done
 done

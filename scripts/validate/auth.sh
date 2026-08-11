@@ -570,6 +570,83 @@ else
     fail "naming both a key and a key file says which one won" "$out"
 fi
 
+section "a key never reaches a remote data source"
+
+# The client builds two HTTP clients: one carrying the key, for CameoDB, and one with no
+# credential for the schema and data URLs a caller supplies — those name somebody else's host.
+# Four of the five source fetches once used the credentialed one, so `schema detect` and
+# `data load` handed the caller's bearer token to whatever host was in the URL. Nothing failed
+# visibly; the fetch worked. The only way to catch it is to be the source host and read the
+# request that arrives, which is what this does.
+if ! command -v python3 > /dev/null 2>&1; then
+    skip "a key never reaches a remote data source (no python3 for the listener)"
+else
+    cat > "$WORK/source_stub.py" <<'PY'
+import http.server, sys
+port, log, body = int(sys.argv[1]), sys.argv[2], sys.argv[3].encode()
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(log, "a") as f:
+            for name, value in self.headers.items():
+                f.write(f"{name.lower()}: {value}\n")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+# Short timeout so the loop stays interruptible; the caller kills this once the client is done.
+server.timeout = 0.5
+while True:
+    server.handle_request()
+PY
+    SRC_PORT="${AUTH_SOURCE_PORT:-19493}"
+
+    # probe <label> <body> <client argv...>
+    probe_source() {
+        local label="$1" body="$2"
+        shift 2
+        local log="$WORK/source_headers.txt"
+        : > "$log"
+        python3 "$WORK/source_stub.py" "$SRC_PORT" "$log" "$body" > /dev/null 2>&1 &
+        local stub=$!
+        # Wait for the listener rather than sleeping blind, so a slow start cannot look like a
+        # client that declined to fetch.
+        local i=0
+        while [ "$i" -lt 40 ] && ! nc -z 127.0.0.1 "$SRC_PORT" > /dev/null 2>&1; do
+            sleep 0.1
+            i=$((i + 1))
+        done
+        "$@" > /dev/null 2>&1
+        kill "$stub" 2> /dev/null
+        wait "$stub" 2> /dev/null
+
+        # The trap in a check like this is the vacuous pass: if the client never connected, the
+        # log is empty and "no Authorization header" holds for the wrong reason. Require the
+        # request to have arrived before believing anything about its headers.
+        if [ ! -s "$log" ]; then
+            fail "$label" "the source was never fetched, so the check proves nothing"
+        elif grep -qi '^authorization:' "$log"; then
+            fail "$label" "$(sed -n 's/^\(authorization\):.*/\1: <the key was sent>/p' "$log" | head -1)"
+        else
+            pass "$label"
+        fi
+    }
+
+    SRC="http://127.0.0.1:$SRC_PORT"
+    probe_source "schema detect over http sends no key" '[{"id":"1","title":"x"}]' \
+        "${CLIENT[@]}" --api-key "$READER_KEY" schema detect "$SRC/source.json"
+    probe_source "a CSV source sends no key" $'id,title\n1,x\n' \
+        "${CLIENT[@]}" --api-key "$READER_KEY" schema detect "$SRC/source.csv"
+    probe_source "data load sends no key to the source" '[{"id":"1","title":"x"}]' \
+        "${CLIENT[@]}" --api-key "$ADMIN_KEY" data load docs "$SRC/source.json"
+fi
+
 section "unknown paths"
 check_eq "anonymous probing learns nothing" "401" "$(code '' "$BASE/api/secret/_internal")"
 check_eq "an authenticated caller gets an honest 404" "404" \

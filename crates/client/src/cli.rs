@@ -3238,7 +3238,7 @@ async fn fetch_source_prefix_bytes(
 
         let url = Url::parse(source).context("Invalid URL for source")?;
         let mut response = client
-            .http()
+            .source_http()
             .get(url)
             .send()
             .await
@@ -3310,7 +3310,7 @@ where
 {
     let url = Url::parse(source).context("Invalid URL for JSON source")?;
     let mut response = client
-        .http()
+        .source_http()
         .get(url)
         .send()
         .await
@@ -3443,7 +3443,7 @@ async fn load_data_from_http_json_source_single_pass(
     let mut spinner = ProgressSpinner::new();
     let url = Url::parse(source).context("Invalid URL for JSON source")?;
     let mut response = client
-        .http()
+        .source_http()
         .get(url)
         .send()
         .await
@@ -4256,7 +4256,7 @@ async fn open_csv_source(client: &CameoClient, source: &str) -> Result<Box<dyn R
     if is_http {
         let url = Url::parse(source).context("Invalid URL for CSV source")?;
         let raw_bytes = client
-            .http()
+            .source_http()
             .get(url)
             .send()
             .await

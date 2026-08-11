@@ -269,6 +269,19 @@ start from `cameodb keygen` and `cameodb check-config`; see
   index with no commits. A write and a search now emit none.
 
 ### Fixed (security)
+- **The client's remote-source fetches used the credential-carrying HTTP client.** `CameoClient`
+  builds two: one with the API key in its default headers for CameoDB, and one with no
+  credential for the schema and data URLs a caller supplies, because those name somebody else's
+  host. Four of the five source fetches used the first — `fetch_source_prefix_bytes`,
+  `open_csv_source`, `for_each_json_document_in_http_source` and
+  `load_data_from_http_json_source_single_pass` — so `schema detect` and `data load` against an
+  `http(s)://` source presented the caller's bearer token to that host, in the clear over
+  plaintext. The same mix-up left `--insecure-source` with no effect on those paths while
+  `--insecure` wrongly governed them, since source trust was being read from the server's
+  setting. All five now use the credential-free client. Introduced and fixed inside this
+  release cycle — API keys did not exist in 0.2.3, so no published version ever sent one to a
+  source host — and recorded here because the guarantee is stated as a feature above.
+  `scripts/validate/remote-sources.sh` was the check that caught it.
 - **Corporate CA certificates were silently dropped by both compose files.** The `zscaler` →
   `corporate-ca` rename reached the Dockerfiles but not `docker-compose.yml`,
   `docker-compose-cluster.yml` or `docs/BUILDING.md`, and a secret id that does not match the

@@ -150,7 +150,13 @@ if [ -f "$WIN_EXE" ]; then
     # Optional sidecar, produced on the Windows machine:
     #     cameodb.exe --version > cameodb.exe.version
     if [ -f "$WIN_EXE.version" ]; then
-        win_reported="$(tr -d '\r' < "$WIN_EXE.version" | head -1)"
+        # Strip NULs and CR, not just CR: PowerShell 5.1 — the default on most Windows installs —
+        # writes `>` redirections as UTF-16LE with a BOM, so every character arrives followed by a
+        # NUL and a plain match for the version would reject a perfectly good binary. PowerShell 7
+        # defaults to UTF-8. Tolerating both beats depending on which one is installed.
+        # LC_ALL=C so tr works on bytes: in a UTF-8 locale it rejects UTF-16 input outright with
+        # "Illegal byte sequence" rather than stripping the NULs.
+        win_reported="$(LC_ALL=C tr -d '\r\000\357\273\277\377\376' < "$WIN_EXE.version" | head -1)"
         case "$win_reported" in
             *"$VERSION"*) ok "reports '$win_reported' (recorded on the Windows machine)" ;;
             *)            die "windows/cameodb.exe reports '$win_reported', but this release is $VERSION" ;;
