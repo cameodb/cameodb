@@ -25,6 +25,7 @@ ALLOW_UNHARDENED=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --allow-unhardened) ALLOW_UNHARDENED=1; shift ;;
+        -h|--help) usage "${BASH_SOURCE[0]}" ;;
         *) reject_unknown_arg "$1" ;;
     esac
 done

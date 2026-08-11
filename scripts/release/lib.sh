@@ -84,8 +84,21 @@ require_tool() {
 # rebuild and looks precisely like `--stage` being broken, so every stage refuses an argument
 # it does not implement rather than proceeding with a different meaning than the one typed.
 reject_unknown_arg() {
-    die "unknown argument '$1' to $(basename "$0") — stage selection belongs to the driver:
+    die "unknown argument '$1' to $(basename "$0") — try '$(basename "$0") --help'.
+  Stage selection belongs to the driver:
   scripts/release/release.sh --stage build|sbom|sign|publish"
+}
+
+# --help prints the script's own header comment. Derived rather than written twice: a second
+# copy of the usage is a copy that goes stale, and a hardcoded line range (which is how this
+# started) silently truncates the help the first time the header grows a line.
+usage() {
+    awk '
+        NR == 1 && /^#!/ { next }                       # skip the shebang
+        /^#/             { sub(/^#[[:space:]]?/, ""); print; next }
+        { exit }                                        # stop at the first non-comment line
+    ' "$1"
+    exit 0
 }
 
 # Every file in the staging tree that is a release artifact, i.e. the things that get signed

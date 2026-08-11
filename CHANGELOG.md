@@ -20,52 +20,68 @@ pre-shared key, security posture profiles that refuse to start a misconfigured n
 rate limiting, an audit trail, and +65-70% write throughput from letting a worker carry more
 than one operation at a time.
 
-**Upgrading from 0.2.x:** nothing is required — authentication, TLS, rate limiting and the
-audit trail are all off by default, and a 0.2.x config file still loads. To turn security on,
-start from `cameodb keygen` and `cameodb check-config`; see
-[docs/CONFIGURATION.md](docs/CONFIGURATION.md) and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
-
-### Fixed
-- **Writes to an index with no schema returned 500.** The worker pool's engine holds `ArcSwap`
-  snapshots, so it can read a schema but not evolve one — that needs the actor. It signalled
-  this by returning a sentinel error, and the caller, which had already moved the op into the
-  worker job, had nothing left to retry with and surfaced the sentinel to the client instead.
-  Since a new index has an empty schema, *every* first write to an index failed. The engine
-  now hands the op back (`WorkerOutcome::UseActor`) and the caller retries it on the actor,
-  with no clone on the fast path. Creating an index by writing to it works again.
-- **Auto-created indexes were write-only.** Fields inferred when an index is first written
-  were marked non-indexed, so documents went in and nothing but `id` could find them again —
-  permanently, because a tantivy schema is fixed at index creation and nothing promotes a
-  field afterwards. Fields discovered at creation are now indexed (and, as before, not
-  stored: hits are rebuilt from redb). Fields that arrive later stay unindexed, which is the
-  only thing tantivy allows; they exist for redb/tantivy schema parity. The bundled client
-  already applied this rule before PUTting a detected schema, so `cameodb data load` was
-  unaffected — the two now agree instead of one compensating for the other.
-- **The initial schema was never persisted, and fields past the sampling limit were dropped.**
-  Sampling filled the in-memory schema, which made the evolution stage — the only thing that
-  wrote to storage — decide there was nothing new, so the storage layer re-derived its own
-  schema from the document. Two more places recomputed "is this initial creation?" from
-  `fields.is_empty()` *after* sampling had filled it, reading false on exactly the call where
-  it was true; one of them selected a validator that does not report new fields, so a field
-  first appearing past document 200 of a bulk load never reached the schema at all.
+**Upgrading from 0.2.x:** every new security feature is off by default — authentication, TLS,
+rate limiting and the audit trail — so none of them has to be adopted. Two changed defaults
+can still stop a node that started before: 0.2.3 shipped `bind_address = "0.0.0.0"` and
+`cors_allowed_origins = ["*"]` in its example config, and a non-loopback bind now requires
+`[node] profile` while `"*"` is accepted only under `local`. Run `cameodb check-config -c
+<your config>` before upgrading — it reports both. See Migration below, and to turn security
+on start from `cameodb keygen`; [docs/CONFIGURATION.md](docs/CONFIGURATION.md) and
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) have the detail.
 
 ### Added
-- **`cameodb-bench`, a latency harness** (`crates/bench`, not shipped). Reports
-  p50/p90/p95/p99/p99.9 for writes and searches, the node's own `took_ms` beside the
-  client-observed figure so the gap shows queueing rather than query cost, and per-worker job
-  counts, core placement and dispatch counters over the measured window. Closed-loop, and it
-  says so: compare runs at equal concurrency rather than reading the percentiles as an SLA.
-  `scripts/testing/load-test.sh` remains as a smoke test but is now marked not to be quoted —
-  it forks `curl` per request and times it in bash, so its latencies are process spawn.
-  The harness doubles as a worked example of the client SDK: it depends on `client` and never
-  on the server crate, and issues no request the SDK cannot express. `--mode bulk` measures
-  batched ingest per request and reports docs/s, which on a 4-shard node showed batching
-  worth ~9× at 50 documents per request and ~24× at 500 against one-per-request writes.
-- **`CameoClient::write_document`.** Writing one document was reachable over HTTP but absent
-  from the SDK, so any consumer needing it had to hand-roll the request.
-- **Every shipped config is now parsed by a test**, and asserted to name no setting no field
-  claims and to state all three affinity flags. Nothing checked the files this repository
-  ships, which is how two flags stayed missing from all of them for a whole phase.
+- **API key authentication.** Off by default. With `[security] enabled = true`, every route
+  except `/_cluster/health` requires `Authorization: Bearer <key>`. Keys are `cameo_v1_`
+  followed by 256 bits of OS entropy; the config stores only `sha256:<hex>`, compared in
+  constant time, so a leaked config file holds nothing that can authenticate. The key-shape
+  check runs before hashing, which is what makes an unsalted digest defensible: a passphrase
+  or a UUID can never authenticate regardless of what digest is configured.
+  - `cameodb keygen --role <admin|writer|reader>` mints one, printing the key to stdout and
+    the config stanza to stderr. `--key-out` / `--hash-out` write the two files instead —
+    `0600`, never overwriting an existing one.
+  - Three roles bundle four capabilities: `admin` (all), `writer` (read + write), `reader`
+    (read). `allowed_indexes` restricts a key to named indexes for any role.
+  - Authorization is one route table and one middleware in front of the router, mounted
+    inside CORS and outside the timeout, concurrency guard and body limits — a refused
+    request takes no permit and buffers no body. Deny by default: an unclassified path needs
+    a key like any other, so no handler can forget to check because no handler checks. Unit
+    tests read the router's own source and fail the build if a route has no row.
+  - Scoping holds through enumeration, not only when an index is named: `/_indexes`,
+    `/_cluster/_indexes`, the MCP catalog and the MCP resource list return only what a key
+    may see, counts included.
+  - MCP is authorized per tool and per index, not just at the endpoint, with a capability
+    table that denies by default. Sessions are bound to the key that opened them on all three
+    verbs, and `tools/list` advertises only what the caller could call.
+  - An anonymous caller gets `{"status": …}` from the health endpoint and nothing more. Node
+    identity and cluster shape are free reconnaissance for anyone who can reach the port.
+  - `--api-key`, `--api-key-file` and `CAMEODB_API_KEY` on the client, with the key in the
+    HTTP client's default headers so no call site can omit it — and never on the client used
+    for remote data sources. `--allow-plaintext-key` is deliberately separate from
+    `--insecure`: one accepts a bad certificate on an encrypted connection, the other puts a
+    bearer token on the wire in the clear. In the REPL a key is bound to its origin, and
+    `key file <path>` / `key show` / `key clear` change it mid-session.
+  - Rotation is add key → restart → migrate clients → remove key → restart. Keys are read at
+    startup; there is no hot reload, and no lockout on failed authentication (against a
+    256-bit key it buys nothing and is itself a denial-of-service lever).
+- **Security posture profiles.** `[node] profile = "local" | "internal" | "external"`
+  declares how far a node can be reached; the server enforces the matching rules and refuses
+  to start if the config contradicts them. Profiles assert, they never rewrite values.
+  Omitting it is valid only for a loopback bind, which infers `local`. The names describe
+  reach rather than an environment (`dev`, `staging`) because every rule keys off the bind
+  address — a lifecycle name invites picking by what the box is for and being rejected for it.
+- `cameodb check-config [-c <path>]` prints the posture matrix and exits non-zero on
+  failure — the manual equivalent of a CI gate.
+- `--profile` / `CAMEODB_PROFILE` override.
+- `[network.http] admin_enabled` (default `true`) removes the unauthenticated `/_admin/*`
+  routes entirely when disabled; required off by the `external` profile.
+- **TLS/HTTPS for the HTTP server**, via `axum-server` with rustls. `[network.http.tls]` takes
+  `enabled`, `cert_file` and `key_file`; the config layer requires both paths when enabled and
+  checks the files exist, and the material is loaded before storage init and before the startup
+  banner, so a bad certificate fails early rather than mid-flight.
+- `--insecure` on the client accepts an invalid certificate — per command for a single
+  operation, and per session in the REPL, where it persists across `connect`.
+- `--insecure-source`, separate from `--insecure`. Accepting an untrusted data source no
+  longer disables verification on the connection to CameoDB itself.
 - **Rate limiting for MCP tool calls** (`[security.limits]`, Phase 14 C1). Authentication
   answers *who* and `allowed_indexes` answers *what*; neither has anything to say about
   **how often**. The caller that matters here is not an attacker but a legitimate `reader`
@@ -110,6 +126,22 @@ start from `cameodb keygen` and `cameodb check-config`; see
   dispatcher — the same host-owns-the-policy split used for authorization and rate limiting.
   Off by default, with a posture row that says so. 14 unit tests and 9 integration tests
   against a real node with three keys.
+- **`cameodb-bench`, a latency harness** (`crates/bench`, not shipped). Reports
+  p50/p90/p95/p99/p99.9 for writes and searches, the node's own `took_ms` beside the
+  client-observed figure so the gap shows queueing rather than query cost, and per-worker job
+  counts, core placement and dispatch counters over the measured window. Closed-loop, and it
+  says so: compare runs at equal concurrency rather than reading the percentiles as an SLA.
+  `scripts/testing/load-test.sh` remains as a smoke test but is now marked not to be quoted —
+  it forks `curl` per request and times it in bash, so its latencies are process spawn.
+  The harness doubles as a worked example of the client SDK: it depends on `client` and never
+  on the server crate, and issues no request the SDK cannot express. `--mode bulk` measures
+  batched ingest per request and reports docs/s, which on a 4-shard node showed batching
+  worth ~9× at 50 documents per request and ~24× at 500 against one-per-request writes.
+- **`CameoClient::write_document`.** Writing one document was reachable over HTTP but absent
+  from the SDK, so any consumer needing it had to hand-roll the request.
+- **Every shipped config is now parsed by a test**, and asserted to name no setting no field
+  claims and to state all three affinity flags. Nothing checked the files this repository
+  ships, which is how two flags stayed missing from all of them for a whole phase.
 - **Integration tests for the server, which had none.** `crates/server` carried 160 unit
   tests and zero end-to-end coverage: it is a binary-only crate, so `tests/` has no library
   to link against, and a `NodeOrchestrator` needs a data directory, threads and a socket
@@ -131,7 +163,21 @@ start from `cameodb keygen` and `cameodb check-config`; see
   flag" and "the binary has the property" needed to become different claims. Runs in a
   container when the host has no `readelf`, and starts the binary when the host can execute
   it. Wired into `all.sh`.
+- [`scripts/validate/`](scripts/validate/README.md): manual validation suite (deps, unit,
+  posture, auth, tls, remote-sources, artifact) with a single `all.sh` entry point, plus
+  [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md). There is no CI by design; this is the gate.
+- **`scripts/release/`, a four-stage release pipeline** (`build`, `sbom`, `sign`, `publish`)
+  driven by `release.sh --stage`, staging into `dist/<version>/`. The version is read from
+  `crates/*/Cargo.toml` and never passed in, so a filename cannot disagree with what the binary
+  reports — the previous script carried its own hardcoded `0.2.3` and labelled 0.3.0 packages
+  with it. The DEB and RPM now wrap the same binary that ships standalone instead of a
+  separately rebuilt one, each stage refuses to run on a tree the previous stage did not
+  complete, every signature is verified against the public key downloaders actually fetch, and
+  `publish.sh` is a dry run until `--commit`.
 
+- **Docker builds take a corporate CA** through a vendor-neutral `corporate-ca` build secret
+  (`--mount=type=secret,id=corporate-ca`, plus `update-ca-certificates` in the first apt-get
+  chain), renamed from the previous `zscaler`.
 ### Changed
 - **An orchestrator worker carries eight operations at once instead of one.** The worker loop
   awaited `execute` inline, which made `worker_count` the node's entire operation concurrency
@@ -149,16 +195,21 @@ start from `cameodb keygen` and `cameodb check-config`; see
   unchanged. Shutdown now waits for accepted operations to answer: on the pinned path the
   loop is the argument to `block_on`, so returning would drop the worker's runtime and cancel
   in-flight work, handing those callers a dropped channel instead of a reply.
-- **The affinity flags were re-measured and still lose — the previous explanation was
-  wrong.** Their regression had been blamed on the serial worker loop above, on the theory
-  that halving `worker_count` halved the node's concurrency. With workers eight operations
-  wide, `shard_affine_dispatch` still costs 24% of write throughput at concurrency 64, and
-  default's worst repeat beat every affinity repeat. The surviving cause is the constraint
-  itself: a shard's jobs may only run on `S % worker_count`, so skew idles workers while
-  their neighbours queue, and round-robin cannot be unlucky that way. Searches confirm it
-  from the other side — affine dispatch is neutral for them (they dispatch round-robin
-  anyway) while worker pinning costs 11% and half again on p99. No default changed; what
-  changed is that the recorded reason is now one that survived a test meant to overturn it.
+- **The CPU affinity flags are documented and measured, and the recommendation is to leave
+  them off.** `shard_affine_dispatch` and `worker_core_affinity` were absent from every shipped
+  config and from `docs/CONFIGURATION.md`; both are now stated explicitly, with what they cost.
+  Measured with `cameodb-bench` on an 8-core Linux node, three repeats per arm:
+  shard-affine dispatch costs 13-20% of write throughput at concurrency 8, 16 and 32 and
+  roughly doubles write p90, and after workers went eight operations wide it still costs 24% at
+  concurrency 64 — default's worst repeat beat every affinity repeat. Pinning the workers on
+  top adds nothing to writes and takes a further 11-15% off search throughput with p99 roughly
+  doubled. `writer_core_affinity` measured neutral and stays on.
+  The cause is the constraint itself rather than the pinning, which the width change above was
+  expected to absolve and did not: a shard's jobs may only run on `S % worker_count`, so skew
+  idles workers while their neighbours queue, and round-robin cannot be unlucky that way.
+  Searches confirm it from the other side — affine dispatch is neutral for them, since they
+  dispatch round-robin regardless. No default changed; what changed is that the choice is now
+  visible, evidenced, and explained by a reason that survived a test meant to overturn it.
 - **`docker/cameodb-docker.toml` shipped `search_threads = 16`** — double the code default,
   on containers typically given 4-8 cores. It now ships the default 8, with the sizing rule
   written next to it. The read pool shares cores with the pinned shard writers, so allowing
@@ -195,6 +246,10 @@ start from `cameodb keygen` and `cameodb check-config`; see
   Dockerfile uses — takes an arch argument (`x86_64` | `aarch64` | `both`), keeps zigbuild as
   the no-Docker fallback, and checks what it produced instead of assuming. Documented, with
   the aarch64 caveats, in `docs/BUILDING.md`.
+- **The Dockerfile's manual `rust-std` fallback works.** It runs when `rustup component add`
+  cannot reach the target, and both halves were wrong: the download URL carried a date prefix
+  the canonical path does not use, and the tarball was extracted without `-J` or
+  `--strip-components=1`, so `install.sh` was never where the next line looked for it.
 - **`.cargo/config.toml` is tracked.** `.gitignore` excluded the whole `.cargo/` directory, so
   the file carrying the musl link flags, the hardening flags and jemalloc's page size existed
   only on machines that happened to have it: a fresh clone built release binaries with none
@@ -209,18 +264,6 @@ start from `cameodb keygen` and `cameodb check-config`; see
   jemalloc to 4 KiB pages, which aborts at startup on aarch64 hosts configured with 16 KiB or
   64 KiB pages — fine for the platforms currently targeted, a decision to revisit before
   shipping aarch64 packages to distros outside them.
-- **The CPU affinity flags are documented, and the recommendation is to leave them off.**
-  `shard_affine_dispatch` and `worker_core_affinity` were absent from every shipped config
-  and from `docs/CONFIGURATION.md`; both are now stated explicitly, with what they cost.
-  Measured with `cameodb-bench` on an 8-core Linux node, 8 shards, three repeats per arm:
-  shard-affine dispatch costs 13–20% of write throughput at concurrency 8, 16 and 32 and
-  roughly doubles write p90; pinning the workers on top adds nothing to writes and takes a
-  further 15% off search throughput with p99 roughly doubled. The cause is not the pinning —
-  a worker awaits each operation inline, so `worker_count` is the node's operation
-  concurrency, and enabling affinity forces it from `min(shards × 2, cores × 2)` down to
-  `cores` while an operation is mostly spent waiting on a shard writer rather than on CPU.
-  `writer_core_affinity` measured neutral and stays on. No default changed; what changed is
-  that the choice is now visible and evidenced rather than an unexercised flag.
 - **Shard-affine dispatch no longer collides.** Worker selection and writer-thread pinning
   both hashed the shard id, and the hash domain (the shard set) is smaller than the core
   count: with the shipped defaults — 4 shards, 8 cores — 40 affine writes reached 3 of 8
@@ -267,8 +310,60 @@ start from `cameodb keygen` and `cameodb check-config`; see
   two per-request routing lines from the coordinator, a handler line carrying the caller's
   query text, and one `No tantivy reader found` warning *per shard* for the normal case of an
   index with no commits. A write and a search now emit none.
+- **Single TLS stack.** The client moved from native-tls/vendored OpenSSL to
+  `reqwest/rustls-no-provider`. `rustls-platform-verifier` uses the OS trust store, which
+  is what native-tls provided and what a corporate CA requires — verified against
+  `dl.cameodb.com` and other real sources. Vendored OpenSSL and `aws-lc-rs` are gone from
+  every build path, so musl and Windows cross-builds no longer need a C toolchain for TLS.
+  The `client/native-tls*` features were removed; build invocations no longer pass them.
+- **Default bind is now `127.0.0.1`** (was `0.0.0.0`). A reachable bind additionally
+  requires a declared profile.
+- **Default `cors_allowed_origins` is now `[]`** (was `["*"]`). CORS governs browsers only,
+  so this costs API and MCP clients nothing; `"*"` is accepted only under `local`. An empty
+  list is no longer a config error.
+- Cluster PSK is held in a `ClusterPsk` newtype that redacts its `Debug`, is never
+  serialized, and zeroizes on drop. Format validation lives in `load_psk()` alone, which
+  `validate()` now calls, so a config that validates is one the swarm can start with.
+  `psk_file` permissions are checked, and a PSK combined with a `/quic-v1` address is
+  rejected at config time (`pnet` wraps TCP only).
+- Every index path is built through `HybridStore::index_dir`, including internally sourced
+  names, so the traversal guarantee has one construction site.
+- Renamed the cluster messaging `default_max_concurrent_requests` to
+  `default_messaging_max_concurrent_requests` to distinguish it from the HTTP knob.
+- `deny.toml`: advisory exceptions carry `review-by` dates that `deps.sh` enforces; added
+  `CDLA-Permissive-2.0` for the Mozilla CA bundle shipped via `rustls-platform-verifier`.
 
-### Fixed (security)
+### Fixed
+- **Writes to an index with no schema returned 500.** The worker pool's engine holds `ArcSwap`
+  snapshots, so it can read a schema but not evolve one — that needs the actor. It signalled
+  this by returning a sentinel error, and the caller, which had already moved the op into the
+  worker job, had nothing left to retry with and surfaced the sentinel to the client instead.
+  Since a new index has an empty schema, *every* first write to an index failed. The engine
+  now hands the op back (`WorkerOutcome::UseActor`) and the caller retries it on the actor,
+  with no clone on the fast path. Creating an index by writing to it works again.
+- **Auto-created indexes were write-only.** Fields inferred when an index is first written
+  were marked non-indexed, so documents went in and nothing but `id` could find them again —
+  permanently, because a tantivy schema is fixed at index creation and nothing promotes a
+  field afterwards. Fields discovered at creation are now indexed (and, as before, not
+  stored: hits are rebuilt from redb). Fields that arrive later stay unindexed, which is the
+  only thing tantivy allows; they exist for redb/tantivy schema parity. The bundled client
+  already applied this rule before PUTting a detected schema, so `cameodb data load` was
+  unaffected — the two now agree instead of one compensating for the other.
+- **The initial schema was never persisted, and fields past the sampling limit were dropped.**
+  Sampling filled the in-memory schema, which made the evolution stage — the only thing that
+  wrote to storage — decide there was nothing new, so the storage layer re-derived its own
+  schema from the document. Two more places recomputed "is this initial creation?" from
+  `fields.is_empty()` *after* sampling had filled it, reading false on exactly the call where
+  it was true; one of them selected a validator that does not report new fields, so a field
+  first appearing past document 200 of a bulk load never reached the schema at all.
+
+### Security
+
+Two of these affected a published version: the unbounded streaming ingest and the missing HTTP
+request timeout, both present in 0.2.3. The rest were introduced and fixed inside this release
+cycle — API keys, TLS, the posture gate and restricted CORS are all new in 0.3.0 — so no 0.2.x
+node was ever exposed to them, and nothing here calls for a credential rotation.
+
 - **The client's remote-source fetches used the credential-carrying HTTP client.** `CameoClient`
   builds two: one with the API key in its default headers for CameoDB, and one with no
   credential for the schema and data URLs a caller supplies, because those name somebody else's
@@ -321,110 +416,19 @@ start from `cameodb keygen` and `cameodb check-config`; see
 - **Restricting CORS broke browser MCP clients.** `mcp-session-id` was neither an allowed
   request header nor exposed on responses, so the Streamable HTTP transport could not work
   from a browser once origins were restricted.
-- TLS material is loaded before storage init and before the banner, so bad certificates
-  fail early rather than mid-flight.
 
-### Added
-- **API key authentication.** Off by default. With `[security] enabled = true`, every route
-  except `/_cluster/health` requires `Authorization: Bearer <key>`. Keys are `cameo_v1_`
-  followed by 256 bits of OS entropy; the config stores only `sha256:<hex>`, compared in
-  constant time, so a leaked config file holds nothing that can authenticate. The key-shape
-  check runs before hashing, which is what makes an unsalted digest defensible: a passphrase
-  or a UUID can never authenticate regardless of what digest is configured.
-  - `cameodb keygen --role <admin|writer|reader>` mints one, printing the key to stdout and
-    the config stanza to stderr. `--key-out` / `--hash-out` write the two files instead —
-    `0600`, never overwriting an existing one.
-  - Three roles bundle four capabilities: `admin` (all), `writer` (read + write), `reader`
-    (read). `allowed_indexes` restricts a key to named indexes for any role.
-  - Authorization is one route table and one middleware in front of the router, mounted
-    inside CORS and outside the timeout, concurrency guard and body limits — a refused
-    request takes no permit and buffers no body. Deny by default: an unclassified path needs
-    a key like any other, so no handler can forget to check because no handler checks. Unit
-    tests read the router's own source and fail the build if a route has no row.
-  - Scoping holds through enumeration, not only when an index is named: `/_indexes`,
-    `/_cluster/_indexes`, the MCP catalog and the MCP resource list return only what a key
-    may see, counts included.
-  - MCP is authorized per tool and per index, not just at the endpoint, with a capability
-    table that denies by default. Sessions are bound to the key that opened them on all three
-    verbs, and `tools/list` advertises only what the caller could call.
-  - An anonymous caller gets `{"status": …}` from the health endpoint and nothing more. Node
-    identity and cluster shape are free reconnaissance for anyone who can reach the port.
-  - `--api-key`, `--api-key-file` and `CAMEODB_API_KEY` on the client, with the key in the
-    HTTP client's default headers so no call site can omit it — and never on the client used
-    for remote data sources. `--allow-plaintext-key` is deliberately separate from
-    `--insecure`: one accepts a bad certificate on an encrypted connection, the other puts a
-    bearer token on the wire in the clear. In the REPL a key is bound to its origin, and
-    `key file <path>` / `key show` / `key clear` change it mid-session.
-  - Rotation is add key → restart → migrate clients → remove key → restart. Keys are read at
-    startup; there is no hot reload, and no lockout on failed authentication (against a
-    256-bit key it buys nothing and is itself a denial-of-service lever).
-- **Security posture profiles.** `[node] profile = "local" | "internal" | "external"`
-  declares how far a node can be reached; the server enforces the matching rules and refuses
-  to start if the config contradicts them. Profiles assert, they never rewrite values.
-  Omitting it is valid only for a loopback bind, which infers `local`. The names describe
-  reach rather than an environment (`dev`, `staging`) because every rule keys off the bind
-  address — a lifecycle name invites picking by what the box is for and being rejected for it.
-- `cameodb check-config [-c <path>]` prints the posture matrix and exits non-zero on
-  failure — the manual equivalent of a CI gate.
-- `--profile` / `CAMEODB_PROFILE` override.
-- `[network.http] admin_enabled` (default `true`) removes the unauthenticated `/_admin/*`
-  routes entirely when disabled; required off by the `external` profile.
-- `--insecure-source` on the client, separate from `--insecure`. Accepting an untrusted
-  data source no longer disables verification on the connection to CameoDB itself.
-- [`scripts/validate/`](scripts/validate/README.md): manual validation suite (deps, unit,
-  posture, auth, tls, remote-sources) with a single `all.sh` entry point, plus
-  [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md). There is no CI by design; this is the gate.
-
-### Changed
-- **Single TLS stack.** The client moved from native-tls/vendored OpenSSL to
-  `reqwest/rustls-no-provider`. `rustls-platform-verifier` uses the OS trust store, which
-  is what native-tls provided and what a corporate CA requires — verified against
-  `dl.cameodb.com` and other real sources. Vendored OpenSSL and `aws-lc-rs` are gone from
-  every build path, so musl and Windows cross-builds no longer need a C toolchain for TLS.
-  The `client/native-tls*` features were removed; build invocations no longer pass them.
-- **Default bind is now `127.0.0.1`** (was `0.0.0.0`). A reachable bind additionally
-  requires a declared profile.
-- **Default `cors_allowed_origins` is now `[]`** (was `["*"]`). CORS governs browsers only,
-  so this costs API and MCP clients nothing; `"*"` is accepted only under `local`. An empty
-  list is no longer a config error.
-- Cluster PSK is held in a `ClusterPsk` newtype that redacts its `Debug`, is never
-  serialized, and zeroizes on drop. Format validation lives in `load_psk()` alone, which
-  `validate()` now calls, so a config that validates is one the swarm can start with.
-  `psk_file` permissions are checked, and a PSK combined with a `/quic-v1` address is
-  rejected at config time (`pnet` wraps TCP only).
-- Every index path is built through `HybridStore::index_dir`, including internally sourced
-  names, so the traversal guarantee has one construction site.
-- Renamed the cluster messaging `default_max_concurrent_requests` to
-  `default_messaging_max_concurrent_requests` to distinguish it from the HTTP knob.
-- `deny.toml`: advisory exceptions carry `review-by` dates that `deps.sh` enforces; added
-  `CDLA-Permissive-2.0` for the Mozilla CA bundle shipped via `rustls-platform-verifier`.
+### Removed
+- `CAMEODB_ACCEPT_INVALID_CERTS`, replaced by `--insecure` and `--insecure-source`.
 
 ### Migration
 - Configs binding a non-loopback address must add `[node] profile = "..."`.
 - Configs with `cors_allowed_origins = ["*"]` must list explicit origins or use `[]`, unless
   the profile is `local`.
-- `cameodb client ... --insecure` for a remote source URL is now `--insecure-source`.
+- `CAMEODB_ACCEPT_INVALID_CERTS` no longer does anything. It governed both connections, so
+  replace it with `--insecure` for the connection to CameoDB, `--insecure-source` for a remote
+  schema or data URL, or both.
 - Build scripts passing `--features client/native-tls-vendored` must drop the flag.
-
-### Added
-- TLS/HTTPS support for the HTTP server via `axum-server` with rustls
-  - Config: `[network.http.tls]` with `enabled`, `cert_file`, `key_file` fields
-  - Config validation for cert/key file existence and required fields when enabled
-- `--insecure` CLI flag for accepting invalid TLS certificates (self-signed certs)
-  - Per-command for single operations (remote schema/data loading)
-  - Per-session for interactive REPL (persists across `connect` commands)
-- Docker build support for corporate CA certificates via generic `corporate-ca` secret
-  - `update-ca-certificates` in initial apt-get install chain
-  - `--mount=type=secret,id=corporate-ca` for BuildKit-based builds
-
-### Changed
-- Renamed Docker secret from `zscaler` to `corporate-ca` for vendor neutrality
-- Fixed rust-std manual download URL: canonical path without date prefix
-- Fixed tar extraction: use `-xJf` flag and `--strip-components=1`
-- Updated ROADMAP.md with accurate status for Phase 12, 13, and 14
-
-### Removed
-- `CAMEODB_ACCEPT_INVALID_CERTS` environment variable (replaced with `--insecure` flag)
+- Docker builds passing the `zscaler` build secret must pass `corporate-ca`.
 
 ---
 

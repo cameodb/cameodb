@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
         --stage=*) STAGES="${1#--stage=}"; shift ;;
         --commit)  COMMIT="--commit"; shift ;;
         --allow-unhardened) ALLOW_UNHARDENED="--allow-unhardened"; shift ;;
-        -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) usage "${BASH_SOURCE[0]}" ;;
         *) die "unknown argument '$1' (see --help)" ;;
     esac
 done
@@ -48,6 +48,18 @@ for s in $(printf '%s' "$STAGES" | tr ',' ' '); do
         *) die "unknown stage '$s' (build, sbom, sign, publish, or all)" ;;
     esac
 done
+
+# Run in pipeline order whatever order they were typed in, and drop repeats. Each stage consumes
+# what the previous one produced, so `--stage sign,sbom` would sign the tree and *then* write the
+# SBOMs into it, leaving the one file that describes the release as the one file with no
+# signature — publish refuses that, but only after the signing pass has already been spent.
+_ordered=""
+for _canon in build sbom sign publish; do
+    case ",$STAGES," in
+        *",$_canon,"*) _ordered="${_ordered:+$_ordered,}$_canon" ;;
+    esac
+done
+STAGES="$_ordered"
 
 printf '%s%s CameoDB %s — stages: %s %s\n' "$_c_bold" '::' "$VERSION" "$STAGES" "$_c_off"
 
