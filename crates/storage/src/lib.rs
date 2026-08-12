@@ -424,17 +424,30 @@ fn is_recovered_ambiguity(err: &tantivy::query::QueryParserError) -> bool {
 /// Replaces Tantivy's own wording, which names parser internals rather than the effect on the
 /// query — an exists leaf reports "Range query need to target a specific field", and a
 /// non-indexed field reports being "not declared as indexed".
+/// Note for a field the schema does not have.
+///
+/// Shared with [`unresolvable_fields`] so that when both the parser and the schema check see the
+/// same field, the two notes are one string and collapse in [`describe_discarded_all`].
+fn unknown_field_note(field: &str) -> String {
+    format!(
+        "unknown field '{field}' — the clause naming it had no effect, so this result set does \
+         not match what the query asked for"
+    )
+}
+
+/// Note for a field present in the schema but not indexed, and so not queryable.
+fn non_indexed_field_note(field: &str) -> String {
+    format!(
+        "field '{field}' exists but is not indexed, so the clause naming it had no effect and \
+         this result set does not match what the query asked for"
+    )
+}
+
 fn describe_discarded(err: &tantivy::query::QueryParserError) -> String {
     use tantivy::query::QueryParserError as E;
     match err {
-        E::FieldDoesNotExist(field) => format!(
-            "unknown field '{field}' — the clause naming it was dropped, so this result set is \
-             wider than the query asked for"
-        ),
-        E::FieldNotIndexed(field) => format!(
-            "field '{field}' exists but is not indexed, so the clause naming it was dropped and \
-             this result set is wider than the query asked for"
-        ),
+        E::FieldDoesNotExist(field) => unknown_field_note(field),
+        E::FieldNotIndexed(field) => non_indexed_field_note(field),
         E::UnsupportedQuery(detail) => {
             // The parser refuses every exists leaf with this text, whatever the field type.
             if detail.contains("Range query need to target a specific field") {
@@ -456,14 +469,34 @@ fn describe_discarded(err: &tantivy::query::QueryParserError) -> String {
     }
 }
 
-/// Describe the dropped clauses in the parser's error list, in order and without repeats.
+/// Describe every clause the query lost, from both sources that can tell: the parser's error
+/// list, and a schema check covering the field names the parser resolved to something
+/// ineffective.
 ///
-/// An unfielded term is attempted against every default field, so a single mistake arrives once
-/// per field.
-fn describe_discarded_all(errors: &[tantivy::query::QueryParserError]) -> Vec<String> {
+/// One note per distinct problem. An unfielded term is attempted against every default field,
+/// so a single mistake arrives from the parser once per field. And where both sources name the
+/// same field the schema's verdict wins, since it distinguishes a field that is absent from one
+/// that is present but not indexed — the parser sees only that it is missing from the Tantivy
+/// schema and reports both as unknown.
+fn describe_discarded_all(
+    errors: &[tantivy::query::QueryParserError],
+    query: &str,
+    schema: &IndexSchema,
+) -> Vec<String> {
+    let from_schema = unresolvable_fields(query, schema);
+    let claimed = |field: &str| {
+        let field = field.replace('\\', "");
+        from_schema.iter().any(|(name, _)| *name == field)
+    };
+
     let mut out: Vec<String> = Vec::new();
     for err in errors {
+        use tantivy::query::QueryParserError as E;
         if is_recovered_ambiguity(err) {
+            continue;
+        }
+        if matches!(err, E::FieldDoesNotExist(field) | E::FieldNotIndexed(field) if claimed(field))
+        {
             continue;
         }
         let described = describe_discarded(err);
@@ -471,7 +504,122 @@ fn describe_discarded_all(errors: &[tantivy::query::QueryParserError]) -> Vec<St
             out.push(described);
         }
     }
+    for (field, issue) in from_schema {
+        let note = match issue {
+            FieldIssue::Unknown => unknown_field_note(&field),
+            FieldIssue::NotIndexed => non_indexed_field_note(&field),
+        };
+        if !out.contains(&note) {
+            out.push(note);
+        }
+    }
     out
+}
+
+/// Byte offset of the first `:` not preceded by a backslash.
+fn first_unescaped_colon(token: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (idx, ch) in token.char_indices() {
+        match ch {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            ':' => return Some(idx),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Why a field name a query references cannot answer it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldIssue {
+    /// No such field in the schema.
+    Unknown,
+    /// Present in the schema but not indexed, so not queryable.
+    NotIndexed,
+}
+
+/// Field names a query references that the schema cannot resolve, each with its reason.
+///
+/// Covers what the parser does not report. When an index has a JSON field, that field is a
+/// default query field, so Tantivy resolves an unrecognised `name:` prefix as a path *inside*
+/// it: the clause parses cleanly, matches nothing, and produces no error. A clause lost that
+/// way is as ineffective as a dropped one, and in a negation it disables the exclusion.
+///
+/// A candidate is the text before the first unescaped colon of a whitespace-separated token,
+/// after any leading `+`, `-`, `(` or `!`. Only tokens in a position where a field name can
+/// appear are read, since a colon also occurs inside values — an RFC3339 timestamp, a URL —
+/// and reading one of those as a field name would refuse a valid query at the MCP layer.
+/// Excluded on that basis: tokens inside a quoted phrase, and tokens inside a range or set,
+/// which hold values rather than field references.
+///
+/// Nothing is claimed either when the schema is empty, or for a dotted name whose root is a real
+/// field, since the parser judges the path itself.
+fn unresolvable_fields(query: &str, schema: &IndexSchema) -> Vec<(String, FieldIssue)> {
+    // An index with no stored schema yields an empty one; everything would look unresolvable.
+    if schema.fields.is_empty() {
+        return Vec::new();
+    }
+
+    let mut found: Vec<(String, FieldIssue)> = Vec::new();
+    let mut inside_phrase = false;
+    // Depth of `[ ]` and `{ }` only. Parentheses group clauses and do contain field references.
+    let mut value_depth = 0i32;
+
+    for token in query.split_whitespace() {
+        let readable_position = !inside_phrase && value_depth == 0;
+        if token.matches('"').count() % 2 == 1 {
+            inside_phrase = !inside_phrase;
+        }
+        value_depth += token.matches(['[', '{']).count() as i32;
+        value_depth -= token.matches([']', '}']).count() as i32;
+        value_depth = value_depth.max(0);
+        if !readable_position {
+            continue;
+        }
+
+        let token = token.trim_start_matches(['+', '-', '(', '!']);
+        // A field reference never opens a phrase, a range or a set.
+        if token.starts_with(['"', '[', '{']) {
+            continue;
+        }
+        let Some(colon) = first_unescaped_colon(token) else {
+            continue;
+        };
+        let candidate = &token[..colon];
+        if candidate.is_empty() {
+            continue;
+        }
+
+        // Escapes are the query's, not the field's: `k8s\.node` names the field `k8s.node`.
+        let name = candidate.replace('\\', "");
+
+        // `id` and `_seq` are added to every Tantivy schema, not to `IndexSchema::fields`.
+        if name == "id" || name == "_seq" {
+            continue;
+        }
+
+        let issue = match schema.fields.get(&name) {
+            // Shadow fields are rewritten to `id` before a query reaches the engine.
+            Some(def) if def.indexed || def.is_shadow => continue,
+            Some(_) => FieldIssue::NotIndexed,
+            // A dotted name whose root is a real field is a path expression; whether the path
+            // is valid for that field's type is the parser's judgement, not ours.
+            None if name
+                .split_once('.')
+                .is_some_and(|(root, _)| schema.fields.contains_key(root)) =>
+            {
+                continue;
+            }
+            None => FieldIssue::Unknown,
+        };
+
+        if !found.iter().any(|(seen, _)| *seen == name) {
+            found.push((name, issue));
+        }
+    }
+
+    found
 }
 
 /// Parse exact ID queries (id:value or shadow_field:value) that can bypass Tantivy.
@@ -4256,7 +4404,7 @@ impl HybridStore {
             let query_parser =
                 tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
             let (parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
-            let discarded = describe_discarded_all(&parse_errors);
+            let discarded = describe_discarded_all(&parse_errors, query, &schema);
 
             if !discarded.is_empty() {
                 // At `warn`: the count below answers a narrower query than the caller wrote.
@@ -4377,7 +4525,7 @@ impl HybridStore {
         // Lenient, so one bad clause does not fail the whole query; what it drops is reported
         // through `SearchOutcome::discarded` rather than swallowed.
         let (parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
-        let discarded = describe_discarded_all(&parse_errors);
+        let discarded = describe_discarded_all(&parse_errors, query, &schema);
 
         if !discarded.is_empty() {
             // At `warn`: the results below answer a wider query than the caller wrote.
