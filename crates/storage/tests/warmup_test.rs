@@ -99,9 +99,10 @@ fn warm_index_makes_queries_serve_from_cache() {
 
     // The query must return the same results it would have from cold, and the index must
     // still be warm afterwards (warmup is not consumed by querying).
-    let (_, total_hits) = store
+    let total_hits = store
         .search_documents(index, "*", 0, None)
-        .expect("search failed");
+        .expect("search failed")
+        .total_hits;
     assert_eq!(total_hits, 50);
     assert!(store.is_index_warm(index));
 }
@@ -139,7 +140,7 @@ fn warm_index_is_idempotent_and_thread_safe() {
         store
             .search_documents(index, "*", 0, None)
             .expect("search")
-            .1,
+            .total_hits,
         40
     );
 }
@@ -267,7 +268,7 @@ fn commit_invalidates_warmup_and_rewarm_restores_it() {
         store
             .search_documents(index, "*", 0, None)
             .expect("search")
-            .1,
+            .total_hits,
         20
     );
 
@@ -286,7 +287,7 @@ fn commit_invalidates_warmup_and_rewarm_restores_it() {
         store
             .search_documents(index, "*", 0, None)
             .expect("search")
-            .1,
+            .total_hits,
         40,
         "documents from the new segment must be visible"
     );

@@ -164,32 +164,113 @@ fn normalize_date_literal(lit: &str) -> Option<String> {
     Some(dt.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
+/// Rewrite both bounds of a date range to RFC3339.
+///
+/// Accepts either delimiter on either side — `[a TO b]`, `{a TO b}`, and the mixed pairs — and
+/// preserves them, since they carry the inclusive/exclusive meaning.
 fn normalize_date_ranges(input: &str, field: &str) -> String {
-    let prefix = format!("{}:[", field);
+    let prefix = format!("{}:", field);
     let mut out = String::with_capacity(input.len());
     let mut idx = 0usize;
 
     while let Some(rel) = input[idx..].find(&prefix) {
         let start = idx + rel;
         out.push_str(&input[idx..start]);
+        let after_colon = start + prefix.len();
 
-        let inner_start = start + prefix.len();
-        if let Some(end_rel) = input[inner_start..].find(']') {
+        // The opening delimiter decides whether this is a range at all.
+        let open = input[after_colon..].chars().next();
+        let Some(open) = open.filter(|ch| *ch == '[' || *ch == '{') else {
+            out.push_str(&input[start..after_colon]);
+            idx = after_colon;
+            continue;
+        };
+
+        let inner_start = after_colon + open.len_utf8();
+        // Either closing form may terminate the range, so take whichever comes first.
+        let close_rel = input[inner_start..]
+            .find([']', '}'])
+            .map(|rel| (rel, input[inner_start + rel..].chars().next().unwrap()));
+
+        if let Some((end_rel, close)) = close_rel {
             let end = inner_start + end_rel;
             let inner = &input[inner_start..end];
 
             if let Some((lower, upper)) = inner.split_once(" TO ") {
                 let lower_norm = normalize_date_literal(lower).unwrap_or_else(|| lower.to_string());
                 let upper_norm = normalize_date_literal(upper).unwrap_or_else(|| upper.to_string());
-                out.push_str(&format!("{}:[{} TO {}]", field, lower_norm, upper_norm));
-                idx = end + 1;
+                out.push_str(&format!(
+                    "{}:{}{} TO {}{}",
+                    field, open, lower_norm, upper_norm, close
+                ));
+                idx = end + close.len_utf8();
                 continue;
             }
         }
 
-        // Fallback: no closing bracket or malformed, copy the rest of the prefix char and move on
-        out.push_str(&input[start..start + prefix.len()]);
-        idx = start + prefix.len();
+        // No closing delimiter, or no ` TO ` inside it: not a range we can rewrite. Copy the
+        // field prefix and the opening delimiter and carry on from there.
+        out.push_str(&input[start..inner_start]);
+        idx = inner_start;
+    }
+
+    out.push_str(&input[idx..]);
+    out
+}
+
+/// Rewrite every element of a date set query — `field: IN [a b c]` — to RFC3339.
+///
+/// Whitespace is allowed around `IN` and after the colon, so this shape is not reachable by the
+/// single-literal pass, which reads a value up to the next whitespace.
+fn normalize_date_in_sets(input: &str, field: &str) -> String {
+    let prefix = format!("{}:", field);
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0usize;
+
+    /// Bytes of leading whitespace at `from`, so the cursor can step over it.
+    fn space_at(input: &str, from: usize) -> usize {
+        input[from..].len() - input[from..].trim_start().len()
+    }
+
+    while let Some(rel) = input[idx..].find(&prefix) {
+        let start = idx + rel;
+        out.push_str(&input[idx..start]);
+        let after_colon = start + prefix.len();
+
+        // Walk forward from the colon with one cursor: optional space, `IN`, optional space,
+        // `[`, elements, `]`. Anything else is not a set query and is copied through.
+        let mut cursor = after_colon + space_at(input, after_colon);
+        if !input[cursor..].starts_with("IN") {
+            out.push_str(&input[start..after_colon]);
+            idx = after_colon;
+            continue;
+        }
+        cursor += "IN".len();
+        cursor += space_at(input, cursor);
+        if !input[cursor..].starts_with('[') {
+            out.push_str(&input[start..after_colon]);
+            idx = after_colon;
+            continue;
+        }
+        cursor += '['.len_utf8();
+
+        let Some(close_rel) = input[cursor..].find(']') else {
+            out.push_str(&input[start..after_colon]);
+            idx = after_colon;
+            continue;
+        };
+
+        // Quoted for the same reason as a bare literal: RFC3339 carries colons, which the
+        // grammar would otherwise read as a field separator inside the set.
+        let normalized: Vec<String> = input[cursor..cursor + close_rel]
+            .split_whitespace()
+            .map(|element| match normalize_date_literal(element) {
+                Some(norm) => format!("\"{norm}\""),
+                None => element.to_string(),
+            })
+            .collect();
+        out.push_str(&format!("{}: IN [{}]", field, normalized.join(" ")));
+        idx = cursor + close_rel + ']'.len_utf8();
     }
 
     out.push_str(&input[idx..]);
@@ -272,19 +353,124 @@ fn normalize_date_literals(input: &str, field: &str) -> String {
         };
         let value = &input[value_start..value_end];
 
-        // Skip if this looks like a range or comparison already handled
-        if value.starts_with('[') || value.starts_with('<') || value.starts_with('>') {
+        // Leave the shapes the range, comparison and `IN` passes own; an empty value is a
+        // bare `field:` with nothing after it.
+        if value.starts_with(['[', '{', '<', '>']) || value.is_empty() {
             out.push_str(&input[start..value_end]);
             idx = value_end;
             continue;
         }
 
-        let norm = normalize_date_literal(value).unwrap_or_else(|| value.to_string());
-        out.push_str(&format!("{}{}", prefix, norm));
+        // Quoted, because RFC3339 contains colons and the grammar would otherwise read
+        // `2024-06-15T00` as a field name. Only on success: a failed normalisation returns
+        // `value` verbatim, which may already carry quotes.
+        let rendered = match normalize_date_literal(value) {
+            Some(norm) => format!("\"{norm}\""),
+            None => value.to_string(),
+        };
+        out.push_str(&format!("{}{}", prefix, rendered));
         idx = value_end;
     }
 
     out.push_str(&input[idx..]);
+    out
+}
+
+/// The results of a search, and the clauses that did not survive parsing.
+///
+/// Tantivy parses leniently: a clause it cannot interpret is dropped and the rest of the query
+/// executes. In a conjunction that widens the result set; in a negation it disables the
+/// exclusion. Neither is visible in the hits, so a caller that needs the query to have meant
+/// what it said checks [`discarded`](Self::discarded) before trusting the rows.
+#[derive(Debug, Clone, Default)]
+pub struct SearchOutcome {
+    /// Matching documents, ordered by relevance or by the requested sort field.
+    pub hits: Vec<(f32, JsonValue)>,
+    /// Total matches, which exceeds `hits.len()` when a limit applied.
+    pub total_hits: usize,
+    /// One entry per dropped clause, phrased for the caller. Empty on a clean parse.
+    pub discarded: Vec<String>,
+}
+
+impl SearchOutcome {
+    /// No hits and nothing dropped: an index with no committed segments.
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    /// A count with no documents attached, for `limit = 0`.
+    fn counted(total_hits: usize, discarded: Vec<String>) -> Self {
+        Self {
+            hits: Vec::new(),
+            total_hits,
+            discarded,
+        }
+    }
+}
+
+/// Whether the parser resolved this ambiguity and ran the clause anyway.
+///
+/// The grammar reads `field:value` whose value contains a colon as a field name first, then
+/// re-reads it as a term. It reports that as an error but the clause still executes, so it does
+/// not belong in [`SearchOutcome::discarded`].
+fn is_recovered_ambiguity(err: &tantivy::query::QueryParserError) -> bool {
+    matches!(err, tantivy::query::QueryParserError::SyntaxError(detail)
+        if detail.contains("parsed possible invalid field as term"))
+}
+
+/// Describe a dropped clause: what was lost from the query, and what to use instead where
+/// there is an alternative.
+///
+/// Replaces Tantivy's own wording, which names parser internals rather than the effect on the
+/// query — an exists leaf reports "Range query need to target a specific field", and a
+/// non-indexed field reports being "not declared as indexed".
+fn describe_discarded(err: &tantivy::query::QueryParserError) -> String {
+    use tantivy::query::QueryParserError as E;
+    match err {
+        E::FieldDoesNotExist(field) => format!(
+            "unknown field '{field}' — the clause naming it was dropped, so this result set is \
+             wider than the query asked for"
+        ),
+        E::FieldNotIndexed(field) => format!(
+            "field '{field}' exists but is not indexed, so the clause naming it was dropped and \
+             this result set is wider than the query asked for"
+        ),
+        E::UnsupportedQuery(detail) => {
+            // The parser refuses every exists leaf with this text, whatever the field type.
+            if detail.contains("Range query need to target a specific field") {
+                "field-presence tests (`field:*`) are not supported; the clause was dropped. \
+                 Use a bounded range or an explicit value instead"
+                    .to_string()
+            } else {
+                format!("unsupported clause was dropped: {detail}")
+            }
+        }
+        E::FieldDoesNotHavePositionsIndexed(field) => format!(
+            "field '{field}' has no positions indexed, so the phrase clause against it was \
+             dropped; phrase queries need a text field"
+        ),
+        E::ExpectedInt(_) | E::ExpectedFloat(_) | E::ExpectedBool(_) | E::ExpectedBase64(_) => {
+            format!("a value did not match its field's type, so the clause was dropped: {err}")
+        }
+        other => format!("clause was dropped: {other}"),
+    }
+}
+
+/// Describe the dropped clauses in the parser's error list, in order and without repeats.
+///
+/// An unfielded term is attempted against every default field, so a single mistake arrives once
+/// per field.
+fn describe_discarded_all(errors: &[tantivy::query::QueryParserError]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for err in errors {
+        if is_recovered_ambiguity(err) {
+            continue;
+        }
+        let described = describe_discarded(err);
+        if !out.contains(&described) {
+            out.push(described);
+        }
+    }
     out
 }
 
@@ -319,11 +505,68 @@ fn parse_exact_id_query(query: &str, schema: &IndexSchema) -> Option<(String, bo
     None
 }
 
-/// Normalize date literals in a Tantivy query string based on schema field types.
-/// Supports common forms:
-/// - field:value (single literal)
-/// - field:<value / field:>value
-/// - field:[lower TO upper]
+/// Quote facet path values so the parser resolves them to facet terms.
+///
+/// The parser matches a facet term only against a quoted value, so `category:/electronics/phones`
+/// alone matches nothing. Only unquoted values beginning with `/` are touched; a quoted value is
+/// already in the form the parser wants. Matching is hierarchical, so a parent path matches its
+/// descendants.
+fn normalize_facet_query(query: &str, schema: &IndexSchema) -> String {
+    let facet_fields: Vec<&str> = schema
+        .fields
+        .iter()
+        .filter(|(_, def)| matches!(def.field_type, TantivyFieldType::Facet))
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    if facet_fields.is_empty() {
+        return query.to_string();
+    }
+
+    let mut normalized = query.to_string();
+    for field in facet_fields {
+        let prefix = format!("{}:/", field);
+        if !normalized.contains(&prefix) {
+            continue;
+        }
+
+        let mut out = String::with_capacity(normalized.len() + 2);
+        let mut idx = 0usize;
+        while let Some(rel) = normalized[idx..].find(&prefix) {
+            let start = idx + rel;
+            out.push_str(&normalized[idx..start]);
+
+            // The path runs to the next whitespace or to a closing paren from a group.
+            let value_start = start + field.len() + ':'.len_utf8();
+            let value_end = normalized[value_start..]
+                .find(|ch: char| ch.is_whitespace() || ch == ')')
+                .map(|r| value_start + r)
+                .unwrap_or(normalized.len());
+
+            out.push_str(&format!(
+                "{}:\"{}\"",
+                field,
+                &normalized[value_start..value_end]
+            ));
+            idx = value_end;
+        }
+        out.push_str(&normalized[idx..]);
+        normalized = out;
+    }
+
+    normalized
+}
+
+/// Rewrite every date literal in a query to RFC3339, the only form Tantivy's date parser
+/// accepts. Covers:
+///
+/// - `field:value`
+/// - `field:>value`, `field:<value`, `field:>=value`, `field:<=value`
+/// - `field:[lower TO upper]`, `field:{lower TO upper}`, and the mixed pairs
+/// - `field: IN [a b c]`
+///
+/// A shape no pass recognises reaches the parser unrewritten, which drops the clause rather
+/// than raising an error — so a gap here surfaces as a query that matches nothing.
 fn normalize_date_query(query: &str, schema: &IndexSchema) -> String {
     let date_fields: HashSet<&str> = schema
         .fields
@@ -338,7 +581,10 @@ fn normalize_date_query(query: &str, schema: &IndexSchema) -> String {
 
     let mut normalized = query.to_string();
     for field in &date_fields {
+        // Each pass claims one shape; the single-literal pass takes whatever is left, so it
+        // runs last or it would rewrite a range bound as a whole value.
         normalized = normalize_date_ranges(&normalized, field);
+        normalized = normalize_date_in_sets(&normalized, field);
         normalized = normalize_date_comparisons(&normalized, field);
         normalized = normalize_date_literals(&normalized, field);
     }
@@ -3960,7 +4206,7 @@ impl HybridStore {
         query: &str,
         limit: usize,
         _sort: Option<&SortSpec>,
-    ) -> Result<(Vec<(f32, JsonValue)>, usize), StoreError> {
+    ) -> Result<SearchOutcome, StoreError> {
         // Get reader and field mapping from cache or disk
         let (reader, fields) = match self.get_reader(index)? {
             Some(r) => r,
@@ -3968,7 +4214,7 @@ impl HybridStore {
                 // Normal for an index with no commits yet, and emitted once per shard per
                 // search — four lines for one query against an empty index at `warn`.
                 debug!(index = %index, "No tantivy reader found for index");
-                return Ok((Vec::new(), 0));
+                return Ok(SearchOutcome::empty());
             }
         };
 
@@ -3987,10 +4233,12 @@ impl HybridStore {
             if let Some((id_value, _)) = parse_exact_id_query(query, &schema) {
                 let exists = self.get_batch_by_keys(index, &[id_value])?.len();
                 let total_hits = if exists > 0 { 1 } else { 0 };
-                return Ok((Vec::new(), total_hits));
+                // No parse happens on this path, so nothing can be discarded.
+                return Ok(SearchOutcome::counted(total_hits, Vec::new()));
             }
 
-            let normalized_query = normalize_date_query(query, &schema);
+            let normalized_query =
+                normalize_facet_query(&normalize_date_query(query, &schema), &schema);
             let tantivy_schema = tantivy_index.schema();
             let default_query_fields: Vec<Field> = fields
                 .indexed_fields
@@ -4008,13 +4256,15 @@ impl HybridStore {
             let query_parser =
                 tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
             let (parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
+            let discarded = describe_discarded_all(&parse_errors);
 
-            if !parse_errors.is_empty() {
-                debug!(
+            if !discarded.is_empty() {
+                // At `warn`: the count below answers a narrower query than the caller wrote.
+                warn!(
                     index = %index,
                     query = %normalized_query,
-                    errors = ?parse_errors,
-                    "Count-only: lenient query parse produced non-fatal errors"
+                    discarded = ?discarded,
+                    "Count-only: query parser discarded clauses; the count is wider than the query"
                 );
             }
 
@@ -4027,7 +4277,7 @@ impl HybridStore {
                 "Count-only search completed (limit=0)"
             );
 
-            return Ok((Vec::new(), total_hits));
+            return Ok(SearchOutcome::counted(total_hits, discarded));
         }
 
         // Check if this is an exact ID lookup (id:field or shadow field) that can bypass Tantivy
@@ -4092,11 +4342,17 @@ impl HybridStore {
             }
 
             let total_hits = if results.is_empty() { 0 } else { 1 };
-            return Ok((results, total_hits));
+            // No parse happens on this path, so nothing can be discarded.
+            return Ok(SearchOutcome {
+                hits: results,
+                total_hits,
+                discarded: Vec::new(),
+            });
         }
 
         // Normalize date literals based on schema so naive inputs match indexed Date fields
-        let normalized_query = normalize_date_query(query, &schema);
+        let normalized_query =
+            normalize_facet_query(&normalize_date_query(query, &schema), &schema);
 
         // Create query parser and execute search
         // Only text/string fields are used as default search fields (for unqualified queries).
@@ -4118,16 +4374,18 @@ impl HybridStore {
         let query_parser =
             tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
 
-        // Use lenient parsing to gracefully handle type mismatches
-        // (e.g. field:hello on a numeric field skips that field instead of failing the entire query)
+        // Lenient, so one bad clause does not fail the whole query; what it drops is reported
+        // through `SearchOutcome::discarded` rather than swallowed.
         let (parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
+        let discarded = describe_discarded_all(&parse_errors);
 
-        if !parse_errors.is_empty() {
-            debug!(
+        if !discarded.is_empty() {
+            // At `warn`: the results below answer a wider query than the caller wrote.
+            warn!(
                 index = %index,
                 query = %normalized_query,
-                errors = ?parse_errors,
-                "Lenient query parse produced non-fatal errors"
+                discarded = ?discarded,
+                "Query parser discarded clauses; results are wider than the query"
             );
         }
 
@@ -4259,7 +4517,7 @@ impl HybridStore {
         };
 
         if is_empty {
-            return Ok((Vec::new(), total_hits));
+            return Ok(SearchOutcome::counted(total_hits, discarded));
         }
 
         // Step 1: Extract document IDs from Tantivy results using direct stored-field access
@@ -4398,7 +4656,11 @@ impl HybridStore {
             results.truncate(limit);
         }
 
-        Ok((results, total_hits))
+        Ok(SearchOutcome {
+            hits: results,
+            total_hits,
+            discarded,
+        })
     }
 
     /// Apply multiple write operations atomically to a specific index

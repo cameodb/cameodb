@@ -46,10 +46,10 @@ fn write_docs(store: &HybridStore, index: &str, ids: impl IntoIterator<Item = u3
 }
 
 fn search_hit_count(store: &HybridStore, index: &str, query: &str) -> usize {
-    let (_, total_hits) = store
+    store
         .search_documents(index, query, 0, None)
-        .expect("search failed");
-    total_hits
+        .expect("search failed")
+        .total_hits
 }
 
 /// A crash before any commit must lose nothing: the WAL still holds every write, and

@@ -6,7 +6,8 @@
 
 use serde_json::json;
 use storage::{
-    FieldDef, HybridStore, IndexSchema, SortOrder, SortSpec, StorageConfig, TantivyFieldType, WalOp,
+    FieldDef, HybridStore, IndexSchema, SearchOutcome, SortOrder, SortSpec, StorageConfig,
+    TantivyFieldType, WalOp,
 };
 use tempfile::TempDir;
 
@@ -102,7 +103,11 @@ fn test_sort_by_numeric_field_orders_results() {
         field: "year".to_string(),
         order: SortOrder::Asc,
     };
-    let (results, total) = store
+    let SearchOutcome {
+        hits: results,
+        total_hits: total,
+        ..
+    } = store
         .search_documents("books", "rust", 10, Some(&sort_asc))
         .expect("search failed");
     assert_eq!(total, 4, "all four docs match 'rust'");
@@ -117,7 +122,7 @@ fn test_sort_by_numeric_field_orders_results() {
         field: "year".to_string(),
         order: SortOrder::Desc,
     };
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "rust", 10, Some(&sort_desc))
         .expect("search failed");
     assert_eq!(
@@ -133,7 +138,7 @@ fn test_numeric_comparison_operators() {
     let store = setup_index(&dir, "books", sample_docs());
 
     // year > 2020 -> b(2022), d(2024)
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "year:>2020", 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -141,7 +146,7 @@ fn test_numeric_comparison_operators() {
     assert_eq!(got, vec!["b", "d"], "year:>2020 mismatch");
 
     // year >= 2020 -> a, b, d
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "year:>=2020", 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -149,13 +154,13 @@ fn test_numeric_comparison_operators() {
     assert_eq!(got, vec!["a", "b", "d"], "year:>=2020 mismatch");
 
     // year < 2020 -> c(2018)
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "year:<2020", 10, None)
         .expect("search failed");
     assert_eq!(ids(&results), vec!["c"], "year:<2020 mismatch");
 
     // price <= 4.5 -> b(4.5), d(1.0)
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "price:<=4.5", 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -169,7 +174,7 @@ fn test_numeric_range_operators() {
     let store = setup_index(&dir, "books", sample_docs());
 
     // Inclusive range year:[2020 TO 2022] -> a, b
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "year:[2020 TO 2022]", 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -177,7 +182,7 @@ fn test_numeric_range_operators() {
     assert_eq!(got, vec!["a", "b"], "inclusive range mismatch");
 
     // Exclusive range year:{2018 TO 2024} -> a(2020), b(2022)
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "year:{2018 TO 2024}", 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -191,7 +196,7 @@ fn test_date_comparison_and_range_operators() {
     let store = setup_index(&dir, "books", sample_docs());
 
     // published > 2021-01-01 -> b(2022), d(2024)
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "published:>2021-01-01", 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -199,7 +204,7 @@ fn test_date_comparison_and_range_operators() {
     assert_eq!(got, vec!["b", "d"], "date comparison mismatch");
 
     // published in [2019-01-01 TO 2023-01-01] -> a(2020), b(2022)
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "published:[2019-01-01 TO 2023-01-01]", 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -213,7 +218,7 @@ fn test_date_comparison_dot_format_and_quoted_values() {
     let store = setup_index(&dir, "books", sample_docs());
 
     // published > "2021.07.01" (dot format, quoted) -> b(2022), d(2024)
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", r#"published:>"2021.07.01""#, 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -225,7 +230,7 @@ fn test_date_comparison_dot_format_and_quoted_values() {
     );
 
     // published > 2021.07.01 (dot format, unquoted) -> b(2022), d(2024)
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "published:>2021.07.01", 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -237,7 +242,7 @@ fn test_date_comparison_dot_format_and_quoted_values() {
     );
 
     // Range with dot format: [2019.01.01 TO 2023.01.01] -> a(2020), b(2022)
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "published:[2019.01.01 TO 2023.01.01]", 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -271,7 +276,7 @@ fn test_datetime_formats_with_slash_and_dot_separators() {
     store.commit_index("dt").unwrap();
 
     // Slash separator datetime: ts > "2021/01/01 00:00:00" -> b, d
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("dt", r#"ts:>"2021/01/01 00:00:00""#, 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -279,7 +284,7 @@ fn test_datetime_formats_with_slash_and_dot_separators() {
     assert_eq!(got, vec!["b", "d"], "slash datetime comparison mismatch");
 
     // Dot separator datetime: ts > "2021.01.01 00:00:00" -> b, d
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("dt", r#"ts:>"2021.01.01 00:00:00""#, 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -287,7 +292,7 @@ fn test_datetime_formats_with_slash_and_dot_separators() {
     assert_eq!(got, vec!["b", "d"], "dot datetime comparison mismatch");
 
     // T separator with dot date: ts > "2021.01.01T00:00:00" -> b, d
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("dt", r#"ts:>"2021.01.01T00:00:00""#, 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -325,7 +330,7 @@ fn test_compact_datetime_and_epoch_formats() {
     store.commit_index("dt").unwrap();
 
     // Compact datetime YYYYMMDDHHMMSS: ts > 20210101000000 -> b, d
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("dt", "ts:>20210101000000", 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -333,7 +338,7 @@ fn test_compact_datetime_and_epoch_formats() {
     assert_eq!(got, vec!["b", "d"], "compact datetime comparison mismatch");
 
     // Epoch seconds: ts > 1609459200 (2021-01-01 UTC) -> b, d
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("dt", "ts:>1609459200", 10, None)
         .expect("search failed");
     let mut got = ids(&results);
@@ -348,7 +353,7 @@ fn test_quoted_value_boundary_without_trailing_space() {
 
     // Quoted value with no space after closing quote — the `+` immediately follows.
     // This tests that the quote boundary detection works correctly.
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents(
             "books",
             r#"published:>"2021.07.01" AND title:rust"#,
@@ -375,7 +380,11 @@ fn test_sort_by_f64_field_orders_results() {
         field: "price".to_string(),
         order: SortOrder::Asc,
     };
-    let (results, total) = store
+    let SearchOutcome {
+        hits: results,
+        total_hits: total,
+        ..
+    } = store
         .search_documents("books", "rust", 10, Some(&sort_asc))
         .expect("search failed");
     assert_eq!(total, 4, "all four docs match 'rust'");
@@ -390,7 +399,7 @@ fn test_sort_by_f64_field_orders_results() {
         field: "price".to_string(),
         order: SortOrder::Desc,
     };
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "rust", 10, Some(&sort_desc))
         .expect("search failed");
     assert_eq!(
@@ -410,7 +419,11 @@ fn test_sort_by_date_field_orders_results() {
         field: "published".to_string(),
         order: SortOrder::Asc,
     };
-    let (results, total) = store
+    let SearchOutcome {
+        hits: results,
+        total_hits: total,
+        ..
+    } = store
         .search_documents("books", "rust", 10, Some(&sort_asc))
         .expect("search failed");
     assert_eq!(total, 4, "all four docs match 'rust'");
@@ -425,7 +438,7 @@ fn test_sort_by_date_field_orders_results() {
         field: "published".to_string(),
         order: SortOrder::Desc,
     };
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "rust", 10, Some(&sort_desc))
         .expect("search failed");
     assert_eq!(
@@ -446,7 +459,11 @@ fn test_sort_by_string_field_orders_results_alphabetically() {
         field: "title".to_string(),
         order: SortOrder::Asc,
     };
-    let (results, total) = store
+    let SearchOutcome {
+        hits: results,
+        total_hits: total,
+        ..
+    } = store
         .search_documents("books", "rust", 10, Some(&sort_asc))
         .expect("search failed");
     assert_eq!(total, 4, "all four docs match 'rust'");
@@ -461,7 +478,7 @@ fn test_sort_by_string_field_orders_results_alphabetically() {
         field: "title".to_string(),
         order: SortOrder::Desc,
     };
-    let (results, _) = store
+    let SearchOutcome { hits: results, .. } = store
         .search_documents("books", "rust", 10, Some(&sort_desc))
         .expect("search failed");
     assert_eq!(

@@ -288,6 +288,10 @@ impl McpBackend for AppState {
 
             match result {
                 Ok(mut response) => {
+                    // Checked before the hits are described, since a dropped clause makes the
+                    // rest of this response answer a different query.
+                    refuse_if_clauses_discarded(&response)?;
+
                     // Add zero-results warning if applicable
                     let hits_returned = response
                         .get("hits_returned")
@@ -295,7 +299,7 @@ impl McpBackend for AppState {
                         .unwrap_or(0);
 
                     if hits_returned == 0
-                        && (query.contains('\"') || query.contains("AND"))
+                        && narrowed_by_phrase_or_conjunction(&query)
                         && let Some(obj) = response.as_object_mut()
                     {
                         obj.insert(
@@ -310,11 +314,7 @@ impl McpBackend for AppState {
                 Err(err) => {
                     let err_str = err.to_string();
 
-                    // Schema-aware error interceptor for field errors
-                    if (err_str.contains("does not exist")
-                        || err_str.contains("FieldDoesNotExist")
-                        || err_str.contains("field")
-                        || err_str.contains("unknown field"))
+                    if names_a_missing_field(&err_str)
                         && let Ok(schema_result) = state
                             .router
                             .handle_client_op(ClientOp::GetConfig {
@@ -325,11 +325,7 @@ impl McpBackend for AppState {
                             schema_result.get("fields").and_then(|v| v.as_object())
                     {
                         let field_names: Vec<String> = fields_obj.keys().cloned().collect();
-                        return Err(format!(
-                            "Query failed: The query references a field that does not exist in the '{}' index. Valid fields are: [{}]. Please correct your query and try again.",
-                            index_name,
-                            field_names.join(", ")
-                        ));
+                        return Err(with_valid_fields(&err_str, &index_name, &field_names));
                     }
 
                     Err(err_str)
@@ -439,10 +435,7 @@ impl McpBackend for AppState {
                     Err(err) => {
                         let err_str = err.to_string();
 
-                        if (err_str.contains("does not exist")
-                            || err_str.contains("FieldDoesNotExist")
-                            || err_str.contains("field")
-                            || err_str.contains("unknown field"))
+                        if names_a_missing_field(&err_str)
                             && let Ok(schema_result) = state
                                 .router
                                 .handle_client_op(ClientOp::GetConfig {
@@ -453,16 +446,18 @@ impl McpBackend for AppState {
                                 schema_result.get("fields").and_then(|v| v.as_object())
                         {
                             let field_names: Vec<String> = fields_obj.keys().cloned().collect();
-                            return Err(format!(
-                                "Query failed in index '{}': The query references a field that does not exist. Valid fields are: [{}]. Please correct your query and try again.",
-                                index_name,
-                                field_names.join(", ")
-                            ));
+                            return Err(with_valid_fields(&err_str, &index_name, &field_names));
                         }
 
                         return Err(err_str);
                     }
                 };
+
+                // One query string covers every index, so a dropped clause affects the whole
+                // merge rather than this index alone.
+                if let Err(refusal) = refuse_if_clauses_discarded(&result) {
+                    return Err(format!("index '{index_name}': {refusal}"));
+                }
 
                 total_hits += result
                     .get("total_hits")
@@ -525,7 +520,7 @@ impl McpBackend for AppState {
 
             // Add zero-results warning if applicable
             if hits_returned == 0
-                && (query.contains('\"') || query.contains("AND"))
+                && narrowed_by_phrase_or_conjunction(&query)
                 && let Some(obj) = response.as_object_mut()
             {
                 obj.insert(
@@ -901,6 +896,70 @@ impl McpBackend for AppState {
             Some(error) => record.refused(error),
         });
     }
+}
+
+/// Whether a query contains a phrase or a conjunction, and so could be usefully relaxed after
+/// matching nothing.
+///
+/// `AND` counts only as a standalone token, the way the parser reads it, so it is not found
+/// inside a value such as `status:ANDROID`.
+fn narrowed_by_phrase_or_conjunction(query: &str) -> bool {
+    query.contains('"') || query.split_whitespace().any(|token| token == "AND")
+}
+
+/// Whether an engine error reports a field the schema does not have.
+///
+/// Matched against specific signals rather than the word "field", which appears in unrelated
+/// errors such as the sort error for a non-FAST field.
+fn names_a_missing_field(error: &str) -> bool {
+    const MISSING_FIELD_SIGNALS: [&str; 4] = [
+        "does not exist",
+        "FieldDoesNotExist",
+        "unknown field",
+        "not declared as indexed",
+    ];
+    MISSING_FIELD_SIGNALS
+        .iter()
+        .any(|signal| error.contains(signal))
+}
+
+/// Append an index's field list to an engine error, keeping the original message.
+fn with_valid_fields(error: &str, index: &str, field_names: &[String]) -> String {
+    format!(
+        "{error}\n\nFields available in '{index}': [{}]",
+        field_names.join(", ")
+    )
+}
+
+/// Turn a search response carrying dropped clauses into a tool execution error.
+///
+/// The hits are real but answer a wider query than the caller wrote, and nothing in the payload
+/// marks them as such. MCP callers present results as fact, so they get an error naming the
+/// clause; the HTTP API keeps the hits and reports the same list as
+/// [`DISCARDED_CLAUSES_FIELD`].
+fn refuse_if_clauses_discarded(response: &JsonValue) -> Result<(), String> {
+    let discarded: Vec<&str> = response
+        .get(crate::node_orchestrator::DISCARDED_CLAUSES_FIELD)
+        .and_then(|value| value.as_array())
+        .map(|notes| notes.iter().filter_map(|note| note.as_str()).collect())
+        .unwrap_or_default();
+
+    if discarded.is_empty() {
+        return Ok(());
+    }
+
+    let detail = discarded
+        .iter()
+        .map(|note| format!("  - {note}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Err(format!(
+        "Query rejected: part of this query could not be interpreted and was dropped, so the \
+         results would not be the ones asked for.\n{detail}\n\nRewrite the query and retry. \
+         `validate_query` lists the fields this index actually has, with the operators each \
+         field's type supports."
+    ))
 }
 
 fn resource_descriptor(uri: String, name: String, description: String) -> JsonValue {

@@ -271,6 +271,8 @@ struct BroadcastStats {
     nodes_contacted: usize,
     max_took_ms: Option<u64>,
     total_hits_sum: usize,
+    /// Distinct dropped clauses across the nodes that answered.
+    discarded: Vec<String>,
 }
 
 fn push_hit_into_top_k(top_hits: &mut Vec<JsonValue>, hit: JsonValue, limit: usize) {
@@ -311,6 +313,45 @@ fn push_hit_into_top_k(top_hits: &mut Vec<JsonValue>, hit: JsonValue, limit: usi
 /// results even when the user's `return` projection excludes the sort field itself. It
 /// is stripped from every hit at the client boundary (`route_and_handle`).
 const SORT_KEY_FIELD: &str = "_sort_key";
+
+/// Response key listing the clauses the query parser dropped.
+///
+/// Absent on a clean parse rather than present and empty, so a caller can test for presence.
+pub const DISCARDED_CLAUSES_FIELD: &str = "_discarded_clauses";
+
+/// Attach `DISCARDED_CLAUSES_FIELD` to a search response, if anything was discarded.
+fn attach_discarded(response: &mut JsonValue, discarded: Vec<String>) {
+    if discarded.is_empty() {
+        return;
+    }
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(
+            DISCARDED_CLAUSES_FIELD.to_string(),
+            JsonValue::Array(discarded.into_iter().map(JsonValue::String).collect()),
+        );
+    }
+}
+
+/// Collect the distinct dropped clauses from per-node responses.
+///
+/// Cross-node merges see [`DISCARDED_CLAUSES_FIELD`] as JSON rather than as a typed reply.
+fn collect_discarded(responses: &[JsonValue]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for response in responses {
+        let Some(notes) = response
+            .get(DISCARDED_CLAUSES_FIELD)
+            .and_then(|value| value.as_array())
+        else {
+            continue;
+        };
+        for note in notes.iter().filter_map(|note| note.as_str()) {
+            if !out.iter().any(|existing| existing == note) {
+                out.push(note.to_string());
+            }
+        }
+    }
+    out
+}
 
 /// Produce a comparable sort key for a hit's raw field value.
 ///
@@ -885,6 +926,11 @@ pub struct SearchHit {
 pub struct SearchReply {
     pub hits: Vec<SearchHit>,
     pub total_hits: usize,
+    /// Clauses the query parser dropped; see [`storage::SearchOutcome::discarded`].
+    ///
+    /// Defaulted because this type crosses the cluster wire and a peer may not send the field.
+    #[serde(default)]
+    pub discarded: Vec<String>,
 }
 
 /// Client operation messages for RouterActor.
@@ -2038,12 +2084,19 @@ impl OrchestratorEngine {
         let mut errors = Vec::new();
         let mut shard_success = 0usize;
         let mut total_hits_sum = 0usize;
+        // Every shard parses the same query string, so collect the distinct set.
+        let mut discarded: Vec<String> = Vec::new();
         for (shard_id, result) in shard_results {
             match result {
                 Ok(r) => {
                     total_hits_sum += r.total_hits;
                     for hit in r.hits {
                         results.push((shard_id, hit.score, hit.doc));
+                    }
+                    for note in r.discarded {
+                        if !discarded.contains(&note) {
+                            discarded.push(note);
+                        }
                     }
                     shard_success += 1;
                 }
@@ -2099,7 +2152,7 @@ impl OrchestratorEngine {
                 }
             })
             .collect();
-        Ok(serde_json::json!({
+        let mut response = serde_json::json!({
             "hits": hits,
             "hits_returned": hits.len(),
             "total_hits": total_hits_sum,
@@ -2113,7 +2166,9 @@ impl OrchestratorEngine {
                 }
             },
             "errors": errors
-        }))
+        });
+        attach_discarded(&mut response, discarded);
+        Ok(response)
     }
 }
 
@@ -2802,7 +2857,7 @@ impl MicroshardActor {
         let index = request.index.clone();
         let sort = request.sort;
 
-        let (results, total_hits) = self
+        let outcome = self
             .spawn_on_read_pool(move || {
                 store.search_documents(&index, &query, limit, sort.as_ref())
             })
@@ -2812,14 +2867,16 @@ impl MicroshardActor {
                 _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
             })?;
 
-        let search_hits: Vec<SearchHit> = results
+        let search_hits: Vec<SearchHit> = outcome
+            .hits
             .into_iter()
             .map(|(score, doc)| SearchHit { score, doc })
             .collect();
 
         Ok(SearchReply {
             hits: search_hits,
-            total_hits,
+            total_hits: outcome.total_hits,
+            discarded: outcome.discarded,
         })
     }
 
@@ -3099,6 +3156,7 @@ impl Message<SearchRequest> for MicroshardActor {
             .map(|result| SearchReply {
                 hits: result.hits,
                 total_hits: result.total_hits,
+                discarded: result.discarded,
             })
             .map_err(RemoteError::from)
     }
@@ -3716,6 +3774,7 @@ impl RouterActor {
                 nodes_contacted: 0,
                 max_took_ms: None,
                 total_hits_sum: 0,
+                discarded: Vec::new(),
             };
 
             // Helper to push hits from a result up to the remaining limit.
@@ -3748,6 +3807,11 @@ impl RouterActor {
                 }
                 if let Some(total) = value.get("total_hits").and_then(|t| t.as_u64()) {
                     stats.total_hits_sum += total as usize;
+                }
+                for note in collect_discarded(std::slice::from_ref(value)) {
+                    if !stats.discarded.contains(&note) {
+                        stats.discarded.push(note);
+                    }
                 }
                 stats.nodes_contacted += 1;
                 if let Some(t) = value.get("took_ms").and_then(|v| v.as_u64()) {
@@ -3807,7 +3871,7 @@ impl RouterActor {
             order_merged_hits(&mut merged_hits, sort.as_ref());
             merged_hits.truncate(limit);
 
-            return Ok(serde_json::json!({
+            let mut response = serde_json::json!({
                 "hits": merged_hits,
                 "hits_returned": merged_hits.len(),
                 "total_hits": stats.total_hits_sum,
@@ -3823,7 +3887,9 @@ impl RouterActor {
                         "contacted": stats.nodes_contacted
                     }
                 }
-            }));
+            });
+            attach_discarded(&mut response, stats.discarded);
+            return Ok(response);
         }
 
         // Aggregate results: for search, merge hits; for writes, report success/failure counts
@@ -3877,6 +3943,8 @@ impl RouterActor {
                 let mut merged_hits: Vec<JsonValue> = Vec::new();
                 let mut total_shards_queried = 0usize;
                 let mut total_hits_sum = 0usize;
+                // Read before the loop below consumes `all_results`.
+                let discarded = collect_discarded(&all_results);
 
                 for mut result in all_results {
                     if let Some(hits) = result.get_mut("hits").and_then(|h| h.as_array_mut()) {
@@ -3907,7 +3975,7 @@ impl RouterActor {
                 });
                 merged_hits.truncate(limit);
 
-                Ok(serde_json::json!({
+                let mut response = serde_json::json!({
                     "hits": merged_hits,
                     "hits_returned": merged_hits.len(),
                     "total_hits": total_hits_sum,
@@ -3922,7 +3990,9 @@ impl RouterActor {
                             "contacted": nodes_contacted
                         }
                     }
-                }))
+                });
+                attach_discarded(&mut response, discarded);
+                Ok(response)
             }
             ClientOp::Write { .. } | ClientOp::BulkWrite { .. } => {
                 // For writes, return aggregate success info
@@ -6855,12 +6925,19 @@ impl NodeOrchestrator {
         let mut errors = Vec::new();
         let mut shard_success = 0usize;
         let mut total_hits_sum = 0usize;
+        // Every shard parses the same query string, so collect the distinct set.
+        let mut discarded: Vec<String> = Vec::new();
         for (shard_id, result) in shard_results {
             match result {
                 Ok(r) => {
                     total_hits_sum += r.total_hits;
                     for hit in r.hits {
                         results.push((shard_id, hit.score, hit.doc));
+                    }
+                    for note in r.discarded {
+                        if !discarded.contains(&note) {
+                            discarded.push(note);
+                        }
                     }
                     shard_success += 1;
                 }
@@ -6913,7 +6990,7 @@ impl NodeOrchestrator {
                 }
             })
             .collect();
-        Ok(serde_json::json!({
+        let mut response = serde_json::json!({
             "hits": hits,
             "hits_returned": hits.len(),
             "total_hits": total_hits_sum,
@@ -6927,7 +7004,9 @@ impl NodeOrchestrator {
                 }
             },
             "errors": errors
-        }))
+        });
+        attach_discarded(&mut response, discarded);
+        Ok(response)
     }
 
     async fn orch_create_config(
