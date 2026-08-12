@@ -302,6 +302,7 @@ schema, and the table below, which is generated and checked against the tables b
 | `field:"a b"` | Exact phrase, terms in order. Text fields only. | text |
 | `field:"a b"~N` | Phrase allowing N extra words between terms. | text |
 | `"a b pre"*` | Phrase whose last term is a prefix. Two or more terms. | text |
+| `field:pre*` | Match every term starting with `pre`. One term, and the field is required. | text, string |
 | `AND / OR / NOT` | Combine clauses. Uppercase only. | any |
 | `+term / -term` | Require or exclude a clause. | any |
 | `(...)` | Group clauses to control precedence. | any |
@@ -317,7 +318,7 @@ schema, and the table below, which is generated and checked against the tables b
 **Not supported**
 
 - `field:*` — Field-presence tests are not supported for any field type. The clause is dropped and reported. Use a bounded range, or match an explicit value.
-- `field:pre*` — A single term with a trailing `*` is not a prefix search; it matches the term `pre` exactly. Use a phrase prefix (`"two words pre"*`) or a lexicographic range (`field:[pre TO prf}`).
+- `pre*` — A prefix needs a field name; without one the `*` is dropped and `pre` is matched as a whole term. Name the field, or OR one clause per field.
 - `field.subfield:value` — Paths into a json field are not queryable. A json field is searchable only as unstructured text, so `field:value` matches any key or value inside it.
 - `field:/regex/` — Regular expressions are disabled.
 

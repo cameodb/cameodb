@@ -1311,7 +1311,7 @@ When a user asks a question, you must follow this deterministic loop:
 ### Step 2: Query Formulation & Validation
 * **Action:** Construct your query using CameoDB's Tantivy syntax.
 * **Rule:** Map the user's intent to the specific data types found in Step 1.
-    * *Text fields:* Use phrases (`title:"exact phrase"`), phrase prefix (`"exact phr"*`), or slop (`body:"near this"~2`). A single term with a trailing `*` is **not** a prefix search — it matches that term exactly.
+    * *Text and string fields:* Use prefixes (`title:data*`), phrases (`title:"exact phrase"`), phrase prefix (`"exact phr"*`), or slop (`body:"near this"~2`). A prefix needs a field name, and a short one scans a wide slice of the term dictionary.
     * *Numeric/Date fields:* Use ranges (`price:[10.0 TO 100.0]`, `created_at:>2024-01-01`) or comparisons. Both bracket styles work, and may be mixed: `[a TO b}`.
     * *Exact ID lookup:* When the question gives an exact document `id`, query it directly (e.g., `id:ABC123`). If that is the whole query, CameoDB reads the key-value store and skips the search index — the fastest retrieval path.
 * **Action:** Only indexed fields can be queried. `get_index` reports an `indexed` flag per field; a field discovered from a document is unindexed until a schema update promotes it.
@@ -1347,7 +1347,7 @@ Every **indexed** field is queryable, whatever its type. Check the `indexed` fla
 ### Forms that do not work
 These are **dropped from the query rather than rejected**, so a search containing one answers a different question than the one asked. CameoDB reports every dropped clause and the tool call fails; do not use them:
 - `field:*` — field-presence tests are unsupported for every type. Match an explicit value or use a range.
-- `field:pre*` — not a prefix search. Use a phrase prefix, or a range such as `field:[pre TO prf}`.
+- `pre*` — a prefix needs a field name; without one `pre` is matched as a whole term. Name the field, or OR one clause per field.
 - `field.subfield:value` — paths into a json field are not queryable. A json field is searchable only as unstructured text, so `field:value` matches any key or value inside it.
 - Regular expressions are disabled.
 

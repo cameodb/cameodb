@@ -653,6 +653,153 @@ fn parse_exact_id_query(query: &str, schema: &IndexSchema) -> Option<(String, bo
     None
 }
 
+/// The single token an analyzer produces from `text`, or None if it produces any other number.
+fn single_token(analyzer: &mut tantivy::tokenizer::TextAnalyzer, text: &str) -> Option<String> {
+    use tantivy::tokenizer::TokenStream;
+
+    let mut tokens: Vec<String> = Vec::new();
+    let mut stream = analyzer.token_stream(text);
+    stream.process(&mut |token| tokens.push(token.text.clone()));
+    match tokens.len() {
+        1 => tokens.pop(),
+        _ => None,
+    }
+}
+
+/// The exclusive upper bound of a lexicographic prefix range: `term` with its final scalar raised
+/// to the next value the analyzer leaves unchanged.
+///
+/// Tantivy tokenizes a range bound and takes a single token only, so a candidate the analyzer
+/// rewrites or discards cannot serve as one. Ascending order keeps the bound tight: a scalar the
+/// analyzer discards cannot appear in an indexed term either, so stepping over it admits nothing.
+///
+/// None when no candidate qualifies, leaving the clause for the caller to report.
+fn prefix_upper_bound(
+    term: &str,
+    analyzer: &mut tantivy::tokenizer::TextAnalyzer,
+) -> Option<String> {
+    /// Enough to cross the punctuation runs between the digits, the ASCII letters and the
+    /// alphanumeric scalars above them.
+    const MAX_CANDIDATES: u32 = 64;
+
+    let mut scalars: Vec<char> = term.chars().collect();
+    let last = scalars.pop()?;
+    let head: String = scalars.into_iter().collect();
+
+    let mut code = last as u32;
+    for _ in 0..MAX_CANDIDATES {
+        code += 1;
+        // Surrogates are not scalar values, so the successor of U+D7FF is U+E000.
+        if code == 0xD800 {
+            code = 0xE000;
+        }
+        let candidate = format!("{head}{}", char::from_u32(code)?);
+        if single_token(analyzer, &candidate).as_deref() == Some(candidate.as_str()) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Split a single-term prefix clause into its term and any trailing boost.
+///
+/// None for the values this rewrite does not claim: a quoted value is a phrase prefix, a bare `*`
+/// a presence test, and a range or group is not a term.
+fn single_term_prefix(value: &str) -> Option<(&str, &str)> {
+    let (head, boost) = match value.find('^') {
+        Some(at) => value.split_at(at),
+        None => (value, ""),
+    };
+    let term = head.strip_suffix('*')?;
+    if term.contains('*') || matches!(term.chars().next()?, '"' | '[' | '{' | '(') {
+        return None;
+    }
+    Some((term, boost))
+}
+
+/// Note for a prefix clause left as the bare term because no bound was available.
+fn unrewritable_prefix_note(field: &str, value: &str) -> String {
+    format!(
+        "'{field}:{value}' could not be rewritten as a prefix range, so it matched the term \
+         '{}' exactly; write the range you want instead",
+        value.trim_end_matches('*')
+    )
+}
+
+/// Rewrite a single-term prefix — `field:pre*` — into the equivalent lexicographic range, on text
+/// and string fields.
+///
+/// The grammar has no prefix operator: it drops the `*` and matches `pre` as a whole term without
+/// raising an error. Tantivy tokenizes the bounds, so the prefix may be written in any case.
+///
+/// Returns the query with a note per prefix clause left unrewritten.
+fn normalize_prefix_query(query: &str, tantivy_index: &Index) -> (String, Vec<String>) {
+    use tantivy::schema::FieldType;
+
+    if !query.contains('*') {
+        return (query.to_string(), Vec::new());
+    }
+
+    let tantivy_schema = tantivy_index.schema();
+    let mut normalized = query.to_string();
+    let mut notes = Vec::new();
+
+    for (_, entry) in tantivy_schema.fields() {
+        let FieldType::Str(ref options) = *entry.field_type() else {
+            continue;
+        };
+        let Some(indexing) = options.get_indexing_options() else {
+            continue;
+        };
+        let name = entry.name();
+        let prefix = format!("{name}:");
+        if !normalized.contains(&prefix) {
+            continue;
+        }
+        let Some(mut analyzer) = tantivy_index.tokenizers().get(indexing.tokenizer()) else {
+            continue;
+        };
+
+        let mut out = String::with_capacity(normalized.len());
+        let mut idx = 0usize;
+        while let Some(rel) = normalized[idx..].find(&prefix) {
+            let start = idx + rel;
+            out.push_str(&normalized[idx..start]);
+
+            // The value runs to the next whitespace or to a closing paren from a group.
+            let value_start = start + prefix.len();
+            let value_end = normalized[value_start..]
+                .find(|ch: char| ch.is_whitespace() || ch == ')')
+                .map(|r| value_start + r)
+                .unwrap_or(normalized.len());
+            let value = &normalized[value_start..value_end];
+
+            let range = single_term_prefix(value).map(|(term, boost)| {
+                single_token(&mut analyzer, term)
+                    .and_then(|lower| {
+                        let upper = prefix_upper_bound(&lower, &mut analyzer)?;
+                        Some(format!("{name}:[{lower} TO {upper}}}{boost}"))
+                    })
+                    .ok_or(value)
+            });
+
+            match range {
+                Some(Ok(rewritten)) => out.push_str(&rewritten),
+                Some(Err(unrewritable)) => {
+                    notes.push(unrewritable_prefix_note(name, unrewritable));
+                    out.push_str(&normalized[start..value_end]);
+                }
+                None => out.push_str(&normalized[start..value_end]),
+            }
+            idx = value_end;
+        }
+        out.push_str(&normalized[idx..]);
+        normalized = out;
+    }
+
+    (normalized, notes)
+}
+
 /// Quote facet path values so the parser resolves them to facet terms.
 ///
 /// The parser matches a facet term only against a quoted value, so `category:/electronics/phones`
@@ -4385,8 +4532,10 @@ impl HybridStore {
                 return Ok(SearchOutcome::counted(total_hits, Vec::new()));
             }
 
-            let normalized_query =
-                normalize_facet_query(&normalize_date_query(query, &schema), &schema);
+            let (normalized_query, prefix_notes) = normalize_prefix_query(
+                &normalize_facet_query(&normalize_date_query(query, &schema), &schema),
+                tantivy_index,
+            );
             let tantivy_schema = tantivy_index.schema();
             let default_query_fields: Vec<Field> = fields
                 .indexed_fields
@@ -4404,7 +4553,8 @@ impl HybridStore {
             let query_parser =
                 tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
             let (parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
-            let discarded = describe_discarded_all(&parse_errors, query, &schema);
+            let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
+            discarded.extend(prefix_notes);
 
             if !discarded.is_empty() {
                 // At `warn`: the count below answers a narrower query than the caller wrote.
@@ -4499,8 +4649,10 @@ impl HybridStore {
         }
 
         // Normalize date literals based on schema so naive inputs match indexed Date fields
-        let normalized_query =
-            normalize_facet_query(&normalize_date_query(query, &schema), &schema);
+        let (normalized_query, prefix_notes) = normalize_prefix_query(
+            &normalize_facet_query(&normalize_date_query(query, &schema), &schema),
+            tantivy_index,
+        );
 
         // Create query parser and execute search
         // Only text/string fields are used as default search fields (for unqualified queries).
@@ -4525,7 +4677,8 @@ impl HybridStore {
         // Lenient, so one bad clause does not fail the whole query; what it drops is reported
         // through `SearchOutcome::discarded` rather than swallowed.
         let (parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
-        let discarded = describe_discarded_all(&parse_errors, query, &schema);
+        let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
+        discarded.extend(prefix_notes);
 
         if !discarded.is_empty() {
             // At `warn`: the results below answer a wider query than the caller wrote.

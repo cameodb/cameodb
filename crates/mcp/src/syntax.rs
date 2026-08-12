@@ -105,7 +105,18 @@ pub const OPERATORS: &[Operator] = &[
         summary: "Phrase whose last term is a prefix. Two or more terms.",
         examples: &["\"big bad wo\"*"],
         types: &[TYPE_TEXT],
-        caveat: Some("A single term with a trailing `*` is not a prefix search."),
+        caveat: None,
+    },
+    Operator {
+        syntax: "field:pre*",
+        summary: "Match every term starting with `pre`. One term, and the field is required.",
+        examples: &["title:data*", "tag:urn:cve*"],
+        types: &[TYPE_TEXT, TYPE_STRING],
+        caveat: Some(
+            "Runs as a lexicographic range, so a short prefix scans a wide slice of the term \
+             dictionary. On a stemmed field the prefix is stemmed too, which can move where it \
+             lands.",
+        ),
     },
     Operator {
         syntax: "AND / OR / NOT",
@@ -233,10 +244,9 @@ pub const NOT_SUPPORTED: &[NotSupported] = &[
                  dropped and reported. Use a bounded range, or match an explicit value.",
     },
     NotSupported {
-        syntax: "field:pre*",
-        detail: "A single term with a trailing `*` is not a prefix search; it matches the term \
-                 `pre` exactly. Use a phrase prefix (`\"two words pre\"*`) or a lexicographic \
-                 range (`field:[pre TO prf}`).",
+        syntax: "pre*",
+        detail: "A prefix needs a field name; without one the `*` is dropped and `pre` is matched \
+                 as a whole term. Name the field, or OR one clause per field.",
     },
     NotSupported {
         syntax: "field.subfield:value",
@@ -581,7 +591,7 @@ mod tests {
     /// dropped clause, so the reference has to say so rather than stay silent.
     #[test]
     fn the_known_broken_forms_are_listed_as_unsupported() {
-        for syntax in ["field:*", "field:pre*", "field.subfield:value"] {
+        for syntax in ["field:*", "pre*", "field.subfield:value"] {
             assert!(
                 NOT_SUPPORTED.iter().any(|form| form.syntax == syntax),
                 "{syntax} must be listed as unsupported"
