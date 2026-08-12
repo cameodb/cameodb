@@ -332,6 +332,46 @@ fn attach_discarded(response: &mut JsonValue, discarded: Vec<String>) {
     }
 }
 
+/// Notes for inline-modifier fields the index does not have.
+///
+/// A projection drops an unknown field and a sort on one falls back to score, both without
+/// complaint, so a keyword lifted out of prose — `find tax return forms` — would otherwise answer
+/// with documents carrying no fields. Metadata names and `shard_id` are added by the response
+/// itself and so are always projectable.
+///
+/// Skipped entirely for an index whose schema is not yet known, where every field would look
+/// unknown.
+fn unknown_modifier_fields(
+    schema: &IndexSchema,
+    fields: Option<&[String]>,
+    sort: Option<&SortSpec>,
+) -> Vec<String> {
+    if schema.fields.is_empty() {
+        return Vec::new();
+    }
+
+    let known = |name: &str| {
+        name.starts_with('_') || name == "shard_id" || schema.fields.contains_key(name)
+    };
+    let note = |clause: &str, field: &str| {
+        format!(
+            "'{clause} {field}' names a field this index does not have, so the clause had no \
+             effect; if it was meant as query text, quote it or drop the keyword"
+        )
+    };
+
+    let mut notes: Vec<String> = fields
+        .unwrap_or_default()
+        .iter()
+        .filter(|field| !known(field))
+        .map(|field| note("return", field))
+        .collect();
+    if let Some(spec) = sort.filter(|spec| !known(&spec.field)) {
+        notes.push(note("sort", &spec.field));
+    }
+    notes
+}
+
 /// Collect the distinct dropped clauses from per-node responses.
 ///
 /// Cross-node merges see [`DISCARDED_CLAUSES_FIELD`] as JSON rather than as a typed reply.
@@ -2167,6 +2207,7 @@ impl OrchestratorEngine {
             },
             "errors": errors
         });
+        discarded.extend(unknown_modifier_fields(&schema, fields, sort));
         attach_discarded(&mut response, discarded);
         Ok(response)
     }
@@ -7005,6 +7046,7 @@ impl NodeOrchestrator {
             },
             "errors": errors
         });
+        discarded.extend(unknown_modifier_fields(&schema, fields, sort));
         attach_discarded(&mut response, discarded);
         Ok(response)
     }

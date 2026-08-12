@@ -29,6 +29,7 @@ When a user asks a question, you must follow this deterministic loop:
 ### Step 3: Precision Execution & Field Projection
 * **Action:** Execute the query using `search_index` (for a single index) or `search_indexes` (for federated searches across domains).
 * **Rule:** Optimize your queries. Use boosting (`title:rust^3 OR body:rust`) to ensure the most relevant documents are returned first. Use `limit N` to prevent overflowing your context window.
+* **Rule:** `return`, `limit` and `sort` are recognised only as one run of clauses at the end of the query, with query text in front of them. Elsewhere they are searched for as words, so `find tax return forms` is four terms and `* limit 10` is how to ask for a bare limit. A field list needs its commas, a limit a number, and a sort order exactly `asc` or `desc`; naming a field the index does not have is reported as a dropped clause. Passing `fields`, `limit` and `sort` as tool parameters avoids the question entirely.
 * **Field Projection Strategy (`return` clause):** Always request **only the fields needed** to answer the user's goal. However, include additional fields when they provide **business-domain context** or enable **pivoting** to related records.
     * *Minimal set:* Request exact fields required for the answer (e.g., `return name, price` for a price lookup).
     * *Context set:* Add fields that reveal relationships or enable follow-up analysis (e.g., `return customer_id, order_id, status, total` — `customer_id` enables pivoting to customer history).

@@ -13,7 +13,7 @@ An interactive command-line client for CameoDB with rich ergonomics, persistent 
 - **Field-aware caching** that fetches schema metadata and surfaces field types
 - **Smart index cache refresh** after `connect`, `list index`, and `list indexes`
 - **Robust Rustyline navigation** (arrow keys, Home/End, Ctrl-R reverse search)
-- **Optional search limit** parsing (e.g., `search books "rust" 25`)
+- **Inline modifiers** (`return`, `limit`, `sort`) passed straight through to the server, which owns where a modifier run may appear
 - **Safe async/blocking isolation** via Tokio + `spawn_blocking`
 - **Colorized JSON output** for all responses (similar to `jq`), with plain fallback
 
@@ -62,7 +62,7 @@ The global `--insecure` flag applies to the entire session (server connection + 
 | `health` | Fetch `_cluster/health` and pretty-print response |
 | `list indexes` | List all indexes with stats + cached field names |
 | `list index <name>` | Show detailed stats and schema for one index |
-| `search <index> <query> [limit]` | Run hybrid search with optional limit (inline `limit N` or `--limit N`) |
+| `search <index> <query>` | Run hybrid search. The query may end in a run of `return`/`limit`/`sort` clauses; the subcommand also takes `--limit N` |
 | `schema detect <file> [--delimiter ...]` | Detect schema from CSV/TSV/JSON/JSONL/NDJSON (auto or forced delimiter, supports compression & HTTP(S)) |
 | `schema load <index> <file> [--delimiter ...]` | Detect schema from CSV/TSV/JSON/JSONL/NDJSON and apply to an index (supports compression & HTTP(S)) |
 | `data load <index> <file> [--delimiter ...] [--batch-size N]` | Ingest CSV/TSV/JSON/JSONL/NDJSON data in batches (supports compression & HTTP(S)) |
@@ -136,9 +136,9 @@ The CLI mirrors Tantivy's query parser (see [docs](https://docs.rs/tantivy/lates
 | Phrase | `"hybrid search"` | Requires fields indexed with positions. |
 | Boolean | `foo AND bar`, `foo OR -bar` | Unary `+`/`-` preserved via completion. |
 | Range / comparisons | `price:[10 TO 20]`, `rating:>=4` | Hinter ignores `> < = !` so hints still show. |
-| Prefix / wildcard | `tag:rust*` | Type `*` manually after completion. |
+| Prefix | `tag:rust*` | Type `*` manually after completion. Rewritten to a lexicographic range; one term, and the field is required. |
 | Boost | `title:rust^2` | Manual entry; CLI does not alter caret syntax. |
-| Sort | `sort field:desc` | Sort by FAST field (u64, i64, f64, date). Order optional (defaults to desc). |
+| Sort | `sort field:desc` | Numeric and date fields need the `fast` flag; text and string sort approximately. Order optional (defaults to `asc`). |
 
 If Tantivy adds more operators, update this table and (optionally) extend the completer to understand them.
 
@@ -152,10 +152,16 @@ CameoDB supports inline modifiers in the query string for convenience:
 | Limit results | `limit N` | `title:rust limit 10` | Limit number of results. Use `limit 0` for count-only queries (returns total_hits without documents) |
 | Sort results | `sort field:order` | `title:rust sort year:desc` | Sort by FAST field |
 
-**Sorting Details:**
-- Supported field types: `u64`, `i64`, `f64`, and `date` (all must be marked as FAST)
-- Order can be `asc` or `desc` (defaults to `desc`)
-- CLI provides autocomplete for sortable fields and `:asc`/:desc` suffixes
+**Modifier rules:**
+- The clauses form one run at the end of the query, with query text in front of them. Elsewhere the keyword is searched for as a word, so `find tax return forms` is four terms and `* limit 10` is how to ask for a bare limit.
+- A field list needs a comma between names, a limit needs a number, and a sort order must be exactly `asc` or `desc`. A run that does not parse stays in the query rather than being applied in part.
+- Naming a field the index does not have is reported in `_discarded_clauses`.
+
+**Sorting details:**
+- Numeric and date fields (`u64`, `i64`, `f64`, `date`) need the `fast` flag, which `list index` reports
+- Text and string fields sort approximately: the top `2 × limit` matches by relevance are collected and then ordered alphabetically
+- Order is `asc` unless `desc` is given
+- The completer offers sortable fields with their `:asc`/`:desc` suffixes, and `return` fields with their commas
 - Example: `search books title:rust sort publication_year:asc limit 20`
 
 **Combined Example:**

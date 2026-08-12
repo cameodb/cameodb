@@ -88,103 +88,6 @@ impl ProgressSpinner {
     }
 }
 
-fn parse_query_modifiers(
-    query: &str,
-) -> (
-    String,
-    Option<usize>,
-    Option<Vec<String>>,
-    Option<storage::SortSpec>,
-) {
-    let parts: Vec<&str> = query.split_whitespace().collect();
-    if parts.is_empty() {
-        return (String::new(), None, None, None);
-    }
-
-    let mut cleaned_end = parts.len();
-    let mut inline_limit = None;
-    let mut inline_fields = None;
-    let mut inline_sort = None;
-    let mut return_idx = None;
-    let mut limit_idx = None;
-    let mut sort_idx = None;
-
-    for (idx, token) in parts.iter().enumerate() {
-        if token.eq_ignore_ascii_case("return") && return_idx.is_none() {
-            return_idx = Some(idx);
-        } else if token.eq_ignore_ascii_case("limit") && limit_idx.is_none() {
-            limit_idx = Some(idx);
-        } else if token.eq_ignore_ascii_case("sort") && sort_idx.is_none() {
-            sort_idx = Some(idx);
-        }
-    }
-
-    if let Some(idx) = return_idx
-        && idx + 1 < parts.len()
-    {
-        let field_end = [limit_idx, sort_idx]
-            .iter()
-            .filter_map(|&opt| opt.filter(|&i| i > idx))
-            .min()
-            .unwrap_or(parts.len());
-        let field_slice = &parts[idx + 1..field_end];
-        let field_str = field_slice.join(" ");
-        let fields: Vec<String> = field_str
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
-        if !fields.is_empty() {
-            inline_fields = Some(fields);
-            cleaned_end = idx.min(cleaned_end);
-        }
-    }
-
-    if let Some(idx) = limit_idx {
-        let value_idx = idx + 1;
-        if value_idx < parts.len()
-            && let Ok(n) = parts[value_idx].parse::<usize>()
-        {
-            inline_limit = Some(n);
-            cleaned_end = cleaned_end.min(idx);
-        }
-    }
-
-    if let Some(idx) = sort_idx
-        && idx + 1 < parts.len()
-    {
-        let sort_spec = parts[idx + 1];
-        let (field, order) = match sort_spec.split_once(':') {
-            Some((f, o)) => {
-                let order = match o.to_lowercase().as_str() {
-                    "desc" => storage::SortOrder::Desc,
-                    _ => storage::SortOrder::Asc,
-                };
-                (f.to_string(), order)
-            }
-            None => (sort_spec.to_string(), storage::SortOrder::Asc),
-        };
-        inline_sort = Some(storage::SortSpec { field, order });
-        cleaned_end = cleaned_end.min(idx);
-    }
-
-    let cleaned_query = if cleaned_end == 0 {
-        "".to_string()
-    } else if cleaned_end >= parts.len() {
-        query.to_string()
-    } else {
-        parts[..cleaned_end].join(" ")
-    };
-
-    (
-        cleaned_query.trim().to_string(),
-        inline_limit,
-        inline_fields,
-        inline_sort,
-    )
-}
-
 impl Drop for ProgressSpinner {
     fn drop(&mut self) {
         self.stop();
@@ -878,6 +781,9 @@ impl IndexCompleter {
         Vec::new()
     }
 
+    /// Fields for a `return` clause, each completed with its trailing comma so that successive
+    /// completions build one comma-separated list. A list without them is query text, not a
+    /// projection.
     fn return_field_suggestions(&self, index: &str, prefix: &str) -> Vec<Pair> {
         if let Ok(cache) = self.cache.read()
             && let Some(metadata) = cache.get(index)
@@ -889,7 +795,7 @@ impl IndexCompleter {
                 .filter(|field| field.name.starts_with(clean_prefix))
                 .map(|field| Pair {
                     display: field.name.clone(),
-                    replacement: field.name.clone(),
+                    replacement: format!("{},", field.name),
                 })
                 .collect();
         }
@@ -1240,21 +1146,15 @@ impl IndexCompleter {
 
                 // Check if we're after a 'return' keyword to suggest fields
                 let query_tokens = &tokens[2..];
-                let after_return = query_tokens
-                    .iter()
-                    .rposition(|t| t.eq_ignore_ascii_case("return"));
+                let after_return = query_tokens.iter().rposition(|t| *t == "return");
 
                 if let Some(return_pos) = after_return {
                     // We're after 'return', suggest fields (comma-separated)
                     let after_return_tokens = &query_tokens[return_pos + 1..];
 
                     // Check if current token is after 'limit' or 'sort' keyword
-                    let after_limit = after_return_tokens
-                        .iter()
-                        .any(|t| t.eq_ignore_ascii_case("limit"));
-                    let after_sort = after_return_tokens
-                        .iter()
-                        .any(|t| t.eq_ignore_ascii_case("sort"));
+                    let after_limit = after_return_tokens.contains(&"limit");
+                    let after_sort = after_return_tokens.contains(&"sort");
 
                     if !after_limit && !after_sort {
                         let suggestions = self.return_field_suggestions(index, current);
@@ -1263,21 +1163,15 @@ impl IndexCompleter {
                 }
 
                 // Check if we're after a 'sort' keyword to suggest sortable fields
-                let after_sort = query_tokens
-                    .iter()
-                    .rposition(|t| t.eq_ignore_ascii_case("sort"));
+                let after_sort = query_tokens.iter().rposition(|t| *t == "sort");
 
                 if let Some(sort_pos) = after_sort {
                     // We're after 'sort', suggest sortable fields with :asc/:desc suffix
                     let after_sort_tokens = &query_tokens[sort_pos + 1..];
 
                     // Check if current token is after 'return' or 'limit' keyword
-                    let after_return_kw = after_sort_tokens
-                        .iter()
-                        .any(|t| t.eq_ignore_ascii_case("return"));
-                    let after_limit_kw = after_sort_tokens
-                        .iter()
-                        .any(|t| t.eq_ignore_ascii_case("limit"));
+                    let after_return_kw = after_sort_tokens.contains(&"return");
+                    let after_limit_kw = after_sort_tokens.contains(&"limit");
 
                     if !after_return_kw && !after_limit_kw {
                         let suggestions = self.sort_field_suggestions(index, current);
@@ -1285,20 +1179,23 @@ impl IndexCompleter {
                     }
                 }
 
-                // Check if we should suggest 'return', 'limit', or 'sort' keywords
-                if current.is_empty()
-                    || "return".starts_with(current)
-                    || "limit".starts_with(current)
-                    || "sort".starts_with(current)
+                // A modifier run has to leave query text in front of it, so a keyword is offered
+                // only once the query opens with something that is not one. The last of
+                // `query_tokens` is the token under the cursor, empty when it follows a space.
+                let query_written = query_tokens[..query_tokens.len() - 1]
+                    .first()
+                    .is_some_and(|token| !matches!(*token, "return" | "limit" | "sort"));
+
+                if query_written
+                    && (current.is_empty()
+                        || "return".starts_with(current)
+                        || "limit".starts_with(current)
+                        || "sort".starts_with(current))
                 {
                     let mut suggestions = Vec::new();
 
                     // Only suggest 'return' if not already in query
-                    if !query_tokens
-                        .iter()
-                        .any(|t| t.eq_ignore_ascii_case("return"))
-                        && "return".starts_with(current)
-                    {
+                    if !query_tokens.contains(&"return") && "return".starts_with(current) {
                         suggestions.push(Pair {
                             display: "return <fields>".to_string(),
                             replacement: "return ".to_string(),
@@ -1306,9 +1203,7 @@ impl IndexCompleter {
                     }
 
                     // Only suggest 'limit' if not already in query
-                    if !query_tokens.iter().any(|t| t.eq_ignore_ascii_case("limit"))
-                        && "limit".starts_with(current)
-                    {
+                    if !query_tokens.contains(&"limit") && "limit".starts_with(current) {
                         suggestions.push(Pair {
                             display: "limit <n>".to_string(),
                             replacement: "limit ".to_string(),
@@ -1316,9 +1211,7 @@ impl IndexCompleter {
                     }
 
                     // Only suggest 'sort' if not already in query
-                    if !query_tokens.iter().any(|t| t.eq_ignore_ascii_case("sort"))
-                        && "sort".starts_with(current)
-                    {
+                    if !query_tokens.contains(&"sort") && "sort".starts_with(current) {
                         suggestions.push(Pair {
                             display: "sort <field:order>".to_string(),
                             replacement: "sort ".to_string(),
@@ -1434,7 +1327,7 @@ impl Hinter for IndexCompleter {
                 if let Some(current) = tail.last() {
                     // Check if we're after the 'sort' keyword — sort values are asc/desc,
                     // not field values, so field type hints are irrelevant.
-                    let after_sort = tail.iter().any(|t| t.eq_ignore_ascii_case("sort"));
+                    let after_sort = tail.contains(&"sort");
 
                     if let Some((field, value_prefix)) = current.split_once(':')
                         && !after_sort
@@ -1450,8 +1343,8 @@ impl Hinter for IndexCompleter {
                     }
 
                     // Provide hints for 'return' and 'limit' keywords
-                    let has_return = tail.iter().any(|t| t.eq_ignore_ascii_case("return"));
-                    let has_limit = tail.iter().any(|t| t.eq_ignore_ascii_case("limit"));
+                    let has_return = tail.contains(&"return");
+                    let has_limit = tail.contains(&"limit");
 
                     // If typing 'r', hint 'return'
                     if current.eq_ignore_ascii_case("r") && !has_return {
@@ -1778,21 +1671,12 @@ pub async fn run_cli() -> Result<()> {
             query,
             limit,
         } => {
-            let (clean_query, parsed_limit, parsed_fields, parsed_sort) =
-                parse_query_modifiers(&query);
-            if clean_query.is_empty() {
-                anyhow::bail!("Query cannot be empty after removing modifiers");
+            if query.trim().is_empty() {
+                anyhow::bail!("Query cannot be empty");
             }
-            let final_limit = limit.or(parsed_limit);
-            let results = client
-                .search(
-                    &index,
-                    &clean_query,
-                    final_limit,
-                    parsed_fields,
-                    parsed_sort,
-                )
-                .await?;
+            // Inline `return`, `limit` and `sort` are read by the server, which owns the one
+            // definition of where a modifier run may appear.
+            let results = client.search(&index, &query, limit, None, None).await?;
             print_json(&results)?;
         }
         ClientCommand::Schema {
@@ -4537,44 +4421,17 @@ async fn dispatch_interactive_command(
             let index = parts
                 .next()
                 .ok_or_else(|| anyhow!("Usage: search <index> <query> [limit N]"))?;
-            let mut query_parts: Vec<&str> = parts.collect();
-
-            // Preserve legacy behavior: detect trailing numeric limit with optional "limit" keyword
-            let trailing_limit = if let Some(last) = query_parts.last().copied() {
-                if let Ok(num) = last.parse::<usize>() {
-                    query_parts.pop();
-                    if query_parts.last().map(|s| s.eq_ignore_ascii_case("limit")) == Some(true) {
-                        query_parts.pop();
-                    }
-                    Some(num)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let raw_query = query_parts.join(" ");
-            if raw_query.trim().is_empty() {
+            let query: Vec<&str> = parts.collect();
+            let query = query.join(" ");
+            if query.trim().is_empty() {
                 return Err(anyhow!("Usage: search <index> <query> [limit N]"));
             }
 
-            let (clean_query, keyword_limit, keyword_fields, keyword_sort) =
-                parse_query_modifiers(&raw_query);
-            if clean_query.is_empty() {
-                return Err(anyhow!("Search query cannot be empty"));
-            }
-
-            let final_limit = trailing_limit.or(keyword_limit);
+            // Inline `return`, `limit` and `sort` are read by the server, which owns the one
+            // definition of where a modifier run may appear.
             let results = session
                 .client()
-                .search(
-                    index,
-                    &clean_query,
-                    final_limit,
-                    keyword_fields,
-                    keyword_sort,
-                )
+                .search(index, &query, None, None, None)
                 .await?;
             print_json(&results)?;
         }
@@ -4863,7 +4720,7 @@ mod tests {
     fn keyword_and_field_completion_after_trailing_space() {
         let c = completer_with_index();
         let history = MemHistory::new();
-        let line = "search myindex ";
+        let line = "search myindex title:rust ";
         let (start, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
         assert_eq!(start, line.len());
         assert!(pairs.iter().any(|p| p.replacement == "return "));
@@ -4874,7 +4731,7 @@ mod tests {
     fn keyword_and_field_completion_after_trailing_tab() {
         let c = completer_with_index();
         let history = MemHistory::new();
-        let line = "search myindex\t";
+        let line = "search myindex title:rust\t";
         let (start, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
         assert_eq!(start, line.len());
         assert!(pairs.iter().any(|p| p.replacement == "return "));
@@ -4885,10 +4742,45 @@ mod tests {
     fn partial_keyword_completion_replaces_current_token() {
         let c = completer_with_index();
         let history = MemHistory::new();
-        let line = "search myindex re";
+        let line = "search myindex title:rust re";
         let (start, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
-        assert_eq!(start, 15);
+        assert_eq!(start, 26);
         assert!(pairs.iter().any(|p| p.replacement == "return "));
+    }
+
+    /// A run must leave query text in front of it, so a query that has none is not offered one.
+    #[test]
+    fn no_modifier_is_offered_before_the_query_has_a_term() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        for line in [
+            "search myindex ",
+            "search myindex re",
+            "search myindex limit 5 ",
+        ] {
+            let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+            assert!(
+                !pairs
+                    .iter()
+                    .any(|p| matches!(p.replacement.as_str(), "return " | "limit " | "sort ")),
+                "{line:?} offered a modifier with no query in front of it"
+            );
+        }
+    }
+
+    /// Successive completions have to build one comma-separated list, since a list without commas
+    /// is query text rather than a projection.
+    #[test]
+    fn a_return_field_completes_with_its_comma() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        let line = "search myindex title:rust return ti";
+        let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert!(
+            pairs.iter().any(|p| p.replacement == "title,"),
+            "expected a comma-terminated field, got: {:?}",
+            pairs.iter().map(|p| &p.replacement).collect::<Vec<_>>()
+        );
     }
 
     #[test]

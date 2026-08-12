@@ -96,13 +96,15 @@ curl -s -X POST http://localhost:9480/api/books/search \
 > 2. Embedding a `return` clause at the end of the Tantivy query: `"query": "space opera return title,author"`
 >
 > The JSON payload always wins over inline `return` clauses. Metadata keys (those starting with `_`, e.g. `_score`, `_id`, `shard_id`) are preserved automatically.
+>
+> A field list needs a comma between names, and the clause must sit in one run of `return`/`limit`/`sort` at the end of the query with query text in front of it. Anywhere else the keyword is searched for as a word, so `find tax return forms` is four terms. A `return` naming a field the index does not have is reported in `_discarded_clauses`.
 
-> **Sort results:** You can sort search results by a FAST field (u64 or date type) by either:
+> **Sort results:** You can sort search results by either:
 >
 > 1. Supplying a sort specification in the payload: `"sort": {"field": "year", "order": "desc"}`
 > 2. Embedding a `sort` clause at the end of the Tantivy query: `"query": "space opera sort year:desc"`
 >
-> Supported field types: `u64` and `date` (both must be marked as FAST). Order can be `asc` or `desc` (defaults to `desc`). The JSON payload always wins over inline `sort` clauses.
+> A numeric or date field must carry the `fast` flag, which `GET /api/{index}` reports per field. Text and string fields sort approximately: the top `2 × limit` matches by relevance are collected and then ordered alphabetically. Order is `asc` unless `desc` is given, and an inline order must be exactly one of those words. The JSON payload always wins over inline `sort` clauses, and a `sort` naming a field the index does not have is reported in `_discarded_clauses`.
 
 **Example with sort:**
 ```bash
@@ -185,7 +187,8 @@ curl -s -X POST http://localhost:9480/api/books/search \
 > enough. Execution stays lenient here — the hits are returned alongside the note, because a person
 > reading a result page can see it. The MCP tools make the opposite choice and fail the call, since
 > an agent presents rows as fact. Causes include an unknown or unindexed field name, a value that
-> does not match its field's type, and an unsupported form such as `field:*`.
+> does not match its field's type, an unsupported form such as `field:*`, and an inline `return` or
+> `sort` naming a field the index does not have.
 
 #### Streaming Search
 Get search results as a real-time stream for large result sets.

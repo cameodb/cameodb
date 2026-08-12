@@ -322,6 +322,18 @@ schema, and the table below, which is generated and checked against the tables b
 - `field.subfield:value` — Paths into a json field are not queryable. A json field is searchable only as unstructured text, so `field:value` matches any key or value inside it.
 - `field:/regex/` — Regular expressions are disabled.
 
+**Inline modifiers**, in one run at the end of the query
+
+| Syntax | Meaning | Example |
+|---|---|---|
+| `return f1,f2` | Return only these fields, in this order. | `title:rust return title,author` |
+| `limit N` | Cap the number of results. | `title:rust limit 5` |
+| `sort field:desc` | Order by a field. See the sorting rules. | `title:rust sort year:desc` |
+
+- A modifier counts only where it opens an unbroken run of clauses reaching the end of the query, with query text left in front of it. Anything else is searched for, so `find tax return forms` is four terms and `* limit 10` is how to ask for a bare limit.
+- A field list needs a comma between names, a limit needs a number, and a sort order must be exactly `asc` or `desc`. A clause that does not parse stays in the query rather than being applied in part.
+- A modifier naming a field the index does not have is reported as a dropped clause, since a projection would otherwise return documents with no fields.
+
 **Rules**
 
 - A field name containing a dot is written as it is, unescaped: `k8s.node:worker-1`. Escaping the dot makes the lookup miss.

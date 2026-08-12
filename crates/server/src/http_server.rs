@@ -1457,132 +1457,126 @@ fn compare_hits_by_sort_key(
     }
 }
 
-/// Parse query string for 'limit <n>', 'return <field1,field2,...>', and 'sort field:order' keywords.
-/// Returns (cleaned_query, extracted_limit, extracted_fields, extracted_sort).
+/// The keywords that open an inline modifier clause.
+const MODIFIER_KEYWORDS: [&str; 3] = ["return", "limit", "sort"];
+
+/// Whether a token has the shape of a field name, which rules out quoted text, groups and a
+/// `field:value` clause.
+fn is_field_name(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+}
+
+/// A `sort` clause's spec. An order suffix must be exactly `asc` or `desc`.
+fn parse_sort_spec(token: &str) -> Option<SortSpec> {
+    let (field, order) = match token.split_once(':') {
+        Some((field, order)) => match order.to_ascii_lowercase().as_str() {
+            "asc" => (field, SortOrder::Asc),
+            "desc" => (field, SortOrder::Desc),
+            _ => return None,
+        },
+        None => (token, SortOrder::Asc),
+    };
+
+    is_field_name(field).then(|| SortSpec {
+        field: field.to_string(),
+        order,
+    })
+}
+
+/// The fields of a `return` clause.
 ///
-/// OPTIMIZED: Single-pass parsing with minimal allocations.
-fn parse_query_keywords(
-    query: &str,
-) -> (String, Option<usize>, Option<Vec<String>>, Option<SortSpec>) {
-    // Early return for empty queries
-    if query.is_empty() {
-        return (String::new(), None, None, None);
+/// The tokens must form one comma-separated list: adjacent names need a comma between them, so
+/// `return name, price` is a projection of two fields while `return tax forms` is not a projection
+/// at all.
+fn parse_field_list(tokens: &[&str]) -> Option<Vec<String>> {
+    if tokens.is_empty()
+        || tokens
+            .windows(2)
+            .any(|pair| !pair[0].ends_with(',') && !pair[1].starts_with(','))
+    {
+        return None;
     }
 
+    let mut names = Vec::new();
+    for name in tokens.iter().flat_map(|token| token.split(',')) {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !is_field_name(name) {
+            return None;
+        }
+        names.push(name.to_string());
+    }
+
+    (!names.is_empty()).then_some(names)
+}
+
+/// What a run of inline modifiers set: limit, projected fields, sort.
+type Modifiers = (Option<usize>, Option<Vec<String>>, Option<SortSpec>);
+
+/// Parse `tokens` as an unbroken run of modifier clauses, in any order and at most one of each.
+///
+/// None unless every token belongs to a clause, which is what confines a keyword to a run that
+/// reaches the end of the query.
+fn parse_modifier_run(tokens: &[&str]) -> Option<Modifiers> {
     let mut limit = None;
     let mut fields = None;
     let mut sort = None;
+    let mut idx = 0;
 
-    // Track keyword positions and parse state in a single pass
-    let mut return_idx = None;
-    let mut limit_idx = None;
-    let mut sort_idx = None;
-    let mut return_parsed = false;
-    let mut limit_parsed = false;
-    let mut sort_parsed = false;
-
-    // Single pass to find all keywords and count parts
-    let mut part_count = 0;
-    for (idx, part) in query.split_whitespace().enumerate() {
-        part_count = idx + 1;
-        match part {
-            "return" if return_idx.is_none() => return_idx = Some(idx),
-            "limit" if limit_idx.is_none() => limit_idx = Some(idx),
-            "sort" if sort_idx.is_none() => sort_idx = Some(idx),
-            _ => {}
-        }
-    }
-
-    // If no keywords found, return original query
-    if return_idx.is_none() && limit_idx.is_none() && sort_idx.is_none() {
-        return (query.to_string(), None, None, None);
-    }
-
-    // Parse 'return' keyword
-    if let Some(ret_idx) = return_idx {
-        // Determine where field list ends
-        let field_end_idx = [limit_idx, sort_idx]
-            .iter()
-            .filter_map(|&idx| idx.filter(|&i| i > ret_idx))
-            .min()
-            .unwrap_or(part_count);
-
-        // Extract field tokens without intermediate join
-        let field_tokens: Vec<&str> = query
-            .split_whitespace()
-            .skip(ret_idx + 1)
-            .take(field_end_idx - ret_idx - 1)
-            .collect();
-
-        if !field_tokens.is_empty() {
-            // Join and parse comma-separated fields
-            let field_str = field_tokens.join(" ");
-            let field_list: Vec<String> = field_str
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect();
-
-            if !field_list.is_empty() {
-                fields = Some(field_list);
-                return_parsed = true;
+    while idx < tokens.len() {
+        match tokens[idx] {
+            "limit" if limit.is_none() => {
+                limit = Some(tokens.get(idx + 1)?.parse().ok()?);
+                idx += 2;
             }
+            "sort" if sort.is_none() => {
+                sort = Some(parse_sort_spec(tokens.get(idx + 1)?)?);
+                idx += 2;
+            }
+            "return" if fields.is_none() => {
+                // The field list runs to the next keyword, since only a keyword can end it.
+                let end = tokens[idx + 1..]
+                    .iter()
+                    .position(|token| MODIFIER_KEYWORDS.contains(token))
+                    .map_or(tokens.len(), |rel| idx + 1 + rel);
+                fields = Some(parse_field_list(&tokens[idx + 1..end])?);
+                idx = end;
+            }
+            _ => return None,
         }
     }
 
-    // Parse 'limit' keyword
-    if let Some(lim_idx) = limit_idx
-        && let Some(limit_str) = query.split_whitespace().nth(lim_idx + 1)
-        && let Ok(n) = limit_str.parse::<usize>()
-    {
-        limit = Some(n);
-        limit_parsed = true;
-    }
+    Some((limit, fields, sort))
+}
 
-    // Parse 'sort' keyword
-    if let Some(s_idx) = sort_idx
-        && let Some(sort_spec) = query.split_whitespace().nth(s_idx + 1)
-    {
-        if let Some((field, order_str)) = sort_spec.split_once(':') {
-            let order = match order_str.to_lowercase().as_str() {
-                "desc" => SortOrder::Desc,
-                _ => SortOrder::Asc,
-            };
-            sort = Some(SortSpec {
-                field: field.to_string(),
-                order,
-            });
-            sort_parsed = true;
-        } else {
-            // No order specified, default to asc
-            sort = Some(SortSpec {
-                field: sort_spec.to_string(),
-                order: SortOrder::Asc,
-            });
-            sort_parsed = true;
+/// Split a query from its trailing inline modifiers — `return`, `limit` and `sort`.
+///
+/// A keyword counts only where it opens a run of clauses that reaches the end of the query and
+/// leaves at least one token in front of it. Everything else is query text, so a keyword used as a
+/// word — `find tax return forms`, `sort by date` — stays in the query.
+///
+/// Returns (query, limit, fields, sort).
+fn parse_query_keywords(
+    query: &str,
+) -> (String, Option<usize>, Option<Vec<String>>, Option<SortSpec>) {
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+
+    // Earliest start first, so `return a limit 5` is one run rather than a query ending in
+    // `return a`.
+    for start in 1..tokens.len() {
+        if MODIFIER_KEYWORDS.contains(&tokens[start])
+            && let Some((limit, fields, sort)) = parse_modifier_run(&tokens[start..])
+        {
+            return (tokens[..start].join(" "), limit, fields, sort);
         }
     }
 
-    // Determine where the query ends (first successfully parsed keyword)
-    let query_end_idx = [
-        return_idx.filter(|_| return_parsed),
-        limit_idx.filter(|_| limit_parsed),
-        sort_idx.filter(|_| sort_parsed),
-    ]
-    .iter()
-    .filter_map(|&idx| idx)
-    .min()
-    .unwrap_or(part_count);
-
-    // Extract cleaned query using iterator (avoid collecting full Vec)
-    let cleaned_query = query
-        .split_whitespace()
-        .take(query_end_idx)
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    (cleaned_query, limit, fields, sort)
+    (query.to_string(), None, None, None)
 }
 
 /// Handler for standard search operations
@@ -2510,8 +2504,8 @@ mod tests {
     fn test_parse_query_keywords_empty_field_list() {
         let query = "title:rust return ";
         let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
-        // Empty field list should not be parsed
-        assert_eq!(cleaned, "title:rust return");
+        // No clause parsed, so the query is passed through as written.
+        assert_eq!(cleaned, "title:rust return ");
         assert_eq!(limit, None);
         assert_eq!(fields, None);
         assert_eq!(parsed_sort, None);
@@ -2641,6 +2635,73 @@ mod tests {
         assert_eq!(limit, None);
         assert_eq!(fields, None);
         assert_eq!(parsed_sort, None);
+    }
+
+    /// A query that is left whole, because no run of clauses reaches its end.
+    fn assert_no_modifiers(query: &str) {
+        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        assert_eq!(cleaned, query, "{query:?} lost text to a modifier");
+        assert_eq!(limit, None, "{query:?}");
+        assert_eq!(fields, None, "{query:?}");
+        assert_eq!(parsed_sort, None, "{query:?}");
+    }
+
+    #[test]
+    fn test_parse_query_keywords_a_keyword_used_as_a_word_stays_in_the_query() {
+        for query in [
+            "sort by date",
+            "how to limit costs",
+            "find tax return forms online",
+            "the sort order of things",
+        ] {
+            assert_no_modifiers(query);
+        }
+    }
+
+    #[test]
+    fn test_parse_query_keywords_a_run_must_reach_the_end_of_the_query() {
+        for query in [
+            "title:rust limit 5 extra",
+            "title:rust sort year:desc AND tag:active",
+            "body:\"the limit 10 rule\"",
+        ] {
+            assert_no_modifiers(query);
+        }
+    }
+
+    #[test]
+    fn test_parse_query_keywords_a_run_may_not_consume_the_whole_query() {
+        // `* limit 10` is the way to ask for a bare limit; on its own it is two terms.
+        assert_no_modifiers("limit 10");
+
+        let (cleaned, limit, _, _) = parse_query_keywords("* limit 10");
+        assert_eq!(cleaned, "*");
+        assert_eq!(limit, Some(10));
+    }
+
+    #[test]
+    fn test_parse_query_keywords_a_field_list_needs_its_commas() {
+        assert_no_modifiers("title:rust return title author");
+        assert_no_modifiers("title:rust return \"title\"");
+
+        // Either side of the gap may carry the comma.
+        let (_, _, fields, _) = parse_query_keywords("title:rust return title ,author");
+        assert_eq!(
+            fields,
+            Some(vec!["title".to_string(), "author".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_parse_query_keywords_a_sort_order_must_be_asc_or_desc() {
+        assert_no_modifiers("title:rust sort year:descending");
+        assert_no_modifiers("title:rust sort year:1");
+    }
+
+    #[test]
+    fn test_parse_query_keywords_a_limit_must_be_a_number() {
+        assert_no_modifiers("title:rust limit many");
+        assert_no_modifiers("title:rust limit -5");
     }
 }
 

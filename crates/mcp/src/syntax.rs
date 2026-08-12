@@ -309,6 +309,18 @@ pub const INLINE_MODIFIERS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// How the inline modifiers are told apart from query text.
+pub const MODIFIER_RULES: &[&str] = &[
+    "A modifier counts only where it opens an unbroken run of clauses reaching the end of the \
+     query, with query text left in front of it. Anything else is searched for, so `find tax \
+     return forms` is four terms and `* limit 10` is how to ask for a bare limit.",
+    "A field list needs a comma between names, a limit needs a number, and a sort order must be \
+     exactly `asc` or `desc`. A clause that does not parse stays in the query rather than being \
+     applied in part.",
+    "A modifier naming a field the index does not have is reported as a dropped clause, since a \
+     projection would otherwise return documents with no fields.",
+];
+
 /// Schema type names an index may use, with what each is for.
 pub const FIELD_TYPES: &[(&str, &str)] = &[
     (
@@ -425,6 +437,7 @@ pub fn reference_json() -> JsonValue {
         "not_supported": not_supported,
         "field_types": field_types,
         "inline_modifiers": inline,
+        "inline_modifier_rules": MODIFIER_RULES,
         "sorting": SORT_RULES,
         "rules": RULES,
         "reserved_characters": RESERVED_CHARACTERS,
@@ -447,7 +460,7 @@ pub fn compact_reference() -> String {
     for form in NOT_SUPPORTED {
         out.push_str(&format!("  {}\n", form.syntax));
     }
-    out.push_str("\nINLINE MODIFIERS, appended to the query\n");
+    out.push_str("\nINLINE MODIFIERS, in one run at the end of the query\n");
     for (syntax, summary, _) in INLINE_MODIFIERS {
         out.push_str(&format!("  {syntax:<22} {summary}\n"));
     }
@@ -456,7 +469,9 @@ pub fn compact_reference() -> String {
          A clause the engine cannot interpret is dropped, not rejected — the call fails and names \
          it.\n  \
          An unindexed field cannot be queried; check the `indexed` flag from `get_index`.\n  \
-         Sorting a text or string field is approximate, and sets every `_score` to 1.0.\n",
+         Sorting a text or string field is approximate, and sets every `_score` to 1.0.\n  \
+         A modifier is searched for as text unless its whole run parses, so give a field list its \
+         commas and a sort an `asc` or `desc`.\n",
     );
     out.push_str(&format!(
         "\nEscape these to match them literally: {RESERVED_CHARACTERS}\n"
@@ -486,6 +501,15 @@ pub fn markdown_reference() -> String {
     out.push_str("\n**Not supported**\n\n");
     for form in NOT_SUPPORTED {
         out.push_str(&format!("- `{}` — {}\n", form.syntax, form.detail));
+    }
+    out.push_str("\n**Inline modifiers**, in one run at the end of the query\n\n");
+    out.push_str("| Syntax | Meaning | Example |\n|---|---|---|\n");
+    for (syntax, summary, example) in INLINE_MODIFIERS {
+        out.push_str(&format!("| `{syntax}` | {summary} | `{example}` |\n"));
+    }
+    out.push('\n');
+    for rule in MODIFIER_RULES {
+        out.push_str(&format!("- {rule}\n"));
     }
     out.push_str("\n**Rules**\n\n");
     for rule in RULES {
