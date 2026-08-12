@@ -48,11 +48,7 @@ Schema and field structures are optimized to return only relevant information fo
 3. **`search_index`** → Construct queries using the field names and operators learned from the schema
 4. **`validate_query`** *(optional)* → Get structural validation, typo detection ("did you mean?"), and the full syntax reference with operator-by-field-type matrix
 
-Each `available_fields` entry (from `validate_query`) and `fields` entry (from `get_index`/`list_indexes`) tells the agent exactly what it can do:
-- A `text` field → phrases, slop, prefix, IN set, boost, range
-- A `date` field → exact date, comparisons (>/<), ranges
-- A `numeric` field → exact, ranges (inclusive/exclusive), boost
-- A `boolean` field → true/false only
+Each `available_fields` entry (from `validate_query`) and `fields` entry (from `get_index`/`list_indexes`) carries a `query_hint` naming the operators that field's type supports, plus the `indexed` and `fast` flags that decide whether it can be queried and sorted at all. The hints are rendered from [`src/syntax.rs`](src/syntax.rs), so they cannot disagree with the reference.
 
 This means an agent can go from zero knowledge to well-formed queries in **two tool calls** (`list_indexes` → `search_index`), with the schema metadata providing all the guidance needed for operator selection.
 
@@ -68,29 +64,17 @@ Execute full-text search on a single CameoDB index.
 > When answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.
 
 **Error Handling:**
-- Schema-aware error messages when queries reference non-existent fields (lists valid fields available)
-- Zero-results warnings for phrase/AND queries with suggestions to use broader boolean OR logic
+- A query whose clause was dropped fails, naming the clause — results that would answer a different question are never returned
+- Errors naming a missing field are appended with the index's field list
+- Zero-results hints for phrase or `AND` queries, suggesting a broader form
 
 **Parameters:**
 - `index` (string, required): Name of the CameoDB index to search
-- `query` (string, required): Search query string. Supports:
-  - Field targeting: `title:rust`
-  - Phrase queries: `title:"rust programming"`
-  - Phrase slop (proximity): `body:"small bike"~2`
-  - Phrase prefix: `"big bad wo"*`
-  - Boolean operators: `title:rust AND author:doe` (AND, OR, NOT — UPPERCASE)
-  - Must/must-not: `+title:rust -author:smith`
-  - Grouping: `(title:rust OR title:go) AND year:[2020 TO 2024]`
-  - Range queries: `year:[2020 TO 2024]` (inclusive `[]`, exclusive `{}`)
-  - Set operator: `status: IN [active pending review]`
-  - Boosting: `title:rust^3 OR body:rust`
-  - Date comparisons: `created_at:>2024-01-01`
-  - Numeric comparisons: `score:>=4.5`, `price:<100`
-  - All docs: `*`
-  - Inline modifiers: `title:rust return title,author limit 5`
-  - Inline sort: `title:rust sort year:asc`, `title:rust sort year:desc`
+- `query` (string, required): Search query string. See [CameoDB Query Syntax Reference](#cameodb-query-syntax-reference); the tool's own description carries a summary, and `validate_query` returns the full reference.
 
-  **Default search fields**: Unqualified queries (no `field:` prefix) search only `text` and `json` fields. Numeric, date, and other typed fields require explicit `field:value` syntax. Query parsing is lenient — type mismatches (e.g., `field:hello` on a numeric field) are silently skipped rather than failing the entire query.
+  **Default search fields**: a query with no `field:` prefix searches only `text`, `string` and `json` fields. Numeric, date, boolean, ip and facet fields must be named explicitly.
+
+  **Dropped clauses**: a clause the engine cannot interpret is dropped and the rest of the query runs, which widens a conjunction and disables a negation. This tool fails rather than returning those results, naming the clause it could not use.
 - `limit` (integer, optional): Maximum number of results to return. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10.
 - `fields` (array of strings, optional): Field names to include in results (field projection)
 
@@ -117,8 +101,8 @@ Execute federated search across multiple CameoDB indexes with optional per-index
 > When answering questions based on CameoDB results, you MUST use ONLY the exact data returned by this tool. Do NOT combine database results with your own prior knowledge. If the index returns partial or incomplete information, state exactly what was found and nothing more. NEVER invent or hallucinate fields or values not explicitly present in the query results.
 
 **Error Handling:**
-- Schema-aware error messages when queries reference non-existent fields (lists valid fields available)
-- Zero-results warnings for phrase/AND queries with suggestions to use broader boolean OR logic
+- One query string is applied to every index, so a dropped clause affects the whole merge; the call fails rather than returning partial results
+- Errors naming a missing field are appended with that index's field list
 
 **Parameters:**
 - `indexes` (array, required): List of indexes to search, each with:
@@ -301,185 +285,90 @@ CameoDB exposes indexes as MCP resources for exploration via `resources/list` an
 
 ## CameoDB Query Syntax Reference
 
-The `validate_query` tool returns a comprehensive syntax reference with an operator-by-field-type compatibility matrix. Below is the full reference.
+The syntax is defined in exactly one place: the tables in [`src/syntax.rs`](src/syntax.rs). Every
+surface that tells a caller what a query may contain renders from them — the `search_index` tool
+description, the reference `validate_query` returns, the per-field hints `get_index` attaches to a
+schema, and the table below, which is generated and checked against the tables by
+`the_readme_syntax_table_matches_the_table`. Regenerate it with
+`UPDATE_DOCS=1 cargo test -p cameodb_mcp readme` rather than editing it by hand.
 
-### Basic Search
-```
-rust database              # AND by default: matches docs with both terms
-machine learning           # searches all default indexed text fields
-```
+<!-- BEGIN GENERATED SYNTAX -->
 
-> **Note**: `field:term` only applies to the term immediately after the colon. `body:rust programming` searches `rust` in body, `programming` in default fields.
+| Syntax | Meaning | Field types |
+|---|---|---|
+| `term` | Match a term; several terms are ANDed. | any |
+| `*` | Match every document. | any |
+| `field:value` | Match a value in one field. | text, string, i64, u64, f64, date, boolean, ip, json, facet |
+| `field:"a b"` | Exact phrase, terms in order. Text fields only. | text |
+| `field:"a b"~N` | Phrase allowing N extra words between terms. | text |
+| `"a b pre"*` | Phrase whose last term is a prefix. Two or more terms. | text |
+| `AND / OR / NOT` | Combine clauses. Uppercase only. | any |
+| `+term / -term` | Require or exclude a clause. | any |
+| `(...)` | Group clauses to control precedence. | any |
+| `field:value^N` | Weight a clause's score contribution. | text, string, i64, u64, f64, date, boolean, ip, json, facet |
+| `field:[low TO high]` | Range, bounds inclusive. | text, string, i64, u64, f64, date, ip |
+| `field:{low TO high}` | Range, bounds exclusive. | text, string, i64, u64, f64, date, ip |
+| `field:[low TO *]` | Range with one side unbounded. | text, string, i64, u64, f64, date, ip |
+| `field:>value` | Comparison: `>` `<` `>=` `<=`. | i64, u64, f64, date |
+| `field: IN [a b c]` | Match any of several values. | text, string, i64, u64, f64, date, boolean |
+| `field:/path/to/value` | Match a facet path. | facet |
+| `id:value` | Look up one document by id. Fastest retrieval path. | any |
 
-### Field-Targeted Search
-```
-title:rust
-author:doe
-body:rust programming      # only 'rust' targets body
-```
+**Not supported**
 
-### Phrase Queries
-```
-title:"rust programming"         # exact phrase (terms in order)
-description:"machine learning"
-title:"Barack Obama"
-```
+- `field:*` — Field-presence tests are not supported for any field type. The clause is dropped and reported. Use a bounded range, or match an explicit value.
+- `field:pre*` — A single term with a trailing `*` is not a prefix search; it matches the term `pre` exactly. Use a phrase prefix (`"two words pre"*`) or a lexicographic range (`field:[pre TO prf}`).
+- `field.subfield:value` — Paths into a json field are not queryable. A json field is searchable only as unstructured text, so `field:value` matches any key or value inside it.
+- `field:/regex/` — Regular expressions are disabled.
 
-### Phrase Slop (Proximity)
-```
-body:"small bike"~1        # matches 'small blue bike' (1 word between)
-body:"small bike"~3        # matches 'small, rusty, and yellow bike'
-title:"big wolf"~1         # transposition costs 2: "A B"~1 does NOT match "B A"
-```
+**Rules**
 
-### Phrase Prefix
-```
-"big bad wo"*              # matches 'big bad wolf' (* applies to last term)
-"rust prog"*               # matches 'rust programming'
-```
+- A field name containing a dot is written as it is, unescaped: `k8s.node:worker-1`. Escaping the dot makes the lookup miss.
+- A field that exists in the schema but is not indexed cannot be queried. Fields discovered from a document are added unindexed, and stay that way until a schema update promotes them, so check the `indexed` flag before naming a field.
+- `_seq` is an internal sequence number used to track write-ahead-log position. It is present in every index and technically queryable, but it carries no meaning for a search and should be ignored.
+- A clause the engine cannot interpret is dropped and the rest of the query runs, which widens a conjunction and disables a negation. Every dropped clause is reported: the HTTP API attaches `_discarded_clauses` to the response, and an MCP tool call fails with the reason. Results are never returned as though the query had been understood.
 
-### Boolean Operators
-```
-title:rust AND author:doe           # both required
-title:rust OR title:go              # either matches
-title:rust NOT author:smith         # exclude
-a AND b OR c                        # parsed as: (a AND b) OR c
-```
+**Sorting**
 
-> **Note**: AND, OR, NOT must be UPPERCASE. AND takes precedence over OR.
+- Sorting on a numeric or date field requires the `fast` flag on that field, reported per field by `get_index`.
+- Sorting on a text or string field is approximate: the top `2 × limit` matches by relevance are collected and then ordered alphabetically, so the result is not the alphabetically first documents in the index.
+- Under a numeric or date sort every hit carries `_score` of 1.0, because no relevance score is computed. Do not read it as a ranking.
+- Ascending unless `desc` is given.
 
-### Must / Must-Not Operators
-```
-+rust +database                     # equivalent to rust AND database
-apple -fruit                        # apple required, fruit excluded
-+title:rust -author:smith
-(+title:rust +year:[2020 TO 2024]) author:doe   # author optional, boosts score
-```
+Reserved characters, which must be escaped with a backslash to be matched literally: + ^ ` : { } " ' [ ] ( ) ! \ * and space
 
-### Grouping
-```
-(title:rust OR title:go) AND year:[2020 TO 2024]
-(color:red OR color:green) AND size:large
-(+title:rust +author:doe) OR title:"systems programming"
-```
+<!-- END GENERATED SYNTAX -->
 
-### Range Queries
-```
-year:[2020 TO 2024]        # inclusive both bounds []
-score:{0 TO 100}           # exclusive both bounds {}
-title:[a TO c}             # mixed: inclusive lower, exclusive upper
-price:[10.0 TO *]          # unbounded upper
-age:[* TO 30]              # unbounded lower
-```
+To read the same reference at runtime, with examples and per-type detail:
 
-### Set Operator (IN)
-```
-status: IN [active pending review]   # more CPU-efficient than OR-ing
-color: IN [red green blue]
-category: IN [rust go python]
+```bash
+# The full reference: operators with examples, per-type support, sorting rules, unsupported forms
+curl -s localhost:9480/mcp -H 'content-type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"tools/call",
+  "params":{"name":"validate_query","arguments":{}}
+}' | jq -r '.result.content[0].text'
+
+# What one index's fields support, per field
+curl -s localhost:9480/mcp -H 'content-type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"tools/call",
+  "params":{"name":"get_index","arguments":{"index":"my_index"}}
+}' | jq -r '.result.content[0].text'
 ```
 
-> **Note**: Must specify field. `title: IN [a b c]` is more efficient than `title:a OR title:b OR title:c`.
+Three behaviours are worth knowing before reading either, because they change results rather than
+merely constraining syntax:
 
-### Boosting
-```
-"SRE"^2.0 OR devops^0.4                        # boost SRE over devops
-title:rust^3 OR body:rust                       # boost title matches
-title:"machine learning"^2.5 OR description:"deep learning"
-```
+- **A clause the engine cannot interpret is dropped, not rejected.** The rest of the query then
+  runs, which widens a conjunction and disables a negation. Every dropped clause is reported: the
+  HTTP API attaches `_discarded_clauses` to the response, and an MCP tool call fails naming the
+  clause. Results are never returned as though the query had been understood.
+- **Only indexed fields are queryable.** A field discovered from a document is added unindexed and
+  stays that way until a schema update promotes it. `get_index` reports the flag per field.
+- **Sorting a text or string field is approximate.** The top `2 × limit` matches by relevance are
+  collected and then ordered alphabetically, so the result is not the alphabetically first
+  documents in the index. Numeric and date sorts are exact but require the field's `fast` flag,
+  and set every `_score` to 1.0.
 
-> Default boost is 1.0. No negative boosts allowed. Boost affects ranking, not filtering.
-
-### All-Docs Query
-```
-*                          # matches every document
-* limit 10                 # all docs, limited to 10 results
-```
-
-### Date Queries
-```
-created_at:2024-01-15                              # exact date
-created_at:>2024-01-01                             # after
-created_at:<2024-12-31                             # before
-created_at:>=2024-06-01                            # on or after
-created_at:<=2024-06-30                            # on or before
-created_at:[2024-01-01 TO 2024-12-31]              # inclusive range
-timestamp:[2024-01-01T00:00:00Z TO 2024-01-02T00:00:00Z}  # exclusive upper
-```
-
-> Accepts YYYY-MM-DD or full RFC3339 (e.g. `2024-01-15T10:30:00Z`). Dates are auto-normalized internally.
-
-### Numeric Comparison Queries
-```
-score:>=4.5                    # score greater than or equal to 4.5
-price:<100                     # price less than 100
-year:>2020                     # year after 2020
-count:[10 TO 100]              # inclusive range
-temperature:{20.0 TO 30.0}     # exclusive range
-```
-
-> Comparison operators (`>`, `<`, `>=`, `<=`) work natively with numeric fields (i64, u64, f64) and date fields. No normalization is needed for numeric values.
-
-### Exact ID Lookup
-```
-id:my-document-id
-id:doc-12345
-```
-
-### Escape Characters
-```
-title:C\+\+               # escape special characters with backslash
-name:O\'Brien
-field:hello\ world         # escape space
-```
-
-Reserved characters: `+ ^ ` `: { } " [ ] ( ) ~ ! \ * SPACE`
-
-### Field Name Rules
-
-Field names must follow these validation rules:
-
-- **Length**: 1-255 characters
-- **First character**: Cannot start with a dot (`.`) or digit (`0-9`)
-- **Allowed characters**: `a-z`, `A-Z`, `0-9`, `.`, `-`, `_`, `/`, `@`, `$`
-- **Reserved names**: Cannot use `_source`, `_dynamic`, `_field_presence`
-
-**Dot Escaping for JSON Fields:**
-
-When a field name literally contains a dot (e.g., `k8s.node`), you MUST escape it with backslash to avoid it being interpreted as JSON nested object access:
-
-```
-k8s\.component\.name:quickwit    # matches field named "k8s.component.name"
-@timestamp:>2024-01-01           # @ is allowed in field names
-```
-
-> **Recommendation**: Avoid using dots in field names when possible, as it requires escaping in queries.
-
-### Inline Modifiers (CameoDB-specific)
-
-```
-title:rust return title,author,year               # field projection
-title:rust limit 5                                 # result limit
-title:rust limit 0                                 # count-only (no document data)
-title:rust sort year:asc                            # sort ascending by field
-title:rust sort year:desc                           # sort descending by field
-title:rust AND author:doe return title,author sort year:desc limit 10  # combined
-```
-
-### Field Type ↔ Operator Compatibility
-
-| Operator | text | string/exact | numeric | date | boolean | ip | json | facet |
-|---|---|---|---|---|---|---|---|---|
-| `field:term` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `field:"phrase"` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | — | ❌ |
-| `"phrase"~N` (slop) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | — | ❌ |
-| `"phrase"*` (prefix) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | — | ❌ |
-| `field:[a TO z]` (range) | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ | — | ❌ |
-| `field:>val` (comparison) | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | — | ❌ |
-| `field: IN [a b]` (set) | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | — | ❌ |
-| `term^boost` | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | — | ❌ |
-| `AND/OR/NOT` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `+/-` (must/must-not) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ## Client Configuration
 
