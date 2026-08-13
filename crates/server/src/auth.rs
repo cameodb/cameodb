@@ -28,6 +28,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+#[cfg(unix)]
 use tracing::warn;
 use zeroize::Zeroize;
 
