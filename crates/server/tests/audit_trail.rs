@@ -570,6 +570,10 @@ async fn query_text_is_kept_only_when_configured() {
 #[tokio::test]
 async fn an_mcp_tool_call_records_the_tool_and_the_index() {
     let node = TestNode::start("").await;
+    // `docs` has to exist for the search below to be an allowed call rather than a refusal:
+    // an MCP search on an index the node does not have is refused, where it used to answer with
+    // an empty result. What this test is about is the record, so it needs the call to succeed.
+    assert!((200..300).contains(&node.write("docs", "d1").await));
 
     let resp = http()
         .post(format!("{}/mcp", node.url))

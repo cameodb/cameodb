@@ -292,6 +292,19 @@ impl McpBackend for AppState {
                     // rest of this response answer a different query.
                     refuse_if_clauses_discarded(&response)?;
 
+                    let total_hits = response
+                        .get("total_hits")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+
+                    // Nothing matched, which is also what a search on an index that does not
+                    // exist looks like. Settle which one it was before describing the result.
+                    if total_hits == 0
+                        && let Some(reason) = absent_index_reason(&state, &index_name).await
+                    {
+                        return Err(reason);
+                    }
+
                     // Add zero-results warning if applicable
                     let hits_returned = response
                         .get("hits_returned")
@@ -372,6 +385,10 @@ impl McpBackend for AppState {
                     })
                 });
 
+            // Read before the requests move into the futures below, for the "did anything at
+            // all answer" test after the merge.
+            let index_count = indexes.len();
+
             // Launch all index searches concurrently
             let mut search_futures = FuturesUnordered::new();
             for index_request in indexes {
@@ -432,6 +449,11 @@ impl McpBackend for AppState {
 
             let mut merged_hits = Vec::new();
             let mut total_hits = 0u64;
+            // What could not be reached, named so the caller can tell which part of its request
+            // is missing from the answer. An index that fails no longer sinks the ones that
+            // answered: partial results with an explicit account of the gap are actionable,
+            // where a failed call throws away work that succeeded.
+            let mut errors: Vec<JsonValue> = Vec::new();
 
             while let Some((index_name, result)) = search_futures.next().await {
                 // Schema-aware error handling
@@ -440,6 +462,7 @@ impl McpBackend for AppState {
                     Err(err) => {
                         let err_str = err.to_string();
 
+                        let mut message = err_str.clone();
                         if names_a_missing_field(&err_str)
                             && let Ok(schema_result) = state
                                 .router
@@ -451,10 +474,11 @@ impl McpBackend for AppState {
                                 schema_result.get("fields").and_then(|v| v.as_object())
                         {
                             let field_names: Vec<String> = fields_obj.keys().cloned().collect();
-                            return Err(with_valid_fields(&err_str, &index_name, &field_names));
+                            message = with_valid_fields(&err_str, &index_name, &field_names);
                         }
 
-                        return Err(err_str);
+                        errors.push(serde_json::json!({"index": index_name, "error": message}));
+                        continue;
                     }
                 };
 
@@ -464,10 +488,20 @@ impl McpBackend for AppState {
                     return Err(format!("index '{index_name}': {refusal}"));
                 }
 
-                total_hits += result
+                let index_hits = result
                     .get("total_hits")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0);
+
+                // An index that answered with nothing may not be an index at all.
+                if index_hits == 0
+                    && let Some(reason) = absent_index_reason(&state, &index_name).await
+                {
+                    errors.push(serde_json::json!({"index": index_name, "error": reason}));
+                    continue;
+                }
+
+                total_hits += index_hits;
 
                 if let Some(hits) = result.get("hits").and_then(|value| value.as_array()) {
                     for hit in hits {
@@ -481,6 +515,25 @@ impl McpBackend for AppState {
                         merged_hits.push(hit_value);
                     }
                 }
+            }
+
+            // Nothing answered. Reported as a failure rather than as an empty result, because
+            // an empty `hits` beside a populated `errors` reads to an agent exactly like a query
+            // that legitimately matched nothing — which is the one reading that must not be
+            // available. Partial failure is a success; total failure is not.
+            if !errors.is_empty() && errors.len() == index_count {
+                let detail = errors
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "{}: {}",
+                            entry["index"].as_str().unwrap_or("?"),
+                            entry["error"].as_str().unwrap_or("unknown error")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(format!("no index in this search could be read — {detail}"));
             }
 
             // Merge sort: if a global sort spec was determined, order by _sort_key
@@ -522,6 +575,14 @@ impl McpBackend for AppState {
                 "total_hits": total_hits,
                 "limit": requested_limit,
             });
+
+            // Present only when something is missing, so that its presence means something. The
+            // engine's own search response uses the same key for shard-level failures.
+            if !errors.is_empty()
+                && let Some(obj) = response.as_object_mut()
+            {
+                obj.insert("errors".to_string(), JsonValue::Array(errors));
+            }
 
             // Add zero-results warning if applicable
             if hits_returned == 0
@@ -910,6 +971,36 @@ impl McpBackend for AppState {
 /// inside a value such as `status:ANDROID`.
 fn narrowed_by_phrase_or_conjunction(query: &str) -> bool {
     query.contains('"') || query.split_whitespace().any(|token| token == "AND")
+}
+
+/// `Some(reason)` when the node has no such index, asked of a search that returned nothing.
+///
+/// A search naming an index that does not exist answers with an empty result, which reads to a
+/// caller exactly like a query that matched nothing — while `get_index` on the same name says
+/// the index is not there. The two MCP tools disagreed about whether an index exists, and the
+/// disagreement was invisible in the answer an agent acts on.
+///
+/// Asked only where the result is empty, because that is the one answer in which "no such index"
+/// and "nothing matched" are indistinguishable. A search that found something has already proved
+/// the index exists and pays nothing for this. `GetConfig` names the index rather than scanning
+/// the catalogue, so the check that is paid for is a single-index lookup.
+async fn absent_index_reason(state: &AppState, index: &str) -> Option<String> {
+    match state
+        .router
+        .handle_client_op(ClientOp::GetConfig {
+            index: index.to_string(),
+        })
+        .await
+    {
+        Ok(_) => None,
+        // Worded as `get_index` words it, since agreeing with that tool is the point.
+        Err(err) if err.to_string().contains("not found") => {
+            Some(format!("Index '{index}' not found"))
+        }
+        // Any other failure to read a schema is not evidence that the index is absent, and
+        // reporting it as one would trade a silent wrong answer for a confident wrong answer.
+        Err(_) => None,
+    }
 }
 
 /// Whether an engine error reports a field the schema does not have.

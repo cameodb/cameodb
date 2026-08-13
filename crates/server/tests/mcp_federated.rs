@@ -100,7 +100,7 @@ max_shards_per_node = 1
     /// An index whose `created` field is a date the engine can sort on.
     ///
     /// `fast` is set explicitly: it defaults to false over the wire, and a sort on a date field
-    /// that is not FAST is refused rather than ordered — which would make this test pass for
+    /// that is not FAST does not order the results — which would make the sort tests pass for
     /// the wrong reason.
     async fn create_index(&self, index: &str) {
         let status = http()
@@ -435,6 +435,116 @@ async fn the_federated_merge_falls_back_to_the_configured_default() {
     );
 }
 
+/// One unusable index must not sink the indexes that answered.
+///
+/// The result an agent can act on is "here is what I found, and here is what I could not
+/// reach": failing the whole call throws away work that succeeded and says nothing about which
+/// part of the request was the problem.
+#[tokio::test]
+async fn a_failing_index_does_not_sink_the_others() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_indexes",
+            json!({
+                "indexes": [
+                    {"index": "alpha"},
+                    {"index": "no-such-index"},
+                ],
+                "query": "title:record",
+                "limit": 10,
+            }),
+        )
+        .await;
+
+    assert!(
+        !is_error,
+        "one index answered, so the call succeeded partially: {result}"
+    );
+    assert_eq!(
+        result["hits"].as_array().map(Vec::len),
+        Some(3),
+        "the index that answered should still have contributed its hits: {result}"
+    );
+    assert!(
+        result["hits"]
+            .as_array()
+            .is_some_and(|hits| hits.iter().all(|hit| hit["_index_source"] == "alpha")),
+        "only the index that answered should appear in the hits: {result}"
+    );
+
+    let errors = result["errors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a partial result must account for what is missing: {result}"));
+    assert_eq!(errors.len(), 1, "expected exactly one failure: {result}");
+    assert_eq!(
+        errors[0]["index"].as_str(),
+        Some("no-such-index"),
+        "the failure must name the index it belongs to: {result}"
+    );
+    assert!(
+        errors[0]["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "the failure must say what went wrong: {result}"
+    );
+}
+
+/// A search where nothing answered is a failed call, not an empty one.
+///
+/// An empty `hits` beside a populated `errors` reads to an agent exactly like a query that
+/// legitimately matched nothing, which is the one reading that must not be available.
+#[tokio::test]
+async fn a_search_where_every_index_fails_is_an_error() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_indexes",
+            json!({
+                "indexes": [
+                    {"index": "no-such-index"},
+                    {"index": "also-missing"},
+                ],
+                "query": "title:record",
+                "limit": 10,
+            }),
+        )
+        .await;
+
+    assert!(
+        is_error,
+        "no index answered, so this is a failure rather than an empty result: {result}"
+    );
+    let text = result.as_str().unwrap_or_default();
+    assert!(
+        text.contains("no-such-index") && text.contains("also-missing"),
+        "the error must name every index that failed, got: {text}"
+    );
+}
+
+/// Success with nothing missing carries no `errors` key, so its presence means something.
+#[tokio::test]
+async fn a_wholly_successful_search_reports_no_errors() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_indexes",
+            json!({
+                "indexes": [{"index": "alpha"}, {"index": "beta"}],
+                "query": "title:record",
+                "limit": 10,
+            }),
+        )
+        .await;
+
+    assert!(!is_error, "search failed: {result}");
+    assert!(
+        result.get("errors").is_none(),
+        "nothing failed, so nothing should be reported as missing: {result}"
+    );
+}
+
 /// A single-index search must be unaffected by the federated path keeping the key.
 #[tokio::test]
 async fn a_single_index_search_still_strips_the_sort_key() {
@@ -454,4 +564,94 @@ async fn a_single_index_search_still_strips_the_sort_key() {
             "a single-index hit carried the internal sort key: {hit}"
         );
     }
+}
+
+/// The single-index tool refuses an index that does not exist, rather than answering with an
+/// empty result an agent reads as "the data is not there".
+///
+/// `get_index` already refuses the same name, so this is two MCP tools agreeing about whether
+/// an index exists.
+#[tokio::test]
+async fn a_search_on_an_index_that_does_not_exist_is_refused() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "no-such-index", "query": "title:record"}),
+        )
+        .await;
+    assert!(
+        is_error,
+        "a search on a missing index must not look like an empty result: {result}"
+    );
+    assert!(
+        result
+            .as_str()
+            .unwrap_or_default()
+            .contains("no-such-index"),
+        "the refusal must name the index: {result}"
+    );
+
+    // The same name through the metadata tool, for the agreement this is about.
+    let (is_error, _) = node
+        .call_tool("get_index", json!({"index": "no-such-index"}))
+        .await;
+    assert!(is_error, "get_index has always refused a missing index");
+}
+
+/// A query that legitimately matches nothing in an index that does exist is still an empty
+/// success — the refusal above must not have swallowed the ordinary no-results case.
+#[tokio::test]
+async fn a_query_matching_nothing_in_a_real_index_is_still_a_success() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "alpha", "query": "title:nothingmatchesthis"}),
+        )
+        .await;
+    assert!(!is_error, "an honest empty result was refused: {result}");
+    assert_eq!(result["total_hits"].as_u64(), Some(0));
+
+    let (is_error, federated) = node
+        .call_tool(
+            "search_indexes",
+            json!({
+                "indexes": [{"index": "alpha"}, {"index": "beta"}],
+                "query": "title:nothingmatchesthis",
+            }),
+        )
+        .await;
+    assert!(
+        !is_error,
+        "an honest empty federated result was refused: {federated}"
+    );
+    assert!(
+        federated.get("errors").is_none(),
+        "both indexes exist, so nothing is missing: {federated}"
+    );
+}
+
+/// The HTTP search API keeps its contract: a missing index answers 200 with no hits.
+///
+/// The refusal above is scoped to the MCP tools, where the caller is an agent that cannot tell
+/// an empty index from an absent one. An HTTP client that already handles 200-with-no-hits is
+/// not broken to give the agent a better answer.
+#[tokio::test]
+async fn the_http_search_api_still_answers_empty_for_a_missing_index() {
+    let node = two_seeded_indexes().await;
+
+    let resp = http()
+        .post(format!("{}/api/no-such-index/search", node.url))
+        .json(&json!({"query": "title:record", "limit": 10}))
+        .send()
+        .await
+        .expect("http search");
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let body: Value = resp.json().await.expect("search json");
+    assert_eq!(body["total_hits"].as_u64(), Some(0));
+    assert_eq!(body["hits"].as_array().map(Vec::len), Some(0));
 }
