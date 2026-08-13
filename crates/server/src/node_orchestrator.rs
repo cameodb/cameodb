@@ -3534,6 +3534,16 @@ impl RouterActor {
         }
     }
 
+    /// Hits returned when a query names no limit, as this node is configured.
+    ///
+    /// A caller that passes `None` through gets this applied for it, deeper down. It is exposed
+    /// for the one caller that has to know the number before the search runs: a federated merge
+    /// truncates the combined result itself, and doing that against a different default than
+    /// the searches used would report a limit the node did not apply.
+    pub fn default_search_limit(&self) -> usize {
+        self.default_search_limit
+    }
+
     /// Answer "this node owns the key" from published state, or `None` to ask the
     /// coordinator.
     ///

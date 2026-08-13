@@ -342,14 +342,16 @@ impl McpBackend for AppState {
     ) -> BoxFuture<'_, Result<JsonValue, String>> {
         let state = self.clone();
         Box::pin(async move {
-            let requested_limit = limit.unwrap_or(10);
-
             // Preprocess query to extract return/limit/sort modifiers (same as HTTP server)
             let (cleaned_query, parsed_limit, parsed_fields, parsed_sort) =
                 parse_query_keywords(&query);
 
-            // Merge MCP-provided limit with parsed limit
+            // One derivation, so the value asked of each index, the value the merge truncates
+            // to, and the value reported back are the same number. Two of them disagreed: the
+            // truncation point ignored an inline `limit` clause, and fell back to a hard-coded
+            // 10 rather than to the limit this node is configured with.
             let final_limit = limit.or(parsed_limit);
+            let requested_limit = final_limit.unwrap_or(state.router.default_search_limit());
 
             // Determine the global sort spec (if any) for the final merge.
             // Per-index sort takes precedence; fall back to query-parsed sort.

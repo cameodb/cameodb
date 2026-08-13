@@ -61,7 +61,7 @@ pub(crate) fn search_index_input_schema() -> JsonValue {
             "limit": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "Maximum number of results to return. Pass 0 for count-only mode (returns total_hits without document data). If omitted, defaults to 10."
+                "description": "Maximum number of results to return. Pass 0 for count-only mode (returns total_hits without document data). If omitted, the node's configured default applies, which is 10 unless an operator changed it."
             },
             "fields": {
                 "type": "array",
@@ -119,7 +119,7 @@ pub(crate) fn search_indexes_input_schema() -> JsonValue {
             "limit": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "Maximum total results across all indexes. Pass 0 for count-only mode (returns total_hits without document data). If omitted, defaults to 10."
+                "description": "Maximum total results across all indexes. Pass 0 for count-only mode (returns total_hits without document data). If omitted, the node's configured default applies, which is 10 unless an operator changed it."
             }
         },
         "required": ["indexes", "query"]

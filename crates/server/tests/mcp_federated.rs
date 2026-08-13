@@ -26,6 +26,10 @@ struct TestNode {
 
 impl TestNode {
     async fn start() -> TestNode {
+        TestNode::start_with("").await
+    }
+
+    async fn start_with(extra: &str) -> TestNode {
         let dir = tempfile::tempdir().expect("temp dir");
         let port = free_port();
         let data = dir.path().join("data");
@@ -48,6 +52,7 @@ enabled = false
 data_paths = ["{data}"]
 num_shards_init = 1
 max_shards_per_node = 1
+{extra}
 "#,
             data = data.display().to_string().replace('\\', "/"),
         );
@@ -333,6 +338,101 @@ async fn the_internal_sort_key_does_not_reach_the_caller() {
             "a hit carried the internal sort key to the caller: {hit}"
         );
     }
+}
+
+/// Enough documents on each side that the node's default limit of 10 is not the answer.
+const WIDE: &[(&str, &str)] = &[
+    ("w1", "2024-01-02T00:00:00Z"),
+    ("w2", "2024-01-04T00:00:00Z"),
+    ("w3", "2024-01-06T00:00:00Z"),
+    ("w4", "2024-01-08T00:00:00Z"),
+    ("w5", "2024-01-10T00:00:00Z"),
+    ("w6", "2024-01-12T00:00:00Z"),
+    ("w7", "2024-01-14T00:00:00Z"),
+    ("w8", "2024-01-16T00:00:00Z"),
+];
+
+/// An inline `limit` has to bound the merge, not just the per-index searches feeding it.
+///
+/// Sixteen documents and a request for all sixteen, with no `limit` argument — so the only
+/// limit in play is the inline one. The merge derived its truncation point separately from the
+/// value it asked each index for, and only the latter saw the inline clause.
+#[tokio::test]
+async fn an_inline_limit_bounds_the_federated_merge() {
+    let node = TestNode::start().await;
+    node.create_index("wide-alpha").await;
+    node.create_index("wide-beta").await;
+    node.seed("wide-alpha", WIDE).await;
+    node.seed("wide-beta", WIDE).await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_indexes",
+            json!({
+                "indexes": [{"index": "wide-alpha"}, {"index": "wide-beta"}],
+                "query": "title:record limit 16",
+            }),
+        )
+        .await;
+    assert!(!is_error, "federated search failed: {result}");
+
+    assert_eq!(
+        result["hits"].as_array().map(Vec::len),
+        Some(16),
+        "an inline limit of 16 was not applied to the merge: {result}"
+    );
+    // The number reported back has to be the number that was honoured, or an agent paging
+    // through results is reasoning from a limit the server did not use.
+    assert_eq!(
+        result["limit"].as_u64(),
+        Some(16),
+        "the response reported a limit it did not apply: {result}"
+    );
+}
+
+/// With no limit anywhere, the merge falls back to the node's configured default rather than to
+/// a number of its own.
+///
+/// Configured to 3 rather than left at 10, because a test that agrees with the hard-coded value
+/// cannot tell the two apart — the single-index path passes `None` down and gets the configured
+/// number, while the merge used a literal.
+#[tokio::test]
+async fn the_federated_merge_falls_back_to_the_configured_default() {
+    let node = TestNode::start_with("\n[search]\ndefault_search_limit = 3\n").await;
+    node.create_index("wide-alpha").await;
+    node.seed("wide-alpha", WIDE).await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_indexes",
+            json!({
+                "indexes": [{"index": "wide-alpha"}],
+                "query": "title:record",
+            }),
+        )
+        .await;
+    assert!(!is_error, "federated search failed: {result}");
+
+    assert_eq!(
+        result["hits"].as_array().map(Vec::len),
+        Some(3),
+        "the merge ignored the node's configured default: {result}"
+    );
+    assert_eq!(result["limit"].as_u64(), Some(3));
+
+    // The single-index tool reads the same configured number, which is the agreement that was
+    // missing: one tool honoured the operator's setting and the other did not.
+    let (_, single) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "wide-alpha", "query": "title:record"}),
+        )
+        .await;
+    assert_eq!(
+        single["hits"].as_array().map(Vec::len),
+        Some(3),
+        "single-index search disagreed with the configured default: {single}"
+    );
 }
 
 /// A single-index search must be unaffected by the federated path keeping the key.
