@@ -13,7 +13,7 @@ use tracing::debug;
 use crate::{
     authz::McpAuthzRef,
     backend::{McpBackend, RateLimitVerdict, ToolCall},
-    guidance::ORCHESTRATOR_SKILL,
+    guidance::{INSTRUCTIONS, ORCHESTRATOR_SKILL},
     protocol::negotiate_protocol_version,
     tools::{ToolCallParams, call_tool, tool_subject, visible_tools},
 };
@@ -100,7 +100,9 @@ where
                     "serverInfo": {
                         "name": "cameodb-mcp",
                         "version": env!("CARGO_PKG_VERSION")
-                    }
+                    },
+                    // The only channel that reaches every client without being asked for.
+                    "instructions": INSTRUCTIONS,
                 }),
             ))
         }
@@ -318,6 +320,27 @@ mod tests {
                 "{method} arrived without an id and was answered with {response:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn initialize_carries_the_session_instructions() {
+        // The one channel a client reads without being asked to. Guidance that lives only in
+        // `prompts/get` reaches the clients that call it by hand, which is almost none.
+        let response = handle_rpc_request(
+            StubBackend,
+            message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" })),
+            &caller(),
+        )
+        .await
+        .expect("initialize is answered");
+
+        let instructions = response["result"]["instructions"]
+            .as_str()
+            .expect("initialize must carry instructions");
+        assert!(
+            instructions.contains("list_indexes") && instructions.contains("validate_query"),
+            "instructions must point at the tools they describe: {instructions}"
+        );
     }
 
     #[tokio::test]

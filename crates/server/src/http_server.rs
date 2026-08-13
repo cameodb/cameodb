@@ -1229,8 +1229,9 @@ fn compact_field_info(value: &JsonValue) -> Vec<FieldInfo> {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true),
                 fast: entry.get("fast").and_then(|v| v.as_bool()).unwrap_or(false),
-                // `enrich_index_entry` drops shadow fields from the compact form, so anything
-                // read back from it is not one.
+                // The compact form carries no shadow flag. It costs nothing today because a
+                // shadow field is always `indexed: false`, and every reader that asks about
+                // shadow asks it alongside `indexed`.
                 is_shadow: false,
             })
         })

@@ -4,6 +4,32 @@
 //! than documentation of one tool, and because every query form it names has to agree with
 //! [`crate::syntax`] — which the tests at the bottom of this module enforce.
 
+/// Session guidance every client receives, whether or not it ever asks for a prompt.
+///
+/// Returned from `initialize`, which is the only channel that reaches a client automatically.
+/// The full skill stays in `prompts/get` for deliberate invocation; this is the map rather than
+/// the manual, and it earns its place in resident context by being short.
+///
+/// Deliberately says nothing about query syntax: the operator tables live in the `search_index`
+/// description and in `validate_query`, and repeating them here would give two homes to facts
+/// that already drift easily. What it does carry is the part no tool description can — what the
+/// responses mean, and which of them is telling the agent that its query did not run as written.
+pub(crate) const INSTRUCTIONS: &str = r#"CameoDB is a fully-indexed search database. You retrieve and synthesize; ingestion happens elsewhere and no tool here writes.
+
+Answer only from what the tools return. Never fill a gap from prior knowledge, and never present an incomplete result as a whole one.
+
+Before querying an unfamiliar index, call `list_indexes` for everything visible or `get_index` for one. Both report each field's `type`, whether it is `indexed` — an unindexed field matches nothing — whether it is `fast`, which is what sorting a numeric or date field requires, and a `query_hint` naming the operators that type supports. Build the query from that, not from field names inferred from the question.
+
+Read what a response is telling you:
+- A call that fails naming a dropped clause did not run the query you wrote. Correct the clause; re-sending the same query repeats the same failure.
+- `errors` on a federated result names indexes that could not be read. The hits are real but partial, so report which indexes are missing from the answer.
+- An empty result means nothing matched. A search naming an index that does not exist is refused instead, so absence of hits is never a misspelled index name.
+- `_index_source` on each federated hit names the index it came from, which is what makes a cross-index answer citable.
+
+Ask for the fields you need with the `fields` parameter, and keep identifiers among them — they are what a follow-up query pivots on. When the whole query is `id:VALUE`, CameoDB answers from the key-value store and skips the search index entirely, which is the fastest retrieval path.
+
+`validate_query` with no arguments returns the full syntax reference; with an index and a query it names unrecognised fields and suggests corrections. The `cameodb://indexes` resources carry the same schemas for browsing."#;
+
 pub(crate) const ORCHESTRATOR_SKILL: &str = r#"# CameoDB Agent Skill: Universal Data Retrieval & Orchestration
 
 ## Role and Purpose
@@ -90,6 +116,34 @@ mod tests {
             on_disk, ORCHESTRATOR_SKILL,
             ".devin/skills/cameodb-agent.md has diverged from ORCHESTRATOR_SKILL"
         );
+    }
+
+    /// Resident context is the most expensive text this server sends, so it stays short.
+    ///
+    /// Not an arbitrary ceiling: it is the difference between guidance a client keeps for the
+    /// whole session and a manual it pays for on every turn. The full skill has no such limit
+    /// because it is fetched deliberately.
+    #[test]
+    fn the_instructions_stay_short_enough_to_be_resident() {
+        let words = INSTRUCTIONS.split_whitespace().count();
+        assert!(
+            words < 400,
+            "instructions have grown to {words} words; move detail to the skill or a tool \
+             description rather than into every session"
+        );
+    }
+
+    /// Syntax has one home. Naming operators here would give the tables a second place to drift
+    /// from, and the tool descriptions already render them from `syntax`.
+    #[test]
+    fn the_instructions_leave_syntax_to_the_syntax_tables() {
+        for form in crate::syntax::NOT_SUPPORTED {
+            assert!(
+                !INSTRUCTIONS.contains(form.syntax),
+                "instructions name the query form {:?}; that belongs in the syntax reference",
+                form.syntax
+            );
+        }
     }
 
     /// The prompt names query forms, so it must not contradict the syntax table.
