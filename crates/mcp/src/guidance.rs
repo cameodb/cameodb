@@ -110,8 +110,8 @@ mod tests {
     use super::*;
 
     /// `.devin/skills/cameodb-agent.md` is a copy of the orchestrator prompt for agents that read
-    /// skills from the repository rather than over MCP. It had drifted — several sections were
-    /// missing — so the two are pinned equal here.
+    /// skills from the repository rather than over MCP. The two are pinned equal here, since a
+    /// copy nothing checks is a copy that answers a different question from the served one.
     ///
     /// `UPDATE_DOCS=1 cargo test -p cameodb_mcp repository_skill` rewrites the file from the
     /// constant, which is the direction the copy travels; without it the test compares and fails

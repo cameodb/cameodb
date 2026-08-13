@@ -251,6 +251,14 @@ pub struct AppState {
     pub audit: Arc<crate::audit::AuditSink>,
 }
 
+/// Every MCP tool, implemented against the same router the HTTP API uses.
+///
+/// The mcp crate owns the protocol and the catalogue; this owns what the tools actually answer.
+/// The difference between the two surfaces lives here rather than in the engine: the HTTP API
+/// answers a client that can read a status code and an empty body, while a tool answers an agent
+/// that acts on the text — so a search naming an index the node does not have is refused here and
+/// still returns 200 with no hits over HTTP, and a dropped clause fails a tool call rather than
+/// returning results for a query nobody wrote.
 impl McpBackend for AppState {
     fn search_index(
         &self,
@@ -354,10 +362,9 @@ impl McpBackend for AppState {
             let (cleaned_query, parsed_limit, parsed_fields, parsed_sort) =
                 parse_query_keywords(&query);
 
-            // One derivation, so the value asked of each index, the value the merge truncates
-            // to, and the value reported back are the same number. Two of them disagreed: the
-            // truncation point ignored an inline `limit` clause, and fell back to a hard-coded
-            // 10 rather than to the limit this node is configured with.
+            // One derivation, so that the value asked of each index, the value the merge
+            // truncates to, and the value reported back are the same number — including when it
+            // comes from an inline `limit` clause or from this node's configured default.
             let final_limit = limit.or(parsed_limit);
             let requested_limit = final_limit.unwrap_or(state.router.default_search_limit());
 
@@ -445,7 +452,7 @@ impl McpBackend for AppState {
             let mut merged_hits = Vec::new();
             let mut total_hits = 0u64;
             // What could not be reached, named so the caller can tell which part of its request
-            // is missing from the answer. An index that fails no longer sinks the ones that
+            // is missing from the answer. An index that fails does not sink the ones that
             // answered: partial results with an explicit account of the gap are actionable,
             // where a failed call throws away work that succeeded.
             let mut errors: Vec<JsonValue> = Vec::new();
@@ -742,8 +749,8 @@ impl McpBackend for AppState {
                 .unwrap_or_default();
 
             // Field-type-aware schema summary. Shadow fields are listed rather than filtered
-            // out: hiding the identifier's own name from the field list is what sent an agent
-            // to reconstruct a lookup the index already answers in one hop.
+            // out: the identifier's own name is the one field answered without the search
+            // index, so a field list that omits it hides the cheapest query in the index.
             let fields_with_types: Vec<JsonValue> = field_infos
                 .iter()
                 .filter(|info| info.name != "_seq")
@@ -804,10 +811,10 @@ impl McpBackend for AppState {
             }
 
             // Its own listing rather than `Self::list_indexes`, for one reason: the sizes.
-            // `total_size_bytes` is only emitted when the listing is asked for data sizes, and
-            // the shared listing never asks — so the aggregate summed a key that was never
-            // present and reported 0 however much the node held. An explicit statistics request
-            // is the one place the redb size computation is worth paying for.
+            // `total_size_bytes` is emitted only when the listing is asked for data sizes, which
+            // the shared listing does not do — an aggregate built on it can only ever sum a key
+            // that is absent. An explicit statistics request is the one place the redb size
+            // computation is worth paying for.
             let mut listing = state
                 .router
                 .handle_client_op(ClientOp::ListIndexes {
@@ -1032,18 +1039,17 @@ impl McpBackend for AppState {
 /// Why a search that matched nothing may have asked for less than it meant to, or `None` when
 /// the query gives no reason to think so.
 ///
-/// The advice names what the query actually contains. Telling a caller to unquote a phrase it
-/// did not write, or to broaden a boolean it did not use, reads as a diagnosis of the result and
-/// sends it looking for something that is not there — worse than saying nothing, because zero
-/// hits is a real answer most of the time.
+/// Names only what the query contains, and only the constructs that narrow. Terms are not among
+/// them: they are ORed, so bare terms that returned nothing matched none of them and there is no
+/// narrowing to undo. Advice about a phrase the caller did not write, or a boolean it did not
+/// use, reads as a finding about the data — worse than silence, since zero hits is usually the
+/// true answer.
 ///
-/// Inline modifiers are stripped first, so `limit` and `sort` are not counted as query terms.
+/// Inline modifiers are stripped first, so `limit` and `sort` are not read as query terms.
 ///
-/// Only the constructs that actually narrow are listed. Terms alone do not: they are ORed, so a
-/// query of bare terms that returns nothing matched none of them, and there is no narrowing to
-/// undo. The behaviour itself is stated in [`cameodb_mcp::syntax`], which is where a change in
-/// the engine is recorded; this is the diagnosis of one query rather than a second copy of the
-/// reference, which is why it is worded as advice.
+/// The behaviour these sentences rest on is stated in [`cameodb_mcp::syntax`]; this is the
+/// diagnosis of one query rather than a second copy of the reference, hence the wording as
+/// advice rather than as a rule.
 fn zero_results_advice(query: &str) -> Option<String> {
     let (text, ..) = parse_query_keywords(query);
     let tokens: Vec<&str> = text.split_whitespace().collect();
@@ -1088,11 +1094,9 @@ fn zero_results_advice(query: &str) -> Option<String> {
 
 /// An index's field definitions, or `Null` if they cannot be read.
 ///
-/// The catalogue listing reports field *names* and nothing else, so an entry built from it
-/// alone describes an index with no types, no `indexed` flags and no per-type query hints —
-/// which is what `get_index`, `list_indexes` and `validate_query` were all handing to agents.
-/// The bundled CLI already composes the two calls this way to render `list indexes`; this is
-/// the same composition, done where the MCP tools can see it.
+/// The catalogue listing reports field *names* and nothing else, so describing an index means
+/// composing it with this: types, `indexed` and `fast` flags and per-type query hints all come
+/// from the schema. The bundled CLI composes the same two calls to render `list indexes`.
 ///
 /// `Null` rather than an error: a schema that cannot be read costs the caller its hints, not
 /// its answer, and the statistics the entry does carry are still worth returning.
@@ -1108,10 +1112,10 @@ async fn index_schema(state: &AppState, index: &str) -> JsonValue {
 
 /// `Some(reason)` when the node has no such index, asked of a search that returned nothing.
 ///
-/// A search naming an index that does not exist answers with an empty result, which reads to a
-/// caller exactly like a query that matched nothing — while `get_index` on the same name says
-/// the index is not there. The two MCP tools disagreed about whether an index exists, and the
-/// disagreement was invisible in the answer an agent acts on.
+/// The engine answers a search on an index it does not have with an empty result, which reads
+/// to a caller exactly like a query that matched nothing — while `get_index` on the same name
+/// says the index is not there. This is what lets the two MCP tools give the same answer about
+/// whether an index exists, in the one place where the difference is invisible.
 ///
 /// Asked only where the result is empty, because that is the one answer in which "no such index"
 /// and "nothing matched" are indistinguishable. A search that found something has already proved
@@ -1200,6 +1204,11 @@ fn resource_descriptor(uri: String, name: String, description: String) -> JsonVa
     })
 }
 
+/// One field, as the discovery tools describe it.
+///
+/// The common form behind both shapes a field arrives in — the schema's map of definitions and
+/// the compact array [`enrich_index_entry`] projects it into — so that everything downstream
+/// reads fields the same way whichever it was handed.
 #[derive(Debug, Clone)]
 struct FieldInfo {
     name: String,
@@ -1214,8 +1223,12 @@ struct FieldInfo {
 impl FieldInfo {
     /// Whether a query may name this field.
     ///
-    /// Not the same question as `indexed`: a shadow field is deliberately absent from the search
-    /// index and is still the one field CameoDB answers on without consulting it.
+    /// Every field an index is created with is searchable — `indexed` defaults to true, so a
+    /// schema defined up front is queryable throughout. Two cases are reported rather than
+    /// assumed: a field discovered from a document after creation is added unindexed and stays
+    /// that way until a schema update promotes it, and a shadow field is searched through the
+    /// identifier it duplicates rather than through the search index. Both are queryable
+    /// answers to a caller; only the first is not.
     fn is_queryable(&self) -> bool {
         self.indexed || self.is_shadow
     }
@@ -1231,8 +1244,8 @@ fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
     let Some(fields_obj) = fields_obj else {
         // An entry that has already been through `enrich_index_entry` carries the compact
         // array rather than the schema map it was built from. Readers downstream of the
-        // enrichment — `validate_query` and the statistics counts — see only that form, so
-        // failing to recognise it here is what made them report an index as having no fields.
+        // enrichment — `validate_query` and the statistics counts — see only that form, and
+        // this is what lets them read the fields out of it.
         return compact_field_info(value);
     };
 
@@ -1318,9 +1331,13 @@ fn extract_field_names(value: &JsonValue) -> Vec<String> {
         .collect()
 }
 
-/// Enrich a raw index entry (with schema) by adding compact field metadata
-/// and a top-level `query_hints` section with unique hints per field type.
-/// All indexed fields are searchable by default.
+/// Turn `{index, stats, schema}` into the entry the discovery tools return.
+///
+/// Projects the schema's field map into a compact array — `field`, `type`, `indexed`, `fast`,
+/// `shadow`, and `description` where one exists — lifts the index description alongside it, adds
+/// one `query_hint` per field type present, and drops the schema it was built from. The
+/// projection is the point: the schema map carries tokenizers and record options that no caller
+/// writing a query can act on, and on a wide index they are most of the response.
 fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
     let field_infos = extract_field_info(&entry);
 
@@ -1343,7 +1360,6 @@ fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
         })
         .collect();
 
-    // Build compact field list (field, type, indexed, fast, shadow, description)
     let fields: Vec<JsonValue> = field_infos
         .iter()
         .filter(|info| info.name != "_seq")
@@ -3098,9 +3114,8 @@ mod zero_results_advice_tests {
         );
     }
 
-    /// The two ways to narrow that are not the word `AND`, and the reason the default operator
-    /// has to be right for any of this to be: with terms ORed, `+` is what a caller reaches for
-    /// to require a clause, and it is easy to leave on one that need not be required.
+    /// The two ways to narrow that are not the word `AND`. With terms ORed, `+` is what a caller
+    /// reaches for to require a clause, and it is easy to leave on one that need not be.
     #[test]
     fn required_and_excluded_clauses_are_recognised_as_narrowing() {
         let required = zero_results_advice("+title:rust +year:2024").expect("`+` requires");
@@ -3132,9 +3147,9 @@ mod search_error_interception_tests {
 
     #[test]
     fn a_sort_error_is_not_read_as_a_missing_field() {
-        // The case that motivated narrowing this: matched on the bare word "field", this error
-        // was reported as a nonexistent field, which is a confident wrong diagnosis of a real
-        // problem the caller could otherwise have fixed.
+        // A sort error names a field without being about a missing one. Matching on the bare
+        // word "field" would report it as nonexistent — a confident wrong diagnosis of a real
+        // problem the caller could otherwise fix.
         assert!(!names_a_missing_field(
             "Field 'year' is not marked as FAST. Only FAST fields support sorting."
         ));

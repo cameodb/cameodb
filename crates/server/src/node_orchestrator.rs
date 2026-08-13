@@ -3574,7 +3574,7 @@ impl RouterActor {
     /// [`route_and_handle`](Self::route_and_handle) for a caller that merges the response itself.
     ///
     /// The internal `SORT_KEY_FIELD` survives, so a merge across several of these calls can
-    /// order by the sort field even where a projection dropped it. **The caller now owes the
+    /// order by the sort field even where a projection dropped it. **The caller owes the
     /// strip**: the key is metadata and must not reach a client. Re-deriving the key from the
     /// hit is not an alternative — the sort field may have been projected away, which is the
     /// reason the key exists at all.

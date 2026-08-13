@@ -87,7 +87,7 @@ impl McpAuthz for McpUnrestricted {
 
 /// What a tool requires, or `None` if it is not a tool this server knows.
 ///
-/// **Deny by default.** A tool added to [`crate::tools::mcp_tools`] without a row here cannot be
+/// **Deny by default.** A tool added to the catalogue without a row here cannot be
 /// called at all, which is the failure that gets noticed; inheriting `Read` from its neighbours
 /// is the failure that does not. `every_advertised_tool_has_a_capability` keeps the two in step.
 pub fn tool_capability(name: &str) -> Option<McpCapability> {

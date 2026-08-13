@@ -36,7 +36,7 @@ pub struct McpIndexSearchRequest {
 
 /// The operations MCP exposes, implemented by the host.
 ///
-/// Methods that **name** their index take no caller: [`crate::tools::call_tool`] has the name in
+/// Methods that **name** their index take no caller: the tool dispatcher has the name in
 /// hand and refuses a disallowed one before dispatching, so the check happens once rather than in
 /// every implementation. Methods that **enumerate** indexes, or that resolve a name from a
 /// URI, take an [`McpAuthzRef`] — only the implementation knows which part of its response

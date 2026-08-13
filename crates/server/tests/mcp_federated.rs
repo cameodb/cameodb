@@ -1,15 +1,16 @@
-//! What a federated MCP search actually returns, over the real endpoint.
+//! What the MCP tools actually answer, driven over the real endpoint against a live node.
 //!
-//! The merge in `search_indexes` orders hits by the internal `_sort_key` the engine stamps on
-//! a field-sorted search. Whether that key is still present when the merge runs is a property
-//! of the routing path, which no unit test on the comparator can see — so this drives
-//! `search_across_indexes` against a live node holding two indexes that share a sortable date
-//! field, and asserts on the order of what comes back.
+//! Everything here is a claim the tools make to an agent — the order of a federated merge, which
+//! fields an index reports, what a shadow field is, what the syntax reference says about the
+//! default operator — checked against the engine rather than against another part of the same
+//! description. A tool that agrees with itself and disagrees with the engine is the failure these
+//! exist to catch, and none of it is visible to a unit test: it is a property of the routing
+//! path, the schema composition and the query parser together.
 //!
-//! Interleaving is the assertion that matters. A merge that ordered each index's block
-//! correctly and then concatenated the blocks passes a naive monotonicity check on a single
-//! index, so the documents below are laid out to make per-index blocking visible: the correct
-//! answer alternates between the two indexes on every hit.
+//! Federated ordering carries the most setup, because interleaving is what has to be asserted. A
+//! merge that ordered each index's block correctly and then concatenated the blocks passes a
+//! naive monotonicity check, so `ALPHA` and `BETA` are laid out to make per-index blocking
+//! visible: the correct answer alternates between the two indexes on every hit.
 
 use std::io::Write as _;
 use std::net::TcpListener;
@@ -402,9 +403,9 @@ const WIDE: &[(&str, &str)] = &[
 
 /// An inline `limit` has to bound the merge, not just the per-index searches feeding it.
 ///
-/// Sixteen documents and a request for all sixteen, with no `limit` argument — so the only
-/// limit in play is the inline one. The merge derived its truncation point separately from the
-/// value it asked each index for, and only the latter saw the inline clause.
+/// Sixteen documents and a request for all sixteen, with no `limit` argument, so the inline
+/// clause is the only limit in play. It has to reach both the value asked of each index and the
+/// point the merge truncates at; a merge deriving that point separately would cut at ten.
 #[tokio::test]
 async fn an_inline_limit_bounds_the_federated_merge() {
     let node = TestNode::start().await;
@@ -441,9 +442,8 @@ async fn an_inline_limit_bounds_the_federated_merge() {
 /// With no limit anywhere, the merge falls back to the node's configured default rather than to
 /// a number of its own.
 ///
-/// Configured to 3 rather than left at 10, because a test that agrees with the hard-coded value
-/// cannot tell the two apart — the single-index path passes `None` down and gets the configured
-/// number, while the merge used a literal.
+/// Configured to 3 rather than left at the built-in 10, because a merge falling back to a
+/// literal of its own would agree with the default and the test could not tell the two apart.
 #[tokio::test]
 async fn the_federated_merge_falls_back_to_the_configured_default() {
     let node = TestNode::start_with("\n[search]\ndefault_search_limit = 3\n").await;
@@ -706,10 +706,10 @@ async fn the_http_search_api_still_answers_empty_for_a_missing_index() {
 
 /// The catalogue aggregate has to be measured, not structurally zero.
 ///
-/// `total_size_bytes` was summed from a key that only appears when the listing is asked for
-/// data sizes, and the MCP listing never asked — so the number was always 0 whatever the node
-/// held. A zero here is indistinguishable from an empty node, which is the reading an agent
-/// deciding whether an index is worth searching would act on.
+/// `total_size_bytes` is summed from a key the listing emits only when asked for data sizes, so
+/// an aggregate built on a listing that does not ask reports 0 whatever the node holds. A zero
+/// here is indistinguishable from an empty node, which is what an agent deciding whether an
+/// index is worth searching would act on.
 #[tokio::test]
 async fn the_catalogue_aggregate_reports_a_size_it_measured() {
     let node = two_seeded_indexes().await;
@@ -763,8 +763,8 @@ async fn single_index_stats_still_describe_one_index() {
 /// The schema-discovery surface has to describe the index, not an index with no fields.
 ///
 /// The catalogue listing reports field names only, so an entry built from it alone has no
-/// types, no `indexed` flags and no query hints. Every tool an agent is told to call before
-/// writing a query read from exactly that entry.
+/// types, no `indexed` flags and no query hints — and every tool an agent is told to call before
+/// writing a query reads from that entry.
 #[tokio::test]
 async fn the_discovery_tools_describe_the_fields_an_index_has() {
     let node = two_seeded_indexes().await;
@@ -818,9 +818,10 @@ async fn the_discovery_tools_describe_the_fields_an_index_has() {
 
 /// `validate_query` must not report a real field as unknown.
 ///
-/// It reads the same entry, so it inherited the empty field list and answered that every field
-/// named in a working query was one the index does not have — the most misleading answer in the
-/// tool set, since an agent is sent here precisely when it doubts a query.
+/// It reads the same enriched entry the catalogue does, so an entry without field types reaches
+/// it as a claim that every field in a working query is one the index does not have — the most
+/// misleading answer in the tool set, since an agent comes here precisely when it doubts a
+/// query.
 #[tokio::test]
 async fn validate_query_recognises_a_field_the_index_has() {
     let node = two_seeded_indexes().await;
@@ -872,11 +873,11 @@ async fn validate_query_recognises_a_field_the_index_has() {
 /// A shadow field is the identifier under the name the source data gave it — `sha1`, `book_id` —
 /// and querying it is querying `id`.
 ///
-/// It is not in the search index, so every discovery surface described it as an unindexed field
-/// and `validate_query` warned that a query naming it would not match. Both were wrong in the
-/// expensive direction: that query is the one retrieval CameoDB answers from the key-value store
-/// without touching the search index at all, and an agent told to avoid it loses the fastest
-/// lookup the index has.
+/// It is not in the search index, so `indexed: false` is all a discovery surface sees unless the
+/// shadow flag travels with it — and an agent reading that alone is told to avoid the one
+/// retrieval CameoDB answers from the key-value store without touching the search index at all.
+/// Every claim below is checked against the engine first, so the description cannot merely agree
+/// with itself.
 #[tokio::test]
 async fn a_shadow_field_is_described_as_the_queryable_alias_of_id() {
     let node = TestNode::start().await;
@@ -1185,8 +1186,8 @@ async fn an_over_long_description_is_refused_at_the_config_endpoint() {
 /// The default operator, checked against the engine rather than assumed.
 ///
 /// Every syntax surface is rendered from one table, so a wrong entry there is wrong in the tool
-/// descriptions, the reference and the prompt at once. This one said terms were ANDed, which
-/// inverts the advice it leads to: an agent narrowing a result by adding a term widens it
+/// descriptions, the reference and the prompt at once — and this entry is the one whose error
+/// inverts the advice it leads to. An agent that narrows a result by adding a term widens it
 /// instead, and the extra documents arrive looking like data rather than like a mistake.
 #[tokio::test]
 async fn bare_terms_are_ored_the_way_the_syntax_reference_says() {
