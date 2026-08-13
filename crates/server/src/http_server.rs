@@ -2801,6 +2801,59 @@ mod tests {
     }
 }
 
+/// What the search error path is allowed to say about an engine error.
+///
+/// The interceptor exists so an agent that named a field wrongly gets the list of real ones.
+/// Both ways it can go wrong are silent: reading an unrelated error as a missing field sends
+/// the agent to fix a name that was never the problem, and replacing the engine's message with
+/// a guess discards the only account of what actually happened. Neither shows up as a failure
+/// anywhere else, so they are pinned here.
+#[cfg(test)]
+mod search_error_interception_tests {
+    use super::{names_a_missing_field, with_valid_fields};
+
+    #[test]
+    fn a_sort_error_is_not_read_as_a_missing_field() {
+        // The case that motivated narrowing this: matched on the bare word "field", this error
+        // was reported as a nonexistent field, which is a confident wrong diagnosis of a real
+        // problem the caller could otherwise have fixed.
+        assert!(!names_a_missing_field(
+            "Field 'year' is not marked as FAST. Only FAST fields support sorting."
+        ));
+    }
+
+    #[test]
+    fn a_missing_field_is_still_recognised_however_the_engine_words_it() {
+        for error in [
+            "Field 'nosuch' does not exist in schema",
+            "FieldDoesNotExist(\"nosuch\")",
+            "Query error: unknown field 'nosuch'",
+            "Field 'nosuch' is not declared as indexed",
+        ] {
+            assert!(
+                names_a_missing_field(error),
+                "the interceptor stopped recognising: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_field_list_is_appended_rather_than_replacing_the_error() {
+        let original = "Field 'titel' does not exist in schema";
+        let enriched =
+            with_valid_fields(original, "docs", &["title".to_string(), "body".to_string()]);
+
+        assert!(
+            enriched.starts_with(original),
+            "the engine's own message must survive: {enriched}"
+        );
+        assert!(
+            enriched.contains("title, body") && enriched.contains("docs"),
+            "the caller needs the real fields and the index they belong to: {enriched}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod index_name_validation_tests {
     use super::validate_index_name;
