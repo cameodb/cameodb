@@ -10,6 +10,9 @@ An interactive command-line client for CameoDB with rich ergonomics, persistent 
   - Top-level commands (`health`, `list`, `search`, `connect`, ...)
   - `list index` suggestions for known indexes
   - `search <index>` field completions with type hints (e.g., `title: [text]`)
+  - Subcommands of `list`, `schema`, `data`, `admin` and `key`, and file paths for the commands that read one
+  - Flags and their values (`--data-size`, `--delimiter comma`), offered by position
+- **Completed words close themselves**: a word the command continues past arrives with its space, so one Tab settles the word and the next moves on to the position after it. A word that ends the command stays bare.
 - **Field-aware caching** that fetches schema metadata and surfaces field types
 - **Smart index cache refresh** after `connect`, `list index`, and `list indexes`
 - **Robust Rustyline navigation** (arrow keys, Home/End, Ctrl-R reverse search)

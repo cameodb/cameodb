@@ -710,6 +710,40 @@ fn format_compact_fields(fields_value: &JsonValue) -> JsonValue {
     JsonValue::Object(result)
 }
 
+/// The token in front of the one under the cursor, which is the last of `tokens`.
+fn preceding_token<'a>(tokens: &[&'a str]) -> Option<&'a str> {
+    let len = tokens.len();
+    (len >= 2).then(|| tokens[len - 2])
+}
+
+/// A replacement that closes its own token: a field's colon, a projection's comma, a directory's
+/// slash, or a space the suggestion carries itself.
+fn is_self_terminating(replacement: &str) -> bool {
+    replacement.ends_with([' ', ':', ',', '/'])
+}
+
+/// The prefix every replacement shares, which is what rustyline splices into the line when the
+/// candidates are ambiguous.
+fn shared_prefix(pairs: &[Pair]) -> &str {
+    let Some(first) = pairs.first() else {
+        return "";
+    };
+
+    let mut shared = first.replacement.as_str();
+    for pair in &pairs[1..] {
+        let mut len = shared
+            .bytes()
+            .zip(pair.replacement.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while !shared.is_char_boundary(len) {
+            len -= 1;
+        }
+        shared = &shared[..len];
+    }
+    shared
+}
+
 #[derive(Clone, Debug)]
 struct IndexCompleter {
     cache: Arc<RwLock<HashMap<String, IndexMetadata>>>,
@@ -947,39 +981,89 @@ impl IndexCompleter {
         pairs
     }
 
-    fn delimiter_flag_suggestions(&self, prefix: &str) -> Vec<Pair> {
-        let options = ["detect", "comma", "tab", "semicolon"];
-        options
-            .iter()
-            .filter(|opt| format!("--delimiter {}", opt).starts_with(prefix))
+    /// A flag is offered while what is typed is still a prefix of it, and only until it is on the
+    /// line.
+    fn flag_suggestion(
+        &self,
+        flag: &str,
+        display: &str,
+        prefix: &str,
+        tokens: &[&str],
+    ) -> Option<Pair> {
+        (!tokens.contains(&flag) && flag.starts_with(prefix)).then(|| Pair {
+            display: display.to_string(),
+            replacement: flag.to_string(),
+        })
+    }
+
+    /// The value of `--delimiter`, which is its own token.
+    fn delimiter_value_suggestions(&self, prefix: &str) -> Vec<Pair> {
+        ["detect", "comma", "tab", "semicolon"]
+            .into_iter()
+            .filter(|opt| opt.starts_with(prefix))
             .map(|opt| Pair {
-                display: format!("--delimiter {}", opt),
-                replacement: format!("--delimiter {}", opt),
+                display: opt.to_string(),
+                replacement: opt.to_string(),
             })
             .collect()
     }
 
-    fn batch_size_flag_suggestions(&self, prefix: &str) -> Vec<Pair> {
-        let flag = "--batch-size ";
-        if flag.starts_with(prefix) || prefix.starts_with(flag) {
-            vec![Pair {
-                display: "--batch-size <n>".to_string(),
-                replacement: flag.to_string(),
-            }]
-        } else {
-            Vec::new()
+    /// Flags for `schema detect|load`, offered once its positional arguments are in.
+    fn schema_flag_suggestions(&self, current: &str, tokens: &[&str]) -> Vec<Pair> {
+        if preceding_token(tokens) == Some("--delimiter") {
+            return self.delimiter_value_suggestions(current);
         }
+        self.flag_suggestion(
+            "--delimiter",
+            "--delimiter <detect|comma|tab|semicolon>",
+            current,
+            tokens,
+        )
+        .into_iter()
+        .collect()
     }
 
-    fn delete_flag_suggestions(&self, prefix: &str) -> Vec<Pair> {
-        if "--delete-schema".starts_with(prefix) {
-            vec![Pair {
-                display: "--delete-schema".to_string(),
-                replacement: "--delete-schema".to_string(),
-            }]
-        } else {
-            Vec::new()
+    /// Flags for `data load`, offered once its positional arguments are in.
+    fn data_flag_suggestions(&self, current: &str, tokens: &[&str]) -> Vec<Pair> {
+        match preceding_token(tokens) {
+            Some("--delimiter") => return self.delimiter_value_suggestions(current),
+            // A document count: nothing to complete.
+            Some("--batch-size") => return Vec::new(),
+            _ => {}
         }
+
+        let mut suggestions: Vec<Pair> = self
+            .flag_suggestion(
+                "--delimiter",
+                "--delimiter <detect|comma|tab|semicolon>",
+                current,
+                tokens,
+            )
+            .into_iter()
+            .collect();
+
+        // The count that follows completes to nothing, which is invisible to the lookahead in
+        // `terminate_completed_words`, so the flag carries its own space.
+        if !tokens.contains(&"--batch-size") && "--batch-size".starts_with(current) {
+            suggestions.push(Pair {
+                display: "--batch-size <n>".to_string(),
+                replacement: "--batch-size ".to_string(),
+            });
+        }
+
+        suggestions
+    }
+
+    fn delete_flag_suggestions(&self, prefix: &str, tokens: &[&str]) -> Vec<Pair> {
+        self.flag_suggestion("--delete-schema", "--delete-schema", prefix, tokens)
+            .into_iter()
+            .collect()
+    }
+
+    fn force_flag_suggestions(&self, prefix: &str, tokens: &[&str]) -> Vec<Pair> {
+        self.flag_suggestion("--force", "--force", prefix, tokens)
+            .into_iter()
+            .collect()
     }
 
     fn admin_subcommand_suggestions(&self, prefix: &str) -> Vec<Pair> {
@@ -1068,6 +1152,20 @@ impl IndexCompleter {
             .collect()
     }
 
+    /// `key` also takes the key itself, which is not something to complete. `file` leads, as it
+    /// does in the help text: it is the form that keeps the key out of the history file.
+    fn key_subcommand_suggestions(&self, prefix: &str) -> Vec<Pair> {
+        let subcommands = vec!["file", "show", "clear"];
+        subcommands
+            .into_iter()
+            .filter(|sub| sub.starts_with(prefix))
+            .map(|sub| Pair {
+                display: sub.to_string(),
+                replacement: sub.to_string(),
+            })
+            .collect()
+    }
+
     fn data_subcommand_suggestions(&self, prefix: &str) -> Vec<Pair> {
         let subcommands = vec!["load"];
         subcommands
@@ -1078,6 +1176,59 @@ impl IndexCompleter {
                 replacement: sub.to_string(),
             })
             .collect()
+    }
+
+    /// Ends a completed word with a space, so that one Tab settles the word and the next moves on
+    /// to the position after it. A word that ends the command keeps its bare form, since a space
+    /// there is only something to delete.
+    ///
+    /// Which of the two a word is comes from asking `complete_tokens` what an empty token in the
+    /// next position would offer. `complete_tokens` holds no terminator logic of its own, which is
+    /// what keeps that one level deep.
+    fn terminate_completed_words(&self, tokens: &[&str], suggestions: &mut [Pair]) {
+        // Past the command word and its subcommand, `complete_tokens` branches on position rather
+        // than on the word under the cursor, so a single probe answers for the whole set. Nearer
+        // the front of the line the word does decide — `admin workers` ends the command where
+        // `admin memory` does not — and each candidate has to be probed on its own.
+        let word_decides_grammar = tokens.len() <= 2;
+        let mut answer_for_position = None;
+
+        for pair in suggestions.iter_mut() {
+            if is_self_terminating(&pair.replacement) {
+                continue;
+            }
+
+            let continues = if word_decides_grammar {
+                self.completes_after(tokens, &pair.replacement)
+            } else {
+                *answer_for_position
+                    .get_or_insert_with(|| self.completes_after(tokens, &pair.replacement))
+            };
+
+            if continues {
+                pair.replacement.push(' ');
+            }
+        }
+    }
+
+    /// Whether the position after `settled` has anything to offer.
+    fn completes_after(&self, tokens: &[&str], settled: &str) -> bool {
+        let Some((_, leading)) = tokens.split_last() else {
+            return false;
+        };
+
+        let mut lookahead: Vec<&str> = leading.to_vec();
+        lookahead.push(settled);
+
+        // A free-form argument — a host to connect to — completes to nothing, yet the command word
+        // in front of it is still not the end of the line.
+        if lookahead.len() == 1 && matches!(settled, "connect" | "conn") {
+            return true;
+        }
+
+        lookahead.push("");
+        self.complete_tokens(&lookahead, "")
+            .is_some_and(|next| !next.is_empty())
     }
 
     fn complete_tokens(&self, tokens: &[&str], current: &str) -> Option<Vec<Pair>> {
@@ -1096,24 +1247,19 @@ impl IndexCompleter {
                 let suggestions = self.list_subcommand_suggestions(current);
                 Some(suggestions)
             }
-            "list" if tokens.len() >= 2 && tokens[1] == "indexes" => {
-                if current.starts_with('-') {
-                    // Suggest --extended flag after indexes
-                    let suggestions = self.extended_flag_suggestions(current, tokens);
-                    Some(suggestions)
-                } else {
-                    None
-                }
+            // `list indexes` takes no positional argument, so every token after it is a flag.
+            "list" if tokens[1] == "indexes" => {
+                let suggestions = self.extended_flag_suggestions(current, tokens);
+                Some(suggestions)
             }
-            "list" if tokens.len() >= 2 && tokens[1] == "index" => {
-                if current.starts_with('-') {
-                    // Suggest --extended flag after index name
-                    let suggestions = self.extended_flag_suggestions(current, tokens);
-                    Some(suggestions)
-                } else {
-                    let suggestions = self.index_suggestions(current);
-                    Some(suggestions)
-                }
+            "list" if tokens.len() == 3 && tokens[1] == "index" => {
+                let suggestions = self.index_suggestions(current);
+                Some(suggestions)
+            }
+            // Past the index name only a flag is valid.
+            "list" if tokens[1] == "index" => {
+                let suggestions = self.extended_flag_suggestions(current, tokens);
+                Some(suggestions)
             }
             // Complete schema subcommands and index for schema load
             "schema" if tokens.len() == 2 => {
@@ -1131,8 +1277,8 @@ impl IndexCompleter {
                 let suggestions = self.file_path_suggestions(current);
                 Some(suggestions)
             }
-            "schema" if current.starts_with('-') => {
-                let suggestions = self.delimiter_flag_suggestions(current);
+            "schema" if matches!(tokens[1], "detect" | "load") => {
+                let suggestions = self.schema_flag_suggestions(current, tokens);
                 Some(suggestions)
             }
             // Complete index name for 'search'
@@ -1244,12 +1390,8 @@ impl IndexCompleter {
                 let suggestions = self.file_path_suggestions(current);
                 Some(suggestions)
             }
-            "data" if current.starts_with("--delimiter") => {
-                let suggestions = self.delimiter_flag_suggestions(current);
-                Some(suggestions)
-            }
-            "data" if current.starts_with("--batch-size") || current == "--batch-size" => {
-                let suggestions = self.batch_size_flag_suggestions(current);
+            "data" if tokens[1] == "load" => {
+                let suggestions = self.data_flag_suggestions(current, tokens);
                 Some(suggestions)
             }
             // Complete index name for delete
@@ -1257,8 +1399,8 @@ impl IndexCompleter {
                 let suggestions = self.index_suggestions(current);
                 Some(suggestions)
             }
-            "delete" if current.starts_with('-') => {
-                let suggestions = self.delete_flag_suggestions(current);
+            "delete" => {
+                let suggestions = self.delete_flag_suggestions(current, tokens);
                 Some(suggestions)
             }
             // Admin subcommands
@@ -1266,16 +1408,29 @@ impl IndexCompleter {
                 let suggestions = self.admin_subcommand_suggestions(current);
                 Some(suggestions)
             }
-            "admin" if tokens.len() >= 2 && tokens[1] == "memory" && tokens.len() == 3 => {
+            "admin" if tokens.len() == 3 && tokens[1] == "memory" => {
                 let suggestions = self.admin_memory_operation_suggestions(current);
                 Some(suggestions)
             }
-            "admin" if tokens.len() >= 2 && tokens[1] == "index" && tokens.len() == 3 => {
+            // Only a purge takes a flag; `admin memory stats` ends there.
+            "admin" if tokens[1] == "memory" && tokens[2] == "purge" => {
+                let suggestions = self.force_flag_suggestions(current, tokens);
+                Some(suggestions)
+            }
+            "admin" if tokens.len() == 3 && tokens[1] == "index" => {
                 let suggestions = self.index_suggestions(current);
                 Some(suggestions)
             }
-            "admin" if tokens.len() >= 3 && tokens[1] == "index" && tokens.len() == 4 => {
+            "admin" if tokens.len() == 4 && tokens[1] == "index" => {
                 let suggestions = self.admin_index_operation_suggestions(current);
+                Some(suggestions)
+            }
+            "key" if tokens.len() == 2 => {
+                let suggestions = self.key_subcommand_suggestions(current);
+                Some(suggestions)
+            }
+            "key" if tokens.len() == 3 && tokens[1] == "file" => {
+                let suggestions = self.file_path_suggestions(current);
                 Some(suggestions)
             }
             _ => None,
@@ -1443,15 +1598,37 @@ impl Completer for IndexCompleter {
 
         // Handle empty/whitespace-only line case
         if parts.is_empty() || (parts.len() == 1 && parts[0].is_empty()) {
-            let suggestions = self.command_suggestions("");
+            let mut suggestions = self.command_suggestions("");
+            self.terminate_completed_words(&[""], &mut suggestions);
             return Ok((start, suggestions));
         }
 
-        if let Some(suggestions) = self.complete_tokens(&parts, current) {
-            Ok((start, suggestions))
-        } else {
-            Ok((pos, Vec::new()))
-        }
+        let Some(mut suggestions) = self.complete_tokens(&parts, current) else {
+            return Ok((pos, Vec::new()));
+        };
+
+        self.terminate_completed_words(&parts, &mut suggestions);
+        elect_settled_word(current, &mut suggestions);
+        Ok((start, suggestions))
+    }
+}
+
+/// A finished word is not ambiguous just because a longer word shares its prefix: `index` is a
+/// target in its own right next to `indexes`. rustyline splices only the shared prefix of the
+/// candidates, which leaves such a word open and its Tab with nothing to do. Electing the finished
+/// word gives that Tab the space that closes it.
+fn elect_settled_word(current: &str, suggestions: &mut Vec<Pair>) {
+    if suggestions.len() < 2 || shared_prefix(suggestions).len() > current.len() {
+        return;
+    }
+
+    // Only a word this run terminated: a set that goes nowhere keeps every candidate.
+    if let Some(settled) = suggestions
+        .iter()
+        .position(|pair| pair.replacement.strip_suffix(' ') == Some(current))
+    {
+        suggestions.swap(0, settled);
+        suggestions.truncate(1);
     }
 }
 
@@ -4688,13 +4865,17 @@ mod tests {
         Context::new(history)
     }
 
+    fn replacements(pairs: &[Pair]) -> Vec<&str> {
+        pairs.iter().map(|p| p.replacement.as_str()).collect()
+    }
+
     #[test]
     fn command_completion_respects_leading_whitespace() {
         let c = completer_with_index();
         let history = MemHistory::new();
         let (start, pairs) = c.complete("  se", 4, &ctx(&history)).unwrap();
         assert_eq!(start, 2);
-        assert!(pairs.iter().any(|p| p.replacement == "search"));
+        assert!(pairs.iter().any(|p| p.replacement == "search "));
     }
 
     #[test]
@@ -4703,7 +4884,7 @@ mod tests {
         let history = MemHistory::new();
         let (start, pairs) = c.complete("se", 2, &ctx(&history)).unwrap();
         assert_eq!(start, 0);
-        assert!(pairs.iter().any(|p| p.replacement == "search"));
+        assert!(pairs.iter().any(|p| p.replacement == "search "));
     }
 
     #[test]
@@ -4713,7 +4894,163 @@ mod tests {
         let line = "search myindex";
         let (start, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
         assert_eq!(start, 7);
-        assert!(pairs.iter().any(|p| p.replacement == "myindex"));
+        assert!(pairs.iter().any(|p| p.replacement == "myindex "));
+    }
+
+    /// A word arrives with the space that opens the position after it, so the next Tab lands
+    /// there.
+    #[test]
+    fn a_word_the_command_continues_past_completes_with_its_space() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        for (line, expected) in [
+            ("li", "list "),
+            ("list ind", "index "),
+            ("delete myind", "myindex "),
+            ("admin mem", "memory "),
+            ("admin index myind", "myindex "),
+            ("ke", "key "),
+            ("key fil", "file "),
+        ] {
+            let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+            assert!(
+                pairs.iter().any(|p| p.replacement == expected),
+                "{line:?} completed to {:?}, expected {expected:?}",
+                replacements(&pairs)
+            );
+        }
+    }
+
+    /// The last word of a command has no position after it to open.
+    #[test]
+    fn a_word_that_ends_the_command_completes_without_a_space() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        for (line, expected) in [
+            ("heal", "health"),
+            ("exi", "exit"),
+            ("admin work", "workers"),
+            ("admin memory stat", "stats"),
+            ("admin index myindex commi", "commit"),
+            ("key sho", "show"),
+            ("key clea", "clear"),
+            ("admin memory purge --for", "--force"),
+        ] {
+            let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+            assert!(
+                pairs.iter().any(|p| p.replacement == expected),
+                "{line:?} completed to {:?}, expected {expected:?}",
+                replacements(&pairs)
+            );
+        }
+    }
+
+    /// `key` takes the key itself as well as its subcommands, so a secret typed at the prompt is
+    /// left alone rather than completed against them.
+    #[test]
+    fn the_key_subcommands_complete_and_a_key_itself_does_not() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+
+        let line = "key ";
+        let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert_eq!(replacements(&pairs), vec!["file ", "show", "clear"]);
+
+        let line = "key cameo_v1_";
+        let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert!(pairs.is_empty(), "got: {:?}", replacements(&pairs));
+    }
+
+    /// An argument nothing can complete still leaves the command open, and the lookahead cannot
+    /// see that on its own.
+    #[test]
+    fn a_command_taking_a_free_form_argument_completes_with_its_space() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        for (line, expected) in [("conne", "connect "), ("con", "conn ")] {
+            let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+            assert!(
+                pairs.iter().any(|p| p.replacement == expected),
+                "{line:?} completed to {:?}, expected {expected:?}",
+                replacements(&pairs)
+            );
+        }
+    }
+
+    /// `index` is a target in its own right next to `indexes`, so a Tab on the finished word
+    /// closes it instead of splicing back the same five characters.
+    #[test]
+    fn a_finished_word_wins_over_the_longer_word_that_shares_its_prefix() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        let line = "list index";
+        let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert_eq!(replacements(&pairs), vec!["index "]);
+    }
+
+    /// Until the word is finished both are still in play.
+    #[test]
+    fn a_partial_word_keeps_every_candidate() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        let line = "list ind";
+        let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert_eq!(replacements(&pairs), vec!["indexes ", "index "]);
+    }
+
+    /// Past the positional arguments only a flag is valid, whatever has been typed of it.
+    #[test]
+    fn only_flags_follow_the_positional_arguments() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        for line in ["list index myindex ", "list indexes ", "delete myindex "] {
+            let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+            assert!(
+                !pairs.is_empty() && pairs.iter().all(|p| p.replacement.starts_with('-')),
+                "{line:?} offered {:?}, expected flags only",
+                replacements(&pairs)
+            );
+        }
+    }
+
+    #[test]
+    fn a_flag_already_on_the_line_is_not_offered_again() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        let line = "list index myindex --data-size ";
+        let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert!(
+            !pairs.iter().any(|p| p.replacement.contains("--data-size")),
+            "expected --data-size to be spent, got: {:?}",
+            replacements(&pairs)
+        );
+    }
+
+    /// A flag is completable from any prefix of it, and its value is a token of its own.
+    #[test]
+    fn a_flag_and_its_value_complete_as_separate_tokens() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+
+        let line = "data load myindex data.csv --de";
+        let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert_eq!(replacements(&pairs), vec!["--delimiter "]);
+
+        let line = "data load myindex data.csv --delimiter ";
+        let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert_eq!(
+            replacements(&pairs),
+            vec!["detect ", "comma ", "tab ", "semicolon "]
+        );
+
+        // The count that follows completes to nothing, so the flag carries its own space.
+        let line = "data load myindex data.csv --ba";
+        let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert_eq!(replacements(&pairs), vec!["--batch-size "]);
+
+        let line = "data load myindex data.csv --batch-size ";
+        let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert!(pairs.is_empty(), "got: {:?}", replacements(&pairs));
     }
 
     #[test]
