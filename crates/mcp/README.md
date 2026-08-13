@@ -339,6 +339,7 @@ schema, and the table below, which is generated and checked against the tables b
 - A field name containing a dot is written as it is, unescaped: `k8s.node:worker-1`. Escaping the dot makes the lookup miss.
 - A field that exists in the schema but is not indexed cannot be queried. Fields discovered from a document are added unindexed, and stay that way until a schema update promotes them, so check the `indexed` flag before naming a field.
 - `_seq` is an internal sequence number used to track write-ahead-log position. It is present in every index and technically queryable, but it carries no meaning for a search and should be ignored.
+- `AND`, `OR`, `NOT`, `TO` and `IN` are keywords in uppercase only. Lowercase is query text: `to` and `in` break the clause around them and are reported, while `and`, `or` and `not` are searched for as ordinary words and change what the query means without any warning.
 - A clause the engine cannot interpret is dropped and the rest of the query runs, which widens a conjunction and disables a negation. Every dropped clause is reported: the HTTP API attaches `_discarded_clauses` to the response, and an MCP tool call fails with the reason. Results are never returned as though the query had been understood.
 
 **Sorting**

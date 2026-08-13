@@ -123,7 +123,10 @@ pub const OPERATORS: &[Operator] = &[
         summary: "Combine clauses. Uppercase only.",
         examples: &["title:rust AND year:2024", "title:rust NOT tag:draft"],
         types: &[],
-        caveat: None,
+        caveat: Some(
+            "Lowercase is not reported: `a and b` is three terms, which widens the query, and \
+             `a not b` matches everything.",
+        ),
     },
     Operator {
         syntax: "+term / -term",
@@ -272,6 +275,9 @@ pub const RULES: &[&str] = &[
     "`_seq` is an internal sequence number used to track write-ahead-log position. It is present \
      in every index and technically queryable, but it carries no meaning for a search and should \
      be ignored.",
+    "`AND`, `OR`, `NOT`, `TO` and `IN` are keywords in uppercase only. Lowercase is query text: \
+     `to` and `in` break the clause around them and are reported, while `and`, `or` and `not` are \
+     searched for as ordinary words and change what the query means without any warning.",
     "A clause the engine cannot interpret is dropped and the rest of the query runs, which widens \
      a conjunction and disables a negation. Every dropped clause is reported: the HTTP API \
      attaches `_discarded_clauses` to the response, and an MCP tool call fails with the reason. \
@@ -468,6 +474,8 @@ pub fn compact_reference() -> String {
         "\nTRAPS\n  \
          A clause the engine cannot interpret is dropped, not rejected — the call fails and names \
          it.\n  \
+         `AND` `OR` `NOT` `TO` `IN` count only in uppercase; lowercase is searched for as a word, \
+         and for `and`, `or` and `not` that happens silently.\n  \
          An unindexed field cannot be queried; check the `indexed` flag from `get_index`.\n  \
          Sorting a text or string field is approximate, and sets every `_score` to 1.0.\n  \
          A modifier is searched for as text unless its whole run parses, so give a field list its \

@@ -187,8 +187,14 @@ curl -s -X POST http://localhost:9480/api/books/search \
 > enough. Execution stays lenient here — the hits are returned alongside the note, because a person
 > reading a result page can see it. The MCP tools make the opposite choice and fail the call, since
 > an agent presents rows as fact. Causes include an unknown or unindexed field name, a value that
-> does not match its field's type, an unsupported form such as `field:*`, and an inline `return` or
-> `sort` naming a field the index does not have.
+> does not match its field's type, an unsupported form such as `field:*`, a lowercase `to` or `in`
+> where the keyword was meant, and an inline `return` or `sort` naming a field the index does not
+> have.
+>
+> **Keyword case:** `AND`, `OR`, `NOT`, `TO` and `IN` are keywords in uppercase only, and lowercase
+> is query text. `to` and `in` break the clause around them, so they surface as dropped clauses
+> above. `and`, `or` and `not` do not: they are searched for as ordinary words, which widens a query
+> silently — `a not b` matches everything rather than excluding `b`.
 
 #### Streaming Search
 Get search results as a real-time stream for large result sets.

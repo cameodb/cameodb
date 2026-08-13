@@ -50,6 +50,7 @@ When a user asks a question, you must follow this deterministic loop:
 Every **indexed** field is queryable, whatever its type. Check the `indexed` flag from `get_index` first — an unindexed field silently matches nothing.
 - **Negation:** `-status:deleted` excludes matching records.
 - **Boolean logic:** `(urgent:true OR priority:>5) AND assignee:john`
+- **Keyword case:** `AND`, `OR`, `NOT`, `TO` and `IN` are keywords in uppercase only. Lowercase is query text — `to` and `in` break the clause around them and are reported, but `and`, `or` and `not` are searched for as words and silently change what the query means.
 - **Sets:** `status: IN [active pending]` works on text, string, numeric, date and boolean fields.
 - **Facets:** `category:/electronics/phones` matches that path and everything under it.
 - **Dotted field names:** written as they are, unescaped — `k8s.node:worker-1`.

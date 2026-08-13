@@ -132,13 +132,15 @@ The CLI mirrors Tantivy's query parser (see [docs](https://docs.rs/tantivy/lates
 
 | Syntax | Example | Notes |
 | --- | --- | --- |
-| Field scoping | `title:rust` | Works with dotted JSON paths (`cart.product_id:103`). |
+| Field scoping | `title:rust` | A dotted field name is written unescaped (`k8s.node:worker-1`); a path into a json field is not queryable. |
 | Phrase | `"hybrid search"` | Requires fields indexed with positions. |
 | Boolean | `foo AND bar`, `foo OR -bar` | Unary `+`/`-` preserved via completion. |
 | Range / comparisons | `price:[10 TO 20]`, `rating:>=4` | Hinter ignores `> < = !` so hints still show. |
 | Prefix | `tag:rust*` | Type `*` manually after completion. Rewritten to a lexicographic range; one term, and the field is required. |
 | Boost | `title:rust^2` | Manual entry; CLI does not alter caret syntax. |
 | Sort | `sort field:desc` | Numeric and date fields need the `fast` flag; text and string sort approximately. Order optional (defaults to `asc`). |
+
+**Keyword case:** `AND`, `OR`, `NOT`, `TO` and `IN` are keywords in uppercase only. Lowercase is query text — `to` and `in` break the clause around them and are reported in `_discarded_clauses`, but `and`, `or` and `not` are searched for as words and silently change what the query means (`a not b` matches everything).
 
 If Tantivy adds more operators, update this table and (optionally) extend the completer to understand them.
 
