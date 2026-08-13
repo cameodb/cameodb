@@ -66,7 +66,7 @@ Execute full-text search on a single CameoDB index.
 **Error Handling:**
 - A query whose clause was dropped fails, naming the clause — results that would answer a different question are never returned
 - Errors naming a missing field are appended with the index's field list
-- Zero-results hints for phrase or `AND` queries, suggesting a broader form
+- Zero results carry a `_warning` naming what narrowed the query — a phrase, an `AND`, a required `+clause` or an exclusion — and nothing when the query contains none of them, since bare terms are ORed and were never narrowed
 
 **Parameters:**
 - `index` (string, required): Name of the CameoDB index to search
@@ -305,7 +305,7 @@ schema, and the table below, which is generated and checked against the tables b
 
 | Syntax | Meaning | Field types |
 |---|---|---|
-| `term` | Match a term; several terms are ANDed. | any |
+| `term` | Match a term; several terms are ORed, so a document matching any one of them is returned. | any |
 | `*` | Match every document. | any |
 | `field:value` | Match a value in one field. | text, string, i64, u64, f64, date, boolean, ip, json, facet |
 | `field:"a b"` | Exact phrase, terms in order. Text fields only. | text |

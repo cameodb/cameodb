@@ -83,6 +83,7 @@ When a user asks a question, you must follow this deterministic loop:
 
 ## Querying Across Field Types
 Every **indexed** field is queryable, whatever its type. Check the `indexed` flag from `get_index` first — an unindexed field silently matches nothing, unless it is marked `shadow`.
+- **Terms are ORed:** `quarterly revenue` returns every document matching either word, so each term you add widens the result rather than narrowing it. To require them all, put `AND` between the clauses or `+` in front of each: `+title:quarterly +title:revenue`. This is the one default most likely to be assumed the other way round, and it fails silently — the extra documents look like data.
 - **Negation:** `-status:deleted` excludes matching records.
 - **Boolean logic:** `(urgent:true OR priority:>5) AND assignee:john`
 - **Keyword case:** `AND`, `OR`, `NOT`, `TO` and `IN` are keywords in uppercase only. Lowercase is query text — `to` and `in` break the clause around them and are reported, but `and`, `or` and `not` are searched for as words and silently change what the query means.

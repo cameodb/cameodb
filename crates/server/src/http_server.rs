@@ -312,15 +312,10 @@ impl McpBackend for AppState {
                         .unwrap_or(0);
 
                     if hits_returned == 0
-                        && narrowed_by_phrase_or_conjunction(&query)
+                        && let Some(advice) = zero_results_advice(&query)
                         && let Some(obj) = response.as_object_mut()
                     {
-                        obj.insert(
-                            "_warning".to_string(),
-                            JsonValue::String(
-                                "No exact matches found. Consider removing exact phrase quotes or using broader boolean OR logic.".to_string()
-                            ),
-                        );
+                        obj.insert("_warning".to_string(), JsonValue::String(advice));
                     }
                     Ok(response)
                 }
@@ -586,15 +581,10 @@ impl McpBackend for AppState {
 
             // Add zero-results warning if applicable
             if hits_returned == 0
-                && narrowed_by_phrase_or_conjunction(&query)
+                && let Some(advice) = zero_results_advice(&query)
                 && let Some(obj) = response.as_object_mut()
             {
-                obj.insert(
-                    "_warning".to_string(),
-                    JsonValue::String(
-                        "No exact matches found. Consider removing exact phrase quotes or using broader boolean OR logic.".to_string()
-                    ),
-                );
+                obj.insert("_warning".to_string(), JsonValue::String(advice));
             }
 
             Ok(response)
@@ -1039,8 +1029,61 @@ impl McpBackend for AppState {
 ///
 /// `AND` counts only as a standalone token, the way the parser reads it, so it is not found
 /// inside a value such as `status:ANDROID`.
-fn narrowed_by_phrase_or_conjunction(query: &str) -> bool {
-    query.contains('"') || query.split_whitespace().any(|token| token == "AND")
+/// Why a search that matched nothing may have asked for less than it meant to, or `None` when
+/// the query gives no reason to think so.
+///
+/// The advice names what the query actually contains. Telling a caller to unquote a phrase it
+/// did not write, or to broaden a boolean it did not use, reads as a diagnosis of the result and
+/// sends it looking for something that is not there — worse than saying nothing, because zero
+/// hits is a real answer most of the time.
+///
+/// Inline modifiers are stripped first, so `limit` and `sort` are not counted as query terms.
+///
+/// Only the constructs that actually narrow are listed. Terms alone do not: they are ORed, so a
+/// query of bare terms that returns nothing matched none of them, and there is no narrowing to
+/// undo. The behaviour itself is stated in [`cameodb_mcp::syntax`], which is where a change in
+/// the engine is recorded; this is the diagnosis of one query rather than a second copy of the
+/// reference, which is why it is worded as advice.
+fn zero_results_advice(query: &str) -> Option<String> {
+    let (text, ..) = parse_query_keywords(query);
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+
+    let mut reasons: Vec<&str> = Vec::new();
+
+    if text.contains('"') {
+        reasons.push(
+            "A quoted phrase matches only that exact run of terms, in that order. Try the terms \
+             unquoted, or `field:\"a b\"~2` to allow words between them.",
+        );
+    }
+
+    if tokens.contains(&"AND") {
+        reasons.push(
+            "Every `AND` clause has to match the same document. Try `OR` between them, or drop \
+             the narrowest clause.",
+        );
+    }
+
+    // `+` makes a clause required where the default is not, so two of them are a conjunction
+    // written another way.
+    if tokens.iter().any(|token| token.starts_with('+')) {
+        reasons.push(
+            "A `+clause` is required rather than optional, so every one of them has to match. \
+             Drop the `+` from the clauses that are not essential.",
+        );
+    }
+
+    if tokens
+        .iter()
+        .any(|token| token.starts_with('-') || *token == "NOT")
+    {
+        reasons.push(
+            "An excluded clause removes every document matching it, however well the rest of the \
+             query fits. Check that the exclusion is not taking the answer with it.",
+        );
+    }
+
+    (!reasons.is_empty()).then(|| reasons.join(" "))
 }
 
 /// An index's field definitions, or `Null` if they cannot be read.
@@ -3001,6 +3044,88 @@ mod tests {
 /// the agent to fix a name that was never the problem, and replacing the engine's message with
 /// a guess discards the only account of what actually happened. Neither shows up as a failure
 /// anywhere else, so they are pinned here.
+#[cfg(test)]
+mod zero_results_advice_tests {
+    use super::zero_results_advice;
+
+    /// Zero hits is usually the true answer, and a warning attached to it claims the query asked
+    /// for less than it meant to. Terms alone never do: they are ORed, so a query of bare terms
+    /// that found nothing matched none of them and there is no narrowing to undo. Advice there
+    /// would send a caller to loosen a query that is already as loose as it gets.
+    #[test]
+    fn a_query_with_nothing_narrowing_it_gets_no_warning() {
+        for query in [
+            "rust",
+            "title:rust",
+            "quarterly revenue report",
+            "title:rust title:go",
+            "title:rust limit 5",
+            "status: IN [active pending]",
+            "year:[2020 TO 2024]",
+            "(title:rust OR title:go)",
+        ] {
+            assert_eq!(
+                zero_results_advice(query),
+                None,
+                "{query:?} was diagnosed as narrowed when nothing in it narrows"
+            );
+        }
+    }
+
+    /// The advice has to describe the query in front of it. Advice about quotes on a query with
+    /// no quotes reads as a finding about the data.
+    #[test]
+    fn the_advice_names_only_what_the_query_contains() {
+        let phrase = zero_results_advice(r#"title:"exact phrase""#).expect("a phrase narrows");
+        assert!(phrase.contains("quoted phrase"), "{phrase}");
+        assert!(
+            !phrase.contains("`AND`"),
+            "the query has no AND to broaden: {phrase}"
+        );
+
+        let conjunction = zero_results_advice("title:rust AND year:2024").expect("AND narrows");
+        assert!(conjunction.contains("`AND`"), "{conjunction}");
+        assert!(
+            !conjunction.contains("quoted"),
+            "the query has no quotes to remove: {conjunction}"
+        );
+
+        let both =
+            zero_results_advice(r#"title:"exact phrase" AND year:2024"#).expect("both narrow");
+        assert!(
+            both.contains("quoted phrase") && both.contains("`AND`"),
+            "both apply and both should be said: {both}"
+        );
+    }
+
+    /// The two ways to narrow that are not the word `AND`, and the reason the default operator
+    /// has to be right for any of this to be: with terms ORed, `+` is what a caller reaches for
+    /// to require a clause, and it is easy to leave on one that need not be required.
+    #[test]
+    fn required_and_excluded_clauses_are_recognised_as_narrowing() {
+        let required = zero_results_advice("+title:rust +year:2024").expect("`+` requires");
+        assert!(required.contains("required"), "{required}");
+
+        for query in ["title:rust -tag:draft", "title:rust NOT tag:draft"] {
+            let excluded = zero_results_advice(query).expect("an exclusion narrows");
+            assert!(
+                excluded.contains("excluded"),
+                "{query:?} excludes documents and the advice missed it: {excluded}"
+            );
+        }
+    }
+
+    /// Modifiers are query syntax, not query text, so they must not be read as clauses.
+    #[test]
+    fn inline_modifiers_are_stripped_before_the_query_is_read() {
+        assert_eq!(zero_results_advice("rust limit 5"), None);
+        assert!(
+            zero_results_advice(r#"title:"a b" limit 5"#).is_some(),
+            "stripping the modifier must not take the phrase with it"
+        );
+    }
+}
+
 #[cfg(test)]
 mod search_error_interception_tests {
     use super::{names_a_missing_field, with_valid_fields};

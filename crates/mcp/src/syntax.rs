@@ -64,12 +64,15 @@ pub struct NotSupported {
 pub const OPERATORS: &[Operator] = &[
     Operator {
         syntax: "term",
-        summary: "Match a term; several terms are ANDed.",
+        summary: "Match a term; several terms are ORed, so a document matching any one of them \
+                  is returned.",
         examples: &["rust database", "machine learning"],
         types: &[],
         caveat: Some(
             "Without a field name only text, string and json fields are searched. Numeric, date, \
-             boolean, ip and facet fields must be named explicitly.",
+             boolean, ip and facet fields must be named explicitly. Adding a term widens the \
+             result rather than narrowing it: put `AND` between clauses, or `+` in front of each, \
+             to require them all.",
         ),
     },
     Operator {
@@ -498,6 +501,8 @@ pub fn compact_reference() -> String {
     }
     out.push_str(
         "\nTRAPS\n  \
+         Terms with no operator between them are ORed, so each one added widens the result. \
+         `AND` or `+` is what requires them all.\n  \
          A clause the engine cannot interpret is dropped, not rejected — the call fails and names \
          it.\n  \
          `AND` `OR` `NOT` `TO` `IN` count only in uppercase; lowercase is searched for as a word, \

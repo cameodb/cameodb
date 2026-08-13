@@ -1181,3 +1181,79 @@ async fn an_over_long_description_is_refused_at_the_config_endpoint() {
         "a refused config must not leave the index half-created: {listed}"
     );
 }
+
+/// The default operator, checked against the engine rather than assumed.
+///
+/// Every syntax surface is rendered from one table, so a wrong entry there is wrong in the tool
+/// descriptions, the reference and the prompt at once. This one said terms were ANDed, which
+/// inverts the advice it leads to: an agent narrowing a result by adding a term widens it
+/// instead, and the extra documents arrive looking like data rather than like a mistake.
+#[tokio::test]
+async fn bare_terms_are_ored_the_way_the_syntax_reference_says() {
+    let node = TestNode::start().await;
+    node.create_index("docs").await;
+    for (id, title) in [("d1", "alpha record"), ("d2", "beta record")] {
+        let status = http()
+            .put(format!("{}/api/docs/document", node.url))
+            .json(&json!({
+                "id": id,
+                "doc": {"id": id, "title": title, "created": "2024-01-01T00:00:00Z"}
+            }))
+            .send()
+            .await
+            .expect("write")
+            .status();
+        assert!(status.is_success(), "seeding {id} failed: {status}");
+    }
+    node.await_searchable("docs", 2).await;
+
+    let hits = |result: &Value| -> u64 { result["total_hits"].as_u64().unwrap_or_default() };
+
+    // One term per document, so ANDing them would match nothing and ORing them matches both.
+    let (is_error, ored) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "docs", "query": "alpha beta"}),
+        )
+        .await;
+    assert!(!is_error, "search failed: {ored}");
+    assert_eq!(
+        hits(&ored),
+        2,
+        "two terms returned fewer documents than either alone, so they are not ORed: {ored}"
+    );
+
+    // And the operator that does require both still does.
+    let (_, anded) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "docs", "query": "title:alpha AND title:beta"}),
+        )
+        .await;
+    assert_eq!(
+        hits(&anded),
+        0,
+        "no document has both terms, so `AND` must return nothing: {anded}"
+    );
+
+    // The zero-results advice follows from that: `AND` narrows and is worth explaining, while
+    // terms that matched nothing were never narrowed and get no warning to undo.
+    assert!(
+        anded["_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("`AND`")),
+        "an AND query that found nothing should say what narrowed it: {anded}"
+    );
+    let (_, nothing) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "docs", "query": "nonexistent absent missing"}),
+        )
+        .await;
+    assert_eq!(hits(&nothing), 0);
+    assert!(
+        nothing.get("_warning").is_none(),
+        "these terms are ORed, so there is no narrowing to undo and nothing to warn about: \
+         {nothing}"
+    );
+}
