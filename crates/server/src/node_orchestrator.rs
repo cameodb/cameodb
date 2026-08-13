@@ -3557,6 +3557,34 @@ impl RouterActor {
         routing_key: Option<String>,
         operation_type: OperationType,
     ) -> Result<JsonValue, OrchestratorError> {
+        self.route_and_handle_inner(op, routing_key, operation_type, true)
+            .await
+    }
+
+    /// [`route_and_handle`](Self::route_and_handle) for a caller that merges the response itself.
+    ///
+    /// The internal `SORT_KEY_FIELD` survives, so a merge across several of these calls can
+    /// order by the sort field even where a projection dropped it. **The caller now owes the
+    /// strip**: the key is metadata and must not reach a client. Re-deriving the key from the
+    /// hit is not an alternative — the sort field may have been projected away, which is the
+    /// reason the key exists at all.
+    pub async fn route_and_handle_keeping_sort_keys(
+        &self,
+        op: ClientOp,
+        routing_key: Option<String>,
+        operation_type: OperationType,
+    ) -> Result<JsonValue, OrchestratorError> {
+        self.route_and_handle_inner(op, routing_key, operation_type, false)
+            .await
+    }
+
+    async fn route_and_handle_inner(
+        &self,
+        op: ClientOp,
+        routing_key: Option<String>,
+        operation_type: OperationType,
+        strip_sort_keys_on_exit: bool,
+    ) -> Result<JsonValue, OrchestratorError> {
         // Metadata operations (schema/config) always execute locally - no need to broadcast
         if matches!(
             op,
@@ -3568,8 +3596,10 @@ impl RouterActor {
         // Search/Stream responses carry an internal `SORT_KEY_FIELD` on each hit so that
         // merges can order by the sort field even when it is projected away. This is the
         // single client-facing boundary for every routing decision (local, broadcast,
-        // remote, streaming-buffered), so strip that metadata here before returning.
-        let is_search = matches!(op, ClientOp::Search { .. } | ClientOp::Stream { .. });
+        // remote, streaming-buffered), so strip that metadata here before returning — unless
+        // the caller is itself a merge and asked to keep it.
+        let is_search = strip_sort_keys_on_exit
+            && matches!(op, ClientOp::Search { .. } | ClientOp::Stream { .. });
 
         // Resolve locally before asking anyone. The ring and the shard placement are both
         // published lock-free and already in hand, and between them they answer the only

@@ -406,9 +406,12 @@ impl McpBackend for AppState {
                         },
                     });
 
+                    // The merge below orders by `_sort_key`, so this is the one caller that
+                    // needs it to survive the routing path. The strip after the merge is what
+                    // keeps it off the response.
                     let result = state
                         .router
-                        .route_and_handle(
+                        .route_and_handle_keeping_sort_keys(
                             ClientOp::Search {
                                 index: index.clone(),
                                 query: cleaned_query,
