@@ -118,6 +118,51 @@ max_shards_per_node = 1
         assert!(status.is_success(), "creating '{index}' failed: {status}");
     }
 
+    /// An index identified by `sha1` rather than by `id`, the shape an import produces when the
+    /// source data names its own identifier.
+    ///
+    /// `sha1` is a shadow of `id`: unindexed and unstored, kept in the schema so that a query
+    /// naming it still resolves to the identifier it duplicates.
+    async fn create_shadow_index(&self, index: &str) {
+        let status = http()
+            .put(format!("{}/api/{index}/_config", self.url))
+            .json(&json!({
+                "fields": {
+                    "title": {"field_type": "text", "indexed": true},
+                    "sha1": {
+                        "field_type": "text",
+                        "indexed": false,
+                        "stored": false,
+                        "is_shadow": true,
+                    },
+                }
+            }))
+            .send()
+            .await
+            .expect("create shadow config")
+            .status();
+        assert!(status.is_success(), "creating '{index}' failed: {status}");
+    }
+
+    /// Write documents whose `sha1` repeats their `id`, the way an import copies the source's
+    /// identifier into the canonical field.
+    async fn seed_shadow(&self, index: &str, ids: &[&str]) {
+        for id in ids {
+            let status = http()
+                .put(format!("{}/api/{index}/document", self.url))
+                .json(&json!({
+                    "id": id,
+                    "doc": {"id": id, "sha1": id, "title": "quarterly record"}
+                }))
+                .send()
+                .await
+                .expect("write")
+                .status();
+            assert!(status.is_success(), "seeding {id} failed: {status}");
+        }
+        self.await_searchable(index, ids.len()).await;
+    }
+
     /// Write `documents` as `(id, created)` pairs, then wait until they are searchable.
     async fn seed(&self, index: &str, documents: &[(&str, &str)]) {
         for (id, created) in documents {
@@ -133,9 +178,12 @@ max_shards_per_node = 1
                 .status();
             assert!(status.is_success(), "seeding {id} failed: {status}");
         }
+        self.await_searchable(index, documents.len()).await;
+    }
 
-        // The write path schedules a commit rather than performing one, so poll for visibility
-        // instead of sleeping.
+    /// The write path schedules a commit rather than performing one, so poll for visibility
+    /// instead of sleeping.
+    async fn await_searchable(&self, index: &str, expected: usize) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             let resp = http()
@@ -145,7 +193,7 @@ max_shards_per_node = 1
                 .await
                 .expect("search");
             let body: Value = resp.json().await.expect("search json");
-            if body["total_hits"].as_u64() == Some(documents.len() as u64) {
+            if body["total_hits"].as_u64() == Some(expected as u64) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -818,5 +866,188 @@ async fn validate_query_recognises_a_field_the_index_has() {
     assert!(
         unknown.contains(&"nosuchfield"),
         "an absent field must still be called out: {missing}"
+    );
+}
+
+/// A shadow field is the identifier under the name the source data gave it — `sha1`, `book_id` —
+/// and querying it is querying `id`.
+///
+/// It is not in the search index, so every discovery surface described it as an unindexed field
+/// and `validate_query` warned that a query naming it would not match. Both were wrong in the
+/// expensive direction: that query is the one retrieval CameoDB answers from the key-value store
+/// without touching the search index at all, and an agent told to avoid it loses the fastest
+/// lookup the index has.
+#[tokio::test]
+async fn a_shadow_field_is_described_as_the_queryable_alias_of_id() {
+    let node = TestNode::start().await;
+    node.create_shadow_index("files").await;
+    node.seed_shadow("files", &["deadbeef01", "cafe02"]).await;
+
+    // The claim the discovery tools are about to make, checked against the engine first: this
+    // query works, so anything describing it as unqueryable is describing something else.
+    let (is_error, found) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "files", "query": "sha1:deadbeef01"}),
+        )
+        .await;
+    assert!(!is_error, "a shadow-field lookup failed: {found}");
+    assert_eq!(
+        found["total_hits"].as_u64(),
+        Some(1),
+        "the shadow lookup found nothing, so the rest of this test proves nothing: {found}"
+    );
+
+    // Which field that was is only discoverable if the flag is reported.
+    let (_, described) = node.call_tool("get_index", json!({"index": "files"})).await;
+    let fields = described["fields"].as_array().expect("a fields array");
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|f| f["field"] == name)
+            .unwrap_or_else(|| panic!("no entry for '{name}': {described}"))
+            .clone()
+    };
+    assert_eq!(
+        field("sha1")["shadow"].as_bool(),
+        Some(true),
+        "nothing in the description distinguishes the identifier's own name from a dead field: \
+         {described}"
+    );
+    assert_eq!(
+        field("title")["shadow"].as_bool(),
+        Some(false),
+        "the flag has to be present on every field to be readable as an answer: {described}"
+    );
+
+    // And `validate_query`, which is where an agent goes when it doubts a query, must not send
+    // it away from one that works.
+    let (_, validated) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "files", "query": "sha1:deadbeef01"}),
+        )
+        .await;
+    let analysis = &validated["query_analysis"];
+    let names = |key: &str| -> Vec<String> {
+        analysis[key]
+            .as_array()
+            .map(|f| {
+                f.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        names("recognized_fields").contains(&"sha1".to_string()),
+        "the field the working query names must be recognised: {validated}"
+    );
+    assert!(
+        !names("not_indexed_fields").contains(&"sha1".to_string()),
+        "unindexed is true of the search index and false of the query: {validated}"
+    );
+    let warnings = names("warnings").join(" ");
+    assert!(
+        !warnings.contains("will not match"),
+        "the query does match, and this warning is why an agent would not send it: {validated}"
+    );
+
+    let listed = validated["available_fields"]
+        .as_array()
+        .expect("available_fields");
+    let sha1 = listed
+        .iter()
+        .find(|f| f["field"] == "sha1")
+        .unwrap_or_else(|| panic!("sha1 missing from available_fields: {validated}"));
+    assert_eq!(
+        sha1["queryable"].as_bool(),
+        Some(true),
+        "a field the engine answers on is queryable: {validated}"
+    );
+    assert_eq!(sha1["shadow"].as_bool(), Some(true), "{validated}");
+    assert!(
+        sha1["query_hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("id")),
+        "a shadow field's hint has to say what it is a shadow of: {validated}"
+    );
+}
+
+/// The other direction, which is where the name does the surprising work.
+///
+/// A shadow field stores nothing: the value moved into `id` on write, and on read `id` comes back
+/// under the descriptive name instead. So the identifier an agent must project and pivot on is the
+/// shadow name, and asking for `id` — the obvious thing to ask for — returns a document with
+/// nothing in it and no explanation. The hint has to say so, which means this has to stay true.
+#[tokio::test]
+async fn a_shadow_index_returns_its_identifier_under_the_shadow_name() {
+    let node = TestNode::start().await;
+    node.create_shadow_index("files").await;
+    node.seed_shadow("files", &["deadbeef01"]).await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "files", "query": "title:record"}),
+        )
+        .await;
+    assert!(!is_error, "search failed: {result}");
+
+    let hit = &result["hits"][0];
+    assert_eq!(
+        hit["sha1"].as_str(),
+        Some("deadbeef01"),
+        "the identifier must come back under the name the schema gives it: {result}"
+    );
+    assert!(
+        hit.get("id").is_none(),
+        "if `id` were also present the shadow name would be a convenience rather than the only \
+         way to read the identifier, and the guidance would be overstating the case: {result}"
+    );
+
+    // What an agent that trusts `id` gets instead. Pinned because the hint promises this, not
+    // because an empty projection is desirable.
+    let (_, projected) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "files", "query": "title:record", "fields": ["id"]}),
+        )
+        .await;
+    let hit = &projected["hits"][0];
+    assert!(
+        hit.get("id").is_none() && hit.get("sha1").is_none(),
+        "projecting `id` on a shadow index returns nothing, which is what the hint tells an \
+         agent to expect: {projected}"
+    );
+}
+
+/// The restriction that comes with it, pinned so the guidance stays checkable.
+///
+/// The key-value bypass recognises `field:VALUE` and nothing else, so the same clause inside a
+/// boolean query is dropped by the parser — which is what makes the whole-query form worth
+/// naming rather than describing the field as generally searchable.
+#[tokio::test]
+async fn a_shadow_field_inside_a_larger_query_is_reported_rather_than_answered() {
+    let node = TestNode::start().await;
+    node.create_shadow_index("files").await;
+    node.seed_shadow("files", &["deadbeef01"]).await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "files", "query": "sha1:deadbeef01 AND title:record"}),
+        )
+        .await;
+    assert!(
+        is_error,
+        "the sha1 clause was dropped and the hits came from title alone; answering as though \
+         the query had run is the failure mode the dropped-clause report exists to prevent: \
+         {result}"
+    );
+    assert!(
+        result.to_string().contains("sha1"),
+        "the refusal must name the clause that was dropped: {result}"
     );
 }

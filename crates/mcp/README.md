@@ -48,7 +48,7 @@ Schema and field structures are optimized to return only relevant information fo
 3. **`search_index`** → Construct queries using the field names and operators learned from the schema
 4. **`validate_query`** *(optional)* → Get structural validation, typo detection ("did you mean?"), and the full syntax reference with operator-by-field-type matrix
 
-Each `available_fields` entry (from `validate_query`) and `fields` entry (from `get_index`/`list_indexes`) carries a `query_hint` naming the operators that field's type supports, plus the `indexed` and `fast` flags that decide whether it can be queried and sorted at all. The hints are rendered from [`src/syntax.rs`](src/syntax.rs), so they cannot disagree with the reference.
+Each `available_fields` entry (from `validate_query`) and `fields` entry (from `get_index`/`list_indexes`) carries a `query_hint` naming the operators that field's type supports, plus the `indexed`, `fast` and `shadow` flags that decide whether it can be queried and sorted at all. The hints are rendered from [`src/syntax.rs`](src/syntax.rs), so they cannot disagree with the reference.
 
 This means an agent can go from zero knowledge to well-formed queries in **two tool calls** (`list_indexes` → `search_index`), with the schema metadata providing all the guidance needed for operator selection.
 
@@ -140,6 +140,8 @@ Retrieve schema and statistics for a single CameoDB index.
 
 **Returns:** Complete field definitions, types, document count, size, metadata, and a `fields` array with per-field details, plus `query_hints` section showing which operators work with each field type.
 
+A field marked `shadow` is the document identifier under the name the source data gave it. The value lives only in `id` and is not stored or indexed again under that name, so the field is a name in the schema rather than data in the index — and the name is applied to `id` in both directions. It is queryable despite being unindexed (`shadow_field:VALUE` on its own is the same key-value lookup as `id:VALUE`), and every hit returns the identifier under the shadow name with no `id` field, so `indexed` alone answers neither what may be queried nor what may be projected.
+
 **Example:**
 ```json
 {
@@ -158,19 +160,22 @@ Retrieve schema and statistics for a single CameoDB index.
       "field": "id",
       "type": "text",
       "indexed": true,
-      "fast": false
+      "fast": false,
+      "shadow": false
     },
     {
-      "field": "title",
+      "field": "sha1",
       "type": "text",
-      "indexed": true,
-      "fast": true
+      "indexed": false,
+      "fast": false,
+      "shadow": true
     },
     {
       "field": "year",
       "type": "i64",
       "indexed": true,
-      "fast": true
+      "fast": true,
+      "shadow": false
     }
   ],
   "query_hints": [
@@ -337,7 +342,8 @@ schema, and the table below, which is generated and checked against the tables b
 **Rules**
 
 - A field name containing a dot is written as it is, unescaped: `k8s.node:worker-1`. Escaping the dot makes the lookup miss.
-- A field that exists in the schema but is not indexed cannot be queried. Fields discovered from a document are added unindexed, and stay that way until a schema update promotes them, so check the `indexed` flag before naming a field.
+- A field that exists in the schema but is not indexed cannot be queried, unless it is marked `shadow`. Fields discovered from a document are added unindexed, and stay that way until a schema update promotes them, so check the `indexed` flag before naming a field.
+- A field marked `shadow` is the name the source data used for its identifier. The value lives only in `id`, the key in both the key-value store and the search index, and is never stored or indexed again under the descriptive name — the schema carries the name and nothing carries a second copy of the data, which is what makes the field a shadow. Querying it is therefore querying `id`: `shadowfield:VALUE` on its own is the fastest retrieval CameoDB has, answered without the search index, and it is the only form that works — named inside a larger query the clause is dropped and reported, and a `*` in the value counts as part of the identifier rather than as a prefix, so it matches nothing. Results come back the same way round: every hit carries the identifier under the shadow name and has no `id` field, so name the shadow field in `fields` or `return`. Asking for `id` there returns a document with nothing in it, and no warning that the field it named is one no document has.
 - `_seq` is an internal sequence number used to track write-ahead-log position. It is present in every index and technically queryable, but it carries no meaning for a search and should be ignored.
 - `AND`, `OR`, `NOT`, `TO` and `IN` are keywords in uppercase only. Lowercase is query text: `to` and `in` break the clause around them and are reported, while `and`, `or` and `not` are searched for as ordinary words and change what the query means without any warning.
 - A clause the engine cannot interpret is dropped and the rest of the query runs, which widens a conjunction and disables a negation. Every dropped clause is reported: the HTTP API attaches `_discarded_clauses` to the response, and an MCP tool call fails with the reason. Results are never returned as though the query had been understood.

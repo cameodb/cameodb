@@ -743,24 +743,28 @@ impl McpBackend for AppState {
                                 "field": info.name,
                                 "type": info.field_type,
                                 "indexed": info.indexed,
+                                "shadow": info.is_shadow,
+                                "queryable": info.is_queryable(),
                             })
                         })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
 
-            // Field-type-aware schema summary
+            // Field-type-aware schema summary. Shadow fields are listed rather than filtered
+            // out: hiding the identifier's own name from the field list is what sent an agent
+            // to reconstruct a lookup the index already answers in one hop.
             let fields_with_types: Vec<JsonValue> = field_infos
                 .iter()
-                .filter(|info| !info.is_shadow && info.name != "_seq")
+                .filter(|info| info.name != "_seq")
                 .map(|info| {
-                    let hint = field_type_query_hint(&info.field_type);
                     serde_json::json!({
                         "field": info.name,
                         "type": info.field_type,
                         "indexed": info.indexed,
-                        "queryable": info.indexed && !info.is_shadow,
-                        "query_hint": hint,
+                        "shadow": info.is_shadow,
+                        "queryable": info.is_queryable(),
+                        "query_hint": field_query_hint(info),
                     })
                 })
                 .collect();
@@ -1156,6 +1160,16 @@ struct FieldInfo {
     is_shadow: bool,
 }
 
+impl FieldInfo {
+    /// Whether a query may name this field.
+    ///
+    /// Not the same question as `indexed`: a shadow field is deliberately absent from the search
+    /// index and is still the one field CameoDB answers on without consulting it.
+    fn is_queryable(&self) -> bool {
+        self.indexed || self.is_shadow
+    }
+}
+
 fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
     let fields_obj = value
         .get("schema")
@@ -1207,7 +1221,7 @@ fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
 /// Read back the compact `fields` array that [`enrich_index_entry`] writes.
 ///
 /// The inverse of the projection performed there, and deliberately not a second source of
-/// truth: it recovers exactly the four properties that form carries.
+/// truth: it recovers exactly the properties that form carries.
 fn compact_field_info(value: &JsonValue) -> Vec<FieldInfo> {
     let Some(entries) = value.get("fields").and_then(|fields| fields.as_array()) else {
         return Vec::new();
@@ -1229,10 +1243,10 @@ fn compact_field_info(value: &JsonValue) -> Vec<FieldInfo> {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true),
                 fast: entry.get("fast").and_then(|v| v.as_bool()).unwrap_or(false),
-                // The compact form carries no shadow flag. It costs nothing today because a
-                // shadow field is always `indexed: false`, and every reader that asks about
-                // shadow asks it alongside `indexed`.
-                is_shadow: false,
+                is_shadow: entry
+                    .get("shadow")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             })
         })
         .collect()
@@ -1270,7 +1284,7 @@ fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
         })
         .collect();
 
-    // Build compact field list (field, type, indexed, fast)
+    // Build compact field list (field, type, indexed, fast, shadow)
     let fields: Vec<JsonValue> = field_infos
         .iter()
         .filter(|info| info.name != "_seq")
@@ -1280,6 +1294,10 @@ fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
                 "type": info.field_type,
                 "indexed": info.indexed,
                 "fast": info.fast,
+                // On every field rather than only where true: a flag that appears by its absence
+                // cannot be read as an answer, and `indexed: false` without it describes a field
+                // nothing can query — the opposite of what a shadow field is.
+                "shadow": info.is_shadow,
             })
         })
         .collect();
@@ -1300,6 +1318,18 @@ fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
 /// Rendered from [`cameodb_mcp::syntax`], the one table every syntax surface reads.
 fn field_type_query_hint(field_type: &str) -> String {
     cameodb_mcp::syntax::hint_for_type(field_type)
+}
+
+/// What this particular field supports.
+///
+/// A shadow field takes the shadow rule rather than its type's operator list: it is not in the
+/// search index, so none of the forms its type would otherwise support reach it.
+fn field_query_hint(info: &FieldInfo) -> String {
+    if info.is_shadow {
+        cameodb_mcp::syntax::SHADOW_FIELD.to_string()
+    } else {
+        field_type_query_hint(&info.field_type)
+    }
 }
 
 fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> JsonValue {
@@ -1346,9 +1376,9 @@ fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> JsonValue {
     // Extract field references (handle phrases and parens gracefully)
     let referenced_fields = extract_query_fields(query_text);
 
-    let indexed_names: Vec<&str> = field_infos
+    let queryable_names: Vec<&str> = field_infos
         .iter()
-        .filter(|info| info.indexed && !info.is_shadow)
+        .filter(|info| info.is_queryable())
         .map(|info| info.name.as_str())
         .collect();
 
@@ -1360,13 +1390,13 @@ fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> JsonValue {
     let mut field_hints = Vec::new();
 
     for field_name in &referenced_fields {
-        if indexed_names.contains(&field_name.as_str()) {
+        if queryable_names.contains(&field_name.as_str()) {
             recognized.push(field_name.clone());
             if let Some(info) = field_infos.iter().find(|i| i.name == *field_name) {
                 field_hints.push(serde_json::json!({
                     "field": field_name,
                     "type": info.field_type,
-                    "hint": field_type_query_hint(&info.field_type),
+                    "hint": field_query_hint(info),
                 }));
             }
         } else if all_names.contains(&field_name.as_str()) {
@@ -1383,7 +1413,7 @@ fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> JsonValue {
     if !unknown.is_empty() && !all_names.is_empty() {
         for unk in &unknown {
             let unk_lower = unk.to_lowercase();
-            let close_matches: Vec<&str> = indexed_names
+            let close_matches: Vec<&str> = queryable_names
                 .iter()
                 .filter(|known| {
                     let known_lower = known.to_lowercase();
@@ -1402,9 +1432,9 @@ fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> JsonValue {
                 ));
             } else {
                 warnings.push(format!(
-                    "Unknown field '{}'. Available indexed fields: {}.",
+                    "Unknown field '{}'. Available queryable fields: {}.",
                     unk,
-                    indexed_names.join(", ")
+                    queryable_names.join(", ")
                 ));
             }
         }

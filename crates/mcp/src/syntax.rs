@@ -265,13 +265,39 @@ pub const NOT_SUPPORTED: &[NotSupported] = &[
 /// Characters the query grammar reserves. A literal one must be escaped with a backslash.
 pub const RESERVED_CHARACTERS: &str = "+ ^ ` : { } \" ' [ ] ( ) ! \\ * and space";
 
+/// What a field marked `shadow` is, how it is queried, and how it comes back.
+///
+/// A shadow field is the name the source data used for its identifier. On write that value moves
+/// into `id`, the key in both the key-value store and the search index, and is not stored or
+/// indexed a second time under the descriptive name — the schema keeps the name, nothing keeps a
+/// copy of the data, which is what makes the field a shadow. The name is then applied to `id` in
+/// both directions: a query naming it resolves to `id`, and a document returns its identifier
+/// under it.
+///
+/// Its own constant because it is both a rule about querying and the per-field hint a schema
+/// listing attaches, and the two must not drift. Deliberately not derived from the field's type:
+/// a shadow field is absent from the search index, so none of the operators its type would
+/// otherwise support reach it.
+pub const SHADOW_FIELD: &str = "A field marked `shadow` is the name the source data used for its identifier. The value lives \
+     only in `id`, the key in both the key-value store and the search index, and is never stored \
+     or indexed again under the descriptive name — the schema carries the name and nothing carries \
+     a second copy of the data, which is what makes the field a shadow. Querying it is therefore \
+     querying `id`: `shadowfield:VALUE` on its own is the fastest retrieval CameoDB has, answered \
+     without the search index, and it is the only form that works — named inside a larger query \
+     the clause is dropped and reported, and a `*` in the value counts as part of the identifier \
+     rather than as a prefix, so it matches nothing. Results come back the same way round: every \
+     hit carries the identifier under the shadow name and has no `id` field, so name the shadow \
+     field in `fields` or `return`. Asking for `id` there returns a document with nothing in it, \
+     and no warning that the field it named is one no document has.";
+
 /// Facts about querying that belong to no single operator.
 pub const RULES: &[&str] = &[
     "A field name containing a dot is written as it is, unescaped: `k8s.node:worker-1`. Escaping \
      the dot makes the lookup miss.",
-    "A field that exists in the schema but is not indexed cannot be queried. Fields discovered \
-     from a document are added unindexed, and stay that way until a schema update promotes them, \
-     so check the `indexed` flag before naming a field.",
+    "A field that exists in the schema but is not indexed cannot be queried, unless it is marked \
+     `shadow`. Fields discovered from a document are added unindexed, and stay that way until a \
+     schema update promotes them, so check the `indexed` flag before naming a field.",
+    SHADOW_FIELD,
     "`_seq` is an internal sequence number used to track write-ahead-log position. It is present \
      in every index and technically queryable, but it carries no meaning for a search and should \
      be ignored.",
@@ -476,7 +502,9 @@ pub fn compact_reference() -> String {
          it.\n  \
          `AND` `OR` `NOT` `TO` `IN` count only in uppercase; lowercase is searched for as a word, \
          and for `and`, `or` and `not` that happens silently.\n  \
-         An unindexed field cannot be queried; check the `indexed` flag from `get_index`.\n  \
+         An unindexed field cannot be queried; check the `indexed` flag from `get_index`. The \
+         exception is a `shadow` field, which is the identifier under another name: query it as \
+         `field:VALUE` on its own, and expect it in results in place of `id`.\n  \
          Sorting a text or string field is approximate, and sets every `_score` to 1.0.\n  \
          A modifier is searched for as text unless its whole run parses, so give a field list its \
          commas and a sort an `asc` or `desc`.\n",
@@ -616,6 +644,33 @@ mod tests {
         assert_eq!(
             reference["field_types"].as_array().map(Vec::len),
             Some(FIELD_TYPES.len())
+        );
+    }
+
+    /// Every surface that tells an agent what it may query has to carry the shadow rule, because
+    /// the flag it explains contradicts the `indexed` flag reported beside it: without the rule,
+    /// `indexed: false` reads as a field nothing can match, and the fastest lookup in the index
+    /// goes unused.
+    #[test]
+    fn every_surface_that_talks_about_queryability_carries_the_shadow_rule() {
+        assert!(
+            RULES.contains(&SHADOW_FIELD),
+            "the shadow rule must be one of the rules, which is what renders it everywhere"
+        );
+        assert!(
+            reference_json().to_string().contains("shadowfield:VALUE"),
+            "the full reference omits the shadow rule"
+        );
+        assert!(
+            markdown_reference().contains("shadowfield:VALUE"),
+            "the markdown reference omits the shadow rule"
+        );
+        // The compact reference writes its own traps list rather than rendering `RULES`, so it
+        // is the one that can lose the exception while the others keep it.
+        assert!(
+            compact_reference().contains("shadow"),
+            "the tool descriptions warn that an unindexed field cannot be queried without \
+             naming the exception"
         );
     }
 

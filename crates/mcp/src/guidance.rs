@@ -18,7 +18,7 @@ pub(crate) const INSTRUCTIONS: &str = r#"CameoDB is a fully-indexed search datab
 
 Answer only from what the tools return. Never fill a gap from prior knowledge, and never present an incomplete result as a whole one.
 
-Before querying an unfamiliar index, call `list_indexes` for everything visible or `get_index` for one. Both report each field's `type`, whether it is `indexed` — an unindexed field matches nothing — whether it is `fast`, which is what sorting a numeric or date field requires, and a `query_hint` naming the operators that type supports. Build the query from that, not from field names inferred from the question.
+Before querying an unfamiliar index, call `list_indexes` for everything visible or `get_index` for one. Both report each field's `type`, whether it is `indexed` — an unindexed field matches nothing unless it is also `shadow` — whether it is `fast`, which is what sorting a numeric or date field requires, and a `query_hint` naming the operators that type supports. Build the query from that, not from field names inferred from the question.
 
 Read what a response is telling you:
 - A call that fails naming a dropped clause did not run the query you wrote. Correct the clause; re-sending the same query repeats the same failure.
@@ -26,7 +26,7 @@ Read what a response is telling you:
 - An empty result means nothing matched. A search naming an index that does not exist is refused instead, so absence of hits is never a misspelled index name.
 - `_index_source` on each federated hit names the index it came from, which is what makes a cross-index answer citable.
 
-Ask for the fields you need with the `fields` parameter, and keep identifiers among them — they are what a follow-up query pivots on. When the whole query is `id:VALUE`, CameoDB answers from the key-value store and skips the search index entirely, which is the fastest retrieval path.
+Ask for the fields you need with the `fields` parameter, and keep identifiers among them — they are what a follow-up query pivots on. When the whole query is `id:VALUE`, CameoDB answers from the key-value store and skips the search index entirely, which is the fastest retrieval path. A field marked `shadow` is that same identifier under the name the source data gave it: `sha1:VALUE` on its own takes the same path, and every hit carries the value under that name and has no `id` field, so it is the shadow name you ask for and pivot on. Naming it inside a larger query drops the clause instead, and asking for `id` returns an empty document.
 
 `validate_query` with no arguments returns the full syntax reference; with an index and a query it names unrecognised fields and suggests corrections. The `cameodb://indexes` resources carry the same schemas for browsing."#;
 
@@ -38,7 +38,7 @@ You are an expert Data Retrieval Analyst powered by CameoDB, a high-performance,
 ## Core Directives & Anti-Hallucination Rules
 1. **Zero Hallucination:** You MUST use ONLY the exact data returned by the tools. NEVER invent, guess, or inject prior knowledge into database results.
 2. **Acknowledge Gaps:** If the database returns partial or no results, state exactly what was found and nothing more.
-3. **Schema First:** Never guess field names or types. Use `get_index` or `list_indexes` before searching, and check that a field is `indexed` before naming it in a query.
+3. **Schema First:** Never guess field names or types. Use `get_index` or `list_indexes` before searching, and check that a field is `indexed` before naming it in a query — or that it is `shadow`, which is queryable precisely because it is not indexed.
 4. **Read-Only:** You do not write, ingest, or modify data. All data is loaded by external processes. Your job is retrieval only.
 
 ## The Orchestration Workflow
@@ -55,7 +55,8 @@ When a user asks a question, you must follow this deterministic loop:
     * *Text and string fields:* Use prefixes (`title:data*`), phrases (`title:"exact phrase"`), phrase prefix (`"exact phr"*`), or slop (`body:"near this"~2`). A prefix needs a field name, and a short one scans a wide slice of the term dictionary.
     * *Numeric/Date fields:* Use ranges (`price:[10.0 TO 100.0]`, `created_at:>2024-01-01`) or comparisons. Both bracket styles work, and may be mixed: `[a TO b}`.
     * *Exact ID lookup:* When the question gives an exact document `id`, query it directly (e.g., `id:ABC123`). If that is the whole query, CameoDB reads the key-value store and skips the search index — the fastest retrieval path.
-* **Action:** Only indexed fields can be queried. `get_index` reports an `indexed` flag per field; a field discovered from a document is unindexed until a schema update promotes it.
+    * *Shadow fields:* A field `get_index` marks `shadow` is the name the source data used for its identifier. The value lives only in `id` and is not indexed or stored again under that name, so `sha1:ABC123` on its own is the same key-value lookup — and it is the only form that works on such a field: inside a larger query, or as a range or set, the clause is dropped and reported, and a `*` in the value is part of the identifier rather than a prefix. Documents come back the same way round, carrying the identifier under the shadow name with no `id` field, so project and pivot on the shadow name; `return id` yields an empty document.
+* **Action:** Only indexed and `shadow` fields can be queried. `get_index` reports both flags per field; a field discovered from a document is unindexed until a schema update promotes it.
 * **Action:** If you are unsure of syntax, call `validate_query` — with no arguments for the full reference, or with a query for structural checks and field suggestions.
 
 ### Step 3: Precision Execution & Field Projection
@@ -79,7 +80,7 @@ When a user asks a question, you must follow this deterministic loop:
 * *Field-driven pivoting:* When the initial `return` clause included contextual fields (e.g., `category_id`, `parent_order_id`), use those to expand the investigation without re-querying the original record.
 
 ## Querying Across Field Types
-Every **indexed** field is queryable, whatever its type. Check the `indexed` flag from `get_index` first — an unindexed field silently matches nothing.
+Every **indexed** field is queryable, whatever its type. Check the `indexed` flag from `get_index` first — an unindexed field silently matches nothing, unless it is marked `shadow`.
 - **Negation:** `-status:deleted` excludes matching records.
 - **Boolean logic:** `(urgent:true OR priority:>5) AND assignee:john`
 - **Keyword case:** `AND`, `OR`, `NOT`, `TO` and `IN` are keywords in uppercase only. Lowercase is query text — `to` and `in` break the clause around them and are reported, but `and`, `or` and `not` are searched for as words and silently change what the query means.
@@ -107,14 +108,28 @@ mod tests {
 
     /// `.devin/skills/cameodb-agent.md` is a copy of the orchestrator prompt for agents that read
     /// skills from the repository rather than over MCP. It had drifted — several sections were
-    /// missing — so the two are pinned equal here. Regenerate the file from the constant rather
-    /// than editing it.
+    /// missing — so the two are pinned equal here.
+    ///
+    /// `UPDATE_DOCS=1 cargo test -p cameodb_mcp repository_skill` rewrites the file from the
+    /// constant, which is the direction the copy travels; without it the test compares and fails
+    /// on a difference.
     #[test]
     fn the_repository_skill_matches_the_orchestrator_prompt() {
-        let on_disk = include_str!("../../../.devin/skills/cameodb-agent.md");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.devin/skills/cameodb-agent.md");
+        let on_disk = std::fs::read_to_string(&path).expect("read cameodb-agent.md");
+
+        if std::env::var_os("UPDATE_DOCS").is_some() {
+            if on_disk != ORCHESTRATOR_SKILL {
+                std::fs::write(&path, ORCHESTRATOR_SKILL).expect("write cameodb-agent.md");
+            }
+            return;
+        }
+
         assert_eq!(
             on_disk, ORCHESTRATOR_SKILL,
-            ".devin/skills/cameodb-agent.md has diverged from ORCHESTRATOR_SKILL"
+            ".devin/skills/cameodb-agent.md has diverged from ORCHESTRATOR_SKILL; regenerate \
+             with UPDATE_DOCS=1 cargo test -p cameodb_mcp repository_skill"
         );
     }
 
