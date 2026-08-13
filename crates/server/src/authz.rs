@@ -28,7 +28,7 @@ use axum::{
 };
 use tracing::{debug, warn};
 
-use cameodb_mcp::server::{McpAuthz, McpAuthzRef, McpCapability};
+use cameodb_mcp::{McpAuthz, McpAuthzRef, McpCapability};
 
 use crate::audit::{AuditRecord, AuditSink};
 use crate::auth::{Capability, KeyEntry, KeyRing};
@@ -58,7 +58,7 @@ pub enum Access {
     /// A single JSON-RPC path cannot be classified per operation from the outside, so the
     /// capability a tool needs and the index it names are decided in the dispatcher, from
     /// the identity this middleware attaches. Everything below the door is
-    /// [`cameodb_mcp::server::tool_capability`] and [`McpAuthz`].
+    /// [`cameodb_mcp::tool_capability`] and [`McpAuthz`].
     Mcp,
 }
 
@@ -743,7 +743,7 @@ mod tests {
         // MCP routes live in another crate and are nested, which is exactly why they are the
         // ones a reviewer forgets. Assert the prefix here rather than assuming it.
         assert!(include_str!("http_server.rs").contains(".nest(\"/mcp\""));
-        for pattern in mounted_routes(include_str!("../../mcp/src/server.rs")) {
+        for pattern in mounted_routes(include_str!("../../mcp/src/transport.rs")) {
             let mounted = format!("/mcp{}", pattern.trim_end_matches('/'));
             assert!(
                 is_classified(&mounted),
@@ -759,7 +759,7 @@ mod tests {
         let mut mounted: Vec<String> = mounted_routes(include_str!("http_server.rs"));
         mounted.push(crate::http_server::HEALTH_PATH.to_string());
         mounted.extend(
-            mounted_routes(include_str!("../../mcp/src/server.rs"))
+            mounted_routes(include_str!("../../mcp/src/transport.rs"))
                 .into_iter()
                 .map(|p| format!("/mcp{}", p.trim_end_matches('/'))),
         );

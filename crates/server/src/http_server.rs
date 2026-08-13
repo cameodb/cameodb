@@ -359,8 +359,8 @@ impl McpBackend for AppState {
                 .map(|mcp_sort| storage::SortSpec {
                     field: mcp_sort.field.clone(),
                     order: match mcp_sort.order {
-                        cameodb_mcp::server::SortOrder::Desc => storage::SortOrder::Desc,
-                        cameodb_mcp::server::SortOrder::Asc => storage::SortOrder::Asc,
+                        cameodb_mcp::SortOrder::Desc => storage::SortOrder::Desc,
+                        cameodb_mcp::SortOrder::Asc => storage::SortOrder::Asc,
                     },
                 })
                 .or_else(|| {
@@ -388,11 +388,11 @@ impl McpBackend for AppState {
                     // Merge MCP-provided fields/sort with parsed values
                     let final_fields = fields.or(parsed_fields);
                     let final_sort = sort.or_else(|| {
-                        parsed_sort.map(|storage_sort| cameodb_mcp::server::SortSpec {
+                        parsed_sort.map(|storage_sort| cameodb_mcp::SortSpec {
                             field: storage_sort.field,
                             order: match storage_sort.order {
-                                storage::SortOrder::Desc => cameodb_mcp::server::SortOrder::Desc,
-                                storage::SortOrder::Asc => cameodb_mcp::server::SortOrder::Asc,
+                                storage::SortOrder::Desc => cameodb_mcp::SortOrder::Desc,
+                                storage::SortOrder::Asc => cameodb_mcp::SortOrder::Asc,
                             },
                         })
                     });
@@ -401,8 +401,8 @@ impl McpBackend for AppState {
                     let storage_sort = final_sort.map(|mcp_sort| storage::SortSpec {
                         field: mcp_sort.field,
                         order: match mcp_sort.order {
-                            cameodb_mcp::server::SortOrder::Desc => storage::SortOrder::Desc,
-                            cameodb_mcp::server::SortOrder::Asc => storage::SortOrder::Asc,
+                            cameodb_mcp::SortOrder::Desc => storage::SortOrder::Desc,
+                            cameodb_mcp::SortOrder::Asc => storage::SortOrder::Asc,
                         },
                     });
 
