@@ -336,11 +336,13 @@ curl -s -X PUT http://localhost:9480/api/books/_config \
   -H "Content-Type: application/json" \
   -d '{
     "shard_count": 256,
+    "description": "Library catalogue, one document per edition.",
     "fields": {
       "title": {
         "name": "title",
         "field_type": "text",
-        "indexed": true
+        "indexed": true,
+        "description": "Title as printed on the edition."
       },
       "author": {
         "name": "author", 
@@ -355,6 +357,15 @@ curl -s -X PUT http://localhost:9480/api/books/_config \
     }
   }'
 ```
+
+**Descriptions.** `description` is optional on the index and on each field, and is the only part
+of a schema that says what the data *is* rather than how it is shaped — field names and types
+describe the shape. Nothing infers one; it is carried verbatim to every reader, including the
+discovery tools an agent uses to choose an index. An index description may be up to 512
+characters and a field description up to 200, counted in characters rather than bytes; a longer
+one is refused with `400` naming the offending field, since a description truncated mid-sentence
+still reads as the whole statement. A blank description is stored as no description, and an
+absent one is omitted from the schema entirely rather than serialised as null.
 
 **Response:**
 ```json
@@ -382,8 +393,9 @@ curl -s http://localhost:9480/api/books/_config
 ```json
 {
   "field_names": ["author", "title"],
+  "description": "Library catalogue, one document per edition.",
   "fields": {
-    "title": {"name": "title", "field_type": "text", "indexed": true},
+    "title": {"name": "title", "field_type": "text", "indexed": true, "description": "Title as printed on the edition."},
     "author": {"name": "author", "field_type": "text", "indexed": true}
   },
   "shard_count": 256

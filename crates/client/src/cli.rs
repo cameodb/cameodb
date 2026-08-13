@@ -662,6 +662,7 @@ fn color_json_braces() -> (String, String) {
 /// - `fast` is omitted when false
 /// - `tokenizer` is omitted when absent or "default"
 /// - `is_shadow` is omitted when false
+/// - `description` is omitted when absent
 /// - `index_record_option` is omitted when absent
 fn format_compact_fields(fields_value: &JsonValue) -> JsonValue {
     let fields = match fields_value.as_object() {
@@ -703,6 +704,12 @@ fn format_compact_fields(fields_value: &JsonValue) -> JsonValue {
         // is_shadow: only show when true
         if let Some(JsonValue::Bool(true)) = field_val.get("is_shadow") {
             compact.insert("shadow".to_string(), json!(true));
+        }
+
+        // description: the one property with no default to fall back on, so it is shown
+        // whenever it exists.
+        if let Some(JsonValue::String(text)) = field_val.get("description") {
+            compact.insert("description".to_string(), json!(text));
         }
 
         result.insert(name.clone(), JsonValue::Object(compact));
@@ -2204,6 +2211,7 @@ async fn detect_schema_from_csv(
             stored: true,
             fast: false,
             is_shadow: false, // The canonical 'id' field is not a shadow field
+            description: None,
             tokenizer: Some("raw".to_string()),
             index_record_option: Some("Basic".to_string()),
         };
@@ -2603,6 +2611,7 @@ fn build_schema_from_effective_json_documents(
             stored: true,
             fast: false,
             is_shadow: false,
+            description: None,
             tokenizer: Some("raw".to_string()),
             index_record_option: Some("Basic".to_string()),
         };

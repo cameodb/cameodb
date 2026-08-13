@@ -5568,9 +5568,20 @@ impl NodeOrchestrator {
         map
     }
 
-    fn schema_response(fields: JsonMap<String, JsonValue>) -> JsonValue {
+    /// The schema as a caller reads it back.
+    ///
+    /// Everything the schema carries belongs here, not only its fields. This response is not just
+    /// read: `PATCH /_schema` decodes it, edits what it was asked to change and writes the whole
+    /// thing back, so a property omitted here is a property erased by an unrelated edit.
+    fn schema_response(schema: &IndexSchema, fields: JsonMap<String, JsonValue>) -> JsonValue {
         let mut map = JsonMap::new();
         map.insert("fields".to_string(), JsonValue::Object(fields));
+        if let Some(description) = &schema.description {
+            map.insert(
+                "description".to_string(),
+                JsonValue::String(description.clone()),
+            );
+        }
         JsonValue::Object(map)
     }
 
@@ -7224,7 +7235,7 @@ impl NodeOrchestrator {
                         "Schema found in shard"
                     );
                     let fields = Self::sorted_fields_map(&s);
-                    return Ok(Self::schema_response(fields));
+                    return Ok(Self::schema_response(&s, fields));
                 }
             }
         }

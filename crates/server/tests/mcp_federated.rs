@@ -1051,3 +1051,133 @@ async fn a_shadow_field_inside_a_larger_query_is_reported_rather_than_answered()
         "the refusal must name the clause that was dropped: {result}"
     );
 }
+
+/// What an index is for is the one thing no schema implies.
+///
+/// Field names and types describe the shape of the data; they do not say which dataset it is or
+/// what a column records. An operator writes that down, and the discovery tools carry it — which
+/// is what the first step of the orchestrator prompt, "read the descriptions to find the right
+/// dataset", depends on being true.
+#[tokio::test]
+async fn descriptions_written_into_the_schema_reach_every_discovery_surface() {
+    let node = TestNode::start().await;
+    let status = http()
+        .put(format!("{}/api/filings/_config", node.url))
+        .json(&json!({
+            "description": "Quarterly regulatory filings, one document per filing.",
+            "fields": {
+                "title": {
+                    "field_type": "text",
+                    "indexed": true,
+                    "description": "Headline as filed, not normalised.",
+                },
+                "created": {"field_type": "date", "indexed": true, "fast": true},
+            }
+        }))
+        .send()
+        .await
+        .expect("create config")
+        .status();
+    assert!(status.is_success(), "creating 'filings' failed: {status}");
+    node.seed("filings", &[("f1", "2024-01-01T00:00:00Z")])
+        .await;
+
+    let (is_error, described) = node
+        .call_tool("get_index", json!({"index": "filings"}))
+        .await;
+    assert!(!is_error, "get_index failed: {described}");
+    assert_eq!(
+        described["description"].as_str(),
+        Some("Quarterly regulatory filings, one document per filing."),
+        "the index's own description is missing from its description: {described}"
+    );
+
+    let fields = described["fields"].as_array().expect("a fields array");
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|f| f["field"] == name)
+            .unwrap_or_else(|| panic!("no entry for '{name}': {described}"))
+            .clone()
+    };
+    assert_eq!(
+        field("title")["description"].as_str(),
+        Some("Headline as filed, not normalised.")
+    );
+    assert!(
+        field("created").get("description").is_none(),
+        "a field nobody described must not carry an empty key, or absent and blank become the \
+         same answer: {described}"
+    );
+
+    // The catalogue is where the choice between datasets is actually made.
+    let (_, listed) = node.call_tool("list_indexes", json!({})).await;
+    let entry = listed["indexes"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|e| e["index"] == "filings"))
+        .unwrap_or_else(|| panic!("filings missing from the catalogue: {listed}"));
+    assert!(
+        entry["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("Quarterly")),
+        "the catalogue lists the index without saying what it is: {listed}"
+    );
+
+    // And the tool an agent reaches for when a query looks wrong.
+    let (_, validated) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "filings", "query": "title:filing"}),
+        )
+        .await;
+    let title = validated["available_fields"]
+        .as_array()
+        .and_then(|fields| fields.iter().find(|f| f["field"] == "title"))
+        .unwrap_or_else(|| panic!("title missing from available_fields: {validated}"));
+    assert_eq!(
+        title["description"].as_str(),
+        Some("Headline as filed, not normalised.")
+    );
+}
+
+/// The limits are a promise about response size, so they are enforced where the schema is
+/// written rather than trimmed on the way out — a description cut off mid-sentence still reads
+/// as the whole statement.
+#[tokio::test]
+async fn an_over_long_description_is_refused_at_the_config_endpoint() {
+    let node = TestNode::start().await;
+
+    let response = http()
+        .put(format!("{}/api/filings/_config", node.url))
+        .json(&json!({
+            "description": "x".repeat(600),
+            "fields": {"title": {"field_type": "text", "indexed": true}}
+        }))
+        .send()
+        .await
+        .expect("create config");
+    assert_eq!(
+        response.status(),
+        400,
+        "an over-long description is the caller's mistake, not the server's"
+    );
+    let body: Value = response.json().await.expect("error json");
+    assert!(
+        body.to_string().contains("512"),
+        "the refusal must say what the limit is: {body}"
+    );
+
+    // And the index was not created despite the description being the only thing wrong with it.
+    let listed = http()
+        .get(format!("{}/_indexes", node.url))
+        .send()
+        .await
+        .expect("list")
+        .json::<Value>()
+        .await
+        .expect("list json");
+    assert!(
+        !listed.to_string().contains("filings"),
+        "a refused config must not leave the index half-created: {listed}"
+    );
+}

@@ -758,14 +758,20 @@ impl McpBackend for AppState {
                 .iter()
                 .filter(|info| info.name != "_seq")
                 .map(|info| {
-                    serde_json::json!({
+                    let mut entry = serde_json::json!({
                         "field": info.name,
                         "type": info.field_type,
                         "indexed": info.indexed,
                         "shadow": info.is_shadow,
                         "queryable": info.is_queryable(),
                         "query_hint": field_query_hint(info),
-                    })
+                    });
+                    if let Some(text) = &info.description
+                        && let Some(obj) = entry.as_object_mut()
+                    {
+                        obj.insert("description".to_string(), JsonValue::String(text.clone()));
+                    }
+                    entry
                 })
                 .collect();
 
@@ -1158,6 +1164,8 @@ struct FieldInfo {
     indexed: bool,
     fast: bool,
     is_shadow: bool,
+    /// What the field records, if anyone wrote it down. Never inferred.
+    description: Option<String>,
 }
 
 impl FieldInfo {
@@ -1203,6 +1211,10 @@ fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
                 .get("is_shadow")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            description: def
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         })
         .collect();
 
@@ -1247,6 +1259,10 @@ fn compact_field_info(value: &JsonValue) -> Vec<FieldInfo> {
                     .get("shadow")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                description: entry
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
             })
         })
         .collect()
@@ -1284,12 +1300,12 @@ fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
         })
         .collect();
 
-    // Build compact field list (field, type, indexed, fast, shadow)
+    // Build compact field list (field, type, indexed, fast, shadow, description)
     let fields: Vec<JsonValue> = field_infos
         .iter()
         .filter(|info| info.name != "_seq")
         .map(|info| {
-            serde_json::json!({
+            let mut field = serde_json::json!({
                 "field": info.name,
                 "type": info.field_type,
                 "indexed": info.indexed,
@@ -1298,11 +1314,29 @@ fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
                 // cannot be read as an answer, and `indexed: false` without it describes a field
                 // nothing can query — the opposite of what a shadow field is.
                 "shadow": info.is_shadow,
-            })
+            });
+            // Unlike the flags, present only when written. A description has no false value to
+            // report, and an index nobody has described should not pay for a key per field.
+            if let Some(text) = &info.description
+                && let Some(obj) = field.as_object_mut()
+            {
+                obj.insert("description".to_string(), JsonValue::String(text.clone()));
+            }
+            field
         })
         .collect();
 
+    // Lifted before the schema is dropped below, since that is where it was written.
+    let description = entry
+        .get("schema")
+        .and_then(|schema| schema.get("description"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+
     if let Some(obj) = entry.as_object_mut() {
+        if let Some(text) = description {
+            obj.insert("description".to_string(), JsonValue::String(text));
+        }
         obj.insert("fields".to_string(), JsonValue::Array(fields));
         obj.insert("query_hints".to_string(), JsonValue::Array(query_hints));
         // The schema map was the input to the projection above; keeping it as well would send
@@ -2246,6 +2280,11 @@ async fn create_config_handler(
     Json(schema): Json<IndexSchema>,
 ) -> Result<Json<JsonValue>, AppError> {
     validate_index_name(&index)?;
+    // Checked here rather than in the engine so that an over-long description is a 400 naming
+    // the offender, instead of a write that half-succeeds across shards.
+    schema
+        .validate_descriptions()
+        .map_err(AppError::bad_request)?;
     info!("Create config request - index: {}", index);
 
     let client_op = ClientOp::CreateConfig { index, schema };

@@ -140,6 +140,8 @@ Retrieve schema and statistics for a single CameoDB index.
 
 **Returns:** Complete field definitions, types, document count, size, metadata, and a `fields` array with per-field details, plus `query_hints` section showing which operators work with each field type.
 
+`description` appears on the index and on a field only when an operator wrote one. It is the one part of a schema that says what the data is rather than how it is shaped, so prefer it over anything a field name suggests; most indexes carry none, and its absence says nothing about them. See [Create/Update Index Schema](../../docs/API_REFERENCE.md#createupdate-index-schema) for how they are set and the length limits.
+
 A field marked `shadow` is the document identifier under the name the source data gave it. The value lives only in `id` and is not stored or indexed again under that name, so the field is a name in the schema rather than data in the index — and the name is applied to `id` in both directions. It is queryable despite being unindexed (`shadow_field:VALUE` on its own is the same key-value lookup as `id:VALUE`), and every hit returns the identifier under the shadow name with no `id` field, so `indexed` alone answers neither what may be queried nor what may be projected.
 
 **Example:**
@@ -155,6 +157,7 @@ A field marked `shadow` is the document identifier under the name the source dat
 **Response includes `fields` and `query_hints`:**
 ```json
 {
+  "description": "Peer-reviewed papers, one document per paper.",
   "fields": [
     {
       "field": "id",
@@ -175,7 +178,8 @@ A field marked `shadow` is the document identifier under the name the source dat
       "type": "i64",
       "indexed": true,
       "fast": true,
-      "shadow": false
+      "shadow": false,
+      "description": "Year of publication, not of submission."
     }
   ],
   "query_hints": [

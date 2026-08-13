@@ -1124,6 +1124,33 @@ fn default_routing_field() -> String {
     "id".to_string()
 }
 
+/// Longest description an index may carry, in characters.
+///
+/// A description is read by a caller choosing between datasets, and a catalogue listing returns
+/// one per index, so the whole node's worth of them is resident in that caller's context at once.
+/// A paragraph is enough to say what a dataset is; a page of it is a document, and belongs
+/// somewhere that can be fetched on purpose.
+pub const MAX_INDEX_DESCRIPTION_CHARS: usize = 512;
+
+/// Longest description a single field may carry, in characters.
+///
+/// Tighter than the index limit because it is paid per field on every schema read: one line
+/// saying what the field means, not the history of how it came to exist.
+pub const MAX_FIELD_DESCRIPTION_CHARS: usize = 200;
+
+/// Blank is the same as unset, so an operator clearing a description gets `None` rather than a
+/// key with nothing in it.
+fn normalize_description(description: &mut Option<String>) {
+    if let Some(text) = description {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            *description = None;
+        } else if trimmed.len() != text.len() {
+            *text = trimmed.to_string();
+        }
+    }
+}
+
 /// Field definition for schema evolution and validation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FieldDef {
@@ -1143,6 +1170,13 @@ pub struct FieldDef {
     /// Default is false for backward compatibility with existing schemas
     #[serde(default)]
     pub is_shadow: bool,
+    /// What this field means, in the operator's words.
+    ///
+    /// Nothing infers it: a field name says what a value is called and a type says how it is
+    /// queried, but neither says what it records. Absent unless someone wrote one, and omitted
+    /// from the serialised schema when absent so an undescribed index costs nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     // Additional options for Text fields
     pub tokenizer: Option<String>,
     pub index_record_option: Option<String>, // "Basic", "WithFreqs", "WithFreqsAndPositions"
@@ -1169,6 +1203,7 @@ impl FieldDef {
             stored,
             fast,
             is_shadow: false,          // Default: not a shadow field
+            description: None,         // Nothing infers a description; an operator writes it
             tokenizer: None,           // Will be set when creating from actual Tantivy schema
             index_record_option: None, // Will be set when creating from actual Tantivy schema
         }
@@ -1203,6 +1238,7 @@ impl FieldDef {
             stored,
             fast,
             is_shadow: false, // Default: not a shadow field
+            description: None,
             tokenizer: None,
             index_record_option: None,
         }
@@ -1218,6 +1254,7 @@ impl FieldDef {
             stored: false,   // Shadow fields are never stored
             fast: false,     // Shadow fields don't need fast access
             is_shadow: true, // This is a shadow field
+            description: None,
             tokenizer: None,
             index_record_option: None,
         }
@@ -1423,6 +1460,12 @@ pub struct IndexSchema {
     pub created_at: i64,
     #[serde(default = "default_timestamp")]
     pub updated_at: i64,
+    /// What this index holds, in the operator's words.
+    ///
+    /// The one thing a caller cannot work out from the schema: field names and types describe the
+    /// shape of the data, not which dataset it is. Absent unless someone wrote one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Field name to use for routing/sharding (default: "id")
     #[serde(default = "default_routing_field")]
     pub routing_field_name: String,
@@ -1442,6 +1485,7 @@ impl Default for IndexSchema {
             fingerprint: 0,
             created_at: now,
             updated_at: now,
+            description: None,
             routing_field_name: "id".to_string(),
             shadow_fields: HashSet::new(),
         }
@@ -1454,11 +1498,13 @@ impl IndexSchema {
     /// - Enriches indexed fields with proper Tantivy defaults (tokenizer, fast, etc.)
     /// - Rebuilds shadow fields cache
     pub fn normalize_after_deserialization(&mut self) {
+        normalize_description(&mut self.description);
         for (key, field_def) in &mut self.fields {
             // Populate name from map key if not provided in JSON
             if field_def.name.is_empty() {
                 field_def.name = key.clone();
             }
+            normalize_description(&mut field_def.description);
 
             // The 'id' field has fixed Tantivy attributes regardless of user input
             if key == "id" {
@@ -1515,6 +1561,7 @@ impl IndexSchema {
                 stored: true,
                 fast: true,
                 is_shadow: false,
+                description: None,
                 tokenizer: None,
                 index_record_option: None,
             });
@@ -1531,6 +1578,58 @@ impl IndexSchema {
             combined.extend_from_slice(name.as_bytes());
         }
         xxh3_64(&combined)
+    }
+
+    /// Check operator-supplied descriptions against their limits.
+    ///
+    /// Rejected rather than truncated: a description cut off mid-sentence still reads as the
+    /// whole statement, and the caller who wrote it is the only one who can say what to drop.
+    ///
+    /// Counted in characters rather than bytes, so a description in a non-ASCII script gets the
+    /// same allowance as one in English.
+    pub fn validate_descriptions(&self) -> Result<(), String> {
+        if let Some(text) = &self.description {
+            let length = text.chars().count();
+            if length > MAX_INDEX_DESCRIPTION_CHARS {
+                return Err(format!(
+                    "index description is {length} characters; the limit is \
+                     {MAX_INDEX_DESCRIPTION_CHARS}"
+                ));
+            }
+        }
+
+        let mut named: Vec<&String> = self
+            .fields
+            .iter()
+            .filter(|(_, def)| {
+                def.description
+                    .as_ref()
+                    .is_some_and(|text| text.chars().count() > MAX_FIELD_DESCRIPTION_CHARS)
+            })
+            .map(|(name, _)| name)
+            .collect();
+        // A HashMap iterates in an arbitrary order, and an error naming a different field on
+        // each attempt is one an operator cannot work through.
+        named.sort();
+
+        if let Some(name) = named.first() {
+            let length = self.fields[*name]
+                .description
+                .as_ref()
+                .map_or(0, |text| text.chars().count());
+            let rest = named.len() - 1;
+            let and_others = match rest {
+                0 => String::new(),
+                1 => " (and 1 other field)".to_string(),
+                n => format!(" (and {n} other fields)"),
+            };
+            return Err(format!(
+                "description for field '{name}' is {length} characters; the limit is \
+                 {MAX_FIELD_DESCRIPTION_CHARS}{and_others}"
+            ));
+        }
+
+        Ok(())
     }
 
     /// Rebuild shadow_fields cache from fields HashMap.
@@ -3046,6 +3145,8 @@ impl HybridStore {
                     stored,
                     fast,
                     is_shadow: false, // Fields derived from Tantivy schema are not shadow fields
+                    // Tantivy stores no description; one lives only in the schema record.
+                    description: None,
                     tokenizer,
                     index_record_option,
                 },
@@ -3071,6 +3172,7 @@ impl HybridStore {
             fingerprint: 0,
             created_at: now,
             updated_at: now,
+            description: None,
             routing_field_name: "id".to_string(),
             shadow_fields: HashSet::new(),
         }
@@ -3176,6 +3278,7 @@ impl HybridStore {
                         stored: true,
                         fast: false,
                         is_shadow: false, // The canonical 'id' field is not a shadow field
+                        description: None,
                         tokenizer: Some("raw".to_string()),
                         index_record_option: Some("Basic".to_string()),
                     }
@@ -6794,6 +6897,111 @@ mod tests {
         assert!(seq.index_record_option.is_none());
 
         println!("✅ Schema enrichment correctly preserves explicit values and fills defaults!");
+    }
+
+    /// A description is the one part of a schema nothing can infer, so it has to survive
+    /// everything the schema does on its own.
+    #[test]
+    fn descriptions_round_trip_and_survive_field_evolution() {
+        let mut schema: IndexSchema = serde_json::from_value(serde_json::json!({
+            "description": "  Quarterly filings, one document per filing.  ",
+            "fields": {
+                "title": {"field_type": "text", "description": "Filing headline"},
+                "year": {"field_type": "i64", "description": "   "},
+                "notes": {"field_type": "text"},
+            }
+        }))
+        .expect("schema with descriptions");
+        schema.normalize_after_deserialization();
+
+        assert_eq!(
+            schema.description.as_deref(),
+            Some("Quarterly filings, one document per filing."),
+            "surrounding whitespace is not part of what someone wrote"
+        );
+        assert_eq!(
+            schema.fields["year"].description, None,
+            "blank is the same as unset, or every reader has to check for it"
+        );
+        assert_eq!(schema.fields["notes"].description, None);
+
+        // Evolution rewrites a field's type; it must not rewrite what the field means.
+        // The fingerprint is taken first: a schema decoded from JSON carries none, and
+        // `evolve_field` computes one, which would look like a change caused by this call.
+        schema.fingerprint = schema.calculate_fingerprint();
+        let before = schema.fingerprint;
+        assert!(schema.evolve_field("notes".to_string(), &serde_json::json!(7)));
+        assert_eq!(
+            schema.fields["title"].description.as_deref(),
+            Some("Filing headline")
+        );
+        assert_eq!(
+            schema.fingerprint, before,
+            "the fingerprint is over field names, so nothing here should have moved it"
+        );
+
+        // And a round trip through the stored form keeps both, while an index that describes
+        // nothing serialises no description keys at all.
+        let encoded = serde_json::to_value(&schema).expect("serialise");
+        let decoded: IndexSchema = serde_json::from_value(encoded).expect("deserialise");
+        assert_eq!(decoded.description, schema.description);
+        assert_eq!(
+            decoded.fields["title"].description.as_deref(),
+            Some("Filing headline")
+        );
+
+        let bare = serde_json::to_value(IndexSchema::default()).expect("serialise default");
+        assert!(
+            bare.get("description").is_none(),
+            "an undescribed index must not pay for the field: {bare}"
+        );
+    }
+
+    /// The limits exist because a catalogue listing carries every index's description at once.
+    #[test]
+    fn an_over_long_description_is_refused_by_name() {
+        let mut schema = IndexSchema {
+            description: Some("x".repeat(MAX_INDEX_DESCRIPTION_CHARS + 1)),
+            ..Default::default()
+        };
+        let err = schema.validate_descriptions().expect_err("must be refused");
+        assert!(
+            err.contains("index description")
+                && err.contains(&MAX_INDEX_DESCRIPTION_CHARS.to_string()),
+            "the refusal must say what was too long and by what measure: {err}"
+        );
+
+        schema.description = Some("x".repeat(MAX_INDEX_DESCRIPTION_CHARS));
+        assert!(
+            schema.validate_descriptions().is_ok(),
+            "the limit is inclusive"
+        );
+
+        for name in ["zebra", "apple"] {
+            let mut def = FieldDef::new(name.to_string(), TantivyFieldType::Text);
+            def.description = Some("x".repeat(MAX_FIELD_DESCRIPTION_CHARS + 1));
+            schema.fields.insert(name.to_string(), def);
+        }
+        let err = schema.validate_descriptions().expect_err("must be refused");
+        assert!(
+            err.starts_with("description for field 'apple'"),
+            "fields live in a HashMap, so the one named has to be chosen in a stable order or \
+             the same schema is refused differently each time: {err}"
+        );
+        assert!(
+            err.contains("1 other field"),
+            "an operator fixing one at a time needs to know there are more: {err}"
+        );
+
+        // A multi-byte description gets the same allowance as an ASCII one.
+        let schema = IndexSchema {
+            description: Some("é".repeat(MAX_INDEX_DESCRIPTION_CHARS)),
+            ..Default::default()
+        };
+        assert!(
+            schema.validate_descriptions().is_ok(),
+            "the limit counts characters, not bytes"
+        );
     }
 
     #[test]
