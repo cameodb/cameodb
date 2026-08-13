@@ -655,3 +655,168 @@ async fn the_http_search_api_still_answers_empty_for_a_missing_index() {
     assert_eq!(body["total_hits"].as_u64(), Some(0));
     assert_eq!(body["hits"].as_array().map(Vec::len), Some(0));
 }
+
+/// The catalogue aggregate has to be measured, not structurally zero.
+///
+/// `total_size_bytes` was summed from a key that only appears when the listing is asked for
+/// data sizes, and the MCP listing never asked — so the number was always 0 whatever the node
+/// held. A zero here is indistinguishable from an empty node, which is the reading an agent
+/// deciding whether an index is worth searching would act on.
+#[tokio::test]
+async fn the_catalogue_aggregate_reports_a_size_it_measured() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, result) = node.call_tool("get_index_stats", json!({})).await;
+    assert!(!is_error, "aggregate stats failed: {result}");
+
+    assert_eq!(result["scope"].as_str(), Some("all_indexes"));
+    assert_eq!(result["total_indexes"].as_u64(), Some(2));
+    assert_eq!(
+        result["total_documents"].as_u64(),
+        Some(6),
+        "six documents were ingested: {result}"
+    );
+    assert!(
+        result["total_size_bytes"].as_u64().is_some_and(|b| b > 0),
+        "a node holding six documents does not occupy zero bytes: {result}"
+    );
+    // Same class of structural zero, same five lines: summed from a key that was never there.
+    assert!(
+        result["total_fields"].as_u64().is_some_and(|f| f > 0),
+        "two indexes with a title and a created field do not have zero fields: {result}"
+    );
+}
+
+/// The single-index scope is unchanged by the aggregate paying for sizes.
+#[tokio::test]
+async fn single_index_stats_still_describe_one_index() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, result) = node
+        .call_tool("get_index_stats", json!({"index": "alpha"}))
+        .await;
+    assert!(!is_error, "single-index stats failed: {result}");
+
+    assert_eq!(result["scope"].as_str(), Some("single_index"));
+    assert_eq!(result["index"].as_str(), Some("alpha"));
+    assert_eq!(result["stats"]["document_count"].as_u64(), Some(3));
+    assert!(
+        result["field_count"].as_u64().is_some_and(|c| c > 0),
+        "field_count was summed from the same absent key: {result}"
+    );
+    assert!(
+        result["field_names"]
+            .as_array()
+            .is_some_and(|names| names.iter().any(|n| n == "title")),
+        "the fields it counted should be the ones the index has: {result}"
+    );
+}
+
+/// The schema-discovery surface has to describe the index, not an index with no fields.
+///
+/// The catalogue listing reports field names only, so an entry built from it alone has no
+/// types, no `indexed` flags and no query hints. Every tool an agent is told to call before
+/// writing a query read from exactly that entry.
+#[tokio::test]
+async fn the_discovery_tools_describe_the_fields_an_index_has() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, described) = node.call_tool("get_index", json!({"index": "alpha"})).await;
+    assert!(!is_error, "get_index failed: {described}");
+
+    let fields = described["fields"].as_array().expect("a fields array");
+    let named: Vec<&str> = fields.iter().filter_map(|f| f["field"].as_str()).collect();
+    assert!(
+        named.contains(&"title") && named.contains(&"created"),
+        "the index's own fields are missing: {described}"
+    );
+
+    let created = fields
+        .iter()
+        .find(|f| f["field"] == "created")
+        .unwrap_or_else(|| panic!("no entry for 'created': {described}"));
+    assert_eq!(
+        created["type"].as_str(),
+        Some("date"),
+        "a field without its type cannot be queried correctly: {described}"
+    );
+    assert_eq!(created["fast"].as_bool(), Some(true), "{described}");
+
+    // The per-type hints are the mechanism the whole guidance design rests on.
+    let hints = described["query_hints"].as_array().expect("query_hints");
+    assert!(
+        hints.iter().any(|h| h["type"] == "date") && hints.iter().any(|h| h["type"] == "text"),
+        "no hint for the types this index actually has: {described}"
+    );
+    assert!(
+        hints.iter().all(|h| !h["query_hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unrecognised")),
+        "a hint that does not recognise its own field type is worse than none: {described}"
+    );
+
+    // The catalogue tool the prompt names as the first discovery step says the same.
+    let (_, listed) = node.call_tool("list_indexes", json!({})).await;
+    let entry = listed["indexes"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|e| e["index"] == "alpha"))
+        .unwrap_or_else(|| panic!("alpha missing from the catalogue: {listed}"));
+    assert!(
+        entry["fields"].as_array().is_some_and(|f| !f.is_empty()),
+        "the catalogue describes alpha as having no fields: {listed}"
+    );
+}
+
+/// `validate_query` must not report a real field as unknown.
+///
+/// It reads the same entry, so it inherited the empty field list and answered that every field
+/// named in a working query was one the index does not have — the most misleading answer in the
+/// tool set, since an agent is sent here precisely when it doubts a query.
+#[tokio::test]
+async fn validate_query_recognises_a_field_the_index_has() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "alpha", "query": "title:record"}),
+        )
+        .await;
+    assert!(!is_error, "validate_query failed: {result}");
+
+    let analysis = &result["query_analysis"];
+    let unknown: Vec<&str> = analysis["unknown_fields"]
+        .as_array()
+        .map(|f| f.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !unknown.contains(&"title"),
+        "'title' is a real indexed field and the search on it works: {result}"
+    );
+
+    let recognized: Vec<&str> = analysis["recognized_fields"]
+        .as_array()
+        .map(|f| f.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        recognized.contains(&"title"),
+        "a field the index has must be recognised: {result}"
+    );
+
+    // And a field it really does not have is still reported.
+    let (_, missing) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "alpha", "query": "nosuchfield:x"}),
+        )
+        .await;
+    let unknown: Vec<&str> = missing["query_analysis"]["unknown_fields"]
+        .as_array()
+        .map(|f| f.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        unknown.contains(&"nosuchfield"),
+        "an absent field must still be called out: {missing}"
+    );
+}

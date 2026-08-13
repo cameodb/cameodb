@@ -628,6 +628,7 @@ impl McpBackend for AppState {
             let entry = serde_json::json!({
                 "index": index,
                 "stats": stats,
+                "schema": index_schema(&state, &index).await,
             });
 
             Ok(enrich_index_entry(entry))
@@ -657,20 +658,38 @@ impl McpBackend for AppState {
                 .cloned()
                 .unwrap_or_default();
 
-            let mut enriched = Vec::with_capacity(indexes.len());
+            // One schema read per index, run together rather than in series: the listing is
+            // the first thing an agent calls, and a catalogue of two hundred indexes should
+            // not cost two hundred sequential round trips.
+            let mut schema_reads = FuturesUnordered::new();
             for stats in indexes {
                 let index_name = stats
                     .get("name")
                     .and_then(|value| value.as_str())
                     .ok_or_else(|| "Index entry missing name".to_string())?
                     .to_string();
-
-                let entry = serde_json::json!({
-                    "index": index_name,
-                    "stats": stats,
+                let state = state.clone();
+                schema_reads.push(async move {
+                    let schema = index_schema(&state, &index_name).await;
+                    enrich_index_entry(serde_json::json!({
+                        "index": index_name,
+                        "stats": stats,
+                        "schema": schema,
+                    }))
                 });
-                enriched.push(enrich_index_entry(entry));
             }
+
+            let mut enriched = Vec::with_capacity(schema_reads.len());
+            while let Some(entry) = schema_reads.next().await {
+                enriched.push(entry);
+            }
+            // Concurrency reorders them; a catalogue an agent reads twice should not change
+            // order between reads.
+            enriched.sort_by(|left, right| {
+                left.get("index")
+                    .and_then(|v| v.as_str())
+                    .cmp(&right.get("index").and_then(|v| v.as_str()))
+            });
 
             let total_indexes = enriched.len();
 
@@ -784,14 +803,55 @@ impl McpBackend for AppState {
                 }));
             }
 
+            // Its own listing rather than `Self::list_indexes`, for one reason: the sizes.
+            // `total_size_bytes` is only emitted when the listing is asked for data sizes, and
+            // the shared listing never asks — so the aggregate summed a key that was never
+            // present and reported 0 however much the node held. An explicit statistics request
+            // is the one place the redb size computation is worth paying for.
+            let mut listing = state
+                .router
+                .handle_client_op(ClientOp::ListIndexes {
+                    include_data_size: true,
+                })
+                .await
+                .map_err(|err| err.to_string())?;
             // Already scoped: the aggregate is over the indexes this caller can see, so
             // the totals it reports do not count documents it cannot read.
-            let listing = state.list_indexes(authz).await?;
-            let indexes = listing
+            retain_visible_indexes(&mut listing, authz.as_ref());
+
+            let raw_indexes = listing
                 .get("indexes")
                 .and_then(|value| value.as_array())
                 .cloned()
                 .unwrap_or_default();
+
+            let mut schema_reads = FuturesUnordered::new();
+            for stats in raw_indexes {
+                let index_name = stats
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let state = state.clone();
+                schema_reads.push(async move {
+                    let schema = index_schema(&state, &index_name).await;
+                    enrich_index_entry(serde_json::json!({
+                        "index": index_name,
+                        "stats": stats,
+                        "schema": schema,
+                    }))
+                });
+            }
+
+            let mut indexes = Vec::with_capacity(schema_reads.len());
+            while let Some(entry) = schema_reads.next().await {
+                indexes.push(entry);
+            }
+            indexes.sort_by(|left, right| {
+                left.get("index")
+                    .and_then(|v| v.as_str())
+                    .cmp(&right.get("index").and_then(|v| v.as_str()))
+            });
 
             let mut total_documents = 0u64;
             let mut total_size_bytes = 0u64;
@@ -973,6 +1033,26 @@ fn narrowed_by_phrase_or_conjunction(query: &str) -> bool {
     query.contains('"') || query.split_whitespace().any(|token| token == "AND")
 }
 
+/// An index's field definitions, or `Null` if they cannot be read.
+///
+/// The catalogue listing reports field *names* and nothing else, so an entry built from it
+/// alone describes an index with no types, no `indexed` flags and no per-type query hints —
+/// which is what `get_index`, `list_indexes` and `validate_query` were all handing to agents.
+/// The bundled CLI already composes the two calls this way to render `list indexes`; this is
+/// the same composition, done where the MCP tools can see it.
+///
+/// `Null` rather than an error: a schema that cannot be read costs the caller its hints, not
+/// its answer, and the statistics the entry does carry are still worth returning.
+async fn index_schema(state: &AppState, index: &str) -> JsonValue {
+    state
+        .router
+        .handle_client_op(ClientOp::GetConfig {
+            index: index.to_string(),
+        })
+        .await
+        .unwrap_or(JsonValue::Null)
+}
+
 /// `Some(reason)` when the node has no such index, asked of a search that returned nothing.
 ///
 /// A search naming an index that does not exist answers with an empty result, which reads to a
@@ -1084,18 +1164,25 @@ fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
         .or_else(|| value.get("fields").and_then(|fields| fields.as_object()));
 
     let Some(fields_obj) = fields_obj else {
-        return Vec::new();
+        // An entry that has already been through `enrich_index_entry` carries the compact
+        // array rather than the schema map it was built from. Readers downstream of the
+        // enrichment — `validate_query` and the statistics counts — see only that form, so
+        // failing to recognise it here is what made them report an index as having no fields.
+        return compact_field_info(value);
     };
 
     let mut infos: Vec<FieldInfo> = fields_obj
         .iter()
         .map(|(name, def)| FieldInfo {
             name: name.clone(),
+            // A schema serialises its type as the variant name — `Date`, `I64` — while every
+            // syntax surface keys on the lowercase names in `cameodb_mcp::syntax`. Left as-is,
+            // each field's hint reads "Unrecognised field type 'Date'".
             field_type: def
                 .get("field_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("text")
-                .to_string(),
+                .to_ascii_lowercase(),
             indexed: def.get("indexed").and_then(|v| v.as_bool()).unwrap_or(true),
             fast: def.get("fast").and_then(|v| v.as_bool()).unwrap_or(false),
             is_shadow: def
@@ -1115,6 +1202,39 @@ fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
     );
 
     infos
+}
+
+/// Read back the compact `fields` array that [`enrich_index_entry`] writes.
+///
+/// The inverse of the projection performed there, and deliberately not a second source of
+/// truth: it recovers exactly the four properties that form carries.
+fn compact_field_info(value: &JsonValue) -> Vec<FieldInfo> {
+    let Some(entries) = value.get("fields").and_then(|fields| fields.as_array()) else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.get("field").and_then(|v| v.as_str())?;
+            Some(FieldInfo {
+                name: name.to_string(),
+                field_type: entry
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("text")
+                    .to_ascii_lowercase(),
+                indexed: entry
+                    .get("indexed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                fast: entry.get("fast").and_then(|v| v.as_bool()).unwrap_or(false),
+                // `enrich_index_entry` drops shadow fields from the compact form, so anything
+                // read back from it is not one.
+                is_shadow: false,
+            })
+        })
+        .collect()
 }
 
 fn extract_field_names(value: &JsonValue) -> Vec<String> {
@@ -1166,6 +1286,9 @@ fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
     if let Some(obj) = entry.as_object_mut() {
         obj.insert("fields".to_string(), JsonValue::Array(fields));
         obj.insert("query_hints".to_string(), JsonValue::Array(query_hints));
+        // The schema map was the input to the projection above; keeping it as well would send
+        // every field twice, which on a wide index is most of the response.
+        obj.remove("schema");
     }
 
     entry
