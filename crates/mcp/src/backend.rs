@@ -136,3 +136,81 @@ pub enum RateLimitVerdict {
         retry_after_secs: u64,
     },
 }
+
+/// A backend for the tests in this crate.
+#[cfg(test)]
+pub(crate) mod testing {
+    use futures::future::BoxFuture;
+    use serde_json::{Value as JsonValue, json};
+
+    use super::{McpBackend, McpIndexSearchRequest};
+    use crate::authz::McpAuthzRef;
+
+    /// Answers every operation with an empty object.
+    ///
+    /// The dispatcher tests are about the JSON-RPC envelope — which messages get a reply, what
+    /// an error carries — so what a tool *returns* is deliberately uninteresting here.
+    #[derive(Clone)]
+    pub(crate) struct StubBackend;
+
+    fn empty() -> BoxFuture<'static, Result<JsonValue, String>> {
+        Box::pin(async { Ok(json!({})) })
+    }
+
+    impl McpBackend for StubBackend {
+        fn search_index(
+            &self,
+            _index: McpIndexSearchRequest,
+            _query: String,
+            _limit: Option<usize>,
+        ) -> BoxFuture<'_, Result<JsonValue, String>> {
+            empty()
+        }
+
+        fn search_indexes(
+            &self,
+            _indexes: Vec<McpIndexSearchRequest>,
+            _query: String,
+            _limit: Option<usize>,
+        ) -> BoxFuture<'_, Result<JsonValue, String>> {
+            empty()
+        }
+
+        fn get_index(&self, _index: String) -> BoxFuture<'_, Result<JsonValue, String>> {
+            empty()
+        }
+
+        fn list_indexes(&self, _authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>> {
+            empty()
+        }
+
+        fn validate_query(
+            &self,
+            _index: Option<String>,
+            _partial_field: Option<String>,
+            _query: Option<String>,
+        ) -> BoxFuture<'_, Result<JsonValue, String>> {
+            empty()
+        }
+
+        fn get_index_stats(
+            &self,
+            _index: Option<String>,
+            _authz: McpAuthzRef,
+        ) -> BoxFuture<'_, Result<JsonValue, String>> {
+            empty()
+        }
+
+        fn list_resources(&self, _authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>> {
+            empty()
+        }
+
+        fn read_resource(
+            &self,
+            _uri: String,
+            _authz: McpAuthzRef,
+        ) -> BoxFuture<'_, Result<JsonValue, String>> {
+            empty()
+        }
+    }
+}

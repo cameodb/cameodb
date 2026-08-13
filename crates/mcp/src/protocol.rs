@@ -34,3 +34,39 @@ pub(crate) fn negotiate_protocol_version(requested: Option<&str>) -> &'static st
         None => LATEST_PROTOCOL_VERSION,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_supported_version_is_echoed_back() {
+        // Echoing is the requirement, not answering with the newest: a client that asked for a
+        // version it can speak and is told a different one has to decide whether to continue.
+        for version in SUPPORTED_PROTOCOL_VERSIONS {
+            assert_eq!(negotiate_protocol_version(Some(version)), *version);
+        }
+    }
+
+    #[test]
+    fn an_unknown_version_falls_back_to_the_latest() {
+        // Both directions of unknown: a revision newer than anything here, and one older.
+        assert_eq!(
+            negotiate_protocol_version(Some("2026-07-28")),
+            LATEST_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            negotiate_protocol_version(Some("2024-01-01")),
+            LATEST_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            negotiate_protocol_version(Some("")),
+            LATEST_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn an_absent_version_falls_back_to_the_latest() {
+        assert_eq!(negotiate_protocol_version(None), LATEST_PROTOCOL_VERSION);
+    }
+}

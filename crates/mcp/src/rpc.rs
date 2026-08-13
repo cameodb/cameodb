@@ -72,6 +72,14 @@ pub(crate) async fn handle_rpc_request<S>(
 where
     S: McpBackend,
 {
+    // A message with no id is a notification by definition, and JSON-RPC 2.0 forbids replying
+    // to one. Checked on the shape rather than per-method, so a notification this server has
+    // never heard of is also answered with silence.
+    if request.id.is_none() {
+        debug!(method = %request.method, "MCP notification received");
+        return None;
+    }
+
     match request.method.as_str() {
         // --- Lifecycle ---
         "initialize" => {
@@ -97,13 +105,6 @@ where
             ))
         }
         "ping" => Some(success_response(request.id, json!({}))),
-
-        // --- Notifications (no response per JSON-RPC spec) ---
-        "notifications/initialized" | "notifications/cancelled" => {
-            debug!(method = %request.method, "MCP notification received");
-            // Don't send response for notifications per JSON-RPC spec
-            None
-        }
 
         // --- Resources ---
         "resources/list" => Some(match backend.list_resources(authz.clone()).await {
@@ -276,5 +277,61 @@ where
             -32601,
             format!("Unsupported MCP method: {other}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{authz::McpUnrestricted, backend::testing::StubBackend};
+
+    fn caller() -> McpAuthzRef {
+        Arc::new(McpUnrestricted)
+    }
+
+    fn message(body: JsonValue) -> JsonRpcRequest {
+        parse_json_rpc_request(body).expect("a well-formed JSON-RPC message")
+    }
+
+    #[tokio::test]
+    async fn a_message_without_an_id_never_gets_a_response() {
+        // JSON-RPC 2.0 forbids replying to a notification, and notification-ness is a property
+        // of the message rather than of its method name — so a notification this server has
+        // never heard of must be answered with silence too, as must a `ping` sent without an id.
+        for method in [
+            "notifications/initialized",
+            "notifications/cancelled",
+            "notifications/progress",
+            "notifications/roots/list_changed",
+            "ping",
+            "tools/list",
+            "no/such/method",
+        ] {
+            let response = handle_rpc_request(
+                StubBackend,
+                message(json!({ "jsonrpc": "2.0", "method": method })),
+                &caller(),
+            )
+            .await;
+            assert!(
+                response.is_none(),
+                "{method} arrived without an id and was answered with {response:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_method_carrying_an_id_gets_method_not_found() {
+        // The guard above must not over-correct into swallowing real requests.
+        let response = handle_rpc_request(
+            StubBackend,
+            message(json!({ "jsonrpc": "2.0", "id": 7, "method": "no/such/method" })),
+            &caller(),
+        )
+        .await
+        .expect("a request carrying an id must be answered");
+
+        assert_eq!(response["id"], json!(7));
+        assert_eq!(response["error"]["code"], json!(-32601));
     }
 }
