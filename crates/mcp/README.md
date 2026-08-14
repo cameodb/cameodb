@@ -78,12 +78,16 @@ parse — with `content` present and empty:
 ```
 
 The spec also permits a text copy of the result for clients predating structured results, and
-CameoDB does not send one. It would be the same JSON escaped into a string, doubling every
-response — measured at 1038 bytes against 520 for a two-hit search — to say nothing new. An
-agent's context is the scarce resource, and the shape of a result is already described where a
-client looks for it: `instructions` at `initialize`, and `outputSchema` on the search tools.
-`content` stays present as an empty array because it is a required field, so a client validating
-the envelope finds what it expects.
+CameoDB sends one exactly to those clients. Whether a request is from one follows its
+`MCP-Protocol-Version` header: the `2025-06-18` revision introduced `structuredContent` and made
+the header mandatory after `initialize`, so a request carrying that version or later gets the
+result once, structured, with `content` empty — the copy would be the same JSON escaped into a
+string, doubling every response (measured at 1038 bytes against 520 for a two-hit search) to say
+nothing new, and an agent's context is the scarce resource. A request carrying an earlier version
+or no header, including everything on the legacy HTTP+SSE transport, gets the serialized copy in
+the text block, because that block is the only place such a client reads. `content` is present
+either way because it is a required field, so a client validating the envelope finds what it
+expects.
 
 **A failure is the exception**, and keeps the text block, because a failure is a message rather
 than data:
@@ -594,7 +598,10 @@ For compatibility with some MCP client integrations, `POST /mcp/sse` is also acc
 
 ### Session Management
 
-- Sessions are created on SSE connection with unique ID: `mcp-session-{counter}`
+- Session IDs are cryptographically random UUIDs on both transports, so an id cannot be guessed even when authorization is off and sessions are bound to nobody
+- A request naming a session the server no longer holds is answered `404 Not Found`, per the Streamable HTTP spec — the signal telling the client to start over with `initialize` (an `initialize` carrying a stale id already is that fresh start, so it proceeds)
+- A session created by an identified key can only be continued or terminated by that key; another key is refused with `403 Forbidden`
+- The registry holds at most 1024 sessions; at the cap the longest-idle one is evicted rather than the new one refused
 - Server emits structured `Event` objects (not raw strings) for proper MCP compliance
 - Sessions are kept alive while the SSE connection remains open
 - Sessions are cleaned up after SSE disconnect + 5 minutes of POST inactivity

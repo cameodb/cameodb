@@ -69,10 +69,17 @@ pub(crate) fn error_response(id: Option<JsonValue>, code: i64, message: String) 
     })
 }
 
+/// Answer one JSON-RPC message, or `None` where the protocol says there is no reply.
+///
+/// `structured_results` is whether this caller reads `structuredContent` on a tool result — a
+/// property of the request's negotiated protocol revision, which only the transport can see.
+/// When false, a successful tool result also travels as the serialized copy in the text block,
+/// because that block is the only place such a client looks.
 pub(crate) async fn handle_rpc_request<S>(
     backend: S,
     request: JsonRpcRequest,
     authz: &McpAuthzRef,
+    structured_results: bool,
 ) -> Option<JsonValue>
 where
     S: McpBackend,
@@ -190,107 +197,14 @@ where
             json!({ "tools": visible_tools(authz, backend.max_search_limit()) }),
         )),
         "tools/call" => Some(
-            match serde_json::from_value::<ToolCallParams>(request.params) {
-                // Checked here rather than inside `call_tool` so the refusal precedes both
-                // the capability check and the tool body: a caller being rate limited should
-                // not learn, from the shape of the refusal, which tools it would otherwise
-                // be allowed to run.
-                Ok(params) => {
-                    // Read off the raw arguments rather than threaded out of `call_tool`,
-                    // which has a differently-shaped struct per tool. Every tool that names
-                    // an index calls the field `index` (or `indexes`), so one reader covers
-                    // all of them and a tool added later is described without being edited
-                    // into this match.
-                    let subject = tool_subject(&params.arguments);
-                    // Read the same way and for the same reason: what the call costs has to
-                    // be known before the rate check, which precedes decoding.
-                    let cost = tool_cost(&params.arguments);
-                    // Owned, because `params` moves into `call_tool` below and the record is
-                    // written after it returns.
-                    let query = params
-                        .arguments
-                        .get("query")
-                        .and_then(JsonValue::as_str)
-                        .map(str::to_string);
-                    match backend.check_tool_rate(Arc::clone(authz), &params.name, cost) {
-                        RateLimitVerdict::Deny { retry_after_secs } => {
-                            backend.record_tool_call(
-                                Arc::clone(authz),
-                                ToolCall {
-                                    tool: &params.name,
-                                    index: subject.as_deref(),
-                                    query: query.as_deref(),
-                                    error: Some("rate limit exceeded"),
-                                },
-                            );
-                            success_response(
-                                request.id,
-                                json!({
-                                    "content": [{
-                                        "type": "text",
-                                        "text": format!(
-                                            "Rate limit exceeded for tool '{}'. Retry after {retry_after_secs}s.",
-                                            params.name
-                                        ),
-                                    }],
-                                    "isError": true,
-                                }),
-                            )
-                        }
-                        RateLimitVerdict::Allow => {
-                            let tool = params.name.clone();
-                            let outcome = call_tool(&backend, params, authz).await;
-                            backend.record_tool_call(
-                                Arc::clone(authz),
-                                ToolCall {
-                                    tool: &tool,
-                                    index: subject.as_deref(),
-                                    query: query.as_deref(),
-                                    error: outcome.as_ref().err().map(String::as_str),
-                                },
-                            );
-                            match outcome {
-                                // The result travels once, as `structuredContent`. The spec also
-                                // allows a text copy for clients predating structured results,
-                                // and it is declined: it is the same JSON escaped into a string,
-                                // so it doubles every response to say nothing new. An agent's
-                                // context is the scarce resource here, and these tools are
-                                // described by `instructions` and `outputSchema` — a client that
-                                // needs to know the shape of a result is told, rather than shown
-                                // twice.
-                                //
-                                // `content` stays present and empty rather than being omitted.
-                                // It is a required array in the revisions this server negotiates,
-                                // and a client validating the envelope should find the field it
-                                // expects rather than an error.
-                                Ok(result) => success_response(
-                                    request.id,
-                                    json!({
-                                        "content": [],
-                                        "structuredContent": result,
-                                        "isError": false,
-                                    }),
-                                ),
-                                Err(err) => success_response(
-                                    request.id,
-                                    json!({
-                                        "content": [{
-                                            "type": "text",
-                                            "text": err,
-                                        }],
-                                        "isError": true,
-                                    }),
-                                ),
-                            }
-                        }
-                    }
-                }
-                Err(err) => error_response(
-                    request.id,
-                    -32602,
-                    format!("Invalid tools/call params: {err}"),
-                ),
-            },
+            handle_tool_call(
+                &backend,
+                request.id,
+                request.params,
+                authz,
+                structured_results,
+            )
+            .await,
         ),
 
         other => Some(error_response(
@@ -298,6 +212,126 @@ where
             -32601,
             format!("Unsupported MCP method: {other}"),
         )),
+    }
+}
+
+/// One `tools/call`: the rate check, the dispatch, and the record of what happened.
+///
+/// Split out of [`handle_rpc_request`] because it is the one method with real control flow —
+/// three outcomes, each recorded — and every outcome added inside a match arm is an outcome
+/// that can miss its `record_tool_call`. Here the two records sit next to the refusal and the
+/// dispatch they describe.
+async fn handle_tool_call<S>(
+    backend: &S,
+    id: Option<JsonValue>,
+    params: JsonValue,
+    authz: &McpAuthzRef,
+    structured_results: bool,
+) -> JsonValue
+where
+    S: McpBackend,
+{
+    let params = match serde_json::from_value::<ToolCallParams>(params) {
+        Ok(params) => params,
+        Err(err) => {
+            return error_response(id, -32602, format!("Invalid tools/call params: {err}"));
+        }
+    };
+
+    // Read off the raw arguments rather than threaded out of `call_tool`, which has a
+    // differently-shaped struct per tool. Every tool that names an index calls the field
+    // `index` (or `indexes`), so one reader covers all of them and a tool added later is
+    // described without being edited here.
+    let subject = tool_subject(&params.arguments);
+    // Read the same way and for the same reason: what the call costs has to be known before
+    // the rate check, which precedes decoding.
+    let cost = tool_cost(&params.arguments);
+    // Owned, because `params` moves into `call_tool` below and the record is written after
+    // it returns.
+    let query = params
+        .arguments
+        .get("query")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string);
+
+    // Checked before `call_tool` so the refusal precedes both the capability check and the
+    // tool body: a caller being rate limited should not learn, from the shape of the refusal,
+    // which tools it would otherwise be allowed to run.
+    if let RateLimitVerdict::Deny { retry_after_secs } =
+        backend.check_tool_rate(Arc::clone(authz), &params.name, cost)
+    {
+        backend.record_tool_call(
+            Arc::clone(authz),
+            ToolCall {
+                tool: &params.name,
+                index: subject.as_deref(),
+                query: query.as_deref(),
+                error: Some("rate limit exceeded"),
+            },
+        );
+        return success_response(
+            id,
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Rate limit exceeded for tool '{}'. Retry after {retry_after_secs}s.",
+                        params.name
+                    ),
+                }],
+                "isError": true,
+            }),
+        );
+    }
+
+    let tool = params.name.clone();
+    let outcome = call_tool(backend, params, authz).await;
+    backend.record_tool_call(
+        Arc::clone(authz),
+        ToolCall {
+            tool: &tool,
+            index: subject.as_deref(),
+            query: query.as_deref(),
+            error: outcome.as_ref().err().map(String::as_str),
+        },
+    );
+    match outcome {
+        // The result travels in the shape the caller's protocol revision defines, and only
+        // that shape. A client on the revision that introduced structured results gets
+        // `structuredContent` with `content` empty — the text copy would be the same JSON
+        // escaped into a string, doubling every response, and an agent's context is the scarce
+        // resource. A client predating that revision gets the serialized result in the text
+        // block and no `structuredContent` at all: the field does not exist in its revision,
+        // so sending it is bytes spent on something the client cannot read.
+        //
+        // Either way `content` is present rather than omitted. It is a required array in every
+        // revision this server negotiates, and a client validating the envelope should find
+        // the field it expects rather than an error.
+        Ok(result) => {
+            let body = if structured_results {
+                json!({
+                    "content": [],
+                    "structuredContent": result,
+                    "isError": false,
+                })
+            } else {
+                json!({
+                    "content": [{ "type": "text", "text": json_to_text(&result) }],
+                    "isError": false,
+                })
+            };
+            success_response(id, body)
+        }
+        Err(err) => success_response(
+            id,
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": err,
+                }],
+                "isError": true,
+            }),
+        ),
     }
 }
 
@@ -332,6 +366,7 @@ mod tests {
                 StubBackend::default(),
                 message(json!({ "jsonrpc": "2.0", "method": method })),
                 &caller(),
+                true,
             )
             .await;
             assert!(
@@ -349,6 +384,7 @@ mod tests {
             StubBackend::default(),
             message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" })),
             &caller(),
+            true,
         )
         .await
         .expect("initialize is answered");
@@ -369,11 +405,64 @@ mod tests {
             StubBackend::default(),
             message(json!({ "jsonrpc": "2.0", "id": 7, "method": "no/such/method" })),
             &caller(),
+            true,
         )
         .await
         .expect("a request carrying an id must be answered");
 
         assert_eq!(response["id"], json!(7));
         assert_eq!(response["error"]["code"], json!(-32601));
+    }
+
+    /// A tool result arrives in the one shape the caller's revision defines.
+    ///
+    /// The revision that introduced `structuredContent` is where a client learned to look for
+    /// it; one negotiated earlier reads only the text block, so the result is serialized into
+    /// it and `structuredContent` is not sent at all — the field does not exist in that
+    /// revision. One negotiated at or after it gets the structured result once, with `content`
+    /// present — it is a required array — and empty.
+    #[tokio::test]
+    async fn the_result_shape_follows_the_negotiated_revision() {
+        for structured_results in [true, false] {
+            let response = handle_rpc_request(
+                StubBackend::default(),
+                message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "list_indexes", "arguments": {}},
+                })),
+                &caller(),
+                structured_results,
+            )
+            .await
+            .expect("a tool call is answered");
+
+            let result = &response["result"];
+            assert_eq!(result["isError"], json!(false), "{response}");
+            let content = result["content"].as_array().expect("content is required");
+
+            if structured_results {
+                assert!(
+                    result["structuredContent"].is_object(),
+                    "a structured-era client got no structured result: {result}"
+                );
+                assert!(
+                    content.is_empty(),
+                    "a client that reads structuredContent was sent the copy too: {result}"
+                );
+            } else {
+                assert!(
+                    result.get("structuredContent").is_none(),
+                    "a pre-structuredContent client was sent a field its revision does not \
+                     define: {result}"
+                );
+                let text = content[0]["text"].as_str().unwrap_or_default();
+                assert!(
+                    serde_json::from_str::<JsonValue>(text).is_ok_and(|value| value.is_object()),
+                    "the text block does not carry the serialized result: {result}"
+                );
+            }
+        }
     }
 }

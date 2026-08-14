@@ -4,7 +4,7 @@
 //! header afterwards. Everything the registry knows is reachable only through the methods
 //! below, so the lock stays inside this module.
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::response::sse::Event;
 use tokio::sync::{Mutex, mpsc};
@@ -12,7 +12,20 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use std::sync::Arc;
+/// How long a session may sit idle before the sweeper removes it.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How often the sweeper looks for idle sessions.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The most sessions the registry will hold.
+///
+/// `initialize` is reachable before any rate limit and creates a session every time, so without
+/// a cap the registry's size is chosen by whoever sends requests fastest. At the cap the
+/// longest-idle session is evicted rather than the new one refused: refusing `initialize` hands
+/// the flood a way to lock everyone else out, while evicting costs the idlest caller one
+/// re-initialize.
+const MAX_SESSIONS: usize = 1024;
 
 #[derive(Clone)]
 pub(crate) struct McpTransportState {
@@ -47,15 +60,25 @@ impl McpTransportState {
 
     /// Create a new Streamable HTTP session (no SSE push channel) and return its id.
     /// The id is a cryptographically random UUID per the MCP spec recommendation.
-    pub(crate) async fn create_session(&self, key_id: Option<String>) -> String {
+    ///
+    /// `protocol_version` is what `initialize` negotiated. It is remembered here because it is
+    /// a property of the session, not of each request: a client that omits the version header
+    /// on later requests is still owed answers in the shape its revision defines.
+    pub(crate) async fn create_session(
+        &self,
+        key_id: Option<String>,
+        protocol_version: Option<String>,
+    ) -> String {
         let session_id = Uuid::new_v4().to_string();
         let mut inner = self.inner.lock().await;
+        inner.evict_idlest_if_full();
         inner.sessions.insert(
             session_id.clone(),
             McpSession {
                 sender: None,
                 last_activity: std::time::Instant::now(),
                 key_id,
+                protocol_version,
             },
         );
         session_id
@@ -63,6 +86,10 @@ impl McpTransportState {
 
     /// Create a legacy SSE session with a push channel, returning its id, a sender the caller
     /// can emit the endpoint event on, and the receiver that becomes the stream.
+    ///
+    /// The id is a random UUID for the same reason the Streamable HTTP one is: a session
+    /// created with authorization off is bound to nobody, so a guessable id would be enough to
+    /// post into someone else's conversation.
     pub(crate) async fn create_sse_session(
         &self,
         key_id: Option<String>,
@@ -71,27 +98,21 @@ impl McpTransportState {
         mpsc::UnboundedSender<Event>,
         mpsc::UnboundedReceiver<Event>,
     ) {
-        let mut inner = self.inner.lock().await;
-        inner.next_session_id += 1;
-        let session_id = format!("mcp-session-{}", inner.next_session_id);
+        let session_id = Uuid::new_v4().to_string();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        // Legacy SSE session ids are sequential, so the next one is guessable. Binding the
-        // session to its creator is what stops that from being useful.
         let session = McpSession {
             sender: Some(tx.clone()),
             last_activity: std::time::Instant::now(),
             key_id,
+            // The legacy HTTP+SSE transport is the 2024-11-05 revision by definition.
+            protocol_version: Some("2024-11-05".to_string()),
         };
 
+        let mut inner = self.inner.lock().await;
+        inner.evict_idlest_if_full();
         inner.sessions.insert(session_id.clone(), session);
         (session_id, tx, rx)
-    }
-
-    /// The session under `session_id`, if there is one.
-    pub(crate) async fn session_of(&self, session_id: &str) -> Option<McpSession> {
-        let inner = self.inner.lock().await;
-        inner.sessions.get(session_id).cloned()
     }
 
     /// Forget a session without asking who is asking. For the SSE stream's drop guard, where
@@ -118,20 +139,24 @@ impl McpTransportState {
         }
     }
 
-    /// Check that `key_id` may act on `session_id`, refreshing its activity clock if so.
+    /// Check that `key_id` may act on `session_id`, refreshing its activity clock and returning
+    /// the session if so.
+    ///
+    /// Returns the session on a grant rather than leaving the caller to fetch it, so checking
+    /// and reading are one lock acquisition and there is no window between them.
     pub(crate) async fn claim_session(
         &self,
         session_id: &str,
         key_id: Option<&str>,
-    ) -> SessionAccess {
+    ) -> SessionClaim {
         let mut inner = self.inner.lock().await;
         match inner.sessions.get_mut(session_id) {
-            None => SessionAccess::Unknown,
+            None => SessionClaim::Unknown,
             Some(session) if session.owned_by(key_id) => {
                 session.last_activity = std::time::Instant::now();
-                SessionAccess::Granted
+                SessionClaim::Granted(session.clone())
             }
-            Some(_) => SessionAccess::WrongKey,
+            Some(_) => SessionClaim::WrongKey,
         }
     }
 }
@@ -139,7 +164,7 @@ impl McpTransportState {
 /// Sweep inactive sessions until the state is cancelled.
 pub(crate) fn spawn_cleanup_task(state: McpTransportState) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut interval = tokio::time::interval(SWEEP_INTERVAL);
         loop {
             tokio::select! {
                 _ = state.cancel.cancelled() => {
@@ -149,7 +174,6 @@ pub(crate) fn spawn_cleanup_task(state: McpTransportState) {
                 _ = interval.tick() => {
                     let mut inner = state.inner.lock().await;
                     let now = std::time::Instant::now();
-                    let timeout = Duration::from_secs(300); // 5 minutes timeout
 
                     // Remove sessions: only clean up if SSE connection is closed AND inactive
                     inner.sessions.retain(|session_id, session| {
@@ -161,7 +185,7 @@ pub(crate) fn spawn_cleanup_task(state: McpTransportState) {
                         {
                             return true;
                         }
-                        let is_active = now.duration_since(session.last_activity) < timeout;
+                        let is_active = now.duration_since(session.last_activity) < SESSION_IDLE_TIMEOUT;
                         if !is_active {
                             info!(session_id = %session_id, "Cleaning up inactive MCP session");
                         }
@@ -180,6 +204,16 @@ pub(crate) enum SessionAccess {
     Granted,
     /// No such session. Not an authorization failure — a session may simply have expired,
     /// and each transport already has its own answer for that.
+    Unknown,
+    /// The session exists and belongs to a different key.
+    WrongKey,
+}
+
+/// The outcome of claiming a session, carrying the session on a grant.
+pub(crate) enum SessionClaim {
+    Granted(McpSession),
+    /// No such session — expired, evicted, or never created. Per the Streamable HTTP spec the
+    /// transport answers 404 so the client starts a new session with `initialize`.
     Unknown,
     /// The session exists and belongs to a different key.
     WrongKey,
@@ -206,8 +240,29 @@ impl McpShutdownHandle {
 
 #[derive(Default)]
 struct McpTransportInner {
-    next_session_id: u64,
     sessions: HashMap<String, McpSession>,
+}
+
+impl McpTransportInner {
+    /// Make room for one more session by evicting the longest-idle one at the cap.
+    ///
+    /// Evicting a legacy SSE session drops the registry's copy of its sender, which ends its
+    /// stream and lets the drop guard clean up — so an evicted session is gone the same way an
+    /// expired one is.
+    fn evict_idlest_if_full(&mut self) {
+        if self.sessions.len() < MAX_SESSIONS {
+            return;
+        }
+        if let Some(idlest) = self
+            .sessions
+            .iter()
+            .min_by_key(|(_, session)| session.last_activity)
+            .map(|(session_id, _)| session_id.clone())
+        {
+            info!(session_id = %idlest, "MCP session evicted: registry at capacity");
+            self.sessions.remove(&idlest);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -216,6 +271,12 @@ pub(crate) struct McpSession {
     /// over the stream); `None` for Streamable HTTP sessions where responses are
     /// returned inline on the POST request.
     pub(crate) sender: Option<mpsc::UnboundedSender<Event>>,
+    /// The protocol version `initialize` negotiated for this session, if one was recorded.
+    ///
+    /// What a later request falls back to when it carries no `MCP-Protocol-Version` header:
+    /// the shape of a tool result follows the revision the client speaks, and the session is
+    /// where that revision was agreed.
+    pub(crate) protocol_version: Option<String>,
     last_activity: std::time::Instant,
     /// The key that created this session, if the host identified one.
     ///
@@ -243,49 +304,53 @@ mod tests {
     #[tokio::test]
     async fn a_session_belongs_to_the_key_that_created_it() {
         let state = McpTransportState::default();
-        let session = state.create_session(Some("aabbccdd".to_string())).await;
+        let session = state
+            .create_session(Some("aabbccdd".to_string()), None)
+            .await;
 
-        assert_eq!(
+        assert!(matches!(
             state.claim_session(&session, Some("aabbccdd")).await,
-            SessionAccess::Granted
-        );
-        assert_eq!(
+            SessionClaim::Granted(_)
+        ));
+        assert!(matches!(
             state.claim_session(&session, Some("11223344")).await,
-            SessionAccess::WrongKey
-        );
+            SessionClaim::WrongKey
+        ));
         // No key at all is not a way around the binding.
-        assert_eq!(
+        assert!(matches!(
             state.claim_session(&session, None).await,
-            SessionAccess::WrongKey
-        );
-        assert_eq!(
+            SessionClaim::WrongKey
+        ));
+        assert!(matches!(
             state.claim_session("never-existed", Some("aabbccdd")).await,
-            SessionAccess::Unknown
-        );
+            SessionClaim::Unknown
+        ));
     }
 
     #[tokio::test]
     async fn another_key_cannot_end_someone_elses_session() {
         let state = McpTransportState::default();
-        let session = state.create_session(Some("aabbccdd".to_string())).await;
+        let session = state
+            .create_session(Some("aabbccdd".to_string()), None)
+            .await;
 
         assert_eq!(
             state.remove_session(&session, Some("11223344")).await,
             SessionAccess::WrongKey
         );
         // Still there: a refused delete must not have deleted anything.
-        assert_eq!(
+        assert!(matches!(
             state.claim_session(&session, Some("aabbccdd")).await,
-            SessionAccess::Granted
-        );
+            SessionClaim::Granted(_)
+        ));
         assert_eq!(
             state.remove_session(&session, Some("aabbccdd")).await,
             SessionAccess::Granted
         );
-        assert_eq!(
+        assert!(matches!(
             state.claim_session(&session, Some("aabbccdd")).await,
-            SessionAccess::Unknown
-        );
+            SessionClaim::Unknown
+        ));
     }
 
     #[tokio::test]
@@ -293,14 +358,72 @@ mod tests {
         // Auth off: there is no key to bind to, and binding to "no key" would lock out the
         // caller that created the session.
         let state = McpTransportState::default();
-        let session = state.create_session(None).await;
-        assert_eq!(
+        let session = state.create_session(None, None).await;
+        assert!(matches!(
             state.claim_session(&session, None).await,
-            SessionAccess::Granted
-        );
-        assert_eq!(
+            SessionClaim::Granted(_)
+        ));
+        assert!(matches!(
             state.claim_session(&session, Some("aabbccdd")).await,
-            SessionAccess::Granted
+            SessionClaim::Granted(_)
+        ));
+    }
+
+    /// The version `initialize` negotiated comes back with the claimed session.
+    ///
+    /// It is what the transport falls back to when a request carries no version header: the
+    /// shape of a tool result follows the client's revision, and the session is where that
+    /// revision was agreed.
+    #[tokio::test]
+    async fn a_claimed_session_recalls_its_negotiated_version() {
+        let state = McpTransportState::default();
+        let session = state
+            .create_session(None, Some("2025-06-18".to_string()))
+            .await;
+        match state.claim_session(&session, None).await {
+            SessionClaim::Granted(session) => {
+                assert_eq!(session.protocol_version.as_deref(), Some("2025-06-18"));
+            }
+            _ => panic!("the session was not granted to its creator"),
+        }
+    }
+
+    /// A legacy SSE session id must not be guessable.
+    ///
+    /// With authorization off a session is bound to nobody, so the id itself is the only thing
+    /// standing between a stranger and someone else's conversation. Sequential ids handed that
+    /// stranger the next one for free.
+    #[tokio::test]
+    async fn a_legacy_sse_session_id_is_not_guessable() {
+        let state = McpTransportState::default();
+        let (first, _tx1, _rx1) = state.create_sse_session(None).await;
+        let (second, _tx2, _rx2) = state.create_sse_session(None).await;
+        assert!(
+            Uuid::parse_str(&first).is_ok() && Uuid::parse_str(&second).is_ok(),
+            "legacy SSE ids are not random UUIDs: {first}, {second}"
+        );
+    }
+
+    /// The registry holds at most [`MAX_SESSIONS`], evicting the idlest rather than refusing
+    /// the newest — a flood of `initialize` must not choose the registry's size, and must not
+    /// lock a new caller out either.
+    #[tokio::test]
+    async fn a_full_registry_evicts_rather_than_grows_or_refuses() {
+        let state = McpTransportState::default();
+        for _ in 0..MAX_SESSIONS {
+            state.create_session(None, None).await;
+        }
+        let newest = state.create_session(None, None).await;
+
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.sessions.len(),
+            MAX_SESSIONS,
+            "the registry grew past its cap"
+        );
+        assert!(
+            inner.sessions.contains_key(&newest),
+            "the newest session was refused instead of the idlest being evicted"
         );
     }
 }

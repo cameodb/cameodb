@@ -233,7 +233,27 @@ max_shards_per_node = 1
     }
 
     /// One JSON-RPC message, returning the whole response envelope.
+    ///
+    /// Sent as a client on the revision that introduced `structuredContent` — the
+    /// `MCP-Protocol-Version` header is what tells the server so, and what these tests read
+    /// results from. `rpc_without_version` below is the client that predates it.
     async fn rpc(&self, body: Value) -> Value {
+        let resp = http()
+            .post(format!("{}/mcp", self.url))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
+            .json(&body)
+            .send()
+            .await
+            .expect("mcp post");
+        resp.json().await.expect("mcp json")
+    }
+
+    /// The same message from a client that negotiated a revision predating structured results,
+    /// which is also why it sends no `MCP-Protocol-Version` header — the header arrived in the
+    /// same revision.
+    async fn rpc_without_version(&self, body: Value) -> Value {
         let resp = http()
             .post(format!("{}/mcp", self.url))
             .header("content-type", "application/json")
@@ -1972,14 +1992,38 @@ async fn a_search_result_satisfies_the_schema_its_tool_advertises() {
             );
         }
 
-        // The result travels once. A text copy would be the same JSON escaped into a string,
-        // doubling every response to say nothing new, so `content` is present and empty rather
-        // than carrying a duplicate — present because it is a required array, empty because the
-        // duplicate is what an agent's context pays for.
+        // For a client on the revision that introduced structured results, the result travels
+        // once: a text copy would be the same JSON escaped into a string, doubling every
+        // response to say nothing new, so `content` is present — it is a required array — and
+        // empty.
         assert_eq!(
             result["content"],
             json!([]),
             "{tool} carried a text copy of a result it already returned structured: {result}"
+        );
+
+        // A client that negotiated a revision predating structured results reads nothing but
+        // the text block, so for it the same call carries the serialized copy there — and no
+        // `structuredContent` field at all, because that field does not exist in its revision.
+        let envelope = node
+            .rpc_without_version(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            }))
+            .await;
+        let result = &envelope["result"];
+        assert_eq!(result["isError"], json!(false), "{tool}: {envelope}");
+        assert!(
+            result["structuredContent"].is_null(),
+            "{tool}: a pre-structuredContent client received structuredContent: {result}"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert_eq!(
+            serde_json::from_str::<Value>(text).ok().as_ref(),
+            Some(structured),
+            "{tool}: a pre-structuredContent client did not get the text copy: {result}"
         );
     }
 }

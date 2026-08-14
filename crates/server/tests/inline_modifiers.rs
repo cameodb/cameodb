@@ -135,6 +135,7 @@ max_shards_per_node = 1
             .post(format!("{}/mcp", self.url))
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
             .json(&body)
             .send()
             .await
