@@ -243,11 +243,11 @@ A field marked `shadow` is the document identifier under the name the source dat
 
 ### 4. `list_indexes`
 
-List all available CameoDB indexes with their schemas and metadata. **New indexes are automatically available here** — no configuration needed.
+List every CameoDB index this key can see, with enough about each to choose between them. **A new index appears here automatically** — no configuration needed.
 
 **Parameters:** None
 
-**Returns:** All index schemas with metadata (document counts, field definitions, sizes). Each index includes a `fields` array with per-field details and `query_hints` section.
+**Returns:** One entry per index carrying `index`, its `description` where an operator wrote one, `document_count`, `field_count` and `field_names`. Enough to choose which index holds the answer; the field types, the `indexed`/`fast`/`shadow` flags and the per-type `query_hints` come from `describe_index` on the one you pick. A listing that repeated `describe_index` for every index would spend most of an agent's context before it had chosen an index — on five indexes of fourteen fields it was 13.5 KB against 1.3 KB.
 
 **Example:**
 ```json

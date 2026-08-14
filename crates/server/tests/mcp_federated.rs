@@ -838,16 +838,38 @@ async fn the_discovery_tools_describe_the_fields_an_index_has() {
         "a hint that does not recognise its own field type is worse than none: {described}"
     );
 
-    // The catalogue tool the prompt names as the first discovery step says the same.
+    // The catalogue tool the prompt names as the first discovery step names the fields too,
+    // without describing them: enough to tell which index holds the answer, and no more.
     let (_, listed) = node.call_tool("list_indexes", json!({})).await;
     let entry = listed["indexes"]
         .as_array()
         .and_then(|entries| entries.iter().find(|e| e["index"] == "alpha"))
         .unwrap_or_else(|| panic!("alpha missing from the catalogue: {listed}"));
+    let listed_names: Vec<&str> = entry["field_names"]
+        .as_array()
+        .expect("field_names")
+        .iter()
+        .filter_map(|name| name.as_str())
+        .collect();
     assert!(
-        entry["fields"].as_array().is_some_and(|f| !f.is_empty()),
-        "the catalogue describes alpha as having no fields: {listed}"
+        listed_names.contains(&"title") && listed_names.contains(&"created"),
+        "the catalogue names none of alpha's fields, so nothing can be chosen from it: {listed}"
     );
+    assert_eq!(entry["document_count"].as_u64(), Some(3), "{listed}");
+    assert_eq!(
+        entry["field_count"].as_u64(),
+        Some(listed_names.len() as u64),
+        "the count and the names disagree: {entry}"
+    );
+
+    // And the detail stops there. A listing that repeated `describe_index` per index would
+    // spend most of an agent's context before it had chosen an index to look at.
+    for key in ["fields", "query_hints", "schema", "stats"] {
+        assert!(
+            entry.get(key).is_none(),
+            "the catalogue still carries '{key}' per index: {entry}"
+        );
+    }
 }
 
 /// `validate_query` must not report a real field as unknown.

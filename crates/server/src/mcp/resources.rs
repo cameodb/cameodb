@@ -33,7 +33,9 @@ pub(super) fn list_resources(
         let mut resources = vec![resource_descriptor(
             "cameodb://indexes".to_string(),
             "CameoDB Index Catalog".to_string(),
-            "All available CameoDB indexes with schema and metadata.".to_string(),
+            "Every CameoDB index, with its description, document count and field names. \
+             Per-index schema is at cameodb://indexes/{index}."
+                .to_string(),
         )];
 
         for item in indexes {

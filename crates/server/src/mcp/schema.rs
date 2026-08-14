@@ -259,6 +259,51 @@ pub(super) fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
     entry
 }
 
+/// One index as the catalogue lists it: enough to choose between indexes, and no more.
+///
+/// The listing carried a full description of every index — field definitions with their flags,
+/// and the query hints for each type present — which made it a `describe_index` per index
+/// delivered in one response. On a catalogue of any size that is most of an agent's context
+/// spent before it has decided which index to look at, and the prompt tells it to start here.
+///
+/// What is left is what choosing needs: the name, the operator's description of the dataset
+/// where there is one, how many documents, and the field names. Types, flags and hints are one
+/// `describe_index` away, on the index that turned out to matter.
+///
+/// The field names are `field_names`, not `fields`, because `describe_index` uses `fields` for
+/// objects carrying a type and three flags. One key naming two shapes is how a client comes to
+/// read `entry.fields[0].type` off a string.
+pub(super) fn catalogue_entry(index: &str, stats: &JsonValue, schema: &JsonValue) -> JsonValue {
+    let field_names: Vec<JsonValue> = extract_field_info(&serde_json::json!({"schema": schema}))
+        .into_iter()
+        .filter(|info| info.name != "_seq")
+        .map(|info| JsonValue::String(info.name))
+        .collect();
+
+    let mut entry = serde_json::json!({
+        "index": index,
+        "document_count": stats
+            .get("document_count")
+            .cloned()
+            .unwrap_or(JsonValue::Null),
+        "field_count": field_names.len(),
+        "field_names": field_names,
+    });
+
+    // Present only where an operator wrote one, as it is on a field. It is the one part of a
+    // listing that says what the data *is* rather than how it is shaped, so it earns its bytes.
+    if let Some(text) = schema.get("description").and_then(|value| value.as_str())
+        && let Some(object) = entry.as_object_mut()
+    {
+        object.insert(
+            "description".to_string(),
+            JsonValue::String(text.to_string()),
+        );
+    }
+
+    entry
+}
+
 /// What a field of this type supports, for attaching to a schema listing.
 ///
 /// Rendered from [`cameodb_mcp::syntax`], the one table every syntax surface reads.

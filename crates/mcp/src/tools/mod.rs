@@ -303,7 +303,7 @@ pub(crate) fn mcp_tools(max_search_limit: usize) -> Vec<JsonValue> {
         json!({
             "name": "list_indexes",
             "title": "List Indexes",
-            "description": "List every CameoDB index this key can see, each with its schema and statistics. Every entry carries the same 'fields' and 'query_hints' arrays that `describe_index` returns. Use this as the first discovery step — a new index appears here with its schema and no configuration.",
+            "description": "List every CameoDB index this key can see. Each entry carries the index name, its 'description' where an operator wrote one, its document count, and its 'field_names' — enough to choose which index holds the answer. Field types, the 'indexed'/'fast'/'shadow' flags and the per-type query hints come from `describe_index` on the one you pick. Use this as the first discovery step: a new index appears here with no configuration.",
             "inputSchema": list_indexes_input_schema(),
             "annotations": {
                 "readOnlyHint": true,

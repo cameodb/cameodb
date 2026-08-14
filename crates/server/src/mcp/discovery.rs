@@ -8,8 +8,8 @@ use cameodb_mcp::McpAuthzRef;
 use crate::authz::retain_visible_indexes;
 use crate::mcp::diagnostics::{analyze_query, cameodb_syntax_reference};
 use crate::mcp::schema::{
-    absent_index_reason, enrich_index_entry, extract_field_info, extract_field_names,
-    field_query_hint, index_schema,
+    absent_index_reason, catalogue_entry, enrich_index_entry, extract_field_info,
+    extract_field_names, field_query_hint, index_schema,
 };
 use crate::node_orchestrator::ClientOp;
 use crate::state::AppState;
@@ -75,9 +75,11 @@ pub(super) fn list_indexes(
             .cloned()
             .unwrap_or_default();
 
-        // One schema read per index, run together rather than in series: the listing is
-        // the first thing an agent calls, and a catalogue of two hundred indexes should
-        // not cost two hundred sequential round trips.
+        // One schema read per index, run together rather than in series: the listing is the
+        // first thing an agent calls, and a catalogue of two hundred indexes should not cost two
+        // hundred sequential round trips. The schema is read for the field names and the
+        // operator's description; what it says about each field's type belongs to
+        // `describe_index`, on whichever index the listing leads to.
         let mut schema_reads = FuturesUnordered::new();
         for stats in indexes {
             let index_name = stats
@@ -88,11 +90,7 @@ pub(super) fn list_indexes(
             let state = state.clone();
             schema_reads.push(async move {
                 let schema = index_schema(&state, &index_name).await;
-                enrich_index_entry(serde_json::json!({
-                    "index": index_name,
-                    "stats": stats,
-                    "schema": schema,
-                }))
+                catalogue_entry(&index_name, &stats, &schema)
             });
         }
 
