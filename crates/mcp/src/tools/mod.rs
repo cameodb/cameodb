@@ -266,70 +266,104 @@ fn search_across_indexes_description() -> String {
         .to_string()
 }
 
+/// The descriptions that are prose rather than rendered from the syntax tables.
+///
+/// Constants so that the catalogue below reads as a list of tools rather than as a wall
+/// of text with six tools hidden in it.
+const DESCRIBE_INDEX_DESCRIPTION: &str = "Describe one CameoDB index: its schema, its statistics, and how to query it. Returns a 'fields' array giving each field's type and its 'indexed', 'fast' and 'shadow' flags, and a 'query_hints' array naming the operators (phrases, ranges, IN set, boost, slop) each type present supports. Call this before constructing a query against unfamiliar data.\n\nORCHESTRATION TIP: Review the returned fields to identify potential pivot fields (like foreign keys, user IDs, or hashes) before running your search.";
+
+const LIST_INDEXES_DESCRIPTION: &str = "List every CameoDB index this key can see. Each entry carries the index name, its 'description' where an operator wrote one, its document count, and its 'field_names' — enough to choose which index holds the answer. Field types, the 'indexed'/'fast'/'shadow' flags and the per-type query hints come from `describe_index` on the one you pick. Use this as the first discovery step: a new index appears here with no configuration.";
+
+const VALIDATE_QUERY_DESCRIPTION: &str = "Validate and get guidance on CameoDB search query syntax. Provides field-type-aware suggestions, detects unknown or non-indexed fields, checks query structure (unbalanced quotes/parens, inline modifiers), and returns the full CameoDB query syntax reference. Supply an index name for schema-aware validation.\n\nPRO TIPS FOR AGENTS:\n1. Call with no arguments to get the complete query syntax reference and operator-by-field-type compatibility matrix.\n2. Supply an index name to get schema-aware field validation with type-specific operator hints per field.\n3. Supply a partial_field to get autocomplete suggestions matching available fields.\n4. Supply a query to get structural validation, field recognition, typo detection ('did you mean?'), and per-field operator guidance.\n\nORCHESTRATION TIP: Use this tool immediately if `search_index` returns a syntax error, before attempting to guess the correct format.";
+
+const CATALOG_STATS_DESCRIPTION: &str = "Totals across every CameoDB index this key can see: how many indexes, documents, fields, and bytes. For one index, call `describe_index`, which reports its statistics alongside its schema.";
+
+/// One entry in the catalogue: a read, described, with its schemas.
+///
+/// The display name is given once and lands twice. A client on the revision that added
+/// `annotations.title` looks there; the top-level `title` came later, and a client on that looks
+/// there. Writing the string in one place is what keeps the two from drifting into different
+/// names for the same tool.
+///
+/// The hints are the same for every tool here because every tool here is a read. `readOnlyHint`
+/// says so, and `openWorldHint: false` says the domain is closed: these tools reach nothing but
+/// this node's own indexes. That the documents inside them arrive from elsewhere does not open
+/// the world the tool interacts with, any more than it does for a memory tool — the spec's own
+/// example of a closed one.
+///
+/// `destructiveHint` and `idempotentHint` are deliberately absent. The spec scopes both to tools
+/// whose `readOnlyHint` is false, so on a read they are bytes in every catalogue listing that no
+/// client should act on. The test below requires them the moment a tool stops being a read.
+fn read_only_tool(
+    name: &str,
+    title: &str,
+    description: JsonValue,
+    input_schema: JsonValue,
+    output_schema: Option<JsonValue>,
+) -> JsonValue {
+    let mut tool = json!({
+        "name": name,
+        "title": title,
+        "description": description,
+        "inputSchema": input_schema,
+        "annotations": {
+            "title": title,
+            "readOnlyHint": true,
+            "openWorldHint": false
+        }
+    });
+    if let Some(schema) = output_schema
+        && let Some(object) = tool.as_object_mut()
+    {
+        object.insert("outputSchema".to_string(), schema);
+    }
+    tool
+}
+
 pub(crate) fn mcp_tools(max_search_limit: usize) -> Vec<JsonValue> {
     vec![
-        json!({
-            "name": "search_index",
-            "title": "Search Index",
-            "description": search_index_description(),
-            "inputSchema": search_index_input_schema(max_search_limit),
-            "outputSchema": search_index_output_schema(),
-            "annotations": {
-                "readOnlyHint": true,
-                "openWorldHint": false
-            }
-        }),
-        json!({
-            "name": "search_across_indexes",
-            "title": "Federated Search",
-            "description": search_across_indexes_description(),
-            "inputSchema": search_across_indexes_input_schema(max_search_limit),
-            "outputSchema": search_across_indexes_output_schema(),
-            "annotations": {
-                "readOnlyHint": true,
-                "openWorldHint": false
-            }
-        }),
-        json!({
-            "name": "describe_index",
-            "title": "Describe Index",
-            "description": "Describe one CameoDB index: its schema, its statistics, and how to query it. Returns a 'fields' array giving each field's type and its 'indexed', 'fast' and 'shadow' flags, and a 'query_hints' array naming the operators (phrases, ranges, IN set, boost, slop) each type present supports. Call this before constructing a query against unfamiliar data.\n\nORCHESTRATION TIP: Review the returned fields to identify potential pivot fields (like foreign keys, user IDs, or hashes) before running your search.",
-            "inputSchema": describe_index_input_schema(),
-            "annotations": {
-                "readOnlyHint": true,
-                "openWorldHint": false
-            }
-        }),
-        json!({
-            "name": "list_indexes",
-            "title": "List Indexes",
-            "description": "List every CameoDB index this key can see. Each entry carries the index name, its 'description' where an operator wrote one, its document count, and its 'field_names' — enough to choose which index holds the answer. Field types, the 'indexed'/'fast'/'shadow' flags and the per-type query hints come from `describe_index` on the one you pick. Use this as the first discovery step: a new index appears here with no configuration.",
-            "inputSchema": list_indexes_input_schema(),
-            "annotations": {
-                "readOnlyHint": true,
-                "openWorldHint": false
-            }
-        }),
-        json!({
-            "name": "validate_query",
-            "title": "Validate Query",
-            "description": "Validate and get guidance on CameoDB search query syntax. Provides field-type-aware suggestions, detects unknown or non-indexed fields, checks query structure (unbalanced quotes/parens, inline modifiers), and returns the full CameoDB query syntax reference. Supply an index name for schema-aware validation.\n\nPRO TIPS FOR AGENTS:\n1. Call with no arguments to get the complete query syntax reference and operator-by-field-type compatibility matrix.\n2. Supply an index name to get schema-aware field validation with type-specific operator hints per field.\n3. Supply a partial_field to get autocomplete suggestions matching available fields.\n4. Supply a query to get structural validation, field recognition, typo detection ('did you mean?'), and per-field operator guidance.\n\nORCHESTRATION TIP: Use this tool immediately if `search_index` returns a syntax error, before attempting to guess the correct format.",
-            "inputSchema": validate_query_input_schema(),
-            "annotations": {
-                "readOnlyHint": true,
-                "openWorldHint": false
-            }
-        }),
-        json!({
-            "name": "get_catalog_stats",
-            "title": "Catalog Statistics",
-            "description": "Totals across every CameoDB index this key can see: how many indexes, documents, fields, and bytes. For one index, call `describe_index`, which reports its statistics alongside its schema.",
-            "inputSchema": get_catalog_stats_input_schema(),
-            "annotations": {
-                "readOnlyHint": true,
-                "openWorldHint": false
-            }
-        }),
+        read_only_tool(
+            "search_index",
+            "Search Index",
+            search_index_description().into(),
+            search_index_input_schema(max_search_limit),
+            Some(search_index_output_schema()),
+        ),
+        read_only_tool(
+            "search_across_indexes",
+            "Federated Search",
+            search_across_indexes_description().into(),
+            search_across_indexes_input_schema(max_search_limit),
+            Some(search_across_indexes_output_schema()),
+        ),
+        read_only_tool(
+            "describe_index",
+            "Describe Index",
+            DESCRIBE_INDEX_DESCRIPTION.into(),
+            describe_index_input_schema(),
+            None,
+        ),
+        read_only_tool(
+            "list_indexes",
+            "List Indexes",
+            LIST_INDEXES_DESCRIPTION.into(),
+            list_indexes_input_schema(),
+            None,
+        ),
+        read_only_tool(
+            "validate_query",
+            "Validate Query",
+            VALIDATE_QUERY_DESCRIPTION.into(),
+            validate_query_input_schema(),
+            None,
+        ),
+        read_only_tool(
+            "get_catalog_stats",
+            "Catalog Statistics",
+            CATALOG_STATS_DESCRIPTION.into(),
+            get_catalog_stats_input_schema(),
+            None,
+        ),
     ]
 }
 
@@ -376,6 +410,66 @@ mod tests {
                 Some(McpCapability::Read),
                 "{name} is not a read; it needs its own row and a look at what else changed"
             );
+        }
+    }
+
+    /// Every tool carries its display name in both places a client looks for one.
+    ///
+    /// `annotations.title` is where the revision that introduced it put the name; the top-level
+    /// `title` came later. A client on either finds a name, and neither finds a different one.
+    #[test]
+    fn a_tool_names_itself_the_same_way_twice() {
+        for tool in mcp_tools(DEFAULT_MAX_SEARCH_LIMIT) {
+            let name = tool["name"].as_str().unwrap_or("?");
+            let title = tool["title"].as_str().unwrap_or_default();
+            assert!(!title.is_empty(), "{name} has no display name");
+            assert_eq!(
+                tool["annotations"]["title"].as_str(),
+                Some(title),
+                "{name} gives two different display names"
+            );
+        }
+    }
+
+    /// The hints a read does not need are absent, and become required if a tool stops being one.
+    ///
+    /// The spec scopes `destructiveHint` and `idempotentHint` to tools whose `readOnlyHint` is
+    /// false, so on a read they are bytes in every catalogue listing that no client should act
+    /// on. Emitting them anyway would also be the easy way to get them wrong later: a write tool
+    /// inheriting `destructiveHint: false` from a template is worse than one that has to state
+    /// it. This is the other half of the deny default in the capability table.
+    #[test]
+    fn a_tool_that_is_not_a_read_must_say_what_it_does() {
+        for tool in mcp_tools(DEFAULT_MAX_SEARCH_LIMIT) {
+            let name = tool["name"].as_str().unwrap_or("?");
+            let annotations = &tool["annotations"];
+            // The domain is this node's own indexes, whatever is ingested into them.
+            assert_eq!(
+                annotations["openWorldHint"],
+                json!(false),
+                "{name} claims an open world; these tools reach nothing but local indexes"
+            );
+
+            if annotations["readOnlyHint"] == json!(true) {
+                for hint in ["destructiveHint", "idempotentHint"] {
+                    assert!(
+                        annotations.get(hint).is_none(),
+                        "{name} is a read and carries '{hint}', which the spec reads only on \
+                         tools that are not"
+                    );
+                }
+                continue;
+            }
+
+            for hint in ["destructiveHint", "idempotentHint"] {
+                assert!(
+                    annotations
+                        .get(hint)
+                        .is_some_and(|value| value.is_boolean()),
+                    "{name} is not a read, so it has to state '{hint}' rather than leave a \
+                     client to assume the default"
+                );
+            }
         }
     }
 

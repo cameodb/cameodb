@@ -54,7 +54,9 @@ This means an agent can go from zero knowledge to well-formed queries in **two t
 
 ## MCP Tools
 
-All tools follow MCP naming conventions (verb-first `snake_case`) and include `title`, property descriptions, and annotations.
+All tools follow MCP naming conventions (verb-first `snake_case`) and include a display name in both places a client looks for one — the top-level `title` and `annotations.title` — plus property descriptions and annotations.
+
+Every tool is annotated `readOnlyHint: true` and `openWorldHint: false`. The closed world is deliberate: these tools reach nothing but this node's own indexes, and documents arriving in them from external ingestion does not change what the tool interacts with. `destructiveHint` and `idempotentHint` are absent because the spec reads them only on tools whose `readOnlyHint` is false; a test requires them the moment a tool is added that is not a read.
 
 Every tool takes the arguments listed below and no others. Each `inputSchema` says `additionalProperties: false`, and a call carrying an argument its tool does not take is refused by name rather than run without it — a misspelled `limit` would otherwise return the default ten hits and read as the whole answer. Tools whose arguments are all optional may be called with `arguments` omitted entirely.
 

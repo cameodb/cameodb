@@ -2222,3 +2222,41 @@ async fn validating_a_query_reads_one_index_rather_than_the_catalogue() {
         "{refusal}"
     );
 }
+
+/// Every advertised tool arrives annotated, with its name in both places a client looks.
+///
+/// Read off `tools/list` rather than the catalogue function, since what matters is what a client
+/// receives — a display name in one place only is a tool that shows up unnamed in half the
+/// clients in the field.
+#[tokio::test]
+async fn every_advertised_tool_arrives_annotated() {
+    let node = TestNode::start().await;
+
+    let listing = node
+        .rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await;
+    let tools = listing["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .clone();
+    assert!(!tools.is_empty(), "{listing}");
+
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("?");
+        let annotations = &tool["annotations"];
+        assert_eq!(
+            annotations["title"].as_str(),
+            tool["title"].as_str(),
+            "{name} does not name itself the same way twice: {tool}"
+        );
+        assert_eq!(annotations["readOnlyHint"], json!(true), "{name}: {tool}");
+        assert_eq!(annotations["openWorldHint"], json!(false), "{name}: {tool}");
+        // Meaningful only on tools that are not reads, and every tool here is one.
+        for hint in ["destructiveHint", "idempotentHint"] {
+            assert!(
+                annotations.get(hint).is_none(),
+                "{name} carries '{hint}' on a read: {tool}"
+            );
+        }
+    }
+}
