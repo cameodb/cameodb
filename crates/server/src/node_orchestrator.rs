@@ -284,6 +284,24 @@ struct BroadcastStats {
 /// is stripped from every hit at the client boundary (`route_and_handle`).
 const SORT_KEY_FIELD: &str = "_sort_key";
 
+/// Report the shards that could not be read, and only then.
+///
+/// Absent means every shard answered, which is what makes its presence worth reading — the same
+/// rule the federated search follows for the indexes it could not reach. An `errors: []` on every
+/// successful search teaches a caller to skip the key, which is precisely the habit that hides
+/// the one response where it matters.
+fn attach_shard_errors(response: &mut JsonValue, errors: Vec<String>) {
+    if errors.is_empty() {
+        return;
+    }
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "errors".to_string(),
+            JsonValue::Array(errors.into_iter().map(JsonValue::String).collect()),
+        );
+    }
+}
+
 /// Response key listing the clauses the query parser dropped.
 ///
 /// Absent on a clean parse rather than present and empty, so a caller can test for presence.
@@ -320,9 +338,7 @@ fn unknown_modifier_fields(
         return Vec::new();
     }
 
-    let known = |name: &str| {
-        name.starts_with('_') || name == "shard_id" || schema.fields.contains_key(name)
-    };
+    let known = |name: &str| name.starts_with('_') || schema.fields.contains_key(name);
     let note = |clause: &str, field: &str| {
         format!(
             "'{clause} {field}' names a field this index does not have, so the clause had no \
@@ -2207,7 +2223,7 @@ impl OrchestratorEngine {
         let total_shards = shards.len();
         let hits: Vec<JsonValue> = results
             .into_iter()
-            .map(|(shard_id, score, mut doc)| {
+            .map(|(_shard_id, score, mut doc)| {
                 // Add metadata fields
                 if let JsonValue::Object(ref mut o) = doc {
                     o.insert(
@@ -2215,10 +2231,6 @@ impl OrchestratorEngine {
                         serde_json::Number::from_f64(score as f64)
                             .map(JsonValue::Number)
                             .unwrap_or(JsonValue::Null),
-                    );
-                    o.insert(
-                        "shard_id".to_string(),
-                        JsonValue::String(shard_id.to_string()),
                     );
                 }
 
@@ -2243,8 +2255,8 @@ impl OrchestratorEngine {
                     "failed": errors.len()
                 }
             },
-            "errors": errors
         });
+        attach_shard_errors(&mut response, errors);
         discarded.extend(unknown_modifier_fields(&schema, fields, sort));
         attach_discarded(&mut response, discarded);
         Ok(response)
@@ -4499,17 +4511,14 @@ impl RouterActor {
                                                 .unwrap_or(serde_json::Number::from(0)),
                                         ),
                                     );
-                                    // Track unique shard IDs from individual documents
-                                    if let Some(shard_id) =
-                                        hit_doc.get("shard_id").and_then(|s| s.as_str())
-                                        && let Ok(uuid) = Uuid::parse_str(shard_id)
-                                    {
-                                        unique_shard_ids.insert(uuid);
-                                    }
                                 }
                                 block.push(hit_doc);
                             }
                             hits_collected += block.len();
+                            // Counted from the result, not from its hits — a shard that matched
+                            // nothing still answered, and reading the id back out of each
+                            // document missed that as well as costing a copy of it per hit.
+                            unique_shard_ids.insert(shard_id);
                             blocks.push(((0, shard_id), block));
                             total_hits_sum += total_hits;
                             shards_queried = unique_shard_ids.len();
@@ -4567,7 +4576,7 @@ impl RouterActor {
                     limit,
                 );
 
-                Ok(serde_json::json!({
+                let mut response = serde_json::json!({
                     "hits": all_hits,
                     "hits_returned": all_hits.len(),
                     "total_hits": total_hits_sum,
@@ -4583,8 +4592,9 @@ impl RouterActor {
                             "contacted": nodes_contacted
                         }
                     },
-                    "errors": errors
-                }))
+                });
+                attach_shard_errors(&mut response, errors);
+                Ok(response)
             }
             _ => {
                 // For non-search operations, fall back to broadcast request handling
@@ -7080,7 +7090,7 @@ impl NodeOrchestrator {
         results.truncate(limit);
         let hits: Vec<JsonValue> = results
             .into_iter()
-            .map(|(shard_id, score, mut doc)| {
+            .map(|(_shard_id, score, mut doc)| {
                 // Add metadata fields
                 if let JsonValue::Object(ref mut o) = doc {
                     o.insert(
@@ -7088,10 +7098,6 @@ impl NodeOrchestrator {
                         serde_json::Number::from_f64(score as f64)
                             .map(JsonValue::Number)
                             .unwrap_or(JsonValue::Null),
-                    );
-                    o.insert(
-                        "shard_id".to_string(),
-                        JsonValue::String(shard_id.to_string()),
                     );
                 }
 
@@ -7116,8 +7122,8 @@ impl NodeOrchestrator {
                     "failed": errors.len()
                 }
             },
-            "errors": errors
         });
+        attach_shard_errors(&mut response, errors);
         discarded.extend(unknown_modifier_fields(&schema, fields, sort));
         attach_discarded(&mut response, discarded);
         Ok(response)

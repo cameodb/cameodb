@@ -197,6 +197,109 @@ pub(crate) fn search_indexes_input_schema(max_search_limit: usize) -> JsonValue 
     })
 }
 
+/// What every search result carries, whichever tool produced it.
+///
+/// Declared so the contract stops being prose inside a description string: a client reading the
+/// catalogue learns that `total_hits` counts matches while `hits_returned` counts what came
+/// back, and that a trimmed response says so — rather than having to be told in a paragraph it
+/// may not have been given.
+///
+/// `additionalProperties` is left open deliberately. A hit is the stored document, whose fields
+/// belong to the index rather than to this protocol, and the envelope also carries engine
+/// diagnostics that are not a promise to anyone. What is written out here is what a caller may
+/// rely on; what is not written out is not thereby forbidden.
+fn search_result_properties() -> JsonValue {
+    json!({
+        "hits": {
+            "type": "array",
+            "description": "The matching documents, highest ranked first, or in sort order when one was requested. Each carries `_score`; a projection returns the named fields in the order given.",
+            "items": { "type": "object" }
+        },
+        "hits_returned": {
+            "type": "integer",
+            "description": "How many hits this response carries. Below `total_hits` when a limit applied or the response was trimmed."
+        },
+        "total_hits": {
+            "type": "integer",
+            "description": "How many documents matched, which is not how many were returned. Unaffected by the limit or by trimming."
+        },
+        "limit": {
+            "type": "integer",
+            "description": "The limit the search ran with, whether it came from the argument, an inline modifier, or the node's default."
+        },
+        "_warning": {
+            "type": "string",
+            "description": "Present when the response needs explaining: nothing matched and something narrowed the query, or hits were left out. Read it before reporting the result."
+        },
+        "_truncated": {
+            "type": "boolean",
+            "description": "Present and true when hits were left out to keep the response within the largest message this node sends. The hits returned are the front of the same order."
+        },
+        "_omitted_hits": {
+            "type": "integer",
+            "description": "How many hits were left out by trimming. Narrow the query to see them rather than treating what was returned as the whole result."
+        }
+    })
+}
+
+pub(crate) fn search_index_output_schema() -> JsonValue {
+    let mut schema = json!({
+        "type": "object",
+        "properties": search_result_properties(),
+        "required": ["hits", "hits_returned", "total_hits"],
+        "additionalProperties": true
+    });
+    if let Some(properties) = schema["properties"].as_object_mut() {
+        properties.insert(
+            "errors".to_string(),
+            json!({
+                "type": "array",
+                "description": "Shards that could not be read, absent when every shard answered — so its presence means part of the answer is missing.",
+                "items": { "type": "string" }
+            }),
+        );
+    }
+    schema
+}
+
+pub(crate) fn search_indexes_output_schema() -> JsonValue {
+    let mut schema = json!({
+        "type": "object",
+        "properties": search_result_properties(),
+        "required": ["hits", "hits_returned", "total_hits"],
+        "additionalProperties": true
+    });
+    if let Some(properties) = schema["properties"].as_object_mut() {
+        properties.insert(
+            "errors".to_string(),
+            json!({
+                "type": "array",
+                "description": "Indexes that could not be read, each naming the index and why. Absent when every index answered, so its presence means part of the answer is missing. A search where every index failed is an error rather than a result.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": { "type": "string" },
+                        "error": { "type": "string" }
+                    }
+                }
+            }),
+        );
+        // Only the federated tool can say which index a hit came from.
+        if let Some(hits) = properties.get_mut("hits")
+            && let Some(hits) = hits.as_object_mut()
+        {
+            hits.insert(
+                "description".to_string(),
+                JsonValue::String(
+                    "The merged hits, highest ranked first, or in sort order when one was requested. Each carries `_score` and `_index_source` naming the index it came from."
+                        .to_string(),
+                ),
+            );
+        }
+    }
+    schema
+}
+
 pub(crate) fn get_index_input_schema() -> JsonValue {
     json!({
         "type": "object",

@@ -49,8 +49,13 @@ fn success_response(id: Option<JsonValue>, result: JsonValue) -> JsonValue {
     })
 }
 
-fn json_to_pretty_string(value: &JsonValue) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+/// A tool's result as the text block, compactly.
+///
+/// Not indented. The result now travels as `structuredContent` too, so the text block is the
+/// backwards-compatible copy rather than the thing a human reads — and indentation would be a
+/// quarter of the message spent on whitespace, twice over.
+fn json_to_text(value: &JsonValue) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
 pub(crate) fn error_response(id: Option<JsonValue>, code: i64, message: String) -> JsonValue {
@@ -125,7 +130,7 @@ where
                             "contents": [{
                                 "uri": params.uri,
                                 "mimeType": "application/json",
-                                "text": json_to_pretty_string(&content),
+                                "text": json_to_text(&content),
                             }]
                         }),
                     ),
@@ -245,13 +250,24 @@ where
                                 },
                             );
                             match outcome {
+                                // The result travels once, as `structuredContent`. The spec also
+                                // allows a text copy for clients predating structured results,
+                                // and it is declined: it is the same JSON escaped into a string,
+                                // so it doubles every response to say nothing new. An agent's
+                                // context is the scarce resource here, and these tools are
+                                // described by `instructions` and `outputSchema` — a client that
+                                // needs to know the shape of a result is told, rather than shown
+                                // twice.
+                                //
+                                // `content` stays present and empty rather than being omitted.
+                                // It is a required array in the revisions this server negotiates,
+                                // and a client validating the envelope should find the field it
+                                // expects rather than an error.
                                 Ok(result) => success_response(
                                     request.id,
                                     json!({
-                                        "content": [{
-                                            "type": "text",
-                                            "text": json_to_pretty_string(&result),
-                                        }],
+                                        "content": [],
+                                        "structuredContent": result,
                                         "isError": false,
                                     }),
                                 ),

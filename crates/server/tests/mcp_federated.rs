@@ -221,8 +221,14 @@ max_shards_per_node = 1
             .await;
         let result = &value["result"];
         let is_error = result["isError"].as_bool().unwrap_or(false);
-        let text = result["content"][0]["text"].as_str().unwrap_or("");
-        let parsed = serde_json::from_str(text).unwrap_or(Value::String(text.to_string()));
+        // A successful result arrives as `structuredContent`, already parsed. A failure has no
+        // structured form — it is a message — so it comes back in the text block.
+        let parsed = if is_error {
+            let text = result["content"][0]["text"].as_str().unwrap_or("");
+            serde_json::from_str(text).unwrap_or(Value::String(text.to_string()))
+        } else {
+            result["structuredContent"].clone()
+        };
         (is_error, parsed)
     }
 
@@ -1839,5 +1845,204 @@ max_response_bytes = 900
     assert!(
         result.get("_truncated").is_none(),
         "a response that fits should carry no trim flag: {result}"
+    );
+}
+
+/// A search result satisfies the schema its tool advertises, and arrives already parsed.
+///
+/// An `outputSchema` nobody checks is the same liability as an `inputSchema` nobody enforces: a
+/// client that trusts it and finds a required key missing has been misled by the catalogue. This
+/// reads the schema out of `tools/list` and holds a real response to it, so the two cannot drift
+/// in either direction.
+#[tokio::test]
+async fn a_search_result_satisfies_the_schema_its_tool_advertises() {
+    let node = two_seeded_indexes().await;
+
+    let listing = node
+        .rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await;
+    let tools = listing["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .clone();
+
+    for (tool, arguments) in [
+        (
+            "search_index",
+            json!({"index": "alpha", "query": "title:record", "limit": 2}),
+        ),
+        (
+            "search_indexes",
+            json!({"indexes": [{"index": "alpha"}, {"index": "beta"}], "query": "title:record", "limit": 2}),
+        ),
+    ] {
+        let declared = tools
+            .iter()
+            .find(|entry| entry["name"] == json!(tool))
+            .and_then(|entry| entry.get("outputSchema"))
+            .unwrap_or_else(|| panic!("{tool} advertises no outputSchema"))
+            .clone();
+
+        // The whole envelope, not the parsed text, so the shape a client receives is what is
+        // checked.
+        let envelope = node
+            .rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            }))
+            .await;
+        let result = &envelope["result"];
+        assert_eq!(result["isError"], json!(false), "{tool}: {envelope}");
+
+        // A tool declaring an output schema must return the result structured, not only as text.
+        let structured = &result["structuredContent"];
+        assert!(
+            structured.is_object(),
+            "{tool} returned no structuredContent: {result}"
+        );
+
+        for required in declared["required"].as_array().expect("required") {
+            let key = required.as_str().expect("a required key is a string");
+            assert!(
+                structured.get(key).is_some(),
+                "{tool} declares '{key}' as required and did not return it: {structured}"
+            );
+        }
+
+        // Every key the response does carry that the schema also names must match the declared
+        // type, so a description cannot say `integer` where a string arrives.
+        let properties = declared["properties"].as_object().expect("properties");
+        for (key, property) in properties {
+            let Some(value) = structured.get(key) else {
+                continue;
+            };
+            let matches = match property["type"].as_str() {
+                Some("array") => value.is_array(),
+                Some("integer") => value.is_i64() || value.is_u64(),
+                Some("string") => value.is_string(),
+                Some("boolean") => value.is_boolean(),
+                Some("object") => value.is_object(),
+                other => panic!("{tool}: unhandled declared type {other:?} for '{key}'"),
+            };
+            assert!(
+                matches,
+                "{tool}: '{key}' is declared {} and arrived as {value}",
+                property["type"]
+            );
+        }
+
+        // The result travels once. A text copy would be the same JSON escaped into a string,
+        // doubling every response to say nothing new, so `content` is present and empty rather
+        // than carrying a duplicate — present because it is a required array, empty because the
+        // duplicate is what an agent's context pays for.
+        assert_eq!(
+            result["content"],
+            json!([]),
+            "{tool} carried a text copy of a result it already returned structured: {result}"
+        );
+    }
+}
+
+/// A hit carries the document and the metadata a caller can use, and nothing internal.
+///
+/// `shard_id` used to ride along on every hit: a 36-character identifier of which shard served
+/// the document, which answers no question an agent can ask, and — because it broke the
+/// underscore convention every other metadata field follows — it was dropped by field projection,
+/// so the same search returned it or not depending on whether fields were named. At a hundred
+/// hits it was kilobytes of identifiers.
+#[tokio::test]
+async fn a_hit_carries_no_internal_shard_identity() {
+    let node = two_seeded_indexes().await;
+
+    for (label, tool, arguments) in [
+        (
+            "single index",
+            "search_index",
+            json!({"index": "alpha", "query": "title:record", "limit": 10}),
+        ),
+        (
+            "projected",
+            "search_index",
+            json!({"index": "alpha", "query": "title:record", "limit": 10, "fields": ["title"]}),
+        ),
+        (
+            "federated",
+            "search_indexes",
+            json!({"indexes": [{"index": "alpha"}, {"index": "beta"}], "query": "title:record", "limit": 10}),
+        ),
+    ] {
+        let (is_error, result) = node.call_tool(tool, arguments).await;
+        assert!(!is_error, "{label}: {result}");
+        let hits = result["hits"].as_array().expect("hits");
+        assert!(!hits.is_empty(), "{label} returned nothing: {result}");
+        for hit in hits {
+            assert!(
+                hit.get("shard_id").is_none(),
+                "{label}: a hit carries the shard that served it: {hit}"
+            );
+            // The metadata that is useful is still there, under the convention that marks it.
+            assert!(
+                hit.get("_score").is_some(),
+                "{label}: a hit lost its score: {hit}"
+            );
+        }
+    }
+
+    // The same search over HTTP, since the engine's response is what both surfaces render.
+    let resp = http()
+        .post(format!("{}/api/alpha/search", node.url))
+        .json(&json!({"query": "title:record", "limit": 10}))
+        .send()
+        .await
+        .expect("http search");
+    let body: Value = resp.json().await.expect("json");
+    for hit in body["hits"].as_array().expect("hits") {
+        assert!(
+            hit.get("shard_id").is_none(),
+            "the HTTP API still returns the shard that served a hit: {hit}"
+        );
+    }
+}
+
+/// `errors` appears when something could not be read, and not otherwise.
+///
+/// The federated tool already worked this way; the single-index one reported `errors: []` on
+/// every success, which teaches a caller to skip the key — the habit that hides the one response
+/// where it matters. Now both tools say the same thing by saying nothing.
+#[tokio::test]
+async fn a_successful_search_reports_no_errors_key_at_all() {
+    let node = two_seeded_indexes().await;
+
+    for (tool, arguments) in [
+        (
+            "search_index",
+            json!({"index": "alpha", "query": "title:record", "limit": 10}),
+        ),
+        (
+            "search_indexes",
+            json!({"indexes": [{"index": "alpha"}, {"index": "beta"}], "query": "title:record", "limit": 10}),
+        ),
+    ] {
+        let (is_error, result) = node.call_tool(tool, arguments).await;
+        assert!(!is_error, "{tool}: {result}");
+        assert!(
+            result.get("errors").is_none(),
+            "{tool} reported an empty error list on a search where nothing failed: {result}"
+        );
+    }
+
+    // And the HTTP API agrees, since it renders the same engine response.
+    let resp = http()
+        .post(format!("{}/api/alpha/search", node.url))
+        .json(&json!({"query": "title:record", "limit": 10}))
+        .send()
+        .await
+        .expect("http search");
+    let body: Value = resp.json().await.expect("json");
+    assert!(
+        body.get("errors").is_none(),
+        "the HTTP API still reports an empty error list: {body}"
     );
 }

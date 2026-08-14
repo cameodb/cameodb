@@ -480,6 +480,9 @@ everything will report it as everything.
 - Applies to the MCP search tools, like `max_search_limit`, and for the same reason.
 - An explicit `0` is refused — it would report every response as truncated rather than
   refusing any.
+- **It bounds one result, not the packet.** The message adds a JSON-RPC envelope around it, so
+  it runs slightly over the ceiling. Bounding the answer is the more useful of the two, and the
+  difference is a small constant rather than a surprise.
 
 ### The audit trail (`[security.audit]`)
 

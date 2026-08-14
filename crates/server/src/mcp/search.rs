@@ -31,6 +31,11 @@ const MAX_CONCURRENT_INDEX_SEARCHES: usize = 8;
 /// not a routine event — a deployment that handles large documents raises the message size and
 /// this moves with it.
 ///
+/// What is measured is one result. The message that carries it adds a JSON-RPC envelope and the
+/// `structuredContent` wrapper, so the ceiling bounds the answer rather than the packet — the
+/// more useful of the two to bound, and the difference is a small constant rather than a
+/// surprise.
+///
 /// Trimming is the right answer rather than refusing: the hits that fit answer the question as
 /// far as they go. But it is only safe if the caller is told. An agent that knows it saw part of
 /// the result narrows its query; one that does not reports what it read as though it were all

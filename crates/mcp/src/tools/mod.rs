@@ -11,8 +11,8 @@ use crate::{
     tools::schema::{
         GetIndexArgs, GetIndexStatsArgs, ListIndexesArgs, MAX_FEDERATED_INDEXES, SearchIndexArgs,
         SearchIndexesArgs, ValidateQueryArgs, get_index_input_schema, get_index_stats_input_schema,
-        list_indexes_input_schema, search_index_input_schema, search_indexes_input_schema,
-        validate_query_input_schema,
+        list_indexes_input_schema, search_index_input_schema, search_index_output_schema,
+        search_indexes_input_schema, search_indexes_output_schema, validate_query_input_schema,
     },
 };
 
@@ -275,6 +275,7 @@ pub(crate) fn mcp_tools(max_search_limit: usize) -> Vec<JsonValue> {
             "title": "Search Index",
             "description": search_index_description(),
             "inputSchema": search_index_input_schema(max_search_limit),
+            "outputSchema": search_index_output_schema(),
             "annotations": {
                 "readOnlyHint": true,
                 "openWorldHint": false
@@ -285,6 +286,7 @@ pub(crate) fn mcp_tools(max_search_limit: usize) -> Vec<JsonValue> {
             "title": "Federated Search",
             "description": search_indexes_description(),
             "inputSchema": search_indexes_input_schema(max_search_limit),
+            "outputSchema": search_indexes_output_schema(),
             "annotations": {
                 "readOnlyHint": true,
                 "openWorldHint": false

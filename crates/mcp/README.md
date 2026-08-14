@@ -60,6 +60,43 @@ Every tool takes the arguments listed below and no others. Each `inputSchema` sa
 
 Bounds are advertised where they are enforced: the search tools carry a `maximum` on `limit` and `minItems`/`maxItems` on `indexes`, taken from the node's own configuration. Read them from `tools/list` rather than from this page — an operator may have set the ceiling lower than the default.
 
+### How a tool result arrives
+
+A successful call returns its result as `structuredContent` — already-parsed JSON, not a string to
+parse — with `content` present and empty:
+
+```json
+{
+  "result": {
+    "content": [],
+    "structuredContent": { "hits": [ ... ], "hits_returned": 2, "total_hits": 3, "limit": 2 },
+    "isError": false
+  }
+}
+```
+
+The spec also permits a text copy of the result for clients predating structured results, and
+CameoDB does not send one. It would be the same JSON escaped into a string, doubling every
+response — measured at 1038 bytes against 520 for a two-hit search — to say nothing new. An
+agent's context is the scarce resource, and the shape of a result is already described where a
+client looks for it: `instructions` at `initialize`, and `outputSchema` on the search tools.
+`content` stays present as an empty array because it is a required field, so a client validating
+the envelope finds what it expects.
+
+**A failure is the exception**, and keeps the text block, because a failure is a message rather
+than data:
+
+```json
+{
+  "result": {
+    "content": [{"type": "text", "text": "limit 20000 is above the maximum of 10000; ..."}],
+    "isError": true
+  }
+}
+```
+
+So: read `structuredContent` when `isError` is false, and `content[0].text` when it is true.
+
 ### 1. `search_index`
 
 Execute full-text search on a single CameoDB index.
