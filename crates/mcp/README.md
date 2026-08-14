@@ -81,6 +81,9 @@ Execute full-text search on a single CameoDB index.
   **Dropped clauses**: a clause the engine cannot interpret is dropped and the rest of the query runs, which widens a conjunction and disables a negation. This tool fails rather than returning those results, naming the clause it could not use.
 - `limit` (integer, optional): Maximum number of results to return, up to the node's configured ceiling (`[security.limits] max_search_limit`, 10000 by default). The tool's own `inputSchema` carries that number as its `maximum`, so read it there rather than assuming the default. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10. A larger value is refused, whether it arrives as this argument or as an inline `limit` modifier in the query.
 - `fields` (array of strings, optional): Field names to include in results (field projection)
+- `sort` (object, optional): Sort results by a field — the same object `search_indexes` takes per index. Takes precedence over an inline `sort` clause in the query.
+  - `field` (string, required): Field name to sort by (u64, i64, f64, date, or text/string for alphabetic sort)
+  - `order` (string, optional): `asc` or `desc` (defaults to `asc`)
 
 **Returns:** JSON array of matching documents with relevance scores.
 

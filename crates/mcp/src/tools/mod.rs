@@ -121,7 +121,7 @@ where
                     McpIndexSearchRequest {
                         index: args.index,
                         fields: args.fields,
-                        sort: None,
+                        sort: args.sort,
                     },
                     args.query,
                     args.limit,
@@ -261,8 +261,9 @@ fn search_index_description() -> String {
 /// What `search_indexes` adds over `search_index`. The syntax is identical, so it is not repeated.
 fn search_indexes_description() -> String {
     "Full-text search over several CameoDB indexes at once, executed concurrently and merged.\n\n     Each hit carries `_index_source` naming the index it came from. Per-index `fields` and \
-     `sort` parameters override the equivalent inline modifiers. One query string is applied to \
-     every index, so a field that exists in only some of them will not match in the rest.\n\n     Query syntax is the same as `search_index`; see that tool's description, or call \
+     `sort` parameters override the equivalent inline modifiers, as they do on `search_index`. \
+     One query string is applied to every index, so a field that exists in only some of them \
+     will not match in the rest.\n\n     Query syntax is the same as `search_index`; see that tool's description, or call \
      `validate_query` with no arguments for the full reference."
         .to_string()
 }

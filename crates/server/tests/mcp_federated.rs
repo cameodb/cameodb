@@ -1584,3 +1584,183 @@ max_search_limit = 25
         "an inline limit above the configured ceiling was accepted: {refusal}"
     );
 }
+
+/// The single-index tool takes the same structured sort the federated one does.
+///
+/// Sorting one index is the common case, so this is where a sort is most often wanted. The
+/// federated tool advertising a per-index `sort` while this one silently discarded it read as
+/// "sorting a single index is done some other way" — and an argument accepted and ignored is
+/// worse than one refused, because the results look sorted enough to believe.
+#[tokio::test]
+async fn the_single_index_tool_sorts_by_a_structured_argument() {
+    let node = two_seeded_indexes().await;
+
+    let order_of = |result: &Value| -> Vec<String> {
+        result["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .filter_map(|hit| hit["id"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    let (is_error, ascending) = node
+        .call_tool(
+            "search_index",
+            json!({
+                "index": "alpha",
+                "query": "title:record",
+                "limit": 10,
+                "sort": {"field": "created", "order": "asc"},
+            }),
+        )
+        .await;
+    assert!(!is_error, "a sorted search failed: {ascending}");
+    assert_eq!(
+        order_of(&ascending),
+        ["a1", "a2", "a3"],
+        "ascending order was not applied: {ascending}"
+    );
+
+    let (_, descending) = node
+        .call_tool(
+            "search_index",
+            json!({
+                "index": "alpha",
+                "query": "title:record",
+                "limit": 10,
+                "sort": {"field": "created", "order": "desc"},
+            }),
+        )
+        .await;
+    assert_eq!(
+        order_of(&descending),
+        ["a3", "a2", "a1"],
+        "descending order was not applied: {descending}"
+    );
+
+    // `order` is optional, and its default is ascending.
+    let (_, defaulted) = node
+        .call_tool(
+            "search_index",
+            json!({
+                "index": "alpha",
+                "query": "title:record",
+                "limit": 10,
+                "sort": {"field": "created"},
+            }),
+        )
+        .await;
+    assert_eq!(order_of(&defaulted), order_of(&ascending));
+
+    // The argument wins over an inline clause, as `limit` and `fields` do.
+    let (_, argument_wins) = node
+        .call_tool(
+            "search_index",
+            json!({
+                "index": "alpha",
+                "query": "title:record sort created:asc",
+                "limit": 10,
+                "sort": {"field": "created", "order": "desc"},
+            }),
+        )
+        .await;
+    assert_eq!(
+        order_of(&argument_wins),
+        ["a3", "a2", "a1"],
+        "the inline clause overrode the argument: {argument_wins}"
+    );
+
+    // The internal sort key stays internal, as it does on the inline path.
+    for hit in argument_wins["hits"].as_array().expect("hits") {
+        assert!(
+            hit.get("_sort_key").is_none(),
+            "a sorted hit carried the internal sort key: {hit}"
+        );
+    }
+}
+
+/// One query, asked many times, gives one answer.
+///
+/// Neither key a search can order on is a total order: every document matching a single term
+/// scores identically, and a sort field repeats as readily as any other value. Indexes and
+/// shards are searched concurrently and answer in whatever order they finish, so a merge that
+/// let arrival order settle a tie returned different documents on different runs — measured at
+/// two distinct answers over twenty-five identical calls, sharing one hit out of four.
+///
+/// Ties now fall back to the order the caller named its indexes in, then to each index's own
+/// ordering. Both are fixed before any result arrives.
+#[tokio::test]
+async fn one_query_asked_repeatedly_gives_one_answer() {
+    let node = TestNode::start().await;
+    for index in ["alpha", "beta"] {
+        node.create_index(index).await;
+    }
+    // Every document shares one `created` value, so every sort key ties, and one shared term
+    // means every score ties too.
+    let tied = "2024-01-01T00:00:00Z";
+    node.seed("alpha", &[("a1", tied), ("a2", tied), ("a3", tied)])
+        .await;
+    node.seed("beta", &[("b1", tied), ("b2", tied), ("b3", tied)])
+        .await;
+
+    let ids = |result: &Value| -> Vec<String> {
+        result["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .filter_map(|hit| hit["id"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    // Both merges: the sorted one keys on `_sort_key`, the unsorted one on `_score`.
+    for query in ["title:record sort created:asc", "title:record"] {
+        let mut answers: std::collections::BTreeSet<Vec<String>> = Default::default();
+        for _ in 0..12 {
+            let (is_error, result) = node
+                .call_tool(
+                    "search_indexes",
+                    json!({
+                        "indexes": [{"index": "alpha"}, {"index": "beta"}],
+                        "query": query,
+                        "limit": 4,
+                    }),
+                )
+                .await;
+            assert!(!is_error, "{result}");
+            answers.insert(ids(&result));
+        }
+        assert_eq!(
+            answers.len(),
+            1,
+            "'{query}' returned {} different answers: {answers:?}",
+            answers.len()
+        );
+    }
+
+    // The tie-break is the caller's own order, so naming the indexes the other way round is a
+    // different question with a different — and equally stable — answer.
+    for (first, second) in [("alpha", "beta"), ("beta", "alpha")] {
+        let (_, result) = node
+            .call_tool(
+                "search_indexes",
+                json!({
+                    "indexes": [{"index": first}, {"index": second}],
+                    "query": "title:record",
+                    "limit": 2,
+                }),
+            )
+            .await;
+        let sources: Vec<&str> = result["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .filter_map(|hit| hit["_index_source"].as_str())
+            .collect();
+        assert_eq!(
+            sources,
+            [first, first],
+            "the index named first should lead a tied merge: {result}"
+        );
+    }
+}

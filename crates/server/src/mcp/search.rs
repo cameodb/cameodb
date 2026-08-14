@@ -10,7 +10,7 @@ use crate::mcp::diagnostics::{
     names_a_missing_field, refuse_if_clauses_discarded, with_valid_fields, zero_results_advice,
 };
 use crate::mcp::schema::absent_index_reason;
-use crate::node_orchestrator::ClientOp;
+use crate::node_orchestrator::{ClientOp, order_hit_blocks};
 use crate::query::parse_query_keywords;
 use crate::state::AppState;
 
@@ -57,7 +57,19 @@ pub(super) fn search_index(
         let final_limit = limit.or(parsed_limit);
         check_effective_limit(final_limit, state.max_search_limit)?;
         let final_fields = index.fields.or(parsed_fields);
-        let final_sort = parsed_sort;
+        // The argument wins over an inline `sort` clause, as `limit` and `fields` do: a caller
+        // that passed a structured sort chose it deliberately, where the clause may be part of
+        // a query string it copied.
+        let final_sort = index
+            .sort
+            .map(|requested| storage::SortSpec {
+                field: requested.field,
+                order: match requested.order {
+                    cameodb_mcp::SortOrder::Desc => storage::SortOrder::Desc,
+                    cameodb_mcp::SortOrder::Asc => storage::SortOrder::Asc,
+                },
+            })
+            .or(parsed_sort);
 
         let result = state
             .router
@@ -173,65 +185,71 @@ pub(super) fn search_indexes(
 
         // Each index is searched concurrently with the others, up to
         // `MAX_CONCURRENT_INDEX_SEARCHES` at a time — the rest start as those finish.
-        let searches = indexes.into_iter().map(|index_request| {
-            let McpIndexSearchRequest {
-                index,
-                fields,
-                sort,
-            } = index_request;
-            let index_name = index.clone();
-            let state = state.clone();
-            let cleaned_query = cleaned_query.clone();
-            let parsed_fields = parsed_fields.clone();
-            let parsed_sort = parsed_sort.clone();
+        let searches = indexes
+            .into_iter()
+            .enumerate()
+            .map(|(named_at, index_request)| {
+                let McpIndexSearchRequest {
+                    index,
+                    fields,
+                    sort,
+                } = index_request;
+                let index_name = index.clone();
+                let state = state.clone();
+                let cleaned_query = cleaned_query.clone();
+                let parsed_fields = parsed_fields.clone();
+                let parsed_sort = parsed_sort.clone();
 
-            async move {
-                // Merge MCP-provided fields/sort with parsed values
-                let final_fields = fields.or(parsed_fields);
-                let final_sort = sort.or_else(|| {
-                    parsed_sort.map(|storage_sort| cameodb_mcp::SortSpec {
-                        field: storage_sort.field,
-                        order: match storage_sort.order {
-                            storage::SortOrder::Desc => cameodb_mcp::SortOrder::Desc,
-                            storage::SortOrder::Asc => cameodb_mcp::SortOrder::Asc,
+                async move {
+                    // Merge MCP-provided fields/sort with parsed values
+                    let final_fields = fields.or(parsed_fields);
+                    let final_sort = sort.or_else(|| {
+                        parsed_sort.map(|storage_sort| cameodb_mcp::SortSpec {
+                            field: storage_sort.field,
+                            order: match storage_sort.order {
+                                storage::SortOrder::Desc => cameodb_mcp::SortOrder::Desc,
+                                storage::SortOrder::Asc => cameodb_mcp::SortOrder::Asc,
+                            },
+                        })
+                    });
+
+                    // Convert MCP SortSpec to storage SortSpec
+                    let storage_sort = final_sort.map(|mcp_sort| storage::SortSpec {
+                        field: mcp_sort.field,
+                        order: match mcp_sort.order {
+                            cameodb_mcp::SortOrder::Desc => storage::SortOrder::Desc,
+                            cameodb_mcp::SortOrder::Asc => storage::SortOrder::Asc,
                         },
-                    })
-                });
+                    });
 
-                // Convert MCP SortSpec to storage SortSpec
-                let storage_sort = final_sort.map(|mcp_sort| storage::SortSpec {
-                    field: mcp_sort.field,
-                    order: match mcp_sort.order {
-                        cameodb_mcp::SortOrder::Desc => storage::SortOrder::Desc,
-                        cameodb_mcp::SortOrder::Asc => storage::SortOrder::Asc,
-                    },
-                });
+                    // The merge below orders by `_sort_key`, so this is the one caller that
+                    // needs it to survive the routing path. The strip after the merge is what
+                    // keeps it off the response.
+                    let result = state
+                        .router
+                        .route_and_handle_keeping_sort_keys(
+                            ClientOp::Search {
+                                index: index.clone(),
+                                query: cleaned_query,
+                                limit: final_limit,
+                                fields: final_fields,
+                                sort: storage_sort,
+                            },
+                            None,
+                            OperationType::Read,
+                        )
+                        .await;
 
-                // The merge below orders by `_sort_key`, so this is the one caller that
-                // needs it to survive the routing path. The strip after the merge is what
-                // keeps it off the response.
-                let result = state
-                    .router
-                    .route_and_handle_keeping_sort_keys(
-                        ClientOp::Search {
-                            index: index.clone(),
-                            query: cleaned_query,
-                            limit: final_limit,
-                            fields: final_fields,
-                            sort: storage_sort,
-                        },
-                        None,
-                        OperationType::Read,
-                    )
-                    .await;
-
-                (index_name, result)
-            }
-        });
+                    (named_at, index_name, result)
+                }
+            });
         let mut search_futures =
             stream::iter(searches).buffer_unordered(MAX_CONCURRENT_INDEX_SEARCHES);
 
-        let mut merged_hits = Vec::new();
+        // One block per index, held against the position the caller named it at. The searches
+        // finish in whatever order they finish, and a merge that let that decide a tie would
+        // answer one query differently on each run.
+        let mut blocks: Vec<(usize, Vec<JsonValue>)> = Vec::new();
         let mut total_hits = 0u64;
         // What could not be reached, named so the caller can tell which part of its request
         // is missing from the answer. An index that fails does not sink the ones that
@@ -239,7 +257,7 @@ pub(super) fn search_indexes(
         // where a failed call throws away work that succeeded.
         let mut errors: Vec<JsonValue> = Vec::new();
 
-        while let Some((index_name, result)) = search_futures.next().await {
+        while let Some((named_at, index_name, result)) = search_futures.next().await {
             // Schema-aware error handling
             let result = match result {
                 Ok(r) => r,
@@ -288,16 +306,20 @@ pub(super) fn search_indexes(
             total_hits += index_hits;
 
             if let Some(hits) = result.get("hits").and_then(|value| value.as_array()) {
-                for hit in hits {
-                    let mut hit_value = hit.clone();
-                    if let Some(hit_obj) = hit_value.as_object_mut() {
-                        hit_obj.insert(
-                            "_index_source".to_string(),
-                            JsonValue::String(index_name.clone()),
-                        );
-                    }
-                    merged_hits.push(hit_value);
-                }
+                let block: Vec<JsonValue> = hits
+                    .iter()
+                    .map(|hit| {
+                        let mut hit_value = hit.clone();
+                        if let Some(hit_obj) = hit_value.as_object_mut() {
+                            hit_obj.insert(
+                                "_index_source".to_string(),
+                                JsonValue::String(index_name.clone()),
+                            );
+                        }
+                        hit_value
+                    })
+                    .collect();
+                blocks.push((named_at, block));
             }
         }
 
@@ -320,30 +342,15 @@ pub(super) fn search_indexes(
             return Err(format!("no index in this search could be read — {detail}"));
         }
 
-        // Merge sort: if a global sort spec was determined, order by _sort_key
-        // (injected by the engine for field-sorted queries). Otherwise sort by
-        // _score descending (the standard relevance merge).
-        match &global_sort {
-            Some(spec) => {
-                merged_hits.sort_by(|a, b| compare_hits_by_sort_key(a, b, spec.order));
-            }
-            None => {
-                merged_hits.sort_by(|a, b| {
-                    let left_score = a
-                        .get("_score")
-                        .and_then(|value| value.as_f64())
-                        .unwrap_or(0.0);
-                    let right_score = b
-                        .get("_score")
-                        .and_then(|value| value.as_f64())
-                        .unwrap_or(0.0);
-                    right_score
-                        .partial_cmp(&left_score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-        }
-        merged_hits.truncate(requested_limit);
+        // Ordered by the requested sort when there is one, otherwise by relevance — and, where
+        // those tie, by the order the caller named the indexes in. The same merge the routing
+        // layer uses across shards and nodes, one level up.
+        blocks.sort_by_key(|(named_at, _)| *named_at);
+        let mut merged_hits = order_hit_blocks(
+            blocks.into_iter().map(|(_, block)| block).collect(),
+            global_sort.as_ref(),
+            requested_limit,
+        );
 
         // Strip internal _sort_key from merged hits before returning
         for hit in &mut merged_hits {
@@ -378,42 +385,4 @@ pub(super) fn search_indexes(
 
         Ok(response)
     })
-}
-
-/// Compare two hit documents by their internal `_sort_key` field for federated
-/// merge ordering. Handles i64, f64, and string keys. Documents missing the
-/// key always sort last, regardless of the requested order.
-fn compare_hits_by_sort_key(
-    a: &JsonValue,
-    b: &JsonValue,
-    order: storage::SortOrder,
-) -> std::cmp::Ordering {
-    let av = a.get("_sort_key");
-    let bv = b.get("_sort_key");
-    let base = match (av, bv) {
-        (Some(a_val), Some(b_val)) => {
-            // Try i64 first for precise large-integer comparison
-            if let Some(ai) = a_val.as_i64()
-                && let Some(bi) = b_val.as_i64()
-            {
-                ai.cmp(&bi)
-            } else if let Some(af) = a_val.as_f64()
-                && let Some(bf) = b_val.as_f64()
-            {
-                af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
-            } else {
-                // Fall back to string comparison
-                let as_str = a_val.as_str().unwrap_or("");
-                let bs_str = b_val.as_str().unwrap_or("");
-                as_str.cmp(bs_str)
-            }
-        }
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
-    };
-    match order {
-        storage::SortOrder::Asc => base,
-        storage::SortOrder::Desc => base.reverse(),
-    }
 }

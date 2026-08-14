@@ -5042,8 +5042,19 @@ impl HybridStore {
 
         // Post-fetch alphabetic sort for string fields.
         // Candidates were collected with budget = limit*2; sort and truncate to limit.
+        //
+        // Documents arrive in Tantivy's order, which is total — it breaks its own ties on
+        // document address — so a value repeated across documents falls back to that order
+        // rather than to whatever the comparison happened to leave in place. Stated as a
+        // comparison on the original position instead of relying on the sort being stable: a
+        // later switch to `sort_unstable_by` would otherwise make this shard's answer vary
+        // between runs, and every merge above it inherits that.
         if let Some((field, order)) = string_sort {
-            results.sort_by(|a, b| {
+            let mut ranked: Vec<(usize, _)> = std::mem::take(&mut results)
+                .into_iter()
+                .enumerate()
+                .collect();
+            ranked.sort_by(|(left_position, a), (right_position, b)| {
                 let av = a.1.get(&field).and_then(|v| v.as_str());
                 let bv = b.1.get(&field).and_then(|v| v.as_str());
                 let base = match (av, bv) {
@@ -5052,11 +5063,13 @@ impl HybridStore {
                     (None, Some(_)) => std::cmp::Ordering::Greater,
                     (None, None) => std::cmp::Ordering::Equal,
                 };
-                match order {
+                let base = match order {
                     SortOrder::Asc => base,
                     SortOrder::Desc => base.reverse(),
-                }
+                };
+                base.then_with(|| left_position.cmp(right_position))
             });
+            results = ranked.into_iter().map(|(_, hit)| hit).collect();
             results.truncate(limit);
         }
 

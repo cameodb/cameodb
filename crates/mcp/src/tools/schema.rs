@@ -13,7 +13,7 @@
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
-use crate::backend::McpIndexSearchRequest;
+use crate::backend::{McpIndexSearchRequest, SortSpec};
 
 /// The largest `limit` a search tool accepts when the host names no other number.
 ///
@@ -43,6 +43,13 @@ pub(crate) struct SearchIndexArgs {
     pub(crate) limit: Option<usize>,
     #[serde(default)]
     pub(crate) fields: Option<Vec<String>>,
+    /// The same structured sort the federated tool takes per index.
+    ///
+    /// One index is the common case, so this is where a sort is most often wanted; the
+    /// federated tool having it and this one not is an asymmetry a caller reads as "sorting a
+    /// single index is done some other way".
+    #[serde(default)]
+    pub(crate) sort: Option<SortSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +94,30 @@ pub(crate) struct GetIndexStatsArgs {
     pub(crate) index: Option<String>,
 }
 
+/// The sort object both search tools take.
+///
+/// Written once because the two tools must describe it identically — they decode it into the
+/// same struct, and the drift tests compare each schema with that struct.
+fn sort_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "description": "Sort results by a field. Supported types: u64, i64, f64, date (FAST fields), and text/string (alphabetic sort).",
+        "properties": {
+            "field": {
+                "type": "string",
+                "description": "Field name to sort by. Supports u64, i64, f64, date, and text/string fields."
+            },
+            "order": {
+                "type": "string",
+                "enum": ["asc", "desc"],
+                "description": "Sort order. Defaults to asc."
+            }
+        },
+        "required": ["field"],
+        "additionalProperties": false
+    })
+}
+
 pub(crate) fn search_index_input_schema(max_search_limit: usize) -> JsonValue {
     json!({
         "type": "object",
@@ -111,7 +142,8 @@ pub(crate) fn search_index_input_schema(max_search_limit: usize) -> JsonValue {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "Field names to include in results (field projection). Fields are returned in the exact order specified. Metadata fields (like '_score') are always included automatically."
-            }
+            },
+            "sort": sort_schema()
         },
         "required": ["index", "query"],
         "additionalProperties": false
@@ -141,23 +173,7 @@ pub(crate) fn search_indexes_input_schema(max_search_limit: usize) -> JsonValue 
                             "items": { "type": "string" },
                             "description": "Fields to include from this index. Fields are returned in the exact order specified. Metadata fields (like '_score') are always included automatically."
                         },
-                        "sort": {
-                            "type": "object",
-                            "description": "Sort results by a field within this index. Supported types: u64, i64, f64, date (FAST fields), and text/string (alphabetic sort).",
-                            "properties": {
-                                "field": {
-                                    "type": "string",
-                                    "description": "Field name to sort by. Supports u64, i64, f64, date, and text/string fields."
-                                },
-                                "order": {
-                                    "type": "string",
-                                    "enum": ["asc", "desc"],
-                                    "description": "Sort order. Defaults to asc."
-                                }
-                            },
-                            "required": ["field"],
-                            "additionalProperties": false
-                        }
+                        "sort": sort_schema()
                     },
                     "required": ["index"],
                     "additionalProperties": false

@@ -275,36 +275,6 @@ struct BroadcastStats {
     discarded: Vec<String>,
 }
 
-fn push_hit_into_top_k(top_hits: &mut Vec<JsonValue>, hit: JsonValue, limit: usize) {
-    if limit == 0 {
-        return;
-    }
-
-    let new_score = hit_score(&hit);
-    if top_hits.len() < limit {
-        top_hits.push(hit);
-        top_hits.sort_by(|a, b| {
-            hit_score(b)
-                .partial_cmp(&hit_score(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        return;
-    }
-
-    let worst_score = top_hits.last().map(hit_score).unwrap_or(f64::NEG_INFINITY);
-    if new_score <= worst_score {
-        return;
-    }
-
-    top_hits.push(hit);
-    top_hits.sort_by(|a, b| {
-        hit_score(b)
-            .partial_cmp(&hit_score(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    top_hits.truncate(limit);
-}
-
 /// Metadata field carrying the normalized sort value of a hit.
 ///
 /// Injected by the shard-gather search paths (`engine_search` / `orch_search`) before
@@ -478,23 +448,97 @@ fn compare_hits_by_field(
     }
 }
 
-/// Order merged search hits in place: by the injected `SORT_KEY_FIELD` when an explicit
-/// sort is requested, otherwise by relevance score (descending). The sort field itself
-/// may have been projected away, so the merge always keys on the metadata field, which
-/// is preserved through projection.
-fn order_merged_hits(hits: &mut [JsonValue], sort: Option<&SortSpec>) {
+/// Compare two hits by what the caller asked to order on.
+///
+/// Relevance score descending by default — the engine's own ranking, and the order in which it
+/// hands hits back — or the injected `SORT_KEY_FIELD` when a sort was requested. Keyed on that
+/// metadata field rather than on the sort field itself, because projection may have removed
+/// the latter from the hit.
+pub(crate) fn compare_hits_primary(
+    a: &JsonValue,
+    b: &JsonValue,
+    sort: Option<&SortSpec>,
+) -> std::cmp::Ordering {
     match sort {
-        Some(spec) => {
-            hits.sort_by(|a, b| compare_hits_by_field(a, b, SORT_KEY_FIELD, spec.order));
-        }
-        None => {
-            hits.sort_by(|a, b| {
-                hit_score(b)
-                    .partial_cmp(&hit_score(a))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
+        Some(spec) => compare_hits_by_field(a, b, SORT_KEY_FIELD, spec.order),
+        None => hit_score(b)
+            .partial_cmp(&hit_score(a))
+            .unwrap_or(std::cmp::Ordering::Equal),
     }
+}
+
+/// Order one node's shard hits, deterministically.
+///
+/// The tuple form of [`order_hit_blocks`], for the scatter paths that hold a shard id and a
+/// score beside each document rather than a finished hit. Shards are polled concurrently and
+/// answer in whatever order they finish, so a tie falls back to the shard's id — fixed when the
+/// shard was created — and then to the hit's place in that shard's own ordering, which Tantivy
+/// has already made total. `results` holds each shard's hits contiguously, so a comparison of
+/// positions within one shard is a comparison within its block.
+fn order_shard_hits(results: &mut Vec<(Uuid, f32, JsonValue)>, sort: Option<&SortSpec>) {
+    let mut ranked: Vec<(usize, (Uuid, f32, JsonValue))> =
+        std::mem::take(results).into_iter().enumerate().collect();
+
+    ranked.sort_by(|(left_position, left), (right_position, right)| {
+        let primary = match sort {
+            Some(spec) => compare_hits_by_field(&left.2, &right.2, SORT_KEY_FIELD, spec.order),
+            None => right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        };
+        primary
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left_position.cmp(right_position))
+    });
+
+    *results = ranked.into_iter().map(|(_, tuple)| tuple).collect();
+}
+
+/// Order hits gathered from several sources and keep the first `limit`.
+///
+/// `blocks` arrive in the order the sources were **dispatched**, never the order they answered,
+/// and that is what makes this deterministic. Neither key a caller can order on is a total
+/// order: every document matching one term scores identically, and a sort field repeats as
+/// readily as any other value. Where a tie is settled by whichever source replied first, two
+/// runs of one query return different documents — measured, not theorised — and a page of such
+/// results is a page of nothing.
+///
+/// So a tie falls back to the source's rank, then to the hit's place within that source's own
+/// ordering. Both are fixed before any result arrives, and each source has already ordered its
+/// own hits totally — a shard through Tantivy, which breaks its own ties on document address;
+/// a node through this same function. The composition is therefore one order, identical on
+/// every run.
+///
+/// Every hit is held before sorting rather than kept in a running top-K. The bound is the same
+/// either way, `limit` per source, and a running top-K cannot be made to agree with this: it
+/// must decide what to discard while later sources are still unheard, so its answer depends on
+/// the order they answer in — exactly what this function exists to remove.
+pub(crate) fn order_hit_blocks(
+    blocks: Vec<Vec<JsonValue>>,
+    sort: Option<&SortSpec>,
+    limit: usize,
+) -> Vec<JsonValue> {
+    let mut ranked: Vec<(usize, usize, JsonValue)> = blocks
+        .into_iter()
+        .enumerate()
+        .flat_map(|(rank, hits)| {
+            hits.into_iter()
+                .enumerate()
+                .map(move |(position, hit)| (rank, position, hit))
+        })
+        .collect();
+
+    ranked.sort_by(
+        |(left_rank, left_position, left), (right_rank, right_position, right)| {
+            compare_hits_primary(left, right, sort)
+                .then_with(|| left_rank.cmp(right_rank))
+                .then_with(|| left_position.cmp(right_position))
+        },
+    );
+
+    ranked.truncate(limit);
+    ranked.into_iter().map(|(_, _, hit)| hit).collect()
 }
 
 /// Recursively transform shadow field names in JSON query structure
@@ -2155,16 +2199,10 @@ impl OrchestratorEngine {
         // the full doc is still present) and key the sort on it. The metadata field
         // survives the field projection below and lets a downstream cross-node merge
         // re-order these results even if the sort field is not among the returned fields.
-        match sort {
-            Some(spec) => {
-                stamp_sort_keys(&mut results, spec, &schema);
-                results
-                    .sort_by(|a, b| compare_hits_by_field(&a.2, &b.2, SORT_KEY_FIELD, spec.order))
-            }
-            None => {
-                results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
-            }
+        if let Some(spec) = sort {
+            stamp_sort_keys(&mut results, spec, &schema);
         }
+        order_shard_hits(&mut results, sort);
         results.truncate(limit);
         let total_shards = shards.len();
         let hits: Vec<JsonValue> = results
@@ -3821,24 +3859,31 @@ impl RouterActor {
         let remote_timeout = self.broadcast_timeout;
         let remote_router = self.clone();
         let remote_op = op.clone();
-        let remote_results_future =
-            futures::stream::iter(peers.into_iter().take(self.broadcast_fanout_limit).map(
-                move |peer| {
+        // Each peer carries the ordinal it was dispatched at. `buffer_unordered` yields in
+        // completion order, and a merge that breaks ties by which peer answered first is a merge
+        // that answers one query two ways.
+        let remote_results_future = futures::stream::iter(
+            peers
+                .into_iter()
+                .take(self.broadcast_fanout_limit)
+                .enumerate()
+                .map(move |(dispatch_ordinal, peer)| {
                     let op_clone = remote_op.clone();
                     let remote_router = remote_router.clone();
                     let node_id = peer.node_id;
                     let peer_addr = peer.address;
                     async move {
-                        timeout(
+                        let outcome = timeout(
                             remote_timeout,
                             remote_router.try_remote(op_clone, node_id, &peer_addr),
                         )
-                        .await
+                        .await;
+                        (dispatch_ordinal, outcome)
                     }
-                },
-            ))
-            .buffer_unordered(remote_limit)
-            .collect::<Vec<_>>();
+                }),
+        )
+        .buffer_unordered(remote_limit)
+        .collect::<Vec<_>>();
 
         // Execute local + remote concurrently
         let t_start = Instant::now();
@@ -3848,7 +3893,6 @@ impl RouterActor {
         if let ClientOp::Search { limit, sort, .. } = &op {
             let limit = limit.unwrap_or(self.default_search_limit);
             let sort = sort.clone();
-            let mut merged_hits: Vec<JsonValue> = Vec::with_capacity(limit);
             let mut error_count = 0u64;
             let mut stats = BroadcastStats {
                 total_shards_queried: 0,
@@ -3858,25 +3902,16 @@ impl RouterActor {
                 discarded: Vec::new(),
             };
 
-            // Helper to push hits from a result up to the remaining limit.
-            // For field-sorted queries we must collect all hits (bounded by fanout*limit)
-            // and order them globally afterwards; the score-based top-K heap would drop
-            // the wrong hits when ranking is by a document field rather than by score.
+            // One block per source, taken whole. Ordering across blocks is
+            // `order_hit_blocks`'s business, and it needs to know which source each hit came
+            // from to settle a tie the same way twice.
             fn push_hits(
                 value: &mut JsonValue,
-                merged_hits: &mut Vec<JsonValue>,
-                limit: usize,
-                is_field_sorted: bool,
+                blocks: &mut Vec<Vec<JsonValue>>,
                 stats: &mut BroadcastStats,
             ) {
                 if let Some(hits) = value.get_mut("hits").and_then(|h| h.as_array_mut()) {
-                    for hit in hits.drain(..) {
-                        if is_field_sorted {
-                            merged_hits.push(hit);
-                        } else {
-                            push_hit_into_top_k(merged_hits, hit, limit);
-                        }
-                    }
+                    blocks.push(std::mem::take(hits));
                 }
                 // Extract shard statistics from the response
                 if let Some(stats_obj) = value.get("stats").and_then(|s| s.as_object())
@@ -3903,33 +3938,23 @@ impl RouterActor {
                 }
             }
 
-            let is_field_sorted = sort.is_some();
+            // The local node is rank 0, then each peer in the order it was dispatched to.
+            let mut blocks: Vec<Vec<JsonValue>> = Vec::new();
 
-            // Process local result first
             match local_result {
-                Ok(mut val) => push_hits(
-                    &mut val,
-                    &mut merged_hits,
-                    limit,
-                    is_field_sorted,
-                    &mut stats,
-                ),
+                Ok(mut val) => push_hits(&mut val, &mut blocks, &mut stats),
                 Err(e) => {
                     error_count += 1;
                     warn!(error = %e, "Broadcast: local search failed");
                 }
             }
 
-            // Then process remote results in completion order until limit is reached
-            for result in remote_results {
+            // Back into dispatch order before merging, rather than the order they finished in.
+            let mut remote_results = remote_results;
+            remote_results.sort_by_key(|(dispatch_ordinal, _)| *dispatch_ordinal);
+            for (_, result) in remote_results {
                 match result {
-                    Ok(Ok(mut val)) => push_hits(
-                        &mut val,
-                        &mut merged_hits,
-                        limit,
-                        is_field_sorted,
-                        &mut stats,
-                    ),
+                    Ok(Ok(mut val)) => push_hits(&mut val, &mut blocks, &mut stats),
                     Ok(Err(e)) => {
                         error_count += 1;
                         warn!(error = %e, "Broadcast: remote search failed");
@@ -3947,10 +3972,7 @@ impl RouterActor {
                     .fetch_add(error_count, AtomicOrdering::Relaxed);
             }
 
-            // Order the collected set: by the requested sort field when provided,
-            // otherwise by relevance score (descending).
-            order_merged_hits(&mut merged_hits, sort.as_ref());
-            merged_hits.truncate(limit);
+            let merged_hits = order_hit_blocks(blocks, sort.as_ref(), limit);
 
             let mut response = serde_json::json!({
                 "hits": merged_hits,
@@ -3986,8 +4008,11 @@ impl RouterActor {
             }
         }
 
-        // Process remote results
-        for result in remote_results {
+        // Back into dispatch order, so that the merge below ranks the nodes the same way on
+        // every run rather than by which of them answered first.
+        let mut remote_results = remote_results;
+        remote_results.sort_by_key(|(dispatch_ordinal, _)| *dispatch_ordinal);
+        for (_, result) in remote_results {
             match result {
                 Ok(Ok(val)) => all_results.push(val),
                 Ok(Err(e)) => {
@@ -4008,7 +4033,7 @@ impl RouterActor {
 
         // Merge results based on operation type
         match &op {
-            ClientOp::Search { limit, .. } => {
+            ClientOp::Search { limit, sort, .. } => {
                 // Enforce a global limit across merged results to avoid returning
                 // (limit * nodes) hits when broadcasting.
                 let limit = limit.unwrap_or(self.default_search_limit);
@@ -4020,8 +4045,8 @@ impl RouterActor {
                     return Ok(all_results[0].clone());
                 }
 
-                // Merge search results from multiple nodes: combine all hits arrays
-                let mut merged_hits: Vec<JsonValue> = Vec::new();
+                // One block per node, in the order they were dispatched to.
+                let mut blocks: Vec<Vec<JsonValue>> = Vec::new();
                 let mut total_shards_queried = 0usize;
                 let mut total_hits_sum = 0usize;
                 // Read before the loop below consumes `all_results`.
@@ -4029,9 +4054,7 @@ impl RouterActor {
 
                 for mut result in all_results {
                     if let Some(hits) = result.get_mut("hits").and_then(|h| h.as_array_mut()) {
-                        for hit in hits.drain(..) {
-                            push_hit_into_top_k(&mut merged_hits, hit, limit);
-                        }
+                        blocks.push(std::mem::take(hits));
                     }
                     if let Some(stats) = result.get("stats").and_then(|s| s.as_object())
                         && let Some(shards) = stats.get("shards").and_then(|s| s.as_object())
@@ -4048,13 +4071,10 @@ impl RouterActor {
                     }
                 }
 
-                // Sort by score descending and deduplicate by _id if present
-                merged_hits.sort_by(|a, b| {
-                    hit_score(b)
-                        .partial_cmp(&hit_score(a))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                merged_hits.truncate(limit);
+                // Ordered by the requested sort when there is one. This branch previously
+                // merged by score whatever was asked for, so a sorted search that reached more
+                // than one node came back ranked by relevance instead.
+                let merged_hits = order_hit_blocks(blocks, sort.as_ref(), limit);
 
                 let mut response = serde_json::json!({
                     "hits": merged_hits,
@@ -4331,7 +4351,6 @@ impl RouterActor {
                 sort,
             } => {
                 let limit = limit.unwrap_or(self.default_search_limit);
-                let is_field_sorted = sort.is_some();
 
                 // Create local search stream using improved concurrent approach
                 let local_future = async {
@@ -4432,7 +4451,13 @@ impl RouterActor {
                 }
 
                 // Process results as they arrive with early termination
-                let mut all_hits = Vec::new();
+                // One block per source, keyed by that source's identity: this node's shards
+                // ahead of its peers, each ordered by id. Streaming means they arrive in
+                // whatever order they finish, and the key is what puts them back.
+                let mut blocks: Vec<((u8, Uuid), Vec<JsonValue>)> = Vec::new();
+                // Counted rather than measured off `blocks`, which the early-termination check
+                // below consults on every iteration.
+                let mut hits_collected = 0usize;
                 let mut total_hits_sum = 0usize;
                 let mut shards_queried = 0usize;
                 let mut nodes_contacted = 0usize;
@@ -4448,7 +4473,7 @@ impl RouterActor {
 
                     // Early termination if limit reached and enabled
                     if self.streaming.enable_early_termination
-                        && all_hits.len() >= limit
+                        && hits_collected >= limit
                         && search_futures.is_empty()
                         && peer_iter.size_hint().0 == 0
                     {
@@ -4457,12 +4482,13 @@ impl RouterActor {
 
                     match search_result {
                         StreamingSearchResult::Local {
-                            shard_id: _,
+                            shard_id,
                             hits,
                             total_hits,
                             took_ms: _,
                         } => {
                             // Process streaming local search results
+                            let mut block: Vec<JsonValue> = Vec::with_capacity(hits.len());
                             for (score, doc) in hits {
                                 let mut hit_doc = doc;
                                 if let JsonValue::Object(ref mut o) = hit_doc {
@@ -4481,12 +4507,10 @@ impl RouterActor {
                                         unique_shard_ids.insert(uuid);
                                     }
                                 }
-                                if is_field_sorted {
-                                    all_hits.push(hit_doc);
-                                } else {
-                                    push_hit_into_top_k(&mut all_hits, hit_doc, limit);
-                                }
+                                block.push(hit_doc);
                             }
+                            hits_collected += block.len();
+                            blocks.push(((0, shard_id), block));
                             total_hits_sum += total_hits;
                             shards_queried = unique_shard_ids.len();
                             nodes_contacted += 1;
@@ -4500,13 +4524,9 @@ impl RouterActor {
                                     if let Some(hits) =
                                         val.get_mut("hits").and_then(|h| h.as_array_mut())
                                     {
-                                        for hit in hits.drain(..) {
-                                            if is_field_sorted {
-                                                all_hits.push(hit);
-                                            } else {
-                                                push_hit_into_top_k(&mut all_hits, hit, limit);
-                                            }
-                                        }
+                                        let block: Vec<JsonValue> = std::mem::take(hits);
+                                        hits_collected += block.len();
+                                        blocks.push(((1, node_id), block));
                                     }
                                     if let Some(total) =
                                         val.get("total_hits").and_then(|t| t.as_u64())
@@ -4535,10 +4555,17 @@ impl RouterActor {
                     }
                 }
 
-                // Order the collected set: by the requested sort field when provided,
-                // otherwise by relevance score (descending), then apply the limit.
-                order_merged_hits(&mut all_hits, sort.as_ref());
-                all_hits.truncate(limit);
+                // Ranked by source identity — this node's shards, then each peer — rather
+                // than by which of them streamed in first, so that a tie between two hits is
+                // settled the same way on every run. Early termination can still change *which*
+                // sources contribute to a page; preferring whoever answers first is what this
+                // path is for, and only the ordering of what did arrive is fixed here.
+                blocks.sort_by_key(|(source, _)| *source);
+                let all_hits = order_hit_blocks(
+                    blocks.into_iter().map(|(_, block)| block).collect(),
+                    sort.as_ref(),
+                    limit,
+                );
 
                 Ok(serde_json::json!({
                     "hits": all_hits,
@@ -7046,16 +7073,10 @@ impl NodeOrchestrator {
         // stamp the normalized `SORT_KEY_FIELD` first (while the full doc is present) so it
         // survives projection and lets the requesting node's cross-node merge re-order
         // these hits even when the sort field is not among the returned fields.
-        match sort {
-            Some(spec) => {
-                stamp_sort_keys(&mut results, spec, &schema);
-                results
-                    .sort_by(|a, b| compare_hits_by_field(&a.2, &b.2, SORT_KEY_FIELD, spec.order))
-            }
-            None => {
-                results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
-            }
+        if let Some(spec) = sort {
+            stamp_sort_keys(&mut results, spec, &schema);
         }
+        order_shard_hits(&mut results, sort);
         results.truncate(limit);
         let hits: Vec<JsonValue> = results
             .into_iter()
@@ -8357,39 +8378,106 @@ mod tests {
             .collect()
     }
 
-    /// The core of finding #1: even when the sort field itself is projected away, the
-    /// `_sort_key` metadata lets a cross-node merge interleave per-node blocks correctly.
+    /// Even when the sort field itself is projected away, the `_sort_key` metadata lets a
+    /// cross-node merge interleave per-node blocks correctly.
     #[test]
-    fn order_merged_hits_interleaves_nodes_by_sort_key_without_sort_field() {
+    fn a_merge_interleaves_nodes_by_sort_key_without_the_sort_field() {
         let spec = SortSpec {
             field: "year".to_string(),
             order: SortOrder::Desc,
         };
-        // Two nodes, each already field-sorted + projected (no `year`), concatenated as
-        // the merge would receive them: all of node A, then all of node B.
-        let mut hits = vec![
-            json!({"title": "a", "_sort_key": 2020}),
-            json!({"title": "c", "_sort_key": 2018}),
-            json!({"title": "d", "_sort_key": 2024}),
-            json!({"title": "b", "_sort_key": 2022}),
-        ];
-        order_merged_hits(&mut hits, Some(&spec));
+        // Two nodes, each already field-sorted and projected (no `year`).
+        let hits = order_hit_blocks(
+            vec![
+                vec![
+                    json!({"title": "a", "_sort_key": 2020}),
+                    json!({"title": "c", "_sort_key": 2018}),
+                ],
+                vec![
+                    json!({"title": "d", "_sort_key": 2024}),
+                    json!({"title": "b", "_sort_key": 2022}),
+                ],
+            ],
+            Some(&spec),
+            10,
+        );
         assert_eq!(titles(&hits), vec!["d", "b", "a", "c"]);
     }
 
     #[test]
-    fn order_merged_hits_ascending_and_missing_key_sorts_last() {
+    fn a_merge_sorts_ascending_and_puts_a_missing_key_last() {
         let spec = SortSpec {
             field: "year".to_string(),
             order: SortOrder::Asc,
         };
-        let mut hits = vec![
-            json!({"title": "b", "_sort_key": 2022}),
-            json!({"title": "missing"}), // no `_sort_key` → sorts last
-            json!({"title": "a", "_sort_key": 2018}),
-        ];
-        order_merged_hits(&mut hits, Some(&spec));
+        let hits = order_hit_blocks(
+            vec![
+                vec![
+                    json!({"title": "b", "_sort_key": 2022}),
+                    json!({"title": "missing"}), // no `_sort_key` → sorts last
+                ],
+                vec![json!({"title": "a", "_sort_key": 2018})],
+            ],
+            Some(&spec),
+            10,
+        );
         assert_eq!(titles(&hits), vec!["a", "b", "missing"]);
+    }
+
+    /// Ties fall back to the source's rank and then to the hit's place within that source.
+    ///
+    /// Sources are polled concurrently and answer in whatever order they finish, so without
+    /// this a tie is settled by whoever replied first and one query has two answers. Every
+    /// hit here has the same sort key, which is the ordinary case rather than a contrived
+    /// one: every document matching a single term scores identically.
+    #[test]
+    fn a_tie_falls_back_to_source_rank_and_then_to_position() {
+        let spec = SortSpec {
+            field: "year".to_string(),
+            order: SortOrder::Desc,
+        };
+        let blocks = vec![
+            vec![
+                json!({"title": "a1", "_sort_key": 2020}),
+                json!({"title": "a2", "_sort_key": 2020}),
+            ],
+            vec![
+                json!({"title": "b1", "_sort_key": 2020}),
+                json!({"title": "b2", "_sort_key": 2020}),
+            ],
+        ];
+        let hits = order_hit_blocks(blocks.clone(), Some(&spec), 10);
+        assert_eq!(titles(&hits), vec!["a1", "a2", "b1", "b2"]);
+
+        // The same blocks in the other dispatch order give the other answer, and that is the
+        // point: the order is the caller's, not the network's.
+        let swapped = vec![blocks[1].clone(), blocks[0].clone()];
+        let hits = order_hit_blocks(swapped, Some(&spec), 10);
+        assert_eq!(titles(&hits), vec!["b1", "b2", "a1", "a2"]);
+    }
+
+    /// A truncated page is the prefix of an untruncated one.
+    ///
+    /// The property paging will rest on, and the one a running top-K could not provide: it had
+    /// to decide what to discard while later sources were still unheard, so which of a tied run
+    /// it kept depended on arrival order.
+    #[test]
+    fn a_limited_merge_is_a_prefix_of_the_unlimited_one() {
+        let blocks = vec![
+            vec![
+                json!({"title": "a1", "_score": 1.0}),
+                json!({"title": "a2", "_score": 1.0}),
+            ],
+            vec![
+                json!({"title": "b1", "_score": 1.0}),
+                json!({"title": "b2", "_score": 2.0}),
+            ],
+        ];
+        let full = titles(&order_hit_blocks(blocks.clone(), None, 10));
+        for limit in 1..=full.len() {
+            let page = titles(&order_hit_blocks(blocks.clone(), None, limit));
+            assert_eq!(page, full[..limit], "limit {limit} is not a prefix");
+        }
     }
 
     /// Finding #2: i64 keys beyond f64's exact-integer range must order precisely.
