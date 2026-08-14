@@ -64,6 +64,9 @@ enabled = false
 # [security.limits]
 # tool_calls_per_minute = 120           # 0 (default) disables limiting entirely
 # tool_call_burst = 30                  # spendable at once; 0 means one minute's worth
+# max_search_limit = 10000              # largest `limit` an MCP search may ask for
+# max_response_bytes = 1048576          # largest MCP search response; unset, it follows
+#                                       # max_record_size_mb like every other message limit
 
 # Audit trail — who read what. Refusals have always been logged; without this a node cannot
 # say who legitimately read which index, which is the question an incident asks. Reads and

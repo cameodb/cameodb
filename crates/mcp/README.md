@@ -87,6 +87,8 @@ Execute full-text search on a single CameoDB index.
 
 **Returns:** JSON array of matching documents with relevance scores.
 
+A response larger than the largest single message the node is configured to carry — its HTTP body size, 128 MB by default, overridable as `[security.limits] max_response_bytes` — is trimmed to fit and carries `_truncated: true`, `_omitted_hits: N` and a `_warning` naming the figure it hit. The hits returned are the highest ranked, in order; `total_hits` still reports everything that matched. Treat the flag as instruction to narrow the query rather than reading the trimmed set as the whole result.
+
 **Example:**
 ```json
 {

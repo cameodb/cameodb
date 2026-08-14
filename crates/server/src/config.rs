@@ -477,6 +477,7 @@ pub struct CameoDbConfig {
     /// | HTTP max body size                   | `max_record_size_mb + 64` MB (overhead) |
     /// | Kameo remote request/response max    | `max_record_size_mb * 1.25` (25 % headroom) |
     /// | HTTP request timeout                 | `max(60, max_record_size_mb / 10)` seconds |
+    /// | Largest MCP search response          | the HTTP max body size — what is accepted in one message is what is sent in one |
     #[serde(default = "default_max_record_size_mb")]
     pub max_record_size_mb: usize,
 }
@@ -852,6 +853,22 @@ impl CameoDbConfig {
         }
     }
 
+    /// Largest MCP search response in **bytes**.
+    ///
+    /// Derived from the HTTP body limit rather than chosen independently: a response is a
+    /// message, and the node has already been told how large one message may be. Deriving it
+    /// means an operator who raises `max_record_size_mb` for large documents does not then find
+    /// searches over those documents trimmed by a bound nobody moved.
+    ///
+    /// `[security.limits] max_response_bytes` overrides it, and is worth setting when the
+    /// callers are agents whose context is smaller than the node's message size.
+    pub fn effective_max_response_bytes(&self) -> usize {
+        self.security
+            .limits
+            .max_response_bytes
+            .unwrap_or_else(|| self.effective_max_body_size_mb() * 1024 * 1024)
+    }
+
     /// Effective Kameo remote messaging size limit in **bytes**.
     ///
     /// The envelope must accommodate a single large record plus serialization
@@ -1059,6 +1076,17 @@ impl CameoDbConfig {
             return Err(ConfigError::SecurityConfig {
                 message: "security.limits.max_search_limit is 0, which would refuse every \
                           search; set the largest limit a search may ask for"
+                    .to_string(),
+            }
+            .into());
+        }
+
+        // Nothing fits in zero bytes, and one hit always survives the trim — so a ceiling of
+        // zero would not refuse a response, it would just describe every response as truncated.
+        if self.security.limits.max_response_bytes == Some(0) {
+            return Err(ConfigError::SecurityConfig {
+                message: "security.limits.max_response_bytes is 0, which would report every \
+                          response as truncated; set the largest response a search may return"
                     .to_string(),
             }
             .into());
@@ -2076,6 +2104,26 @@ mod tests {
         );
     }
 
+    /// A response ceiling of zero would describe every response as truncated rather than
+    /// refusing any, since one hit always survives the trim.
+    #[test]
+    fn a_response_ceiling_of_zero_is_refused() {
+        let config = CameoDbConfig {
+            security: crate::auth::SecurityConfig {
+                limits: crate::ratelimit::McpLimitsConfig {
+                    max_response_bytes: Some(0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "a response ceiling of zero was accepted"
+        );
+    }
+
     /// Zero is a misconfiguration rather than "no ceiling".
     ///
     /// Read as unlimited it would invert the meaning of the number, and read literally it
@@ -2093,6 +2141,47 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err(), "a ceiling of zero was accepted");
+    }
+
+    /// The response ceiling follows the node's message size unless an operator names one.
+    ///
+    /// A deployment that raises `max_record_size_mb` for large documents must not then find its
+    /// searches over those documents trimmed by a bound nobody moved — which is what a fixed
+    /// default would do.
+    #[test]
+    fn the_response_ceiling_follows_the_message_size() {
+        let config = CameoDbConfig::default();
+        assert_eq!(
+            config.effective_max_response_bytes(),
+            config.effective_max_body_size_mb() * 1024 * 1024
+        );
+
+        let larger = CameoDbConfig {
+            max_record_size_mb: 512,
+            ..Default::default()
+        };
+        assert!(
+            larger.effective_max_response_bytes() > config.effective_max_response_bytes(),
+            "raising the record size should raise the response ceiling with it"
+        );
+        assert_eq!(
+            larger.effective_max_response_bytes(),
+            (512 + 64) * 1024 * 1024
+        );
+
+        // And an explicit setting wins, for callers whose context is smaller than the node's
+        // message size.
+        let capped = CameoDbConfig {
+            security: crate::auth::SecurityConfig {
+                limits: crate::ratelimit::McpLimitsConfig {
+                    max_response_bytes: Some(64 * 1024),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(capped.effective_max_response_bytes(), 64 * 1024);
     }
 
     /// An absent `[security.limits]` is a bounded deployment, not an unbounded one.

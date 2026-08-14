@@ -1764,3 +1764,80 @@ async fn one_query_asked_repeatedly_gives_one_answer() {
         );
     }
 }
+
+/// A response too large to read comes back trimmed, and says so.
+///
+/// A limit bounds how many hits are returned, not how large they are — a search well inside
+/// every advertised bound can still be megabytes of documents. The hits that fit are returned
+/// and remain usable; what matters is that the caller is told the rest were left out, because an
+/// agent that thinks it read the whole result reports it as the whole result.
+#[tokio::test]
+async fn a_response_past_the_byte_ceiling_is_trimmed_and_says_so() {
+    let node = TestNode::start_with(
+        r#"
+[security.limits]
+max_response_bytes = 900
+"#,
+    )
+    .await;
+    node.create_index("docs").await;
+    let documents: Vec<(String, &str)> = (0..12)
+        .map(|n| (format!("d{n:02}"), "2024-01-01T00:00:00Z"))
+        .collect();
+    let borrowed: Vec<(&str, &str)> = documents
+        .iter()
+        .map(|(id, created)| (id.as_str(), *created))
+        .collect();
+    node.seed("docs", &borrowed).await;
+
+    for tool in ["search_index", "search_indexes"] {
+        let arguments = if tool == "search_index" {
+            json!({"index": "docs", "query": "title:record", "limit": 12})
+        } else {
+            json!({"indexes": [{"index": "docs"}], "query": "title:record", "limit": 12})
+        };
+        let (is_error, result) = node.call_tool(tool, arguments).await;
+        assert!(!is_error, "{tool}: {result}");
+
+        let kept = result["hits"].as_array().expect("hits").len();
+        assert!(kept > 0, "{tool} returned nothing at all: {result}");
+        assert!(kept < 12, "{tool} was not trimmed: {result}");
+        assert_eq!(result["_truncated"], json!(true), "{tool}: {result}");
+        assert_eq!(
+            result["_omitted_hits"].as_u64(),
+            Some((12 - kept) as u64),
+            "{tool} did not account for what it left out: {result}"
+        );
+        assert_eq!(
+            result["hits_returned"].as_u64(),
+            Some(kept as u64),
+            "{tool} reported a count it did not return: {result}"
+        );
+        // What matched is unchanged by what was returned.
+        assert_eq!(
+            result["total_hits"].as_u64(),
+            Some(12),
+            "{tool} restated the match count: {result}"
+        );
+        assert!(
+            result["_warning"]
+                .as_str()
+                .is_some_and(|text| text.contains("Narrow the query")),
+            "{tool} did not say what to do about it: {result}"
+        );
+    }
+
+    // A narrower query fits, and then nothing is reported as missing — which is what makes the
+    // flag worth reading.
+    let (is_error, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "docs", "query": "title:record", "limit": 2}),
+        )
+        .await;
+    assert!(!is_error, "{result}");
+    assert!(
+        result.get("_truncated").is_none(),
+        "a response that fits should carry no trim flag: {result}"
+    );
+}

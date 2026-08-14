@@ -32,6 +32,11 @@ pub struct AppState {
     /// Both advertised and enforced: the tool schemas render it as their `maximum`, so a
     /// client is shown the same number a call is measured against.
     pub max_search_limit: usize,
+    /// Largest MCP search response in bytes, from `[security.limits]`.
+    ///
+    /// Hits past it are left out and the response says so. The limit bounds how many hits are
+    /// returned; this bounds how large they may be, which no count can.
+    pub max_response_bytes: usize,
     /// Where the audit trail goes. Inert unless `[security.audit]` turned it on.
     pub audit: Arc<crate::audit::AuditSink>,
 }

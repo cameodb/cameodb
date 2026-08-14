@@ -399,6 +399,7 @@ you only discover on the day you turn authentication on. These all refuse to sta
 tool_calls_per_minute = 120   # 0 (the default) disables limiting entirely
 tool_call_burst = 30          # spendable at once; 0 means one minute's worth
 max_search_limit = 10000      # largest `limit` an MCP search may ask for
+# max_response_bytes = 1048576  # optional; defaults to the node's HTTP body size
 ```
 
 Authentication answers *who*, and `allowed_indexes` answers *what*. Neither says anything
@@ -451,6 +452,34 @@ each hit is a redb lookup, a merge entry and a serialized document.
   than clamping, so the number an operator wrote is the number that runs.
 - **`0` is refused**, not read as unlimited. A bound whose zero inverts its meaning is a trap;
   an operator who wants a high ceiling writes a high number.
+
+#### `max_response_bytes` — how large one response may be
+
+`max_search_limit` bounds how many hits come back; nothing bounds how large they are. A search
+well inside it can still be more bytes than this node carries in one message.
+
+**Leave it unset.** It then derives from `max_record_size_mb`, the single source of truth for
+message size — the same place the HTTP body limit, the inter-node message size and the request
+timeout come from. What a node accepts in one message is what it will send in one: with the
+default 64 MB record size that is **128 MB**, and raising the record size for large documents
+raises this with it rather than leaving searches over those documents trimmed by a bound nobody
+moved. See [the derived limits table](#configuration-reference).
+
+Past the ceiling the hits that do not fit are left out and the response says so: `_truncated:
+true`, `_omitted_hits: N`, and a `_warning` naming the byte figure it hit and telling the caller
+to narrow the query. The hits returned are the front of the same order, so the answer stays
+usable as far as it goes — the point of the flag is that an agent which thinks it read
+everything will report it as everything.
+
+- Set it explicitly only to go **below** the message size, which is worth doing when the
+  callers are agents whose context is smaller than what the node can send. To go above it,
+  raise `max_record_size_mb` and every limit moves together.
+- `total_hits` still counts what matched. `hits_returned` counts what came back.
+- One hit always survives, even one larger than the whole allowance: a response trimmed to
+  nothing is indistinguishable from a query that matched nothing.
+- Applies to the MCP search tools, like `max_search_limit`, and for the same reason.
+- An explicit `0` is refused — it would report every response as truncated rather than
+  refusing any.
 
 ### The audit trail (`[security.audit]`)
 

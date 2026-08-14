@@ -520,6 +520,7 @@ async fn main() -> Result<()> {
             cameodb_config.security.limits.clone(),
         )),
         max_search_limit: cameodb_config.security.limits.max_search_limit,
+        max_response_bytes: cameodb_config.effective_max_response_bytes(),
         audit: Arc::clone(&audit_sink),
     };
 

@@ -23,6 +23,75 @@ use crate::state::AppState;
 /// narrow one.
 const MAX_CONCURRENT_INDEX_SEARCHES: usize = 8;
 
+/// Trim a response down to `max_bytes`, and say so in the response itself.
+///
+/// A limit bounds how many hits come back, not how large they are: ten thousand hits is within
+/// every bound the tools advertise and can still be more bytes than the node is configured to
+/// carry in one message. `max_bytes` follows that configured size, so this is a backstop and
+/// not a routine event — a deployment that handles large documents raises the message size and
+/// this moves with it.
+///
+/// Trimming is the right answer rather than refusing: the hits that fit answer the question as
+/// far as they go. But it is only safe if the caller is told. An agent that knows it saw part of
+/// the result narrows its query; one that does not reports what it read as though it were all
+/// there was.
+///
+/// `total_hits` is left alone: it counts what matched, which trimming does not change. What
+/// changes is `hits_returned`, and `_omitted_hits` says how many were dropped here — dropped
+/// from the end, so what remains is still the front of the same order.
+///
+/// One hit always survives, even one larger than the whole allowance. A response trimmed to
+/// nothing reads exactly like a query that matched nothing, and the two must not look alike.
+fn cap_response_bytes(response: &mut JsonValue, max_bytes: usize) {
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    let Some(JsonValue::Array(hits)) = object.remove("hits") else {
+        return;
+    };
+
+    // Measured without the hits, so the room left for them is what is actually left.
+    let envelope = serde_json::to_vec(&*object)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+    let mut used = envelope;
+    let mut kept = 0usize;
+    for hit in &hits {
+        let hit_bytes = serde_json::to_vec(hit)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        // `+ 1` for the comma that joins it to the previous hit.
+        if kept > 0 && used + hit_bytes + 1 > max_bytes {
+            break;
+        }
+        used += hit_bytes + 1;
+        kept += 1;
+    }
+
+    let omitted = hits.len() - kept;
+    let mut hits = hits;
+    hits.truncate(kept);
+    object.insert("hits".to_string(), JsonValue::Array(hits));
+    object.insert("hits_returned".to_string(), JsonValue::from(kept));
+
+    if omitted > 0 {
+        object.insert("_truncated".to_string(), JsonValue::Bool(true));
+        object.insert("_omitted_hits".to_string(), JsonValue::from(omitted));
+        // The same key the zero-results advice uses, and they cannot both apply: a response
+        // with no hits has nothing to trim.
+        object.insert(
+            "_warning".to_string(),
+            JsonValue::String(format!(
+                "{omitted} of the hits for this query were left out: the full response would \
+                 have exceeded the largest single message this node sends ({max_bytes} bytes). \
+                 The ones returned are the highest ranked, in order. Narrow the query — add a \
+                 field, a phrase or an `AND` clause — or ask for fewer fields with `return`, \
+                 rather than reading these as the whole result."
+            )),
+        );
+    }
+}
+
 /// Refuse a limit above what the tool schemas advertise.
 ///
 /// Checked on the value the search will actually run with rather than on the argument, because
@@ -117,6 +186,7 @@ pub(super) fn search_index(
                 {
                     obj.insert("_warning".to_string(), JsonValue::String(advice));
                 }
+                cap_response_bytes(&mut response, state.max_response_bytes);
                 Ok(response)
             }
             Err(err) => {
@@ -383,6 +453,109 @@ pub(super) fn search_indexes(
             obj.insert("_warning".to_string(), JsonValue::String(advice));
         }
 
+        cap_response_bytes(&mut response, state.max_response_bytes);
         Ok(response)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn response_with(hits: usize) -> JsonValue {
+        let hits: Vec<JsonValue> = (0..hits)
+            .map(|n| json!({"id": format!("d{n:03}"), "body": "x".repeat(100)}))
+            .collect();
+        json!({
+            "hits": hits,
+            "hits_returned": hits.len(),
+            "total_hits": 5_000,
+            "limit": 100,
+        })
+    }
+
+    /// A response inside the allowance is left exactly as it was.
+    ///
+    /// The trim has to be invisible in the ordinary case: a `_truncated` flag on a complete
+    /// response would teach an agent to distrust every result it reads.
+    #[test]
+    fn a_response_that_fits_is_untouched() {
+        let mut response = response_with(3);
+        let before = response.clone();
+        cap_response_bytes(&mut response, 1024 * 1024);
+        assert_eq!(response, before);
+        assert!(response.get("_truncated").is_none());
+        assert!(response.get("_omitted_hits").is_none());
+    }
+
+    /// What is dropped is accounted for, and what matched is not restated.
+    #[test]
+    fn an_oversized_response_is_trimmed_and_says_so() {
+        let mut response = response_with(50);
+        cap_response_bytes(&mut response, 1_000);
+
+        let kept = response["hits"].as_array().expect("hits").len();
+        assert!(kept > 0 && kept < 50, "kept {kept} of 50");
+        assert_eq!(response["hits_returned"].as_u64(), Some(kept as u64));
+        assert_eq!(response["_truncated"], json!(true));
+        assert_eq!(response["_omitted_hits"].as_u64(), Some((50 - kept) as u64));
+        // `total_hits` counts what matched, which trimming does not change.
+        assert_eq!(response["total_hits"].as_u64(), Some(5_000));
+        let warning = response["_warning"].as_str().unwrap_or_default();
+        assert!(
+            warning.contains("Narrow the query"),
+            "the trim should say what to do about it: {response}"
+        );
+        assert!(
+            warning.contains("1000 bytes"),
+            "the trim should name the bound it hit, so an operator knows which knob: {warning}"
+        );
+
+        // Within the allowance it was given, give or take the closing bracket.
+        let size = serde_json::to_vec(&response).expect("serialize").len();
+        assert!(
+            size < 1_000 + 600,
+            "trimmed to {size} bytes against an allowance of 1000"
+        );
+    }
+
+    /// The hits kept are the front of the order, not a sample of it.
+    #[test]
+    fn a_trim_keeps_the_highest_ranked_hits() {
+        let mut response = response_with(20);
+        cap_response_bytes(&mut response, 800);
+        let ids: Vec<String> = response["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .filter_map(|hit| hit["id"].as_str().map(str::to_string))
+            .collect();
+        assert!(ids.len() > 1 && ids.len() < 20, "kept {}", ids.len());
+        let expected: Vec<String> = (0..ids.len()).map(|n| format!("d{n:03}")).collect();
+        assert_eq!(ids, expected, "the trim did not keep a prefix of the order");
+    }
+
+    /// One hit survives an allowance too small for any hit at all.
+    ///
+    /// A response trimmed to nothing reads exactly like a query that matched nothing, and those
+    /// two must not look alike — so the caller gets one hit, the flag, and the count.
+    #[test]
+    fn a_single_oversized_hit_is_still_returned() {
+        let mut response = response_with(5);
+        cap_response_bytes(&mut response, 1);
+        assert_eq!(response["hits"].as_array().expect("hits").len(), 1);
+        assert_eq!(response["_truncated"], json!(true));
+        assert_eq!(response["_omitted_hits"].as_u64(), Some(4));
+    }
+
+    /// A response with no hits has nothing to trim, which is what keeps the trim's advice and
+    /// the zero-results advice from ever contending for `_warning`.
+    #[test]
+    fn an_empty_response_is_never_reported_as_trimmed() {
+        let mut response = response_with(0);
+        cap_response_bytes(&mut response, 1);
+        assert!(response.get("_truncated").is_none());
+        assert_eq!(response["hits_returned"].as_u64(), Some(0));
+    }
 }
