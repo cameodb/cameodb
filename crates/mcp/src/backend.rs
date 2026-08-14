@@ -28,18 +28,74 @@ pub enum SortOrder {
 
 /// One index named in a federated search, with what to return from it and how to order it.
 ///
-/// Arrives from a client, so it refuses fields it does not know: the schema advertising this
-/// says `additionalProperties: false`, and a struct that quietly ignored the rest would make
-/// that advertisement false. A misspelled `feilds` is then a named error rather than a
-/// projection silently not applied.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Accepts either the name on its own or an object naming it, because most entries in a
+/// federated search want nothing but the name and `{"index": "docs"}` is three times the
+/// characters to say so.
+///
+/// Arrives from a client, so the object form refuses fields it does not know: the schema
+/// advertising it says `additionalProperties: false`, and a struct that quietly ignored the rest
+/// would make that advertisement false. A misspelled `feilds` is then a named error rather than
+/// a projection silently not applied.
+#[derive(Debug, Clone)]
 pub struct McpIndexSearchRequest {
     pub index: String,
-    #[serde(default)]
     pub fields: Option<Vec<String>>,
-    #[serde(default)]
     pub sort: Option<SortSpec>,
+}
+
+/// Written by hand rather than derived from an untagged enum.
+///
+/// An untagged enum buffers the input and reports only that it matched no variant, which would
+/// turn "unknown field `feilds`" into "data did not match any variant" and lose the one thing
+/// that makes a misspelling correctable. Dispatching on what actually arrived — a string, or a
+/// map — keeps the object form's own errors intact.
+impl<'de> Deserialize<'de> for McpIndexSearchRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Named {
+            index: String,
+            #[serde(default)]
+            fields: Option<Vec<String>>,
+            #[serde(default)]
+            sort: Option<SortSpec>,
+        }
+
+        struct EitherForm;
+
+        impl<'de> serde::de::Visitor<'de> for EitherForm {
+            type Value = McpIndexSearchRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an index name, or an object naming one")
+            }
+
+            fn visit_str<E>(self, index: &str) -> Result<Self::Value, E> {
+                Ok(McpIndexSearchRequest {
+                    index: index.to_string(),
+                    fields: None,
+                    sort: None,
+                })
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let named = Named::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(McpIndexSearchRequest {
+                    index: named.index,
+                    fields: named.fields,
+                    sort: named.sort,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(EitherForm)
+    }
 }
 
 /// The operations MCP exposes, implemented by the host.

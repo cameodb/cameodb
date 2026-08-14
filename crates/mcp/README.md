@@ -151,7 +151,7 @@ Execute federated search across multiple CameoDB indexes with optional per-index
 - Errors naming a missing field are appended with that index's field list
 
 **Parameters:**
-- `indexes` (array, required): The indexes to search, at least one and at most 20. Naming the same index twice is refused rather than searched twice — each mention would be counted separately, reporting more documents than the index holds. Each entry takes:
+- `indexes` (array, required): The indexes to search, at least one and at most 20. Naming the same index twice is refused rather than searched twice — each mention would be counted separately, reporting more documents than the index holds. An entry is **either a bare index name** (`"papers"`) or an object naming one, and the two mix freely; use the bare form unless the index needs a projection or a sort of its own. The object form takes:
   - `index` (string, required): Name of the CameoDB index
   - `fields` (array of strings, optional): Fields to include from this index
   - `sort` (object, optional): Sort results by a field within this index
@@ -169,7 +169,7 @@ Execute federated search across multiple CameoDB indexes with optional per-index
   "arguments": {
     "indexes": [
       {"index": "papers", "fields": ["title", "author"], "sort": {"field": "year", "order": "asc"}},
-      {"index": "books", "fields": ["title", "isbn"]}
+      "books"
     ],
     "query": "rust programming",
     "limit": 20

@@ -159,24 +159,32 @@ pub(crate) fn search_indexes_input_schema(max_search_limit: usize) -> JsonValue 
                 "minItems": 1,
                 "maxItems": MAX_FEDERATED_INDEXES,
                 "description": format!(
-                    "The indexes to search, at least one and at most {MAX_FEDERATED_INDEXES}, each with optional field projection. Naming the same index twice is refused rather than searched twice."
+                    "The indexes to search, at least one and at most {MAX_FEDERATED_INDEXES}. An entry is either a bare index name, or an object naming one with a field projection and a sort of its own. Naming the same index twice is refused rather than searched twice."
                 ),
                 "items": {
-                    "type": "object",
-                    "properties": {
-                        "index": {
+                    "oneOf": [
+                        {
                             "type": "string",
-                            "description": "Name of the CameoDB index."
+                            "description": "The name of an index to search with no per-index options."
                         },
-                        "fields": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Fields to include from this index. Fields are returned in the exact order specified. Metadata fields (like '_score') are always included automatically."
-                        },
-                        "sort": sort_schema()
-                    },
-                    "required": ["index"],
-                    "additionalProperties": false
+                        {
+                            "type": "object",
+                            "properties": {
+                                "index": {
+                                    "type": "string",
+                                    "description": "Name of the CameoDB index."
+                                },
+                                "fields": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Fields to include from this index. Fields are returned in the exact order specified. Metadata fields (like '_score') are always included automatically."
+                                },
+                                "sort": sort_schema()
+                            },
+                            "required": ["index"],
+                            "additionalProperties": false
+                        }
+                    ]
                 }
             },
             "query": {
@@ -470,7 +478,9 @@ mod tests {
     /// they can drift the same way.
     fn contracts() -> Vec<Contract> {
         let federated = search_indexes_input_schema(DEFAULT_MAX_SEARCH_LIMIT);
-        let per_index = federated["properties"]["indexes"]["items"].clone();
+        // The object branch of the entry's `oneOf`. A bare name has no properties to compare;
+        // the object form is the half that has to agree with the struct.
+        let per_index = federated["properties"]["indexes"]["items"]["oneOf"][1].clone();
         let sort = per_index["properties"]["sort"].clone();
 
         vec![

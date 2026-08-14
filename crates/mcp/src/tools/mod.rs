@@ -569,6 +569,62 @@ mod tests {
         }
     }
 
+    /// An entry may be the name on its own, and a misspelling inside the object form is still
+    /// refused by name.
+    ///
+    /// The bare form is what most entries want — a federated search usually names indexes and
+    /// nothing else. What it must not cost is the object form's error quality: "data did not
+    /// match any variant" tells a caller nothing it can correct.
+    #[tokio::test]
+    async fn an_index_entry_may_be_a_bare_name() {
+        let authz: McpAuthzRef = Arc::new(Scoped("docs"));
+
+        let params = ToolCallParams {
+            name: "search_indexes".to_string(),
+            arguments: json!({"indexes": ["docs"], "query": "a"}),
+        };
+        assert!(
+            call_tool(&StubBackend::default(), params, &authz)
+                .await
+                .is_ok(),
+            "a bare index name was refused"
+        );
+
+        // Mixed with the object form, and the scope check still sees both names.
+        let params = ToolCallParams {
+            name: "search_indexes".to_string(),
+            arguments: json!({"indexes": ["docs", {"index": "payroll"}], "query": "a"}),
+        };
+        let err = call_tool(&StubBackend::default(), params, &authz)
+            .await
+            .expect_err("an index outside the scope was accepted");
+        assert!(err.contains("payroll"), "{err}");
+
+        // Duplicate detection reads through both forms, since one name twice is one name twice
+        // however it was written.
+        let params = ToolCallParams {
+            name: "search_indexes".to_string(),
+            arguments: json!({"indexes": ["docs", {"index": "docs"}], "query": "a"}),
+        };
+        let err = call_tool(&StubBackend::default(), params, &authz)
+            .await
+            .expect_err("the same index named twice in two forms was accepted");
+        assert!(err.contains("twice"), "{err}");
+
+        // And the object form still names what it refused.
+        let params = ToolCallParams {
+            name: "search_indexes".to_string(),
+            arguments: json!({"indexes": [{"index": "docs", "feilds": ["title"]}], "query": "a"}),
+        };
+        let err = call_tool(&StubBackend::default(), params, &authz)
+            .await
+            .expect_err("a misspelled projection was accepted");
+        assert!(
+            err.contains("feilds"),
+            "the bare-name form cost the object form its error: {err}"
+        );
+    }
+
     /// A federated search is charged for every index it names, and nothing is charged for less
     /// than one call.
     #[test]

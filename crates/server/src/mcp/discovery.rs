@@ -8,7 +8,8 @@ use cameodb_mcp::McpAuthzRef;
 use crate::authz::retain_visible_indexes;
 use crate::mcp::diagnostics::{analyze_query, cameodb_syntax_reference};
 use crate::mcp::schema::{
-    enrich_index_entry, extract_field_info, extract_field_names, field_query_hint, index_schema,
+    absent_index_reason, enrich_index_entry, extract_field_info, extract_field_names,
+    field_query_hint, index_schema,
 };
 use crate::node_orchestrator::ClientOp;
 use crate::state::AppState;
@@ -127,8 +128,23 @@ pub(super) fn validate_query(
     query: Option<String>,
 ) -> BoxFuture<'static, Result<JsonValue, String>> {
     Box::pin(async move {
+        // The index's schema, named — not the catalogue. This wants field definitions and
+        // nothing else, and reaching them through `get_index` meant gathering statistics for
+        // every index in the deployment and discarding all of them to validate one query.
         let index_details = if let Some(index_name) = index.clone() {
-            Some(get_index(state.clone(), index_name).await?)
+            let schema = index_schema(&state, &index_name).await;
+            // A schema that could not be read is the one case where the catalogue's answer
+            // mattered: an index that is not there must be refused, in the same words
+            // `get_index` refuses it, rather than described as having no fields.
+            if schema.is_null()
+                && let Some(reason) = absent_index_reason(&state, &index_name).await
+            {
+                return Err(reason);
+            }
+            Some(enrich_index_entry(serde_json::json!({
+                "index": index_name,
+                "schema": schema,
+            })))
         } else {
             None
         };

@@ -2046,3 +2046,140 @@ async fn a_successful_search_reports_no_errors_key_at_all() {
         "the HTTP API still reports an empty error list: {body}"
     );
 }
+
+/// A federated search accepts a bare index name beside the object form.
+///
+/// Most entries in a federated search want nothing but the name, and `{"index": "docs"}` is three
+/// times the characters to say it. The two forms mix freely, and everything downstream reads
+/// through both: the scope check, the duplicate check, and the record of which indexes a call
+/// touched.
+#[tokio::test]
+async fn a_federated_search_takes_a_bare_index_name() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, bare) = node
+        .call_tool(
+            "search_indexes",
+            json!({"indexes": ["alpha", "beta"], "query": "title:record", "limit": 10}),
+        )
+        .await;
+    assert!(!is_error, "bare names were refused: {bare}");
+
+    let (_, spelled_out) = node
+        .call_tool(
+            "search_indexes",
+            json!({
+                "indexes": [{"index": "alpha"}, {"index": "beta"}],
+                "query": "title:record",
+                "limit": 10,
+            }),
+        )
+        .await;
+    assert_eq!(
+        bare, spelled_out,
+        "the two ways of naming the same indexes gave different answers"
+    );
+
+    // Mixed, with a per-index projection on the one that needs it.
+    let (is_error, mixed) = node
+        .call_tool(
+            "search_indexes",
+            json!({
+                "indexes": ["alpha", {"index": "beta", "fields": ["title"]}],
+                "query": "title:record",
+                "limit": 10,
+            }),
+        )
+        .await;
+    assert!(!is_error, "the mixed form was refused: {mixed}");
+    for hit in mixed["hits"].as_array().expect("hits") {
+        let from_beta = hit["_index_source"] == json!("beta");
+        assert_eq!(
+            hit.get("created").is_none(),
+            from_beta,
+            "the projection applied to the wrong index's hits: {hit}"
+        );
+    }
+
+    // The catalogue says both forms are acceptable, so a schema-driven client can send either.
+    let listing = node
+        .rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await;
+    let entry = listing["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["name"] == json!("search_indexes"))
+        .map(|tool| tool["inputSchema"]["properties"]["indexes"]["items"].clone())
+        .expect("the federated tool describes its entries");
+    let forms: Vec<&str> = entry["oneOf"]
+        .as_array()
+        .expect("both forms are advertised")
+        .iter()
+        .filter_map(|form| form["type"].as_str())
+        .collect();
+    assert_eq!(forms, ["string", "object"], "advertised forms: {entry}");
+}
+
+/// Validating a query against one index reads that index, not the whole catalogue.
+///
+/// The field definitions are all this needs, and they come from the index by name. Reaching them
+/// through the catalogue meant gathering statistics for every index in the deployment and
+/// discarding all of them — while still having to refuse a name that is not there, which is the
+/// one thing the catalogue was answering.
+#[tokio::test]
+async fn validating_a_query_reads_one_index_rather_than_the_catalogue() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "alpha", "query": "titel:rust"}),
+        )
+        .await;
+    assert!(!is_error, "{result}");
+
+    // The fields still arrive, with their types and hints.
+    let fields: Vec<&str> = result["available_fields"]
+        .as_array()
+        .expect("available_fields")
+        .iter()
+        .filter_map(|field| field["field"].as_str())
+        .collect();
+    assert!(
+        fields.contains(&"title") && fields.contains(&"created"),
+        "the index's fields did not survive: {result}"
+    );
+    for field in result["available_fields"].as_array().expect("fields") {
+        assert!(
+            field["query_hint"].is_string(),
+            "a field lost its query hint: {field}"
+        );
+        assert!(field["type"].is_string(), "a field lost its type: {field}");
+    }
+    // And the misspelling is still caught against them.
+    assert!(
+        serde_json::to_string(&result["query_analysis"])
+            .unwrap_or_default()
+            .contains("title"),
+        "the typo was not matched against this index's fields: {result}"
+    );
+
+    // An index that does not exist is still refused, in the words `get_index` uses.
+    let (is_error, refusal) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "nonexistent", "query": "title:x"}),
+        )
+        .await;
+    assert!(
+        is_error,
+        "a missing index was described rather than refused: {refusal}"
+    );
+    assert!(
+        refusal
+            .as_str()
+            .is_some_and(|text| text.contains("nonexistent") && text.contains("not found")),
+        "{refusal}"
+    );
+}
