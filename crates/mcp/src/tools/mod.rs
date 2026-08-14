@@ -9,10 +9,11 @@ use crate::{
     authz::{McpAuthzRef, tool_capability},
     backend::{McpBackend, McpIndexSearchRequest},
     tools::schema::{
-        GetIndexArgs, GetIndexStatsArgs, ListIndexesArgs, MAX_FEDERATED_INDEXES, SearchIndexArgs,
-        SearchIndexesArgs, ValidateQueryArgs, get_index_input_schema, get_index_stats_input_schema,
-        list_indexes_input_schema, search_index_input_schema, search_index_output_schema,
-        search_indexes_input_schema, search_indexes_output_schema, validate_query_input_schema,
+        DescribeIndexArgs, GetCatalogStatsArgs, ListIndexesArgs, MAX_FEDERATED_INDEXES,
+        SearchAcrossIndexesArgs, SearchIndexArgs, ValidateQueryArgs, describe_index_input_schema,
+        get_catalog_stats_input_schema, list_indexes_input_schema,
+        search_across_indexes_input_schema, search_across_indexes_output_schema,
+        search_index_input_schema, search_index_output_schema, validate_query_input_schema,
     },
 };
 
@@ -128,8 +129,9 @@ where
                 )
                 .await
         }
-        "search_indexes" => {
-            let args: SearchIndexesArgs = decode_args("search_indexes", params.arguments)?;
+        "search_across_indexes" => {
+            let args: SearchAcrossIndexesArgs =
+                decode_args("search_across_indexes", params.arguments)?;
             check_limit(args.limit, backend.max_search_limit())?;
             check_index_list(&args.indexes)?;
             // Refuse the whole call rather than quietly dropping the indexes this key may
@@ -138,13 +140,13 @@ where
                 check_index(authz, &request.index)?;
             }
             backend
-                .search_indexes(args.indexes, args.query, args.limit)
+                .search_across_indexes(args.indexes, args.query, args.limit)
                 .await
         }
-        "get_index" => {
-            let args: GetIndexArgs = decode_args("get_index", params.arguments)?;
+        "describe_index" => {
+            let args: DescribeIndexArgs = decode_args("describe_index", params.arguments)?;
             check_index(authz, &args.index)?;
-            backend.get_index(args.index).await
+            backend.describe_index(args.index).await
         }
         "list_indexes" => {
             let ListIndexesArgs {} = decode_args("list_indexes", params.arguments)?;
@@ -160,14 +162,10 @@ where
                 .validate_query(args.index, args.partial_field, args.query)
                 .await
         }
-        "get_index_stats" => {
-            let args: GetIndexStatsArgs = decode_args("get_index_stats", params.arguments)?;
-            // With no index named this aggregates across the catalogue, which the backend
-            // filters to the caller's scope.
-            if let Some(index) = &args.index {
-                check_index(authz, index)?;
-            }
-            backend.get_index_stats(args.index, authz.clone()).await
+        "get_catalog_stats" => {
+            let GetCatalogStatsArgs {} = decode_args("get_catalog_stats", params.arguments)?;
+            // Aggregates across the catalogue, which the backend filters to the caller's scope.
+            backend.get_catalog_stats(authz.clone()).await
         }
         // Unreachable: `tool_capability` above rejects anything not in this match.
         other => Err(format!("Unsupported MCP tool: {other}")),
@@ -206,7 +204,7 @@ pub(crate) fn tool_subject(arguments: &JsonValue) -> Option<String> {
     let names: Vec<&str> = entries
         .iter()
         .filter_map(|entry| match entry {
-            // `search_indexes` accepts both a bare name and an object naming one.
+            // `search_across_indexes` accepts both a bare name and an object naming one.
             JsonValue::String(name) => Some(name.as_str()),
             other => other.get("index").and_then(JsonValue::as_str),
         })
@@ -252,14 +250,14 @@ fn search_index_description() -> String {
     format!(
         "Full-text search over one CameoDB index.\n\n         Results carry `_score` and, when a projection was requested, only the named fields in \
          the order given. A query the engine cannot fully interpret fails rather than returning \
-         partial results, and the error names the clause it could not use.\n\n         Call `get_index` for an index's fields and their types before constructing a query \
+         partial results, and the error names the clause it could not use.\n\n         Call `describe_index` for an index's fields and their types before constructing a query \
          against unfamiliar data.\n\n{}",
         crate::syntax::compact_reference()
     )
 }
 
-/// What `search_indexes` adds over `search_index`. The syntax is identical, so it is not repeated.
-fn search_indexes_description() -> String {
+/// What `search_across_indexes` adds over `search_index`. The syntax is identical, so it is not repeated.
+fn search_across_indexes_description() -> String {
     "Full-text search over several CameoDB indexes at once, executed concurrently and merged.\n\n     Each hit carries `_index_source` naming the index it came from. Per-index `fields` and \
      `sort` parameters override the equivalent inline modifiers, as they do on `search_index`. \
      One query string is applied to every index, so a field that exists in only some of them \
@@ -282,21 +280,21 @@ pub(crate) fn mcp_tools(max_search_limit: usize) -> Vec<JsonValue> {
             }
         }),
         json!({
-            "name": "search_indexes",
+            "name": "search_across_indexes",
             "title": "Federated Search",
-            "description": search_indexes_description(),
-            "inputSchema": search_indexes_input_schema(max_search_limit),
-            "outputSchema": search_indexes_output_schema(),
+            "description": search_across_indexes_description(),
+            "inputSchema": search_across_indexes_input_schema(max_search_limit),
+            "outputSchema": search_across_indexes_output_schema(),
             "annotations": {
                 "readOnlyHint": true,
                 "openWorldHint": false
             }
         }),
         json!({
-            "name": "get_index",
-            "title": "Get Index",
-            "description": "Retrieve schema and statistics for a single CameoDB index. Returns field definitions with types and a 'queryable_fields' array containing per-field 'query_hint' showing exactly which operators (phrases, ranges, IN set, boost, slop, etc.) work with each field's data type. Use this to understand an index's structure before constructing queries.\n\nORCHESTRATION TIP: Review the returned schema to identify potential pivot fields (like foreign keys, user IDs, or hashes) before running your search.",
-            "inputSchema": get_index_input_schema(),
+            "name": "describe_index",
+            "title": "Describe Index",
+            "description": "Describe one CameoDB index: its schema, its statistics, and how to query it. Returns a 'fields' array giving each field's type and its 'indexed', 'fast' and 'shadow' flags, and a 'query_hints' array naming the operators (phrases, ranges, IN set, boost, slop) each type present supports. Call this before constructing a query against unfamiliar data.\n\nORCHESTRATION TIP: Review the returned fields to identify potential pivot fields (like foreign keys, user IDs, or hashes) before running your search.",
+            "inputSchema": describe_index_input_schema(),
             "annotations": {
                 "readOnlyHint": true,
                 "openWorldHint": false
@@ -305,7 +303,7 @@ pub(crate) fn mcp_tools(max_search_limit: usize) -> Vec<JsonValue> {
         json!({
             "name": "list_indexes",
             "title": "List Indexes",
-            "description": "List all available CameoDB indexes with their schemas and metadata. Each index includes a 'queryable_fields' array with per-field type and 'query_hint' showing supported operators. Use this as the first discovery step — new indexes are automatically available here with full schema details.",
+            "description": "List every CameoDB index this key can see, each with its schema and statistics. Every entry carries the same 'fields' and 'query_hints' arrays that `describe_index` returns. Use this as the first discovery step — a new index appears here with its schema and no configuration.",
             "inputSchema": list_indexes_input_schema(),
             "annotations": {
                 "readOnlyHint": true,
@@ -323,10 +321,10 @@ pub(crate) fn mcp_tools(max_search_limit: usize) -> Vec<JsonValue> {
             }
         }),
         json!({
-            "name": "get_index_stats",
-            "title": "Get Index Statistics",
-            "description": "Return statistics for a single CameoDB index or aggregated statistics across all indexes.",
-            "inputSchema": get_index_stats_input_schema(),
+            "name": "get_catalog_stats",
+            "title": "Catalog Statistics",
+            "description": "Totals across every CameoDB index this key can see: how many indexes, documents, fields, and bytes. For one index, call `describe_index`, which reports its statistics alongside its schema.",
+            "inputSchema": get_catalog_stats_input_schema(),
             "annotations": {
                 "readOnlyHint": true,
                 "openWorldHint": false
@@ -397,7 +395,7 @@ mod tests {
     #[tokio::test]
     async fn a_tool_that_needs_no_arguments_is_callable_without_them() {
         let authz: McpAuthzRef = Arc::new(Scoped("docs"));
-        for tool in ["list_indexes", "validate_query", "get_index_stats"] {
+        for tool in ["list_indexes", "validate_query", "get_catalog_stats"] {
             for arguments in [JsonValue::Null, json!({})] {
                 let params = ToolCallParams {
                     name: tool.to_string(),
@@ -423,13 +421,13 @@ mod tests {
                 json!({"index": "docs", "query": "a", "limt": 5}),
             ),
             (
-                "search_indexes",
+                "search_across_indexes",
                 json!({"indexes": [{"index": "docs", "feilds": ["title"]}], "query": "a"}),
             ),
-            ("get_index", json!({"index": "docs", "verbose": true})),
+            ("describe_index", json!({"index": "docs", "verbose": true})),
             ("list_indexes", json!({"index": "docs"})),
             ("validate_query", json!({"quer": "a"})),
-            ("get_index_stats", json!({"indexes": ["docs"]})),
+            ("get_catalog_stats", json!({"indexes": ["docs"]})),
         ] {
             let params = ToolCallParams {
                 name: tool.to_string(),
@@ -456,7 +454,7 @@ mod tests {
                 json!({"index": "docs", "query": "a", "limit": over}),
             ),
             (
-                "search_indexes",
+                "search_across_indexes",
                 json!({"indexes": [{"index": "docs"}], "query": "a", "limit": over}),
             ),
         ] {
@@ -556,7 +554,7 @@ mod tests {
             ),
         ] {
             let params = ToolCallParams {
-                name: "search_indexes".to_string(),
+                name: "search_across_indexes".to_string(),
                 arguments: json!({"indexes": indexes, "query": "a"}),
             };
             match call_tool(&StubBackend::default(), params, &authz).await {
@@ -580,7 +578,7 @@ mod tests {
         let authz: McpAuthzRef = Arc::new(Scoped("docs"));
 
         let params = ToolCallParams {
-            name: "search_indexes".to_string(),
+            name: "search_across_indexes".to_string(),
             arguments: json!({"indexes": ["docs"], "query": "a"}),
         };
         assert!(
@@ -592,7 +590,7 @@ mod tests {
 
         // Mixed with the object form, and the scope check still sees both names.
         let params = ToolCallParams {
-            name: "search_indexes".to_string(),
+            name: "search_across_indexes".to_string(),
             arguments: json!({"indexes": ["docs", {"index": "payroll"}], "query": "a"}),
         };
         let err = call_tool(&StubBackend::default(), params, &authz)
@@ -603,7 +601,7 @@ mod tests {
         // Duplicate detection reads through both forms, since one name twice is one name twice
         // however it was written.
         let params = ToolCallParams {
-            name: "search_indexes".to_string(),
+            name: "search_across_indexes".to_string(),
             arguments: json!({"indexes": ["docs", {"index": "docs"}], "query": "a"}),
         };
         let err = call_tool(&StubBackend::default(), params, &authz)
@@ -613,7 +611,7 @@ mod tests {
 
         // And the object form still names what it refused.
         let params = ToolCallParams {
-            name: "search_indexes".to_string(),
+            name: "search_across_indexes".to_string(),
             arguments: json!({"indexes": [{"index": "docs", "feilds": ["title"]}], "query": "a"}),
         };
         let err = call_tool(&StubBackend::default(), params, &authz)

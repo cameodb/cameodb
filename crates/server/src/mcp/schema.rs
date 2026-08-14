@@ -30,7 +30,7 @@ pub(super) async fn index_schema(state: &AppState, index: &str) -> JsonValue {
 /// `Some(reason)` when the node has no such index, asked of a search that returned nothing.
 ///
 /// The engine answers a search on an index it does not have with an empty result, which reads
-/// to a caller exactly like a query that matched nothing — while `get_index` on the same name
+/// to a caller exactly like a query that matched nothing — while `describe_index` on the same name
 /// says the index is not there. This is what lets the two MCP tools give the same answer about
 /// whether an index exists, in the one place where the difference is invisible.
 ///
@@ -47,7 +47,7 @@ pub(super) async fn absent_index_reason(state: &AppState, index: &str) -> Option
         .await
     {
         Ok(_) => None,
-        // Worded as `get_index` words it, since agreeing with that tool is the point.
+        // Worded as `describe_index` words it, since agreeing with that tool is the point.
         Err(err) if err.to_string().contains("not found") => {
             Some(format!("Index '{index}' not found"))
         }

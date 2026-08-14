@@ -231,7 +231,7 @@ async fn federated_search_refuses_rather_than_merging_widened_results() {
 
     let (is_error, text) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": [{"index": "docs"}, {"index": "more"}],
                 "query": "tag:active AND nosuch:x"

@@ -36,7 +36,7 @@ CameoDB is designed as a self-contained document store where indexed fields, sch
 **Optimized Schema Responses:**
 Schema and field structures are optimized to return only relevant information for AI clients to build effective queries. Responses avoid overwhelming agents with redundant or irrelevant metadata, focusing on:
 - `searchable_field_names`: List of all queryable field names (for quick reference)
-- `fields` (from `get_index`/`list_indexes`): Per-field type with compact details
+- `fields` (from `describe_index`/`list_indexes`): Per-field type with compact details
 - `available_fields` (from `validate_query`): Per-field type with detailed query hints
 - `query_hints`: Section showing which operators work with each field type
 - Essential statistics and metadata (for context)
@@ -44,11 +44,11 @@ Schema and field structures are optimized to return only relevant information fo
 **Agent workflow (no prior knowledge required):**
 
 1. **`list_indexes`** → Discover all indexes with schemas and per-field `query_hint` (what operators work with each field type)
-2. **`get_index`** → Deep-dive into a specific index: field definitions, types, stats, `fields` array, and `query_hints` section
+2. **`describe_index`** → Deep-dive into a specific index: field definitions, types, stats, `fields` array, and `query_hints` section
 3. **`search_index`** → Construct queries using the field names and operators learned from the schema
 4. **`validate_query`** *(optional)* → Get structural validation, typo detection ("did you mean?"), and the full syntax reference with operator-by-field-type matrix
 
-Each `available_fields` entry (from `validate_query`) and `fields` entry (from `get_index`/`list_indexes`) carries a `query_hint` naming the operators that field's type supports, plus the `indexed`, `fast` and `shadow` flags that decide whether it can be queried and sorted at all. The hints are rendered from [`src/syntax.rs`](src/syntax.rs), so they cannot disagree with the reference.
+Each `available_fields` entry (from `validate_query`) and `fields` entry (from `describe_index`/`list_indexes`) carries a `query_hint` naming the operators that field's type supports, plus the `indexed`, `fast` and `shadow` flags that decide whether it can be queried and sorted at all. The hints are rendered from [`src/syntax.rs`](src/syntax.rs), so they cannot disagree with the reference.
 
 This means an agent can go from zero knowledge to well-formed queries in **two tool calls** (`list_indexes` → `search_index`), with the schema metadata providing all the guidance needed for operator selection.
 
@@ -118,7 +118,7 @@ Execute full-text search on a single CameoDB index.
   **Dropped clauses**: a clause the engine cannot interpret is dropped and the rest of the query runs, which widens a conjunction and disables a negation. This tool fails rather than returning those results, naming the clause it could not use.
 - `limit` (integer, optional): Maximum number of results to return, up to the node's configured ceiling (`[security.limits] max_search_limit`, 10000 by default). The tool's own `inputSchema` carries that number as its `maximum`, so read it there rather than assuming the default. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10. A larger value is refused, whether it arrives as this argument or as an inline `limit` modifier in the query.
 - `fields` (array of strings, optional): Field names to include in results (field projection)
-- `sort` (object, optional): Sort results by a field — the same object `search_indexes` takes per index. Takes precedence over an inline `sort` clause in the query.
+- `sort` (object, optional): Sort results by a field — the same object `search_across_indexes` takes per index. Takes precedence over an inline `sort` clause in the query.
   - `field` (string, required): Field name to sort by (u64, i64, f64, date, or text/string for alphabetic sort)
   - `order` (string, optional): `asc` or `desc` (defaults to `asc`)
 
@@ -139,7 +139,7 @@ A response larger than the largest single message the node is configured to carr
 }
 ```
 
-### 2. `search_indexes`
+### 2. `search_across_indexes`
 
 Execute federated search across multiple CameoDB indexes with optional per-index field projection. Searches execute **concurrently** across all specified indexes, and results are merged into a single ranked list.
 
@@ -165,7 +165,7 @@ Execute federated search across multiple CameoDB indexes with optional per-index
 **Example:**
 ```json
 {
-  "name": "search_indexes",
+  "name": "search_across_indexes",
   "arguments": {
     "indexes": [
       {"index": "papers", "fields": ["title", "author"], "sort": {"field": "year", "order": "asc"}},
@@ -177,7 +177,7 @@ Execute federated search across multiple CameoDB indexes with optional per-index
 }
 ```
 
-### 3. `get_index`
+### 3. `describe_index`
 
 Retrieve schema and statistics for a single CameoDB index.
 
@@ -193,7 +193,7 @@ A field marked `shadow` is the document identifier under the name the source dat
 **Example:**
 ```json
 {
-  "name": "get_index",
+  "name": "describe_index",
   "arguments": {
     "index": "papers"
   }
@@ -296,7 +296,7 @@ Validate and get guidance on CameoDB search query syntax. This is the **primary 
 - `field_hints`: Type-specific query guidance (e.g., "text supports phrases, slop, prefix, IN set, boost, range")
 - `syntax_reference`: Complete query syntax with operator-by-field-type matrix
 
-### 6. `get_index_stats`
+### 6. `get_catalog_stats`
 
 Return statistics for a single CameoDB index or aggregated statistics across all indexes.
 
@@ -310,7 +310,7 @@ Return statistics for a single CameoDB index or aggregated statistics across all
 **Example:**
 ```json
 {
-  "name": "get_index_stats",
+  "name": "get_catalog_stats",
   "arguments": {
     "index": "papers"
   }
@@ -342,7 +342,7 @@ CameoDB exposes indexes as MCP resources for exploration via `resources/list` an
 
 The syntax is defined in exactly one place: the tables in [`src/syntax.rs`](src/syntax.rs). Every
 surface that tells a caller what a query may contain renders from them — the `search_index` tool
-description, the reference `validate_query` returns, the per-field hints `get_index` attaches to a
+description, the reference `validate_query` returns, the per-field hints `describe_index` attaches to a
 schema, and the table below, which is generated and checked against the tables by
 `the_readme_syntax_table_matches_the_table`. Regenerate it with
 `UPDATE_DOCS=1 cargo test -p cameodb_mcp readme` rather than editing it by hand.
@@ -400,7 +400,7 @@ schema, and the table below, which is generated and checked against the tables b
 
 **Sorting**
 
-- Sorting on a numeric or date field requires the `fast` flag on that field, reported per field by `get_index`.
+- Sorting on a numeric or date field requires the `fast` flag on that field, reported per field by `describe_index`.
 - Sorting on a text or string field is approximate: the top `2 × limit` matches by relevance are collected and then ordered alphabetically, so the result is not the alphabetically first documents in the index.
 - Under a numeric or date sort every hit carries `_score` of 1.0, because no relevance score is computed. Do not read it as a ranking.
 - Ascending unless `desc` is given.
@@ -421,7 +421,7 @@ curl -s localhost:9480/mcp -H 'content-type: application/json' -d '{
 # What one index's fields support, per field
 curl -s localhost:9480/mcp -H 'content-type: application/json' -d '{
   "jsonrpc":"2.0","id":1,"method":"tools/call",
-  "params":{"name":"get_index","arguments":{"index":"my_index"}}
+  "params":{"name":"describe_index","arguments":{"index":"my_index"}}
 }' | jq -r '.result.content[0].text'
 ```
 
@@ -433,7 +433,7 @@ merely constraining syntax:
   HTTP API attaches `_discarded_clauses` to the response, and an MCP tool call fails naming the
   clause. Results are never returned as though the query had been understood.
 - **Only indexed fields are queryable.** A field discovered from a document is added unindexed and
-  stays that way until a schema update promotes it. `get_index` reports the flag per field.
+  stays that way until a schema update promotes it. `describe_index` reports the flag per field.
 - **Sorting a text or string field is approximate.** The top `2 × limit` matches by relevance are
   collected and then ordered alphabetically, so the result is not the alphabetically first
   documents in the index. Numeric and date sorts are exact but require the field's `fast` flag,
@@ -619,11 +619,11 @@ The `McpBackend` trait defines the interface between the MCP protocol layer and 
 ```rust
 pub trait McpBackend: Clone + Send + Sync + 'static {
     fn search_index(...) -> BoxFuture<'_, Result<JsonValue, String>>;
-    fn search_indexes(...) -> BoxFuture<'_, Result<JsonValue, String>>;
-    fn get_index(...) -> BoxFuture<'_, Result<JsonValue, String>>;
+    fn search_across_indexes(...) -> BoxFuture<'_, Result<JsonValue, String>>;
+    fn describe_index(...) -> BoxFuture<'_, Result<JsonValue, String>>;
     fn list_indexes(...) -> BoxFuture<'_, Result<JsonValue, String>>;
     fn validate_query(...) -> BoxFuture<'_, Result<JsonValue, String>>;
-    fn get_index_stats(...) -> BoxFuture<'_, Result<JsonValue, String>>;
+    fn get_catalog_stats(...) -> BoxFuture<'_, Result<JsonValue, String>>;
     fn list_resources(...) -> BoxFuture<'_, Result<JsonValue, String>>;
     fn read_resource(...) -> BoxFuture<'_, Result<JsonValue, String>>;
 }
@@ -642,7 +642,7 @@ Here's a complete workflow using the MCP tools:
 
 2. **Inspect a specific index schema:**
    ```json
-   {"name": "get_index", "arguments": {"index": "papers"}}
+   {"name": "describe_index", "arguments": {"index": "papers"}}
    ```
 
 3. **Validate a query before executing:**
@@ -673,7 +673,7 @@ Here's a complete workflow using the MCP tools:
 5. **Search across multiple indexes:**
    ```json
    {
-     "name": "search_indexes",
+     "name": "search_across_indexes",
      "arguments": {
        "indexes": [
          {"index": "papers", "fields": ["title", "author"]},
@@ -703,7 +703,7 @@ cargo clippy -p cameodb_mcp -- -D warnings
 
 #### v0.2.3 — Federated Search Overhaul & Sort Improvements
 
-- **Concurrent Multi-Index Search**: `search_indexes` now executes all index searches concurrently using `FuturesUnordered`, reducing latency from sum-of-all-searches to max-of-all-searches
+- **Concurrent Multi-Index Search**: `search_across_indexes` now executes all index searches concurrently using `FuturesUnordered`, reducing latency from sum-of-all-searches to max-of-all-searches
 - **Fixed Merge Sort**: Relevance merge now reads `_score` (the actual field name) instead of `score`, which was a no-op causing arbitrary truncation order
 - **Removed `results_by_index`**: Response no longer includes per-index result duplicates — only the merged `hits` array is returned, cutting token usage by 2-4x for LLM consumers
 - **Sort-Aware Merge**: When a per-index sort spec is provided, the federated merge orders hits by `_sort_key` (internal metadata) instead of score, preserving sort order across indexes

@@ -36,17 +36,17 @@ impl McpBackend for AppState {
         search::search_index(self.clone(), index, query, limit)
     }
 
-    fn search_indexes(
+    fn search_across_indexes(
         &self,
         indexes: Vec<McpIndexSearchRequest>,
         query: String,
         limit: Option<usize>,
     ) -> BoxFuture<'_, Result<JsonValue, String>> {
-        search::search_indexes(self.clone(), indexes, query, limit)
+        search::search_across_indexes(self.clone(), indexes, query, limit)
     }
 
-    fn get_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, String>> {
-        discovery::get_index(self.clone(), index)
+    fn describe_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, String>> {
+        discovery::describe_index(self.clone(), index)
     }
 
     fn list_indexes(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>> {
@@ -62,12 +62,8 @@ impl McpBackend for AppState {
         discovery::validate_query(self.clone(), index, partial_field, query)
     }
 
-    fn get_index_stats(
-        &self,
-        index: Option<String>,
-        authz: McpAuthzRef,
-    ) -> BoxFuture<'_, Result<JsonValue, String>> {
-        discovery::get_index_stats(self.clone(), index, authz)
+    fn get_catalog_stats(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>> {
+        discovery::index_stats(self.clone(), None, authz)
     }
 
     fn list_resources(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>> {

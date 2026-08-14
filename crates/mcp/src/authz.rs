@@ -92,8 +92,12 @@ impl McpAuthz for McpUnrestricted {
 /// is the failure that does not. `every_advertised_tool_has_a_capability` keeps the two in step.
 pub fn tool_capability(name: &str) -> Option<McpCapability> {
     match name {
-        "search_index" | "search_indexes" | "get_index" | "list_indexes" | "validate_query"
-        | "get_index_stats" => Some(McpCapability::Read),
+        "search_index"
+        | "search_across_indexes"
+        | "describe_index"
+        | "list_indexes"
+        | "validate_query"
+        | "get_catalog_stats" => Some(McpCapability::Read),
         _ => None,
     }
 }

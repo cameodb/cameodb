@@ -316,7 +316,7 @@ pub const RULES: &[&str] = &[
 /// How ordering behaves, which the `sort` modifier and parameter share.
 pub const SORT_RULES: &[&str] = &[
     "Sorting on a numeric or date field requires the `fast` flag on that field, reported per field \
-     by `get_index`.",
+     by `describe_index`.",
     "Sorting on a text or string field is approximate: the top `2 × limit` matches by relevance \
      are collected and then ordered alphabetically, so the result is not the alphabetically first \
      documents in the index.",
@@ -483,7 +483,7 @@ pub fn reference_json() -> JsonValue {
 ///
 /// Summaries only: caveats, examples, per-type tables and the full rule text are omitted, since
 /// this text is resident in the caller's context for a whole session while `validate_query` and
-/// `get_index` supply the detail on demand. Only the traps that change a result silently — a
+/// `describe_index` supply the detail on demand. Only the traps that change a result silently — a
 /// dropped clause, an unindexed field, an approximate sort — are worth their space here.
 pub fn compact_reference() -> String {
     let mut out = String::with_capacity(1536);
@@ -507,7 +507,7 @@ pub fn compact_reference() -> String {
          it.\n  \
          `AND` `OR` `NOT` `TO` `IN` count only in uppercase; lowercase is searched for as a word, \
          and for `and`, `or` and `not` that happens silently.\n  \
-         An unindexed field cannot be queried; check the `indexed` flag from `get_index`. The \
+         An unindexed field cannot be queried; check the `indexed` flag from `describe_index`. The \
          exception is a `shadow` field, which is the identifier under another name: query it as \
          `field:VALUE` on its own, and expect it in results in place of `id`.\n  \
          Sorting a text or string field is approximate, and sets every `_score` to 1.0.\n  \
@@ -519,7 +519,7 @@ pub fn compact_reference() -> String {
     ));
     out.push_str(
         "\nCall `validate_query` with no arguments for the full reference including examples, \
-         per-type operators and sorting rules; `get_index` for one index's fields and types.\n",
+         per-type operators and sorting rules; `describe_index` for one index's fields and types.\n",
     );
     out
 }

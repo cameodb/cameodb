@@ -298,7 +298,7 @@ async fn a_federated_sort_orders_across_indexes_rather_than_within_them() {
 
     let (is_error, result) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": [
                     {"index": "alpha", "sort": {"field": "created", "order": "desc"}},
@@ -352,7 +352,7 @@ async fn a_federated_sort_honours_ascending_order() {
 
     let (is_error, result) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": [
                     {"index": "alpha", "sort": {"field": "created"}},
@@ -388,7 +388,7 @@ async fn the_internal_sort_key_does_not_reach_the_caller() {
 
     let (_, result) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": [
                     {"index": "alpha", "sort": {"field": "created", "order": "desc"}},
@@ -435,7 +435,7 @@ async fn an_inline_limit_bounds_the_federated_merge() {
 
     let (is_error, result) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": [{"index": "wide-alpha"}, {"index": "wide-beta"}],
                 "query": "title:record limit 16",
@@ -471,7 +471,7 @@ async fn the_federated_merge_falls_back_to_the_configured_default() {
 
     let (is_error, result) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": [{"index": "wide-alpha"}],
                 "query": "title:record",
@@ -513,7 +513,7 @@ async fn a_failing_index_does_not_sink_the_others() {
 
     let (is_error, result) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": [
                     {"index": "alpha"},
@@ -566,7 +566,7 @@ async fn a_search_where_every_index_fails_is_an_error() {
 
     let (is_error, result) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": [
                     {"index": "no-such-index"},
@@ -596,7 +596,7 @@ async fn a_wholly_successful_search_reports_no_errors() {
 
     let (is_error, result) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": [{"index": "alpha"}, {"index": "beta"}],
                 "query": "title:record",
@@ -636,7 +636,7 @@ async fn a_single_index_search_still_strips_the_sort_key() {
 /// The single-index tool refuses an index that does not exist, rather than answering with an
 /// empty result an agent reads as "the data is not there".
 ///
-/// `get_index` already refuses the same name, so this is two MCP tools agreeing about whether
+/// `describe_index` already refuses the same name, so this is two MCP tools agreeing about whether
 /// an index exists.
 #[tokio::test]
 async fn a_search_on_an_index_that_does_not_exist_is_refused() {
@@ -662,9 +662,12 @@ async fn a_search_on_an_index_that_does_not_exist_is_refused() {
 
     // The same name through the metadata tool, for the agreement this is about.
     let (is_error, _) = node
-        .call_tool("get_index", json!({"index": "no-such-index"}))
+        .call_tool("describe_index", json!({"index": "no-such-index"}))
         .await;
-    assert!(is_error, "get_index has always refused a missing index");
+    assert!(
+        is_error,
+        "describe_index has always refused a missing index"
+    );
 }
 
 /// A query that legitimately matches nothing in an index that does exist is still an empty
@@ -684,7 +687,7 @@ async fn a_query_matching_nothing_in_a_real_index_is_still_a_success() {
 
     let (is_error, federated) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": [{"index": "alpha"}, {"index": "beta"}],
                 "query": "title:nothingmatchesthis",
@@ -733,7 +736,7 @@ async fn the_http_search_api_still_answers_empty_for_a_missing_index() {
 async fn the_catalogue_aggregate_reports_a_size_it_measured() {
     let node = two_seeded_indexes().await;
 
-    let (is_error, result) = node.call_tool("get_index_stats", json!({})).await;
+    let (is_error, result) = node.call_tool("get_catalog_stats", json!({})).await;
     assert!(!is_error, "aggregate stats failed: {result}");
 
     assert_eq!(result["scope"].as_str(), Some("all_indexes"));
@@ -754,28 +757,38 @@ async fn the_catalogue_aggregate_reports_a_size_it_measured() {
     );
 }
 
-/// The single-index scope is unchanged by the aggregate paying for sizes.
+/// One index's statistics come from describing it, and the catalogue tool refuses to be asked.
+///
+/// Two tools answering "how big is this index" is how the two come to disagree, so the question
+/// has one home. `describe_index` already reported an index's statistics beside its schema; the
+/// catalogue tool now answers only about the catalogue, and says so rather than quietly widening
+/// its answer when handed a name.
 #[tokio::test]
-async fn single_index_stats_still_describe_one_index() {
+async fn one_index_reports_its_statistics_through_describe_index() {
     let node = two_seeded_indexes().await;
 
-    let (is_error, result) = node
-        .call_tool("get_index_stats", json!({"index": "alpha"}))
+    let (is_error, described) = node
+        .call_tool("describe_index", json!({"index": "alpha"}))
         .await;
-    assert!(!is_error, "single-index stats failed: {result}");
-
-    assert_eq!(result["scope"].as_str(), Some("single_index"));
-    assert_eq!(result["index"].as_str(), Some("alpha"));
-    assert_eq!(result["stats"]["document_count"].as_u64(), Some(3));
+    assert!(!is_error, "describing an index failed: {described}");
+    assert_eq!(described["index"].as_str(), Some("alpha"));
+    assert_eq!(described["stats"]["document_count"].as_u64(), Some(3));
     assert!(
-        result["field_count"].as_u64().is_some_and(|c| c > 0),
-        "field_count was summed from the same absent key: {result}"
-    );
-    assert!(
-        result["field_names"]
+        described["fields"]
             .as_array()
-            .is_some_and(|names| names.iter().any(|n| n == "title")),
-        "the fields it counted should be the ones the index has: {result}"
+            .is_some_and(|fields| fields.iter().any(|f| f["field"] == "title")),
+        "the fields it describes should be the ones the index has: {described}"
+    );
+
+    // The catalogue tool takes no index, and refuses one rather than answering a question it is
+    // no longer named for.
+    let (is_error, refusal) = node
+        .call_tool("get_catalog_stats", json!({"index": "alpha"}))
+        .await;
+    assert!(is_error, "the catalogue tool accepted an index: {refusal}");
+    assert!(
+        refusal.as_str().is_some_and(|text| text.contains("index")),
+        "the refusal should name what it would not take: {refusal}"
     );
 }
 
@@ -788,8 +801,10 @@ async fn single_index_stats_still_describe_one_index() {
 async fn the_discovery_tools_describe_the_fields_an_index_has() {
     let node = two_seeded_indexes().await;
 
-    let (is_error, described) = node.call_tool("get_index", json!({"index": "alpha"})).await;
-    assert!(!is_error, "get_index failed: {described}");
+    let (is_error, described) = node
+        .call_tool("describe_index", json!({"index": "alpha"}))
+        .await;
+    assert!(!is_error, "describe_index failed: {described}");
 
     let fields = described["fields"].as_array().expect("a fields array");
     let named: Vec<&str> = fields.iter().filter_map(|f| f["field"].as_str()).collect();
@@ -919,7 +934,9 @@ async fn a_shadow_field_is_described_as_the_queryable_alias_of_id() {
     );
 
     // Which field that was is only discoverable if the flag is reported.
-    let (_, described) = node.call_tool("get_index", json!({"index": "files"})).await;
+    let (_, described) = node
+        .call_tool("describe_index", json!({"index": "files"}))
+        .await;
     let fields = described["fields"].as_array().expect("a fields array");
     let field = |name: &str| {
         fields
@@ -1103,9 +1120,9 @@ async fn descriptions_written_into_the_schema_reach_every_discovery_surface() {
         .await;
 
     let (is_error, described) = node
-        .call_tool("get_index", json!({"index": "filings"}))
+        .call_tool("describe_index", json!({"index": "filings"}))
         .await;
-    assert!(!is_error, "get_index failed: {described}");
+    assert!(!is_error, "describe_index failed: {described}");
     assert_eq!(
         described["description"].as_str(),
         Some("Quarterly regulatory filings, one document per filing."),
@@ -1309,7 +1326,7 @@ async fn an_argument_no_tool_takes_is_refused_rather_than_ignored() {
     // argument whose absence looks like a document that has no such fields.
     let (is_error, refusal) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": [{"index": "alpha", "feilds": ["title"]}],
                 "query": "title:record",
@@ -1430,7 +1447,7 @@ async fn an_index_list_that_cannot_be_answered_is_refused() {
 
     let (is_error, refusal) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({"indexes": [], "query": "title:record"}),
         )
         .await;
@@ -1438,7 +1455,7 @@ async fn an_index_list_that_cannot_be_answered_is_refused() {
 
     let (is_error, refusal) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({"indexes": [{"index": "alpha"}, {"index": "alpha"}], "query": "title:record"}),
         )
         .await;
@@ -1451,7 +1468,7 @@ async fn an_index_list_that_cannot_be_answered_is_refused() {
     // What the repeated name would have reported, for contrast: naming it once is the truth.
     let (is_error, result) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({"indexes": [{"index": "alpha"}], "query": "title:record"}),
         )
         .await;
@@ -1485,7 +1502,7 @@ async fn the_widest_permitted_fan_out_answers_from_every_index() {
 
     let (is_error, result) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": named,
                 "query": "title:record",
@@ -1725,7 +1742,7 @@ async fn one_query_asked_repeatedly_gives_one_answer() {
         for _ in 0..12 {
             let (is_error, result) = node
                 .call_tool(
-                    "search_indexes",
+                    "search_across_indexes",
                     json!({
                         "indexes": [{"index": "alpha"}, {"index": "beta"}],
                         "query": query,
@@ -1749,7 +1766,7 @@ async fn one_query_asked_repeatedly_gives_one_answer() {
     for (first, second) in [("alpha", "beta"), ("beta", "alpha")] {
         let (_, result) = node
             .call_tool(
-                "search_indexes",
+                "search_across_indexes",
                 json!({
                     "indexes": [{"index": first}, {"index": second}],
                     "query": "title:record",
@@ -1796,7 +1813,7 @@ max_response_bytes = 900
         .collect();
     node.seed("docs", &borrowed).await;
 
-    for tool in ["search_index", "search_indexes"] {
+    for tool in ["search_index", "search_across_indexes"] {
         let arguments = if tool == "search_index" {
             json!({"index": "docs", "query": "title:record", "limit": 12})
         } else {
@@ -1872,7 +1889,7 @@ async fn a_search_result_satisfies_the_schema_its_tool_advertises() {
             json!({"index": "alpha", "query": "title:record", "limit": 2}),
         ),
         (
-            "search_indexes",
+            "search_across_indexes",
             json!({"indexes": [{"index": "alpha"}, {"index": "beta"}], "query": "title:record", "limit": 2}),
         ),
     ] {
@@ -1969,7 +1986,7 @@ async fn a_hit_carries_no_internal_shard_identity() {
         ),
         (
             "federated",
-            "search_indexes",
+            "search_across_indexes",
             json!({"indexes": [{"index": "alpha"}, {"index": "beta"}], "query": "title:record", "limit": 10}),
         ),
     ] {
@@ -2021,7 +2038,7 @@ async fn a_successful_search_reports_no_errors_key_at_all() {
             json!({"index": "alpha", "query": "title:record", "limit": 10}),
         ),
         (
-            "search_indexes",
+            "search_across_indexes",
             json!({"indexes": [{"index": "alpha"}, {"index": "beta"}], "query": "title:record", "limit": 10}),
         ),
     ] {
@@ -2059,7 +2076,7 @@ async fn a_federated_search_takes_a_bare_index_name() {
 
     let (is_error, bare) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({"indexes": ["alpha", "beta"], "query": "title:record", "limit": 10}),
         )
         .await;
@@ -2067,7 +2084,7 @@ async fn a_federated_search_takes_a_bare_index_name() {
 
     let (_, spelled_out) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": [{"index": "alpha"}, {"index": "beta"}],
                 "query": "title:record",
@@ -2083,7 +2100,7 @@ async fn a_federated_search_takes_a_bare_index_name() {
     // Mixed, with a per-index projection on the one that needs it.
     let (is_error, mixed) = node
         .call_tool(
-            "search_indexes",
+            "search_across_indexes",
             json!({
                 "indexes": ["alpha", {"index": "beta", "fields": ["title"]}],
                 "query": "title:record",
@@ -2109,7 +2126,7 @@ async fn a_federated_search_takes_a_bare_index_name() {
         .as_array()
         .expect("tools")
         .iter()
-        .find(|tool| tool["name"] == json!("search_indexes"))
+        .find(|tool| tool["name"] == json!("search_across_indexes"))
         .map(|tool| tool["inputSchema"]["properties"]["indexes"]["items"].clone())
         .expect("the federated tool describes its entries");
     let forms: Vec<&str> = entry["oneOf"]
@@ -2165,7 +2182,7 @@ async fn validating_a_query_reads_one_index_rather_than_the_catalogue() {
         "the typo was not matched against this index's fields: {result}"
     );
 
-    // An index that does not exist is still refused, in the words `get_index` uses.
+    // An index that does not exist is still refused, in the words `describe_index` uses.
     let (is_error, refusal) = node
         .call_tool(
             "validate_query",

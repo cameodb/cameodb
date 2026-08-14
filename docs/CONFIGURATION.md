@@ -404,7 +404,7 @@ max_search_limit = 10000      # largest `limit` an MCP search may ask for
 
 Authentication answers *who*, and `allowed_indexes` answers *what*. Neither says anything
 about **how often**, and the caller this matters for is not an attacker: it is a legitimate
-`reader` key held by an agent that decides to call `search_indexes` in a loop. Every one of
+`reader` key held by an agent that decides to call `search_across_indexes` in a loop. Every one of
 those calls is authorized, and a search fans out across every shard, so the loop costs the
 node far more than it costs the agent.
 

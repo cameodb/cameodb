@@ -263,10 +263,9 @@ fi
 
 for probe in \
     'search_index|{"index":"payroll","query":"x"}' \
-    'get_index|{"index":"payroll"}' \
-    'get_index_stats|{"index":"payroll"}' \
+    'describe_index|{"index":"payroll"}' \
     'validate_query|{"index":"payroll","query":"x"}' \
-    'search_indexes|{"indexes":[{"index":"docs"},{"index":"payroll"}],"query":"x"}'
+    'search_across_indexes|{"indexes":[{"index":"docs"},{"index":"payroll"}],"query":"x"}'
 do
     name="${probe%%|*}"; args="${probe#*|}"
     out="$(rpc "$SCOPED_KEY" "$(tool "$name" "$args")")"
@@ -279,11 +278,18 @@ done
 
 # A federated search naming one allowed and one forbidden index fails as a whole. Partial
 # results that look complete are worse than an error.
-out="$(rpc "$SCOPED_KEY" "$(tool search_indexes '{"indexes":[{"index":"docs"},{"index":"payroll"}],"query":"x"}')")"
+out="$(rpc "$SCOPED_KEY" "$(tool search_across_indexes '{"indexes":[{"index":"docs"},{"index":"payroll"}],"query":"x"}')")"
 if grep -q '"results"' <<< "$out"; then
     fail "a federated search is refused rather than silently narrowed" "$out"
 else
     pass "a federated search is refused rather than silently narrowed"
+fi
+
+out="$(rpc "$SCOPED_KEY" "$(tool get_catalog_stats '{}')")"
+if grep -q 'payroll' <<< "$out"; then
+    fail "the catalog aggregate is filtered to the scope" "$out"
+else
+    pass "the catalog aggregate is filtered to the scope"
 fi
 
 out="$(rpc "$SCOPED_KEY" "$(tool list_indexes '{}')")"

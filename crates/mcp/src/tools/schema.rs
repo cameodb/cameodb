@@ -54,7 +54,7 @@ pub(crate) struct SearchIndexArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SearchIndexesArgs {
+pub(crate) struct SearchAcrossIndexesArgs {
     pub(crate) indexes: Vec<McpIndexSearchRequest>,
     pub(crate) query: String,
     #[serde(default)]
@@ -63,7 +63,7 @@ pub(crate) struct SearchIndexesArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GetIndexArgs {
+pub(crate) struct DescribeIndexArgs {
     pub(crate) index: String,
 }
 
@@ -87,12 +87,13 @@ pub(crate) struct ValidateQueryArgs {
     pub(crate) query: Option<String>,
 }
 
+/// `get_catalog_stats` takes nothing, for the same reason `list_indexes` does.
+///
+/// It answers about the catalogue. One index's statistics are part of describing that index, and
+/// a tool that answered both would be two tools sharing a name — and eventually disagreeing.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GetIndexStatsArgs {
-    #[serde(default)]
-    pub(crate) index: Option<String>,
-}
+pub(crate) struct GetCatalogStatsArgs {}
 
 /// The sort object both search tools take.
 ///
@@ -150,7 +151,7 @@ pub(crate) fn search_index_input_schema(max_search_limit: usize) -> JsonValue {
     })
 }
 
-pub(crate) fn search_indexes_input_schema(max_search_limit: usize) -> JsonValue {
+pub(crate) fn search_across_indexes_input_schema(max_search_limit: usize) -> JsonValue {
     json!({
         "type": "object",
         "properties": {
@@ -270,7 +271,7 @@ pub(crate) fn search_index_output_schema() -> JsonValue {
     schema
 }
 
-pub(crate) fn search_indexes_output_schema() -> JsonValue {
+pub(crate) fn search_across_indexes_output_schema() -> JsonValue {
     let mut schema = json!({
         "type": "object",
         "properties": search_result_properties(),
@@ -308,7 +309,7 @@ pub(crate) fn search_indexes_output_schema() -> JsonValue {
     schema
 }
 
-pub(crate) fn get_index_input_schema() -> JsonValue {
+pub(crate) fn describe_index_input_schema() -> JsonValue {
     json!({
         "type": "object",
         "properties": {
@@ -351,15 +352,10 @@ pub(crate) fn validate_query_input_schema() -> JsonValue {
     })
 }
 
-pub(crate) fn get_index_stats_input_schema() -> JsonValue {
+pub(crate) fn get_catalog_stats_input_schema() -> JsonValue {
     json!({
         "type": "object",
-        "properties": {
-            "index": {
-                "type": "string",
-                "description": "Index name. If omitted, returns aggregated statistics for all indexes."
-            }
-        },
+        "properties": {},
         "additionalProperties": false
     })
 }
@@ -477,7 +473,7 @@ mod tests {
     /// two nested objects inside the federated search — a client reads those the same way and
     /// they can drift the same way.
     fn contracts() -> Vec<Contract> {
-        let federated = search_indexes_input_schema(DEFAULT_MAX_SEARCH_LIMIT);
+        let federated = search_across_indexes_input_schema(DEFAULT_MAX_SEARCH_LIMIT);
         // The object branch of the entry's `oneOf`. A bare name has no properties to compare;
         // the object form is the half that has to agree with the struct.
         let per_index = federated["properties"]["indexes"]["items"]["oneOf"][1].clone();
@@ -488,13 +484,13 @@ mod tests {
                 "search_index",
                 search_index_input_schema(DEFAULT_MAX_SEARCH_LIMIT),
             ),
-            contract::<SearchIndexesArgs>("search_indexes", federated),
-            contract::<McpIndexSearchRequest>("search_indexes.indexes[]", per_index),
-            contract::<SortSpec>("search_indexes.indexes[].sort", sort),
-            contract::<GetIndexArgs>("get_index", get_index_input_schema()),
+            contract::<SearchAcrossIndexesArgs>("search_across_indexes", federated),
+            contract::<McpIndexSearchRequest>("search_across_indexes.indexes[]", per_index),
+            contract::<SortSpec>("search_across_indexes.indexes[].sort", sort),
+            contract::<DescribeIndexArgs>("describe_index", describe_index_input_schema()),
             contract::<ListIndexesArgs>("list_indexes", list_indexes_input_schema()),
             contract::<ValidateQueryArgs>("validate_query", validate_query_input_schema()),
-            contract::<GetIndexStatsArgs>("get_index_stats", get_index_stats_input_schema()),
+            contract::<GetCatalogStatsArgs>("get_catalog_stats", get_catalog_stats_input_schema()),
         ]
     }
 
@@ -528,8 +524,8 @@ mod tests {
         for (label, schema) in [
             ("search_index", search_index_input_schema(hosts_own_ceiling)),
             (
-                "search_indexes",
-                search_indexes_input_schema(hosts_own_ceiling),
+                "search_across_indexes",
+                search_across_indexes_input_schema(hosts_own_ceiling),
             ),
         ] {
             assert_eq!(
@@ -546,7 +542,7 @@ mod tests {
         }
 
         let indexes =
-            &search_indexes_input_schema(DEFAULT_MAX_SEARCH_LIMIT)["properties"]["indexes"];
+            &search_across_indexes_input_schema(DEFAULT_MAX_SEARCH_LIMIT)["properties"]["indexes"];
         assert_eq!(
             indexes["minItems"],
             json!(1),

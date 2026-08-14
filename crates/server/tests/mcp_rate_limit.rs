@@ -253,7 +253,7 @@ tool_call_burst = 3
 
     // Three indexes named, three tokens spent — the whole burst on one call.
     node.call_tool(
-        "search_indexes",
+        "search_across_indexes",
         json!({
             "indexes": [{"index": "a"}, {"index": "b"}, {"index": "c"}],
             "query": "x",

@@ -2,7 +2,7 @@
 //!
 //! The threat this exists for is not a hostile stranger — B1's authentication already
 //! answers that — but a `reader` key held by an AI agent that decides to call
-//! `search_indexes` in a loop. The key is legitimate, every individual call is authorized,
+//! `search_across_indexes` in a loop. The key is legitimate, every individual call is authorized,
 //! and nothing in the capability model has anything to say about *how often*. A search fans
 //! out across every shard, so a loop costs the node far more than it costs the agent.
 //!

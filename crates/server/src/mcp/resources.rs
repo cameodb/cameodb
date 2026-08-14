@@ -4,7 +4,7 @@ use cameodb_mcp::McpAuthzRef;
 use futures::future::BoxFuture;
 use serde_json::Value as JsonValue;
 
-use crate::mcp::discovery::{get_index, get_index_stats, list_indexes};
+use crate::mcp::discovery::{describe_index, index_stats, list_indexes};
 use crate::state::AppState;
 
 fn resource_descriptor(uri: String, name: String, description: String) -> JsonValue {
@@ -90,14 +90,14 @@ pub(super) fn read_resource(
         }
 
         if let Some(index_name) = resource.strip_suffix("/schema") {
-            let details = get_index(state.clone(), index_name.to_string()).await?;
+            let details = describe_index(state.clone(), index_name.to_string()).await?;
             return Ok(details.get("schema").cloned().unwrap_or(JsonValue::Null));
         }
 
         if let Some(index_name) = resource.strip_suffix("/stats") {
-            return get_index_stats(state.clone(), Some(index_name.to_string()), authz).await;
+            return index_stats(state.clone(), Some(index_name.to_string()), authz).await;
         }
 
-        get_index(state.clone(), resource.to_string()).await
+        describe_index(state.clone(), resource.to_string()).await
     })
 }

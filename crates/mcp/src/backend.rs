@@ -113,14 +113,14 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
         limit: Option<usize>,
     ) -> BoxFuture<'_, Result<JsonValue, String>>;
 
-    fn search_indexes(
+    fn search_across_indexes(
         &self,
         indexes: Vec<McpIndexSearchRequest>,
         query: String,
         limit: Option<usize>,
     ) -> BoxFuture<'_, Result<JsonValue, String>>;
 
-    fn get_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, String>>;
+    fn describe_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, String>>;
 
     fn list_indexes(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>>;
 
@@ -131,11 +131,11 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
         query: Option<String>,
     ) -> BoxFuture<'_, Result<JsonValue, String>>;
 
-    fn get_index_stats(
-        &self,
-        index: Option<String>,
-        authz: McpAuthzRef,
-    ) -> BoxFuture<'_, Result<JsonValue, String>>;
+    /// Totals across the whole catalogue, scoped to what this caller may see.
+    ///
+    /// Takes no index. One index's statistics are part of describing it, and answering the same
+    /// question from two tools is how the two come to disagree.
+    fn get_catalog_stats(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>>;
 
     fn list_resources(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>>;
 
@@ -198,7 +198,7 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
 #[derive(Debug, Clone, Copy)]
 pub struct ToolCall<'a> {
     pub tool: &'a str,
-    /// The index the call named, when it named one. `search_indexes` names several and they
+    /// The index the call named, when it named one. `search_across_indexes` names several and they
     /// arrive comma-joined — the record is for a human reading a trail, not for a parser.
     pub index: Option<&'a str>,
     /// The query text as sent. Passed regardless of whether the host will keep it; deciding
@@ -270,7 +270,7 @@ pub(crate) mod testing {
             empty()
         }
 
-        fn search_indexes(
+        fn search_across_indexes(
             &self,
             _indexes: Vec<McpIndexSearchRequest>,
             _query: String,
@@ -279,7 +279,7 @@ pub(crate) mod testing {
             empty()
         }
 
-        fn get_index(&self, _index: String) -> BoxFuture<'_, Result<JsonValue, String>> {
+        fn describe_index(&self, _index: String) -> BoxFuture<'_, Result<JsonValue, String>> {
             empty()
         }
 
@@ -296,9 +296,8 @@ pub(crate) mod testing {
             empty()
         }
 
-        fn get_index_stats(
+        fn get_catalog_stats(
             &self,
-            _index: Option<String>,
             _authz: McpAuthzRef,
         ) -> BoxFuture<'_, Result<JsonValue, String>> {
             empty()

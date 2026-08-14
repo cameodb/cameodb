@@ -217,7 +217,7 @@ pub(super) fn search_index(
     })
 }
 
-pub(super) fn search_indexes(
+pub(super) fn search_across_indexes(
     state: AppState,
     indexes: Vec<McpIndexSearchRequest>,
     query: String,

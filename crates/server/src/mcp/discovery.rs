@@ -14,7 +14,7 @@ use crate::mcp::schema::{
 use crate::node_orchestrator::ClientOp;
 use crate::state::AppState;
 
-pub(super) fn get_index(
+pub(super) fn describe_index(
     state: AppState,
     index: String,
 ) -> BoxFuture<'static, Result<JsonValue, String>> {
@@ -53,7 +53,7 @@ pub(super) fn get_index(
 /// The MCP index catalogue, filtered to what the caller may see.
 ///
 /// The tool dispatcher refuses a *named* index outside the caller's scope; this is the
-/// enumeration half, and it is also what `get_index_stats` and `list_resources` are
+/// enumeration half, and it is also what `get_catalog_stats` and `list_resources` are
 /// built on, so filtering here covers all three.
 pub(super) fn list_indexes(
     state: AppState,
@@ -129,13 +129,13 @@ pub(super) fn validate_query(
 ) -> BoxFuture<'static, Result<JsonValue, String>> {
     Box::pin(async move {
         // The index's schema, named — not the catalogue. This wants field definitions and
-        // nothing else, and reaching them through `get_index` meant gathering statistics for
+        // nothing else, and reaching them through `describe_index` meant gathering statistics for
         // every index in the deployment and discarding all of them to validate one query.
         let index_details = if let Some(index_name) = index.clone() {
             let schema = index_schema(&state, &index_name).await;
             // A schema that could not be read is the one case where the catalogue's answer
             // mattered: an index that is not there must be refused, in the same words
-            // `get_index` refuses it, rather than described as having no fields.
+            // `describe_index` refuses it, rather than described as having no fields.
             if schema.is_null()
                 && let Some(reason) = absent_index_reason(&state, &index_name).await
             {
@@ -221,14 +221,19 @@ pub(super) fn validate_query(
     })
 }
 
-pub(super) fn get_index_stats(
+/// Statistics for one index, or totals across the catalogue.
+///
+/// Both cases live here because the `cameodb://indexes/{index}/stats` resource asks for one index
+/// while the tool asks for the catalogue. The tool takes no index argument: naming one would be
+/// asking `describe_index`'s question through a tool called `get_catalog_stats`.
+pub(super) fn index_stats(
     state: AppState,
     index: Option<String>,
     authz: McpAuthzRef,
 ) -> BoxFuture<'static, Result<JsonValue, String>> {
     Box::pin(async move {
         if let Some(index_name) = index {
-            let details = get_index(state.clone(), index_name.clone()).await?;
+            let details = describe_index(state.clone(), index_name.clone()).await?;
             let stats = details.get("stats").cloned().unwrap_or(JsonValue::Null);
             let field_names = extract_field_names(&details);
             let field_count = field_names.len();
