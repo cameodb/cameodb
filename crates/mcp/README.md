@@ -56,6 +56,8 @@ This means an agent can go from zero knowledge to well-formed queries in **two t
 
 All tools follow MCP naming conventions (verb-first `snake_case`) and include `title`, property descriptions, and annotations.
 
+Every tool takes the arguments listed below and no others. Each `inputSchema` says `additionalProperties: false`, and a call carrying an argument its tool does not take is refused by name rather than run without it — a misspelled `limit` would otherwise return the default ten hits and read as the whole answer. Tools whose arguments are all optional may be called with `arguments` omitted entirely.
+
 ### 1. `search_index`
 
 Execute full-text search on a single CameoDB index.

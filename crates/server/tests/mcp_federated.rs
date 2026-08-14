@@ -204,12 +204,30 @@ max_shards_per_node = 1
 
     /// One `tools/call`, returning `(isError, parsed result text)`.
     async fn call_tool(&self, tool: &str, arguments: Value) -> (bool, Value) {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": tool, "arguments": arguments},
-        });
+        self.call_tool_raw(json!({"name": tool, "arguments": arguments}))
+            .await
+    }
+
+    /// One `tools/call` with the params written out, for the shapes `call_tool` cannot express —
+    /// a call that omits `arguments` altogether rather than sending an empty object.
+    async fn call_tool_raw(&self, params: Value) -> (bool, Value) {
+        let value = self
+            .rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": params,
+            }))
+            .await;
+        let result = &value["result"];
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let parsed = serde_json::from_str(text).unwrap_or(Value::String(text.to_string()));
+        (is_error, parsed)
+    }
+
+    /// One JSON-RPC message, returning the whole response envelope.
+    async fn rpc(&self, body: Value) -> Value {
         let resp = http()
             .post(format!("{}/mcp", self.url))
             .header("content-type", "application/json")
@@ -218,12 +236,7 @@ max_shards_per_node = 1
             .send()
             .await
             .expect("mcp post");
-        let value: Value = resp.json().await.expect("mcp json");
-        let result = &value["result"];
-        let is_error = result["isError"].as_bool().unwrap_or(false);
-        let text = result["content"][0]["text"].as_str().unwrap_or("");
-        let parsed = serde_json::from_str(text).unwrap_or(Value::String(text.to_string()));
-        (is_error, parsed)
+        resp.json().await.expect("mcp json")
     }
 }
 
@@ -1257,4 +1270,100 @@ async fn bare_terms_are_ored_the_way_the_syntax_reference_says() {
         "these terms are ORed, so there is no narrowing to undo and nothing to warn about: \
          {nothing}"
     );
+}
+
+/// An argument no tool takes is an error rather than a silence.
+///
+/// This is what the strictness is for: `limt` is dropped by a lenient decoder, the search then
+/// runs under the node's default limit, and the agent reads a truncated answer as a complete
+/// one. Nothing in the response would say otherwise, which is why the misspelling has to be
+/// refused rather than reported alongside results.
+#[tokio::test]
+async fn an_argument_no_tool_takes_is_refused_rather_than_ignored() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, refusal) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "alpha", "query": "title:record", "limt": 1}),
+        )
+        .await;
+    assert!(is_error, "a misspelled limit was accepted: {refusal}");
+    let text = refusal.as_str().unwrap_or_default();
+    assert!(
+        text.contains("limt"),
+        "the refusal does not name it: {text}"
+    );
+    assert!(
+        refusal.get("hits").is_none(),
+        "the search ran anyway, so the limit was silently dropped: {refusal}"
+    );
+
+    // Nested arguments are read the same way: a per-index projection is exactly the kind of
+    // argument whose absence looks like a document that has no such fields.
+    let (is_error, refusal) = node
+        .call_tool(
+            "search_indexes",
+            json!({
+                "indexes": [{"index": "alpha", "feilds": ["title"]}],
+                "query": "title:record",
+            }),
+        )
+        .await;
+    assert!(is_error, "a misspelled projection was accepted: {refusal}");
+    assert!(
+        refusal.as_str().is_some_and(|text| text.contains("feilds")),
+        "the refusal does not name it: {refusal}"
+    );
+}
+
+/// A tool whose arguments are all optional is callable with none of them, however "none" is spelled.
+///
+/// `validate_query`'s description tells an agent to call it with no arguments for the syntax
+/// reference, and a client that has none to send omits the key rather than sending an empty
+/// object. Both have to arrive as a call.
+#[tokio::test]
+async fn a_tool_call_that_carries_no_arguments_is_still_a_call() {
+    let node = TestNode::start().await;
+
+    for params in [
+        json!({"name": "validate_query"}),
+        json!({"name": "validate_query", "arguments": {}}),
+        json!({"name": "validate_query", "arguments": null}),
+    ] {
+        let (is_error, result) = node.call_tool_raw(params.clone()).await;
+        assert!(!is_error, "{params} was refused: {result}");
+        assert!(
+            result["syntax_reference"].is_object() || result["syntax_reference"].is_array(),
+            "{params} did not return the syntax reference: {result}"
+        );
+    }
+}
+
+/// Every advertised schema tells a client that it is closed.
+///
+/// The dispatcher refuses an unknown argument either way; what this checks is that the client
+/// was told in advance, so a schema-driven caller never constructs the call at all.
+#[tokio::test]
+async fn every_advertised_tool_schema_says_it_is_closed() {
+    let node = TestNode::start().await;
+
+    let listing = node
+        .rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await;
+    let tools = listing["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .clone();
+    assert!(!tools.is_empty(), "no tools advertised: {listing}");
+
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("?");
+        assert_eq!(
+            tool["inputSchema"]["additionalProperties"],
+            json!(false),
+            "{name} does not advertise itself as closed: {}",
+            tool["inputSchema"]
+        );
+    }
 }

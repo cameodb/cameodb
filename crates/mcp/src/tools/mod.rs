@@ -2,16 +2,17 @@
 
 pub(crate) mod schema;
 
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
     authz::{McpAuthzRef, tool_capability},
     backend::{McpBackend, McpIndexSearchRequest},
     tools::schema::{
-        GetIndexArgs, GetIndexStatsArgs, SearchIndexArgs, SearchIndexesArgs, ValidateQueryArgs,
-        get_index_input_schema, get_index_stats_input_schema, list_indexes_input_schema,
-        search_index_input_schema, search_indexes_input_schema, validate_query_input_schema,
+        GetIndexArgs, GetIndexStatsArgs, ListIndexesArgs, SearchIndexArgs, SearchIndexesArgs,
+        ValidateQueryArgs, get_index_input_schema, get_index_stats_input_schema,
+        list_indexes_input_schema, search_index_input_schema, search_indexes_input_schema,
+        validate_query_input_schema,
     },
 };
 
@@ -20,6 +21,20 @@ pub(crate) struct ToolCallParams {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) arguments: JsonValue,
+}
+
+/// A tool's arguments, as the struct that tool accepts.
+///
+/// An absent `arguments` and an explicit `null` both mean the call carried none, which for a
+/// tool whose parameters are all optional is a call in its own right: `validate_query` with
+/// nothing supplied is how an agent asks for the query reference.
+fn decode_args<T: DeserializeOwned>(tool: &str, arguments: JsonValue) -> Result<T, String> {
+    let arguments = if arguments.is_null() {
+        json!({})
+    } else {
+        arguments
+    };
+    serde_json::from_value(arguments).map_err(|err| format!("Invalid {tool} arguments: {err}"))
 }
 
 pub(crate) async fn call_tool<S>(
@@ -45,8 +60,7 @@ where
 
     match params.name.as_str() {
         "search_index" => {
-            let args: SearchIndexArgs = serde_json::from_value(params.arguments)
-                .map_err(|err| format!("Invalid search_index arguments: {err}"))?;
+            let args: SearchIndexArgs = decode_args("search_index", params.arguments)?;
             check_index(authz, &args.index)?;
             backend
                 .search_index(
@@ -61,8 +75,7 @@ where
                 .await
         }
         "search_indexes" => {
-            let args: SearchIndexesArgs = serde_json::from_value(params.arguments)
-                .map_err(|err| format!("Invalid search_indexes arguments: {err}"))?;
+            let args: SearchIndexesArgs = decode_args("search_indexes", params.arguments)?;
             // Refuse the whole call rather than quietly dropping the indexes this key may
             // not read: partial results that look complete are worse than an error.
             for request in &args.indexes {
@@ -73,15 +86,16 @@ where
                 .await
         }
         "get_index" => {
-            let args: GetIndexArgs = serde_json::from_value(params.arguments)
-                .map_err(|err| format!("Invalid get_index arguments: {err}"))?;
+            let args: GetIndexArgs = decode_args("get_index", params.arguments)?;
             check_index(authz, &args.index)?;
             backend.get_index(args.index).await
         }
-        "list_indexes" => backend.list_indexes(authz.clone()).await,
+        "list_indexes" => {
+            let ListIndexesArgs {} = decode_args("list_indexes", params.arguments)?;
+            backend.list_indexes(authz.clone()).await
+        }
         "validate_query" => {
-            let args: ValidateQueryArgs = serde_json::from_value(params.arguments)
-                .map_err(|err| format!("Invalid validate_query arguments: {err}"))?;
+            let args: ValidateQueryArgs = decode_args("validate_query", params.arguments)?;
             // Validation reports an index's field names, so it is a read of that index.
             if let Some(index) = &args.index {
                 check_index(authz, index)?;
@@ -91,8 +105,7 @@ where
                 .await
         }
         "get_index_stats" => {
-            let args: GetIndexStatsArgs = serde_json::from_value(params.arguments)
-                .map_err(|err| format!("Invalid get_index_stats arguments: {err}"))?;
+            let args: GetIndexStatsArgs = decode_args("get_index_stats", params.arguments)?;
             // With no index named this aggregates across the catalogue, which the backend
             // filters to the caller's scope.
             if let Some(index) = &args.index {
@@ -252,6 +265,7 @@ mod tests {
         McpCapability,
         testing::{NoCapabilities, Scoped},
     };
+    use crate::backend::testing::StubBackend;
 
     fn advertised_tool_names() -> Vec<String> {
         mcp_tools()
@@ -293,6 +307,62 @@ mod tests {
         assert!(check_index(&authz, "docs").is_ok());
         let err = check_index(&authz, "payroll").unwrap_err();
         assert!(err.contains("payroll"), "{err}");
+    }
+
+    /// A tool whose parameters are all optional is callable with none of them.
+    ///
+    /// `validate_query`'s own description tells an agent to do exactly this for the syntax
+    /// reference, and a client that omits `arguments` sends no key at all rather than an empty
+    /// object — so both spellings of "nothing" have to arrive as a call.
+    #[tokio::test]
+    async fn a_tool_that_needs_no_arguments_is_callable_without_them() {
+        let authz: McpAuthzRef = Arc::new(Scoped("docs"));
+        for tool in ["list_indexes", "validate_query", "get_index_stats"] {
+            for arguments in [JsonValue::Null, json!({})] {
+                let params = ToolCallParams {
+                    name: tool.to_string(),
+                    arguments: arguments.clone(),
+                };
+                let outcome = call_tool(&StubBackend, params, &authz).await;
+                assert!(outcome.is_ok(), "{tool} with {arguments}: {outcome:?}");
+            }
+        }
+    }
+
+    /// An argument the tool does not know is an error, not a silence.
+    ///
+    /// Every argument these tools take changes what comes back, so ignoring one that was
+    /// misspelled answers a different question than the one asked — and answers it without
+    /// saying so.
+    #[tokio::test]
+    async fn an_argument_the_tool_does_not_take_is_refused_by_name() {
+        let authz: McpAuthzRef = Arc::new(Scoped("docs"));
+        for (tool, arguments) in [
+            (
+                "search_index",
+                json!({"index": "docs", "query": "a", "limt": 5}),
+            ),
+            (
+                "search_indexes",
+                json!({"indexes": [{"index": "docs", "feilds": ["title"]}], "query": "a"}),
+            ),
+            ("get_index", json!({"index": "docs", "verbose": true})),
+            ("list_indexes", json!({"index": "docs"})),
+            ("validate_query", json!({"quer": "a"})),
+            ("get_index_stats", json!({"indexes": ["docs"]})),
+        ] {
+            let params = ToolCallParams {
+                name: tool.to_string(),
+                arguments,
+            };
+            let err = call_tool(&StubBackend, params, &authz)
+                .await
+                .expect_err("{tool} accepted an argument it does not take");
+            assert!(
+                err.contains("unknown field"),
+                "{tool} did not name the field it refused: {err}"
+            );
+        }
     }
 
     #[test]

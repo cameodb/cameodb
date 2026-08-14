@@ -8,6 +8,7 @@ use crate::authz::McpAuthzRef;
 
 /// Sort specification for search results
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SortSpec {
     /// Field name to sort by
     pub field: String,
@@ -25,7 +26,14 @@ pub enum SortOrder {
     Desc,
 }
 
+/// One index named in a federated search, with what to return from it and how to order it.
+///
+/// Arrives from a client, so it refuses fields it does not know: the schema advertising this
+/// says `additionalProperties: false`, and a struct that quietly ignored the rest would make
+/// that advertisement false. A misspelled `feilds` is then a named error rather than a
+/// projection silently not applied.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpIndexSearchRequest {
     pub index: String,
     #[serde(default)]
