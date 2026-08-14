@@ -1052,6 +1052,35 @@ impl CameoDbConfig {
 
     /// Validate the configuration for consistency and constraints
     pub fn validate(&self) -> Result<()> {
+        // A ceiling of zero would mean no search may return anything. Refused rather than read
+        // as "no ceiling", because a bound whose zero inverts its meaning is a trap: an
+        // operator who wants a high ceiling should write a high number.
+        if self.security.limits.max_search_limit == 0 {
+            return Err(ConfigError::SecurityConfig {
+                message: "security.limits.max_search_limit is 0, which would refuse every \
+                          search; set the largest limit a search may ask for"
+                    .to_string(),
+            }
+            .into());
+        }
+
+        // A default above the ceiling contradicts itself, and the contradiction is invisible
+        // from the caller's side: a search naming no limit is filled in with the default, and
+        // would then run past the bound the MCP tools advertise. Refused rather than clamped,
+        // so that the number an operator wrote is the number that runs — or startup says why
+        // not.
+        if self.search.default_search_limit > self.security.limits.max_search_limit {
+            return Err(ConfigError::SecurityConfig {
+                message: format!(
+                    "search.default_search_limit ({}) is above \
+                     security.limits.max_search_limit ({}); a search that names no limit \
+                     would exceed the ceiling the MCP tools advertise",
+                    self.search.default_search_limit, self.security.limits.max_search_limit
+                ),
+            }
+            .into());
+        }
+
         // Validate HTTP configuration
         if self.network.http.port == 0 {
             return Err(ConfigError::NetworkConfig {
@@ -2016,6 +2045,70 @@ mod tests {
         }
 
         println!("✅ Batch size configuration works!");
+    }
+
+    /// The search ceiling and the default that fills in for an absent limit must not
+    /// contradict each other.
+    ///
+    /// A search naming no limit is filled in with the default *after* the ceiling has been
+    /// checked, so a default above the ceiling runs past a bound the MCP tools advertise —
+    /// and nothing in the response says so. Refused at startup rather than clamped, because
+    /// clamping would mean the number an operator wrote is not the number that runs.
+    #[test]
+    fn a_default_search_limit_above_the_ceiling_is_refused() {
+        let mut config = CameoDbConfig::default();
+        config.security.limits.max_search_limit = 500;
+
+        config.search.default_search_limit = 500;
+        assert!(
+            config.validate().is_ok(),
+            "a default equal to the ceiling is within it"
+        );
+
+        config.search.default_search_limit = 501;
+        let err = config
+            .validate()
+            .expect_err("a default above the ceiling was accepted")
+            .to_string();
+        assert!(
+            err.contains("501") && err.contains("500"),
+            "the refusal does not name both numbers: {err}"
+        );
+    }
+
+    /// Zero is a misconfiguration rather than "no ceiling".
+    ///
+    /// Read as unlimited it would invert the meaning of the number, and read literally it
+    /// refuses every search. An operator who wants a high ceiling writes a high number.
+    #[test]
+    fn a_ceiling_of_zero_is_refused() {
+        let config = CameoDbConfig {
+            security: crate::auth::SecurityConfig {
+                limits: crate::ratelimit::McpLimitsConfig {
+                    max_search_limit: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_err(), "a ceiling of zero was accepted");
+    }
+
+    /// An absent `[security.limits]` is a bounded deployment, not an unbounded one.
+    #[test]
+    fn the_ceiling_defaults_to_a_number_rather_than_to_nothing() {
+        let config: CameoDbConfig = toml::from_str("").expect("empty config must parse");
+        assert_eq!(
+            config.security.limits.max_search_limit,
+            cameodb_mcp::DEFAULT_MAX_SEARCH_LIMIT
+        );
+        assert!(config.validate().is_ok());
+        // And a config built in code agrees with a config parsed from nothing.
+        assert_eq!(
+            CameoDbConfig::default().security.limits.max_search_limit,
+            config.security.limits.max_search_limit
+        );
     }
 
     #[test]

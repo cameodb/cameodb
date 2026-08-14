@@ -33,4 +33,8 @@ pub use backend::{
 };
 pub use protocol::MCP_SESSION_ID_HEADER;
 pub use session::McpShutdownHandle;
+// The bounds the tool schemas advertise. Public because the host enforces the same numbers on
+// the value a search runs with, which is not always the argument a client sent — importing
+// them is what keeps the advertised bound and the enforced one from becoming two numbers.
+pub use tools::schema::{DEFAULT_MAX_SEARCH_LIMIT, MAX_FEDERATED_INDEXES};
 pub use transport::mcp_router;

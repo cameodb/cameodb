@@ -58,6 +58,8 @@ All tools follow MCP naming conventions (verb-first `snake_case`) and include `t
 
 Every tool takes the arguments listed below and no others. Each `inputSchema` says `additionalProperties: false`, and a call carrying an argument its tool does not take is refused by name rather than run without it — a misspelled `limit` would otherwise return the default ten hits and read as the whole answer. Tools whose arguments are all optional may be called with `arguments` omitted entirely.
 
+Bounds are advertised where they are enforced: the search tools carry a `maximum` on `limit` and `minItems`/`maxItems` on `indexes`, taken from the node's own configuration. Read them from `tools/list` rather than from this page — an operator may have set the ceiling lower than the default.
+
 ### 1. `search_index`
 
 Execute full-text search on a single CameoDB index.
@@ -77,7 +79,7 @@ Execute full-text search on a single CameoDB index.
   **Default search fields**: a query with no `field:` prefix searches only `text`, `string` and `json` fields. Numeric, date, boolean, ip and facet fields must be named explicitly.
 
   **Dropped clauses**: a clause the engine cannot interpret is dropped and the rest of the query runs, which widens a conjunction and disables a negation. This tool fails rather than returning those results, naming the clause it could not use.
-- `limit` (integer, optional): Maximum number of results to return. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10.
+- `limit` (integer, optional): Maximum number of results to return, up to the node's configured ceiling (`[security.limits] max_search_limit`, 10000 by default). The tool's own `inputSchema` carries that number as its `maximum`, so read it there rather than assuming the default. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10. A larger value is refused, whether it arrives as this argument or as an inline `limit` modifier in the query.
 - `fields` (array of strings, optional): Field names to include in results (field projection)
 
 **Returns:** JSON array of matching documents with relevance scores.
@@ -107,14 +109,14 @@ Execute federated search across multiple CameoDB indexes with optional per-index
 - Errors naming a missing field are appended with that index's field list
 
 **Parameters:**
-- `indexes` (array, required): List of indexes to search, each with:
+- `indexes` (array, required): The indexes to search, at least one and at most 20. Naming the same index twice is refused rather than searched twice — each mention would be counted separately, reporting more documents than the index holds. Each entry takes:
   - `index` (string, required): Name of the CameoDB index
   - `fields` (array of strings, optional): Fields to include from this index
   - `sort` (object, optional): Sort results by a field within this index
     - `field` (string, required): Field name to sort by (u64, i64, f64, date, or text/string for alphabetic sort)
     - `order` (string, optional): `asc` or `desc` (defaults to `asc`)
 - `query` (string, required): Search query applied to all specified indexes
-- `limit` (integer, optional): Maximum total results across all indexes. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10.
+- `limit` (integer, optional): Maximum total results across all indexes, up to the node's configured ceiling — see `search_index` above. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10.
 
 **Returns:** Combined results merged by relevance score (or by the sort field if specified). Each hit includes an `_index_source` field indicating its origin index. The response contains only the merged `hits` array — per-index results are not duplicated, keeping token usage proportional to the limit.
 

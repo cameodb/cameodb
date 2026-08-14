@@ -223,3 +223,41 @@ tool_call_burst = 2
         "a different tool should draw on the same budget, got isError={is_error} {text}"
     );
 }
+
+/// A federated search is charged for every index it names, not once for the call.
+///
+/// One authorized call otherwise buys as many concurrent index searches as the caller cares to
+/// name, which makes a per-key budget a count of requests rather than of work — and work is
+/// what the limiter exists to bound. The indexes need not exist: the charge is taken from the
+/// raw arguments before the tool runs, which is the same ordering that keeps a refused call
+/// costing a hash lookup rather than a search.
+#[tokio::test]
+async fn a_federated_search_is_charged_for_its_fan_out() {
+    let node = TestNode::start(
+        r#"
+[security]
+enabled = false
+
+[security.limits]
+tool_calls_per_minute = 60
+tool_call_burst = 3
+"#,
+    )
+    .await;
+
+    // Three indexes named, three tokens spent — the whole burst on one call.
+    node.call_tool(
+        "search_indexes",
+        json!({
+            "indexes": [{"index": "a"}, {"index": "b"}, {"index": "c"}],
+            "query": "x",
+        }),
+    )
+    .await;
+
+    let (is_error, text) = node.call_tool("list_indexes", json!({})).await;
+    assert!(
+        is_error && text.contains("Rate limit exceeded"),
+        "a three-index fan-out should have spent a burst of three, got isError={is_error} {text}"
+    );
+}

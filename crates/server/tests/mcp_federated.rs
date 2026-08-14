@@ -1367,3 +1367,220 @@ async fn every_advertised_tool_schema_says_it_is_closed() {
         );
     }
 }
+
+/// A limit above the advertised maximum is refused, however it reaches the search.
+///
+/// The argument is refused by the dispatcher; an inline `limit` modifier in the query string
+/// arrives after that check, so the node checks the value the search will actually run with.
+/// Both matter: unbounded means the caller decides how many hits the node builds, merges and
+/// serializes for one request.
+#[tokio::test]
+async fn a_limit_above_the_maximum_is_refused_by_either_door() {
+    let node = two_seeded_indexes().await;
+    let over = cameodb_mcp::DEFAULT_MAX_SEARCH_LIMIT + 1;
+
+    for (door, arguments) in [
+        (
+            "argument",
+            json!({"index": "alpha", "query": "title:record", "limit": over}),
+        ),
+        (
+            "inline modifier",
+            json!({"index": "alpha", "query": format!("title:record limit {over}")}),
+        ),
+    ] {
+        let (is_error, refusal) = node.call_tool("search_index", arguments).await;
+        assert!(is_error, "the {door} was accepted: {refusal}");
+        assert!(
+            refusal.as_str().is_some_and(
+                |text| text.contains(&cameodb_mcp::DEFAULT_MAX_SEARCH_LIMIT.to_string())
+            ),
+            "the {door} refusal does not say what the maximum is: {refusal}"
+        );
+    }
+
+    // The maximum itself is allowed, so the bound is not off by one.
+    let (is_error, result) = node
+        .call_tool(
+            "search_index",
+            json!({
+                "index": "alpha",
+                "query": "title:record",
+                "limit": cameodb_mcp::DEFAULT_MAX_SEARCH_LIMIT,
+            }),
+        )
+        .await;
+    assert!(!is_error, "the maximum itself was refused: {result}");
+}
+
+/// An index list that cannot be answered coherently is refused rather than answered.
+///
+/// Both cases previously returned something an agent would read as a fact about the data: no
+/// hits and no errors for an empty list, and — for an index named twice — a `total_hits`
+/// larger than the index holds, because each mention is searched and counted separately.
+#[tokio::test]
+async fn an_index_list_that_cannot_be_answered_is_refused() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, refusal) = node
+        .call_tool(
+            "search_indexes",
+            json!({"indexes": [], "query": "title:record"}),
+        )
+        .await;
+    assert!(is_error, "an empty index list was answered: {refusal}");
+
+    let (is_error, refusal) = node
+        .call_tool(
+            "search_indexes",
+            json!({"indexes": [{"index": "alpha"}, {"index": "alpha"}], "query": "title:record"}),
+        )
+        .await;
+    assert!(is_error, "a repeated index was searched twice: {refusal}");
+    assert!(
+        refusal.as_str().is_some_and(|text| text.contains("alpha")),
+        "the refusal does not name the repeated index: {refusal}"
+    );
+
+    // What the repeated name would have reported, for contrast: naming it once is the truth.
+    let (is_error, result) = node
+        .call_tool(
+            "search_indexes",
+            json!({"indexes": [{"index": "alpha"}], "query": "title:record"}),
+        )
+        .await;
+    assert!(!is_error, "{result}");
+    assert_eq!(
+        result["total_hits"], 3,
+        "the index holds three documents: {result}"
+    );
+}
+
+/// The widest permitted fan-out is answered in full, though it exceeds what runs at once.
+///
+/// Indexes are searched a bounded number at a time — one name is a scatter-gather across that
+/// index's shards, so an uncapped fan-out lets a single request occupy every shard worker and
+/// starve the searches already running. What the bound must not do is lose an index: the ones
+/// that wait for a slot have to arrive like the ones that did not, which is the property a
+/// queue can quietly break.
+///
+/// The two seeded indexes are named last, so they are the ones that wait, and every other name
+/// is one no index answers — which accounts for all twenty either as hits or as errors.
+#[tokio::test]
+async fn the_widest_permitted_fan_out_answers_from_every_index() {
+    let node = two_seeded_indexes().await;
+
+    let absent = cameodb_mcp::MAX_FEDERATED_INDEXES - 2;
+    let mut named: Vec<Value> = (0..absent)
+        .map(|n| json!({"index": format!("gone{n:02}")}))
+        .collect();
+    named.push(json!({"index": "alpha"}));
+    named.push(json!({"index": "beta"}));
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_indexes",
+            json!({
+                "indexes": named,
+                "query": "title:record",
+                "limit": cameodb_mcp::MAX_FEDERATED_INDEXES,
+            }),
+        )
+        .await;
+    assert!(!is_error, "the widest permitted search failed: {result}");
+
+    // Every name is accounted for, so nothing was dropped while waiting for a slot.
+    assert_eq!(
+        result["errors"].as_array().map(Vec::len),
+        Some(absent),
+        "an absent index went unreported: {result}"
+    );
+    assert_eq!(
+        result["total_hits"].as_u64(),
+        Some(6),
+        "the two real indexes hold three documents each: {result}"
+    );
+    let sources: std::collections::BTreeSet<&str> = result["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .filter_map(|hit| hit["_index_source"].as_str())
+        .collect();
+    assert_eq!(
+        sources,
+        ["alpha", "beta"].into_iter().collect(),
+        "an index that waited for a slot did not reach the merge: {sources:?}"
+    );
+}
+
+/// A configured ceiling is the number the tools advertise and the number they enforce.
+///
+/// The bound is a deployment question — how many hits this node can afford to build, merge and
+/// serialize for one request — so an operator sets it, and both halves have to follow. A client
+/// reading a `maximum` of one number and being refused at another has been misled by the
+/// catalogue it was given.
+#[tokio::test]
+async fn a_configured_search_ceiling_is_advertised_and_enforced() {
+    let node = TestNode::start_with(
+        r#"
+[search]
+default_search_limit = 5
+
+[security.limits]
+max_search_limit = 25
+"#,
+    )
+    .await;
+    node.create_index("docs").await;
+    node.seed("docs", &[("d1", "2024-01-01T00:00:00Z")]).await;
+
+    let listing = node
+        .rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await;
+    for tool in listing["result"]["tools"].as_array().expect("tools") {
+        let name = tool["name"].as_str().unwrap_or("?");
+        if !name.starts_with("search") {
+            continue;
+        }
+        assert_eq!(
+            tool["inputSchema"]["properties"]["limit"]["maximum"],
+            json!(25),
+            "{name} advertises a ceiling the operator did not configure"
+        );
+    }
+
+    // Enforced at the configured number, not at the compiled-in default.
+    let (is_error, refusal) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "docs", "query": "*", "limit": 26}),
+        )
+        .await;
+    assert!(
+        is_error,
+        "the configured ceiling was not enforced: {refusal}"
+    );
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "docs", "query": "*", "limit": 25}),
+        )
+        .await;
+    assert!(
+        !is_error,
+        "the configured ceiling itself was refused: {result}"
+    );
+
+    // The inline door too, since it bypasses the argument check.
+    let (is_error, refusal) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "docs", "query": "* limit 26"}),
+        )
+        .await;
+    assert!(
+        is_error,
+        "an inline limit above the configured ceiling was accepted: {refusal}"
+    );
+}

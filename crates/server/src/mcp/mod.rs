@@ -82,8 +82,12 @@ impl McpBackend for AppState {
         resources::read_resource(self.clone(), uri, authz)
     }
 
-    fn check_tool_rate(&self, authz: McpAuthzRef, tool: &str) -> RateLimitVerdict {
-        governance::check_tool_rate(self, authz, tool)
+    fn max_search_limit(&self) -> usize {
+        self.max_search_limit
+    }
+
+    fn check_tool_rate(&self, authz: McpAuthzRef, tool: &str, cost: u32) -> RateLimitVerdict {
+        governance::check_tool_rate(self, authz, tool, cost)
     }
 
     fn record_tool_call(&self, authz: McpAuthzRef, call: ToolCall<'_>) {

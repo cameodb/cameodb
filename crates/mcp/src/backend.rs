@@ -89,16 +89,35 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
         authz: McpAuthzRef,
     ) -> BoxFuture<'_, Result<JsonValue, String>>;
 
-    /// May this caller invoke another tool right now?
+    /// The largest `limit` a search tool may be asked for.
+    ///
+    /// A deployment question rather than a protocol one — it is the node that has to build,
+    /// merge and serialize that many hits — so the host owns the number and this crate only
+    /// carries it. Read once per `tools/list` to render the `maximum` each search schema
+    /// advertises, and again per call to enforce it, so a client is never refused for
+    /// exceeding a bound it was not shown.
+    ///
+    /// The default is [`DEFAULT_MAX_SEARCH_LIMIT`](crate::DEFAULT_MAX_SEARCH_LIMIT), which
+    /// leaves a host that configures nothing bounded rather than unbounded.
+    fn max_search_limit(&self) -> usize {
+        crate::tools::schema::DEFAULT_MAX_SEARCH_LIMIT
+    }
+
+    /// May this caller invoke another tool right now, at this cost?
     ///
     /// Asked once per `tools/call`, before the tool runs and before its arguments are
     /// interpreted, so a refused call costs a hash lookup rather than a search.
+    ///
+    /// `cost` is how many units of work the call is asking for: the number of indexes a
+    /// federated search names, and one for everything else. A budget charged per call rather
+    /// than per unit counts requests instead of work, which prices a twenty-index fan-out the
+    /// same as a single lookup.
     ///
     /// The policy lives in the host for the same reason authorization does: this crate
     /// speaks MCP and must not acquire opinions about how a deployment is configured. It
     /// asks the question; the host answers it. The default allows everything, so a host that
     /// configures no limits — and every existing implementation of this trait — is unchanged.
-    fn check_tool_rate(&self, _authz: McpAuthzRef, _tool: &str) -> RateLimitVerdict {
+    fn check_tool_rate(&self, _authz: McpAuthzRef, _tool: &str, _cost: u32) -> RateLimitVerdict {
         RateLimitVerdict::Allow
     }
 
@@ -158,14 +177,34 @@ pub(crate) mod testing {
     ///
     /// The dispatcher tests are about the JSON-RPC envelope — which messages get a reply, what
     /// an error carries — so what a tool *returns* is deliberately uninteresting here.
-    #[derive(Clone)]
-    pub(crate) struct StubBackend;
+    ///
+    /// The search ceiling is settable because it is the one thing a host supplies that this
+    /// crate both advertises and enforces: a stub fixed at the default could not tell a bound
+    /// that follows the host from a constant compiled in here.
+    #[derive(Clone, Default)]
+    pub(crate) struct StubBackend {
+        max_search_limit: Option<usize>,
+    }
+
+    impl StubBackend {
+        /// A host whose ceiling is not the default one.
+        pub(crate) fn capped(max_search_limit: usize) -> Self {
+            Self {
+                max_search_limit: Some(max_search_limit),
+            }
+        }
+    }
 
     fn empty() -> BoxFuture<'static, Result<JsonValue, String>> {
         Box::pin(async { Ok(json!({})) })
     }
 
     impl McpBackend for StubBackend {
+        fn max_search_limit(&self) -> usize {
+            self.max_search_limit
+                .unwrap_or(crate::tools::schema::DEFAULT_MAX_SEARCH_LIMIT)
+        }
+
         fn search_index(
             &self,
             _index: McpIndexSearchRequest,

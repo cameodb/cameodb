@@ -519,6 +519,7 @@ async fn main() -> Result<()> {
         tool_limiter: std::sync::Arc::new(ratelimit::ToolRateLimiter::new(
             cameodb_config.security.limits.clone(),
         )),
+        max_search_limit: cameodb_config.security.limits.max_search_limit,
         audit: Arc::clone(&audit_sink),
     };
 

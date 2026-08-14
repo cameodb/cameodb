@@ -5,17 +5,22 @@ use tracing::warn;
 
 use crate::state::AppState;
 
-/// Charge one token against the calling key's budget.
+/// Charge `cost` tokens against the calling key's budget.
 ///
 /// Attributed by `key_id`, not by session: a session id is chosen by the caller's host
 /// and a new one is a header away, so metering per session would let an agent reset its
 /// own limit by reconnecting. The key is the thing an operator issued and can revoke.
+///
+/// The cost is the fan-out the protocol layer read off the call, so a search naming ten
+/// indexes is charged as ten searches. Which is what it is: ten scatter-gathers across ten
+/// indexes' shards, dispatched by one authorized request.
 pub(super) fn check_tool_rate(
     state: &AppState,
     authz: McpAuthzRef,
     tool: &str,
+    cost: u32,
 ) -> RateLimitVerdict {
-    match state.tool_limiter.check(authz.key_id().as_deref()) {
+    match state.tool_limiter.check(authz.key_id().as_deref(), cost) {
         crate::ratelimit::Verdict::Allow => RateLimitVerdict::Allow,
         crate::ratelimit::Verdict::Deny { retry_after_secs } => {
             // Worth a line each: this needs a valid key, so its volume is bounded by

@@ -398,6 +398,7 @@ you only discover on the day you turn authentication on. These all refuse to sta
 [security.limits]
 tool_calls_per_minute = 120   # 0 (the default) disables limiting entirely
 tool_call_burst = 30          # spendable at once; 0 means one minute's worth
+max_search_limit = 10000      # largest `limit` an MCP search may ask for
 ```
 
 Authentication answers *who*, and `allowed_indexes` answers *what*. Neither says anything
@@ -418,12 +419,38 @@ Points worth knowing:
   limited never reveals which tools a key would otherwise be allowed to call.
 - **The budget is shared across tools.** It bounds what a key costs the node, not how often
   it may call any one thing.
+- **Charged by fan-out, not per call.** A federated search over five indexes spends five
+  tokens, because it is five scatter-gathers dispatched by one request. Charging per call
+  would make the budget a count of requests, and one request can name twenty indexes. A cost
+  above the whole bucket empties it rather than being refused forever.
 - **A refusal names a wait**: `Rate limit exceeded for tool 'x'. Retry after Ns.`, returned
   as an MCP tool error (`isError: true`) rather than a transport failure, because the
   request was well-formed and the tool simply did not run. Agents that are given a number
   back off correctly; ones told only "too many requests" usually retry immediately.
 
 Off by default: an upgrade must not start refusing calls a deployment used to serve.
+
+#### `max_search_limit` — how much one search may ask for
+
+The rate above is off by default; this one is not. There is no reading of "no ceiling" that is
+a number, and without one the caller decides how many hits the node builds, merges and
+serializes for a single request. It defaults to **10000**, which is where one request stops
+being one request for this architecture: a search fans out across every shard of an index, and
+each hit is a redb lookup, a merge entry and a serialized document.
+
+- **Applies to the MCP tools, not to `POST /api/{index}/search`.** The HTTP API is an
+  operator's own client asking a considered question; the ceiling exists for an agent choosing
+  its own limit, which is why it sits with the other MCP limits rather than under `[search]`.
+- **Advertised as well as enforced.** Both search tools render it as their `inputSchema`
+  `maximum`, so a schema-driven client never constructs a call that will be refused — and a
+  caller is never refused for exceeding a bound it was not shown.
+- **Both doors are checked.** A `limit` argument above the ceiling is refused, and so is an
+  inline `limit N` written into the query string, which reaches the search by a different route.
+- **`search.default_search_limit` may not exceed it.** A search naming no limit is filled in
+  with that default, so the pair would contradict each other; the node refuses to start rather
+  than clamping, so the number an operator wrote is the number that runs.
+- **`0` is refused**, not read as unlimited. A bound whose zero inverts its meaning is a trap;
+  an operator who wants a high ceiling writes a high number.
 
 ### The audit trail (`[security.audit]`)
 

@@ -27,6 +27,11 @@ pub struct AppState {
     /// Per-key budget for MCP tool calls. Shared across every request, because a rate limit
     /// that reset per connection would not be one.
     pub tool_limiter: Arc<ToolRateLimiter>,
+    /// Largest `limit` an MCP search may ask for, from `[security.limits]`.
+    ///
+    /// Both advertised and enforced: the tool schemas render it as their `maximum`, so a
+    /// client is shown the same number a call is measured against.
+    pub max_search_limit: usize,
     /// Where the audit trail goes. Inert unless `[security.audit]` turned it on.
     pub audit: Arc<crate::audit::AuditSink>,
 }

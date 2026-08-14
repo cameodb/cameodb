@@ -15,6 +15,25 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::backend::McpIndexSearchRequest;
 
+/// The largest `limit` a search tool accepts when the host names no other number.
+///
+/// A limit is a promise to hold that many hits in memory, merge them and serialize them, so an
+/// unbounded one is a caller choosing how much work the node does for a single request. What
+/// the ceiling should be is a deployment question — how much the node can afford — so the host
+/// answers it through [`McpBackend::max_search_limit`](crate::McpBackend::max_search_limit) and
+/// this is only the answer for a host that does not.
+///
+/// Whatever the number is, both search schemas advertise it as `maximum` and the dispatcher
+/// enforces it, so a client is never refused for exceeding a bound it was not shown.
+pub const DEFAULT_MAX_SEARCH_LIMIT: usize = 10_000;
+
+/// The most indexes one federated search may name.
+///
+/// Each name is a full scatter-gather across that index's shards, so the argument is a
+/// multiplier on everything the call costs. A caller that wants the whole catalogue is asking
+/// a different question — `list_indexes` answers it in one request.
+pub const MAX_FEDERATED_INDEXES: usize = 20;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SearchIndexArgs {
@@ -68,7 +87,7 @@ pub(crate) struct GetIndexStatsArgs {
     pub(crate) index: Option<String>,
 }
 
-pub(crate) fn search_index_input_schema() -> JsonValue {
+pub(crate) fn search_index_input_schema(max_search_limit: usize) -> JsonValue {
     json!({
         "type": "object",
         "properties": {
@@ -83,7 +102,10 @@ pub(crate) fn search_index_input_schema() -> JsonValue {
             "limit": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "Maximum number of results to return. Pass 0 for count-only mode (returns total_hits without document data). If omitted, the node's configured default applies, which is 10 unless an operator changed it."
+                "maximum": max_search_limit,
+                "description": format!(
+                    "Maximum number of results to return, up to {max_search_limit}. Pass 0 for count-only mode (returns total_hits without document data). If omitted, the node's configured default applies, which is 10 unless an operator changed it."
+                )
             },
             "fields": {
                 "type": "array",
@@ -96,13 +118,17 @@ pub(crate) fn search_index_input_schema() -> JsonValue {
     })
 }
 
-pub(crate) fn search_indexes_input_schema() -> JsonValue {
+pub(crate) fn search_indexes_input_schema(max_search_limit: usize) -> JsonValue {
     json!({
         "type": "object",
         "properties": {
             "indexes": {
                 "type": "array",
-                "description": "List of indexes to search, each with optional field projection.",
+                "minItems": 1,
+                "maxItems": MAX_FEDERATED_INDEXES,
+                "description": format!(
+                    "The indexes to search, at least one and at most {MAX_FEDERATED_INDEXES}, each with optional field projection. Naming the same index twice is refused rather than searched twice."
+                ),
                 "items": {
                     "type": "object",
                     "properties": {
@@ -144,7 +170,10 @@ pub(crate) fn search_indexes_input_schema() -> JsonValue {
             "limit": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "Maximum total results across all indexes. Pass 0 for count-only mode (returns total_hits without document data). If omitted, the node's configured default applies, which is 10 unless an operator changed it."
+                "maximum": max_search_limit,
+                "description": format!(
+                    "Maximum total results across all indexes, up to {max_search_limit}. Pass 0 for count-only mode (returns total_hits without document data). If omitted, the node's configured default applies, which is 10 unless an operator changed it."
+                )
             }
         },
         "required": ["indexes", "query"],
@@ -321,12 +350,15 @@ mod tests {
     /// two nested objects inside the federated search — a client reads those the same way and
     /// they can drift the same way.
     fn contracts() -> Vec<Contract> {
-        let federated = search_indexes_input_schema();
+        let federated = search_indexes_input_schema(DEFAULT_MAX_SEARCH_LIMIT);
         let per_index = federated["properties"]["indexes"]["items"].clone();
         let sort = per_index["properties"]["sort"].clone();
 
         vec![
-            contract::<SearchIndexArgs>("search_index", search_index_input_schema()),
+            contract::<SearchIndexArgs>(
+                "search_index",
+                search_index_input_schema(DEFAULT_MAX_SEARCH_LIMIT),
+            ),
             contract::<SearchIndexesArgs>("search_indexes", federated),
             contract::<McpIndexSearchRequest>("search_indexes.indexes[]", per_index),
             contract::<SortSpec>("search_indexes.indexes[].sort", sort),
@@ -353,6 +385,49 @@ mod tests {
                  either reads about one it cannot send or sends one it was never told about"
             );
         }
+    }
+
+    /// The advertised bounds are the enforced ones.
+    ///
+    /// A `maximum` a client reads and a maximum the dispatcher applies are the same drift as a
+    /// property and a struct field: the schema is where a caller learns what it may ask for, so
+    /// a number written into it by hand is a promise nothing keeps. The ceiling is checked
+    /// against a value no constant here could supply, since it is the host's to choose.
+    #[test]
+    fn a_schema_advertises_the_bounds_that_are_enforced() {
+        let hosts_own_ceiling = 4_242;
+        for (label, schema) in [
+            ("search_index", search_index_input_schema(hosts_own_ceiling)),
+            (
+                "search_indexes",
+                search_indexes_input_schema(hosts_own_ceiling),
+            ),
+        ] {
+            assert_eq!(
+                schema["properties"]["limit"]["maximum"],
+                json!(hosts_own_ceiling),
+                "{label} advertises a limit bound that is not the host's"
+            );
+            assert!(
+                schema["properties"]["limit"]["description"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&hosts_own_ceiling.to_string())),
+                "{label} describes a limit bound that is not the host's: {schema}"
+            );
+        }
+
+        let indexes =
+            &search_indexes_input_schema(DEFAULT_MAX_SEARCH_LIMIT)["properties"]["indexes"];
+        assert_eq!(
+            indexes["minItems"],
+            json!(1),
+            "an empty index list must be refused by the schema as well as the dispatcher"
+        );
+        assert_eq!(
+            indexes["maxItems"],
+            json!(MAX_FEDERATED_INDEXES),
+            "the advertised fan-out bound is not the enforced one"
+        );
     }
 
     #[test]

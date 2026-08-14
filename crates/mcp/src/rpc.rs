@@ -15,7 +15,7 @@ use crate::{
     backend::{McpBackend, RateLimitVerdict, ToolCall},
     guidance::{INSTRUCTIONS, ORCHESTRATOR_SKILL},
     protocol::negotiate_protocol_version,
-    tools::{ToolCallParams, call_tool, tool_subject, visible_tools},
+    tools::{ToolCallParams, call_tool, tool_cost, tool_subject, visible_tools},
 };
 
 #[derive(Debug, Deserialize)]
@@ -182,7 +182,7 @@ where
         // --- Tools ---
         "tools/list" => Some(success_response(
             request.id,
-            json!({ "tools": visible_tools(authz) }),
+            json!({ "tools": visible_tools(authz, backend.max_search_limit()) }),
         )),
         "tools/call" => Some(
             match serde_json::from_value::<ToolCallParams>(request.params) {
@@ -197,6 +197,9 @@ where
                     // all of them and a tool added later is described without being edited
                     // into this match.
                     let subject = tool_subject(&params.arguments);
+                    // Read the same way and for the same reason: what the call costs has to
+                    // be known before the rate check, which precedes decoding.
+                    let cost = tool_cost(&params.arguments);
                     // Owned, because `params` moves into `call_tool` below and the record is
                     // written after it returns.
                     let query = params
@@ -204,7 +207,7 @@ where
                         .get("query")
                         .and_then(JsonValue::as_str)
                         .map(str::to_string);
-                    match backend.check_tool_rate(Arc::clone(authz), &params.name) {
+                    match backend.check_tool_rate(Arc::clone(authz), &params.name, cost) {
                         RateLimitVerdict::Deny { retry_after_secs } => {
                             backend.record_tool_call(
                                 Arc::clone(authz),
@@ -310,7 +313,7 @@ mod tests {
             "no/such/method",
         ] {
             let response = handle_rpc_request(
-                StubBackend,
+                StubBackend::default(),
                 message(json!({ "jsonrpc": "2.0", "method": method })),
                 &caller(),
             )
@@ -327,7 +330,7 @@ mod tests {
         // The one channel a client reads without being asked to. Guidance that lives only in
         // `prompts/get` reaches the clients that call it by hand, which is almost none.
         let response = handle_rpc_request(
-            StubBackend,
+            StubBackend::default(),
             message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" })),
             &caller(),
         )
@@ -347,7 +350,7 @@ mod tests {
     async fn an_unknown_method_carrying_an_id_gets_method_not_found() {
         // The guard above must not over-correct into swallowing real requests.
         let response = handle_rpc_request(
-            StubBackend,
+            StubBackend::default(),
             message(json!({ "jsonrpc": "2.0", "id": 7, "method": "no/such/method" })),
             &caller(),
         )

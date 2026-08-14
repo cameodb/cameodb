@@ -1,6 +1,6 @@
 //! The two search tools, and the merge that makes a federated one answerable.
 
-use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use futures::{StreamExt, future::BoxFuture, stream};
 use serde_json::Value as JsonValue;
 
 use cameodb_mcp::McpIndexSearchRequest;
@@ -13,6 +13,32 @@ use crate::mcp::schema::absent_index_reason;
 use crate::node_orchestrator::ClientOp;
 use crate::query::parse_query_keywords;
 use crate::state::AppState;
+
+/// How many of a federated search's indexes are queried at once.
+///
+/// The bound on how many may be *named* is the protocol's; this is the node's. Each name is a
+/// scatter-gather across that index's shards, so an uncapped fan-out lets one request occupy
+/// every shard worker at once and starve the searches already running. Well below the naming
+/// bound on purpose: a wide search finishes slightly later and costs the node no more than a
+/// narrow one.
+const MAX_CONCURRENT_INDEX_SEARCHES: usize = 8;
+
+/// Refuse a limit above what the tool schemas advertise.
+///
+/// Checked on the value the search will actually run with rather than on the argument, because
+/// the query string is a second door into the same number: `limit 5000000` written inline
+/// reaches this after the argument has already been validated and found absent. `None` needs no
+/// check — the node's own default fills it in, and config load refuses a default above the
+/// ceiling so that the value which arrives here cannot exceed it.
+fn check_effective_limit(limit: Option<usize>, max_search_limit: usize) -> Result<(), String> {
+    match limit {
+        Some(limit) if limit > max_search_limit => Err(format!(
+            "limit {limit} is above the maximum of {max_search_limit}; ask for at most that many \
+             and narrow the query to reach the rest"
+        )),
+        _ => Ok(()),
+    }
+}
 
 pub(super) fn search_index(
     state: AppState,
@@ -29,6 +55,7 @@ pub(super) fn search_index(
 
         // Merge MCP-provided values with parsed values (MCP takes precedence for limit/fields)
         let final_limit = limit.or(parsed_limit);
+        check_effective_limit(final_limit, state.max_search_limit)?;
         let final_fields = index.fields.or(parsed_fields);
         let final_sort = parsed_sort;
 
@@ -118,6 +145,7 @@ pub(super) fn search_indexes(
         // truncates to, and the value reported back are the same number — including when it
         // comes from an inline `limit` clause or from this node's configured default.
         let final_limit = limit.or(parsed_limit);
+        check_effective_limit(final_limit, state.max_search_limit)?;
         let requested_limit = final_limit.unwrap_or(state.router.default_search_limit());
 
         // Determine the global sort spec (if any) for the final merge.
@@ -143,9 +171,9 @@ pub(super) fn search_indexes(
         // all answer" test after the merge.
         let index_count = indexes.len();
 
-        // Launch all index searches concurrently
-        let mut search_futures = FuturesUnordered::new();
-        for index_request in indexes {
+        // Each index is searched concurrently with the others, up to
+        // `MAX_CONCURRENT_INDEX_SEARCHES` at a time — the rest start as those finish.
+        let searches = indexes.into_iter().map(|index_request| {
             let McpIndexSearchRequest {
                 index,
                 fields,
@@ -157,7 +185,7 @@ pub(super) fn search_indexes(
             let parsed_fields = parsed_fields.clone();
             let parsed_sort = parsed_sort.clone();
 
-            search_futures.push(async move {
+            async move {
                 // Merge MCP-provided fields/sort with parsed values
                 let final_fields = fields.or(parsed_fields);
                 let final_sort = sort.or_else(|| {
@@ -198,8 +226,10 @@ pub(super) fn search_indexes(
                     .await;
 
                 (index_name, result)
-            });
-        }
+            }
+        });
+        let mut search_futures =
+            stream::iter(searches).buffer_unordered(MAX_CONCURRENT_INDEX_SEARCHES);
 
         let mut merged_hits = Vec::new();
         let mut total_hits = 0u64;
