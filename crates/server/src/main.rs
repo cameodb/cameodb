@@ -19,10 +19,13 @@ mod cluster_state_machine;
 mod config;
 mod distributed;
 mod http_server;
+mod mcp;
 mod node_orchestrator;
 mod posture;
+mod query;
 mod ratelimit;
 mod remote_peer_pool;
+mod state;
 mod swarm;
 
 use cluster_coordinator::{
@@ -31,12 +34,13 @@ use cluster_coordinator::{
 use cluster_state::ClusterStateStore;
 use config::CameoDbConfig;
 use distributed::{ClusterStatus, DistributedCluster};
-use http_server::{AppState, create_router};
+use http_server::create_router;
 use node_orchestrator::{
     NodeConfig, NodeOrchestrator, ProposeShard, RouterActor, ShardAffineConfig,
     StreamingSearchConfig, UpdateTopology, orchestrator_remote_name,
 };
 use remote_peer_pool::RemotePeerPool;
+use state::AppState;
 use tokio::sync::mpsc;
 
 /// Global shutdown flag to prevent double-shutdown issues.

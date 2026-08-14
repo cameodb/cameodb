@@ -712,7 +712,7 @@ mod tests {
     fn every_mounted_route_is_classified() {
         // The guarantee the route table cannot make for itself: a route added to the router
         // without a row here fails the build instead of shipping open.
-        let router_source = include_str!("http_server.rs");
+        let router_source = include_str!("http_server/routes.rs");
         let unclassified: Vec<String> = mounted_routes(router_source)
             .into_iter()
             .filter(|pattern| !is_classified(pattern))
@@ -738,11 +738,35 @@ mod tests {
         );
     }
 
+    /// The check above reads one file, so it is only a check while one file mounts everything.
+    ///
+    /// A route mounted from a handler module would be invisible to it — classified by nothing and
+    /// reported by nothing. Keeping every `.route(` call in `routes.rs` is what makes reading that
+    /// one file sufficient, so the containment is asserted rather than left as a convention.
+    #[test]
+    fn no_module_outside_the_router_mounts_a_route() {
+        for (module, source) in [
+            ("admin", include_str!("http_server/admin.rs")),
+            ("catalogue", include_str!("http_server/catalogue.rs")),
+            ("error", include_str!("http_server/error.rs")),
+            ("health", include_str!("http_server/health.rs")),
+            ("mod", include_str!("http_server/mod.rs")),
+            ("search", include_str!("http_server/search.rs")),
+            ("write", include_str!("http_server/write.rs")),
+        ] {
+            assert!(
+                !source.contains(".route("),
+                "http_server::{module} mounts a route; `every_mounted_route_is_classified` reads \
+                 only routes.rs and would not see it"
+            );
+        }
+    }
+
     #[test]
     fn every_mcp_route_is_classified_under_its_mount_point() {
         // MCP routes live in another crate and are nested, which is exactly why they are the
         // ones a reviewer forgets. Assert the prefix here rather than assuming it.
-        assert!(include_str!("http_server.rs").contains(".nest(\"/mcp\""));
+        assert!(include_str!("http_server/routes.rs").contains(".nest(\"/mcp\""));
         for pattern in mounted_routes(include_str!("../../mcp/src/transport.rs")) {
             let mounted = format!("/mcp{}", pattern.trim_end_matches('/'));
             assert!(
@@ -756,7 +780,7 @@ mod tests {
     fn no_row_classifies_a_route_that_is_not_mounted() {
         // The reverse direction: a stale row is a rule nothing enforces, and a reader would
         // take it for coverage.
-        let mut mounted: Vec<String> = mounted_routes(include_str!("http_server.rs"));
+        let mut mounted: Vec<String> = mounted_routes(include_str!("http_server/routes.rs"));
         mounted.push(crate::http_server::HEALTH_PATH.to_string());
         mounted.extend(
             mounted_routes(include_str!("../../mcp/src/transport.rs"))
