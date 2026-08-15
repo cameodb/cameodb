@@ -315,11 +315,15 @@ pub const RULES: &[&str] = &[
 
 /// How ordering behaves, which the `sort` modifier and parameter share.
 pub const SORT_RULES: &[&str] = &[
-    "Sorting on a numeric or date field requires the `fast` flag on that field, reported per field \
-     by `describe_index`.",
-    "Sorting on a text or string field is approximate: the top `2 × limit` matches by relevance \
-     are collected and then ordered alphabetically, so the result is not the alphabetically first \
-     documents in the index.",
+    "Sorting is exact on a field with a fast column, and `describe_index` reports which those are \
+     as `sortable`. A numeric or date field needs one to be sorted at all; a text or string field \
+     without one is sorted approximately rather than refused.",
+    "An approximate sort collects the top `2 × limit` matches by relevance and orders those \
+     alphabetically, so the result is not the alphabetically first documents in the index and \
+     paging through it re-orders a different sample on each page. The response says so: it \
+     carries `_approximate_sort` naming the field, and a `_warning`.",
+    "A field's fast column is written when the index is built, so `sortable` cannot be turned on \
+     for an index that already has data. Declare the field `fast` before writing to it.",
     "Under a numeric or date sort every hit carries `_score` of 1.0, because no relevance score is \
      computed. Do not read it as a ranking.",
     "Ascending unless `desc` is given.",
@@ -336,6 +340,12 @@ pub const INLINE_MODIFIERS: &[(&str, &str, &str)] = &[
         "limit N",
         "Cap the number of results.",
         "title:rust limit 5",
+    ),
+    (
+        "offset K",
+        "Skip the first K results — the page, where `limit` is the page size. `offset + limit` \
+         is bounded by the same maximum `limit` is.",
+        "title:rust limit 10 offset 20",
     ),
     (
         "sort field:desc",

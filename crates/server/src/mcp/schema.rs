@@ -72,6 +72,11 @@ pub(super) struct FieldInfo {
     /// schema declares. The two differ for a field declared after the index was built: it has no
     /// column until the index data is rebuilt, so it is `indexed` and matches nothing.
     pub(super) searchable: bool,
+    /// Whether a sort on this field is exact — the built index has a fast column for it — as
+    /// opposed to `fast`, which is what the schema declares. A text field without one is sorted
+    /// approximately rather than refused, so this is the flag that decides whether an order can
+    /// be trusted or paged through.
+    pub(super) sortable: bool,
     /// What the field records, if anyone wrote it down. Never inferred.
     pub(super) description: Option<String>,
 }
@@ -117,6 +122,10 @@ pub(super) fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
                         .get("searchable")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true),
+                    sortable: def
+                        .get("sortable")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                     description: def
                         .get("description")
                         .and_then(|v| v.as_str())

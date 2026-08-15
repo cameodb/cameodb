@@ -235,24 +235,36 @@ fixes whose root cause turned out to sit in the engine rather than in the MCP la
    name — so `id` should stop being offered as something to *project*, while remaining something
    to query.
 
-4. **Paging: `offset` on a search.** `total_hits` reports how many documents matched and there is
-   no way to reach the eleventh. Nothing below the API supports it — not `ClientOp::Search`, not
-   `search_documents`, not the shard merge, and not `POST /api/{index}/search`. The engine half is
-   free: Tantivy 0.26 has `TopDocs::with_limit(n).and_offset(k)`, carried into every sort variant
-   through `doc_range()`, and its own segment merge is exactly the algorithm needed one level up —
-   each segment collects `offset + limit`, the merge pools them, sorts, and skips `offset`. So the
-   work is to thread a range rather than a limit through `ClientOp::Search` and `search_documents`,
-   have each shard return `offset + limit`, and skip after the merge — then the same again across
-   indexes for the federated tool. Two things to decide with it: whether `POST /api/{index}/search`
-   gets it at the same time (the MCP tools and the HTTP API would otherwise disagree about what a
-   search can express), and where the bound goes, since cost is linear in `offset + limit` rather
-   than in either alone — `[security.limits] max_search_limit` currently bounds only the limit.
-   The prerequisite is met as of 2026-08-14: every hit merge has a total order, and a truncated
-   page is a prefix of an untruncated one, which is what makes page *k* mean anything. Note also
-   that paging over an approximate sort compounds the approximation — a string-field sort collects
-   `limit * 2` candidates per shard and sorts what it fetched, so a deep page is ordered against a
-   different candidate set than a shallow one. Either restrict paging to FAST-field sorts or say
-   so where an agent will read it
+4. ~~**Paging: `offset` on a search.**~~ ✅ Landed 2026-08-15. `offset` on both HTTP search routes,
+   both MCP tools, the SDK, a `--offset` flag and the query grammar (`limit 10 offset 20`) — the
+   last of those because the client and the REPL express a search *entirely* through that grammar,
+   so a paging option that existed only as a JSON field was one they could not reach.
+   **The skip is applied once, after the merge, and `and_offset` is not used.** Tantivy's own is
+   the right tool for one segment and the wrong one for a scatter-gather: every hit on a page may
+   come from a single source, so a source that skipped `offset` of *its own* hits drops rows that
+   belong on the page. Each source is asked for `offset + limit` from the front instead. This was
+   not a theoretical hazard — the federated tool shipped doing exactly that, applying the offset
+   per index *and* again at the merge, so page 2 was page 3 of an order built from the wrong
+   candidates. `crates/server/tests/mcp_federated.rs` now fixes it in place with an interleaved
+   fixture, where a per-index skip returns different *documents* rather than a different order.
+   **Both decisions the item named were made, and the second was got wrong first.** The HTTP API
+   did get it at the same time — but the bound went only on the MCP tools, and that route had
+   never bounded `limit` either, so `{"limit": 10, "offset": 500000000}` was a request that reads
+   as ten documents and hands the node an allocation the caller sizes (Tantivy's collector
+   allocates `2 × limit` up front, before matching anything). `SearchWindow::checked` is now the
+   one rule, applied by every surface, over `offset + limit` — and counting the node's default
+   limit when none is given, which an earlier check read as zero.
+   **The third note — "restrict paging to FAST-field sorts or say so where an agent will read
+   it" — was answered by removing the approximation where it can be removed and reporting it where
+   it cannot.** A text field declared `fast` now builds the string fast column, so its sort is a
+   true lexicographic order over every match and pages through correctly. Without one, the
+   response carries `_approximate_sort` and a `_warning` saying the order is over a sample and
+   does not page — in the response, not the node's log, which is where the first attempt put it.
+   `sortable` joins `searchable` on every field description for the same reason `searchable`
+   exists: `fast` is a declaration, and only the engine knows whether the column was built.
+   **Still open:** a text field cannot be made `sortable` after its index holds data — the column
+   is written at index time and `PATCH /_schema` edits `indexed` only. That is Phase 15 stage 1
+   (reindex), and the gap is reported rather than hidden.
 5. **Phase 12: MCP streaming.** Large result sets over the MCP streaming protocol. Left until
    after items 1-4 deliberately: streaming a result shape that is still changing means building
    the transport twice

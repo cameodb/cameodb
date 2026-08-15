@@ -28,7 +28,7 @@ use crate::query::parse_query_keywords;
 /// diagnosis of one query rather than a second copy of the reference, hence the wording as
 /// advice rather than as a rule.
 pub(super) fn zero_results_advice(query: &str) -> Option<String> {
-    let (text, ..) = parse_query_keywords(query);
+    let text = parse_query_keywords(query).query;
     let tokens: Vec<&str> = text.split_whitespace().collect();
 
     let mut reasons: Vec<&str> = Vec::new();
@@ -67,6 +67,44 @@ pub(super) fn zero_results_advice(query: &str) -> Option<String> {
     }
 
     (!reasons.is_empty()).then(|| reasons.join(" "))
+}
+
+/// Why an empty page came back from a query that matched, or `None` when it did not page past
+/// the end.
+///
+/// This is the case [`zero_results_advice`] must not be asked about. A page beyond the last one
+/// returns no hits and a `total_hits` in the hundreds, and the query is blameless — advice about
+/// a phrase or an `AND` clause there reads as a finding about the data and sends the caller off
+/// to rewrite a query that was already correct.
+///
+/// Names the last offset that holds a hit, because that is what the caller needs to get back to
+/// a page with something on it.
+pub(super) fn paged_past_the_end(offset: usize, total_hits: usize) -> Option<String> {
+    if offset == 0 || total_hits == 0 || offset < total_hits {
+        return None;
+    }
+    Some(format!(
+        "This page is empty because it starts past the end of the result: offset {offset} with \
+         {total_hits} matching document(s). The last document is at offset {}.",
+        total_hits - 1
+    ))
+}
+
+/// What an approximate sort order means for the caller holding it.
+///
+/// Attached whenever the engine reports [`crate::node_orchestrator::APPROXIMATE_SORT_FIELD`],
+/// rather than left in the node's log where the caller cannot see it. An agent reading a sorted
+/// page has no other way to tell that it is holding the alphabetical order of a sample: the hits
+/// look exactly like an exact answer, and every hit in them is real.
+pub(super) fn approximate_sort_note(field: &str) -> String {
+    format!(
+        "These hits are sorted on '{field}', which has no fast column, so the order is the \
+         alphabetical order of the highest-scoring candidates rather than of everything that \
+         matched — the alphabetically first document may be absent entirely, and paging deeper \
+         re-orders a different sample rather than continuing this one. `describe_index` reports \
+         `sortable: false` for such a field. An exact order needs the field declared `fast` \
+         before the index is built."
+    )
 }
 
 /// Whether an engine error reports a field the schema does not have.

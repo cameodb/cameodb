@@ -161,6 +161,19 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
         crate::tools::schema::DEFAULT_MAX_SEARCH_LIMIT
     }
 
+    /// The `limit` a search runs with when the call names none.
+    ///
+    /// Needed here, and not only by the host, because `offset` is bounded against
+    /// `offset + limit` — so a call that omits `limit` still has one, and a check that read the
+    /// omission as zero would pass a window the node then exceeds by exactly this number. The
+    /// host owns the value for the same reason it owns [`Self::max_search_limit`].
+    ///
+    /// The default matches the schema descriptions, which tell a caller that an omitted `limit`
+    /// means ten.
+    fn default_search_limit(&self) -> usize {
+        crate::tools::schema::DEFAULT_SEARCH_LIMIT
+    }
+
     /// May this caller invoke another tool right now, at this cost?
     ///
     /// Asked once per `tools/call`, before the tool runs and before its arguments are

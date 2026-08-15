@@ -2304,3 +2304,208 @@ async fn every_advertised_tool_arrives_annotated() {
         }
     }
 }
+
+/// Every id of a result, in the order returned.
+fn ids_of(result: &Value) -> Vec<String> {
+    result["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["id"].as_str().unwrap_or("<missing>").to_string())
+        .collect()
+}
+
+/// A federated page is a slice of the merged order, not a slice of each index's own order.
+///
+/// The distinction is the whole of paging across indexes and it is invisible without a fixture
+/// like this one: `ALPHA` and `BETA` interleave, so applying the offset inside each index before
+/// merging returns *different documents*, not merely a different order. With `offset 2 limit 2`
+/// the correct answer is the third and fourth of the merged six (`b2`, `a2` descending) — while
+/// a per-index skip drops `a1`/`b1` first and answers `a3`, `b3`.
+#[tokio::test]
+async fn a_federated_page_is_a_slice_of_the_merged_order() {
+    let node = two_seeded_indexes().await;
+
+    let sorted_indexes = json!([
+        {"index": "alpha", "sort": {"field": "created", "order": "desc"}},
+        {"index": "beta", "sort": {"field": "created", "order": "desc"}},
+    ]);
+
+    let (is_error, whole) = node
+        .call_tool(
+            "search_across_indexes",
+            json!({"indexes": sorted_indexes, "query": "title:record", "limit": 10}),
+        )
+        .await;
+    assert!(!is_error, "federated search failed: {whole}");
+    let all = ids_of(&whole);
+    assert_eq!(all.len(), 6, "the unpaged search should return everything");
+
+    for offset in 0..=4 {
+        let (is_error, page) = node
+            .call_tool(
+                "search_across_indexes",
+                json!({
+                    "indexes": sorted_indexes,
+                    "query": "title:record",
+                    "limit": 2,
+                    "offset": offset,
+                }),
+            )
+            .await;
+        assert!(!is_error, "federated page failed: {page}");
+        assert_eq!(
+            ids_of(&page),
+            all[offset..offset + 2],
+            "offset {offset} should be that slice of the merged order, got {page}"
+        );
+        assert_eq!(page["offset"], json!(offset));
+    }
+}
+
+/// Paging through a federated search visits every document exactly once.
+///
+/// The consequence of the property above, stated the way a caller experiences it — and the
+/// thing that breaks loudly if an offset is ever applied twice on the way down.
+#[tokio::test]
+async fn federated_pages_cover_the_whole_result_without_repeats() {
+    let node = two_seeded_indexes().await;
+
+    let mut seen: Vec<String> = Vec::new();
+    for page in 0..3 {
+        let (is_error, result) = node
+            .call_tool(
+                "search_across_indexes",
+                json!({
+                    "indexes": ["alpha", "beta"],
+                    "query": "title:record",
+                    "limit": 2,
+                    "offset": page * 2,
+                }),
+            )
+            .await;
+        assert!(!is_error, "page {page} failed: {result}");
+        seen.extend(ids_of(&result));
+    }
+
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec!["a1", "a2", "a3", "b1", "b2", "b3"],
+        "three pages of two should be the whole result, each document once"
+    );
+}
+
+/// A page past the end explains itself as paging, not as a query that matched nothing.
+///
+/// The failure this replaces: `hits_returned == 0` used to reach the zero-results advice, which
+/// reads only the query text — so an agent that paged too far was told its `AND` clause was too
+/// narrow, about a query that had matched six documents.
+#[tokio::test]
+async fn a_page_past_the_end_says_so_rather_than_blaming_the_query() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_index",
+            json!({
+                "index": "alpha",
+                // A conjunction, which is exactly what the zero-results advice comments on.
+                "query": "title:quarterly AND title:record",
+                "limit": 2,
+                "offset": 50,
+            }),
+        )
+        .await;
+    assert!(!is_error, "a page past the end is answered: {result}");
+
+    assert_eq!(result["hits_returned"], json!(0));
+    assert_eq!(
+        result["total_hits"],
+        json!(3),
+        "the query matched; only the page is empty"
+    );
+
+    let warning = result["_warning"].as_str().unwrap_or_default();
+    assert!(
+        warning.contains("offset 50"),
+        "the warning should say the page starts past the end: {warning}"
+    );
+    assert!(
+        !warning.contains("`AND`"),
+        "and must not blame a query that matched: {warning}"
+    );
+}
+
+/// A query that genuinely matched nothing still gets the advice about why.
+///
+/// The other half of the case above: narrowing the check to real zero-result searches must not
+/// have removed it from the searches it was written for.
+#[tokio::test]
+async fn a_query_that_matches_nothing_still_gets_its_advice() {
+    let node = two_seeded_indexes().await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_index",
+            json!({
+                "index": "alpha",
+                "query": "title:quarterly AND title:nonexistent",
+                "limit": 10,
+            }),
+        )
+        .await;
+    assert!(!is_error, "search failed: {result}");
+
+    assert_eq!(result["total_hits"], json!(0));
+    let warning = result["_warning"].as_str().unwrap_or_default();
+    assert!(
+        warning.contains("AND"),
+        "a conjunction that matched nothing should still be explained: {warning}"
+    );
+}
+
+/// The window bound is enforced against `offset + limit`, counting the default limit.
+#[tokio::test]
+async fn the_tools_refuse_a_window_past_the_ceiling() {
+    let node = TestNode::start_with(
+        r#"
+[security.limits]
+max_search_limit = 100
+"#,
+    )
+    .await;
+    node.create_index("alpha").await;
+    node.seed("alpha", ALPHA).await;
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "alpha", "query": "title:record", "limit": 60, "offset": 60}),
+        )
+        .await;
+    assert!(is_error, "offset + limit past the ceiling is refused");
+    let text = result.to_string();
+    assert!(text.contains("120"), "the refusal names the window: {text}");
+
+    // No limit named, so the node's default counts against the ceiling too.
+    let (is_error, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "alpha", "query": "title:record", "offset": 100}),
+        )
+        .await;
+    assert!(
+        is_error,
+        "an offset at the ceiling leaves no room for the default limit: {result}"
+    );
+
+    // And the window that fits is still served.
+    let (is_error, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "alpha", "query": "title:record", "limit": 50, "offset": 50}),
+        )
+        .await;
+    assert!(!is_error, "a window inside the ceiling is served: {result}");
+}

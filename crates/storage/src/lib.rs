@@ -390,6 +390,17 @@ pub struct SearchOutcome {
     pub total_hits: usize,
     /// One entry per dropped clause, phrased for the caller. Empty on a clean parse.
     pub discarded: Vec<String>,
+    /// The sorted field, when the order returned is an approximation of the one asked for.
+    ///
+    /// Set only for a text or string sort on a field with no fast column: those candidates are
+    /// taken by relevance and alphabetised afterwards, so the answer is the alphabetical order
+    /// of the top-scoring `limit * 2` rather than of everything that matched. Separate from
+    /// [`Self::discarded`] because the two mean different things and a caller acts on them
+    /// differently — a discarded clause means the query ran wider than it was written, while
+    /// this means the query ran as written and the *order* is a sample.
+    ///
+    /// `None` whenever the order is exact, which is every other sort and every unsorted search.
+    pub approximate_sort: Option<String>,
 }
 
 impl SearchOutcome {
@@ -399,11 +410,14 @@ impl SearchOutcome {
     }
 
     /// A count with no documents attached, for `limit = 0`.
+    ///
+    /// Never approximate: a count is over every match, and no order was produced to approximate.
     fn counted(total_hits: usize, discarded: Vec<String>) -> Self {
         Self {
             hits: Vec::new(),
             total_hits,
             discarded,
+            approximate_sort: None,
         }
     }
 }
@@ -2007,6 +2021,17 @@ pub struct IndexShardStats {
     ///
     /// Empty when the index has not been built on this shard.
     pub searchable_fields: HashSet<String>,
+    /// Field names the built Tantivy index has a *fast column* for, on this shard.
+    ///
+    /// The same distinction as `searchable_fields`, applied to sorting: `fast` in the schema is a
+    /// declaration, and the column it asks for is written at index time. See
+    /// [`HybridStore::sortable_fields`].
+    ///
+    /// Defaulted because this type crosses the cluster wire: a peer running an older build sends
+    /// no such field, and reporting nothing sortable there is better than failing to decode its
+    /// statistics at all.
+    #[serde(default)]
+    pub sortable_fields: HashSet<String>,
 }
 
 /// Timing metadata for shard-level statistics gathering.
@@ -5095,11 +5120,13 @@ impl HybridStore {
             }
 
             let total_hits = if results.is_empty() { 0 } else { 1 };
-            // No parse happens on this path, so nothing can be discarded.
+            // No parse happens on this path, and no sort: an id lookup returns the one document
+            // it names. So nothing can be discarded and no order can be approximate.
             return Ok(SearchOutcome {
                 hits: results,
                 total_hits,
                 discarded: Vec::new(),
+                approximate_sort: None,
             });
         }
 
@@ -5221,13 +5248,21 @@ impl HybridStore {
                     // happens to favour it.
                     //
                     // Declaring the field `fast` takes the branch above instead and removes the
-                    // approximation. Doing so on an index that already exists needs its data
-                    // rebuilt, since the column is written at index time.
-                    warn!(
+                    // approximation. The column is written at index time, so that declaration
+                    // has to be in place before the data is: on an index that already exists
+                    // there is no way to add one, and no reindex to add it with (ROADMAP
+                    // Phase 15). `sortable` on the field's description reports which case an
+                    // index is in.
+                    //
+                    // `debug`, not `warn`: this fires once per shard per search, and the caller
+                    // is told in the response itself through `approximate_sort` — which is where
+                    // it can be acted on. A log line per query would be noise in front of an
+                    // operator who cannot fix it from there anyway.
+                    debug!(
+                        index = %index,
                         field = %sort_spec.field,
-                        "sorting on a text field without a fast column; results are the \
-                         alphabetical order of the top-scoring candidates, not of all matches. \
-                         Mark the field `fast` for a true lexicographic sort (requires reindex)."
+                        "sorting on a text field without a fast column; the order returned is \
+                         the alphabetical order of the top-scoring candidates, not of all matches"
                     );
                     let budget = limit.saturating_mul(2);
                     string_sort = Some((sort_spec.field.clone(), sort_spec.order));
@@ -5417,6 +5452,10 @@ impl HybridStore {
         // comparison on the original position instead of relying on the sort being stable: a
         // later switch to `sort_unstable_by` would otherwise make this shard's answer vary
         // between runs, and every merge above it inherits that.
+        // Read before the sort below consumes it: an approximate order is a property of the
+        // answer, and the caller has to be able to see it on the answer.
+        let approximate_sort = string_sort.as_ref().map(|(field, _)| field.clone());
+
         if let Some((field, order)) = string_sort {
             let mut ranked: Vec<(usize, _)> = std::mem::take(&mut results)
                 .into_iter()
@@ -5445,6 +5484,7 @@ impl HybridStore {
             hits: results,
             total_hits,
             discarded,
+            approximate_sort,
         })
     }
 
@@ -5955,6 +5995,7 @@ impl HybridStore {
                             .map(|state| *state.value())
                             .unwrap_or(IndexWarmupState::Cold),
                         searchable_fields: self.searchable_fields(index_name),
+                        sortable_fields: self.sortable_fields(index_name),
                     },
                 );
             }
@@ -6011,6 +6052,42 @@ impl HybridStore {
                 .collect(),
             Err(err) => {
                 tracing::debug!(index = %index, error = %err, "Could not read searchable fields");
+                HashSet::new()
+            }
+        }
+    }
+
+    /// Field names the built Tantivy index has a *fast column* for, and can therefore sort
+    /// exactly.
+    ///
+    /// The same distinction [`Self::searchable_fields`] draws, one property along: `fast` in the
+    /// schema is a declaration, the column is written at index time from that declaration, and
+    /// the two part company for any field declared after the index was built. A caller that
+    /// reads the declaration and sorts on it gets an answer — an approximate one for a text
+    /// field, an error for a numeric one — so the declaration alone cannot answer "will a sort
+    /// on this field be exact".
+    ///
+    /// Read from the built index rather than from the cached field handles, because
+    /// [`SchemaFields`] records which fields exist and not which carry a column. Empty for an
+    /// index with no built directory, as above.
+    pub fn sortable_fields(&self, index: &str) -> HashSet<String> {
+        let Ok(index_path) = self.index_dir(index) else {
+            return HashSet::new();
+        };
+        if !index_path.join("meta.json").exists() {
+            return HashSet::new();
+        }
+
+        match Index::open_in_dir(&index_path) {
+            Ok(opened) => opened
+                .schema()
+                .fields()
+                .filter(|(_, entry)| entry.is_fast())
+                .map(|(_, entry)| entry.name().to_string())
+                .filter(|name| name != "_seq")
+                .collect(),
+            Err(err) => {
+                tracing::debug!(index = %index, error = %err, "Could not read sortable fields");
                 HashSet::new()
             }
         }

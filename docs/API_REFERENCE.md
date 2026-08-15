@@ -97,14 +97,44 @@ curl -s -X POST http://localhost:9480/api/books/search \
 >
 > The JSON payload always wins over inline `return` clauses. Metadata keys (those starting with `_`, e.g. `_score`, `_id`, `shard_id`) are preserved automatically.
 >
-> A field list needs a comma between names, and the clause must sit in one run of `return`/`limit`/`sort` at the end of the query with query text in front of it. Anywhere else the keyword is searched for as a word, so `find tax return forms` is four terms. A `return` naming a field the index does not have is reported in `_discarded_clauses`.
+> A field list needs a comma between names, and the clause must sit in one run of `return`/`limit`/`offset`/`sort` at the end of the query with query text in front of it. Anywhere else the keyword is searched for as a word, so `find tax return forms` is four terms. A `return` naming a field the index does not have is reported in `_discarded_clauses`.
+
+> **Paging (`offset`):** `limit` is the page size and `offset` is where the page starts, so page N
+> is `offset = N * limit`. Supply it in the payload — `"offset": 20` — or inline, as
+> `"query": "space opera limit 10 offset 20"`; the payload wins. The response reports both, and
+> there are more results when `offset + hits_returned < total_hits`.
+>
+> **The ceiling applies to `offset + limit`, not to either alone.** A page is served by asking every
+> shard for the whole window from the front and taking the slice after merging them — the skip
+> cannot be pushed down into a shard, because every hit on the page may have come from one of them.
+> So the node fetches `offset + limit` hits however small the page is, and
+> `[security.limits] max_search_limit` bounds that sum: a request past it is refused with `400`
+> naming the window and the bound. An `offset` with no `limit` still counts the node's default limit
+> against the ceiling.
+>
+> A page needs an order to be a page of. With a `sort` on a `sortable` field the order is total and
+> pages are consecutive slices of it; without one the order is by relevance, which is stable for one
+> query against unchanged data but not across writes. Paging is not a cursor and does not snapshot
+> the index. Do not page through an approximate sort — see below.
+>
+> Paging past the end returns an empty `hits` with `total_hits` intact, rather than an error.
+>
+> ```bash
+> curl -s -X POST http://localhost:9480/api/books/search \
+>   -H "Content-Type: application/json" \
+>   -d '{"query": "science fiction", "limit": 10, "offset": 20, "sort": {"field": "publication_year", "order": "desc"}}'
+> ```
 
 > **Sort results:** You can sort search results by either:
 >
 > 1. Supplying a sort specification in the payload: `"sort": {"field": "year", "order": "desc"}`
 > 2. Embedding a `sort` clause at the end of the Tantivy query: `"query": "space opera sort year:desc"`
 >
-> A numeric or date field must carry the `fast` flag, which `GET /api/{index}` reports per field. Text and string fields sort approximately: the top `2 × limit` matches by relevance are collected and then ordered alphabetically. Order is `asc` unless `desc` is given, and an inline order must be exactly one of those words. The JSON payload always wins over inline `sort` clauses, and a `sort` naming a field the index does not have is reported in `_discarded_clauses`.
+> Sorting is exact on a field the built index has a fast column for, which `GET /api/{index}/_config` reports per field as `sortable`. A numeric or date field needs one to be sorted at all. A text or string field without one is sorted *approximately* rather than refused: the top `2 × limit` matches by relevance are collected and then ordered alphabetically, so the result is not the alphabetically first documents in the index. Such a response carries `_approximate_sort` naming the field — do not page through one, since each page orders a different set of candidates and the pages are not slices of a single order.
+>
+> The column is written when the index is built, so `sortable` cannot be turned on for an index that already holds data: declare the field `fast` in the schema before writing to it. `fast` is the declaration and `sortable` is whether the built index carries it; the two differ for a field declared after the fact.
+>
+> Order is `asc` unless `desc` is given, and an inline order must be exactly one of those words. The JSON payload always wins over inline `sort` clauses, and a `sort` naming a field the index does not have is reported in `_discarded_clauses`.
 
 **Example with sort:**
 ```bash
@@ -212,6 +242,13 @@ curl -s -X POST http://localhost:9480/api/books/search/stream \
 ```
 
 **Response:** NDJSON stream (one hit per line). If no `hits` array is present, falls back to a single JSON body.
+
+> **No `offset` here.** A stream carries the whole result as it is produced, so there is no page to
+> skip to, and a non-zero `offset` on this route is refused with `400` rather than ignored — a
+> silently dropped offset would return the first page for every page requested. Use
+> `POST /api/{index}/search` for a page, or read the stream and skip what you do not want.
+> `"offset": 0` is accepted, so a client that always sends the field needs no special case.
+> `limit` applies as usual and is bounded by `max_search_limit`.
 
 > **Note:** Streaming search returns results as NDJSON for improved performance with large result sets.
 
@@ -396,9 +433,9 @@ curl -s http://localhost:9480/api/books/_config
   "description": "Library catalogue, one document per edition.",
   "field_count": 3,
   "fields": [
-    {"name": "id", "type": "text", "indexed": true, "stored": true, "fast": false, "shadow": false, "searchable": true},
-    {"name": "author", "type": "text", "indexed": true, "stored": false, "fast": false, "shadow": false, "searchable": true},
-    {"name": "title", "type": "text", "indexed": true, "stored": false, "fast": false, "shadow": false, "searchable": true,
+    {"name": "id", "type": "text", "indexed": true, "stored": true, "fast": false, "shadow": false, "searchable": true, "sortable": false},
+    {"name": "author", "type": "text", "indexed": true, "stored": false, "fast": false, "shadow": false, "searchable": true, "sortable": false},
+    {"name": "title", "type": "text", "indexed": true, "stored": false, "fast": false, "shadow": false, "searchable": true, "sortable": false,
      "description": "Title as printed on the edition."}
   ]
 }
@@ -412,6 +449,7 @@ has one description. `fields` is ordered with `id` first, then alphabetically.
 | `type` | Lowercase, and the same name the query syntax reference uses — `text`, `date`, `i64` |
 | `indexed` | What the schema **declares** |
 | `searchable` | Whether the built index can actually match on it. Differs from `indexed` for a field declared after the index was built — see `PATCH /api/{index}/_schema` |
+| `sortable` | Whether the built index can sort on it exactly. The same distinction `searchable` draws, for the fast column a sort orders on: `fast` is the declaration, this is whether the column exists. A numeric sort on a field that is `fast` but not `sortable` fails; a text sort on one returns an approximate order |
 | `fast` | Required to sort on a numeric or date field |
 | `shadow` | The field carries the identifier under its original name; queried through `id` |
 | `stored` | Kept in the search index as well as the document store |

@@ -291,7 +291,10 @@ async fn search_worker(
         round += 1;
 
         let started = Instant::now();
-        match client.search(&index, &query, Some(10), None, None).await {
+        match client
+            .search(&index, &query, Some(10), None, None, None)
+            .await
+        {
             Ok(response) => {
                 observed.record(started.elapsed());
                 if let Some(took) = response.get("took_ms").and_then(|v| v.as_u64()) {

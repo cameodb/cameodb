@@ -123,6 +123,7 @@ Execute full-text search on a single CameoDB index.
 
   **Dropped clauses**: a clause the engine cannot interpret is dropped and the rest of the query runs, which widens a conjunction and disables a negation. This tool fails rather than returning those results, naming the clause it could not use.
 - `limit` (integer, optional): Maximum number of results to return, up to the node's configured ceiling (`[security.limits] max_search_limit`, 10000 by default). The tool's own `inputSchema` carries that number as its `maximum`, so read it there rather than assuming the default. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10. A larger value is refused, whether it arrives as this argument or as an inline `limit` modifier in the query.
+- `offset` (integer, optional): How many hits to skip before the first one returned. With `limit` as the page size, page N is `offset = N * limit`; there are more results when `offset + hits_returned < total_hits`. Defaults to 0. **The ceiling applies to `offset + limit`**, not to either alone: the engine fetches the whole window from the front of every shard and takes the page after merging them, so a deep page costs what a large limit costs and is refused the same way. An offset at or past `total_hits` is answered with an empty page and a `_warning` saying so, rather than an error — see [Paging](#paging).
 - `fields` (array of strings, optional): Field names to include in results (field projection)
 - `sort` (object, optional): Sort results by a field — the same object `search_across_indexes` takes per index. Takes precedence over an inline `sort` clause in the query.
   - `field` (string, required): Field name to sort by (u64, i64, f64, date, or text/string for alphabetic sort)
@@ -165,6 +166,7 @@ Execute federated search across multiple CameoDB indexes with optional per-index
     - `order` (string, optional): `asc` or `desc` (defaults to `asc`)
 - `query` (string, required): Search query applied to all specified indexes
 - `limit` (integer, optional): Maximum total results across all indexes, up to the node's configured ceiling — see `search_index` above. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10.
+- `offset` (integer, optional): How many hits to skip, applied **once, to the merged order** — so page N of a federated search is page N of the combined result, not page N of each index. Each index is asked for `offset + limit` hits from the front and the skip happens after the merge; the same ceiling bounds the sum. Defaults to 0.
 
 **Returns:** Combined results merged by relevance score (or by the sort field if specified). Each hit includes an `_index_source` field indicating its origin index. The response contains only the merged `hits` array — per-index results are not duplicated, keeping token usage proportional to the limit.
 
@@ -194,6 +196,14 @@ Retrieve schema and statistics for a single CameoDB index.
 
 `description` appears on the index and on a field only when an operator wrote one. It is the one part of a schema that says what the data is rather than how it is shaped, so prefer it over anything a field name suggests; most indexes carry none, and its absence says nothing about them. See [Create/Update Index Schema](../../docs/API_REFERENCE.md#createupdate-index-schema) for how they are set and the length limits.
 
+Two of the per-field flags are answers rather than declarations, and they are the ones to read
+before writing a query. `indexed` is what the schema says; `searchable` is whether the built index
+can actually reach the field — they differ for a field declared after the index was built, which is
+`indexed` and matches nothing. `fast` is likewise a declaration, and `sortable` is whether the built
+index carries the column a sort orders on: a numeric sort on a field that is `fast` but not
+`sortable` fails, and a text sort on one silently returns an approximate order. Sort on `sortable`
+fields; query `searchable` ones.
+
 A field marked `shadow` is the document identifier under the name the source data gave it. The value lives only in `id` and is not stored or indexed again under that name, so the field is a name in the schema rather than data in the index — and the name is applied to `id` in both directions. It is queryable despite being unindexed (`shadow_field:VALUE` on its own is the same key-value lookup as `id:VALUE`), and every hit returns the identifier under the shadow name with no `id` field, so `indexed` alone answers neither what may be queried nor what may be projected.
 
 **Example:**
@@ -215,21 +225,27 @@ A field marked `shadow` is the document identifier under the name the source dat
       "field": "id",
       "type": "text",
       "indexed": true,
+      "searchable": true,
       "fast": false,
+      "sortable": false,
       "shadow": false
     },
     {
       "field": "sha1",
       "type": "text",
       "indexed": false,
+      "searchable": true,
       "fast": false,
+      "sortable": false,
       "shadow": true
     },
     {
       "field": "year",
       "type": "i64",
       "indexed": true,
+      "searchable": true,
       "fast": true,
+      "sortable": true,
       "shadow": false,
       "description": "Year of publication, not of submission."
     }
@@ -333,6 +349,40 @@ Return statistics for a single CameoDB index or aggregated statistics across all
 }
 ```
 
+## Paging
+
+`limit` is the page size and `offset` is where the page starts, so page N is `offset = N * limit`.
+Both search tools take them, and both are also writable inline — `title:rust limit 10 offset 20` —
+which is how the bundled client and the REPL express them. An argument wins over the inline form.
+
+Every response says what it ran with. There are more results when
+`offset + hits_returned < total_hits`, which is the test to walk a result to its end; `total_hits`
+counts what matched and is unaffected by either number.
+
+Three things worth knowing before paging through a large result:
+
+**The ceiling applies to `offset + limit`.** A page is served by asking every shard and every index
+for the whole window from the front and taking the slice after merging them — the skip cannot be
+pushed down, because all of a page may come from one source. So the node fetches `offset + limit`
+hits however small the page is, a deep page costs exactly what a large limit costs, and
+`[security.limits] max_search_limit` bounds the sum. `offset: 9990` with no `limit` is refused on a
+node whose ceiling is 10000, because the default limit of 10 is counted too.
+
+**A page needs an order to be a page of.** With a `sort` on a `sortable` field the order is total
+and pages are consecutive slices of it. Without one the order is by relevance, which is stable for
+one query against unchanged data but says nothing across writes — a document written between two
+requests can shift everything after it. Neither is a snapshot: paging is not a cursor.
+
+**Do not page through an approximate sort.** A sort on a text field with no fast column orders the
+top `2 × limit` scoring candidates rather than everything that matched, and each page collects a
+*different* set of candidates — so the pages are not slices of one order and cannot be assembled.
+Such a response says so: `_approximate_sort` names the field, and `_warning` explains it.
+`describe_index` reports `sortable: false` for the field beforehand.
+
+Paging past the end is not an error. It returns an empty `hits` with `total_hits` intact and a
+`_warning` naming the last offset that holds a document, so an empty page is never mistaken for a
+query that stopped matching.
+
 ## MCP Resources
 
 CameoDB exposes indexes as MCP resources for exploration via `resources/list` and `resources/read`.
@@ -399,6 +449,7 @@ schema, and the table below, which is generated and checked against the tables b
 |---|---|---|
 | `return f1,f2` | Return only these fields, in this order. | `title:rust return title,author` |
 | `limit N` | Cap the number of results. | `title:rust limit 5` |
+| `offset K` | Skip the first K results — the page, where `limit` is the page size. `offset + limit` is bounded by the same maximum `limit` is. | `title:rust limit 10 offset 20` |
 | `sort field:desc` | Order by a field. See the sorting rules. | `title:rust sort year:desc` |
 
 - A modifier counts only where it opens an unbroken run of clauses reaching the end of the query, with query text left in front of it. Anything else is searched for, so `find tax return forms` is four terms and `* limit 10` is how to ask for a bare limit.
@@ -416,8 +467,9 @@ schema, and the table below, which is generated and checked against the tables b
 
 **Sorting**
 
-- Sorting on a numeric or date field requires the `fast` flag on that field, reported per field by `describe_index`.
-- Sorting on a text or string field is approximate: the top `2 × limit` matches by relevance are collected and then ordered alphabetically, so the result is not the alphabetically first documents in the index.
+- Sorting is exact on a field with a fast column, and `describe_index` reports which those are as `sortable`. A numeric or date field needs one to be sorted at all; a text or string field without one is sorted approximately rather than refused.
+- An approximate sort collects the top `2 × limit` matches by relevance and orders those alphabetically, so the result is not the alphabetically first documents in the index and paging through it re-orders a different sample on each page. The response says so: it carries `_approximate_sort` naming the field, and a `_warning`.
+- A field's fast column is written when the index is built, so `sortable` cannot be turned on for an index that already has data. Declare the field `fast` before writing to it.
 - Under a numeric or date sort every hit carries `_score` of 1.0, because no relevance score is computed. Do not read it as a ranking.
 - Ascending unless `desc` is given.
 

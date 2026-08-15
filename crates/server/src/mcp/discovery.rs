@@ -142,6 +142,7 @@ pub(super) fn validate_query(
                             "type": info.field_type,
                             "indexed": info.indexed,
                             "fast": info.fast,
+                            "sortable": info.sortable,
                             "shadow": info.is_shadow,
                             "searchable": info.searchable,
                             "queryable": info.is_queryable(),
@@ -161,11 +162,17 @@ pub(super) fn validate_query(
                 // `fast` belongs here as much as the other flags: it is what decides whether a
                 // field can be sorted on, and a caller choosing how to query has to know.
                 // Leaving it out was one of the spellings that differed between surfaces.
+                //
+                // `sortable` sits beside it for the reason `searchable` sits beside `indexed`:
+                // `fast` is the declaration and `sortable` is whether the built index carries
+                // the column. They differ for a field declared after the index was built, and a
+                // caller picking a field to sort on needs the second one.
                 let mut entry = serde_json::json!({
                     "name": info.name,
                     "type": info.field_type,
                     "indexed": info.indexed,
                     "fast": info.fast,
+                    "sortable": info.sortable,
                     "shadow": info.is_shadow,
                     "searchable": info.searchable,
                     "queryable": info.is_queryable(),

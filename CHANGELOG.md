@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Paging: `offset` on a search.** `total_hits` reported how many documents matched and there was
+  no way to reach the eleventh. Both HTTP search routes, both MCP search tools, the bundled SDK
+  (`search(..., offset, ...)`), the `cameodb search --offset` flag and the query grammar
+  (`title:rust limit 10 offset 20`) now take one, and every search response reports the `offset` it
+  ran with beside its `limit`.
+
+  The skip is applied **once, after merging**, never inside a source. Every shard and every index
+  is asked for `offset + limit` hits from the front, because all of one page may come from one of
+  them — a source that skipped `offset` of its own hits would drop rows belonging on the page and
+  promote rows that do not. This is also why Tantivy's `and_offset` is not used: right for one
+  segment, wrong for a scatter-gather.
+
+  The consequence a caller has to know is that **`max_search_limit` bounds `offset + limit`**, not
+  either alone: the window is what gets fetched, so a deep page costs what a large limit costs. The
+  bound is enforced on every surface, and an `offset` sent with no `limit` counts the node's
+  default against it.
+
+  Paging past the end returns an empty page with `total_hits` intact and a warning naming the last
+  offset that holds a document — not an error, and not a report that the query matched nothing.
+
+- **Text and string fields can be sorted exactly.** Declaring such a field `fast` now builds the
+  string fast column Tantivy orders on by term ordinal, giving a true lexicographic order over
+  every match instead of the old approximation. The column is written at index time, so the
+  declaration has to be in place before the data is.
+
+- **`sortable` on every field description**, beside `searchable`, and for the same reason: `fast`
+  is a declaration and `sortable` is whether the built index carries the column a sort orders on.
+  They differ for a field declared after the index was built, and only the engine can tell — a
+  numeric sort on a `fast` field with no column fails, and a text sort on one silently returns an
+  approximate order. Reported by `GET /api/{index}/_config`, `GET /_indexes`,
+  `GET /_cluster/_indexes` and `describe_index`.
+
+- **An approximate sort is reported on the response that carries it.** A sort on a text field with
+  no fast column returns the alphabetical order of the top-scoring candidates rather than of every
+  match, and the hits look exactly like an exact answer. The response now carries
+  `_approximate_sort` naming the field, and the MCP tools add a `_warning` explaining what it means
+  for the order and why paging through it does not work. It was previously a line in the node's
+  log, where the caller could not see it.
+
 - **`validate_query` runs the real parser.** It checked that quotes and parentheses balanced and
   that named fields existed, which left out the case the tool is recommended for: a query that
   balances fine and still does not parse. `title:`, `title:[2020 TO`, `year:{2020 TO 2021` and a
@@ -21,6 +60,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   above the engine could answer this.
 
 ### Fixed
+
+- **A federated page was the wrong page.** `search_across_indexes` passed the caller's `offset` down
+  to each index *and* applied it again to the merged result, so page 2 was page 3 of an order
+  assembled from the wrong candidates — each index having already dropped its own first `offset`
+  hits, which are not the same documents as the merged first `offset`. Each index is now asked for
+  `offset + limit` from the front and the skip happens once, after the merge.
+
+- **`POST /api/{index}/search` enforced no limit at all.** Neither `limit` nor `offset` was checked
+  against `max_search_limit` on the HTTP surface — the ceiling existed only on the MCP tools. Since
+  the engine fetches `offset + limit` hits and Tantivy's collector allocates against that number
+  before matching anything, `{"limit": 10, "offset": 500000000}` was a request that looks like ten
+  documents and asks the node for an allocation of its own choosing. Both routes now bound the
+  window and refuse with `400`.
+
+- **`POST /api/{index}/search/stream` accepted an `offset` and ignored it.** Both routes share one
+  payload type, so the field deserialized and was dropped: a client paging over the stream received
+  page 1 every time with nothing saying so. A non-zero offset is now refused, naming the route that
+  does page.
+
+- **A page past the end was reported as a query that matched nothing.** The MCP zero-results advice
+  reads only the query text, so an agent that paged too far was told its quoted phrase or `AND`
+  clause was too narrow — about a query that had matched hundreds of documents. The two cases are
+  now told apart, and the paging one names the last offset that holds a hit.
+
+- **An omitted `limit` counted as zero when bounding a window**, so `offset` at exactly
+  `max_search_limit` passed a check the engine then exceeded by the default limit. The advertised
+  ceiling is now the enforced one.
 
 - **The cluster index listing no longer describes the same index two ways.** `GET
   /_cluster/_indexes` dropped `memory_*` and `warm_shards` from its top-level rollup while

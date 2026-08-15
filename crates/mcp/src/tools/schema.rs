@@ -27,6 +27,15 @@ use crate::backend::{McpIndexSearchRequest, SortSpec};
 /// enforces it, so a client is never refused for exceeding a bound it was not shown.
 pub const DEFAULT_MAX_SEARCH_LIMIT: usize = 10_000;
 
+/// The `limit` a search runs with when the call names none.
+///
+/// The number the schema descriptions have always quoted to callers ("If omitted, defaults to
+/// 10"). It is a constant here because `offset` is bounded against `offset + limit`, so the
+/// dispatcher has to know what an omitted `limit` will become — see
+/// [`McpBackend::default_search_limit`](crate::McpBackend::default_search_limit), which a host
+/// overrides when its own default differs.
+pub const DEFAULT_SEARCH_LIMIT: usize = 10;
+
 /// The most indexes one federated search may name.
 ///
 /// Each name is a full scatter-gather across that index's shards, so the argument is a
@@ -135,7 +144,7 @@ pub(crate) fn search_index_input_schema(max_search_limit: usize) -> JsonValue {
             },
             "query": {
                 "type": "string",
-                "description": "Search query string. Supports field:value, phrases, AND/OR/NOT, ranges, and inline 'return'/'limit'/'sort' modifiers. Use 'limit 0' for count-only queries. Inline sort: 'sort field:asc' or 'sort field:desc'."
+                "description": "Search query string. Supports field:value, phrases, AND/OR/NOT, ranges, and inline 'return'/'limit'/'offset'/'sort' modifiers. Use 'limit 0' for count-only queries. Inline sort: 'sort field:asc' or 'sort field:desc'; inline paging: 'limit 10 offset 20'. An argument wins over the same modifier written inline."
             },
             "limit": {
                 "type": "integer",
@@ -148,7 +157,9 @@ pub(crate) fn search_index_input_schema(max_search_limit: usize) -> JsonValue {
             "offset": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "How many hits to skip before the first one returned (paging offset). The engine fetches offset + limit hits, so offset + limit must not exceed the limit maximum. Defaults to 0."
+                "description": format!(
+                    "How many hits to skip before the first one returned. With `limit` as the page size, page N is `offset = N * limit`. There are more results when `offset + hits_returned < total_hits`, and an offset at or past `total_hits` returns an empty page with a `_warning` saying so rather than an error. The engine fetches offset + limit hits, so `offset + limit` must not exceed {max_search_limit} — a deep page costs what a large limit costs. Sorting is what makes a page mean anything: without a `sort` the order is by relevance, which is stable for one query against unchanged data but not across writes. Defaults to 0."
+                )
             },
             "fields": {
                 "type": "array",
@@ -214,7 +225,9 @@ pub(crate) fn search_across_indexes_input_schema(max_search_limit: usize) -> Jso
             "offset": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "How many hits to skip before the first one returned (paging offset), applied after merging across all indexes. The engine fetches offset + limit hits from each source, so offset + limit must not exceed the limit maximum. Defaults to 0."
+                "description": format!(
+                    "How many hits to skip before the first one returned, applied once after merging across every index — so page N of a federated search is page N of the combined order, not of each index separately. With `limit` as the page size, page N is `offset = N * limit`. Each index is asked for offset + limit hits, so `offset + limit` must not exceed {max_search_limit}. Defaults to 0."
+                )
             }
         },
         "required": ["indexes", "query"],
@@ -254,11 +267,15 @@ fn search_result_properties() -> JsonValue {
         },
         "offset": {
             "type": "integer",
-            "description": "The offset the search ran with — how many hits were skipped before the first one returned. Defaults to 0 when no offset was requested."
+            "description": "The offset the search ran with — how many hits were skipped before the first one returned. There are more results when `offset + hits_returned < total_hits`; the next page is `offset + limit`. Defaults to 0 when no offset was requested."
         },
         "_warning": {
             "type": "string",
-            "description": "Present when the response needs explaining: nothing matched and something narrowed the query, or hits were left out. Read it before reporting the result."
+            "description": "Present when the response needs explaining: nothing matched and something narrowed the query, the page starts past the end of the result, the order is approximate, or hits were left out. Read it before reporting the result."
+        },
+        "_approximate_sort": {
+            "type": "string",
+            "description": "Present when the hits are sorted on a field with no fast column, naming that field. The order is then the alphabetical order of the highest-scoring candidates rather than of everything that matched, so a document that belongs first may be absent and each page re-orders a different sample. Do not report such an order as ranked, and do not page through it. `describe_index` reports `sortable: false` for the field."
         },
         "_truncated": {
             "type": "boolean",

@@ -273,6 +273,8 @@ struct BroadcastStats {
     total_hits_sum: usize,
     /// Distinct dropped clauses across the nodes that answered.
     discarded: Vec<String>,
+    /// The approximated sort field, if any node reported one; see [`APPROXIMATE_SORT_FIELD`].
+    approximate_sort: Option<String>,
 }
 
 /// Metadata field carrying the normalized sort value of a hit.
@@ -377,6 +379,40 @@ fn collect_discarded(responses: &[JsonValue]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Response key naming the field whose sort order is an approximation.
+///
+/// Absent when the order is exact, which is the common case — present means the hits are in the
+/// alphabetical order of a *sample* of the matches rather than of all of them. See
+/// [`storage::SearchOutcome::approximate_sort`].
+///
+/// Carries the field name rather than `true`, because the caller's next move is to look that
+/// field up in the schema and see that it has no fast column.
+pub const APPROXIMATE_SORT_FIELD: &str = "_approximate_sort";
+
+/// Attach [`APPROXIMATE_SORT_FIELD`] to a search response, if the order returned is approximate.
+fn attach_approximate_sort(response: &mut JsonValue, field: Option<String>) {
+    let Some(field) = field else {
+        return;
+    };
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(APPROXIMATE_SORT_FIELD.to_string(), JsonValue::String(field));
+    }
+}
+
+/// The approximated field from per-node responses, if any node reported one.
+///
+/// One field, not a list: every node ran the same sort on the same field, so either that field
+/// has a fast column everywhere or it has one nowhere. A node whose shards are all empty reports
+/// nothing at all, which is why the first answer wins rather than requiring agreement.
+fn collect_approximate_sort(responses: &[JsonValue]) -> Option<String> {
+    responses.iter().find_map(|response| {
+        response
+            .get(APPROXIMATE_SORT_FIELD)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    })
 }
 
 /// Produce a comparable sort key for a hit's raw field value.
@@ -527,6 +563,55 @@ impl SearchWindow {
     /// The first `limit` hits — what every caller that does not page asks for.
     pub fn first(limit: usize) -> Self {
         SearchWindow { offset: 0, limit }
+    }
+
+    /// Resolve a request's `limit` and `offset` into a window, or say why it cannot be served.
+    ///
+    /// Every request surface goes through here, so that all of them apply the node's default and
+    /// its ceiling the same way. Two things it settles that a per-surface check kept getting
+    /// wrong:
+    ///
+    /// An absent `limit` means the node's default, not zero. Bounding `offset + 0` lets
+    /// `offset = max_search_limit` past a check the engine then exceeds by the default, so the
+    /// advertised ceiling was not the real one.
+    ///
+    /// The ceiling applies to `offset + limit` rather than to `limit`, because that sum is what
+    /// gets fetched: every source is asked for the whole window from the front (see
+    /// [`Self::fetch_count`]), and Tantivy's collector allocates against the number it is given
+    /// before it has matched anything. So a deep page is exactly as expensive as a large limit,
+    /// and `max_search_limit` has to bound both or it bounds neither.
+    pub fn checked(
+        limit: Option<usize>,
+        offset: Option<usize>,
+        default_limit: usize,
+        max_search_limit: usize,
+    ) -> Result<Self, String> {
+        let window = SearchWindow {
+            offset: offset.unwrap_or(0),
+            limit: limit.unwrap_or(default_limit),
+        };
+
+        if window.limit > max_search_limit {
+            return Err(format!(
+                "limit {} is above the maximum of {max_search_limit}; ask for at most that many \
+                 hits, or narrow the query",
+                window.limit
+            ));
+        }
+
+        if window.fetch_count() > max_search_limit {
+            return Err(format!(
+                "offset {} + limit {} = {} is above the maximum of {max_search_limit}; the \
+                 engine fetches offset + limit hits, so a page this deep costs what a limit that \
+                 large costs. Narrow the query, or sort on a field that lets you resume from the \
+                 last hit instead of paging.",
+                window.offset,
+                window.limit,
+                window.fetch_count()
+            ));
+        }
+
+        Ok(window)
     }
 
     /// How many hits each source must return for this window to be servable from them.
@@ -1116,6 +1201,14 @@ pub struct SearchReply {
     /// Defaulted because this type crosses the cluster wire and a peer may not send the field.
     #[serde(default)]
     pub discarded: Vec<String>,
+    /// The field whose order is approximate, if the sort could not be exact; see
+    /// [`storage::SearchOutcome::approximate_sort`].
+    ///
+    /// Defaulted for the same reason as `discarded`. A peer that does not send it is read as
+    /// "exact", which is the safe direction only because the field is advisory — the hits are
+    /// the same either way.
+    #[serde(default)]
+    pub approximate_sort: Option<String>,
 }
 
 /// Client operation messages for RouterActor.
@@ -2301,6 +2394,10 @@ impl OrchestratorEngine {
         let mut total_hits_sum = 0usize;
         // Every shard parses the same query string, so collect the distinct set.
         let mut discarded: Vec<String> = Vec::new();
+        // Every shard runs the same sort against the same schema, so one shard reporting an
+        // approximate order describes the whole answer. A shard with no built index reports
+        // nothing, hence first-wins rather than agreement.
+        let mut approximate_sort: Option<String> = None;
         for (shard_id, result) in shard_results {
             match result {
                 Ok(r) => {
@@ -2313,6 +2410,7 @@ impl OrchestratorEngine {
                             discarded.push(note);
                         }
                     }
+                    approximate_sort = approximate_sort.or(r.approximate_sort);
                     shard_success += 1;
                 }
                 Err(err) => {
@@ -2375,6 +2473,7 @@ impl OrchestratorEngine {
         attach_shard_errors(&mut response, errors);
         discarded.extend(unknown_modifier_fields(&schema, fields, sort));
         attach_discarded(&mut response, discarded);
+        attach_approximate_sort(&mut response, approximate_sort);
         Ok(response)
     }
 }
@@ -3092,6 +3191,7 @@ impl MicroshardActor {
             hits: search_hits,
             total_hits: outcome.total_hits,
             discarded: outcome.discarded,
+            approximate_sort: outcome.approximate_sort,
         })
     }
 
@@ -3372,6 +3472,7 @@ impl Message<SearchRequest> for MicroshardActor {
                 hits: result.hits,
                 total_hits: result.total_hits,
                 discarded: result.discarded,
+                approximate_sort: result.approximate_sort,
             })
             .map_err(RemoteError::from)
     }
@@ -4071,6 +4172,7 @@ impl RouterActor {
                 max_took_ms: None,
                 total_hits_sum: 0,
                 discarded: Vec::new(),
+                approximate_sort: None,
             };
 
             // One block per source, taken whole. Ordering across blocks is
@@ -4100,6 +4202,10 @@ impl RouterActor {
                         stats.discarded.push(note);
                     }
                 }
+                stats.approximate_sort = stats
+                    .approximate_sort
+                    .take()
+                    .or_else(|| collect_approximate_sort(std::slice::from_ref(value)));
                 stats.nodes_contacted += 1;
                 if let Some(t) = value.get("took_ms").and_then(|v| v.as_u64()) {
                     stats.max_took_ms = match stats.max_took_ms {
@@ -4164,6 +4270,7 @@ impl RouterActor {
                 }
             });
             attach_discarded(&mut response, stats.discarded);
+            attach_approximate_sort(&mut response, stats.approximate_sort);
             return Ok(response);
         }
 
@@ -4224,6 +4331,7 @@ impl RouterActor {
                 let mut total_hits_sum = 0usize;
                 // Read before the loop below consumes `all_results`.
                 let discarded = collect_discarded(&all_results);
+                let approximate_sort = collect_approximate_sort(&all_results);
 
                 for mut result in all_results {
                     if let Some(hits) = result.get_mut("hits").and_then(|h| h.as_array_mut()) {
@@ -4267,6 +4375,7 @@ impl RouterActor {
                     }
                 });
                 attach_discarded(&mut response, discarded);
+                attach_approximate_sort(&mut response, approximate_sort);
                 Ok(response)
             }
             ClientOp::Write { .. } | ClientOp::BulkWrite { .. } => {
@@ -4388,8 +4497,9 @@ impl RouterActor {
                                 entry.description = Some(text.to_string());
                             }
 
-                            // Merged by name, and `searchable` is OR-ed: one node able to search
-                            // the field is enough, since the search reaches all of them.
+                            // Merged by name. `searchable` and `sortable` are both OR-ed: one node
+                            // holding the column is enough, since the search reaches all of them
+                            // and each answers from what it has.
                             if let Some(fields) = idx.get("fields").and_then(|v| v.as_array()) {
                                 for field in fields {
                                     let Some(field_name) =
@@ -4399,17 +4509,19 @@ impl RouterActor {
                                     };
                                     match entry.fields.get_mut(field_name) {
                                         Some(existing) => {
-                                            let searchable_here = field
-                                                .get("searchable")
-                                                .and_then(|v| v.as_bool())
-                                                .unwrap_or(false);
-                                            if searchable_here
-                                                && let Some(obj) = existing.as_object_mut()
-                                            {
-                                                obj.insert(
-                                                    "searchable".to_string(),
-                                                    JsonValue::Bool(true),
-                                                );
+                                            for flag in ["searchable", "sortable"] {
+                                                let set_here = field
+                                                    .get(flag)
+                                                    .and_then(|v| v.as_bool())
+                                                    .unwrap_or(false);
+                                                if set_here
+                                                    && let Some(obj) = existing.as_object_mut()
+                                                {
+                                                    obj.insert(
+                                                        flag.to_string(),
+                                                        JsonValue::Bool(true),
+                                                    );
+                                                }
                                             }
                                         }
                                         None => {
@@ -5806,10 +5918,21 @@ impl NodeOrchestrator {
     /// nothing. A shadow field is searchable regardless: it names the identifier, which is
     /// answered from redb without the search index at all.
     ///
+    /// `sortable` is the same distinction one property along, and it exists for the same reason.
+    /// `fast` is a *declaration*; the column a sort orders on is written at index time from that
+    /// declaration, so a field can be `fast: true` with no column behind it — after which a
+    /// numeric sort on it errors and a text sort on it silently returns the alphabetical order of
+    /// a sample. Only the engine can see which, so a caller choosing a field to sort on reads
+    /// `sortable`, not `fast`.
+    ///
     /// `_seq` is omitted everywhere. It is WAL bookkeeping, and offering it as a queryable field
     /// invites a query that cannot mean anything. Filtering it in one place also settles an
     /// inconsistency where one response reported two different field counts.
-    fn describe_fields(schema: &IndexSchema, searchable: &HashSet<String>) -> Vec<JsonValue> {
+    fn describe_fields(
+        schema: &IndexSchema,
+        searchable: &HashSet<String>,
+        sortable: &HashSet<String>,
+    ) -> Vec<JsonValue> {
         Self::sorted_field_names(schema)
             .into_iter()
             .filter(|name| name != "_seq")
@@ -5828,6 +5951,10 @@ impl NodeOrchestrator {
                 entry.insert(
                     "searchable".to_string(),
                     JsonValue::Bool(field.is_shadow || searchable.contains(&name)),
+                );
+                entry.insert(
+                    "sortable".to_string(),
+                    JsonValue::Bool(sortable.contains(&name)),
                 );
                 if let Some(description) = &field.description {
                     entry.insert(
@@ -5855,6 +5982,7 @@ impl NodeOrchestrator {
         index: &str,
         schema: &IndexSchema,
         searchable: &HashSet<String>,
+        sortable: &HashSet<String>,
     ) -> JsonValue {
         let mut map = JsonMap::new();
         map.insert("name".to_string(), JsonValue::String(index.to_string()));
@@ -5864,30 +5992,46 @@ impl NodeOrchestrator {
                 JsonValue::String(description.clone()),
             );
         }
-        let fields = Self::describe_fields(schema, searchable);
+        let fields = Self::describe_fields(schema, searchable, sortable);
         map.insert("field_count".to_string(), JsonValue::from(fields.len()));
         map.insert("fields".to_string(), JsonValue::Array(fields));
         JsonValue::Object(map)
     }
 
-    /// Every field the built index can search, across every shard holding this index.
-    async fn searchable_fields_across_shards(&self, index: &str) -> HashSet<String> {
+    /// Every field the built index can search, and every field it can sort exactly, across every
+    /// shard holding this index.
+    ///
+    /// Gathered together because they come from the same open of the same index and are reported
+    /// side by side on the same field entry — two passes over the shards to answer one question
+    /// about each field would double the cost of describing an index for nothing.
+    ///
+    /// A union in both cases: a shard that has not built this index yet reports neither set, and
+    /// describing the field as unsearchable because one shard is empty would be a worse answer
+    /// than the one every populated shard gives.
+    async fn field_capabilities_across_shards(
+        &self,
+        index: &str,
+    ) -> (HashSet<String>, HashSet<String>) {
         let stores: Vec<Arc<HybridStore>> = self
             .shards
             .values()
             .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
             .collect();
 
-        let mut union = HashSet::new();
+        let mut searchable = HashSet::new();
+        let mut sortable = HashSet::new();
         for store in stores {
             let idx = index.to_string();
-            if let Ok(names) =
-                tokio::task::spawn_blocking(move || store.searchable_fields(&idx)).await
+            if let Ok((found, sorted)) = tokio::task::spawn_blocking(move || {
+                (store.searchable_fields(&idx), store.sortable_fields(&idx))
+            })
+            .await
             {
-                union.extend(names);
+                searchable.extend(found);
+                sortable.extend(sorted);
             }
         }
-        union
+        (searchable, sortable)
     }
 
     /// Creates a new NodeOrchestrator with the given configuration and identity.
@@ -7337,6 +7481,9 @@ impl NodeOrchestrator {
         let mut total_hits_sum = 0usize;
         // Every shard parses the same query string, so collect the distinct set.
         let mut discarded: Vec<String> = Vec::new();
+        // One shard reporting an approximate order describes the whole answer; see the same
+        // gather in `engine_search`.
+        let mut approximate_sort: Option<String> = None;
         for (shard_id, result) in shard_results {
             match result {
                 Ok(r) => {
@@ -7349,6 +7496,7 @@ impl NodeOrchestrator {
                             discarded.push(note);
                         }
                     }
+                    approximate_sort = approximate_sort.or(r.approximate_sort);
                     shard_success += 1;
                 }
                 Err(err) => {
@@ -7408,6 +7556,7 @@ impl NodeOrchestrator {
         attach_shard_errors(&mut response, errors);
         discarded.extend(unknown_modifier_fields(&schema, fields, sort));
         attach_discarded(&mut response, discarded);
+        attach_approximate_sort(&mut response, approximate_sort);
         Ok(response)
     }
 
@@ -7703,8 +7852,8 @@ impl NodeOrchestrator {
                         num_fields = s.fields.len(),
                         "Schema found in shard"
                     );
-                    let searchable = self.searchable_fields_across_shards(index).await;
-                    return Ok(Self::schema_response(index, &s, &searchable));
+                    let (searchable, sortable) = self.field_capabilities_across_shards(index).await;
+                    return Ok(Self::schema_response(index, &s, &searchable, &sortable));
                 }
             }
         }
@@ -7803,6 +7952,9 @@ impl NodeOrchestrator {
             /// query on that field, and a scatter-gather asks every shard. Reporting the
             /// intersection would call a field unsearchable because one empty shard lacks it.
             searchable: HashSet<String>,
+            /// Union of the fields the built index can sort exactly, across shards, on the same
+            /// reasoning.
+            sortable: HashSet<String>,
         }
 
         let mut all: HashMap<String, IndexTotals> = HashMap::new();
@@ -7853,6 +8005,9 @@ impl NodeOrchestrator {
                         for field in stats.searchable_fields {
                             entry.searchable.insert(field);
                         }
+                        for field in stats.sortable_fields {
+                            entry.sortable.insert(field);
+                        }
                     }
                 }
                 Err(e) => return Err(e),
@@ -7885,6 +8040,7 @@ impl NodeOrchestrator {
                 shard_count,
                 warm_shards,
                 searchable,
+                sortable,
             } = totals;
             let mut json_obj = JsonMap::new();
             json_obj.insert("name".to_string(), JsonValue::String(name.clone()));
@@ -7931,7 +8087,7 @@ impl NodeOrchestrator {
                             JsonValue::String(description.clone()),
                         );
                     }
-                    let fields = Self::describe_fields(&schema, &searchable);
+                    let fields = Self::describe_fields(&schema, &searchable, &sortable);
                     json_obj.insert("field_count".to_string(), JsonValue::from(fields.len()));
                     json_obj.insert("fields".to_string(), JsonValue::Array(fields));
                 }

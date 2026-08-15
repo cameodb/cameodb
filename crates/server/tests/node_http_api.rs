@@ -170,7 +170,7 @@ async fn a_written_document_is_retrievable_by_id() {
         .expect("write");
 
     let found = client
-        .search("books", "id:b1", Some(10), None, None)
+        .search("books", "id:b1", Some(10), None, None, None)
         .await
         .expect("search");
 
@@ -202,7 +202,7 @@ async fn a_committed_document_is_searchable_by_content() {
         .expect("explicit commit");
 
     let found = client
-        .search("books", "title:Neuromancer", Some(10), None, None)
+        .search("books", "title:Neuromancer", Some(10), None, None, None)
         .await
         .expect("search");
 
@@ -247,7 +247,14 @@ async fn searching_an_unknown_index_is_empty_and_leaves_the_node_serving() {
     let client = node.client();
 
     let found = client
-        .search("no_such_index", "title:anything", Some(10), None, None)
+        .search(
+            "no_such_index",
+            "title:anything",
+            Some(10),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("querying an unknown index is answered, not refused");
 
@@ -413,7 +420,7 @@ async fn changing_a_flag_leaves_the_rest_of_the_schema_alone() {
     // The document still routes and reads back, which is the observable half of the routing
     // field surviving the edit.
     let hits = client
-        .search("papers", "id:p1", Some(10), None, None)
+        .search("papers", "id:p1", Some(10), None, None, None)
         .await
         .expect("search");
     assert_eq!(
@@ -589,4 +596,422 @@ async fn get_json(node: &TestNode, path: &str) -> serde_json::Value {
         .json()
         .await
         .expect("json")
+}
+
+/// A POST against the node with a raw JSON body, returning the status and the decoded body.
+///
+/// The SDK is the right tool for a supported request; this is for the ones a client should
+/// never send, where what is being tested is the refusal itself.
+async fn post_json(
+    node: &TestNode,
+    path: &str,
+    body: serde_json::Value,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    with_tls_provider();
+    let resp = reqwest::Client::new()
+        .post(format!("{}{path}", node.url))
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    (status, resp.json().await.unwrap_or(json!(null)))
+}
+
+/// Write `count` documents that sort unambiguously, and commit so they are searchable.
+///
+/// `rank` is a fast i64, so an ordered page is a page of a *total* order and this test can
+/// assert exact membership rather than "some documents came back". `d000`, `d001`, … keep the
+/// id in the same order as the rank.
+async fn seed_ordered(node: &TestNode, index: &str, count: usize) {
+    let client = node.client();
+    let docs: Vec<serde_json::Value> = (0..count)
+        .map(|n| {
+            let id = format!("d{n:03}");
+            json!({"id": id, "doc": {"id": id, "rank": n as i64, "body": "page"}})
+        })
+        .collect();
+    client.bulk_index(index, &docs).await.expect("bulk write");
+    client.admin_index_commit(index).await.expect("commit");
+}
+
+/// The ids of a search response's hits, in the order they came back.
+fn hit_ids(found: &serde_json::Value) -> Vec<String> {
+    found["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn rank_sort() -> storage::SortSpec {
+    storage::SortSpec {
+        field: "rank".to_string(),
+        order: storage::SortOrder::Asc,
+    }
+}
+
+/// Paging returns consecutive, non-overlapping slices of one order.
+///
+/// The property that makes paging worth having, and the one no unit test can reach: these
+/// hits are gathered from two shards and merged, so a page is only meaningful if the skip is
+/// applied once to the merged order rather than inside each shard. Asserted as exact
+/// membership against a sort with no ties.
+#[tokio::test]
+async fn paging_walks_the_result_without_repeating_or_skipping_a_document() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+    seed_ordered(&node, "paged", 25).await;
+
+    let mut seen: Vec<String> = Vec::new();
+    for page in 0..5 {
+        let found = client
+            .search(
+                "paged",
+                "body:page",
+                Some(5),
+                Some(page * 5),
+                None,
+                Some(rank_sort()),
+            )
+            .await
+            .expect("search");
+
+        assert_eq!(found["offset"], json!(page * 5), "page {page}");
+        assert_eq!(found["limit"], json!(5), "page {page}");
+        assert_eq!(found["total_hits"], json!(25), "page {page}");
+        seen.extend(hit_ids(&found));
+    }
+
+    let expected: Vec<String> = (0..25).map(|n| format!("d{n:03}")).collect();
+    assert_eq!(
+        seen, expected,
+        "five pages of five should be the whole result, in order, each document once"
+    );
+}
+
+/// One page equals the same slice of one large request.
+///
+/// Paging is only a way of reading a result if it does not *change* the result. Compared
+/// against the unpaged answer rather than against a hand-written expectation, so the two can
+/// only agree by actually agreeing.
+#[tokio::test]
+async fn a_page_is_the_same_slice_an_unpaged_search_would_have_returned() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+    seed_ordered(&node, "slices", 20).await;
+
+    let whole = client
+        .search(
+            "slices",
+            "body:page",
+            Some(20),
+            None,
+            None,
+            Some(rank_sort()),
+        )
+        .await
+        .expect("unpaged search");
+    let all = hit_ids(&whole);
+    assert_eq!(all.len(), 20, "the unpaged search should return everything");
+
+    for (offset, limit) in [(0, 20), (0, 3), (7, 4), (17, 3), (19, 1)] {
+        let page = client
+            .search(
+                "slices",
+                "body:page",
+                Some(limit),
+                Some(offset),
+                None,
+                Some(rank_sort()),
+            )
+            .await
+            .expect("paged search");
+        assert_eq!(
+            hit_ids(&page),
+            all[offset..offset + limit],
+            "offset {offset} limit {limit}"
+        );
+    }
+}
+
+/// A page past the end is an empty page, not an error and not a wrong answer.
+///
+/// `total_hits` still reports the whole result, so a caller can tell it paged too far rather
+/// than that the query stopped matching.
+#[tokio::test]
+async fn a_page_past_the_end_is_empty_and_still_reports_the_total() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+    seed_ordered(&node, "short", 3).await;
+
+    let found = client
+        .search(
+            "short",
+            "body:page",
+            Some(10),
+            Some(50),
+            None,
+            Some(rank_sort()),
+        )
+        .await
+        .expect("a page past the end is answered, not refused");
+
+    assert_eq!(hit_ids(&found).len(), 0, "nothing lives at offset 50");
+    assert_eq!(
+        found["total_hits"],
+        json!(3),
+        "the query still matched everything it matched, got {found}"
+    );
+    assert_eq!(found["offset"], json!(50));
+}
+
+/// The node's ceiling applies to `offset + limit`, on the HTTP surface as well as MCP.
+///
+/// The window is what gets fetched, so a deep page costs what a large limit costs — and this
+/// route enforced neither before. Both refusals are `400` with the numbers in the message,
+/// since a caller can only fix this by choosing different ones.
+#[tokio::test]
+async fn the_http_search_bounds_the_window_it_is_asked_for() {
+    let node = TestNode::start(
+        r#"
+[security.limits]
+max_search_limit = 100
+"#,
+    )
+    .await;
+    seed_ordered(&node, "bounded", 5).await;
+
+    // Within the bound: accepted.
+    let (status, _) = post_json(
+        &node,
+        "/api/bounded/search",
+        json!({"query": "body:page", "limit": 50, "offset": 50}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "offset + limit exactly at the bound is allowed"
+    );
+
+    // The sum is over the bound, though neither number is on its own.
+    let (status, body) = post_json(
+        &node,
+        "/api/bounded/search",
+        json!({"query": "body:page", "limit": 51, "offset": 50}),
+    )
+    .await;
+    assert_eq!(status, 400, "offset + limit past the bound is refused");
+    let detail = body["details"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("101"),
+        "the message should name the window it refused: {detail}"
+    );
+    assert!(
+        detail.contains("100"),
+        "and the bound it exceeded: {detail}"
+    );
+
+    // A limit past the bound on its own, which this route also never checked.
+    let (status, _) = post_json(
+        &node,
+        "/api/bounded/search",
+        json!({"query": "body:page", "limit": 5_000}),
+    )
+    .await;
+    assert_eq!(status, 400, "a limit past the bound is refused");
+
+    // An offset alone still counts the default limit against the bound, so the ceiling the
+    // node advertises is the one it enforces.
+    let (status, _) = post_json(
+        &node,
+        "/api/bounded/search",
+        json!({"query": "body:page", "offset": 100}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "offset at the ceiling plus the default limit is over it"
+    );
+}
+
+/// The streaming route refuses an offset rather than ignoring one.
+///
+/// A stream carries the whole result as it is produced, so there is no page to skip to. The
+/// failure this prevents is silent: the same payload type serves both routes, so an offset
+/// that reached here would have been dropped and page 2 would have been page 1.
+#[tokio::test]
+async fn the_streaming_search_refuses_an_offset_instead_of_dropping_it() {
+    let node = TestNode::start("").await;
+    seed_ordered(&node, "streamed", 5).await;
+
+    let (status, body) = post_json(
+        &node,
+        "/api/streamed/search/stream",
+        json!({"query": "body:page", "limit": 2, "offset": 2}),
+    )
+    .await;
+    assert_eq!(status, 400, "an offset on a stream is refused, got {body}");
+    let detail = body["details"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("/api/streamed/search"),
+        "the refusal should name the route that does page, and name it correctly: {detail}"
+    );
+
+    // `offset: 0` asks for nothing, so it is not an error — a client that always sends the
+    // field is not forced to special-case this route.
+    let (status, _) = post_json(
+        &node,
+        "/api/streamed/search/stream",
+        json!({"query": "body:page", "limit": 2, "offset": 0}),
+    )
+    .await;
+    assert_eq!(status, 200, "offset 0 is the absence of paging, not paging");
+}
+
+/// `offset` written into the query reaches the same place the argument does.
+///
+/// The client and the REPL express a search entirely through this grammar, so this is the
+/// only form of paging available to them.
+#[tokio::test]
+async fn an_inline_offset_modifier_pages_like_the_argument() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+    seed_ordered(&node, "inline", 12).await;
+
+    let by_argument = client
+        .search(
+            "inline",
+            "body:page",
+            Some(4),
+            Some(4),
+            None,
+            Some(rank_sort()),
+        )
+        .await
+        .expect("search by argument");
+
+    let by_modifier = client
+        .search(
+            "inline",
+            "body:page limit 4 offset 4 sort rank:asc",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("search by inline modifier");
+
+    assert_eq!(
+        hit_ids(&by_modifier),
+        hit_ids(&by_argument),
+        "the same page, however it was asked for"
+    );
+    assert_eq!(by_modifier["offset"], json!(4));
+    assert_eq!(by_modifier["limit"], json!(4));
+}
+
+/// A field is `sortable` when the built index can order on it exactly, which is not what
+/// `fast` says.
+///
+/// `fast` is the declaration; the column is written when the index is built. They agree here
+/// — the schema was declared before any data — and the point of the flag is that a caller can
+/// read one number rather than reasoning about when the index was created.
+#[tokio::test]
+async fn the_schema_reports_which_fields_can_be_sorted_exactly() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    client
+        .put_index_config(
+            "sorted",
+            &json!({
+                "fields": {
+                    "id": {"field_type": "text", "indexed": true, "stored": true},
+                    "title": {"field_type": "text", "indexed": true, "stored": true, "fast": true},
+                    "body": {"field_type": "text", "indexed": true, "stored": true},
+                    "rank": {"field_type": "i64", "indexed": true, "stored": true, "fast": true}
+                }
+            }),
+        )
+        .await
+        .expect("put schema");
+    seed_ordered(&node, "sorted", 3).await;
+
+    let config = get_json(&node, "/api/sorted/_config").await;
+    let field = |name: &str| {
+        config["fields"]
+            .as_array()
+            .and_then(|f| f.iter().find(|f| f["name"] == name))
+            .cloned()
+            .unwrap_or_else(|| panic!("field {name} in {config}"))
+    };
+
+    assert_eq!(
+        field("rank")["sortable"],
+        json!(true),
+        "a fast numeric field sorts exactly"
+    );
+    assert_eq!(
+        field("title")["sortable"],
+        json!(true),
+        "a text field declared fast has the column an exact sort needs"
+    );
+    assert_eq!(
+        field("body")["sortable"],
+        json!(false),
+        "a text field without the declaration has no column, so its sort is approximate"
+    );
+}
+
+/// Sorting on a text field with no fast column says so in the response.
+///
+/// The hits are real and look exactly like an exact answer, so nothing about them reveals
+/// that the order is over a sample. It has to be stated, and stated where the caller reading
+/// the result will see it rather than in the node's log.
+#[tokio::test]
+async fn an_approximate_sort_is_reported_on_the_response_that_carries_it() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+    seed_ordered(&node, "approx", 6).await;
+
+    let found = client
+        .search(
+            "approx",
+            "body:page",
+            Some(3),
+            None,
+            None,
+            Some(storage::SortSpec {
+                field: "body".to_string(),
+                order: storage::SortOrder::Asc,
+            }),
+        )
+        .await
+        .expect("search");
+
+    assert_eq!(
+        found["_approximate_sort"],
+        json!("body"),
+        "a sort on a field with no fast column is approximate, got {found}"
+    );
+
+    // The exact sort on the same data says nothing, so the flag's presence carries meaning.
+    let exact = client
+        .search(
+            "approx",
+            "body:page",
+            Some(3),
+            None,
+            None,
+            Some(rank_sort()),
+        )
+        .await
+        .expect("search");
+    assert!(
+        exact.get("_approximate_sort").is_none(),
+        "an exact sort should not be flagged, got {exact}"
+    );
 }

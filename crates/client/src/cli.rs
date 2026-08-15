@@ -1652,6 +1652,9 @@ pub enum ClientCommand {
         /// Max results
         #[arg(short, long)]
         limit: Option<usize>,
+        /// Skip this many results — the page, where --limit is the page size
+        #[arg(short = 'o', long)]
+        offset: Option<usize>,
     },
 
     /// Schema utilities
@@ -1838,13 +1841,18 @@ pub async fn run_cli() -> Result<()> {
             index,
             query,
             limit,
+            offset,
         } => {
             if query.trim().is_empty() {
                 anyhow::bail!("Query cannot be empty");
             }
-            // Inline `return`, `limit` and `sort` are read by the server, which owns the one
-            // definition of where a modifier run may appear.
-            let results = client.search(&index, &query, limit, None, None).await?;
+            // Inline `return`, `limit`, `offset` and `sort` are read by the server, which owns
+            // the one definition of where a modifier run may appear. The flags here win over
+            // the inline form, which is what lets a caller page through a query it did not
+            // write itself.
+            let results = client
+                .search(&index, &query, limit, offset, None, None)
+                .await?;
             print_json(&results)?;
         }
         ClientCommand::Schema {
@@ -4601,7 +4609,7 @@ async fn dispatch_interactive_command(
             // definition of where a modifier run may appear.
             let results = session
                 .client()
-                .search(index, &query, None, None, None)
+                .search(index, &query, None, None, None, None)
                 .await?;
             print_json(&results)?;
         }

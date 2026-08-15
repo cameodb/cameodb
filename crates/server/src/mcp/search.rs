@@ -7,10 +7,11 @@ use cameodb_mcp::McpIndexSearchRequest;
 
 use crate::cluster_coordinator::OperationType;
 use crate::mcp::diagnostics::{
-    names_a_missing_field, refuse_if_clauses_discarded, with_valid_fields, zero_results_advice,
+    approximate_sort_note, names_a_missing_field, paged_past_the_end, refuse_if_clauses_discarded,
+    with_valid_fields, zero_results_advice,
 };
 use crate::mcp::schema::absent_index_reason;
-use crate::node_orchestrator::{ClientOp, SearchWindow, order_hit_blocks};
+use crate::node_orchestrator::{APPROXIMATE_SORT_FIELD, ClientOp, SearchWindow, order_hit_blocks};
 use crate::query::parse_query_keywords;
 use crate::state::AppState;
 
@@ -97,43 +98,74 @@ fn cap_response_bytes(response: &mut JsonValue, max_bytes: usize) {
     }
 }
 
-/// Refuse a limit above what the tool schemas advertise.
+/// Resolve the window this search will run with, or refuse it.
 ///
-/// Checked on the value the search will actually run with rather than on the argument, because
-/// the query string is a second door into the same number: `limit 5000000` written inline
-/// reaches this after the argument has already been validated and found absent. `None` needs no
-/// check — the node's own default fills it in, and config load refuses a default above the
-/// ceiling so that the value which arrives here cannot exceed it.
-fn check_effective_limit(limit: Option<usize>, max_search_limit: usize) -> Result<(), String> {
-    match limit {
-        Some(limit) if limit > max_search_limit => Err(format!(
-            "limit {limit} is above the maximum of {max_search_limit}; ask for at most that many \
-             and narrow the query to reach the rest"
-        )),
-        _ => Ok(()),
-    }
-}
-
-/// Refuse an offset whose window — `offset + limit` — exceeds what the engine will fetch.
+/// Checked on the values the search will actually run with rather than on the arguments, because
+/// the query string is a second door into the same numbers: `limit 5000000 offset 900000` written
+/// inline reaches this after the arguments have already been validated and found absent.
 ///
-/// The engine holds `offset + limit` hits in memory to apply the skip after merging, so the
-/// sum is what the bound applies to, not `limit` alone. A caller that pages deep into a
-/// result is asking for the same work as a large `limit`, and the same ceiling stops both.
-fn check_effective_window(
+/// The rule itself lives on [`SearchWindow::checked`], with the HTTP surface, so that a caller
+/// cannot get a different answer by asking a different way.
+fn effective_window(
+    state: &AppState,
     limit: Option<usize>,
     offset: Option<usize>,
-    max_search_limit: usize,
-) -> Result<(), String> {
-    let limit = limit.unwrap_or(0);
-    let offset = offset.unwrap_or(0);
-    let window = offset.saturating_add(limit);
-    if window > max_search_limit {
-        return Err(format!(
-            "offset {offset} + limit {limit} = {window} is above the maximum of {max_search_limit}; \
-             narrow the query or reduce the offset to stay within the bound"
-        ));
+) -> Result<SearchWindow, String> {
+    SearchWindow::checked(
+        limit,
+        offset,
+        state.router.default_search_limit(),
+        state.max_search_limit,
+    )
+}
+
+/// Say what a caller cannot read off the hits: why a page is empty, and when its order is only
+/// approximate.
+///
+/// One `_warning`, built from every note that applies, because the field is documented as
+/// "present when the response needs explaining" — two notes is still one explanation, and a
+/// caller that has learned to read `_warning` should not have to learn a second key.
+///
+/// The order of the checks is the order a reader needs them in: an empty page is answered first
+/// (it is the thing they are looking at), then why the query might have matched nothing, then
+/// how far to trust the order of what did come back.
+fn annotate_search_response(
+    response: &mut JsonValue,
+    query: &str,
+    window: SearchWindow,
+    total_hits: usize,
+) {
+    let hits_returned = response
+        .get("hits_returned")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let mut notes: Vec<String> = Vec::new();
+
+    if hits_returned == 0 {
+        // A page past the end and a query that matched nothing are different failures with the
+        // same shape, and only one of them is the query's fault.
+        match paged_past_the_end(window.offset, total_hits) {
+            Some(note) => notes.push(note),
+            // `limit 0` is count-only and returns no hits on purpose, so it is not explained.
+            None if window.limit > 0 => notes.extend(zero_results_advice(query)),
+            None => {}
+        }
     }
-    Ok(())
+
+    if let Some(field) = response
+        .get(APPROXIMATE_SORT_FIELD)
+        .and_then(|value| value.as_str())
+    {
+        notes.push(approximate_sort_note(field));
+    }
+
+    if notes.is_empty() {
+        return;
+    }
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert("_warning".to_string(), JsonValue::String(notes.join(" ")));
+    }
 }
 
 pub(super) fn search_index(
@@ -146,15 +178,13 @@ pub(super) fn search_index(
     Box::pin(async move {
         let index_name = index.index.clone();
 
-        // Preprocess query to extract return/limit/sort modifiers (same as HTTP server)
-        let (cleaned_query, parsed_limit, parsed_fields, parsed_sort) =
-            parse_query_keywords(&query);
+        // Preprocess query to extract return/limit/offset/sort modifiers (same as HTTP server)
+        let inline = parse_query_keywords(&query);
+        let cleaned_query = inline.query;
 
         // Merge MCP-provided values with parsed values (MCP takes precedence for limit/fields)
-        let final_limit = limit.or(parsed_limit);
-        check_effective_limit(final_limit, state.max_search_limit)?;
-        check_effective_window(final_limit, offset, state.max_search_limit)?;
-        let final_fields = index.fields.or(parsed_fields);
+        let window = effective_window(&state, limit.or(inline.limit), offset.or(inline.offset))?;
+        let final_fields = index.fields.or(inline.fields);
         // The argument wins over an inline `sort` clause, as `limit` and `fields` do: a caller
         // that passed a structured sort chose it deliberately, where the clause may be part of
         // a query string it copied.
@@ -167,7 +197,7 @@ pub(super) fn search_index(
                     cameodb_mcp::SortOrder::Asc => storage::SortOrder::Asc,
                 },
             })
-            .or(parsed_sort);
+            .or(inline.sort);
 
         let result = state
             .router
@@ -175,8 +205,8 @@ pub(super) fn search_index(
                 ClientOp::Search {
                     index: index.index,
                     query: cleaned_query,
-                    limit: final_limit,
-                    offset,
+                    limit: Some(window.limit),
+                    offset: Some(window.offset),
                     fields: final_fields,
                     sort: final_sort,
                 },
@@ -191,12 +221,6 @@ pub(super) fn search_index(
                 // rest of this response answer a different query.
                 refuse_if_clauses_discarded(&response)?;
 
-                // Report the offset the search ran with, so a caller paging through results
-                // can tell where this page starts.
-                if let Some(obj) = response.as_object_mut() {
-                    obj.insert("offset".to_string(), JsonValue::from(offset.unwrap_or(0)));
-                }
-
                 let total_hits = response
                     .get("total_hits")
                     .and_then(|v| v.as_u64())
@@ -210,18 +234,7 @@ pub(super) fn search_index(
                     return Err(reason);
                 }
 
-                // Add zero-results warning if applicable
-                let hits_returned = response
-                    .get("hits_returned")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-
-                if hits_returned == 0
-                    && let Some(advice) = zero_results_advice(&query)
-                    && let Some(obj) = response.as_object_mut()
-                {
-                    obj.insert("_warning".to_string(), JsonValue::String(advice));
-                }
+                annotate_search_response(&mut response, &query, window, total_hits as usize);
                 cap_response_bytes(&mut response, state.max_response_bytes);
                 Ok(response)
             }
@@ -256,18 +269,18 @@ pub(super) fn search_across_indexes(
     offset: Option<usize>,
 ) -> BoxFuture<'static, Result<JsonValue, String>> {
     Box::pin(async move {
-        // Preprocess query to extract return/limit/sort modifiers (same as HTTP server)
-        let (cleaned_query, parsed_limit, parsed_fields, parsed_sort) =
-            parse_query_keywords(&query);
+        // Preprocess query to extract return/limit/offset/sort modifiers (same as HTTP server)
+        let inline = parse_query_keywords(&query);
+        let cleaned_query = inline.query;
+        let parsed_fields = inline.fields;
+        let parsed_sort = inline.sort;
 
-        // One derivation, so that the value asked of each index, the value the merge
-        // truncates to, and the value reported back are the same number — including when it
-        // comes from an inline `limit` clause or from this node's configured default.
-        let final_limit = limit.or(parsed_limit);
-        check_effective_limit(final_limit, state.max_search_limit)?;
-        check_effective_window(final_limit, offset, state.max_search_limit)?;
-        let requested_limit = final_limit.unwrap_or(state.router.default_search_limit());
-        let requested_offset = offset.unwrap_or(0);
+        // One derivation, so that the window asked of each index, the window the merge takes,
+        // and the window reported back are the same numbers — including when they come from an
+        // inline clause or from this node's configured default.
+        let window = effective_window(&state, limit.or(inline.limit), offset.or(inline.offset))?;
+        let requested_limit = window.limit;
+        let requested_offset = window.offset;
 
         // Determine the global sort spec (if any) for the final merge.
         // Per-index sort takes precedence; fall back to query-parsed sort.
@@ -334,14 +347,21 @@ pub(super) fn search_across_indexes(
                     // The merge below orders by `_sort_key`, so this is the one caller that
                     // needs it to survive the routing path. The strip after the merge is what
                     // keeps it off the response.
+                    //
+                    // Every index is asked for the whole window *from the front* — the same rule
+                    // the shard gather follows, for the same reason (`SearchWindow::fetch_count`).
+                    // Passing the caller's `offset` down here would apply it twice: once inside
+                    // each index, dropping rows that belong on this page, and again at the merge
+                    // below. Page 2 of a federated search would then be page 3 of an order
+                    // assembled from the wrong candidates.
                     let result = state
                         .router
                         .route_and_handle_keeping_sort_keys(
                             ClientOp::Search {
                                 index: index.clone(),
                                 query: cleaned_query,
-                                limit: final_limit,
-                                offset,
+                                limit: Some(window.fetch_count()),
+                                offset: None,
                                 fields: final_fields,
                                 sort: storage_sort,
                             },
@@ -366,6 +386,7 @@ pub(super) fn search_across_indexes(
         // answered: partial results with an explicit account of the gap are actionable,
         // where a failed call throws away work that succeeded.
         let mut errors: Vec<JsonValue> = Vec::new();
+        let mut approximate_sort: Option<String> = None;
 
         while let Some((named_at, index_name, result)) = search_futures.next().await {
             // Schema-aware error handling
@@ -414,6 +435,15 @@ pub(super) fn search_across_indexes(
             }
 
             total_hits += index_hits;
+            // One index sorting approximately makes the merged order approximate, since these
+            // hits are merged with the rest and the sample they came from is not the whole of
+            // what matched there.
+            approximate_sort = approximate_sort.or_else(|| {
+                result
+                    .get(APPROXIMATE_SORT_FIELD)
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            });
 
             if let Some(hits) = result.get("hits").and_then(|value| value.as_array()) {
                 let block: Vec<JsonValue> = hits
@@ -459,10 +489,7 @@ pub(super) fn search_across_indexes(
         let mut merged_hits = order_hit_blocks(
             blocks.into_iter().map(|(_, block)| block).collect(),
             global_sort.as_ref(),
-            SearchWindow {
-                offset: requested_offset,
-                limit: requested_limit,
-            },
+            window,
         );
 
         // Strip internal _sort_key from merged hits before returning
@@ -489,13 +516,16 @@ pub(super) fn search_across_indexes(
             obj.insert("errors".to_string(), JsonValue::Array(errors));
         }
 
-        // Add zero-results warning if applicable
-        if hits_returned == 0
-            && let Some(advice) = zero_results_advice(&query)
+        // The merge strips `_sort_key` but nothing has carried the approximation forward yet, so
+        // put it on the response before it is annotated — `annotate_search_response` reads it
+        // from there, exactly as it does for a single-index search.
+        if let Some(field) = approximate_sort
             && let Some(obj) = response.as_object_mut()
         {
-            obj.insert("_warning".to_string(), JsonValue::String(advice));
+            obj.insert(APPROXIMATE_SORT_FIELD.to_string(), JsonValue::String(field));
         }
+
+        annotate_search_response(&mut response, &query, window, total_hits as usize);
 
         cap_response_bytes(&mut response, state.max_response_bytes);
         Ok(response)

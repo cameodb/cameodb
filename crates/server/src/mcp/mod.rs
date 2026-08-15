@@ -84,6 +84,15 @@ impl McpBackend for AppState {
         self.max_search_limit
     }
 
+    /// This node's `[search] default_search_limit`, which is what an omitted `limit` becomes.
+    ///
+    /// The dispatcher bounds `offset + limit` and so needs the number a missing `limit` resolves
+    /// to. Answered from the node's own configuration rather than left at the crate default, so
+    /// an operator who raised the default does not open a gap of that size above the ceiling.
+    fn default_search_limit(&self) -> usize {
+        self.router.default_search_limit()
+    }
+
     fn check_tool_rate(&self, authz: McpAuthzRef, tool: &str, cost: u32) -> RateLimitVerdict {
         governance::check_tool_rate(self, authz, tool, cost)
     }

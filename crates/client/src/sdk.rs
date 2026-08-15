@@ -335,11 +335,21 @@ impl CameoClient {
             .context("Failed to parse indexes response")
     }
 
+    /// Run a search, optionally taking one page of the result.
+    ///
+    /// `offset` is the paging half of `limit`: with `limit` as the page size, page N starts at
+    /// `offset = N * limit`. The node bounds `offset + limit` by its `max_search_limit`, since
+    /// it fetches that many hits to serve the page, so a deep page is refused for the same
+    /// reason a large limit is. `None` and `Some(0)` mean the same thing.
+    ///
+    /// The same values can be written into the query itself — `limit 10 offset 20` — which is
+    /// how the REPL expresses them; passing them here wins over the inline form.
     pub async fn search(
         &self,
         index: &str,
         query: &str,
         limit: Option<usize>,
+        offset: Option<usize>,
         fields: Option<Vec<String>>,
         sort: Option<storage::SortSpec>,
     ) -> Result<JsonValue> {
@@ -347,6 +357,7 @@ impl CameoClient {
         let body = serde_json::json!({
             "query": query,
             "limit": limit,
+            "offset": offset,
             "fields": fields,
             "sort": sort,
         });

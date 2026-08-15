@@ -1,12 +1,15 @@
-//! The inline modifiers a query may carry after its text: `return`, `limit` and `sort`.
+//! The inline modifiers a query may carry after its text: `return`, `limit`, `offset` and `sort`.
 //!
-//! Shared by both surfaces — an HTTP search and an MCP tool call accept the same query string, so
-//! they have to agree on where the query ends and the modifiers begin.
+//! Shared by every surface — an HTTP search, an MCP tool call and the bundled client all accept
+//! the same query string, so they have to agree on where the query ends and the modifiers begin.
+//! `offset` is here rather than only in the request bodies for that reason: the client and the
+//! REPL express a search *entirely* through this grammar, so a paging option that exists only as
+//! a JSON field is a paging option they cannot reach.
 
 use storage::{SortOrder, SortSpec};
 
 /// The keywords that open an inline modifier clause.
-const MODIFIER_KEYWORDS: [&str; 3] = ["return", "limit", "sort"];
+const MODIFIER_KEYWORDS: [&str; 4] = ["return", "limit", "offset", "sort"];
 
 /// Whether a token has the shape of a field name, which rules out quoted text, groups and a
 /// `field:value` clause.
@@ -63,8 +66,28 @@ fn parse_field_list(tokens: &[&str]) -> Option<Vec<String>> {
     (!names.is_empty()).then_some(names)
 }
 
-/// What a run of inline modifiers set: limit, projected fields, sort.
-type Modifiers = (Option<usize>, Option<Vec<String>>, Option<SortSpec>);
+/// What a run of inline modifiers set, and the query left in front of them.
+///
+/// A struct rather than a tuple because there are now four optional values and two of them are
+/// `Option<usize>` — `limit` and `offset` are adjacent, same-typed and mean opposite things, so a
+/// positional call site is one transposition away from paging by the page size.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct QueryModifiers {
+    /// The query with its modifier run removed, or the whole query when there was none.
+    pub query: String,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub fields: Option<Vec<String>>,
+    pub sort: Option<SortSpec>,
+}
+
+/// What a run of inline modifiers set, before the query text is attached.
+type Modifiers = (
+    Option<usize>,
+    Option<usize>,
+    Option<Vec<String>>,
+    Option<SortSpec>,
+);
 
 /// Parse `tokens` as an unbroken run of modifier clauses, in any order and at most one of each.
 ///
@@ -72,6 +95,7 @@ type Modifiers = (Option<usize>, Option<Vec<String>>, Option<SortSpec>);
 /// reaches the end of the query.
 fn parse_modifier_run(tokens: &[&str]) -> Option<Modifiers> {
     let mut limit = None;
+    let mut offset = None;
     let mut fields = None;
     let mut sort = None;
     let mut idx = 0;
@@ -80,6 +104,12 @@ fn parse_modifier_run(tokens: &[&str]) -> Option<Modifiers> {
         match tokens[idx] {
             "limit" if limit.is_none() => {
                 limit = Some(tokens.get(idx + 1)?.parse().ok()?);
+                idx += 2;
+            }
+            // Parsed as `usize`, so `offset -1` fails to parse and stays query text, the same
+            // way `limit -5` does.
+            "offset" if offset.is_none() => {
+                offset = Some(tokens.get(idx + 1)?.parse().ok()?);
                 idx += 2;
             }
             "sort" if sort.is_none() => {
@@ -99,32 +129,39 @@ fn parse_modifier_run(tokens: &[&str]) -> Option<Modifiers> {
         }
     }
 
-    Some((limit, fields, sort))
+    Some((limit, offset, fields, sort))
 }
 
-/// Split a query from its trailing inline modifiers — `return`, `limit` and `sort`.
+/// Split a query from its trailing inline modifiers — `return`, `limit`, `offset` and `sort`.
 ///
 /// A keyword counts only where it opens a run of clauses that reaches the end of the query and
 /// leaves at least one token in front of it. Everything else is query text, so a keyword used as a
-/// word — `find tax return forms`, `sort by date` — stays in the query.
+/// word — `find tax return forms`, `sort by date`, `the offset of the margin` — stays in the
+/// query.
 ///
-/// Returns (query, limit, fields, sort).
-pub(crate) fn parse_query_keywords(
-    query: &str,
-) -> (String, Option<usize>, Option<Vec<String>>, Option<SortSpec>) {
+pub(crate) fn parse_query_keywords(query: &str) -> QueryModifiers {
     let tokens: Vec<&str> = query.split_whitespace().collect();
 
     // Earliest start first, so `return a limit 5` is one run rather than a query ending in
     // `return a`.
     for start in 1..tokens.len() {
         if MODIFIER_KEYWORDS.contains(&tokens[start])
-            && let Some((limit, fields, sort)) = parse_modifier_run(&tokens[start..])
+            && let Some((limit, offset, fields, sort)) = parse_modifier_run(&tokens[start..])
         {
-            return (tokens[..start].join(" "), limit, fields, sort);
+            return QueryModifiers {
+                query: tokens[..start].join(" "),
+                limit,
+                offset,
+                fields,
+                sort,
+            };
         }
     }
 
-    (query.to_string(), None, None, None)
+    QueryModifiers {
+        query: query.to_string(),
+        ..QueryModifiers::default()
+    }
 }
 
 #[cfg(test)]
@@ -134,7 +171,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_no_keywords() {
         let query = "title:rust";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, None);
         assert_eq!(fields, None);
@@ -144,7 +186,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_limit_only() {
         let query = "title:rust limit 10";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, Some(10));
         assert_eq!(fields, None);
@@ -154,7 +201,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_limit_zero() {
         let query = "title:rust limit 0";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, Some(0));
         assert_eq!(fields, None);
@@ -164,7 +216,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_return_only() {
         let query = "title:rust return title,author,year";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, None);
         assert_eq!(
@@ -181,7 +238,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_both() {
         let query = "title:rust limit 5 return title,author";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, Some(5));
         assert_eq!(
@@ -194,7 +256,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_reverse_order() {
         let query = "title:rust return title,author limit 5";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, Some(5));
         assert_eq!(
@@ -207,7 +274,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_single_field() {
         let query = "title:rust return title";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, None);
         assert_eq!(fields, Some(vec!["title".to_string()]));
@@ -218,7 +290,12 @@ mod tests {
     fn test_parse_query_keywords_with_spaces() {
         // Test space-separated field list: "return title, author, year"
         let query = "title:rust return title, author, year";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, None);
         assert_eq!(
@@ -235,7 +312,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_complex_query() {
         let query = "title:rust AND author:smith limit 20 return title,author,year,isbn";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust AND author:smith");
         assert_eq!(limit, Some(20));
         assert_eq!(
@@ -253,7 +335,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_invalid_limit() {
         let query = "title:rust limit abc";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         // Invalid limit should not be parsed, query remains unchanged
         assert_eq!(cleaned, "title:rust limit abc");
         assert_eq!(limit, None);
@@ -264,7 +351,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_empty_field_list() {
         let query = "title:rust return ";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         // No clause parsed, so the query is passed through as written.
         assert_eq!(cleaned, "title:rust return ");
         assert_eq!(limit, None);
@@ -275,7 +367,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_trailing_comma() {
         let query = "title:rust return title,author,";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, None);
         // Trailing comma should be filtered out
@@ -289,7 +386,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_sort_desc() {
         let query = "title:rust sort year:desc";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, None);
         assert_eq!(fields, None);
@@ -305,7 +407,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_sort_asc() {
         let query = "title:rust sort year:asc";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, None);
         assert_eq!(fields, None);
@@ -321,7 +428,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_sort_default_order() {
         let query = "title:rust sort year";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, None);
         assert_eq!(fields, None);
@@ -337,7 +449,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_all_three() {
         let query = "title:rust return title,author limit 10 sort year:desc";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, Some(10));
         assert_eq!(
@@ -356,7 +473,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_sort_before_return() {
         let query = "title:rust sort year:asc return title,author";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, None);
         assert_eq!(
@@ -375,7 +497,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_sort_between_limit_and_return() {
         let query = "title:rust limit 5 sort timestamp:desc return title";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "title:rust");
         assert_eq!(limit, Some(5));
         assert_eq!(fields, Some(vec!["title".to_string()]));
@@ -391,7 +518,12 @@ mod tests {
     #[test]
     fn test_parse_query_keywords_empty_query() {
         let query = "";
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, "");
         assert_eq!(limit, None);
         assert_eq!(fields, None);
@@ -400,7 +532,12 @@ mod tests {
 
     /// A query that is left whole, because no run of clauses reaches its end.
     fn assert_no_modifiers(query: &str) {
-        let (cleaned, limit, fields, parsed_sort) = parse_query_keywords(query);
+        let m = parse_query_keywords(query);
+        let cleaned = m.query;
+        let limit = m.limit;
+        let _offset = m.offset;
+        let fields = m.fields;
+        let parsed_sort = m.sort;
         assert_eq!(cleaned, query, "{query:?} lost text to a modifier");
         assert_eq!(limit, None, "{query:?}");
         assert_eq!(fields, None, "{query:?}");
@@ -435,7 +572,9 @@ mod tests {
         // `* limit 10` is the way to ask for a bare limit; on its own it is two terms.
         assert_no_modifiers("limit 10");
 
-        let (cleaned, limit, _, _) = parse_query_keywords("* limit 10");
+        let m = parse_query_keywords("* limit 10");
+        let cleaned = m.query;
+        let limit = m.limit;
         assert_eq!(cleaned, "*");
         assert_eq!(limit, Some(10));
     }
@@ -446,7 +585,8 @@ mod tests {
         assert_no_modifiers("title:rust return \"title\"");
 
         // Either side of the gap may carry the comma.
-        let (_, _, fields, _) = parse_query_keywords("title:rust return title ,author");
+        let m = parse_query_keywords("title:rust return title ,author");
+        let fields = m.fields;
         assert_eq!(
             fields,
             Some(vec!["title".to_string(), "author".to_string()])
@@ -463,5 +603,86 @@ mod tests {
     fn test_parse_query_keywords_a_limit_must_be_a_number() {
         assert_no_modifiers("title:rust limit many");
         assert_no_modifiers("title:rust limit -5");
+    }
+
+    #[test]
+    fn test_parse_query_keywords_offset_only() {
+        let m = parse_query_keywords("title:rust offset 20");
+        let cleaned = m.query;
+        let limit = m.limit;
+        let offset = m.offset;
+        let fields = m.fields;
+        let sort = m.sort;
+        assert_eq!(cleaned, "title:rust");
+        assert_eq!(offset, Some(20));
+        assert_eq!(limit, None);
+        assert_eq!(fields, None);
+        assert_eq!(sort, None);
+    }
+
+    /// The pair a caller actually writes to page: `limit` sets the page size, `offset` the page.
+    #[test]
+    fn test_parse_query_keywords_offset_pages_with_limit() {
+        for (query, want_offset) in [
+            ("title:rust limit 10 offset 0", 0),
+            ("title:rust limit 10 offset 10", 10),
+            ("title:rust offset 20 limit 10", 20),
+        ] {
+            let m = parse_query_keywords(query);
+            let cleaned = m.query;
+            let limit = m.limit;
+            let offset = m.offset;
+            assert_eq!(cleaned, "title:rust", "{query:?}");
+            assert_eq!(limit, Some(10), "{query:?}");
+            assert_eq!(offset, Some(want_offset), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_query_keywords_offset_with_every_other_modifier() {
+        let m = parse_query_keywords(
+            "title:rust return title,author limit 10 offset 30 sort year:desc",
+        );
+        let (cleaned, limit, offset, fields, sort) = (m.query, m.limit, m.offset, m.fields, m.sort);
+        assert_eq!(cleaned, "title:rust");
+        assert_eq!(limit, Some(10));
+        assert_eq!(offset, Some(30));
+        assert_eq!(
+            fields,
+            Some(vec!["title".to_string(), "author".to_string()])
+        );
+        assert_eq!(
+            sort,
+            Some(SortSpec {
+                field: "year".to_string(),
+                order: SortOrder::Desc,
+            })
+        );
+    }
+
+    /// `offset` is subject to every rule the other keywords are, so that adding it did not widen
+    /// what counts as a modifier: it must open a run reaching the end, and take a number.
+    #[test]
+    fn test_parse_query_keywords_offset_is_a_word_like_any_other_keyword() {
+        assert_no_modifiers("the offset of the margin");
+        assert_no_modifiers("title:rust offset many");
+        assert_no_modifiers("title:rust offset -1");
+        assert_no_modifiers("title:rust offset 10 extra");
+        assert_no_modifiers("offset 10");
+    }
+
+    /// A `return` list ends at `offset`, as it does at every other keyword — otherwise
+    /// `return title offset 10` would project a field named `offset`.
+    #[test]
+    fn test_parse_query_keywords_a_field_list_ends_at_offset() {
+        let m = parse_query_keywords("title:rust return title offset 10");
+        let cleaned = m.query;
+        let limit = m.limit;
+        let offset = m.offset;
+        let fields = m.fields;
+        assert_eq!(cleaned, "title:rust");
+        assert_eq!(fields, Some(vec!["title".to_string()]));
+        assert_eq!(offset, Some(10));
+        assert_eq!(limit, None);
     }
 }
