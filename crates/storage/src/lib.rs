@@ -1089,7 +1089,7 @@ impl StorageConfig {
 }
 
 /// Native Tantivy field types with proper enum for type safety.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum TantivyFieldType {
     /// Tokenized text for full-text search
     #[default]
@@ -1114,6 +1114,27 @@ pub enum TantivyFieldType {
     Json,
     /// Categorical/facet field
     Facet,
+}
+
+/// Serialized as the same lowercase name every other surface uses.
+///
+/// The derived implementation emitted the variant name — `Date`, `Boolean` — while
+/// [`TantivyFieldType::to_string`] returns `date` and `boolean`, and that is the name the query
+/// syntax reference, the per-field hints and the deserializer's own canonical list are all keyed
+/// on. So a schema described one type and every instruction for querying it named another.
+///
+/// Delegating to `to_string` rather than renaming the variants means the JSON name and the name
+/// an agent is told to use are one function, and a new variant cannot introduce a third spelling.
+///
+/// Safe to change: deserialization lowercases before matching, so schemas already persisted with
+/// the capitalized form still load.
+impl Serialize for TantivyFieldType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.to_string())
+    }
 }
 
 impl TantivyFieldType {
@@ -6431,6 +6452,56 @@ mod index_dir_tests {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A field type serializes under the name every other surface calls it.
+    ///
+    /// The derived implementation emitted the variant name, so a schema said `Date` while the
+    /// syntax reference, the per-field query hints and the deserializer's own canonical list all
+    /// said `date`. An agent reading the schema and then reading how to query it was given two
+    /// spellings of one type.
+    #[test]
+    fn a_field_type_serializes_as_the_name_everything_else_uses() {
+        for field_type in [
+            TantivyFieldType::Text,
+            TantivyFieldType::String,
+            TantivyFieldType::I64,
+            TantivyFieldType::U64,
+            TantivyFieldType::F64,
+            TantivyFieldType::Date,
+            TantivyFieldType::Boolean,
+            TantivyFieldType::Bytes,
+            TantivyFieldType::Ip,
+            TantivyFieldType::Json,
+            TantivyFieldType::Facet,
+        ] {
+            let serialized = serde_json::to_value(&field_type).unwrap();
+            assert_eq!(
+                serialized,
+                JsonValue::String(field_type.to_string().to_string()),
+                "{field_type:?} should serialize as its canonical lowercase name"
+            );
+
+            let round_tripped: TantivyFieldType = serde_json::from_value(serialized).unwrap();
+            assert_eq!(round_tripped, field_type, "{field_type:?} must round-trip");
+        }
+    }
+
+    /// Schemas persisted before the change above still load.
+    ///
+    /// This is what makes it safe to change at all: deserialization lowercases before matching,
+    /// so a redb table full of `"Date"` is read exactly as one full of `"date"`.
+    #[test]
+    fn a_schema_written_with_the_old_capitalized_names_still_loads() {
+        for (stored, expected) in [
+            ("\"Date\"", TantivyFieldType::Date),
+            ("\"Text\"", TantivyFieldType::Text),
+            ("\"Boolean\"", TantivyFieldType::Boolean),
+            ("\"I64\"", TantivyFieldType::I64),
+        ] {
+            let parsed: TantivyFieldType = serde_json::from_str(stored).unwrap();
+            assert_eq!(parsed, expected, "{stored} should still deserialize");
+        }
+    }
 
     /// Warming must actually fill the per-field caches, and must skip a generation it has
     /// already warmed.

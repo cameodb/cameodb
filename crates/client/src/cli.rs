@@ -574,12 +574,12 @@ fn print_compact_index_entry_body(
 /// Input (from colored_json pretty-print of `{"field_name": {...}}`):
 ///   {
 ///     "field_name": {
-///       "type": "Text"
+///       "type": "text"
 ///     }
 ///   }
 ///
 /// Output:
-///   "field_name": { "type": "Text" }
+///   "field_name": { "type": "text" }
 ///
 /// This works because we strip the first `{` and last `}` lines, then
 /// join the remaining (indented) lines with single spaces.

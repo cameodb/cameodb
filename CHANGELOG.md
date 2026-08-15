@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A field type is reported in lowercase, matching every other surface.** A schema serialized
+  `Date` and `Boolean` while the query syntax reference, the per-field query hints and the
+  deserializer's own canonical list all say `date` and `boolean` — so an agent reading a schema
+  and then reading how to query it was given two spellings of one type. Serialization now
+  delegates to the same function those surfaces use, so a new type cannot introduce a third
+  spelling. **Backward compatible in both directions**: deserialization already lowercased before
+  matching, so schemas persisted with the capitalized form still load, and API callers may still
+  send either form (plus the existing aliases such as `integer`, `datetime`, `bool`). Only
+  consumers that string-match the capitalized output need to change.
 - **`PATCH /api/{index}/_schema` refuses to make a late-discovered field searchable, with `409`
   and a reason, instead of acknowledging it.** A Tantivy schema is fixed when the index is
   created; a field that first appears in a later document has no column, so setting its
