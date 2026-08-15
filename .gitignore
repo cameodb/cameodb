@@ -150,10 +150,15 @@ logs/
 # hardening flags and jemalloc's page size. Ignoring the whole directory meant a fresh clone
 # silently built release binaries with none of them. Credentials stay ignored.
 #
+# .cargo/audit.toml is policy for the same reason: it records which advisories are accepted
+# and why. `scripts/validate/deps.sh` runs `cargo audit`, which reads it, so a clone without
+# it fails on exceptions this repo has already reviewed.
+#
 # `.cargo/*` rather than `.cargo/` on purpose — git does not descend into an excluded
 # directory, so a negation cannot re-include a file underneath one.
 .cargo/*
 !.cargo/config.toml
+!.cargo/audit.toml
 
 # Backup files
 *.orig

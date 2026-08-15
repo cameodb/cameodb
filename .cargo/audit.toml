@@ -1,0 +1,46 @@
+# cargo-audit configuration
+# https://github.com/rustsec/rustsec/tree/main/cargo-audit
+#
+# Config file location: .cargo/audit.toml (project-level)
+# Docs: https://docs.rs/crate/cargo-audit/latest/source/audit.toml.example
+
+[advisories]
+# Ignore specific advisory IDs with documented justifications.
+# Each entry is just the advisory ID string; reasons are in comments below.
+#
+# deny.toml grants the same exceptions and is where each one's `review-by` date lives, because
+# scripts/validate/deps.sh reads that file to fail an exception that has outlived its date. The
+# dates are deliberately not copied here: a second copy nothing checks is a second copy that can
+# be wrong.
+#
+# The two lists need no such check. deps.sh runs `cargo audit` and `cargo deny` against one
+# advisory database, so an ID dropped from either file is reported by that tool, by name.
+ignore = [
+    # ---- hickory-proto 0.25.2 (via libp2p 0.56.0) ----
+    # Dependency chain: libp2p 0.56.0 → libp2p-dns / libp2p-mdns → hickory-resolver / hickory-proto
+    # Both advisories are fixed in hickory 0.26.x. libp2p has merged the bump
+    # (PR #6423, commit 6766985) but v0.57 is not released yet.
+    # Upgrade requires verifying kameo 0.22.2 compatibility with libp2p 0.57.
+
+    # RUSTSEC-2026-0119: O(n²) name compression — CPU exhaustion
+    # Risk for CameoDB: Low. DNS used only for peer discovery multiaddr resolution,
+    # not user-facing query paths. No DNSSEC validation enabled.
+    "RUSTSEC-2026-0119",
+
+    # RUSTSEC-2026-0118: NSEC3 closest-encloser unbounded loop
+    # Risk for CameoDB: Very low. Requires dnssec-ring or dnssec-aws-lc-rs feature,
+    # which is not enabled in our libp2p configuration.
+    "RUSTSEC-2026-0118",
+
+    # ---- paste 1.0.15 (via netlink-packet-core → if-watch → libp2p) ----
+    # paste is a finished proc-macro by dtolnay (Rust core library team).
+    # Advisory is informational only — no security vulnerability.
+    # netlink-packet-core maintainers explicitly rejected swapping to pastey
+    # (PR #44), citing supply-chain risk of unvetted fork vs trusted finished crate.
+    # They reverted to paste in v0.8.1 and keep their own deny.toml ignore.
+    # Used only in Linux netlink packet parsing, no network input surface.
+    "RUSTSEC-2024-0436",
+]
+
+# Treat unmaintained warnings as informational (exit 0), not errors
+informational_warnings = ["unmaintained"]
