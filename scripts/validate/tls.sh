@@ -30,9 +30,26 @@ if ! command -v openssl > /dev/null; then
 fi
 
 section "certificate material"
+# rustls refuses an X.509 v1 certificate outright (UnsupportedCertVersion), and `openssl
+# req -x509` only emits v3 when the certificate carries at least one extension — the system
+# LibreSSL on macOS emits v1 without one. So ask for the extensions a server certificate
+# should have anyway, and assert the version here: a v1 certificate makes every check below
+# read as "the server cannot serve HTTPS" when what happened is that this probe generated
+# something no TLS stack will load.
 openssl req -x509 -newkey rsa:2048 -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
-    -days 1 -nodes -subj "/CN=localhost" > /dev/null 2>&1
-[ -s "$WORK/cert.pem" ] && pass "generated a self-signed certificate" || fail "generated a self-signed certificate"
+    -days 1 -nodes -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+    -addext "basicConstraints=critical,CA:FALSE" > /dev/null 2>&1
+cert_version="$(openssl x509 -in "$WORK/cert.pem" -noout -text 2>/dev/null \
+    | sed -n 's/.*Version: \([0-9]\).*/\1/p' | head -1)"
+if [ ! -s "$WORK/cert.pem" ]; then
+    fail "generated a self-signed certificate" "$(openssl version) produced no certificate"
+elif [ "$cert_version" != "3" ]; then
+    fail "generated a self-signed certificate" \
+        "$(openssl version) produced an X.509 v${cert_version:-?} certificate; rustls loads v3 only"
+else
+    pass "generated a self-signed certificate (X.509 v3)"
+fi
 
 write_config() {
     cat > "$WORK/node.toml" <<EOF
