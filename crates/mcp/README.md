@@ -46,7 +46,7 @@ Schema and field structures are optimized to return only relevant information fo
 1. **`list_indexes`** → Discover all indexes with schemas and per-field `query_hint` (what operators work with each field type)
 2. **`describe_index`** → Deep-dive into a specific index: field definitions, types, stats, `fields` array, and `query_hints` section
 3. **`search_index`** → Construct queries using the field names and operators learned from the schema
-4. **`validate_query`** *(optional)* → Get structural validation, typo detection ("did you mean?"), and the full syntax reference with operator-by-field-type matrix
+4. **`validate_query`** *(optional)* → Parse a query with the same parser a search uses: whether it parses, where it fails, the form the engine will actually run, and which clauses can never match. Also typo detection ("did you mean?") and the full syntax reference
 
 Each `available_fields` entry (from `validate_query`) and `fields` entry (from `describe_index`/`list_indexes`) carries a `query_hint` naming the operators that field's type supports, plus the `indexed`, `fast` and `shadow` flags that decide whether it can be queried and sorted at all. The hints are rendered from [`src/syntax.rs`](src/syntax.rs), so they cannot disagree with the reference.
 
@@ -272,13 +272,13 @@ Validate and get guidance on CameoDB search query syntax. This is the **primary 
 1. **No arguments**: Returns complete query syntax reference with operator-by-field-type compatibility matrix
 2. **Index only**: Returns schema-aware field list with type-specific operator hints per field
 3. **Index + partial_field**: Returns autocomplete suggestions matching available fields
-4. **Index + query**: Returns structural validation, field recognition, typo detection, and per-field operator guidance
+4. **Index + query**: Runs the real parser. This is the only combination that can tell you whether the query parses — a query on its own gets a structural check that passes things like `title:` and `title:[2020 TO`, neither of which parse
 
 **Returns:**
 - `syntax_reference`: Full query syntax documentation with all operators, examples, and field-type compatibility
 - `available_fields`: Schema fields with types, indexed status, and per-field query hints (includes `query_hint` per field)
 - `field_suggestions`: Autocomplete matches for partial field names
-- `query_analysis`: Structural validation, recognized/unknown fields, warnings, and suggestions
+- `query_analysis`: The parser's verdict plus the structural pass — see below
 - `searchable_field_names`: List of all queryable field names
 
 **Example:**
@@ -292,11 +292,21 @@ Validate and get guidance on CameoDB search query syntax. This is the **primary 
 }
 ```
 
-**Response includes:**
-- `warnings`: `["Unknown field 'titel'. Did you mean: title?"]`
-- `suggestions`: Field corrections and syntax tips
-- `field_hints`: Type-specific query guidance (e.g., "text supports phrases, slop, prefix, IN set, boost, range")
-- `syntax_reference`: Complete query syntax with operator-by-field-type matrix
+**`query_analysis` fields** (present when both `index` and `query` are supplied):
+
+| Field | Meaning |
+|---|---|
+| `parses` | `true` if the query is well-formed. `false` if not — `syntax_errors` says where. **`null` means it could not be checked**, not that it passed |
+| `syntax_errors` | The parser's own messages, each with the position it reached |
+| `normalized_query` | What the engine actually runs, after date, facet and prefix rewriting |
+| `discarded_clauses` | Clauses that parse but can never match — unknown fields, non-indexed fields, unsupported constructs. Exactly what a search would drop |
+| `warnings` | Structural findings, plus a line per syntax error |
+| `suggestions` | Field corrections, e.g. `Unknown field 'titel'. Did you mean: title?` |
+| `field_hints` | Type-specific query guidance per referenced field |
+
+A clause in `discarded_clauses` is the dangerous case: the search runs, returns results, and
+answers a narrower question than the one asked. `search_index` refuses such a query outright;
+validating first is how to find out why.
 
 ### 6. `get_catalog_stats`
 

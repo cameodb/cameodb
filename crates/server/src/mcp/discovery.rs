@@ -204,9 +204,28 @@ pub(super) fn validate_query(
             .collect();
 
         // Query analysis with structural validation
-        let query_analysis = query
+        let mut query_analysis = query
             .as_ref()
             .map(|query_text| analyze_query(query_text, &field_infos));
+
+        // The parser's own verdict, which is the only thing here that can answer the question the
+        // tool is recommended for: a query that balances and still does not parse. It needs an
+        // index, because resolving a field name does, so it runs only when one was named — the
+        // structural analysis above is what remains when one was not.
+        if let (Some(index_name), Some(query_text), Some(analysis)) =
+            (index.as_ref(), query.as_ref(), query_analysis.as_mut())
+        {
+            let parsed = state
+                .router
+                .handle_client_op(ClientOp::ValidateQuery {
+                    index: index_name.clone(),
+                    query: query_text.clone(),
+                })
+                .await
+                .map_err(|err| err.to_string())?;
+
+            merge_parser_verdict(analysis, &parsed);
+        }
 
         Ok(serde_json::json!({
             "index": index,
@@ -217,6 +236,65 @@ pub(super) fn validate_query(
             "searchable_field_names": field_names,
         }))
     })
+}
+
+/// Fold the engine's parse of a query into the structural analysis of it.
+///
+/// Kept as a merge rather than a replacement because the two see different things. The parser is
+/// authoritative on whether the query runs and on what the engine will actually execute; the
+/// structural pass is what produces the "did you mean" suggestions, which need the schema's field
+/// names and the parser never offers.
+///
+/// `parses` is the field worth reading first: it is the answer the tool previously could not give
+/// at all, and it is `null` rather than `true` when the index has no documents to check against —
+/// an unchecked query must not read as a passing one.
+fn merge_parser_verdict(analysis: &mut JsonValue, parsed: &JsonValue) {
+    let Some(object) = analysis.as_object_mut() else {
+        return;
+    };
+
+    let syntax_errors = parsed
+        .get("syntax_errors")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let parses = match parsed.get("valid") {
+        // `valid` folds in discarded clauses, which are reported separately here; what this
+        // field claims is narrower and answerable on its own.
+        Some(JsonValue::Null) | None => JsonValue::Null,
+        Some(_) => JsonValue::Bool(
+            syntax_errors
+                .as_array()
+                .is_none_or(|errors| errors.is_empty()),
+        ),
+    };
+
+    object.insert("parses".to_string(), parses);
+    object.insert("syntax_errors".to_string(), syntax_errors.clone());
+
+    if let Some(normalized) = parsed.get("normalized_query") {
+        object.insert("normalized_query".to_string(), normalized.clone());
+    }
+    if let Some(discarded) = parsed.get("discarded") {
+        object.insert("discarded_clauses".to_string(), discarded.clone());
+    }
+    if let Some(note) = parsed.get("note") {
+        object.insert("note".to_string(), note.clone());
+    }
+
+    // A syntax error is the finding, not a footnote: it is why the search the agent was about to
+    // run would have failed, and the structural warnings above it all passed.
+    if let Some(JsonValue::Array(warnings)) = object.get_mut("warnings")
+        && let Some(errors) = syntax_errors.as_array()
+    {
+        for error in errors {
+            if let Some(text) = error.as_str() {
+                warnings.push(JsonValue::String(format!(
+                    "Query does not parse: {text}. The clause it names was dropped, so a search \
+                     with this query would answer a different question."
+                )));
+            }
+        }
+    }
 }
 
 /// Statistics for one index, or totals across the catalogue.

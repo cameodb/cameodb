@@ -1126,6 +1126,12 @@ pub enum ClientOp {
     },
     /// Get index configuration/schema
     GetConfig { index: String },
+    /// Parse a query against an index without running it.
+    ///
+    /// Metadata rather than a search: it touches no documents and returns no hits, only what the
+    /// parser made of the query. Local-only for the same reason `GetConfig` is — every shard
+    /// resolves field names against the same schema, so the first that can answer does.
+    ValidateQuery { index: String, query: String },
     /// List all available indexes with statistics (optimized for _indexes endpoint)
     ListIndexes { include_data_size: bool },
     /// Get node identity information
@@ -6570,6 +6576,9 @@ impl NodeOrchestrator {
                 field_updates,
             } => self.orch_update_schema(&index, &field_updates).await,
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
+            ClientOp::ValidateQuery { index, query } => {
+                self.orch_validate_query(&index, &query).await
+            }
             ClientOp::ListIndexes { include_data_size } => {
                 self.orch_list_indexes(include_data_size).await
             }
@@ -7467,6 +7476,55 @@ impl NodeOrchestrator {
             std::io::ErrorKind::NotFound,
             format!("Schema for index '{}' not found", index),
         )))
+    }
+
+    /// Parse a query against an index on whichever local shard can answer.
+    ///
+    /// Resolving a field name needs a built Tantivy index, and a shard that holds the schema but
+    /// has never been written to has none — so this asks each shard in turn and takes the first
+    /// real verdict. Shards share a schema, so the first answer is every shard's answer.
+    async fn orch_validate_query(
+        &self,
+        index: &str,
+        query: &str,
+    ) -> Result<JsonValue, OrchestratorError> {
+        for shard in self.shards.values() {
+            let Some(store) = &shard.store else { continue };
+            let store = Arc::clone(store);
+            let idx = index.to_string();
+            let q = query.to_string();
+
+            let outcome = tokio::task::spawn_blocking(move || store.validate_query(&idx, &q))
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                .map_err(OrchestratorError::Storage)?;
+
+            if let Some(outcome) = outcome {
+                return Ok(serde_json::json!({
+                    "index": index,
+                    "query": query,
+                    "valid": outcome.is_valid(),
+                    "normalized_query": outcome.normalized_query,
+                    "syntax_errors": outcome.syntax_errors,
+                    "discarded": outcome.discarded,
+                }));
+            }
+        }
+
+        // Every shard holds the schema and none has a built index, or the index is unknown here.
+        // Either way there is nothing to resolve field names against, and saying so beats
+        // returning a verdict that was never checked.
+        Ok(serde_json::json!({
+            "index": index,
+            "query": query,
+            "valid": JsonValue::Null,
+            "normalized_query": query,
+            "syntax_errors": [],
+            "discarded": [],
+            "note": "This index has no documents yet, so the query could not be checked against \
+                     it. Field names are resolved against a built index, which does not exist \
+                     until the first write.",
+        }))
     }
 
     /// List all available indexes (unified function for both local and cluster operations)

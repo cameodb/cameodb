@@ -408,6 +408,75 @@ impl SearchOutcome {
     }
 }
 
+/// What parsing a query against an index found, without running it.
+///
+/// The two lists are separate because they fail differently. A syntax error means the query is
+/// malformed and the parser recovered by dropping something; a discarded clause parsed fine and
+/// simply cannot match. An agent can fix the first from the message alone, while the second
+/// usually means looking at the schema.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueryValidation {
+    /// The query as the engine parses it, after date, facet and prefix normalization.
+    ///
+    /// Worth returning even when nothing is wrong: a query is rewritten before it runs, and the
+    /// rewrite is where a surprising result usually comes from.
+    pub normalized_query: String,
+    /// Malformed syntax, in the parser's own words, including the position it reached.
+    ///
+    /// This is the case a structural check cannot reach — a query whose quotes and parentheses
+    /// balance and which still does not parse.
+    pub syntax_errors: Vec<String>,
+    /// Clauses that parse but cannot match: unknown fields, fields that are not indexed,
+    /// constructs the parser does not support. The same notes a search reports as discarded.
+    pub discarded: Vec<String>,
+}
+
+impl QueryValidation {
+    /// Whether the query runs, and every clause in it can match something.
+    pub fn is_valid(&self) -> bool {
+        self.syntax_errors.is_empty() && self.discarded.is_empty()
+    }
+}
+
+/// Normalize a query the way a search does, and build the parser a search would use.
+///
+/// Shared by the search path, the count-only path and validation, so that what validation
+/// reports is what a search would actually do. A validator that built its parser differently —
+/// a different default field set, a different normalization — would be worse than none: it would
+/// disagree with the search it exists to predict.
+fn prepare_query_parser(
+    tantivy_index: &Index,
+    fields: &SchemaFields,
+    schema: &IndexSchema,
+    query: &str,
+) -> (String, Vec<String>, tantivy::query::QueryParser) {
+    // Normalize date literals against the schema so naive inputs match indexed Date fields,
+    // then facets, then rewrite single-term prefixes into ranges.
+    let (normalized_query, prefix_notes) = normalize_prefix_query(
+        &normalize_facet_query(&normalize_date_query(query, schema), schema),
+        tantivy_index,
+    );
+
+    // Only text and JSON fields are default search fields, so an unqualified term is never
+    // attempted against a numeric or date field — which the parser reports as a type error
+    // rather than as a non-match.
+    let tantivy_schema = tantivy_index.schema();
+    let default_query_fields: Vec<Field> = fields
+        .indexed_fields
+        .values()
+        .filter(|field| {
+            matches!(
+                tantivy_schema.get_field_entry(**field).field_type(),
+                tantivy::schema::FieldType::Str(_) | tantivy::schema::FieldType::JsonObject(_)
+            )
+        })
+        .cloned()
+        .collect();
+
+    let parser = tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
+    (normalized_query, prefix_notes, parser)
+}
+
 /// Whether the parser resolved this ambiguity and ran the clause anyway.
 ///
 /// The grammar reads `field:value` whose value contains a colon as a field name first, then
@@ -4768,6 +4837,68 @@ impl HybridStore {
             .is_some_and(|state| *state.value() == IndexWarmupState::Warm)
     }
 
+    /// Parse a query against an index without running it, and report what the parser found.
+    ///
+    /// This exists because the only way to learn whether a query parses used to be to run it and
+    /// read what a search discarded. Checking that quotes and parentheses balance is not the same
+    /// question: the interesting failure is a query that balances fine and still does not parse,
+    /// and resolving a field name needs the index, so nothing above the engine can answer it.
+    ///
+    /// Parses through exactly the path a search takes — same normalization, same default field
+    /// set, same lenient parser — so a query this accepts is one a search will run, and the
+    /// clauses it reports as discarded are the clauses that search would drop.
+    ///
+    /// `Ok(None)` when the index has no Tantivy directory yet: an index that has a schema but has
+    /// never been written to has nothing to resolve field names against. That is not an error,
+    /// and it is the same distinction [`HybridStore::warm_index`] draws.
+    pub fn validate_query(
+        &self,
+        index: &str,
+        query: &str,
+    ) -> Result<Option<QueryValidation>, StoreError> {
+        let Some((reader, fields)) = self.get_reader(index)? else {
+            return Ok(None);
+        };
+
+        let searcher = reader.searcher();
+        let tantivy_index = searcher.index();
+        let schema = self
+            .get_schema_cached(index)?
+            .unwrap_or_else(|| Arc::new(IndexSchema::default()));
+
+        let (normalized_query, prefix_notes, query_parser) =
+            prepare_query_parser(tantivy_index, &fields, &schema, query);
+
+        // The query itself is discarded: what is wanted is the error list, which is the half a
+        // search throws away after deciding it can still run.
+        let (_parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
+
+        let syntax_errors: Vec<String> = parse_errors
+            .iter()
+            .filter(|err| !is_recovered_ambiguity(err))
+            .filter_map(|err| match err {
+                tantivy::query::QueryParserError::SyntaxError(detail) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Syntax errors are reported above with the parser's own wording and position, so they
+        // are kept out of the discarded list rather than appearing twice in weaker words.
+        let semantic_errors: Vec<tantivy::query::QueryParserError> = parse_errors
+            .into_iter()
+            .filter(|err| !matches!(err, tantivy::query::QueryParserError::SyntaxError(_)))
+            .collect();
+
+        let mut discarded = describe_discarded_all(&semantic_errors, query, &schema);
+        discarded.extend(prefix_notes);
+
+        Ok(Some(QueryValidation {
+            normalized_query,
+            syntax_errors,
+            discarded,
+        }))
+    }
+
     /// Search documents in a specific index
     /// Uses tantivy for search, then batch-retrieves complete documents from redb
     /// Returns (results, total_hits) where total_hits is the total number of matching documents
@@ -4808,26 +4939,8 @@ impl HybridStore {
                 return Ok(SearchOutcome::counted(total_hits, Vec::new()));
             }
 
-            let (normalized_query, prefix_notes) = normalize_prefix_query(
-                &normalize_facet_query(&normalize_date_query(query, &schema), &schema),
-                tantivy_index,
-            );
-            let tantivy_schema = tantivy_index.schema();
-            let default_query_fields: Vec<Field> = fields
-                .indexed_fields
-                .values()
-                .filter(|field| {
-                    let field_entry = tantivy_schema.get_field_entry(**field);
-                    matches!(
-                        field_entry.field_type(),
-                        tantivy::schema::FieldType::Str(_)
-                            | tantivy::schema::FieldType::JsonObject(_)
-                    )
-                })
-                .cloned()
-                .collect();
-            let query_parser =
-                tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
+            let (normalized_query, prefix_notes, query_parser) =
+                prepare_query_parser(tantivy_index, &fields, &schema, query);
             let (parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
             let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
             discarded.extend(prefix_notes);
@@ -4924,31 +5037,8 @@ impl HybridStore {
             });
         }
 
-        // Normalize date literals based on schema so naive inputs match indexed Date fields
-        let (normalized_query, prefix_notes) = normalize_prefix_query(
-            &normalize_facet_query(&normalize_date_query(query, &schema), &schema),
-            tantivy_index,
-        );
-
-        // Create query parser and execute search
-        // Only text/string fields are used as default search fields (for unqualified queries).
-        // Numeric/date fields require explicit field:value syntax.
-        // This prevents parse errors when a generic text search tries to match against numeric fields.
-        let tantivy_schema = tantivy_index.schema();
-        let default_query_fields: Vec<Field> = fields
-            .indexed_fields
-            .values()
-            .filter(|field| {
-                let field_entry = tantivy_schema.get_field_entry(**field);
-                matches!(
-                    field_entry.field_type(),
-                    tantivy::schema::FieldType::Str(_) | tantivy::schema::FieldType::JsonObject(_)
-                )
-            })
-            .cloned()
-            .collect();
-        let query_parser =
-            tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
+        let (normalized_query, prefix_notes, query_parser) =
+            prepare_query_parser(tantivy_index, &fields, &schema, query);
 
         // Lenient, so one bad clause does not fail the whole query; what it drops is reported
         // through `SearchOutcome::discarded` rather than swallowed.

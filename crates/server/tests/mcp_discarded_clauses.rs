@@ -4,6 +4,10 @@
 //! carries it out — shard reply, per-node merge, response JSON — and the two contracts built on
 //! it: MCP returns a tool execution error, while the HTTP API returns the hits with
 //! `_discarded_clauses` attached.
+//!
+//! Also covers `validate_query`, which answers the same question before a search rather than
+//! after one — including the case it previously could not see at all, a query whose quotes and
+//! parentheses balance and which still does not parse.
 
 use std::io::Write as _;
 use std::net::TcpListener;
@@ -279,4 +283,167 @@ async fn the_http_api_reports_discarded_clauses_instead_of_refusing() {
         body.get("_discarded_clauses").is_none(),
         "a clean parse must not attach the key at all: {body}"
     );
+}
+
+/// The case a structural check cannot reach: `title:` balances perfectly and does not parse.
+///
+/// The tool used to answer this with a structural pass that had already succeeded, which is
+/// exactly the situation its own description sends an agent into after a search fails.
+#[tokio::test]
+async fn validate_query_catches_a_query_that_balances_but_does_not_parse() {
+    let node = TestNode::start().await;
+    node.seed("docs").await;
+
+    let query = "title:";
+    assert_eq!(
+        query.chars().filter(|c| *c == '"').count() % 2,
+        0,
+        "the point of this case is that a structural check passes it"
+    );
+
+    let (is_error, text) = node
+        .call_tool("validate_query", json!({"index": "docs", "query": query}))
+        .await;
+    assert!(!is_error, "validation itself should succeed: {text}");
+
+    let body: Value = serde_json::from_str(&text).expect("structured result");
+    let analysis = &body["query_analysis"];
+
+    assert_eq!(
+        analysis["parses"],
+        json!(false),
+        "`{query}` does not parse, and validation should say so: {analysis}"
+    );
+    assert!(
+        analysis["syntax_errors"]
+            .as_array()
+            .is_some_and(|errors| !errors.is_empty()),
+        "a malformed query should carry the parser's errors: {analysis}"
+    );
+}
+
+/// A well-formed query is reported as parsing, and carries the form the engine will run.
+#[tokio::test]
+async fn validate_query_reports_the_query_the_engine_will_run() {
+    let node = TestNode::start().await;
+    node.seed("docs").await;
+
+    let (is_error, text) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "docs", "query": "title:rust"}),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+
+    let body: Value = serde_json::from_str(&text).expect("structured result");
+    let analysis = &body["query_analysis"];
+
+    assert_eq!(analysis["parses"], json!(true), "{analysis}");
+    assert_eq!(
+        analysis["normalized_query"], "title:rust",
+        "an unrewritten query normalizes to itself: {analysis}"
+    );
+}
+
+/// What validation predicts is what the search does.
+///
+/// A clause naming a field the index does not have is refused by `search_index`; validation has
+/// to name the same clause beforehand, or an agent that checks first learns nothing.
+#[tokio::test]
+async fn validate_query_names_the_clause_the_search_would_refuse() {
+    let node = TestNode::start().await;
+    node.seed("docs").await;
+
+    let query = "nosuchfield:rust";
+
+    let (validation_failed, validation_text) = node
+        .call_tool("validate_query", json!({"index": "docs", "query": query}))
+        .await;
+    assert!(!validation_failed, "{validation_text}");
+
+    let body: Value = serde_json::from_str(&validation_text).expect("structured result");
+    let analysis = &body["query_analysis"];
+
+    assert_eq!(
+        analysis["parses"],
+        json!(true),
+        "this query parses; what is wrong with it is semantic: {analysis}"
+    );
+    let discarded = analysis["discarded_clauses"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        discarded
+            .iter()
+            .any(|note| note.as_str().is_some_and(|n| n.contains("nosuchfield"))),
+        "validation should name the clause that cannot match: {analysis}"
+    );
+
+    // And the search it was predicting does refuse.
+    let (search_failed, _) = node
+        .call_tool("search_index", json!({"index": "docs", "query": query}))
+        .await;
+    assert!(
+        search_failed,
+        "the search validation warned about should be the one that fails"
+    );
+}
+
+/// A declared but empty index still validates, because `PUT /_config` builds the Tantivy index
+/// rather than waiting for the first write.
+///
+/// That is what lets an agent check a query before there is anything to find with it. The
+/// unbuilt case — a schema with no index behind it — is reachable below the HTTP layer and is
+/// covered in `crates/storage/tests/query_validation_test.rs`; what matters here is that the
+/// ordinary path does not fall into it and answer `null` for every new index.
+#[tokio::test]
+async fn validate_query_works_on_a_declared_index_with_no_documents() {
+    let node = TestNode::start().await;
+    node.seed("docs").await;
+
+    let status = http()
+        .put(format!("{}/api/empty/_config", node.url))
+        .json(&json!({
+            "fields": {
+                "title": {"name": "title", "field_type": "text", "indexed": true}
+            }
+        }))
+        .send()
+        .await
+        .expect("create config")
+        .status();
+    assert!(
+        status.is_success(),
+        "creating the empty index failed: {status}"
+    );
+
+    // Malformed, against an index holding nothing: the verdict comes from the schema, not from
+    // the documents, so it is available immediately.
+    let (is_error, text) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "empty", "query": "title:"}),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+
+    let body: Value = serde_json::from_str(&text).expect("structured result");
+    let analysis = &body["query_analysis"];
+    assert_eq!(
+        analysis["parses"],
+        json!(false),
+        "an empty index can still tell a malformed query from a good one: {analysis}"
+    );
+
+    // And the well-formed counterpart passes, so the above is not just a blanket refusal.
+    let (_, text) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "empty", "query": "title:rust"}),
+        )
+        .await;
+    let body: Value = serde_json::from_str(&text).expect("structured result");
+    assert_eq!(body["query_analysis"]["parses"], json!(true));
 }

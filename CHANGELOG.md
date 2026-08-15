@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`validate_query` runs the real parser.** It checked that quotes and parentheses balanced and
+  that named fields existed, which left out the case the tool is recommended for: a query that
+  balances fine and still does not parse. `title:`, `title:[2020 TO`, `year:{2020 TO 2021` and a
+  leading `AND` all pass a structural check and none of them parse. The tool now reports `parses`,
+  `syntax_errors` (the parser's own message, with position), `normalized_query` (what the engine
+  actually runs after rewriting) and `discarded_clauses` (clauses that parse but can never match).
+  `parses` is `null` rather than `true` when the query could not be checked, so an unchecked query
+  never reads as a passing one. Backed by a new `HybridStore::validate_query`, which parses
+  against an index without searching it — field-name resolution needs a built index, so nothing
+  above the engine could answer this.
+
 ### Fixed
 
 - **`PATCH /api/{index}/_schema` works.** It answered `500` for every index that had ever been

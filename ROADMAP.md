@@ -170,20 +170,33 @@ fixes whose root cause turned out to sit in the engine rather than in the MCP la
    (`crates/storage/tests/schema_promotion_test.rs`) and four against a real node process
    (`crates/server/tests/node_http_api.rs`). The remaining half of (c) — actually making such a
    field queryable — is item 8 below
-2. **`validate_query` cannot actually validate a query.** It checks that quotes and parentheses
-   balance and that named fields exist, which leaves the case the tool is recommended for: a query
-   that balances fine and still fails to parse. The prompt sends an agent here when a search
-   returns a syntax error, and what it gets back is a structural check that already passed. The
-   fix is to run the real parser and return its errors — the engine parses leniently and collects
-   them (`parse_query_lenient`, used twice in `crates/storage/src/lib.rs`) but only behind a
-   search, and only against a `QueryParser` built from a live Tantivy index, because resolving a
-   field name needs the index. So this needs a storage entry point that parses against an index
-   without searching it, returning the same `QueryParserError` list a search would discard — which
-   is engine work rather than MCP work, and why it is here rather than in the tool. Two things
-   fall out of it once it exists: the same errors could be reported on the HTTP search path, and
-   `validate_query` could stop being a documentation endpoint (the static reference belongs in
-   `instructions` and a `cameodb://syntax` resource; a tool call that returns unchanging text is a
-   round trip spent on nothing)
+2. ~~**`validate_query` cannot actually validate a query.**~~ ✅ Landed 2026-08-15.
+   `HybridStore::validate_query` parses against an index without searching it, and the tool
+   reports what it found. The engine work was the point: resolving a field name needs a built
+   Tantivy index, so nothing above the storage layer could answer the question. It parses through
+   the *same* path a search takes — one `prepare_query_parser` now builds the normalization and
+   the default field set for the search path, the count-only path and validation, which had been
+   three copies of the same twenty lines. A validator that parsed differently from the search
+   would be worse than none.
+   Syntax errors and unmatched clauses are reported separately, because they are fixed
+   differently: `parses` plus `syntax_errors` with the parser's own message and position, against
+   `discarded_clauses` for what parses and can never match. `normalized_query` is returned too —
+   a query is rewritten before it runs and that rewrite is where a surprising result usually comes
+   from. `parses` is `null`, never `true`, when the index could not be checked, so an unchecked
+   query cannot read as a passing one.
+   The gap it closes, measured rather than asserted: `title:`, `title:[2020 TO`,
+   `year:{2020 TO 2021` and `AND title:rust` all balance their quotes and parentheses — so the
+   old structural check passed every one — and none of them parse. A test asserts each one's
+   balance before asserting it fails, so the reason the case is there stays visible. Another
+   asserts that what validation calls discarded is exactly what a search discards, which is the
+   property that makes checking first worth a round trip. Seven engine tests
+   (`crates/storage/tests/query_validation_test.rs`), four over MCP against a real node
+   (`crates/server/tests/mcp_discarded_clauses.rs`).
+   **Not done, deliberately:** the tool still returns the static syntax reference. Moving that to
+   `instructions` and a `cameodb://syntax` resource is a change to the tool's contract rather than
+   a fix to it, and the tool's own description currently tells agents to call it with no arguments
+   for exactly that text — so it belongs with item 6's documentation pass, where the description,
+   the instructions and the README change together
 3. **One structured description of an index, built once.** There is no single answer to "what is
    in this index". `ClientOp::ListIndexes` returns per-index statistics plus a flat `field_names`
    array; `ClientOp::GetConfig` returns the field *definitions* with types and flags; and the two
