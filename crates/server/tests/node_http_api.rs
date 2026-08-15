@@ -321,15 +321,14 @@ async fn a_schema_flag_can_be_changed_on_an_index_that_is_open() {
     assert_eq!(response.1["updated_fields"], json!(["title"]));
 }
 
-/// A field discovered *after* the index exists cannot be made queryable by setting its flag,
-/// because the Tantivy schema was fixed when the index was created. The endpoint has to say so
-/// rather than acknowledge an edit that would change nothing a search can see.
+/// Marking a late-discovered field indexed is applied and flagged, not refused.
 ///
-/// The distinction the two writes below draw is the whole point: fields present on the first
-/// write are indexed then, because it is the last moment they can be. `mark_initial_fields_indexed`
-/// says so, and this pins the other side of that rule.
+/// The Tantivy schema was fixed when the index was built, so the field has no column yet and the
+/// flag takes effect at the next rebuild. That makes the edit the first step of
+/// declare-then-reingest rather than a mistake — so the endpoint saves it and says what remains
+/// to be done, instead of blocking the only route to a searchable field.
 #[tokio::test]
-async fn promoting_a_late_discovered_field_is_refused_with_a_reason() {
+async fn promoting_a_late_discovered_field_is_applied_and_flagged() {
     let node = TestNode::start("").await;
     let client = node.client();
 
@@ -344,8 +343,7 @@ async fn promoting_a_late_discovered_field_is_refused_with_a_reason() {
         .await
         .expect("first write");
 
-    // `author` arrives afterwards, so it is recorded non-indexed — there is no Tantivy column
-    // for it and nothing rebuilds one.
+    // `author` arrives afterwards, so it is recorded non-indexed.
     client
         .write_document(
             "papers",
@@ -358,15 +356,19 @@ async fn promoting_a_late_discovered_field_is_refused_with_a_reason() {
 
     let (status, body) = patch_schema(&node, "papers", &json!({"author": true})).await;
 
-    assert_eq!(status, 409, "expected a refusal, got {status}: {body}");
-    let details = body["details"].as_str().unwrap_or_default();
-    assert!(
-        details.contains("author"),
-        "the refusal should name the field, got: {details}"
+    assert_eq!(status, 200, "the declaration should be accepted: {body}");
+    assert_eq!(body["acknowledged"], json!(true));
+    assert_eq!(body["updated_fields"], json!(["author"]));
+    assert_eq!(
+        body["pending_reindex_fields"],
+        json!(["author"]),
+        "and it should say the field is not searchable yet: {body}"
     );
+
+    let note = body["note"].as_str().unwrap_or_default();
     assert!(
-        details.contains("re-ingest") || details.contains("Recreating"),
-        "the refusal should say what it would take, got: {details}"
+        note.contains("re-ingest"),
+        "the note should say what makes it searchable, got: {note}"
     );
 }
 
@@ -403,8 +405,8 @@ async fn changing_a_flag_leaves_the_rest_of_the_schema_alone() {
         .expect("config after");
 
     assert_eq!(
-        before.fields.as_object().map(|f| f.len()),
-        after.fields.as_object().map(|f| f.len()),
+        before.fields.len(),
+        after.fields.len(),
         "the field set should be unchanged by a flag edit"
     );
 
@@ -454,4 +456,137 @@ async fn patch_schema(
     let status = response.status().as_u16();
     let body = response.json().await.unwrap_or(serde_json::Value::Null);
     (status, body)
+}
+
+/// The listing describes each index in full: identity, statistics and every field with its type.
+///
+/// Before this, `/_indexes` gave field *names* only, so every caller — the bundled client, the
+/// MCP tools — fetched `/api/{index}/_config` again per index just to learn the types. That is
+/// what made the listing cost 1 + N requests instead of one.
+#[tokio::test]
+async fn the_listing_describes_every_field_without_a_second_request() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    client
+        .write_document(
+            "papers",
+            "p1",
+            &json!({"id": "p1", "title": "On Shapes", "year": 2020}),
+            None,
+        )
+        .await
+        .expect("write");
+
+    // Raw HTTP rather than the SDK: the typed `IndexInfo` does not model the new keys, so
+    // deserializing through it would silently drop exactly what this asserts.
+    let raw = get_json(&node, "/_indexes").await;
+    let entry = raw["indexes"]
+        .as_array()
+        .and_then(|a| a.iter().find(|e| e["name"] == "papers"))
+        .expect("papers in the listing");
+
+    let fields = entry["fields"].as_array().expect("fields array");
+    assert!(
+        !fields.is_empty(),
+        "the listing should carry fields: {entry}"
+    );
+    assert_eq!(
+        entry["field_count"].as_u64(),
+        Some(fields.len() as u64),
+        "field_count should match the array it counts"
+    );
+
+    let title = fields
+        .iter()
+        .find(|f| f["name"] == "title")
+        .expect("title described");
+
+    // The one-word type an agent keys on, lowercase and matching the syntax reference.
+    assert_eq!(title["type"], json!("text"));
+    assert_eq!(title["indexed"], json!(true));
+    assert_eq!(
+        title["searchable"],
+        json!(true),
+        "declared and built, so a query reaches it: {title}"
+    );
+
+    // Every field carries the same keys — no property is present on one and absent on another.
+    for field in fields {
+        for key in [
+            "name",
+            "type",
+            "indexed",
+            "stored",
+            "fast",
+            "shadow",
+            "searchable",
+        ] {
+            assert!(
+                field.get(key).is_some(),
+                "every field needs `{key}`, missing on {field}"
+            );
+        }
+    }
+
+    assert!(
+        fields.iter().all(|f| f["name"] != "_seq"),
+        "`_seq` is WAL bookkeeping and must not be offered as a queryable field: {fields:?}"
+    );
+}
+
+/// `/api/{index}/_config` describes a field exactly as the listing does.
+///
+/// The two used to disagree on every property name — the schema keyed fields by map key with
+/// `field_type` and `is_shadow`, the listing offered names only — so a caller reading both had to
+/// translate between them.
+#[tokio::test]
+async fn the_schema_endpoint_and_the_listing_describe_a_field_identically() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    client
+        .write_document(
+            "papers",
+            "p1",
+            &json!({"id": "p1", "title": "On Shapes"}),
+            None,
+        )
+        .await
+        .expect("write");
+
+    let listing = get_json(&node, "/_indexes").await;
+    let from_listing = listing["indexes"]
+        .as_array()
+        .and_then(|a| a.iter().find(|e| e["name"] == "papers"))
+        .and_then(|e| e["fields"].as_array())
+        .and_then(|f| f.iter().find(|f| f["name"] == "title"))
+        .cloned()
+        .expect("title from listing");
+
+    let config = get_json(&node, "/api/papers/_config").await;
+
+    let from_config = config["fields"]
+        .as_array()
+        .and_then(|f| f.iter().find(|f| f["name"] == "title"))
+        .cloned()
+        .expect("title from config");
+
+    assert_eq!(
+        from_listing, from_config,
+        "one index, one description of its fields"
+    );
+}
+
+/// A GET against the node, decoded as raw JSON.
+async fn get_json(node: &TestNode, path: &str) -> serde_json::Value {
+    with_tls_provider();
+    reqwest::Client::new()
+        .get(format!("{}{path}", node.url))
+        .send()
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json")
 }

@@ -92,8 +92,20 @@ pub(super) fn read_resource(
         }
 
         if let Some(index_name) = resource.strip_suffix("/schema") {
+            // This asked for a `schema` key that `describe_index` had already removed, so the
+            // resource answered `null` for every index while still paying for the lookup. The
+            // description carries the fields directly now, and the schema is what they are.
             let details = describe_index(state.clone(), index_name.to_string()).await?;
-            return Ok(details.get("schema").cloned().unwrap_or(JsonValue::Null));
+            return Ok(serde_json::json!({
+                "name": details.get("name").cloned().unwrap_or(JsonValue::Null),
+                "description": details.get("description").cloned().unwrap_or(JsonValue::Null),
+                "field_count": details.get("field_count").cloned().unwrap_or(JsonValue::Null),
+                "fields": details.get("fields").cloned().unwrap_or(JsonValue::Array(Vec::new())),
+                "query_hints": details
+                    .get("query_hints")
+                    .cloned()
+                    .unwrap_or(JsonValue::Array(Vec::new())),
+            }));
         }
 
         if let Some(index_name) = resource.strip_suffix("/stats") {

@@ -392,15 +392,29 @@ curl -s http://localhost:9480/api/books/_config
 **Response:**
 ```json
 {
-  "field_names": ["author", "title"],
+  "name": "books",
   "description": "Library catalogue, one document per edition.",
-  "fields": {
-    "title": {"name": "title", "field_type": "text", "indexed": true, "description": "Title as printed on the edition."},
-    "author": {"name": "author", "field_type": "text", "indexed": true}
-  },
-  "shard_count": 256
+  "field_count": 3,
+  "fields": [
+    {"name": "id", "type": "text", "indexed": true, "stored": true, "fast": false, "shadow": false, "searchable": true},
+    {"name": "author", "type": "text", "indexed": true, "stored": false, "fast": false, "shadow": false, "searchable": true},
+    {"name": "title", "type": "text", "indexed": true, "stored": false, "fast": false, "shadow": false, "searchable": true,
+     "description": "Title as printed on the edition."}
+  ]
 }
 ```
+
+Every field carries the same keys, in the same spelling, here and in `GET /_indexes` — one index
+has one description. `fields` is ordered with `id` first, then alphabetically.
+
+| Key | Meaning |
+|-----|---------|
+| `type` | Lowercase, and the same name the query syntax reference uses — `text`, `date`, `i64` |
+| `indexed` | What the schema **declares** |
+| `searchable` | Whether the built index can actually match on it. Differs from `indexed` for a field declared after the index was built — see `PATCH /api/{index}/_schema` |
+| `fast` | Required to sort on a numeric or date field |
+| `shadow` | The field carries the identifier under its original name; queried through `id` |
+| `stored` | Kept in the search index as well as the document store |
 
 #### Change Field Indexing Flags
 Turn a field's `indexed` flag on or off on an existing schema.
@@ -426,29 +440,49 @@ curl -s -X PATCH http://localhost:9480/api/books/_schema \
 }
 ```
 
-The edit is all-or-nothing: if any named field is refused, nothing is written, and the request
-is answered with `409` rather than a partial success. An empty `field_updates` is a `400`.
+A name no shard recognises refuses the whole request with `409`, and nothing is written. An
+empty `field_updates` is a `400`.
 
-**What this endpoint cannot do, and why.** A field can only be made searchable if the index's
-Tantivy schema already has a column for it, and that schema is fixed when the index is created.
-Fields present on the **first** write are indexed then, because it is the last moment they can
-be. A field that first appears in a **later** document is recorded so that reads stay complete,
-but it has no column, and setting its flag would report success while leaving it unqueryable —
-so it is refused instead:
+**Declaring a field that the index cannot search yet.** A field is only searchable if the
+Tantivy index has a column for it, and that is fixed when the index is built. Fields present on
+the **first** write are indexed then; a field that first appears in a **later** document is
+recorded non-indexed, so marking it `indexed` does not make it searchable immediately. The edit
+is still accepted, because the stored schema is the *declaration* the index gets rebuilt from —
+so this is the first step of making the field searchable, not a mistake. Such fields come back
+under `pending_reindex_fields`:
 
 ```json
 {
-  "error": "Schema update refused, nothing was changed: cannot be made searchable on an index that is already built: notes. …",
-  "details": "…"
+  "acknowledged": true,
+  "index": "books",
+  "updated_fields": ["notes"],
+  "unchanged_fields": [],
+  "pending_reindex_fields": ["notes"],
+  "note": "Marked indexed and saved, but not searchable yet: notes. …"
 }
 ```
 
-Making such a field searchable means recreating the index with the field declared and
-re-ingesting. To avoid the situation, declare fields up front with `PUT /api/{index}/_config`,
-or make sure the first document written carries every field you intend to search.
+To complete it, rebuild the index data from the schema — delete the index data *without*
+deleting the schema, then re-ingest:
 
-Demoting a field (`true` → `false`) always works and takes effect on the next write; documents
-already indexed under it stay searchable until the index is rebuilt.
+```bash
+curl -s -X PATCH http://localhost:9480/api/books/_schema \
+  -H "Content-Type: application/json" \
+  -d '{"field_updates": {"notes": true}}'
+
+curl -s -X DELETE "http://localhost:9480/api/books?delete_schema=false"
+# re-ingest, and `notes` is now searchable
+```
+
+Until the rebuild, a query naming the field matches nothing — and says so: the search reports it
+under `_discarded_clauses`, and the MCP tools refuse such a search outright rather than returning
+a narrower answer as though it were complete.
+
+To avoid the situation entirely, declare fields up front with `PUT /api/{index}/_config`, or make
+sure the first document written carries every field you intend to search.
+
+Demoting a field (`true` → `false`) takes effect on the next write; documents already indexed
+under it stay searchable until the index is rebuilt.
 
 #### 🗑️ Delete Index
 Permanently delete an index and all its data across the cluster.
@@ -491,26 +525,38 @@ curl -s http://localhost:9480/_indexes
   "indexes": [
     {
       "name": "books",
+      "description": "Library catalogue, one document per edition.",
       "document_count": 16559,
-      "total_size_bytes": 45231680,
-      "size_mb": 43,
+      "index_size_bytes": 45231680,
+      "memory_bytes": 47316480,
       "shard_count": 4,
-      "field_names": ["id", "author", "genres", "publication_date", "summary", "title"]
-    },
-    {
-      "name": "ted",
-      "document_count": 4641,
-      "total_size_bytes": 12458752,
-      "size_mb": 12,
-      "shard_count": 4,
-      "field_names": ["id", "description", "like_count", "speaker", "tags", "title", "view_count"]
+      "warm_shards": 4,
+      "field_count": 3,
+      "fields": [
+        {"name": "id", "type": "text", "indexed": true, "stored": true, "fast": false, "shadow": false, "searchable": true},
+        {"name": "publication_date", "type": "date", "indexed": true, "stored": false, "fast": true, "shadow": false, "searchable": true},
+        {"name": "title", "type": "text", "indexed": true, "stored": false, "fast": false, "shadow": false, "searchable": true}
+      ]
     }
   ],
-  "total_indexes": 2,
+  "total_indexes": 1,
   "total_shards": 4,
-  "node_id": "550e8400-e29b-41d4-a716-446655440000"
+  "node_id": "550e8400-e29b-41d4-a716-446655440000",
+  "node_name": "node-a",
+  "took_ms": 3
 }
 ```
+
+The listing describes each index in full, so learning a field's type costs no extra request.
+Field entries are exactly those of `GET /api/{index}/_config`.
+
+Sizes are **bytes**, not megabytes: `GET /_cluster/_indexes` sums them across nodes, and summing
+values already rounded to whole megabytes lost up to a megabyte per node. `data_size_bytes` and
+`total_size_bytes` appear only with `?data_size=true`, since measuring the document store is the
+expensive half of the call.
+
+`GET /_cluster/_indexes` returns the same per-index shape, plus `nodes_contacted`, `nodes_failed`
+and a `nodes[]` array carrying each node's own listing.
 
 ### 🏥 System Operations
 

@@ -1,15 +1,15 @@
 //! Changing a field's `indexed` flag, which is what `PATCH /api/{index}/_schema` exists to do.
 //!
 //! A field that first appears inside a written document is recorded as non-indexed, on the
-//! stated expectation that it "can be promoted to indexed later". No mechanism was ever built
-//! for the second half of that sentence, and two separate defects hid it: persisting any schema
-//! against an open index failed on the writer lockfile, and had it succeeded, the flag would
-//! have been written while the field stayed unqueryable — the Tantivy schema is fixed when the
-//! index is created and nothing rebuilds it.
+//! stated expectation that it "can be promoted to indexed later". Promoting it used to fail
+//! outright: persisting any schema against an open index stranded its writer on the Tantivy
+//! lockfile, so every such edit answered `500`.
 //!
-//! So these tests pin down three things: that persisting a schema no longer strands a live
-//! writer, that the edits which *can* work do, and that the one which cannot is refused by name
-//! instead of being acknowledged and dropped.
+//! What the promotion means is the subtler half. The Tantivy schema is fixed when the index is
+//! built, so a newly declared field has no column until the index data is rebuilt from the
+//! schema — which `delete_index_data(delete_schema = false)` plus a re-ingest does. The edit is
+//! therefore a *declaration*, applied and flagged rather than refused, and these tests walk that
+//! round trip: declare, observe that the clause matches nothing and says so, rebuild, find it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -114,32 +114,77 @@ fn persisting_a_schema_does_not_strand_a_live_writer() {
     );
 }
 
-/// Setting `indexed` on a field the built Tantivy index does not have is refused.
+/// Marking a field indexed that the built index has no column for is applied, and flagged.
 ///
-/// Writing the flag would report success and change nothing a query can see: the Tantivy schema
-/// is fixed when the index is created, nothing rebuilds it, and the write path skips a field with
-/// no Tantivy field to write into. A refusal that names the field is the only honest answer until
-/// there is a reindex path.
+/// The stored schema is a declaration and the Tantivy index is built from it, so this edit is the
+/// first step of declare-then-reingest — the workflow the next test walks end to end. Refusing it
+/// would block the only way such a field is ever made searchable.
 #[test]
-fn promoting_a_discovered_field_is_refused_rather_than_silently_ignored() {
+fn promoting_a_discovered_field_is_applied_and_reported_as_pending() {
     let temp = TempDir::new().unwrap();
     let store = store_with_a_discovered_field(&temp, "docs");
 
     let updates = BTreeMap::from([("author".to_string(), true)]);
     let outcome = store.update_field_indexing("docs", &updates).unwrap();
 
-    assert!(outcome.is_rejected(), "promotion should be refused");
-    assert_eq!(outcome.needs_reindex, vec!["author".to_string()]);
-    assert!(
-        outcome.applied.is_empty(),
-        "a refused request must write nothing"
+    assert!(!outcome.is_rejected(), "{outcome:?}");
+    assert_eq!(outcome.applied, vec!["author".to_string()]);
+    assert_eq!(
+        outcome.pending_reindex,
+        vec!["author".to_string()],
+        "the caller has to be told it is not searchable yet"
     );
 
     let persisted = store.get_schema("docs").unwrap().unwrap();
     assert!(
-        !persisted.fields["author"].indexed,
-        "the refused flag must not have been persisted"
+        persisted.fields["author"].indexed,
+        "the declaration must be saved, or the rebuild has nothing to build from"
     );
+}
+
+/// Declare, rebuild, and the field is searchable. This is the whole reason the edit is allowed.
+///
+/// `delete_index_data` with `delete_schema = false` drops the documents and keeps the
+/// declaration, so the next write rebuilds the Tantivy index from a schema that now has the
+/// field in it.
+#[test]
+fn a_promoted_field_becomes_searchable_once_the_index_is_rebuilt() {
+    let temp = TempDir::new().unwrap();
+    let store = store_with_a_discovered_field(&temp, "docs");
+
+    let updates = BTreeMap::from([("author".to_string(), true)]);
+    store.update_field_indexing("docs", &updates).unwrap();
+
+    // Before the rebuild the clause matches nothing — and says so rather than passing silently.
+    let before = store
+        .search_documents("docs", "author:hoare", 10, None)
+        .unwrap();
+    assert!(before.hits.is_empty());
+    assert!(
+        !before.discarded.is_empty(),
+        "a clause that cannot match must be reported, not dropped quietly"
+    );
+
+    store.delete_index_data("docs", false).unwrap();
+    store
+        .apply_write(
+            "docs",
+            WalOp::Put {
+                id: "d1".to_string(),
+                json_blob: Some(serde_json::json!({
+                    "title": "Rust in Anger",
+                    "author": "hoare",
+                })),
+            },
+        )
+        .unwrap();
+    store.commit_index("docs").unwrap();
+
+    let after = store
+        .search_documents("docs", "author:hoare", 10, None)
+        .unwrap();
+    assert_eq!(after.hits.len(), 1, "the rebuild should make it searchable");
+    assert!(after.discarded.is_empty(), "{:?}", after.discarded);
 }
 
 /// Before the index is materialised there is no Tantivy schema to contradict, so the flag is
@@ -203,9 +248,18 @@ fn demoting_an_indexed_field_stops_new_documents_being_indexed_into_it() {
     );
 }
 
-/// An unknown field is refused, and refused without touching the fields that were valid.
+/// An unknown field is reported and skipped; the rest of the request still applies.
+///
+/// One shard is deliberately mechanical here. Shards normally hold the same schema — one declared
+/// through `PUT /_config` is fanned out to all of them, and one inferred from a bulk load is
+/// sampled from the first 200 documents and persisted everywhere before the first write lands.
+/// Semi-structured input written a document at a time is the exception: a field only some
+/// documents carry reaches only some shards. So "absent here" does not mean "absent everywhere",
+/// and only the caller spanning the shards can tell the two apart. That caller
+/// (`NodeOrchestrator::orch_update_schema`) refuses the request when every shard says unknown,
+/// and plans across all of them before any writes.
 #[test]
-fn an_unknown_field_refuses_the_whole_request() {
+fn an_unknown_field_is_reported_without_blocking_the_rest() {
     let temp = TempDir::new().unwrap();
     let store = store_with_a_discovered_field(&temp, "docs");
 
@@ -213,9 +267,10 @@ fn an_unknown_field_refuses_the_whole_request() {
     let outcome = store.update_field_indexing("docs", &updates).unwrap();
 
     assert_eq!(outcome.unknown, vec!["nonesuch".to_string()]);
+    assert_eq!(outcome.applied, vec!["title".to_string()]);
     assert!(
-        store.get_schema("docs").unwrap().unwrap().fields["title"].indexed,
-        "the valid half of a refused request must not be applied"
+        !store.get_schema("docs").unwrap().unwrap().fields["title"].indexed,
+        "the field this shard does know should still have been changed"
     );
 }
 
@@ -251,4 +306,95 @@ fn updating_a_flag_preserves_every_other_schema_property() {
         "description erased"
     );
     assert!(!after.fields["title"].indexed, "the edit itself was lost");
+}
+
+/// `searchable_fields` reports what a query can actually reach, which is not what `indexed` says.
+///
+/// This is the fact no caller above the engine can work out for itself, and the reason an index
+/// description is built here rather than composed by each consumer.
+#[test]
+fn searchable_fields_reports_the_built_index_not_the_declaration() {
+    let temp = TempDir::new().unwrap();
+    let store = store_with_a_discovered_field(&temp, "docs");
+
+    let searchable = store.searchable_fields("docs");
+    assert!(searchable.contains("title"), "{searchable:?}");
+    assert!(
+        searchable.contains("id"),
+        "`id:value` is answerable, so `id` is searchable: {searchable:?}"
+    );
+    assert!(
+        !searchable.contains("_seq"),
+        "`_seq` is WAL bookkeeping, not a queryable field: {searchable:?}"
+    );
+    assert!(
+        !searchable.contains("author"),
+        "a discovered field has no column: {searchable:?}"
+    );
+
+    // Declaring it does not change what the built index holds — that is the whole distinction.
+    let updates = BTreeMap::from([("author".to_string(), true)]);
+    store.update_field_indexing("docs", &updates).unwrap();
+    assert!(
+        store.get_schema("docs").unwrap().unwrap().fields["author"].indexed,
+        "declared indexed"
+    );
+    assert!(
+        !store.searchable_fields("docs").contains("author"),
+        "but still not searchable until the index is rebuilt"
+    );
+
+    // After the rebuild the two agree again.
+    store.delete_index_data("docs", false).unwrap();
+    store
+        .apply_write(
+            "docs",
+            WalOp::Put {
+                id: "d1".to_string(),
+                json_blob: Some(serde_json::json!({"title": "t", "author": "hoare"})),
+            },
+        )
+        .unwrap();
+    store.commit_index("docs").unwrap();
+    assert!(store.searchable_fields("docs").contains("author"));
+}
+
+/// The warm and cold paths must report the same set, or a description would change with cache
+/// state rather than with the index.
+#[test]
+fn searchable_fields_agrees_whether_the_index_is_cached_or_not() {
+    let temp = TempDir::new().unwrap();
+    let store = store_with_a_discovered_field(&temp, "docs");
+    let warm = store.searchable_fields("docs");
+    assert!(
+        !warm.is_empty(),
+        "the warm path should have found the cache"
+    );
+
+    // Dropping the field cache sends the next call down the open-from-disk path.
+    store.invalidate_schema_cache("docs");
+    let cold = store.searchable_fields("docs");
+
+    assert_eq!(warm, cold, "cache state must not change what is reported");
+}
+
+/// An index that has a schema but was never written to has nothing searchable yet.
+#[test]
+fn an_unbuilt_index_reports_nothing_searchable() {
+    let temp = TempDir::new().unwrap();
+    let store = HybridStore::new(config(temp.path().to_path_buf()), 1).unwrap();
+
+    let mut fields = HashMap::new();
+    fields.insert("title".to_string(), indexed_text("title"));
+    let mut schema = IndexSchema {
+        fields,
+        ..Default::default()
+    };
+    schema.rebuild_shadow_fields_cache();
+    store.store_schema_and_cache("empty", &schema).unwrap();
+
+    assert!(
+        store.searchable_fields("empty").is_empty(),
+        "nothing is built, so nothing is searchable"
+    );
 }

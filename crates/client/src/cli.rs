@@ -1,4 +1,6 @@
-use crate::sdk::{CameoClient, ClientAuth, Credential, ListIndexesResponse, TlsTrust, origin_of};
+use crate::sdk::{
+    CameoClient, ClientAuth, Credential, IndexInfo, ListIndexesResponse, TlsTrust, origin_of,
+};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored_json;
@@ -306,27 +308,24 @@ impl InteractiveSession {
     async fn update_index_cache(&self, response: &ListIndexesResponse) {
         let mut cache_updates = HashMap::new();
 
+        // The listing already describes every field, so this no longer fetches a schema per
+        // index. It used to, on top of the one the caller had just made for the same reason —
+        // so opening a REPL against a catalogue of N indexes cost 1 + 2N requests.
         for idx in &response.indexes {
-            let mut fields = Vec::new();
-
-            // Fetch schema to get field types
-            if let Ok(config) = self.client.get_index_config(&idx.name).await
-                && let JsonValue::Object(schema_fields) = config.fields
-            {
-                for (field_name, field_info) in schema_fields {
-                    if let JsonValue::Object(info) = field_info {
-                        let field_type = info
-                            .get("field_type")
+            let fields = idx
+                .fields
+                .iter()
+                .filter_map(|field| {
+                    Some(FieldInfo {
+                        name: field.get("name")?.as_str()?.to_string(),
+                        field_type: field
+                            .get("type")
                             .and_then(|t| t.as_str())
-                            .unwrap_or("text"); // Default to text
-
-                        fields.push(FieldInfo {
-                            name: field_name.clone(),
-                            field_type: field_type.to_string(),
-                        });
-                    }
-                }
-            }
+                            .unwrap_or("text")
+                            .to_string(),
+                    })
+                })
+                .collect();
 
             cache_updates.insert(idx.name.clone(), IndexMetadata { fields });
         }
@@ -402,35 +401,19 @@ async fn handle_list_command(
             let mut entries = Vec::new();
             let mut enriched_indexes = Vec::new();
 
+            // One request for the whole catalogue. Each entry already describes its fields, so
+            // the `_config` call this used to make per index — sequentially, so a catalogue of
+            // two hundred indexes was two hundred round trips — is gone.
             for index_info in &indexes.indexes {
-                let config = client.get_index_config(&index_info.name).await?;
-                let mut stats = serde_json::Map::new();
-                stats.insert(
-                    "document_count".to_string(),
-                    json!(index_info.document_count),
-                );
-                if let Some(total_size) = index_info.total_size_bytes {
-                    stats.insert("total_size_bytes".to_string(), json!(total_size));
-                }
-                if let Some(index_size) = index_info.index_size_mb {
-                    stats.insert("index_size_mb".to_string(), json!(index_size));
-                }
-                if let Some(data_size) = index_info.data_size_mb {
-                    stats.insert("data_size_mb".to_string(), json!(data_size));
-                }
-                stats.insert("shard_count".to_string(), json!(index_info.shard_count));
-                let stats = serde_json::Value::Object(stats);
-                let compact_fields = format_compact_fields(&config.fields);
+                let stats = index_stats_json(index_info);
+                let compact_fields = format_compact_fields(&index_info.fields);
                 entries.push((index_info.name.clone(), stats.clone(), compact_fields));
 
                 if extended {
-                    let schema = json!({
-                        "fields": config.fields,
-                    });
                     enriched_indexes.push(json!({
                         "name": index_info.name,
                         "stats": stats,
-                        "schema": schema,
+                        "schema": json!({ "fields": index_info.fields }),
                     }));
                 }
             }
@@ -467,43 +450,19 @@ async fn handle_list_command(
                     )
                 })?;
 
-            let config = client.get_index_config(&info.name).await?;
+            // No second request: the listing entry already describes the index in full. It is
+            // the same shape `/api/{index}/_config` returns, so both read the same either way.
+            let stats = index_stats_json(info);
 
             if extended {
-                let mut stats = serde_json::Map::new();
-                stats.insert("document_count".to_string(), json!(info.document_count));
-                if let Some(total_size) = info.total_size_bytes {
-                    stats.insert("total_size_bytes".to_string(), json!(total_size));
-                }
-                if let Some(index_size) = info.index_size_mb {
-                    stats.insert("index_size_mb".to_string(), json!(index_size));
-                }
-                if let Some(data_size) = info.data_size_mb {
-                    stats.insert("data_size_mb".to_string(), json!(data_size));
-                }
-                stats.insert("shard_count".to_string(), json!(info.shard_count));
-                let stats = serde_json::Value::Object(stats);
                 let enriched = json!({
                     "index": info.name,
                     "stats": stats,
-                    "schema": config,
+                    "schema": json!({ "fields": info.fields }),
                 });
                 print_json(&enriched)?;
             } else {
-                let mut stats = serde_json::Map::new();
-                stats.insert("document_count".to_string(), json!(info.document_count));
-                if let Some(total_size) = info.total_size_bytes {
-                    stats.insert("total_size_bytes".to_string(), json!(total_size));
-                }
-                if let Some(index_size) = info.index_size_mb {
-                    stats.insert("index_size_mb".to_string(), json!(index_size));
-                }
-                if let Some(data_size) = info.data_size_mb {
-                    stats.insert("data_size_mb".to_string(), json!(data_size));
-                }
-                stats.insert("shard_count".to_string(), json!(info.shard_count));
-                let stats = serde_json::Value::Object(stats);
-                let compact_fields = format_compact_fields(&config.fields);
+                let compact_fields = format_compact_fields(&info.fields);
                 print_compact_index_output(&info.name, &stats, &compact_fields)?;
             }
             Ok(Some(indexes))
@@ -654,6 +613,26 @@ fn color_json_braces() -> (String, String) {
     ("{".to_string(), "}".to_string())
 }
 
+/// The statistics a listing entry carries, as the client displays them.
+///
+/// Megabytes are computed here, once, from the bytes the node reports. They used to arrive
+/// pre-rounded, which the cluster listing then summed across nodes.
+fn index_stats_json(info: &IndexInfo) -> JsonValue {
+    let mut stats = serde_json::Map::new();
+    stats.insert("document_count".to_string(), json!(info.document_count));
+    if let Some(total_size) = info.total_size_bytes {
+        stats.insert("total_size_bytes".to_string(), json!(total_size));
+    }
+    if let Some(mb) = IndexInfo::megabytes(info.index_size_bytes) {
+        stats.insert("index_size_mb".to_string(), json!(mb));
+    }
+    if let Some(mb) = IndexInfo::megabytes(info.data_size_bytes) {
+        stats.insert("data_size_mb".to_string(), json!(mb));
+    }
+    stats.insert("shard_count".to_string(), json!(info.shard_count));
+    JsonValue::Object(stats)
+}
+
 /// Format schema fields as compact one-line-per-field JSON objects.
 ///
 /// Only non-default properties are shown:
@@ -661,27 +640,32 @@ fn color_json_braces() -> (String, String) {
 /// - `stored` is omitted when false (most fields are not stored)
 /// - `fast` is omitted when false
 /// - `tokenizer` is omitted when absent or "default"
-/// - `is_shadow` is omitted when false
+/// - `shadow` is omitted when false
+/// - `searchable` is omitted when true — it differs from `indexed` only for a field the
+///   schema declares but the built index has no column for
 /// - `description` is omitted when absent
-/// - `index_record_option` is omitted when absent
-fn format_compact_fields(fields_value: &JsonValue) -> JsonValue {
-    let fields = match fields_value.as_object() {
-        Some(f) => f,
-        None => return fields_value.clone(),
-    };
-
+fn format_compact_fields(fields: &[JsonValue]) -> JsonValue {
     let mut result = JsonMap::new();
-    for (name, field_val) in fields {
+    for field_val in fields {
+        let Some(name) = field_val.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
         let mut compact = JsonMap::new();
 
-        // Always show field_type
-        if let Some(ft) = field_val.get("field_type") {
+        if let Some(ft) = field_val.get("type") {
             compact.insert("type".to_string(), ft.clone());
         }
 
         // indexed: only show when false (default is true)
         if let Some(JsonValue::Bool(false)) = field_val.get("indexed") {
             compact.insert("indexed".to_string(), json!(false));
+        }
+
+        // A field the schema declares but the built index has no column for. It is `indexed`
+        // and yet matches nothing until the index data is rebuilt, so saying only `indexed`
+        // here would describe it as ready to query.
+        if let Some(JsonValue::Bool(false)) = field_val.get("searchable") {
+            compact.insert("searchable".to_string(), json!(false));
         }
 
         // stored: only show when true (default is false)
@@ -701,8 +685,8 @@ fn format_compact_fields(fields_value: &JsonValue) -> JsonValue {
             compact.insert("tokenizer".to_string(), json!(tok));
         }
 
-        // is_shadow: only show when true
-        if let Some(JsonValue::Bool(true)) = field_val.get("is_shadow") {
+        // shadow: only show when true
+        if let Some(JsonValue::Bool(true)) = field_val.get("shadow") {
             compact.insert("shadow".to_string(), json!(true));
         }
 
@@ -712,7 +696,7 @@ fn format_compact_fields(fields_value: &JsonValue) -> JsonValue {
             compact.insert("description".to_string(), json!(text));
         }
 
-        result.insert(name.clone(), JsonValue::Object(compact));
+        result.insert(name.to_string(), JsonValue::Object(compact));
     }
     JsonValue::Object(result)
 }

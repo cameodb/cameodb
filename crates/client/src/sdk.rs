@@ -659,22 +659,50 @@ pub struct ListIndexesResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IndexInfo {
     pub name: String,
+    /// What the operator wrote down about the dataset, if anything.
+    #[serde(default)]
+    pub description: Option<String>,
     pub document_count: u64,
+    /// Sizes arrive in bytes and are rendered in megabytes here.
+    ///
+    /// They used to arrive already rounded to whole megabytes, which the cluster listing then
+    /// summed across nodes — losing up to a megabyte per node before anyone saw the number.
+    #[serde(default)]
+    pub index_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub data_size_bytes: Option<u64>,
     #[serde(default)]
     pub total_size_bytes: Option<u64>,
-    #[serde(default, alias = "size_mb")]
-    pub index_size_mb: Option<u64>,
-    #[serde(default)]
-    pub data_size_mb: Option<u64>,
     pub shard_count: usize,
     #[serde(default)]
-    pub field_names: Vec<String>,
+    pub warm_shards: Option<usize>,
+    #[serde(default)]
+    pub field_count: Option<usize>,
+    /// Every field, described. The listing used to carry names alone, which is why showing an
+    /// index cost a second request per index just to learn the types.
+    #[serde(default)]
+    pub fields: Vec<JsonValue>,
+}
+
+impl IndexInfo {
+    /// Whole megabytes, rounded once, at the point of display.
+    pub fn megabytes(bytes: Option<u64>) -> Option<u64> {
+        bytes.map(|value| value / (1024 * 1024))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IndexConfigResponse {
     #[serde(default)]
-    pub fields: JsonValue,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub field_count: usize,
+    #[serde(default)]
+    pub fields: Vec<JsonValue>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

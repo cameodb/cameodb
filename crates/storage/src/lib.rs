@@ -1549,18 +1549,24 @@ pub struct SchemaFieldUpdate {
     pub applied: Vec<String>,
     /// Fields already in the requested state, so nothing was written for them.
     pub unchanged: Vec<String>,
-    /// Fields the schema does not have.
+    /// Fields the schema does not have. The only reason a request is refused.
     pub unknown: Vec<String>,
-    /// Fields that cannot be promoted because the Tantivy index is already built without them.
-    /// Making these queryable needs the index rebuilt, which this engine has no path for; see
-    /// [`HybridStore::update_field_indexing`].
-    pub needs_reindex: Vec<String>,
+    /// Fields marked indexed that the built index has no column for, so the flag takes effect at
+    /// the next rebuild rather than now.
+    ///
+    /// A subset of `applied`: the edit was made. Until the index data is rebuilt from the schema
+    /// these fields match nothing, which the query path reports rather than hides.
+    pub pending_reindex: Vec<String>,
 }
 
 impl SchemaFieldUpdate {
     /// Whether the request was refused, in which case nothing was written.
+    ///
+    /// Only an unknown field refuses. A field whose flag cannot take effect until the index is
+    /// rebuilt is applied and reported, not refused — declaring it is the first step of the
+    /// rebuild, so refusing it would block the very workflow that makes it searchable.
     pub fn is_rejected(&self) -> bool {
-        !self.unknown.is_empty() || !self.needs_reindex.is_empty()
+        !self.unknown.is_empty()
     }
 }
 
@@ -1991,6 +1997,16 @@ pub struct IndexShardStats {
     /// Where this index sits in the startup warmup lifecycle. `Cold` means the first query
     /// will pay the open-and-fault cost; `Warm` means it is served from warm buffers.
     pub warmup_state: IndexWarmupState,
+    /// Field names the built Tantivy index actually has a column for, on this shard.
+    ///
+    /// Distinct from the schema's `indexed` flag, which is a *declaration*. A field declared
+    /// after the index was built has no column until the index data is rebuilt from the schema,
+    /// so it is `indexed` and yet matches nothing — the state `PATCH /_schema` reports as
+    /// `pending_reindex`. Nothing above the engine can tell the two apart, which is why this is
+    /// gathered here rather than inferred by a caller.
+    ///
+    /// Empty when the index has not been built on this shard.
+    pub searchable_fields: HashSet<String>,
 }
 
 /// Timing metadata for shard-level statistics gathering.
@@ -4477,13 +4493,16 @@ impl HybridStore {
     /// erases every property that shape does not carry — `routing_field_name` among them,
     /// which silently changes which shard a document routes to.
     ///
-    /// The second is that a field can only be promoted if the Tantivy schema already has it.
-    /// That schema is fixed when the index is created and nothing rebuilds it, so a field that
-    /// first appeared inside a document has no Tantivy field to write into: flipping its flag
-    /// would report success and change nothing a query can see. Those fields are reported in
-    /// `needs_reindex` and the whole request is refused rather than half-applied. An index that
-    /// has not been materialised yet has no such constraint — its Tantivy schema is still built
-    /// from this stored one — so promotion is allowed there.
+    /// The second is that the stored schema is a *declaration*, and the Tantivy index is built
+    /// from it — at creation, and again whenever the index data is rebuilt. So marking a field
+    /// indexed is meaningful even when the current Tantivy index has no column for it: it is the
+    /// first step of declare-then-reingest, which is how a discovered field is made searchable
+    /// today (`delete_index_data` with `delete_schema = false`, then write again).
+    ///
+    /// Such a field is reported in `pending_reindex` rather than refused. Until the rebuild it
+    /// simply does not match, and that is not silent — the query path reports the clause as
+    /// discarded and the MCP layer refuses the search outright, so nothing reads a narrower
+    /// answer as a complete one.
     pub fn update_field_indexing(
         &self,
         index: &str,
@@ -4491,7 +4510,12 @@ impl HybridStore {
     ) -> Result<SchemaFieldUpdate, StoreError> {
         let (mut schema, outcome) = self.plan_field_indexing_inner(index, updates)?;
 
-        if outcome.is_rejected() || outcome.applied.is_empty() {
+        // Applies what this shard knows and reports what it does not, rather than refusing the
+        // whole request. Shards usually hold the same schema, but semi-structured input written a
+        // document at a time can leave a field on only the shards that received it — so "unknown
+        // here" is not by itself a bad request. Whether a name is unknown *everywhere*, and so
+        // worth refusing, is a question only the caller spanning the shards can answer.
+        if outcome.applied.is_empty() {
             return Ok(outcome);
         }
 
@@ -4503,8 +4527,10 @@ impl HybridStore {
         schema.fingerprint = schema.calculate_fingerprint();
         schema.updated_at = chrono::Utc::now().timestamp();
 
-        // Persist without re-creating the index: the Tantivy schema is unchanged by
-        // definition, since every field that would have required a new one was refused above.
+        // Persist without re-creating the index. A field in `pending_reindex` deliberately does
+        // not get a Tantivy column here: building one would mean recreating the index and
+        // discarding every document in it, which is the caller's decision to make, not this
+        // function's.
         self.persist_schema_evolution(index, &schema)?;
         self.schema_cache
             .insert(index.to_string(), Arc::new(schema));
@@ -4543,9 +4569,10 @@ impl HybridStore {
             .map(|arc| (*arc).clone())
             .ok_or_else(|| StoreError::IndexNotFound(index.to_string()))?;
 
-        // The Tantivy schema constrains promotion only once it exists on disk. Opening the
-        // index reads `meta.json`; it does not touch the writer lockfile, so this is safe
-        // against a live writer.
+        // Whether the built index has a column for a field decides only whether the edit takes
+        // effect *now* or at the next rebuild — not whether it is allowed. Opening the index
+        // reads `meta.json`; it does not touch the writer lockfile, so this is safe against a
+        // live writer.
         let index_path = self.index_dir(index)?;
         let tantivy_schema = if index_path.join("meta.json").exists() {
             Some(Index::open_in_dir(&index_path)?.schema())
@@ -4571,12 +4598,12 @@ impl HybridStore {
                 .as_ref()
                 .is_some_and(|schema| schema.get_field(field_name).is_err());
 
-            if is_promotion && missing_from_tantivy {
-                outcome.needs_reindex.push(field_name.clone());
-                continue;
-            }
-
+            // Applied either way. The flag is a declaration, and the index is built from the
+            // declaration — so this takes effect at the next rebuild rather than immediately.
             outcome.applied.push(field_name.clone());
+            if is_promotion && missing_from_tantivy {
+                outcome.pending_reindex.push(field_name.clone());
+            }
         }
 
         Ok((schema, outcome))
@@ -5870,6 +5897,7 @@ impl HybridStore {
                             .get(index_name)
                             .map(|state| *state.value())
                             .unwrap_or(IndexWarmupState::Cold),
+                        searchable_fields: self.searchable_fields(index_name),
                     },
                 );
             }
@@ -5885,6 +5913,50 @@ impl HybridStore {
                 total_ms: redb_duration.as_millis(),
             },
         })
+    }
+
+    /// Field names the built Tantivy index has a column for.
+    ///
+    /// Answers "can a query reach this field *now*", which the schema alone cannot: `indexed`
+    /// there is a declaration, and a field declared after the index was built has no column until
+    /// the data is rebuilt. See [`IndexShardStats::searchable_fields`].
+    ///
+    /// Free when the index has been touched — the field handles are already cached — and one
+    /// `meta.json` read when it has not. Returns empty rather than erroring for an index with no
+    /// built directory, since that is a normal state and not a failure to report.
+    /// Both paths report the same set: every column except `_seq`, which is WAL bookkeeping and
+    /// not something a caller queries. `id` *is* included — `id:value` is answerable, and is in
+    /// fact the one lookup served without touching the search index at all — even though
+    /// [`SchemaFields::indexed_fields`] omits it, since that map exists to drive document
+    /// building where `id` is handled separately.
+    pub fn searchable_fields(&self, index: &str) -> HashSet<String> {
+        if let Some(fields) = self.fields_cache.get(index) {
+            let mut names: HashSet<String> = fields.indexed_fields.keys().cloned().collect();
+            names.insert("id".to_string());
+            return names;
+        }
+
+        let Ok(index_path) = self.index_dir(index) else {
+            return HashSet::new();
+        };
+        if !index_path.join("meta.json").exists() {
+            return HashSet::new();
+        }
+
+        // Opening reads `meta.json` for the schema; it does not take the writer lockfile, so this
+        // is safe against a live writer.
+        match Index::open_in_dir(&index_path) {
+            Ok(opened) => opened
+                .schema()
+                .fields()
+                .map(|(_, entry)| entry.name().to_string())
+                .filter(|name| name != "_seq")
+                .collect(),
+            Err(err) => {
+                tracing::debug!(index = %index, error = %err, "Could not read searchable fields");
+                HashSet::new()
+            }
+        }
     }
 
     /// Get list of index names from redb schema table only

@@ -1,6 +1,6 @@
 //! Describing the catalogue: what indexes exist, what is in them, and whether a query fits.
 
-use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use futures::future::BoxFuture;
 use serde_json::Value as JsonValue;
 
 use cameodb_mcp::McpAuthzRef;
@@ -8,8 +8,8 @@ use cameodb_mcp::McpAuthzRef;
 use crate::authz::retain_visible_indexes;
 use crate::mcp::diagnostics::{analyze_query, cameodb_syntax_reference};
 use crate::mcp::schema::{
-    absent_index_reason, catalogue_entry, enrich_index_entry, extract_field_info,
-    extract_field_names, field_query_hint, index_schema,
+    absent_index_reason, catalogue_entry, enrich_index_entry, enrich_index_entry_owned,
+    extract_field_info, extract_field_names, field_query_hint, index_schema,
 };
 use crate::node_orchestrator::ClientOp;
 use crate::state::AppState;
@@ -27,24 +27,20 @@ pub(super) fn describe_index(
             .await
             .map_err(|err| err.to_string())?;
 
-        let stats = listing
+        // The listing entry *is* the description. It used to be half of one — statistics here,
+        // field definitions from a second `GetConfig`, stitched together by this function in a
+        // shape neither endpoint used — which is how the tools came to describe every index as
+        // having no fields at all while the bundled client, stitching differently, looked right.
+        let entry = listing
             .get("indexes")
             .and_then(|value| value.as_array())
             .and_then(|indexes| {
-                indexes.iter().find(|item| {
-                    item.get("name")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|name| name == index)
-                })
+                indexes
+                    .iter()
+                    .find(|item| item.get("name").and_then(|v| v.as_str()) == Some(index.as_str()))
             })
             .cloned()
             .ok_or_else(|| format!("Index '{}' not found", index))?;
-
-        let entry = serde_json::json!({
-            "index": index,
-            "stats": stats,
-            "schema": index_schema(&state, &index).await,
-        });
 
         Ok(enrich_index_entry(entry))
     })
@@ -69,47 +65,23 @@ pub(super) fn list_indexes(
             .map_err(|err| err.to_string())?;
         retain_visible_indexes(&mut listing, authz.as_ref());
 
-        let indexes = listing
+        // One request. Each entry already describes its fields, so the schema read this used to
+        // make per index — concurrently, but still one round trip each — is gone.
+        //
+        // What is kept is narrower than what arrives, deliberately. The listing is where an agent
+        // starts, and a full description of every index is most of its context spent before it
+        // has chosen one. Types, flags and hints are one `describe_index` away, on the index that
+        // turned out to matter.
+        let entries: Vec<JsonValue> = listing
             .get("indexes")
             .and_then(|value| value.as_array())
-            .cloned()
+            .map(|indexes| indexes.iter().map(catalogue_entry).collect())
             .unwrap_or_default();
 
-        // One schema read per index, run together rather than in series: the listing is the
-        // first thing an agent calls, and a catalogue of two hundred indexes should not cost two
-        // hundred sequential round trips. The schema is read for the field names and the
-        // operator's description; what it says about each field's type belongs to
-        // `describe_index`, on whichever index the listing leads to.
-        let mut schema_reads = FuturesUnordered::new();
-        for stats in indexes {
-            let index_name = stats
-                .get("name")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| "Index entry missing name".to_string())?
-                .to_string();
-            let state = state.clone();
-            schema_reads.push(async move {
-                let schema = index_schema(&state, &index_name).await;
-                catalogue_entry(&index_name, &stats, &schema)
-            });
-        }
-
-        let mut enriched = Vec::with_capacity(schema_reads.len());
-        while let Some(entry) = schema_reads.next().await {
-            enriched.push(entry);
-        }
-        // Concurrency reorders them; a catalogue an agent reads twice should not change
-        // order between reads.
-        enriched.sort_by(|left, right| {
-            left.get("index")
-                .and_then(|v| v.as_str())
-                .cmp(&right.get("index").and_then(|v| v.as_str()))
-        });
-
-        let total_indexes = enriched.len();
+        let total_indexes = entries.len();
 
         Ok(serde_json::json!({
-            "indexes": enriched,
+            "indexes": entries,
             "total_indexes": total_indexes,
             "node_id": listing.get("node_id").cloned().unwrap_or(JsonValue::Null),
             "node_name": listing.get("node_name").cloned().unwrap_or(JsonValue::Null),
@@ -139,10 +111,8 @@ pub(super) fn validate_query(
             {
                 return Err(reason);
             }
-            Some(enrich_index_entry(serde_json::json!({
-                "index": index_name,
-                "schema": schema,
-            })))
+            // Already the one description shape, fields and all — nothing to stitch.
+            Some(schema)
         } else {
             None
         };
@@ -168,10 +138,12 @@ pub(super) fn validate_query(
                     })
                     .map(|info| {
                         serde_json::json!({
-                            "field": info.name,
+                            "name": info.name,
                             "type": info.field_type,
                             "indexed": info.indexed,
+                            "fast": info.fast,
                             "shadow": info.is_shadow,
+                            "searchable": info.searchable,
                             "queryable": info.is_queryable(),
                         })
                     })
@@ -186,11 +158,16 @@ pub(super) fn validate_query(
             .iter()
             .filter(|info| info.name != "_seq")
             .map(|info| {
+                // `fast` belongs here as much as the other flags: it is what decides whether a
+                // field can be sorted on, and a caller choosing how to query has to know.
+                // Leaving it out was one of the spellings that differed between surfaces.
                 let mut entry = serde_json::json!({
-                    "field": info.name,
+                    "name": info.name,
                     "type": info.field_type,
                     "indexed": info.indexed,
+                    "fast": info.fast,
                     "shadow": info.is_shadow,
+                    "searchable": info.searchable,
                     "queryable": info.is_queryable(),
                     "query_hint": field_query_hint(info),
                 });
@@ -310,16 +287,14 @@ pub(super) fn index_stats(
     Box::pin(async move {
         if let Some(index_name) = index {
             let details = describe_index(state.clone(), index_name.clone()).await?;
-            let stats = details.get("stats").cloned().unwrap_or(JsonValue::Null);
             let field_names = extract_field_names(&details);
-            let field_count = field_names.len();
 
             return Ok(serde_json::json!({
                 "scope": "single_index",
                 "index": index_name,
-                "field_count": field_count,
+                "field_count": field_names.len(),
                 "field_names": field_names,
-                "stats": stats,
+                "stats": details,
             }));
         }
 
@@ -339,38 +314,18 @@ pub(super) fn index_stats(
         // the totals it reports do not count documents it cannot read.
         retain_visible_indexes(&mut listing, authz.as_ref());
 
-        let raw_indexes = listing
+        // Each entry already describes its fields, so the schema read this made per index is
+        // gone along with the stitching that combined the two.
+        let mut indexes: Vec<JsonValue> = listing
             .get("indexes")
             .and_then(|value| value.as_array())
-            .cloned()
+            .map(|entries| entries.iter().map(enrich_index_entry_owned).collect())
             .unwrap_or_default();
 
-        let mut schema_reads = FuturesUnordered::new();
-        for stats in raw_indexes {
-            let index_name = stats
-                .get("name")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let state = state.clone();
-            schema_reads.push(async move {
-                let schema = index_schema(&state, &index_name).await;
-                enrich_index_entry(serde_json::json!({
-                    "index": index_name,
-                    "stats": stats,
-                    "schema": schema,
-                }))
-            });
-        }
-
-        let mut indexes = Vec::with_capacity(schema_reads.len());
-        while let Some(entry) = schema_reads.next().await {
-            indexes.push(entry);
-        }
         indexes.sort_by(|left, right| {
-            left.get("index")
+            left.get("name")
                 .and_then(|v| v.as_str())
-                .cmp(&right.get("index").and_then(|v| v.as_str()))
+                .cmp(&right.get("name").and_then(|v| v.as_str()))
         });
 
         let mut total_documents = 0u64;
@@ -378,18 +333,18 @@ pub(super) fn index_stats(
         let mut total_fields = 0usize;
 
         for item in &indexes {
-            if let Some(stats) = item.get("stats") {
-                total_documents += stats
-                    .get("document_count")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0);
-                total_size_bytes += stats
-                    .get("total_size_bytes")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0);
-            }
-
-            total_fields += extract_field_names(item).len();
+            total_documents += item
+                .get("document_count")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            total_size_bytes += item
+                .get("total_size_bytes")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            total_fields += item
+                .get("field_count")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as usize;
         }
 
         Ok(serde_json::json!({

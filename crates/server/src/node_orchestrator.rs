@@ -913,32 +913,24 @@ fn merge_names(into: &mut Vec<String>, from: Vec<String>) {
 
 /// Why a schema update was refused, phrased for whoever has to act on it.
 ///
-/// The reindex case is the one worth spelling out: nothing in the message is inferable from
-/// the field list alone, and an agent that reads "unknown field" would go looking for a typo.
+/// Only an unknown field gets here. A field whose flag cannot take effect until the index is
+/// rebuilt is applied and reported through `pending_reindex`, not refused.
 fn describe_schema_refusal(outcome: &SchemaFieldUpdate) -> String {
-    let mut reasons = Vec::new();
-
-    if !outcome.unknown.is_empty() {
-        reasons.push(format!(
-            "no such field in this schema: {}",
-            outcome.unknown.join(", ")
-        ));
-    }
-
-    if !outcome.needs_reindex.is_empty() {
-        reasons.push(format!(
-            "cannot be made searchable on an index that is already built: {}. \
-             These fields were discovered inside documents after the index was created, so the \
-             Tantivy index has no column for them, and setting the flag would report success \
-             while leaving them unqueryable. Recreating the index with these fields declared, \
-             and re-ingesting, is currently the only way to query them",
-            outcome.needs_reindex.join(", ")
-        ));
-    }
-
     format!(
-        "Schema update refused, nothing was changed: {}",
-        reasons.join("; ")
+        "Schema update refused, nothing was changed: no such field in this schema: {}",
+        outcome.unknown.join(", ")
+    )
+}
+
+/// What a caller has to do about a flag that cannot take effect yet.
+fn describe_pending_reindex(outcome: &SchemaFieldUpdate) -> String {
+    format!(
+        "Marked indexed and saved, but not searchable yet: {}. The index was built before these \
+         fields were declared, so it has no column for them. Rebuilding the index data from the \
+         schema is what makes them searchable — delete the index data without deleting the \
+         schema, then re-ingest. Until then a query naming them matches nothing, and says so \
+         rather than returning a narrower answer as though it were complete.",
+        outcome.pending_reindex.join(", ")
     )
 }
 
@@ -2326,12 +2318,20 @@ impl OrchestratorEngine {
 #[derive(Debug, Clone)]
 struct IndexStats {
     name: String,
+    description: Option<String>,
     document_count: u64,
+    index_size_bytes: u64,
+    memory_bytes: u64,
+    data_size_bytes: u64,
     total_size_bytes: u64,
-    index_size_mb: u64,
-    data_size_mb: u64,
     shard_count: usize,
-    field_names: Vec<String>,
+    warm_shards: usize,
+    /// Field descriptions merged by name across nodes.
+    ///
+    /// A field is `searchable` in the cluster when any node can search it, for the same reason
+    /// the per-node union is a union: a scatter-gather asks every node, so one node holding the
+    /// column is enough to answer.
+    fields: BTreeMap<String, JsonValue>,
 }
 
 /// Microshard actor that manages a single shard's storage and search operations.
@@ -4260,42 +4260,62 @@ impl RouterActor {
 
                             let entry = index_map.entry(name.clone()).or_insert(IndexStats {
                                 name: name.clone(),
+                                description: None,
                                 document_count: 0,
+                                index_size_bytes: 0,
+                                memory_bytes: 0,
+                                data_size_bytes: 0,
                                 total_size_bytes: 0,
-                                index_size_mb: 0,
-                                data_size_mb: 0,
                                 shard_count: 0,
-                                field_names: Vec::new(),
+                                warm_shards: 0,
+                                fields: BTreeMap::new(),
                             });
 
-                            entry.document_count += idx
-                                .get("document_count")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            entry.total_size_bytes += idx
-                                .get("total_size_bytes")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            entry.index_size_mb += idx
-                                .get("index_size_mb")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            if let Some(data_size) =
-                                idx.get("data_size_mb").and_then(|v| v.as_u64())
-                            {
-                                entry.data_size_mb += data_size;
-                            }
-                            entry.shard_count +=
-                                idx.get("shard_count").and_then(|v| v.as_u64()).unwrap_or(0)
-                                    as usize;
+                            let sum =
+                                |key: &str| idx.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+                            entry.document_count += sum("document_count");
+                            entry.index_size_bytes += sum("index_size_bytes");
+                            entry.memory_bytes += sum("memory_bytes");
+                            entry.data_size_bytes += sum("data_size_bytes");
+                            entry.total_size_bytes += sum("total_size_bytes");
+                            entry.shard_count += sum("shard_count") as usize;
+                            entry.warm_shards += sum("warm_shards") as usize;
 
-                            if let Some(fields) = idx.get("field_names").and_then(|v| v.as_array())
+                            if entry.description.is_none()
+                                && let Some(text) = idx.get("description").and_then(|v| v.as_str())
                             {
+                                entry.description = Some(text.to_string());
+                            }
+
+                            // Merged by name, and `searchable` is OR-ed: one node able to search
+                            // the field is enough, since the search reaches all of them.
+                            if let Some(fields) = idx.get("fields").and_then(|v| v.as_array()) {
                                 for field in fields {
-                                    if let Some(field_str) = field.as_str()
-                                        && !entry.field_names.contains(&field_str.to_string())
-                                    {
-                                        entry.field_names.push(field_str.to_string());
+                                    let Some(field_name) =
+                                        field.get("name").and_then(|v| v.as_str())
+                                    else {
+                                        continue;
+                                    };
+                                    match entry.fields.get_mut(field_name) {
+                                        Some(existing) => {
+                                            let searchable_here = field
+                                                .get("searchable")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false);
+                                            if searchable_here
+                                                && let Some(obj) = existing.as_object_mut()
+                                            {
+                                                obj.insert(
+                                                    "searchable".to_string(),
+                                                    JsonValue::Bool(true),
+                                                );
+                                            }
+                                        }
+                                        None => {
+                                            entry
+                                                .fields
+                                                .insert(field_name.to_string(), field.clone());
+                                        }
                                     }
                                 }
                             }
@@ -4303,46 +4323,40 @@ impl RouterActor {
                     }
                 }
 
-                for stats in index_map.values_mut() {
-                    stats
-                        .field_names
-                        .sort_by(|a, b| match (a.as_str(), b.as_str()) {
-                            ("id", "id") => std::cmp::Ordering::Equal,
-                            ("id", _) => std::cmp::Ordering::Less,
-                            (_, "id") => std::cmp::Ordering::Greater,
-                            _ => a.cmp(b),
-                        });
-                }
-
-                // Convert to JSON array with new format
+                // Convert to the same per-index shape a single node returns, so an index
+                // described by the cluster and by one of its nodes reads identically. The
+                // previous merge dropped `memory_*` and `warm_shards` entirely, so the same
+                // index had two shapes inside one response.
                 let mut cluster_indexes: Vec<(String, JsonValue)> = index_map
                     .into_values()
                     .map(|stats| {
                         let name = stats.name.clone();
                         let mut json_obj = serde_json::Map::new();
                         json_obj.insert("name".to_string(), serde_json::json!(stats.name));
+                        if let Some(description) = stats.description {
+                            json_obj
+                                .insert("description".to_string(), serde_json::json!(description));
+                        }
                         json_obj.insert(
                             "document_count".to_string(),
                             serde_json::json!(stats.document_count),
                         );
-
-                        // Only include size fields when data size is requested
+                        json_obj.insert(
+                            "index_size_bytes".to_string(),
+                            serde_json::json!(stats.index_size_bytes),
+                        );
+                        json_obj.insert(
+                            "memory_bytes".to_string(),
+                            serde_json::json!(stats.memory_bytes),
+                        );
                         if *include_data_size {
+                            json_obj.insert(
+                                "data_size_bytes".to_string(),
+                                serde_json::json!(stats.data_size_bytes),
+                            );
                             json_obj.insert(
                                 "total_size_bytes".to_string(),
                                 serde_json::json!(stats.total_size_bytes),
-                            );
-                        }
-
-                        json_obj.insert(
-                            "index_size_mb".to_string(),
-                            serde_json::json!(stats.index_size_mb),
-                        );
-
-                        if *include_data_size {
-                            json_obj.insert(
-                                "data_size_mb".to_string(),
-                                serde_json::json!(stats.data_size_mb),
                             );
                         }
                         json_obj.insert(
@@ -4350,9 +4364,29 @@ impl RouterActor {
                             serde_json::json!(stats.shard_count),
                         );
                         json_obj.insert(
-                            "field_names".to_string(),
-                            serde_json::json!(stats.field_names),
+                            "warm_shards".to_string(),
+                            serde_json::json!(stats.warm_shards),
                         );
+
+                        // `id` first, then alphabetical — the order a single node uses.
+                        let mut fields: Vec<JsonValue> = stats.fields.into_values().collect();
+                        fields.sort_by(|a, b| {
+                            let key = |v: &JsonValue| {
+                                v.get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or_default()
+                                    .to_string()
+                            };
+                            match (key(a).as_str(), key(b).as_str()) {
+                                ("id", "id") => std::cmp::Ordering::Equal,
+                                ("id", _) => std::cmp::Ordering::Less,
+                                (_, "id") => std::cmp::Ordering::Greater,
+                                _ => key(a).cmp(&key(b)),
+                            }
+                        });
+                        json_obj.insert("field_count".to_string(), serde_json::json!(fields.len()));
+                        json_obj.insert("fields".to_string(), JsonValue::Array(fields));
+
                         (name, serde_json::Value::Object(json_obj))
                     })
                     .collect();
@@ -5648,22 +5682,62 @@ impl NodeOrchestrator {
         names
     }
 
-    /// Produce a JSON object of fields, ordered with "id" first (if present).
-    fn sorted_fields_map(schema: &IndexSchema) -> JsonMap<String, JsonValue> {
-        let mut entries: Vec<_> = schema.fields.iter().collect();
-        entries.sort_by(|(a, _), (b, _)| match (a.as_str(), b.as_str()) {
-            ("id", "id") => std::cmp::Ordering::Equal,
-            ("id", _) => std::cmp::Ordering::Less,
-            (_, "id") => std::cmp::Ordering::Greater,
-            _ => a.cmp(b),
-        });
-
-        let mut map = JsonMap::new();
-        for (k, v) in entries {
-            let value = serde_json::to_value(v).unwrap_or(JsonValue::Null);
-            map.insert(k.clone(), value);
-        }
-        map
+    /// Describe every field of an index, in the one shape every caller renders.
+    ///
+    /// This is the whole point of the consolidation: the client, the MCP tools and the HTTP
+    /// listing each used to compose their own answer to "what is in this index" out of a
+    /// statistics call and a schema call, and each composed it differently — `field` against
+    /// `name`, `type` against `field_type`, `shadow` against `is_shadow` — so the same index had
+    /// as many descriptions as it had readers.
+    ///
+    /// Identity is always `name`, here and for the index itself. Ordering puts `id` first and the
+    /// rest alphabetically, so a description read twice reads the same way.
+    ///
+    /// `searchable` is the field no caller could compute. `indexed` is a *declaration*, and the
+    /// Tantivy index is built from that declaration — so a field declared after the index was
+    /// built is `indexed` and yet matches nothing until the data is rebuilt. Only the engine can
+    /// see the difference, and an agent that cannot see it writes a query that silently returns
+    /// nothing. A shadow field is searchable regardless: it names the identifier, which is
+    /// answered from redb without the search index at all.
+    ///
+    /// `_seq` is omitted everywhere. It is WAL bookkeeping, and offering it as a queryable field
+    /// invites a query that cannot mean anything. Filtering it in one place also settles an
+    /// inconsistency where one response reported two different field counts.
+    fn describe_fields(schema: &IndexSchema, searchable: &HashSet<String>) -> Vec<JsonValue> {
+        Self::sorted_field_names(schema)
+            .into_iter()
+            .filter(|name| name != "_seq")
+            .filter_map(|name| {
+                let field = schema.fields.get(&name)?;
+                let mut entry = JsonMap::new();
+                entry.insert("name".to_string(), JsonValue::String(name.clone()));
+                entry.insert(
+                    "type".to_string(),
+                    JsonValue::String(field.field_type.to_string().to_string()),
+                );
+                entry.insert("indexed".to_string(), JsonValue::Bool(field.indexed));
+                entry.insert("stored".to_string(), JsonValue::Bool(field.stored));
+                entry.insert("fast".to_string(), JsonValue::Bool(field.fast));
+                entry.insert("shadow".to_string(), JsonValue::Bool(field.is_shadow));
+                entry.insert(
+                    "searchable".to_string(),
+                    JsonValue::Bool(field.is_shadow || searchable.contains(&name)),
+                );
+                if let Some(description) = &field.description {
+                    entry.insert(
+                        "description".to_string(),
+                        JsonValue::String(description.clone()),
+                    );
+                }
+                if let Some(tokenizer) = &field.tokenizer {
+                    entry.insert(
+                        "tokenizer".to_string(),
+                        JsonValue::String(tokenizer.clone()),
+                    );
+                }
+                Some(JsonValue::Object(entry))
+            })
+            .collect()
     }
 
     /// The schema as a caller reads it back.
@@ -5671,16 +5745,43 @@ impl NodeOrchestrator {
     /// Everything the schema carries belongs here, not only its fields. This response is not just
     /// read: `PATCH /_schema` decodes it, edits what it was asked to change and writes the whole
     /// thing back, so a property omitted here is a property erased by an unrelated edit.
-    fn schema_response(schema: &IndexSchema, fields: JsonMap<String, JsonValue>) -> JsonValue {
+    fn schema_response(
+        index: &str,
+        schema: &IndexSchema,
+        searchable: &HashSet<String>,
+    ) -> JsonValue {
         let mut map = JsonMap::new();
-        map.insert("fields".to_string(), JsonValue::Object(fields));
+        map.insert("name".to_string(), JsonValue::String(index.to_string()));
         if let Some(description) = &schema.description {
             map.insert(
                 "description".to_string(),
                 JsonValue::String(description.clone()),
             );
         }
+        let fields = Self::describe_fields(schema, searchable);
+        map.insert("field_count".to_string(), JsonValue::from(fields.len()));
+        map.insert("fields".to_string(), JsonValue::Array(fields));
         JsonValue::Object(map)
+    }
+
+    /// Every field the built index can search, across every shard holding this index.
+    async fn searchable_fields_across_shards(&self, index: &str) -> HashSet<String> {
+        let stores: Vec<Arc<HybridStore>> = self
+            .shards
+            .values()
+            .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
+            .collect();
+
+        let mut union = HashSet::new();
+        for store in stores {
+            let idx = index.to_string();
+            if let Ok(names) =
+                tokio::task::spawn_blocking(move || store.searchable_fields(&idx)).await
+            {
+                union.extend(names);
+            }
+        }
+        union
     }
 
     /// Creates a new NodeOrchestrator with the given configuration and identity.
@@ -7371,17 +7472,42 @@ impl NodeOrchestrator {
             .collect();
 
         let mut merged = SchemaFieldUpdate::default();
+        let mut shard_count = 0usize;
+        let mut unknown_counts: HashMap<String, usize> = HashMap::new();
+
         for handle in handles {
             let outcome = handle
                 .await
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
                 .map_err(OrchestratorError::Storage)?;
 
+            shard_count += 1;
+            for name in outcome.unknown {
+                *unknown_counts.entry(name).or_default() += 1;
+            }
             merge_names(&mut merged.applied, outcome.applied);
             merge_names(&mut merged.unchanged, outcome.unchanged);
-            merge_names(&mut merged.unknown, outcome.unknown);
-            merge_names(&mut merged.needs_reindex, outcome.needs_reindex);
+            merge_names(&mut merged.pending_reindex, outcome.pending_reindex);
         }
+
+        // A name is unknown only when *every* shard says so.
+        //
+        // Shards normally agree, and the two paths that create a schema both make sure of it: a
+        // schema declared through `PUT /_config` is fanned out by `orch_create_config`, and one
+        // inferred from a bulk load is sampled from up to `SCHEMA_SAMPLE_LIMIT` documents and
+        // persisted to every shard before the first write lands. Uniform input therefore gives
+        // every shard the same schema.
+        //
+        // Divergence comes from per-document writes over semi-structured input, where a field
+        // only some documents carry exists only on the shards those documents reached. That case
+        // is legitimate — those shards genuinely cannot answer a query on that field — so one
+        // shard's "unknown" must not refuse an edit the others can apply.
+        merged.unknown = unknown_counts
+            .into_iter()
+            .filter(|(_, seen)| *seen == shard_count)
+            .map(|(name, _)| name)
+            .collect();
+        merged.unknown.sort();
 
         // A field one shard applied and another reported unchanged is applied overall; saying
         // both would read as a contradiction.
@@ -7403,8 +7529,12 @@ impl NodeOrchestrator {
 
         if outcome.is_rejected() {
             body["unknown_fields"] = serde_json::json!(outcome.unknown);
-            body["needs_reindex_fields"] = serde_json::json!(outcome.needs_reindex);
             body["reason"] = serde_json::json!(describe_schema_refusal(outcome));
+        } else if !outcome.pending_reindex.is_empty() {
+            // Applied, saved, and not yet searchable. Reported rather than refused: declaring the
+            // field is the first step of the rebuild that makes it searchable.
+            body["pending_reindex_fields"] = serde_json::json!(outcome.pending_reindex);
+            body["note"] = serde_json::json!(describe_pending_reindex(outcome));
         }
 
         body
@@ -7460,8 +7590,8 @@ impl NodeOrchestrator {
                         num_fields = s.fields.len(),
                         "Schema found in shard"
                     );
-                    let fields = Self::sorted_fields_map(&s);
-                    return Ok(Self::schema_response(&s, fields));
+                    let searchable = self.searchable_fields_across_shards(index).await;
+                    return Ok(Self::schema_response(index, &s, &searchable));
                 }
             }
         }
@@ -7554,10 +7684,15 @@ impl NodeOrchestrator {
             shard_count: usize,
             /// Of those, how many have finished warming their reader.
             warm_shards: usize,
+            /// Union of the fields the built index can actually search, across shards.
+            ///
+            /// A union rather than an intersection: a shard that has the column can answer a
+            /// query on that field, and a scatter-gather asks every shard. Reporting the
+            /// intersection would call a field unsearchable because one empty shard lacks it.
+            searchable: HashSet<String>,
         }
 
         let mut all: HashMap<String, IndexTotals> = HashMap::new();
-        let mut field_cache: HashMap<String, Vec<String>> = HashMap::new();
 
         // Create GetShardStats message
         let msg = GetShardStats { include_data_size };
@@ -7602,6 +7737,9 @@ impl NodeOrchestrator {
                                 entry.warm_shards += 1;
                             }
                         }
+                        for field in stats.searchable_fields {
+                            entry.searchable.insert(field);
+                        }
                     }
                 }
                 Err(e) => return Err(e),
@@ -7633,11 +7771,8 @@ impl NodeOrchestrator {
                 tantivy_bytes,
                 shard_count,
                 warm_shards,
+                searchable,
             } = totals;
-            let total_size_bytes = tantivy_bytes + if include_data_size { redb_bytes } else { 0 };
-            let index_size_mb = tantivy_bytes / (1024 * 1024);
-            let memory_mb = (redb_bytes + tantivy_bytes) / (1024 * 1024);
-
             let mut json_obj = JsonMap::new();
             json_obj.insert("name".to_string(), JsonValue::String(name.clone()));
             json_obj.insert(
@@ -7645,44 +7780,55 @@ impl NodeOrchestrator {
                 JsonValue::from(document_count),
             );
 
-            // Only include size fields when data size is requested
+            // Bytes rather than megabytes, everywhere. The cluster listing sums these across
+            // nodes, and summing values already rounded to whole megabytes lost up to a megabyte
+            // per node. A renderer that wants megabytes divides once, at the end.
+            json_obj.insert(
+                "index_size_bytes".to_string(),
+                JsonValue::from(tantivy_bytes),
+            );
+            json_obj.insert(
+                "memory_bytes".to_string(),
+                JsonValue::from(redb_bytes + tantivy_bytes),
+            );
+
+            // The redb half is only measured when it was asked for — walking it is the expensive
+            // part of the statistics call — so these are absent rather than reported as zero.
             if include_data_size {
+                json_obj.insert("data_size_bytes".to_string(), JsonValue::from(redb_bytes));
                 json_obj.insert(
                     "total_size_bytes".to_string(),
-                    JsonValue::from(total_size_bytes),
+                    JsonValue::from(tantivy_bytes + redb_bytes),
                 );
             }
 
-            json_obj.insert("index_size_mb".to_string(), JsonValue::from(index_size_mb));
-            json_obj.insert("memory_mb".to_string(), JsonValue::from(memory_mb));
-
-            if include_data_size {
-                json_obj.insert(
-                    "data_size_mb".to_string(),
-                    JsonValue::from(redb_bytes / (1024 * 1024)),
-                );
-            }
             json_obj.insert("shard_count".to_string(), JsonValue::from(shard_count));
             // Warmup coverage on this node: how many of the shards holding this index are
             // already serving from warm readers. Below shard_count means the first query
             // routed to a cold shard still pays the open-and-fault cost.
             json_obj.insert("warm_shards".to_string(), JsonValue::from(warm_shards));
-            let fields = if let Some(cached) = field_cache.get(&name) {
-                cached.clone()
-            } else {
-                match self.load_schema(&name).await {
-                    Ok(schema) => {
-                        let sorted = Self::sorted_field_names(&schema);
-                        field_cache.insert(name.clone(), sorted.clone());
-                        sorted
+            // The schema is read here, once, and rendered in full. Every caller used to fetch it
+            // again per index to learn field types — the client sequentially, the MCP tools
+            // concurrently — because the listing offered names alone.
+            match self.load_schema(&name).await {
+                Ok(schema) => {
+                    if let Some(description) = &schema.description {
+                        json_obj.insert(
+                            "description".to_string(),
+                            JsonValue::String(description.clone()),
+                        );
                     }
-                    Err(_) => Vec::new(),
+                    let fields = Self::describe_fields(&schema, &searchable);
+                    json_obj.insert("field_count".to_string(), JsonValue::from(fields.len()));
+                    json_obj.insert("fields".to_string(), JsonValue::Array(fields));
                 }
-            };
-            json_obj.insert(
-                "field_names".to_string(),
-                JsonValue::Array(fields.into_iter().map(JsonValue::String).collect()),
-            );
+                Err(_) => {
+                    // An unreadable schema is reported as no fields rather than as a missing key,
+                    // so a consumer never has to distinguish "absent" from "empty".
+                    json_obj.insert("field_count".to_string(), JsonValue::from(0));
+                    json_obj.insert("fields".to_string(), JsonValue::Array(Vec::new()));
+                }
+            }
 
             indexes.push((name, JsonValue::Object(json_obj)));
         }

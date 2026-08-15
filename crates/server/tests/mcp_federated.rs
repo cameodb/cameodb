@@ -771,12 +771,12 @@ async fn one_index_reports_its_statistics_through_describe_index() {
         .call_tool("describe_index", json!({"index": "alpha"}))
         .await;
     assert!(!is_error, "describing an index failed: {described}");
-    assert_eq!(described["index"].as_str(), Some("alpha"));
-    assert_eq!(described["stats"]["document_count"].as_u64(), Some(3));
+    assert_eq!(described["name"].as_str(), Some("alpha"));
+    assert_eq!(described["document_count"].as_u64(), Some(3));
     assert!(
         described["fields"]
             .as_array()
-            .is_some_and(|fields| fields.iter().any(|f| f["field"] == "title")),
+            .is_some_and(|fields| fields.iter().any(|f| f["name"] == "title")),
         "the fields it describes should be the ones the index has: {described}"
     );
 
@@ -807,7 +807,7 @@ async fn the_discovery_tools_describe_the_fields_an_index_has() {
     assert!(!is_error, "describe_index failed: {described}");
 
     let fields = described["fields"].as_array().expect("a fields array");
-    let named: Vec<&str> = fields.iter().filter_map(|f| f["field"].as_str()).collect();
+    let named: Vec<&str> = fields.iter().filter_map(|f| f["name"].as_str()).collect();
     assert!(
         named.contains(&"title") && named.contains(&"created"),
         "the index's own fields are missing: {described}"
@@ -815,7 +815,7 @@ async fn the_discovery_tools_describe_the_fields_an_index_has() {
 
     let created = fields
         .iter()
-        .find(|f| f["field"] == "created")
+        .find(|f| f["name"] == "created")
         .unwrap_or_else(|| panic!("no entry for 'created': {described}"));
     assert_eq!(
         created["type"].as_str(),
@@ -963,7 +963,7 @@ async fn a_shadow_field_is_described_as_the_queryable_alias_of_id() {
     let field = |name: &str| {
         fields
             .iter()
-            .find(|f| f["field"] == name)
+            .find(|f| f["name"] == name)
             .unwrap_or_else(|| panic!("no entry for '{name}': {described}"))
             .clone()
     };
@@ -1018,7 +1018,7 @@ async fn a_shadow_field_is_described_as_the_queryable_alias_of_id() {
         .expect("available_fields");
     let sha1 = listed
         .iter()
-        .find(|f| f["field"] == "sha1")
+        .find(|f| f["name"] == "sha1")
         .unwrap_or_else(|| panic!("sha1 missing from available_fields: {validated}"));
     assert_eq!(
         sha1["queryable"].as_bool(),
@@ -1155,7 +1155,7 @@ async fn descriptions_written_into_the_schema_reach_every_discovery_surface() {
     let field = |name: &str| {
         fields
             .iter()
-            .find(|f| f["field"] == name)
+            .find(|f| f["name"] == name)
             .unwrap_or_else(|| panic!("no entry for '{name}': {described}"))
             .clone()
     };
@@ -1191,7 +1191,7 @@ async fn descriptions_written_into_the_schema_reach_every_discovery_surface() {
         .await;
     let title = validated["available_fields"]
         .as_array()
-        .and_then(|fields| fields.iter().find(|f| f["field"] == "title"))
+        .and_then(|fields| fields.iter().find(|f| f["name"] == "title"))
         .unwrap_or_else(|| panic!("title missing from available_fields: {validated}"));
     assert_eq!(
         title["description"].as_str(),
@@ -2183,7 +2183,7 @@ async fn validating_a_query_reads_one_index_rather_than_the_catalogue() {
         .as_array()
         .expect("available_fields")
         .iter()
-        .filter_map(|field| field["field"].as_str())
+        .filter_map(|field| field["name"].as_str())
         .collect();
     assert!(
         fields.contains(&"title") && fields.contains(&"created"),

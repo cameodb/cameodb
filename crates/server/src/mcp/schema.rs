@@ -59,9 +59,8 @@ pub(super) async fn absent_index_reason(state: &AppState, index: &str) -> Option
 
 /// One field, as the discovery tools describe it.
 ///
-/// The common form behind both shapes a field arrives in — the schema's map of definitions and
-/// the compact array [`enrich_index_entry`] projects it into — so that everything downstream
-/// reads fields the same way whichever it was handed.
+/// Read from the single shape the engine now produces for every surface, so nothing downstream
+/// has to know which endpoint the entry came from.
 #[derive(Debug, Clone)]
 pub(super) struct FieldInfo {
     pub(super) name: String,
@@ -69,112 +68,64 @@ pub(super) struct FieldInfo {
     pub(super) indexed: bool,
     pub(super) fast: bool,
     pub(super) is_shadow: bool,
+    /// Whether a query can reach this field *now*, as opposed to `indexed`, which is what the
+    /// schema declares. The two differ for a field declared after the index was built: it has no
+    /// column until the index data is rebuilt, so it is `indexed` and matches nothing.
+    pub(super) searchable: bool,
     /// What the field records, if anyone wrote it down. Never inferred.
     pub(super) description: Option<String>,
 }
 
 impl FieldInfo {
-    /// Whether a query may name this field.
+    /// Whether a query naming this field can match anything.
     ///
-    /// Every field an index is created with is searchable — `indexed` defaults to true, so a
-    /// schema defined up front is queryable throughout. Two cases are reported rather than
-    /// assumed: a field discovered from a document after creation is added unindexed and stays
-    /// that way until a schema update promotes it, and a shadow field is searched through the
-    /// identifier it duplicates rather than through the search index. Both are queryable
-    /// answers to a caller; only the first is not.
+    /// This used to be `indexed || is_shadow`, which was the best guess available without the
+    /// engine's help: it could not see that a declared-but-unbuilt field matches nothing, so it
+    /// reported such a field as queryable and an agent querying it got silence. The engine now
+    /// answers directly, and a shadow field remains queryable because it names the identifier,
+    /// which is answered from the key-value store rather than the search index.
     pub(super) fn is_queryable(&self) -> bool {
-        self.indexed || self.is_shadow
+        self.searchable || self.is_shadow
     }
 }
 
 pub(super) fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
-    let fields_obj = value
-        .get("schema")
-        .and_then(|schema| schema.get("fields"))
-        .and_then(|fields| fields.as_object())
-        .or_else(|| value.get("fields").and_then(|fields| fields.as_object()));
-
-    let Some(fields_obj) = fields_obj else {
-        // An entry that has already been through `enrich_index_entry` carries the compact
-        // array rather than the schema map it was built from. Readers downstream of the
-        // enrichment — `validate_query` and the statistics counts — see only that form, and
-        // this is what lets them read the fields out of it.
-        return compact_field_info(value);
-    };
-
-    let mut infos: Vec<FieldInfo> = fields_obj
-        .iter()
-        .map(|(name, def)| FieldInfo {
-            name: name.clone(),
-            // A schema serialises its type as the variant name — `Date`, `I64` — while every
-            // syntax surface keys on the lowercase names in `cameodb_mcp::syntax`. Left as-is,
-            // each field's hint reads "Unrecognised field type 'Date'".
-            field_type: def
-                .get("field_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("text")
-                .to_ascii_lowercase(),
-            indexed: def.get("indexed").and_then(|v| v.as_bool()).unwrap_or(true),
-            fast: def.get("fast").and_then(|v| v.as_bool()).unwrap_or(false),
-            is_shadow: def
-                .get("is_shadow")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            description: def
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
+    // One shape to read. The engine describes every field the same way for the listing, the
+    // schema endpoint and everything built on them, so this no longer has to guess whether it
+    // was handed a schema map, an enriched entry, or a listing row.
+    value
+        .get("fields")
+        .and_then(|fields| fields.as_array())
+        .map(|fields| {
+            fields
+                .iter()
+                .map(|def| FieldInfo {
+                    name: def
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    field_type: def
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("text")
+                        .to_string(),
+                    indexed: def.get("indexed").and_then(|v| v.as_bool()).unwrap_or(true),
+                    fast: def.get("fast").and_then(|v| v.as_bool()).unwrap_or(false),
+                    is_shadow: def.get("shadow").and_then(|v| v.as_bool()).unwrap_or(false),
+                    searchable: def
+                        .get("searchable")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                    description: def
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                })
+                .filter(|info| !info.name.is_empty())
+                .collect()
         })
-        .collect();
-
-    infos.sort_by(
-        |left, right| match (left.name.as_str(), right.name.as_str()) {
-            ("id", "id") => std::cmp::Ordering::Equal,
-            ("id", _) => std::cmp::Ordering::Less,
-            (_, "id") => std::cmp::Ordering::Greater,
-            _ => left.name.cmp(&right.name),
-        },
-    );
-
-    infos
-}
-
-/// Read back the compact `fields` array that [`enrich_index_entry`] writes.
-///
-/// The inverse of the projection performed there, and deliberately not a second source of
-/// truth: it recovers exactly the properties that form carries.
-pub(super) fn compact_field_info(value: &JsonValue) -> Vec<FieldInfo> {
-    let Some(entries) = value.get("fields").and_then(|fields| fields.as_array()) else {
-        return Vec::new();
-    };
-
-    entries
-        .iter()
-        .filter_map(|entry| {
-            let name = entry.get("field").and_then(|v| v.as_str())?;
-            Some(FieldInfo {
-                name: name.to_string(),
-                field_type: entry
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("text")
-                    .to_ascii_lowercase(),
-                indexed: entry
-                    .get("indexed")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true),
-                fast: entry.get("fast").and_then(|v| v.as_bool()).unwrap_or(false),
-                is_shadow: entry
-                    .get("shadow")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                description: entry
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-            })
-        })
-        .collect()
+        .unwrap_or_default()
 }
 
 pub(super) fn extract_field_names(value: &JsonValue) -> Vec<String> {
@@ -191,19 +142,25 @@ pub(super) fn extract_field_names(value: &JsonValue) -> Vec<String> {
 /// one `query_hint` per field type present, and drops the schema it was built from. The
 /// projection is the point: the schema map carries tokenizers and record options that no caller
 /// writing a query can act on, and on a wide index they are most of the response.
+/// [`enrich_index_entry`] for an entry held by reference.
+pub(super) fn enrich_index_entry_owned(entry: &JsonValue) -> JsonValue {
+    enrich_index_entry(entry.clone())
+}
+
 pub(super) fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
     let field_infos = extract_field_info(&entry);
 
-    // Collect unique field types present in this index
-    let mut unique_types: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // One hint per distinct type rather than per field: the hint depends on nothing else, so on
+    // a wide index repeating it per field is the same paragraph a dozen times.
+    let mut seen: Vec<String> = Vec::new();
     for info in &field_infos {
-        if info.name != "_seq" {
-            unique_types.insert(info.field_type.clone());
+        if !seen.contains(&info.field_type) {
+            seen.push(info.field_type.clone());
         }
     }
+    seen.sort();
 
-    // Build query hints for each unique field type
-    let query_hints: Vec<JsonValue> = unique_types
+    let query_hints: Vec<JsonValue> = seen
         .iter()
         .map(|field_type| {
             serde_json::json!({
@@ -213,47 +170,8 @@ pub(super) fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
         })
         .collect();
 
-    let fields: Vec<JsonValue> = field_infos
-        .iter()
-        .filter(|info| info.name != "_seq")
-        .map(|info| {
-            let mut field = serde_json::json!({
-                "field": info.name,
-                "type": info.field_type,
-                "indexed": info.indexed,
-                "fast": info.fast,
-                // On every field rather than only where true: a flag that appears by its absence
-                // cannot be read as an answer, and `indexed: false` without it describes a field
-                // nothing can query — the opposite of what a shadow field is.
-                "shadow": info.is_shadow,
-            });
-            // Unlike the flags, present only when written. A description has no false value to
-            // report, and an index nobody has described should not pay for a key per field.
-            if let Some(text) = &info.description
-                && let Some(obj) = field.as_object_mut()
-            {
-                obj.insert("description".to_string(), JsonValue::String(text.clone()));
-            }
-            field
-        })
-        .collect();
-
-    // Lifted before the schema is dropped below, since that is where it was written.
-    let description = entry
-        .get("schema")
-        .and_then(|schema| schema.get("description"))
-        .and_then(|value| value.as_str())
-        .map(str::to_string);
-
     if let Some(obj) = entry.as_object_mut() {
-        if let Some(text) = description {
-            obj.insert("description".to_string(), JsonValue::String(text));
-        }
-        obj.insert("fields".to_string(), JsonValue::Array(fields));
         obj.insert("query_hints".to_string(), JsonValue::Array(query_hints));
-        // The schema map was the input to the projection above; keeping it as well would send
-        // every field twice, which on a wide index is most of the response.
-        obj.remove("schema");
     }
 
     entry
@@ -261,52 +179,39 @@ pub(super) fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
 
 /// One index as the catalogue lists it: enough to choose between indexes, and no more.
 ///
-/// The listing carried a full description of every index — field definitions with their flags,
-/// and the query hints for each type present — which made it a `describe_index` per index
-/// delivered in one response. On a catalogue of any size that is most of an agent's context
-/// spent before it has decided which index to look at, and the prompt tells it to start here.
+/// The entry that arrives describes every field with its type and flags. Passing that straight
+/// through would make the listing a `describe_index` per index delivered at once, which on a
+/// catalogue of any size is most of an agent's context spent before it has decided which index to
+/// look at — and the prompt tells it to start here.
 ///
-/// What is left is what choosing needs: the name, the operator's description of the dataset
-/// where there is one, how many documents, and the field names. Types, flags and hints are one
+/// What is kept is what choosing needs: the name, the operator's description of the dataset where
+/// there is one, how many documents, and the field names. Types, flags and hints are one
 /// `describe_index` away, on the index that turned out to matter.
 ///
-/// The field names are `field_names`, not `fields`, because `describe_index` uses `fields` for
-/// objects carrying a type and three flags. One key naming two shapes is how a client comes to
-/// read `entry.fields[0].type` off a string.
-pub(super) fn catalogue_entry(index: &str, stats: &JsonValue, schema: &JsonValue) -> JsonValue {
-    let field_names: Vec<JsonValue> = extract_field_info(&serde_json::json!({"schema": schema}))
+/// The names go under `field_names`, not `fields`, because `fields` names objects everywhere
+/// else. One key naming two shapes is how a reader comes to look for `fields[0].type` on a string.
+pub(super) fn catalogue_entry(entry: &JsonValue) -> JsonValue {
+    let field_names: Vec<String> = extract_field_info(entry)
         .into_iter()
-        .filter(|info| info.name != "_seq")
-        .map(|info| JsonValue::String(info.name))
+        .map(|info| info.name)
         .collect();
 
-    let mut entry = serde_json::json!({
-        "index": index,
-        "document_count": stats
-            .get("document_count")
-            .cloned()
-            .unwrap_or(JsonValue::Null),
+    let mut out = serde_json::json!({
+        "index": entry.get("name").cloned().unwrap_or(JsonValue::Null),
+        "document_count": entry.get("document_count").cloned().unwrap_or(JsonValue::Null),
         "field_count": field_names.len(),
         "field_names": field_names,
     });
 
-    // Present only where an operator wrote one, as it is on a field. It is the one part of a
-    // listing that says what the data *is* rather than how it is shaped, so it earns its bytes.
-    if let Some(text) = schema.get("description").and_then(|value| value.as_str())
-        && let Some(object) = entry.as_object_mut()
+    if let Some(description) = entry.get("description")
+        && let Some(obj) = out.as_object_mut()
     {
-        object.insert(
-            "description".to_string(),
-            JsonValue::String(text.to_string()),
-        );
+        obj.insert("description".to_string(), description.clone());
     }
 
-    entry
+    out
 }
 
-/// What a field of this type supports, for attaching to a schema listing.
-///
-/// Rendered from [`cameodb_mcp::syntax`], the one table every syntax surface reads.
 pub(super) fn field_type_query_hint(field_type: &str) -> String {
     cameodb_mcp::syntax::hint_for_type(field_type)
 }

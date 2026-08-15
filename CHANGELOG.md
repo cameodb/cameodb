@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The cluster index listing no longer describes the same index two ways.** `GET
+  /_cluster/_indexes` dropped `memory_*` and `warm_shards` from its top-level rollup while
+  keeping them in the nested per-node array, because the merge went through a private struct
+  that lacked those fields. It now renders the per-index shape a single node renders.
+- **`cameodb://indexes/{index}/schema` returned `null` for every index.** The resource read a
+  `schema` key that `describe_index` had already removed, so it paid for the lookup and answered
+  nothing. No test covered it.
+- **`validate_query` reported two different field counts in one response**, because `_seq` was
+  filtered out of some field lists and not others. It is filtered in one place now.
 - **`PATCH /api/{index}/_schema` works.** It answered `500` for every index that had ever been
   written to. The cause was not the endpoint: persisting *any* schema against an index whose
   writer is open stranded that writer, because storing a schema evicts the field-handle cache
@@ -37,6 +46,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **One description of an index, built once by the engine.** `GET /_indexes`,
+  `GET /_cluster/_indexes` and `GET /api/{index}/_config` now return the same per-index shape,
+  and every field in it carries the same keys: `name`, `type`, `indexed`, `stored`, `fast`,
+  `shadow`, `searchable`, and `description` where one was written. Identity is `name`
+  everywhere, and `fields` is an ordered array (`id` first, then alphabetical) rather than a map
+  in one place and a name list in another. **Breaking**: the listing's `field_names` is replaced
+  by `fields`; `/api/{index}/_config` returns `{name, description?, field_count, fields[]}`
+  instead of a map keyed by field name; `field_type` is now `type` and `is_shadow` is `shadow`.
+  - **The listing carries field types for the first time.** It previously gave names only, so
+    every caller fetched the schema again per index to learn the types — the bundled client
+    sequentially. `cameodb list indexes` and `list index <name>` now make **one** request
+    instead of `1 + N` and `2`; the interactive REPL made `1 + 2N`, because its completion cache
+    re-fetched every schema the command had just read.
+  - **`searchable` is new, and is not `indexed`.** `indexed` is what the schema declares;
+    `searchable` is whether the built index has a column for the field. They differ for a field
+    declared after the index was built, which is `indexed` and yet matches nothing until the
+    index data is rebuilt. Only the engine can tell them apart, so it now reports it rather than
+    leaving each caller to guess — the MCP tools previously called such a field queryable.
+  - **Sizes are reported in bytes** (`index_size_bytes`, `memory_bytes`, `data_size_bytes`)
+    instead of pre-rounded megabytes. The cluster listing sums these across nodes, and summing
+    values already rounded to whole megabytes lost up to a megabyte per node.
 - **A field type is reported in lowercase, matching every other surface.** A schema serialized
   `Date` and `Boolean` while the query syntax reference, the per-field query hints and the
   deserializer's own canonical list all say `date` and `boolean` — so an agent reading a schema
@@ -46,13 +76,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching, so schemas persisted with the capitalized form still load, and API callers may still
   send either form (plus the existing aliases such as `integer`, `datetime`, `bool`). Only
   consumers that string-match the capitalized output need to change.
-- **`PATCH /api/{index}/_schema` refuses to make a late-discovered field searchable, with `409`
-  and a reason, instead of acknowledging it.** A Tantivy schema is fixed when the index is
-  created; a field that first appears in a later document has no column, so setting its
-  `indexed` flag never made it queryable. That was already the documented rule internally, but
-  nothing enforced it at the edit. Demotion, and promotion of a field the index does have,
-  continue to work; the edit is now all-or-nothing across shards. Making such a field searchable
-  still requires recreating the index and re-ingesting — see `docs/API_REFERENCE.md`.
+- **`PATCH /api/{index}/_schema` reports a field it cannot make searchable yet, instead of
+  quietly succeeding.** A Tantivy index only has columns for the fields declared when it was
+  built, so marking a later-discovered field `indexed` does not make it searchable right away.
+  The edit is still applied — the stored schema is the declaration the index is rebuilt from, so
+  this is the first step of declare-then-reingest — and the response now names those fields under
+  `pending_reindex_fields` with a note saying what completes the change. Until the rebuild, a
+  query naming such a field matches nothing and reports the clause as discarded rather than
+  returning a narrower answer silently. See `docs/API_REFERENCE.md`.
+- A field name **no shard** recognises refuses the whole request with `409`; a name absent from
+  only some shards does not. Shards normally agree — a declared schema is fanned out to all of
+  them, and an inferred one is sampled from the first 200 documents and persisted everywhere
+  before the first write — but semi-structured input written a document at a time can leave a
+  field on only the shards that received it, and those are exactly the shards that can act on it.
 - An empty `field_updates` is now `400` rather than a success that changed nothing.
 
 ## [0.3.0] - 2026-08-10

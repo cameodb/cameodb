@@ -204,7 +204,8 @@ pub(super) async fn update_schema_handler(
         .await?;
 
     // The engine reports a refusal rather than raising it, because which HTTP status it deserves
-    // is this layer's question. Nothing was written in that case.
+    // is this layer's question. Nothing was written in that case, and only an unknown field
+    // gets here — a flag that cannot take effect yet is applied and noted, not refused.
     if result.get("acknowledged").and_then(|v| v.as_bool()) == Some(false) {
         let reason = result
             .get("reason")

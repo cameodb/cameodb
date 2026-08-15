@@ -152,24 +152,27 @@ fixes whose root cause turned out to sit in the engine rather than in the MCP la
    carries only `fields` and `description`, so serde defaults silently reset `routing_field_name`
    to `id` — changing which shard a document routes to — along with `version`, `fingerprint`,
    `created_at` and `updated_at`. The round trip is gone: `ClientOp::UpdateSchema` edits the
-   stored struct in place. **(c)** The one that changed the plan — **fixing (a) alone would have
-   turned a `500` into a `200` that did nothing.** This item's own premise was wrong: promoting a
-   field to `indexed` is *not* a way to make it queryable, and had not been since before the item
-   was written. A Tantivy schema is fixed at `Index::create_in_dir` from the fields that are
-   `indexed` at that moment, so a field first seen afterwards has no column, and the write path
-   skips it. `mark_initial_fields_indexed` states the rule and the reasoning
-   (`node_orchestrator.rs`) — fields present on the **first** write are indexed then, because it
-   is the last moment they can be; fields discovered **later** are deliberately non-indexed and
-   are "searchable only by rebuilding the index". The rule was understood; what was missing was
-   anything enforcing it at the edit, so `evolve_field`'s promise that fields "can be promoted to
-   indexed later" read as a supported operation. A late-discovered field is now **refused by
-   name** with `409` and a reason saying what it would take, instead of being acknowledged and
-   dropped. Demotion works, promoting a field that is in the Tantivy schema works, promotion
-   before the index is materialised works, and the edit is all-or-nothing across shards — one
-   shard cannot accept what another refuses. Seven engine tests
-   (`crates/storage/tests/schema_promotion_test.rs`) and four against a real node process
-   (`crates/server/tests/node_http_api.rs`). The remaining half of (c) — actually making such a
-   field queryable — is item 8 below
+   stored struct in place. **(c)** The interesting one, and the place this item's own premise was
+   half wrong in both directions. A Tantivy schema is fixed at `Index::create_in_dir` from the
+   fields that are `indexed` at that moment, so a field first seen in a later document has no
+   column and setting its flag does not make it searchable *now*.
+   **But the stored schema is a declaration, and the index is rebuilt from it** —
+   `delete_index_data(delete_schema = false)` then re-ingest, which is a path that already
+   exists and works (asserted end to end in `schema_promotion_test.rs`). Marking the field is
+   therefore the *first step* of making it searchable, and a first attempt at this item refused
+   it with `409`, which blocked the only route there. Corrected 2026-08-15: the edit is applied
+   and the field reported under `pending_reindex_fields` with a note saying what completes it.
+   Nothing is silently wrong in between — a query naming the field reports the clause as
+   discarded and the MCP layer refuses the search outright.
+   One more thing that first attempt got wrong: it required every shard to accept the edit.
+   Shards normally agree, and both schema-creation paths ensure it — a declared schema is fanned
+   out to every shard, and an inferred one is sampled from up to 200 documents and persisted
+   everywhere before the first write lands. The exception is semi-structured input written a
+   document at a time, where a field only some documents carry reaches only some shards; there
+   the divergence is legitimate, since those shards genuinely cannot answer a query on it. A
+   single shard's "unknown" was refusing edits the other shards could apply. A name is now refused only when *every*
+   shard says it is unknown, planned across all shards before any of them writes.
+   Eight engine tests and five against a real node process.
 2. ~~**`validate_query` cannot actually validate a query.**~~ ✅ Landed 2026-08-15.
    `HybridStore::validate_query` parses against an index without searching it, and the tool
    reports what it found. The engine work was the point: resolving a field name needs a built
@@ -197,27 +200,40 @@ fixes whose root cause turned out to sit in the engine rather than in the MCP la
    a fix to it, and the tool's own description currently tells agents to call it with no arguments
    for exactly that text — so it belongs with item 6's documentation pass, where the description,
    the instructions and the README change together
-3. **One structured description of an index, built once.** There is no single answer to "what is
-   in this index". `ClientOp::ListIndexes` returns per-index statistics plus a flat `field_names`
-   array; `ClientOp::GetConfig` returns the field *definitions* with types and flags; and the two
-   are composed, separately and differently, by at least three callers — the bundled client for
-   `list indexes` and `list index <name>`, the MCP tools for `list_indexes` / `describe_index` /
-   `get_catalog_stats` / `validate_query`, and `GET /_indexes` which composes nothing and
-   therefore describes fields by name only. Each composition is a chance to disagree, and each one
-   has: the MCP tools described every index as having no fields at all until 2026-08-13, because
-   they built their entry from the listing alone, while the client had been fetching the schema
-   per index all along and looked correct. Types compound it — a schema serialises `Date` where
-   every syntax surface keys on `date`. What is wanted is one server-side shape carrying identity,
-   statistics, and per-field type/`indexed`/`fast`/`shadow` with its query hint, produced in one
-   place and rendered by everything else: the client, the MCP tools and the HTTP listing. Doing it
-   in the engine rather than at each caller also removes the per-index round trip the current
-   composition costs, and gives `/_indexes` the field types it has never had. Two wrinkles belong
-   to that shape rather than to any caller: on an index with a shadow field, `id` is described as
-   an ordinary indexed field while no document ever returns one — the identifier comes back under
-   the shadow name — so a description built where the rename is known should stop offering `id` as
-   a field to project; and as of item 1 a field's `indexed` flag no longer implies it is
-   *queryable*, since a discovered field can be neither, so the shape should say which fields a
-   query can actually reach rather than leaving each caller to infer it
+3. ~~**One structured description of an index, built once.**~~ ✅ Landed 2026-08-15. The engine
+   produces one per-index shape and `GET /_indexes`, `GET /_cluster/_indexes` and
+   `GET /api/{index}/_config` all return it; the bundled client, the MCP tools and the HTTP
+   listing render it rather than each composing their own. Identity is `name` everywhere and
+   `fields` is an ordered array whose entries all carry the same keys — the survey that preceded
+   this found **seven** properties spelled differently across the callers (`field` against a map
+   key, `type` against `field_type`, `shadow` against `is_shadow`, `hint` against `query_hint`,
+   and three flags that were present, absent or only-when-true depending on who emitted them).
+   **The round trips are gone**, which was the larger cost: `cameodb list indexes` was `1 + N`
+   *sequential* requests and `list index <name>` was 2; the REPL was `1 + 2N`, because its
+   completion cache re-fetched every schema the command it had just run had already read. All
+   are one request now, as is MCP `list_indexes`, which was `1 + N`. MCP's listing still projects
+   down to the lean catalogue entry — that was a deliberate context decision and it now costs
+   nothing, since the data already arrives.
+   **The server disagreed with itself, which the item did not record.** `GET /_cluster/_indexes`
+   dropped `memory_*` and `warm_shards` from its rollup while keeping them one level down in
+   `nodes[]`, so one response described an index two ways; the merge went through a private
+   struct that lacked the fields. Sizes were summed as *already-rounded megabytes* across nodes,
+   losing up to a megabyte per node — they are bytes now, rounded once at display. Two live bugs
+   turned up too: `cameodb://indexes/{index}/schema` answered `null` for every index, reading a
+   key `describe_index` had already removed; and `_seq` was filtered from some field lists and
+   not others, so one `validate_query` response reported two different field counts.
+   **`searchable` is the fact that made this worth doing in the engine.** `indexed` is what the
+   schema declares; `searchable` is whether the built index has a column. They differ exactly for
+   the field item 1 reports as `pending_reindex`, and nothing above the engine can see the
+   difference — the MCP tools had been calling such a field queryable, so an agent querying it got
+   silence. `is_queryable()` was `indexed || is_shadow`; it is `searchable || is_shadow` now, the
+   shadow half kept because a shadow field names the identifier, which is answered from redb
+   rather than the search index.
+   Still open, and worth doing with item 6: on an index with a shadow field, `id` is described as
+   an ordinary field although no document returns one — the identifier comes back under the shadow
+   name — so `id` should stop being offered as something to *project*, while remaining something
+   to query.
+
 4. **Paging: `offset` on a search.** `total_hits` reports how many documents matched and there is
    no way to reach the eleventh. Nothing below the API supports it — not `ClientOp::Search`, not
    `search_documents`, not the shard merge, and not `POST /api/{index}/search`. The engine half is
