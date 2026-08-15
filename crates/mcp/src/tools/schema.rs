@@ -41,6 +41,9 @@ pub(crate) struct SearchIndexArgs {
     pub(crate) query: String,
     #[serde(default)]
     pub(crate) limit: Option<usize>,
+    /// How many ordered hits to skip before the first one returned (paging offset).
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
     #[serde(default)]
     pub(crate) fields: Option<Vec<String>>,
     /// The same structured sort the federated tool takes per index.
@@ -59,6 +62,9 @@ pub(crate) struct SearchAcrossIndexesArgs {
     pub(crate) query: String,
     #[serde(default)]
     pub(crate) limit: Option<usize>,
+    /// How many ordered hits to skip before the first one returned (paging offset).
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +145,11 @@ pub(crate) fn search_index_input_schema(max_search_limit: usize) -> JsonValue {
                     "Maximum number of results to return, up to {max_search_limit}. Pass 0 for count-only mode (returns total_hits without document data). If omitted, the node's configured default applies, which is 10 unless an operator changed it."
                 )
             },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "How many hits to skip before the first one returned (paging offset). The engine fetches offset + limit hits, so offset + limit must not exceed the limit maximum. Defaults to 0."
+            },
             "fields": {
                 "type": "array",
                 "items": { "type": "string" },
@@ -199,6 +210,11 @@ pub(crate) fn search_across_indexes_input_schema(max_search_limit: usize) -> Jso
                 "description": format!(
                     "Maximum total results across all indexes, up to {max_search_limit}. Pass 0 for count-only mode (returns total_hits without document data). If omitted, the node's configured default applies, which is 10 unless an operator changed it."
                 )
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "How many hits to skip before the first one returned (paging offset), applied after merging across all indexes. The engine fetches offset + limit hits from each source, so offset + limit must not exceed the limit maximum. Defaults to 0."
             }
         },
         "required": ["indexes", "query"],
@@ -235,6 +251,10 @@ fn search_result_properties() -> JsonValue {
         "limit": {
             "type": "integer",
             "description": "The limit the search ran with, whether it came from the argument, an inline modifier, or the node's default."
+        },
+        "offset": {
+            "type": "integer",
+            "description": "The offset the search ran with — how many hits were skipped before the first one returned. Defaults to 0 when no offset was requested."
         },
         "_warning": {
             "type": "string",

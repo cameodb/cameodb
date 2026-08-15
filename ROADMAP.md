@@ -129,6 +129,7 @@ This document outlines the current development priorities and optimization roadm
 - ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, resources, and query syntax docs completed; security moved to Phase 14. Integration testing is no longer absent — `crates/server/tests/mcp_rate_limit.rs` and the MCP cases in `crates/server/tests/audit_trail.rs` drive `tools/call` against a real node over JSON-RPC — but streaming and the MCP-specific documentation pass remain. **The completion track was ordered by cost on 2026-08-15 and is the numbered list below; step 1 (the schema endpoint) landed the same day.** Two of its four remaining steps turned out to be engine work surfaced by the MCP tools rather than MCP work: what an agent could see was a broken endpoint and a validator that validates nothing, and in both cases the cause sits under the tool
 - 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f partially done (merge thread count control implemented via `IndexWriterOptions`; core pinning and per-arena stats planned). Shard placement reworked 2026-08-08: dense ordinals replace `xxh3(shard_id) % n` on both the dispatch and writer-pinning sides, and a single `CoreLayout` reconciles `get_core_ids()` with `available_parallelism()`. `/_admin/workers` reports the pin outcome per worker and per shard, not the request. **Verified on Linux (aarch64 container, 8 cores) 2026-08-08: 8/8 workers pinned to their target cores and all four writer threads to cores 0–3, confirmed independently against `Cpus_allowed_list` in `/proc/<pid>/task/*/status` — one CPU per worker thread, one per writer, no collisions.** Pinning is a no-op on macOS, so it must be validated on Linux; the whole suite passes there too. **Measured 2026-08-09 and re-measured 2026-08-10 (see "Worker concurrency, measured"): Stages 2d and 2e cost throughput rather than gaining it, and both flags stay off. The first diagnosis blamed the per-worker serial loop from Stage 2; that loop is gone as of 2026-08-10 and the flags still lose, so the cause is the affine constraint itself — a shard's jobs may only run on one worker, and skew leaves workers idle.**
 - 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) complete, landed 2026-08-08 — steps 1–5 plus hardening (6a) and documentation (6b): credential model, `keygen`, `[security]` config, enforcement at the HTTP/MCP ingress with capability and index scoping (so `external` can now start), `--api-key` / `--api-key-file` / `CAMEODB_API_KEY` on the bundled client, index list filtering, and MCP per-tool authorization with sessions bound to their key. C1 (MCP rate limiting) completed 2026-08-10 and C2 (audit trail) completed 2026-08-10 — `[security.limits]` and `[security.audit]`, both off by default, with `GET /_admin/audit` for reading the trail back. **C3 is the only stage still open**, and it shrank because B1 absorbed index scoping
+- 🎯 **Phase 15 (HA — Reindex, Replication & Migration)**: Scoped 2026-08-15 as enterprise work. It absorbs the index-rebuild item that was briefly filed as the MCP track's step 8 — engine work, not MCP work, and nothing in the track depends on it
 
 ### **Recommended Next Steps**
 
@@ -265,38 +266,30 @@ fixes whose root cause turned out to sit in the engine rather than in the MCP la
 
 #### Opened by the work above
 
-8. **Rebuilding an index so a late-discovered field can be queried.** Filed 2026-08-15 out of
-   item 1, which established that this is the *only* way to make such a field reachable and that
-   no path for it exists — `create_schema_from_definition` has exactly one caller, the branch that
-   creates an index that is not there yet. The shape of the work: drop the writer, rebuild the
-   Tantivy index from the documents redb already holds under a schema that declares the field, per
-   shard, with the original left intact until the replacement is complete. It is a genuine engine
-   feature rather than a bug fix, which is why item 1 refuses the case rather than quietly
-   containing it. What it unblocks is worth stating, because it is the whole reason an agent
-   notices: until it exists, "the index knows about this field" and "you can search on it" stay
-   permanently different states for anything discovered after creation, and `describe_index`,
-   `validate_query` and the schema endpoint all have to keep explaining the gap. The cheap
-   mitigation that already exists and should be documented alongside it — declare the fields up
-   front with `PUT /api/{index}/_config`, or let the first write carry them — belongs in item 6's
-   index-design guidance
+**Rebuilding an index so a late-discovered field can be queried** moved out of this track
+2026-08-15, into Phase 15. It is engine work — reindex, alongside replication and migration —
+rather than MCP work; the MCP side of the gap is already honest about it (`pending_reindex`,
+refused searches), and the cheap mitigation that already exists — declare the fields up front
+with `PUT /api/{index}/_config`, or let the first write carry them — belongs in item 6's
+index-design guidance.
 
 #### Other open work, unchanged
 
-9. **The cost of a durable commit under read load.** What the linger was meant to paper over,
+8. **The cost of a durable commit under read load.** What the linger was meant to paper over,
    still open: a commit costs ~12.5ms with searches running against ~4.6ms without, and
    `wal_sync = false` recovers +86% of write throughput. The lever is the fsync itself — WAL
    device and placement, or a durability level between "every commit" and "none" — not how the
    writer groups writes
-10. **Take unkeyed searches off the coordinator.** A keyed write now resolves locally from the
+9. **Take unkeyed searches off the coordinator.** A keyed write now resolves locally from the
     published ring and shard placement, but a search still pays a mailbox round trip to a single
     actor because the decision depends on cluster size, which the router has no cheap way to know.
     Needs the node count published alongside the ring
-11. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats. No longer
+10. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats. No longer
     blocked behind the worker-width work — but the evidence against it got stronger, not weaker.
     Per-arena jemalloc stats are worth having on their own; more *pinning* now has two independent
     measurements saying it does not pay, and should not be attempted without a specific hypothesis
     neither of them covers
-12. **Phase 14 Stage C3**: per-index role overrides — capability *subtraction* on a named index,
+11. **Phase 14 Stage C3**: per-index role overrides — capability *subtraction* on a named index,
     on top of B1's scoping. The only security stage left; C1 and C2 landed 2026-08-10, and it
     matters only for multi-tenant deployments
 
@@ -1377,3 +1370,33 @@ HTTP search. Nothing has shipped with the old names.
 [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md).)
 
 ---
+
+## Phase 15: High Availability — Reindex, Replication & Migration 🎯 PLANNED
+
+**Objective**: The operational features a deployment needs once data outlives the shape it was
+written in. Scoped 2026-08-15 as enterprise/HA work, separate from the MCP completion track it
+was briefly filed under — nothing here is surfaced by an MCP tool, and none of it blocks one.
+
+**Stages (provisional, not yet ordered):**
+
+1. **Reindex: rebuild an index so a late-discovered field can be queried.** Filed 2026-08-15 out
+   of the MCP track's item 1, which established that this is the *only* way to make such a field
+   reachable and that no path for it exists — `create_schema_from_definition` has exactly one
+   caller, the branch that creates an index that is not there yet. The shape of the work: drop
+   the writer, rebuild the Tantivy index from the documents redb already holds under a schema
+   that declares the field, per shard, with the original left intact until the replacement is
+   complete. Until it exists, "the index knows about this field" and "you can search on it" stay
+   permanently different states for anything discovered after creation — the engine already
+   reports the gap honestly (`pending_reindex`, discarded-clause refusals), so this stage turns
+   an explained gap into a closed one.
+2. **Replication.** Documents copied beyond their primary shard placement, so a lost node loses
+   availability rather than data. Depends on reindex for catch-up: a rebuilt replica is the same
+   operation as a rebuilt index, from a different source.
+3. **Migration.** Moving shard ownership between nodes without downtime — placement change,
+   catch-up replication, cutover. Depends on both stages above; it is replication with an end
+   state.
+
+**Audience**: enterprise and multi-tenant deployments. A single-node local deployment gains
+nothing from stages 2 and 3, and stage 1 has a documented workaround (declare fields up front,
+or `delete_index_data(delete_schema = false)` and re-ingest) that item 6 of the MCP track is
+responsible for teaching.

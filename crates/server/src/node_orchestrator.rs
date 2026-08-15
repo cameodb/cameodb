@@ -511,7 +511,50 @@ fn order_shard_hits(results: &mut Vec<(Uuid, f32, JsonValue)>, sort: Option<&Sor
     *results = ranked.into_iter().map(|(_, tuple)| tuple).collect();
 }
 
-/// Order hits gathered from several sources and keep the first `limit`.
+/// The slice of an ordered result a caller asked for.
+///
+/// Kept as one value rather than two loose numbers because the two are not independent, and the
+/// relationship between them is the whole of paging: see [`SearchWindow::fetch_count`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SearchWindow {
+    /// How many ordered hits to discard before the first one returned.
+    pub offset: usize,
+    /// How many to return after that.
+    pub limit: usize,
+}
+
+impl SearchWindow {
+    /// The first `limit` hits — what every caller that does not page asks for.
+    pub fn first(limit: usize) -> Self {
+        SearchWindow { offset: 0, limit }
+    }
+
+    /// How many hits each source must return for this window to be servable from them.
+    ///
+    /// `offset + limit`, not `limit`. The skip happens once, after every source's hits have been
+    /// merged into one order, so a source that returned only `limit` would leave the window short
+    /// as soon as `offset` was non-zero.
+    ///
+    /// The tempting alternative — telling each source to skip `offset` itself — is wrong rather
+    /// than merely different. Every hit in the window may come from a single source, so a source
+    /// that skipped `offset` of *its own* hits would drop rows that belong in the answer and
+    /// promote rows that do not. This is why Tantivy's own `and_offset` is not used here: it is
+    /// the right tool for one segment and the wrong one for a scatter-gather.
+    pub fn fetch_count(&self) -> usize {
+        self.offset.saturating_add(self.limit)
+    }
+
+    /// Take this window out of a sequence that is already in its final order.
+    pub fn apply<T>(&self, ordered: Vec<T>) -> Vec<T> {
+        ordered
+            .into_iter()
+            .skip(self.offset)
+            .take(self.limit)
+            .collect()
+    }
+}
+
+/// Order hits gathered from several sources and return the requested window of them.
 ///
 /// `blocks` arrive in the order the sources were **dispatched**, never the order they answered,
 /// and that is what makes this deterministic. Neither key a caller can order on is a total
@@ -527,13 +570,16 @@ fn order_shard_hits(results: &mut Vec<(Uuid, f32, JsonValue)>, sort: Option<&Sor
 /// every run.
 ///
 /// Every hit is held before sorting rather than kept in a running top-K. The bound is the same
-/// either way, `limit` per source, and a running top-K cannot be made to agree with this: it
-/// must decide what to discard while later sources are still unheard, so its answer depends on
-/// the order they answer in — exactly what this function exists to remove.
+/// either way, `window.fetch_count()` per source, and a running top-K cannot be made to agree
+/// with this: it must decide what to discard while later sources are still unheard, so its answer
+/// depends on the order they answer in — exactly what this function exists to remove.
+///
+/// The window is taken *after* the merge, which is what makes page *k* mean the same thing here
+/// as it would on a single source — see [`SearchWindow::fetch_count`].
 pub(crate) fn order_hit_blocks(
     blocks: Vec<Vec<JsonValue>>,
     sort: Option<&SortSpec>,
-    limit: usize,
+    window: SearchWindow,
 ) -> Vec<JsonValue> {
     let mut ranked: Vec<(usize, usize, JsonValue)> = blocks
         .into_iter()
@@ -553,8 +599,11 @@ pub(crate) fn order_hit_blocks(
         },
     );
 
-    ranked.truncate(limit);
-    ranked.into_iter().map(|(_, _, hit)| hit).collect()
+    window
+        .apply(ranked)
+        .into_iter()
+        .map(|(_, _, hit)| hit)
+        .collect()
 }
 
 /// Recursively transform shadow field names in JSON query structure
@@ -1078,6 +1127,13 @@ pub enum ClientOp {
         index: String,
         query: String,
         limit: Option<usize>,
+        /// How many ordered hits to skip before the first one returned — the paging half of
+        /// `limit`. `None` and `Some(0)` mean the same thing and cost the same.
+        ///
+        /// Widened away before this op is forwarded to another node: a peer is asked for
+        /// `offset + limit` hits from the front, and the node that received the request applies
+        /// the skip once, after merging. See `SearchWindow::fetch_count`.
+        offset: Option<usize>,
         /// Optional field projection (return only specified fields)
         fields: Option<Vec<String>>,
         /// Optional sort specification
@@ -2044,18 +2100,24 @@ impl OrchestratorEngine {
                 index,
                 query,
                 limit,
+                offset,
                 fields,
                 sort,
             } => WorkerOutcome::Done(
                 self.engine_search(
                     &index,
                     &query,
-                    limit.unwrap_or(self.default_search_limit),
+                    SearchWindow {
+                        offset: offset.unwrap_or(0),
+                        limit: limit.unwrap_or(self.default_search_limit),
+                    },
                     fields.as_deref(),
                     sort.as_ref(),
                 )
                 .await,
             ),
+            // A stream carries the whole result to the caller as it is produced, so there is no
+            // page to ask for and no offset on this op.
             ClientOp::Stream {
                 index,
                 query,
@@ -2068,7 +2130,7 @@ impl OrchestratorEngine {
                     self.engine_search(
                         &index,
                         &query,
-                        search_limit,
+                        SearchWindow::first(search_limit),
                         fields.as_deref(),
                         sort.as_ref(),
                     )
@@ -2192,7 +2254,7 @@ impl OrchestratorEngine {
         &self,
         index: &str,
         query: &str,
-        limit: usize,
+        window: SearchWindow,
         fields: Option<&[String]>,
         sort: Option<&SortSpec>,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -2219,10 +2281,12 @@ impl OrchestratorEngine {
             .collect();
         let shard_results: Vec<_> =
             futures::stream::iter(shard_targets.into_iter().map(|(shard_id, shard)| {
+                // Every shard is asked for the whole window from the front, because any of
+                // them may hold all of it. The skip is applied once, below.
                 let req = SearchRequest {
                     index: index.to_string(),
                     query: transformed_query.clone(),
-                    limit: Some(limit),
+                    limit: Some(window.fetch_count()),
                     sort: sort.cloned(),
                 };
                 async move { (shard_id, shard.handle_search(req).await) }
@@ -2270,7 +2334,7 @@ impl OrchestratorEngine {
             stamp_sort_keys(&mut results, spec, &schema);
         }
         order_shard_hits(&mut results, sort);
-        results.truncate(limit);
+        let results = window.apply(results);
         let total_shards = shards.len();
         let hits: Vec<JsonValue> = results
             .into_iter()
@@ -2297,7 +2361,8 @@ impl OrchestratorEngine {
             "hits": hits,
             "hits_returned": hits.len(),
             "total_hits": total_hits_sum,
-            "limit": limit,
+            "limit": window.limit,
+            "offset": window.offset,
             "took_ms": start.elapsed().as_millis(),
             "stats": {
                 "shards": {
@@ -3897,6 +3962,38 @@ impl RouterActor {
 
         self.broadcasts_total.fetch_add(1, AtomicOrdering::Relaxed);
 
+        // A paged search is widened before it is fanned out: every node — this one included —
+        // is asked for `offset + limit` hits from the front of its own order, and the skip is
+        // applied here, once, after their blocks have been merged into one order. A node that
+        // skipped `offset` of its own hits would drop rows that belong on this page.
+        //
+        // The window is read off the original op and the copies carry no offset, so this cannot
+        // be applied twice however many levels the request travels through.
+        let window = match &op {
+            ClientOp::Search { limit, offset, .. } => SearchWindow {
+                offset: offset.unwrap_or(0),
+                limit: limit.unwrap_or(self.default_search_limit),
+            },
+            _ => SearchWindow::first(self.default_search_limit),
+        };
+        let op = match op {
+            ClientOp::Search {
+                index,
+                query,
+                fields,
+                sort,
+                ..
+            } => ClientOp::Search {
+                index,
+                query,
+                limit: Some(window.fetch_count()),
+                offset: None,
+                fields,
+                sort,
+            },
+            other => other,
+        };
+
         // Get known peers for remote fan-out
         let peers: Vec<KnownPeer> = self
             .coordinator
@@ -3963,8 +4060,9 @@ impl RouterActor {
         let (local_result, remote_results) = tokio::join!(local_future, remote_results_future);
 
         // If this is a search, prefer fastest/local results and stop after hitting the limit.
-        if let ClientOp::Search { limit, sort, .. } = &op {
-            let limit = limit.unwrap_or(self.default_search_limit);
+        if let ClientOp::Search { sort, .. } = &op {
+            // `window`, not the op's own limit: the op was widened above to `fetch_count` so
+            // that every node returned enough for this merge to page through.
             let sort = sort.clone();
             let mut error_count = 0u64;
             let mut stats = BroadcastStats {
@@ -4045,13 +4143,14 @@ impl RouterActor {
                     .fetch_add(error_count, AtomicOrdering::Relaxed);
             }
 
-            let merged_hits = order_hit_blocks(blocks, sort.as_ref(), limit);
+            let merged_hits = order_hit_blocks(blocks, sort.as_ref(), window);
 
             let mut response = serde_json::json!({
                 "hits": merged_hits,
                 "hits_returned": merged_hits.len(),
                 "total_hits": stats.total_hits_sum,
-                "limit": limit,
+                "limit": window.limit,
+                "offset": window.offset,
                 "took_ms": stats.max_took_ms.unwrap_or_else(|| t_start.elapsed().as_millis() as u64),
                 "stats": {
                     "shards": {
@@ -4106,10 +4205,11 @@ impl RouterActor {
 
         // Merge results based on operation type
         match &op {
-            ClientOp::Search { limit, sort, .. } => {
-                // Enforce a global limit across merged results to avoid returning
-                // (limit * nodes) hits when broadcasting.
-                let limit = limit.unwrap_or(self.default_search_limit);
+            ClientOp::Search { sort, .. } => {
+                // Unreachable for a search today — the branch above returns for every
+                // `ClientOp::Search`. Kept in step with `window` regardless, so that it cannot
+                // come back to life paging incorrectly.
+                let limit = window.limit;
                 let nodes_contacted = all_results.len();
 
                 // For search operations, if we only have local results (no remote peers),
@@ -4147,13 +4247,14 @@ impl RouterActor {
                 // Ordered by the requested sort when there is one. This branch previously
                 // merged by score whatever was asked for, so a sorted search that reached more
                 // than one node came back ranked by relevance instead.
-                let merged_hits = order_hit_blocks(blocks, sort.as_ref(), limit);
+                let merged_hits = order_hit_blocks(blocks, sort.as_ref(), window);
 
                 let mut response = serde_json::json!({
                     "hits": merged_hits,
                     "hits_returned": merged_hits.len(),
                     "total_hits": total_hits_sum,
                     "limit": limit,
+                    "offset": window.offset,
                     "stats": {
                         "shards": {
                             "total": total_shards_queried,
@@ -4443,10 +4544,13 @@ impl RouterActor {
 
         // Handle search operations with streaming
         match op {
+            // `offset` is ignored rather than bound: this is the streaming path, which hands
+            // the caller the whole result as it is produced, so there is no page to take.
             ClientOp::Search {
                 index,
                 query,
                 limit,
+                offset: _,
                 fields,
                 sort,
             }
@@ -4472,6 +4576,7 @@ impl RouterActor {
                             index: index.clone(),
                             query: query.clone(),
                             limit: Some(limit),
+                            offset: None,
                             fields: fields.clone(),
                             sort: sort.clone(),
                         })
@@ -4534,6 +4639,7 @@ impl RouterActor {
                                     index,
                                     query,
                                     limit: Some(limit),
+                                    offset: None,
                                     fields,
                                     sort,
                                 },
@@ -4668,7 +4774,7 @@ impl RouterActor {
                 let all_hits = order_hit_blocks(
                     blocks.into_iter().map(|(_, block)| block).collect(),
                     sort.as_ref(),
-                    limit,
+                    SearchWindow::first(limit),
                 );
 
                 let mut response = serde_json::json!({
@@ -6632,13 +6738,17 @@ impl NodeOrchestrator {
                 index,
                 query,
                 limit,
+                offset,
                 fields,
                 sort,
             } => {
                 self.orch_search(
                     &index,
                     &query,
-                    limit.unwrap_or(self.default_search_limit),
+                    SearchWindow {
+                        offset: offset.unwrap_or(0),
+                        limit: limit.unwrap_or(self.default_search_limit),
+                    },
                     fields.as_deref(),
                     sort.as_ref(),
                 )
@@ -6656,7 +6766,7 @@ impl NodeOrchestrator {
                 self.orch_search(
                     &index,
                     &query,
-                    search_limit,
+                    SearchWindow::first(search_limit),
                     fields.as_deref(),
                     sort.as_ref(),
                 )
@@ -7180,7 +7290,7 @@ impl NodeOrchestrator {
         &self,
         index: &str,
         query: &str,
-        limit: usize,
+        window: SearchWindow,
         fields: Option<&[String]>,
         sort: Option<&SortSpec>,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -7206,10 +7316,12 @@ impl NodeOrchestrator {
             .map(|(&shard_id, shard)| (shard_id, shard.clone()))
             .collect();
         let shard_searches = shard_targets.into_iter().map(|(shard_id, shard)| {
+            // The whole window from the front of each shard, for the reason given on
+            // `SearchWindow::fetch_count` — the skip cannot be pushed down here either.
             let req = SearchRequest {
                 index: index.to_string(),
                 query: transformed_query.clone(),
-                limit: Some(limit),
+                limit: Some(window.fetch_count()),
                 sort: sort.cloned(),
             };
             async move { (shard_id, shard.handle_search(req).await) }
@@ -7256,7 +7368,7 @@ impl NodeOrchestrator {
             stamp_sort_keys(&mut results, spec, &schema);
         }
         order_shard_hits(&mut results, sort);
-        results.truncate(limit);
+        let results: Vec<(Uuid, f32, JsonValue)> = window.apply(results);
         let hits: Vec<JsonValue> = results
             .into_iter()
             .map(|(_shard_id, score, mut doc)| {
@@ -7282,7 +7394,8 @@ impl NodeOrchestrator {
             "hits": hits,
             "hits_returned": hits.len(),
             "total_hits": total_hits_sum,
-            "limit": limit,
+            "limit": window.limit,
+            "offset": window.offset,
             "took_ms": start.elapsed().as_millis(),
             "stats": {
                 "shards": {
@@ -8799,7 +8912,7 @@ mod tests {
                 ],
             ],
             Some(&spec),
-            10,
+            SearchWindow::first(10),
         );
         assert_eq!(titles(&hits), vec!["d", "b", "a", "c"]);
     }
@@ -8819,7 +8932,7 @@ mod tests {
                 vec![json!({"title": "a", "_sort_key": 2018})],
             ],
             Some(&spec),
-            10,
+            SearchWindow::first(10),
         );
         assert_eq!(titles(&hits), vec!["a", "b", "missing"]);
     }
@@ -8846,13 +8959,13 @@ mod tests {
                 json!({"title": "b2", "_sort_key": 2020}),
             ],
         ];
-        let hits = order_hit_blocks(blocks.clone(), Some(&spec), 10);
+        let hits = order_hit_blocks(blocks.clone(), Some(&spec), SearchWindow::first(10));
         assert_eq!(titles(&hits), vec!["a1", "a2", "b1", "b2"]);
 
         // The same blocks in the other dispatch order give the other answer, and that is the
         // point: the order is the caller's, not the network's.
         let swapped = vec![blocks[1].clone(), blocks[0].clone()];
-        let hits = order_hit_blocks(swapped, Some(&spec), 10);
+        let hits = order_hit_blocks(swapped, Some(&spec), SearchWindow::first(10));
         assert_eq!(titles(&hits), vec!["b1", "b2", "a1", "a2"]);
     }
 
@@ -8873,11 +8986,117 @@ mod tests {
                 json!({"title": "b2", "_score": 2.0}),
             ],
         ];
-        let full = titles(&order_hit_blocks(blocks.clone(), None, 10));
+        let full = titles(&order_hit_blocks(
+            blocks.clone(),
+            None,
+            SearchWindow::first(10),
+        ));
         for limit in 1..=full.len() {
-            let page = titles(&order_hit_blocks(blocks.clone(), None, limit));
+            let page = titles(&order_hit_blocks(
+                blocks.clone(),
+                None,
+                SearchWindow::first(limit),
+            ));
             assert_eq!(page, full[..limit], "limit {limit} is not a prefix");
         }
+    }
+
+    /// `SearchWindow::fetch_count` is `offset + limit` — the number each source must return
+    /// for the window to be servable after a merge.
+    #[test]
+    fn search_window_fetch_count_is_offset_plus_limit() {
+        assert_eq!(SearchWindow::first(10).fetch_count(), 10);
+        assert_eq!(
+            SearchWindow {
+                offset: 30,
+                limit: 10
+            }
+            .fetch_count(),
+            40
+        );
+        // Saturating: a huge offset does not overflow.
+        assert_eq!(
+            SearchWindow {
+                offset: usize::MAX,
+                limit: 1
+            }
+            .fetch_count(),
+            usize::MAX
+        );
+    }
+
+    /// `SearchWindow::apply` takes the slice `[offset, offset+limit)` from an ordered vec.
+    #[test]
+    fn search_window_apply_takes_the_right_slice() {
+        let hits: Vec<usize> = (0..100).collect();
+        let page = SearchWindow {
+            offset: 30,
+            limit: 10,
+        }
+        .apply(hits);
+        assert_eq!(page, (30..40usize).collect::<Vec<_>>());
+    }
+
+    /// `apply` clamps to what is available rather than panicking.
+    #[test]
+    fn search_window_apply_clamps_to_available() {
+        let hits: Vec<usize> = vec![1, 2, 3];
+        assert_eq!(
+            SearchWindow {
+                offset: 0,
+                limit: 10
+            }
+            .apply(hits.clone()),
+            vec![1usize, 2, 3]
+        );
+        assert_eq!(
+            SearchWindow {
+                offset: 2,
+                limit: 10
+            }
+            .apply(hits.clone()),
+            vec![3usize]
+        );
+        assert_eq!(
+            SearchWindow {
+                offset: 5,
+                limit: 10
+            }
+            .apply(hits),
+            Vec::<usize>::new()
+        );
+    }
+
+    /// A paged merge is the middle of an untruncated one, not a re-run of it.
+    ///
+    /// `order_hit_blocks` with a window of `offset=2, limit=2` returns the third and fourth
+    /// hits of the full order, which is what a caller paging through results expects.
+    #[test]
+    fn a_paged_merge_returns_the_right_slice_of_the_full_order() {
+        let blocks = vec![
+            vec![
+                json!({"title": "a1", "_score": 1.0}),
+                json!({"title": "a2", "_score": 1.0}),
+            ],
+            vec![
+                json!({"title": "b1", "_score": 1.0}),
+                json!({"title": "b2", "_score": 2.0}),
+            ],
+        ];
+        let full = titles(&order_hit_blocks(
+            blocks.clone(),
+            None,
+            SearchWindow::first(10),
+        ));
+        let page = titles(&order_hit_blocks(
+            blocks,
+            None,
+            SearchWindow {
+                offset: 2,
+                limit: 2,
+            },
+        ));
+        assert_eq!(page, full[2..4].to_vec());
     }
 
     /// Finding #2: i64 keys beyond f64's exact-integer range must order precisely.

@@ -10,7 +10,7 @@ use crate::mcp::diagnostics::{
     names_a_missing_field, refuse_if_clauses_discarded, with_valid_fields, zero_results_advice,
 };
 use crate::mcp::schema::absent_index_reason;
-use crate::node_orchestrator::{ClientOp, order_hit_blocks};
+use crate::node_orchestrator::{ClientOp, SearchWindow, order_hit_blocks};
 use crate::query::parse_query_keywords;
 use crate::state::AppState;
 
@@ -114,11 +114,34 @@ fn check_effective_limit(limit: Option<usize>, max_search_limit: usize) -> Resul
     }
 }
 
+/// Refuse an offset whose window — `offset + limit` — exceeds what the engine will fetch.
+///
+/// The engine holds `offset + limit` hits in memory to apply the skip after merging, so the
+/// sum is what the bound applies to, not `limit` alone. A caller that pages deep into a
+/// result is asking for the same work as a large `limit`, and the same ceiling stops both.
+fn check_effective_window(
+    limit: Option<usize>,
+    offset: Option<usize>,
+    max_search_limit: usize,
+) -> Result<(), String> {
+    let limit = limit.unwrap_or(0);
+    let offset = offset.unwrap_or(0);
+    let window = offset.saturating_add(limit);
+    if window > max_search_limit {
+        return Err(format!(
+            "offset {offset} + limit {limit} = {window} is above the maximum of {max_search_limit}; \
+             narrow the query or reduce the offset to stay within the bound"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn search_index(
     state: AppState,
     index: McpIndexSearchRequest,
     query: String,
     limit: Option<usize>,
+    offset: Option<usize>,
 ) -> BoxFuture<'static, Result<JsonValue, String>> {
     Box::pin(async move {
         let index_name = index.index.clone();
@@ -130,6 +153,7 @@ pub(super) fn search_index(
         // Merge MCP-provided values with parsed values (MCP takes precedence for limit/fields)
         let final_limit = limit.or(parsed_limit);
         check_effective_limit(final_limit, state.max_search_limit)?;
+        check_effective_window(final_limit, offset, state.max_search_limit)?;
         let final_fields = index.fields.or(parsed_fields);
         // The argument wins over an inline `sort` clause, as `limit` and `fields` do: a caller
         // that passed a structured sort chose it deliberately, where the clause may be part of
@@ -152,6 +176,7 @@ pub(super) fn search_index(
                     index: index.index,
                     query: cleaned_query,
                     limit: final_limit,
+                    offset,
                     fields: final_fields,
                     sort: final_sort,
                 },
@@ -165,6 +190,12 @@ pub(super) fn search_index(
                 // Checked before the hits are described, since a dropped clause makes the
                 // rest of this response answer a different query.
                 refuse_if_clauses_discarded(&response)?;
+
+                // Report the offset the search ran with, so a caller paging through results
+                // can tell where this page starts.
+                if let Some(obj) = response.as_object_mut() {
+                    obj.insert("offset".to_string(), JsonValue::from(offset.unwrap_or(0)));
+                }
 
                 let total_hits = response
                     .get("total_hits")
@@ -222,6 +253,7 @@ pub(super) fn search_across_indexes(
     indexes: Vec<McpIndexSearchRequest>,
     query: String,
     limit: Option<usize>,
+    offset: Option<usize>,
 ) -> BoxFuture<'static, Result<JsonValue, String>> {
     Box::pin(async move {
         // Preprocess query to extract return/limit/sort modifiers (same as HTTP server)
@@ -233,7 +265,9 @@ pub(super) fn search_across_indexes(
         // comes from an inline `limit` clause or from this node's configured default.
         let final_limit = limit.or(parsed_limit);
         check_effective_limit(final_limit, state.max_search_limit)?;
+        check_effective_window(final_limit, offset, state.max_search_limit)?;
         let requested_limit = final_limit.unwrap_or(state.router.default_search_limit());
+        let requested_offset = offset.unwrap_or(0);
 
         // Determine the global sort spec (if any) for the final merge.
         // Per-index sort takes precedence; fall back to query-parsed sort.
@@ -307,6 +341,7 @@ pub(super) fn search_across_indexes(
                                 index: index.clone(),
                                 query: cleaned_query,
                                 limit: final_limit,
+                                offset,
                                 fields: final_fields,
                                 sort: storage_sort,
                             },
@@ -424,7 +459,10 @@ pub(super) fn search_across_indexes(
         let mut merged_hits = order_hit_blocks(
             blocks.into_iter().map(|(_, block)| block).collect(),
             global_sort.as_ref(),
-            requested_limit,
+            SearchWindow {
+                offset: requested_offset,
+                limit: requested_limit,
+            },
         );
 
         // Strip internal _sort_key from merged hits before returning
@@ -440,6 +478,7 @@ pub(super) fn search_across_indexes(
             "hits_returned": hits_returned,
             "total_hits": total_hits,
             "limit": requested_limit,
+            "offset": requested_offset,
         });
 
         // Present only when something is missing, so that its presence means something. The

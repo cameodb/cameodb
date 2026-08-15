@@ -55,6 +55,28 @@ fn check_limit(limit: Option<usize>, max_search_limit: usize) -> Result<(), Stri
     }
 }
 
+/// Refuse an offset whose window — `offset + limit` — exceeds the advertised maximum.
+///
+/// The engine fetches `offset + limit` hits to apply the skip after merging, so the sum is
+/// what the bound applies to. Checked here for the same reason [`check_limit`] is: the schema
+/// advertises the bound, and a promise nothing enforces describes nothing.
+fn check_offset_window(
+    limit: Option<usize>,
+    offset: Option<usize>,
+    max_search_limit: usize,
+) -> Result<(), String> {
+    let limit = limit.unwrap_or(0);
+    let offset = offset.unwrap_or(0);
+    let window = offset.saturating_add(limit);
+    if window > max_search_limit {
+        return Err(format!(
+            "offset {offset} + limit {limit} = {window} is above the maximum of {max_search_limit}; \
+             narrow the query or reduce the offset to stay within the bound"
+        ));
+    }
+    Ok(())
+}
+
 /// Refuse an index list that is empty, too long, or names an index twice.
 ///
 /// Each of the three would otherwise be answered rather than refused, and the answer would
@@ -116,6 +138,7 @@ where
         "search_index" => {
             let args: SearchIndexArgs = decode_args("search_index", params.arguments)?;
             check_limit(args.limit, backend.max_search_limit())?;
+            check_offset_window(args.limit, args.offset, backend.max_search_limit())?;
             check_index(authz, &args.index)?;
             backend
                 .search_index(
@@ -126,6 +149,7 @@ where
                     },
                     args.query,
                     args.limit,
+                    args.offset,
                 )
                 .await
         }
@@ -133,6 +157,7 @@ where
             let args: SearchAcrossIndexesArgs =
                 decode_args("search_across_indexes", params.arguments)?;
             check_limit(args.limit, backend.max_search_limit())?;
+            check_offset_window(args.limit, args.offset, backend.max_search_limit())?;
             check_index_list(&args.indexes)?;
             // Refuse the whole call rather than quietly dropping the indexes this key may
             // not read: partial results that look complete are worse than an error.
@@ -140,7 +165,7 @@ where
                 check_index(authz, &request.index)?;
             }
             backend
-                .search_across_indexes(args.indexes, args.query, args.limit)
+                .search_across_indexes(args.indexes, args.query, args.limit, args.offset)
                 .await
         }
         "describe_index" => {
@@ -752,5 +777,27 @@ mod tests {
         // invites an agent to plan around it and fail mid-task.
         let nobody: McpAuthzRef = Arc::new(NoCapabilities);
         assert!(visible_tools(&nobody, DEFAULT_MAX_SEARCH_LIMIT).is_empty());
+    }
+
+    #[test]
+    fn check_limit_refuses_past_the_maximum() {
+        assert!(check_limit(Some(101), 100).is_err());
+        assert!(check_limit(Some(100), 100).is_ok());
+        assert!(check_limit(None, 100).is_ok());
+    }
+
+    #[test]
+    fn check_offset_window_refuses_when_offset_plus_limit_exceeds_the_maximum() {
+        // offset + limit within the bound is accepted.
+        assert!(check_offset_window(Some(50), Some(50), 100).is_ok());
+        assert!(check_offset_window(Some(100), Some(0), 100).is_ok());
+        assert!(check_offset_window(None, Some(100), 100).is_ok());
+
+        // offset + limit past the bound is refused.
+        assert!(check_offset_window(Some(50), Some(51), 100).is_err());
+        assert!(check_offset_window(Some(1), Some(100), 100).is_err());
+
+        // Defaults: no limit and no offset is a zero window, always accepted.
+        assert!(check_offset_window(None, None, 100).is_ok());
     }
 }

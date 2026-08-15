@@ -22,6 +22,8 @@ use storage::SortSpec;
 pub struct SearchPayload {
     pub query: String,
     pub limit: Option<usize>,
+    /// How many ordered hits to skip before the first one returned (paging offset).
+    pub offset: Option<usize>,
     /// Optional list of fields to return (field projection)
     pub fields: Option<Vec<String>>,
     /// Optional sort specification
@@ -61,6 +63,7 @@ pub(super) async fn search_handler(
         index,
         query: cleaned_query,
         limit: final_limit,
+        offset: payload.offset,
         fields: final_fields,
         sort: final_sort,
     };

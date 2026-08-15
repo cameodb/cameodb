@@ -111,6 +111,7 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
         index: McpIndexSearchRequest,
         query: String,
         limit: Option<usize>,
+        offset: Option<usize>,
     ) -> BoxFuture<'_, Result<JsonValue, String>>;
 
     fn search_across_indexes(
@@ -118,6 +119,7 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
         indexes: Vec<McpIndexSearchRequest>,
         query: String,
         limit: Option<usize>,
+        offset: Option<usize>,
     ) -> BoxFuture<'_, Result<JsonValue, String>>;
 
     fn describe_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, String>>;
@@ -266,6 +268,7 @@ pub(crate) mod testing {
             _index: McpIndexSearchRequest,
             _query: String,
             _limit: Option<usize>,
+            _offset: Option<usize>,
         ) -> BoxFuture<'_, Result<JsonValue, String>> {
             empty()
         }
@@ -275,6 +278,7 @@ pub(crate) mod testing {
             _indexes: Vec<McpIndexSearchRequest>,
             _query: String,
             _limit: Option<usize>,
+            _offset: Option<usize>,
         ) -> BoxFuture<'_, Result<JsonValue, String>> {
             empty()
         }

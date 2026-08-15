@@ -32,8 +32,9 @@ impl McpBackend for AppState {
         index: McpIndexSearchRequest,
         query: String,
         limit: Option<usize>,
+        offset: Option<usize>,
     ) -> BoxFuture<'_, Result<JsonValue, String>> {
-        search::search_index(self.clone(), index, query, limit)
+        search::search_index(self.clone(), index, query, limit, offset)
     }
 
     fn search_across_indexes(
@@ -41,8 +42,9 @@ impl McpBackend for AppState {
         indexes: Vec<McpIndexSearchRequest>,
         query: String,
         limit: Option<usize>,
+        offset: Option<usize>,
     ) -> BoxFuture<'_, Result<JsonValue, String>> {
-        search::search_across_indexes(self.clone(), indexes, query, limit)
+        search::search_across_indexes(self.clone(), indexes, query, limit, offset)
     }
 
     fn describe_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, String>> {

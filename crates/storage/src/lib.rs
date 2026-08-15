@@ -3103,9 +3103,27 @@ impl HybridStore {
                     if field_def.stored {
                         options = options.set_stored();
                     }
+                    // `fast` on a text field builds the string fast column that a sort needs.
+                    // `None` rather than a tokenizer name on purpose: the column then holds the
+                    // whole untokenized value, which is what an alphabetical sort orders on. A
+                    // tokenized fast column would sort by whichever token came first.
+                    //
+                    // Without this the field has no column, and `search_documents` has to pick
+                    // sort candidates by relevance and reorder them afterwards — an ordering that
+                    // is only approximately right and cannot be paged through. See the sort
+                    // branch there.
+                    if field_def.fast {
+                        options = options.set_fast(None);
+                    }
                     schema_builder.add_text_field(name, options)
                 }
-                TantivyFieldType::String => schema_builder.add_text_field(name, STRING),
+                TantivyFieldType::String => {
+                    if field_def.fast {
+                        schema_builder.add_text_field(name, STRING | FAST)
+                    } else {
+                        schema_builder.add_text_field(name, STRING)
+                    }
+                }
                 TantivyFieldType::I64 => {
                     if field_def.fast {
                         schema_builder.add_i64_field(name, INDEXED | FAST)
@@ -5163,15 +5181,54 @@ impl HybridStore {
                 }};
             }
 
-            // Support u64, i64, f64, and Date fields via FAST fields; Text/String via post-fetch sort.
+            // u64, i64, f64 and Date sort on their FAST column; text sorts on its own when it
+            // has one, and falls back to a post-fetch sort of scored candidates when it does not.
             match field_entry.field_type() {
                 tantivy::schema::FieldType::U64(_) => collect_sorted!(u64),
                 tantivy::schema::FieldType::I64(_) => collect_sorted!(i64),
                 tantivy::schema::FieldType::F64(_) => collect_sorted!(f64),
                 tantivy::schema::FieldType::Date(_) => collect_sorted!(tantivy::DateTime),
+                // A text field with a fast column is sorted by the column, in the collector,
+                // like any other sortable type. Tantivy keys this on the term ordinal, which
+                // its term dictionary holds in lexicographic order, so the result is a true
+                // alphabetical total order over *every* match rather than over a sample —
+                // which is what makes a deep page of a text sort mean anything.
+                tantivy::schema::FieldType::Str(_) if field_entry.is_fast() => {
+                    let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit)
+                        .order_by_string_fast_field(&sort_spec.field, order);
+                    let count_collector = tantivy::collector::Count;
+                    let mut multi_collector = tantivy::collector::MultiCollector::new();
+                    let top_docs_handle = multi_collector.add_collector(top_docs_collector);
+                    let count_handle = multi_collector.add_collector(count_collector);
+
+                    let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
+                    let sorted: Vec<(Option<String>, tantivy::DocAddress)> =
+                        top_docs_handle.extract(&mut multi_fruit);
+                    let total_hits = count_handle.extract(&mut multi_fruit);
+
+                    // Ordering is carried by the sequence from here on, as it is for the
+                    // numeric branches, so the key itself is dropped.
+                    let docs: Vec<(Option<u64>, tantivy::DocAddress)> =
+                        sorted.into_iter().map(|(_, addr)| (None, addr)).collect();
+                    (SearchResult::Sorted(docs), total_hits)
+                }
                 tantivy::schema::FieldType::Str(_) => {
-                    // String sort: collect limit*2 candidates by relevance score, sort
-                    // alphabetically after the redb fetch.
+                    // No fast column on this field, so there is nothing to order on in the
+                    // collector: candidates are taken by relevance and sorted alphabetically
+                    // after the redb fetch. The result is the alphabetical order *of the
+                    // highest-scoring `limit * 2`*, not of everything that matched — the
+                    // alphabetically first document does not score its way in unless the query
+                    // happens to favour it.
+                    //
+                    // Declaring the field `fast` takes the branch above instead and removes the
+                    // approximation. Doing so on an index that already exists needs its data
+                    // rebuilt, since the column is written at index time.
+                    warn!(
+                        field = %sort_spec.field,
+                        "sorting on a text field without a fast column; results are the \
+                         alphabetical order of the top-scoring candidates, not of all matches. \
+                         Mark the field `fast` for a true lexicographic sort (requires reindex)."
+                    );
                     let budget = limit.saturating_mul(2);
                     string_sort = Some((sort_spec.field.clone(), sort_spec.order));
 
