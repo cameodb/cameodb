@@ -122,11 +122,18 @@ fi
 
 # The other half of the rule, asserted so it stays deliberate: a field that arrives after the
 # index exists cannot be added to tantivy's schema, so it is carried for redb parity only.
-if body "$BASE/api/autoschema/_config" \
-    | grep -o '"author":{[^}]*}' | grep -q '"indexed":false'; then
-    pass "a field added after creation is carried unindexed"
+#
+# `searchable` is the field's own account of that: it reports false, so a caller reading the
+# schema learns a query naming this field cannot match without the index being rebuilt, rather
+# than inferring it from `indexed`. Both are asserted because they answer different questions —
+# whether tantivy holds the field, and whether a query may rely on it.
+author_field="$(body "$BASE/api/autoschema/_config" | grep -o '{"name":"author"[^}]*}')"
+if [ -n "$author_field" ] \
+    && grep -q '"indexed":false' <<< "$author_field" \
+    && grep -q '"searchable":false' <<< "$author_field"; then
+    pass "a field added after creation is carried unindexed and reports searchable:false"
 else
-    fail "a field added after creation is carried unindexed" \
+    fail "a field added after creation is carried unindexed and reports searchable:false" \
         "$(body "$BASE/api/autoschema/_config")"
 fi
 
