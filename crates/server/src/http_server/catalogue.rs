@@ -3,6 +3,7 @@
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
+    http::StatusCode,
 };
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -165,6 +166,13 @@ pub(super) async fn list_indexes_handler(
 }
 
 /// Handler for schema updates (maintenance API)
+///
+/// Only the `indexed` flag can be changed, and only through the engine, which edits the stored
+/// schema in place. The two things it must not do are what the previous implementation did: read
+/// the schema out through the `GetConfig` response shape and write it back — which erased every
+/// property that shape does not carry, `routing_field_name` among them — and replay the edit as
+/// `CreateConfig`, which re-creates the Tantivy index and so failed on the writer lockfile for
+/// every index that had ever been written to.
 pub(super) async fn update_schema_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
@@ -176,68 +184,45 @@ pub(super) async fn update_schema_handler(
         "Schema update request"
     );
 
-    // Get current schema
-    let current_schema_result = state
-        .router
-        .route_and_handle(
-            ClientOp::GetConfig {
-                index: index.clone(),
-            },
-            None,
-            OperationType::Read,
-        )
-        .await?;
-
-    // The stored schema is server-side data, so a decode failure here is a 500,
-    // not a client error.
-    let mut schema: IndexSchema = serde_json::from_value(current_schema_result)
-        .map_err(|e| AppError::from(anyhow::anyhow!("Failed to decode stored schema: {}", e)))?;
-
-    // Update indexed flags for specified fields
-    let mut updated_fields = Vec::new();
-    let mut missing_fields = Vec::new();
-
-    for (field_name, indexed) in payload.field_updates {
-        if let Some(field_def) = schema.fields.get_mut(&field_name) {
-            field_def.indexed = indexed;
-            updated_fields.push(field_name);
-        } else {
-            missing_fields.push(field_name);
-        }
+    if payload.field_updates.is_empty() {
+        return Err(AppError::bad_request(
+            "No field updates supplied. Provide `field_updates` as a map of field name to the \
+             desired `indexed` flag.",
+        ));
     }
 
-    if !missing_fields.is_empty() {
-        return Err(AppError::bad_request(format!(
-            "Fields not found in schema: {}",
-            missing_fields.join(", ")
-        )));
-    }
-
-    // Store updated schema
-    state
+    let result = state
         .router
         .route_and_handle(
-            ClientOp::CreateConfig {
+            ClientOp::UpdateSchema {
                 index: index.clone(),
-                schema: schema.clone(),
+                field_updates: payload.field_updates.into_iter().collect(),
             },
             None,
             OperationType::Write,
         )
         .await?;
 
+    // The engine reports a refusal rather than raising it, because which HTTP status it deserves
+    // is this layer's question. Nothing was written in that case.
+    if result.get("acknowledged").and_then(|v| v.as_bool()) == Some(false) {
+        let reason = result
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Schema update refused");
+        return Err(AppError {
+            error: anyhow::anyhow!("{}", reason),
+            status: Some(StatusCode::CONFLICT),
+        });
+    }
+
     info!(
         index = %index,
-        updated_fields = ?updated_fields,
+        updated_fields = ?result.get("updated_fields"),
         "Schema updated successfully"
     );
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "index": index,
-        "updated_fields": updated_fields,
-        "message": "Schema updated successfully. New writes will respect updated indexed flags."
-    })))
+    Ok(Json(result))
 }
 
 /// Handler for deleting an index and all its data

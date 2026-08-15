@@ -288,3 +288,170 @@ async fn a_document_without_an_inner_id_is_refused() {
         "the error should name the missing field, got: {err}"
     );
 }
+
+/// `PATCH /api/{index}/_schema` on an index that has been written to.
+///
+/// This is the case that answered `500` for every index that had ever seen a write: the update
+/// was applied by replaying `CreateConfig`, which re-creates the Tantivy index and could not take
+/// a lock the open writer still held. A node with two shards, one index and one document is the
+/// whole reproduction.
+#[tokio::test]
+async fn a_schema_flag_can_be_changed_on_an_index_that_is_open() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    client
+        .write_document(
+            "papers",
+            "p1",
+            &json!({"id": "p1", "title": "On Lockfiles", "author": "hoare"}),
+            None,
+        )
+        .await
+        .expect("write");
+
+    let response = patch_schema(&node, "papers", &json!({"title": false})).await;
+
+    assert_eq!(
+        response.0, 200,
+        "patching an open index should succeed, got {}: {}",
+        response.0, response.1
+    );
+    assert_eq!(response.1["acknowledged"], json!(true));
+    assert_eq!(response.1["updated_fields"], json!(["title"]));
+}
+
+/// A field discovered *after* the index exists cannot be made queryable by setting its flag,
+/// because the Tantivy schema was fixed when the index was created. The endpoint has to say so
+/// rather than acknowledge an edit that would change nothing a search can see.
+///
+/// The distinction the two writes below draw is the whole point: fields present on the first
+/// write are indexed then, because it is the last moment they can be. `mark_initial_fields_indexed`
+/// says so, and this pins the other side of that rule.
+#[tokio::test]
+async fn promoting_a_late_discovered_field_is_refused_with_a_reason() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    // Creates the index, and with it the Tantivy schema: `title` and nothing else.
+    client
+        .write_document(
+            "papers",
+            "p1",
+            &json!({"id": "p1", "title": "On Lockfiles"}),
+            None,
+        )
+        .await
+        .expect("first write");
+
+    // `author` arrives afterwards, so it is recorded non-indexed — there is no Tantivy column
+    // for it and nothing rebuilds one.
+    client
+        .write_document(
+            "papers",
+            "p2",
+            &json!({"id": "p2", "title": "On Lockfiles II", "author": "hoare"}),
+            None,
+        )
+        .await
+        .expect("second write");
+
+    let (status, body) = patch_schema(&node, "papers", &json!({"author": true})).await;
+
+    assert_eq!(status, 409, "expected a refusal, got {status}: {body}");
+    let details = body["details"].as_str().unwrap_or_default();
+    assert!(
+        details.contains("author"),
+        "the refusal should name the field, got: {details}"
+    );
+    assert!(
+        details.contains("re-ingest") || details.contains("Recreating"),
+        "the refusal should say what it would take, got: {details}"
+    );
+}
+
+/// Changing a flag must not disturb anything else the schema carries. The endpoint used to read
+/// the schema out through the `GetConfig` response and write it back, so every property that
+/// response omits — `routing_field_name` among them, which decides which shard a document lands
+/// on — was reset by an unrelated edit.
+#[tokio::test]
+async fn changing_a_flag_leaves_the_rest_of_the_schema_alone() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    client
+        .write_document(
+            "papers",
+            "p1",
+            &json!({"id": "p1", "title": "On Lockfiles", "summary": "a note"}),
+            None,
+        )
+        .await
+        .expect("write");
+
+    let before = client
+        .get_index_config("papers")
+        .await
+        .expect("config before");
+
+    let (status, _) = patch_schema(&node, "papers", &json!({"title": false})).await;
+    assert_eq!(status, 200);
+
+    let after = client
+        .get_index_config("papers")
+        .await
+        .expect("config after");
+
+    assert_eq!(
+        before.fields.as_object().map(|f| f.len()),
+        after.fields.as_object().map(|f| f.len()),
+        "the field set should be unchanged by a flag edit"
+    );
+
+    // The document still routes and reads back, which is the observable half of the routing
+    // field surviving the edit.
+    let hits = client
+        .search("papers", "id:p1", Some(10), None, None)
+        .await
+        .expect("search");
+    assert_eq!(
+        hits["hits"].as_array().map(|h| h.len()),
+        Some(1),
+        "the document should still be reachable after a schema edit"
+    );
+}
+
+/// An empty request is a client error, not a no-op that reports success.
+#[tokio::test]
+async fn an_empty_schema_patch_is_refused() {
+    let node = TestNode::start("").await;
+    node.client()
+        .write_document("papers", "p1", &json!({"id": "p1", "title": "t"}), None)
+        .await
+        .expect("write");
+
+    let (status, _) = patch_schema(&node, "papers", &json!({})).await;
+    assert_eq!(status, 400, "an empty patch should be a 400");
+}
+
+/// `PATCH /api/{index}/_schema` over raw HTTP, returning the status and decoded body.
+///
+/// The SDK has no method for this endpoint, and half of what these tests assert is the status
+/// code rather than the payload, so they speak HTTP directly.
+async fn patch_schema(
+    node: &TestNode,
+    index: &str,
+    field_updates: &serde_json::Value,
+) -> (u16, serde_json::Value) {
+    with_tls_provider();
+    let response = reqwest::Client::new()
+        .patch(format!("{}/api/{index}/_schema", node.url))
+        .json(&json!({ "field_updates": field_updates }))
+        .send()
+        .await
+        .expect("patch request");
+
+    let status = response.status().as_u16();
+    let body = response.json().await.unwrap_or(serde_json::Value::Null);
+    (status, body)
+}

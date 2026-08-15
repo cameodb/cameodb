@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`PATCH /api/{index}/_schema` works.** It answered `500` for every index that had ever been
+  written to. The cause was not the endpoint: persisting *any* schema against an index whose
+  writer is open stranded that writer, because storing a schema evicts the field-handle cache
+  while the writer cache keeps the writer, and the acquisition path needed both — so a live
+  index fell through to opening a second `IndexWriter` against a lockfile the first still held.
+  A cached writer with no cached field handles now rebuilds them from its own index. The same
+  trap was reachable from the write and bulk-write paths with no HTTP involved.
+- **A schema edit no longer erases the rest of the schema.** The handler read the schema out
+  through the `GET /_config` response and wrote it back, and that response carries only `fields`
+  and `description` — so every edit silently reset `routing_field_name` to `id`, changing which
+  shard a document routes to, along with `version`, `fingerprint`, `created_at` and `updated_at`.
+  The schema is now edited in place and nothing round-trips through a response shape.
+
+### Changed
+
+- **`PATCH /api/{index}/_schema` refuses to make a late-discovered field searchable, with `409`
+  and a reason, instead of acknowledging it.** A Tantivy schema is fixed when the index is
+  created; a field that first appears in a later document has no column, so setting its
+  `indexed` flag never made it queryable. That was already the documented rule internally, but
+  nothing enforced it at the edit. Demotion, and promotion of a field the index does have,
+  continue to work; the edit is now all-or-nothing across shards. Making such a field searchable
+  still requires recreating the index and re-ingesting — see `docs/API_REFERENCE.md`.
+- An empty `field_updates` is now `400` rather than a success that changed nothing.
+
 ## [0.3.0] - 2026-08-10
 
 The authentication release. A node can now require a credential on every route, decide what

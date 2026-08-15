@@ -126,24 +126,157 @@ This document outlines the current development priorities and optimization roadm
 - ✅ **Phase 10 (Field Projection)**: Completed
 - ✅ **Phase 11 (Workflow Hot-Path Optimizations)**: All 7 steps completed
 - ✅ **Phase 11.5 (Jemalloc Memory Management)**: Completed
-- ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, resources, and query syntax docs completed; security moved to Phase 14. Integration testing is no longer absent — `crates/server/tests/mcp_rate_limit.rs` and the MCP cases in `crates/server/tests/audit_trail.rs` drive `tools/call` against a real node over JSON-RPC — but streaming and the MCP-specific documentation pass remain
+- ✅ **Phase 12 (MCP Server Integration)**: Core tools, transport, resources, and query syntax docs completed; security moved to Phase 14. Integration testing is no longer absent — `crates/server/tests/mcp_rate_limit.rs` and the MCP cases in `crates/server/tests/audit_trail.rs` drive `tools/call` against a real node over JSON-RPC — but streaming and the MCP-specific documentation pass remain. **The completion track was ordered by cost on 2026-08-15 and is the numbered list below; step 1 (the schema endpoint) landed the same day.** Two of its four remaining steps turned out to be engine work surfaced by the MCP tools rather than MCP work: what an agent could see was a broken endpoint and a validator that validates nothing, and in both cases the cause sits under the tool
 - 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f partially done (merge thread count control implemented via `IndexWriterOptions`; core pinning and per-arena stats planned). Shard placement reworked 2026-08-08: dense ordinals replace `xxh3(shard_id) % n` on both the dispatch and writer-pinning sides, and a single `CoreLayout` reconciles `get_core_ids()` with `available_parallelism()`. `/_admin/workers` reports the pin outcome per worker and per shard, not the request. **Verified on Linux (aarch64 container, 8 cores) 2026-08-08: 8/8 workers pinned to their target cores and all four writer threads to cores 0–3, confirmed independently against `Cpus_allowed_list` in `/proc/<pid>/task/*/status` — one CPU per worker thread, one per writer, no collisions.** Pinning is a no-op on macOS, so it must be validated on Linux; the whole suite passes there too. **Measured 2026-08-09 and re-measured 2026-08-10 (see "Worker concurrency, measured"): Stages 2d and 2e cost throughput rather than gaining it, and both flags stay off. The first diagnosis blamed the per-worker serial loop from Stage 2; that loop is gone as of 2026-08-10 and the flags still lose, so the cause is the affine constraint itself — a shard's jobs may only run on one worker, and skew leaves workers idle.**
 - 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) complete, landed 2026-08-08 — steps 1–5 plus hardening (6a) and documentation (6b): credential model, `keygen`, `[security]` config, enforcement at the HTTP/MCP ingress with capability and index scoping (so `external` can now start), `--api-key` / `--api-key-file` / `CAMEODB_API_KEY` on the bundled client, index list filtering, and MCP per-tool authorization with sessions bound to their key. C1 (MCP rate limiting) completed 2026-08-10 and C2 (audit trail) completed 2026-08-10 — `[security.limits]` and `[security.audit]`, both off by default, with `GET /_admin/audit` for reading the trail back. **C3 is the only stage still open**, and it shrank because B1 absorbed index scoping
 
 ### **Recommended Next Steps**
+
+Ordered by what the work costs rather than by what it is worth, agreed 2026-08-15: each item
+below is a prerequisite for reading the next one clearly, and the two cheapest are both bug
+fixes whose root cause turned out to sit in the engine rather than in the MCP layer.
+
+#### The MCP completion track, in order
+
+1. ~~**`PATCH /api/{index}/_schema` does not work.**~~ ✅ Landed 2026-08-15, and it was three
+   defects rather than the one recorded here, each hiding the next. **(a)** The endpoint answered
+   `500` for every index that had ever been written to. The cause was not `CreateConfig` as such:
+   persisting *any* schema against a live index stranded its writer, because
+   `store_schema_and_cache` evicts the field cache while `get_or_create_index`'s fast path
+   requires the writer *and* the fields, so a live index fell through to the slow path and opened
+   a second `IndexWriter` against a lockfile the first still held. `apply_write`, `apply_batch`
+   and `invalidate_schema_cache` all armed the same trap; it was reachable with no HTTP involved
+   at all. Fixed where it belongs — a cached writer with no cached fields now rebuilds the field
+   handles from its own index, which is also what keeps the pair in step by construction.
+   **(b)** The handler round-tripped the schema through the `GetConfig` response, and that shape
+   carries only `fields` and `description`, so serde defaults silently reset `routing_field_name`
+   to `id` — changing which shard a document routes to — along with `version`, `fingerprint`,
+   `created_at` and `updated_at`. The round trip is gone: `ClientOp::UpdateSchema` edits the
+   stored struct in place. **(c)** The one that changed the plan — **fixing (a) alone would have
+   turned a `500` into a `200` that did nothing.** This item's own premise was wrong: promoting a
+   field to `indexed` is *not* a way to make it queryable, and had not been since before the item
+   was written. A Tantivy schema is fixed at `Index::create_in_dir` from the fields that are
+   `indexed` at that moment, so a field first seen afterwards has no column, and the write path
+   skips it. `mark_initial_fields_indexed` states the rule and the reasoning
+   (`node_orchestrator.rs`) — fields present on the **first** write are indexed then, because it
+   is the last moment they can be; fields discovered **later** are deliberately non-indexed and
+   are "searchable only by rebuilding the index". The rule was understood; what was missing was
+   anything enforcing it at the edit, so `evolve_field`'s promise that fields "can be promoted to
+   indexed later" read as a supported operation. A late-discovered field is now **refused by
+   name** with `409` and a reason saying what it would take, instead of being acknowledged and
+   dropped. Demotion works, promoting a field that is in the Tantivy schema works, promotion
+   before the index is materialised works, and the edit is all-or-nothing across shards — one
+   shard cannot accept what another refuses. Seven engine tests
+   (`crates/storage/tests/schema_promotion_test.rs`) and four against a real node process
+   (`crates/server/tests/node_http_api.rs`). The remaining half of (c) — actually making such a
+   field queryable — is item 8 below
+2. **`validate_query` cannot actually validate a query.** It checks that quotes and parentheses
+   balance and that named fields exist, which leaves the case the tool is recommended for: a query
+   that balances fine and still fails to parse. The prompt sends an agent here when a search
+   returns a syntax error, and what it gets back is a structural check that already passed. The
+   fix is to run the real parser and return its errors — the engine parses leniently and collects
+   them (`parse_query_lenient`, used twice in `crates/storage/src/lib.rs`) but only behind a
+   search, and only against a `QueryParser` built from a live Tantivy index, because resolving a
+   field name needs the index. So this needs a storage entry point that parses against an index
+   without searching it, returning the same `QueryParserError` list a search would discard — which
+   is engine work rather than MCP work, and why it is here rather than in the tool. Two things
+   fall out of it once it exists: the same errors could be reported on the HTTP search path, and
+   `validate_query` could stop being a documentation endpoint (the static reference belongs in
+   `instructions` and a `cameodb://syntax` resource; a tool call that returns unchanging text is a
+   round trip spent on nothing)
+3. **One structured description of an index, built once.** There is no single answer to "what is
+   in this index". `ClientOp::ListIndexes` returns per-index statistics plus a flat `field_names`
+   array; `ClientOp::GetConfig` returns the field *definitions* with types and flags; and the two
+   are composed, separately and differently, by at least three callers — the bundled client for
+   `list indexes` and `list index <name>`, the MCP tools for `list_indexes` / `describe_index` /
+   `get_catalog_stats` / `validate_query`, and `GET /_indexes` which composes nothing and
+   therefore describes fields by name only. Each composition is a chance to disagree, and each one
+   has: the MCP tools described every index as having no fields at all until 2026-08-13, because
+   they built their entry from the listing alone, while the client had been fetching the schema
+   per index all along and looked correct. Types compound it — a schema serialises `Date` where
+   every syntax surface keys on `date`. What is wanted is one server-side shape carrying identity,
+   statistics, and per-field type/`indexed`/`fast`/`shadow` with its query hint, produced in one
+   place and rendered by everything else: the client, the MCP tools and the HTTP listing. Doing it
+   in the engine rather than at each caller also removes the per-index round trip the current
+   composition costs, and gives `/_indexes` the field types it has never had. Two wrinkles belong
+   to that shape rather than to any caller: on an index with a shadow field, `id` is described as
+   an ordinary indexed field while no document ever returns one — the identifier comes back under
+   the shadow name — so a description built where the rename is known should stop offering `id` as
+   a field to project; and as of item 1 a field's `indexed` flag no longer implies it is
+   *queryable*, since a discovered field can be neither, so the shape should say which fields a
+   query can actually reach rather than leaving each caller to infer it
+4. **Paging: `offset` on a search.** `total_hits` reports how many documents matched and there is
+   no way to reach the eleventh. Nothing below the API supports it — not `ClientOp::Search`, not
+   `search_documents`, not the shard merge, and not `POST /api/{index}/search`. The engine half is
+   free: Tantivy 0.26 has `TopDocs::with_limit(n).and_offset(k)`, carried into every sort variant
+   through `doc_range()`, and its own segment merge is exactly the algorithm needed one level up —
+   each segment collects `offset + limit`, the merge pools them, sorts, and skips `offset`. So the
+   work is to thread a range rather than a limit through `ClientOp::Search` and `search_documents`,
+   have each shard return `offset + limit`, and skip after the merge — then the same again across
+   indexes for the federated tool. Two things to decide with it: whether `POST /api/{index}/search`
+   gets it at the same time (the MCP tools and the HTTP API would otherwise disagree about what a
+   search can express), and where the bound goes, since cost is linear in `offset + limit` rather
+   than in either alone — `[security.limits] max_search_limit` currently bounds only the limit.
+   The prerequisite is met as of 2026-08-14: every hit merge has a total order, and a truncated
+   page is a prefix of an untruncated one, which is what makes page *k* mean anything. Note also
+   that paging over an approximate sort compounds the approximation — a string-field sort collects
+   `limit * 2` candidates per shard and sorts what it fetched, so a deep page is ordered against a
+   different candidate set than a shallow one. Either restrict paging to FAST-field sorts or say
+   so where an agent will read it
+5. **Phase 12: MCP streaming.** Large result sets over the MCP streaming protocol. Left until
+   after items 1-4 deliberately: streaming a result shape that is still changing means building
+   the transport twice
+6. **Phase 12: the documentation pass.** MCP server setup guide, example agent configurations
+   (Claude Desktop and others), sample prompts and workflows, and index-design guidance for agent
+   context. Last of the feature work, so the docs describe tool behaviour that has stopped moving
+7. **Phase 12: protocol-compliance tests and agent-query benchmarks.** Integration testing is no
+   longer part of this — `tools/call` is driven end to end against a real node by the C1 and C2
+   suites — but conformance against the MCP specification and latency figures for agent query
+   patterns are still absent
+
+#### Opened by the work above
+
+8. **Rebuilding an index so a late-discovered field can be queried.** Filed 2026-08-15 out of
+   item 1, which established that this is the *only* way to make such a field reachable and that
+   no path for it exists — `create_schema_from_definition` has exactly one caller, the branch that
+   creates an index that is not there yet. The shape of the work: drop the writer, rebuild the
+   Tantivy index from the documents redb already holds under a schema that declares the field, per
+   shard, with the original left intact until the replacement is complete. It is a genuine engine
+   feature rather than a bug fix, which is why item 1 refuses the case rather than quietly
+   containing it. What it unblocks is worth stating, because it is the whole reason an agent
+   notices: until it exists, "the index knows about this field" and "you can search on it" stay
+   permanently different states for anything discovered after creation, and `describe_index`,
+   `validate_query` and the schema endpoint all have to keep explaining the gap. The cheap
+   mitigation that already exists and should be documented alongside it — declare the fields up
+   front with `PUT /api/{index}/_config`, or let the first write carry them — belongs in item 6's
+   index-design guidance
+
+#### Other open work, unchanged
+
+9. **The cost of a durable commit under read load.** What the linger was meant to paper over,
+   still open: a commit costs ~12.5ms with searches running against ~4.6ms without, and
+   `wal_sync = false` recovers +86% of write throughput. The lever is the fsync itself — WAL
+   device and placement, or a durability level between "every commit" and "none" — not how the
+   writer groups writes
+10. **Take unkeyed searches off the coordinator.** A keyed write now resolves locally from the
+    published ring and shard placement, but a search still pays a mailbox round trip to a single
+    actor because the decision depends on cluster size, which the router has no cheap way to know.
+    Needs the node count published alongside the ring
+11. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats. No longer
+    blocked behind the worker-width work — but the evidence against it got stronger, not weaker.
+    Per-arena jemalloc stats are worth having on their own; more *pinning* now has two independent
+    measurements saying it does not pay, and should not be attempted without a specific hypothesis
+    neither of them covers
+12. **Phase 14 Stage C3**: per-index role overrides — capability *subtraction* on a named index,
+    on top of B1's scoping. The only security stage left; C1 and C2 landed 2026-08-10, and it
+    matters only for multi-tenant deployments
+
+#### Already settled
+
 1. ~~**A latency harness.**~~ ✅ Landed 2026-08-09 as `cameodb-bench` (`crates/bench`): percentiles for writes and searches, the node's `took_ms` beside the client-observed figure, and the worker-pool delta over the measured window. Closed-loop, so runs are comparable at equal concurrency rather than being an SLA
 2. ~~**Document and default the affinity flags.**~~ ✅ Landed 2026-08-09, and the answer was *no*: see "The affinity flags, measured" below. Both stay `false`, now present and explained in `cameodb.example.toml`, `crates/server/cameodb.toml`, `docker/cameodb-docker.toml` and `docs/CONFIGURATION.md`
 3. ~~**Give a worker more than one operation at a time.**~~ ✅ Landed 2026-08-10. A worker now carries up to 8 operations, bounded by a semaphore acquired *before* the receive so the channel stays the backpressure signal. Worth **+65-70% write throughput and −64% on p90** where the pool is the constraint, and nothing where it is not — see "Worker concurrency, measured". It did *not* redeem the affinity flags, which was the other reason to do it
 4. ~~**A bounded linger before the writer commits.**~~ ❌ Built and rejected 2026-08-10 — no measurable gain at any concurrency tested, and the arrival arithmetic says there cannot be one against a closed-loop client. Removed; the reasoning is recorded in "Mixed read/write load, measured" so it is not rebuilt. **An open-loop load generator is the prerequisite for revisiting it** — and is worth having anyway, since every number in this document is closed-loop
-5. **The cost of a durable commit under read load.** What the linger was meant to paper over, still open: a commit costs ~12.5ms with searches running against ~4.6ms without, and `wal_sync = false` recovers +86% of write throughput. The lever is the fsync itself — WAL device and placement, or a durability level between "every commit" and "none" — not how the writer groups writes
-6. **Take unkeyed searches off the coordinator.** A keyed write now resolves locally from the published ring and shard placement, but a search still pays a mailbox round trip to a single actor because the decision depends on cluster size, which the router has no cheap way to know. Needs the node count published alongside the ring
-7. **Phase 13 Stage 2f**: Tantivy merge thread core pinning + per-arena jemalloc stats. No longer blocked behind step 3 — but the evidence against it got stronger, not weaker. Per-arena jemalloc stats are worth having on their own; more *pinning* now has two independent measurements saying it does not pay, and should not be attempted without a specific hypothesis neither of them covers
-8. **Phase 14 Stage C3**: per-index role overrides — capability *subtraction* on a named index, on top of B1's scoping. The only security stage left; C1 and C2 landed 2026-08-10, and it matters only for multi-tenant deployments
-9. **Phase 12 remaining**: MCP streaming and the documentation pass. Integration tests are no longer part of this item — `tools/call` is now driven end to end against a real node by the C1 and C2 suites
-10. **One structured description of an index, built once.** There is no single answer to "what is in this index". `ClientOp::ListIndexes` returns per-index statistics plus a flat `field_names` array; `ClientOp::GetConfig` returns the field *definitions* with types and flags; and the two are composed, separately and differently, by at least three callers — the bundled client for `list indexes` and `list index <name>`, the MCP tools for `list_indexes` / `describe_index` / `get_catalog_stats` / `validate_query`, and `GET /_indexes` which composes nothing and therefore describes fields by name only. Each composition is a chance to disagree, and each one has: the MCP tools described every index as having no fields at all until 2026-08-13, because they built their entry from the listing alone, while the client had been fetching the schema per index all along and looked correct. Types compound it — a schema serialises `Date` where every syntax surface keys on `date`. What is wanted is one server-side shape carrying identity, statistics, and per-field type/`indexed`/`fast`/`shadow` with its query hint, produced in one place and rendered by everything else: the client, the MCP tools and the HTTP listing. Doing it in the engine rather than at each caller also removes the per-index round trip the current composition costs, and gives `/_indexes` the field types it has never had. One wrinkle belongs to that shape rather than to any caller: on an index with a shadow field, `id` is described as an ordinary indexed field while no document ever returns one — the identifier comes back under the shadow name — so a description built where the rename is known should stop offering `id` as a field to project
-11. **`PATCH /api/{index}/_schema` does not work.** Promoting a discovered field to `indexed` is the documented way to make it queryable, and the endpoint answers `500` for every index that has been opened: the update is applied by replaying `CreateConfig`, which re-creates the Tantivy index and fails to take the lock an open writer already holds (`Failed to acquire Lockfile: LockBusy`). Verified 2026-08-13 on a fresh single-shard node — create a config, then patch any field. Underneath that there is a second problem waiting: the handler round-trips the schema through the `GetConfig` response, so every property that response does not carry is reset by the write. `routing_field_name` is one of them today, and resetting it to `id` silently changes which shard a document routes to
-12. **Paging: `offset` on a search.** `total_hits` reports how many documents matched and there is no way to reach the eleventh. Nothing below the API supports it — not `ClientOp::Search`, not `search_documents`, not the shard merge, and not `POST /api/{index}/search`. The engine half is free: Tantivy 0.26 has `TopDocs::with_limit(n).and_offset(k)`, carried into every sort variant through `doc_range()`, and its own segment merge is exactly the algorithm needed one level up — each segment collects `offset + limit`, the merge pools them, sorts, and skips `offset`. So the work is to thread a range rather than a limit through `ClientOp::Search` and `search_documents`, have each shard return `offset + limit`, and skip after the merge — then the same again across indexes for the federated tool. Two things to decide with it: whether `POST /api/{index}/search` gets it at the same time (the MCP tools and the HTTP API would otherwise disagree about what a search can express), and where the bound goes, since cost is linear in `offset + limit` rather than in either alone — `[security.limits] max_search_limit` currently bounds only the limit. The prerequisite is met as of 2026-08-14: every hit merge has a total order, and a truncated page is a prefix of an untruncated one, which is what makes page *k* mean anything. Note also that paging over an approximate sort compounds the approximation — a string-field sort collects `limit * 2` candidates per shard and sorts what it fetched, so a deep page is ordered against a different candidate set than a shallow one. Either restrict paging to FAST-field sorts or say so where an agent will read it
-13. **`validate_query` cannot actually validate a query.** It checks that quotes and parentheses balance and that named fields exist, which leaves the case the tool is recommended for: a query that balances fine and still fails to parse. The prompt sends an agent here when a search returns a syntax error, and what it gets back is a structural check that already passed. The fix is to run the real parser and return its errors — the engine parses leniently and collects them (`parse_query_lenient`, used twice in `crates/storage/src/lib.rs`) but only behind a search, and only against a `QueryParser` built from a live Tantivy index, because resolving a field name needs the index. So this needs a storage entry point that parses against an index without searching it, returning the same `QueryParserError` list a search would discard — which is engine work rather than MCP work, and why it is here rather than in the tool. Two things fall out of it once it exists: the same errors could be reported on the HTTP search path, and `validate_query` could stop being a documentation endpoint (the static reference belongs in `instructions` and a `cameodb://syntax` resource; a tool call that returns unchanging text is a round trip spent on nothing)
 
 ### **The affinity flags, measured**
 

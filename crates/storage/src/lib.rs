@@ -23,7 +23,7 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1446,6 +1446,32 @@ fn parse_date_str_to_tantivy(s: &str) -> Option<(DateTime, i64, i64)> {
     }
 
     None
+}
+
+/// What happened when `indexed` flags were applied to a stored schema.
+///
+/// A rejected update applies nothing at all — the lists below then say why, and `applied` is
+/// empty. Partially applying a schema edit would leave the caller unable to tell which half
+/// took effect.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaFieldUpdate {
+    /// Fields whose `indexed` flag changed.
+    pub applied: Vec<String>,
+    /// Fields already in the requested state, so nothing was written for them.
+    pub unchanged: Vec<String>,
+    /// Fields the schema does not have.
+    pub unknown: Vec<String>,
+    /// Fields that cannot be promoted because the Tantivy index is already built without them.
+    /// Making these queryable needs the index rebuilt, which this engine has no path for; see
+    /// [`HybridStore::update_field_indexing`].
+    pub needs_reindex: Vec<String>,
+}
+
+impl SchemaFieldUpdate {
+    /// Whether the request was refused, in which case nothing was written.
+    pub fn is_rejected(&self) -> bool {
+        !self.unknown.is_empty() || !self.needs_reindex.is_empty()
+    }
 }
 
 /// Index schema definition for validation and evolution.
@@ -3227,6 +3253,38 @@ impl HybridStore {
             return Ok((Arc::clone(writer.value()), fields.value().clone()));
         }
 
+        // A writer is cached but its field handles are not. Persisting a schema evicts the
+        // field cache without touching the writer — `store_schema_and_cache` and
+        // `invalidate_schema_cache` both do — so a live index can arrive here with half of the
+        // pair the fast path needs. Rebuilding the handles from the writer's own index is the
+        // only correct response: the slow path below would open a *second* `IndexWriter`
+        // against the lockfile this one still holds and fail with `LockBusy`, which is what
+        // made every schema write against an open index a 500.
+        //
+        // Deriving them from the cached writer is also what keeps the two in step by
+        // construction — the handles resolve against exactly the index the writer is writing
+        // to, rather than against a schema read from somewhere else.
+        if let Some(writer) = self.writers.get(index) {
+            let writer_arc = Arc::clone(writer.value());
+            // Release the map's shard guard before blocking on the writer mutex.
+            drop(writer);
+
+            let fields = {
+                let guard = writer_arc.lock().unwrap_or_else(|poisoned| {
+                    tracing::error!(index = %index, "Writer mutex was poisoned, recovering");
+                    poisoned.into_inner()
+                });
+                Self::load_fields_from_existing_index(guard.index())?
+            };
+
+            self.fields_cache.insert(index.to_string(), fields.clone());
+            tracing::debug!(
+                index = %index,
+                "Rebuilt field handles for a live index from its cached writer"
+            );
+            return Ok((writer_arc, fields));
+        }
+
         // Create index directory and Tantivy index if it doesn't exist.
         // `index_dir` rejects any name that is not a single path component, so a
         // traversal attempt cannot reach the `create_dir_all` below.
@@ -4317,6 +4375,121 @@ impl HybridStore {
         self.fields_cache.remove(index);
 
         Ok(())
+    }
+
+    /// Set the `indexed` flag on named fields of a stored schema.
+    ///
+    /// This is the engine half of `PATCH /api/{index}/_schema`, and it exists because the two
+    /// things the operation has to get right are both only knowable here.
+    ///
+    /// The first is that the schema must be edited in place rather than round-tripped through
+    /// a response shape. Reading the schema out as JSON, mutating it and writing it back
+    /// erases every property that shape does not carry — `routing_field_name` among them,
+    /// which silently changes which shard a document routes to.
+    ///
+    /// The second is that a field can only be promoted if the Tantivy schema already has it.
+    /// That schema is fixed when the index is created and nothing rebuilds it, so a field that
+    /// first appeared inside a document has no Tantivy field to write into: flipping its flag
+    /// would report success and change nothing a query can see. Those fields are reported in
+    /// `needs_reindex` and the whole request is refused rather than half-applied. An index that
+    /// has not been materialised yet has no such constraint — its Tantivy schema is still built
+    /// from this stored one — so promotion is allowed there.
+    pub fn update_field_indexing(
+        &self,
+        index: &str,
+        updates: &BTreeMap<String, bool>,
+    ) -> Result<SchemaFieldUpdate, StoreError> {
+        let (mut schema, outcome) = self.plan_field_indexing_inner(index, updates)?;
+
+        if outcome.is_rejected() || outcome.applied.is_empty() {
+            return Ok(outcome);
+        }
+
+        for field_name in &outcome.applied {
+            if let Some(field_def) = schema.fields.get_mut(field_name) {
+                field_def.indexed = updates[field_name];
+            }
+        }
+        schema.fingerprint = schema.calculate_fingerprint();
+        schema.updated_at = chrono::Utc::now().timestamp();
+
+        // Persist without re-creating the index: the Tantivy schema is unchanged by
+        // definition, since every field that would have required a new one was refused above.
+        self.persist_schema_evolution(index, &schema)?;
+        self.schema_cache
+            .insert(index.to_string(), Arc::new(schema));
+
+        tracing::info!(
+            index = %index,
+            applied = ?outcome.applied,
+            "Field indexing flags updated"
+        );
+
+        Ok(outcome)
+    }
+
+    /// What [`HybridStore::update_field_indexing`] would do, without doing it.
+    ///
+    /// A schema spans every shard that holds the index, so a caller that wants the edit to be
+    /// all-or-nothing across them has to learn whether each one would accept it before any of
+    /// them writes.
+    pub fn plan_field_indexing(
+        &self,
+        index: &str,
+        updates: &BTreeMap<String, bool>,
+    ) -> Result<SchemaFieldUpdate, StoreError> {
+        self.plan_field_indexing_inner(index, updates)
+            .map(|(_, outcome)| outcome)
+    }
+
+    /// The classification both the plan and the apply path share, with the schema it read.
+    fn plan_field_indexing_inner(
+        &self,
+        index: &str,
+        updates: &BTreeMap<String, bool>,
+    ) -> Result<(IndexSchema, SchemaFieldUpdate), StoreError> {
+        let schema = self
+            .get_schema_cached(index)?
+            .map(|arc| (*arc).clone())
+            .ok_or_else(|| StoreError::IndexNotFound(index.to_string()))?;
+
+        // The Tantivy schema constrains promotion only once it exists on disk. Opening the
+        // index reads `meta.json`; it does not touch the writer lockfile, so this is safe
+        // against a live writer.
+        let index_path = self.index_dir(index)?;
+        let tantivy_schema = if index_path.join("meta.json").exists() {
+            Some(Index::open_in_dir(&index_path)?.schema())
+        } else {
+            None
+        };
+
+        let mut outcome = SchemaFieldUpdate::default();
+
+        for (field_name, want_indexed) in updates {
+            let Some(field_def) = schema.fields.get(field_name) else {
+                outcome.unknown.push(field_name.clone());
+                continue;
+            };
+
+            if field_def.indexed == *want_indexed {
+                outcome.unchanged.push(field_name.clone());
+                continue;
+            }
+
+            let is_promotion = *want_indexed;
+            let missing_from_tantivy = tantivy_schema
+                .as_ref()
+                .is_some_and(|schema| schema.get_field(field_name).is_err());
+
+            if is_promotion && missing_from_tantivy {
+                outcome.needs_reindex.push(field_name.clone());
+                continue;
+            }
+
+            outcome.applied.push(field_name.clone());
+        }
+
+        Ok((schema, outcome))
     }
 
     /// Get max WAL ID for a specific index

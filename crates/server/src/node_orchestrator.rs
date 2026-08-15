@@ -46,7 +46,7 @@ use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::path::PathBuf;
@@ -80,8 +80,8 @@ use chrono::{NaiveDate, NaiveDateTime};
 use cluster::{ConsistentRing, IdentityError, NodeIdentity, generate_tokens};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use storage::{
-    FieldDef, HybridStore, IndexSchema, ShardStatsTimings, StorageConfig, StoreError,
-    TantivyFieldType, WalOp,
+    FieldDef, HybridStore, IndexSchema, SchemaFieldUpdate, ShardStatsTimings, StorageConfig,
+    StoreError, TantivyFieldType, WalOp,
 };
 pub use storage::{SortOrder, SortSpec};
 use xxhash_rust::xxh3::xxh3_64;
@@ -898,6 +898,50 @@ impl<'de> Deserialize<'de> for OrchestratorError {
     }
 }
 
+/// Append names not already present, keeping the list sorted and free of duplicates.
+///
+/// Shard verdicts on a schema update overlap almost entirely — they are reading copies of the
+/// same schema — so merging them is a union, not a concatenation.
+fn merge_names(into: &mut Vec<String>, from: Vec<String>) {
+    for name in from {
+        if !into.contains(&name) {
+            into.push(name);
+        }
+    }
+    into.sort();
+}
+
+/// Why a schema update was refused, phrased for whoever has to act on it.
+///
+/// The reindex case is the one worth spelling out: nothing in the message is inferable from
+/// the field list alone, and an agent that reads "unknown field" would go looking for a typo.
+fn describe_schema_refusal(outcome: &SchemaFieldUpdate) -> String {
+    let mut reasons = Vec::new();
+
+    if !outcome.unknown.is_empty() {
+        reasons.push(format!(
+            "no such field in this schema: {}",
+            outcome.unknown.join(", ")
+        ));
+    }
+
+    if !outcome.needs_reindex.is_empty() {
+        reasons.push(format!(
+            "cannot be made searchable on an index that is already built: {}. \
+             These fields were discovered inside documents after the index was created, so the \
+             Tantivy index has no column for them, and setting the flag would report success \
+             while leaving them unqueryable. Recreating the index with these fields declared, \
+             and re-ingesting, is currently the only way to query them",
+            outcome.needs_reindex.join(", ")
+        ));
+    }
+
+    format!(
+        "Schema update refused, nothing was changed: {}",
+        reasons.join("; ")
+    )
+}
+
 /// Document payload for write operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocPayload {
@@ -1071,6 +1115,15 @@ pub enum ClientOp {
     },
     /// Create or update index configuration/schema
     CreateConfig { index: String, schema: IndexSchema },
+    /// Set the `indexed` flag on named fields of an existing schema.
+    ///
+    /// Distinct from `CreateConfig` because it must *not* re-create the Tantivy index: the
+    /// index is already open, and replaying a create against it fails on the writer lockfile.
+    /// It edits the stored schema in place, so no property is erased by the edit.
+    UpdateSchema {
+        index: String,
+        field_updates: BTreeMap<String, bool>,
+    },
     /// Get index configuration/schema
     GetConfig { index: String },
     /// List all available indexes with statistics (optimized for _indexes endpoint)
@@ -3648,7 +3701,9 @@ impl RouterActor {
         // Metadata operations (schema/config) always execute locally - no need to broadcast
         if matches!(
             op,
-            ClientOp::GetConfig { .. } | ClientOp::CreateConfig { .. }
+            ClientOp::GetConfig { .. }
+                | ClientOp::CreateConfig { .. }
+                | ClientOp::UpdateSchema { .. }
         ) {
             return self.handle_client_op(op).await;
         }
@@ -6510,6 +6565,10 @@ impl NodeOrchestrator {
             ClientOp::CreateConfig { index, schema } => {
                 self.orch_create_config(&index, schema).await
             }
+            ClientOp::UpdateSchema {
+                index,
+                field_updates,
+            } => self.orch_update_schema(&index, &field_updates).await,
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
             ClientOp::ListIndexes { include_data_size } => {
                 self.orch_list_indexes(include_data_size).await
@@ -7209,6 +7268,137 @@ impl NodeOrchestrator {
             "index": index,
             "field_names": Self::sorted_field_names(&schema)
         }))
+    }
+
+    /// Set `indexed` flags on an existing schema, across every shard that holds it.
+    ///
+    /// Two properties this owes the caller, neither of which `CreateConfig` could provide.
+    ///
+    /// It does not re-create the Tantivy index, so it works on an index that is open — which
+    /// is every index that has ever been written to, and the reason the previous
+    /// implementation answered `500` for all of them.
+    ///
+    /// And it is all-or-nothing across shards: every shard is asked whether it would accept
+    /// the edit before any shard writes. A shard can legitimately disagree — one that has not
+    /// materialised the index yet accepts a promotion the others refuse — so a single shard's
+    /// refusal has to refuse the whole request, or the schema diverges between shards.
+    ///
+    /// The gap between asking and writing is not locked, so a schema change racing this one can
+    /// still leave a shard refusing during the apply pass. Each shard re-validates before it
+    /// writes, so the outcome of that race is a reported refusal and an edit applied to some
+    /// shards — never a shard that wrote something it had already judged impossible. Schema
+    /// edits are rare administrative operations against a rare competing writer, which is why
+    /// this is a documented bound rather than a lock.
+    async fn orch_update_schema(
+        &self,
+        index: &str,
+        field_updates: &BTreeMap<String, bool>,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let stores: Vec<Arc<HybridStore>> = self
+            .shards
+            .values()
+            .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
+            .collect();
+
+        if stores.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No local stores available to update schema",
+            )));
+        }
+
+        let plan = self
+            .fan_out_schema_update(&stores, index, field_updates, true)
+            .await?;
+
+        if plan.is_rejected() {
+            return Ok(Self::schema_update_response(index, &plan));
+        }
+
+        let applied = self
+            .fan_out_schema_update(&stores, index, field_updates, false)
+            .await?;
+
+        // Every shard now agrees on the stored schema, so refresh the orchestrator's own copy
+        // from one of them rather than reconstructing what it should be.
+        if let Some(store) = stores.first()
+            && let Ok(Some(schema)) = store.get_schema(index)
+        {
+            self.put_cached_schema(index, &schema);
+        }
+
+        tracing::info!(
+            index = %index,
+            num_shards = stores.len(),
+            applied = ?applied.applied,
+            "Schema field flags updated across shards"
+        );
+
+        Ok(Self::schema_update_response(index, &applied))
+    }
+
+    /// Run the plan or apply half of a schema update on every shard and merge the verdicts.
+    async fn fan_out_schema_update(
+        &self,
+        stores: &[Arc<HybridStore>],
+        index: &str,
+        field_updates: &BTreeMap<String, bool>,
+        plan_only: bool,
+    ) -> Result<SchemaFieldUpdate, OrchestratorError> {
+        let handles: Vec<_> = stores
+            .iter()
+            .map(|store| {
+                let store = Arc::clone(store);
+                let idx = index.to_string();
+                let updates = field_updates.clone();
+                tokio::task::spawn_blocking(move || {
+                    if plan_only {
+                        store.plan_field_indexing(&idx, &updates)
+                    } else {
+                        store.update_field_indexing(&idx, &updates)
+                    }
+                })
+            })
+            .collect();
+
+        let mut merged = SchemaFieldUpdate::default();
+        for handle in handles {
+            let outcome = handle
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                .map_err(OrchestratorError::Storage)?;
+
+            merge_names(&mut merged.applied, outcome.applied);
+            merge_names(&mut merged.unchanged, outcome.unchanged);
+            merge_names(&mut merged.unknown, outcome.unknown);
+            merge_names(&mut merged.needs_reindex, outcome.needs_reindex);
+        }
+
+        // A field one shard applied and another reported unchanged is applied overall; saying
+        // both would read as a contradiction.
+        merged
+            .unchanged
+            .retain(|name| !merged.applied.contains(name));
+
+        Ok(merged)
+    }
+
+    /// The body describing a schema update, whether it was accepted or refused.
+    fn schema_update_response(index: &str, outcome: &SchemaFieldUpdate) -> JsonValue {
+        let mut body = serde_json::json!({
+            "acknowledged": !outcome.is_rejected(),
+            "index": index,
+            "updated_fields": outcome.applied,
+            "unchanged_fields": outcome.unchanged,
+        });
+
+        if outcome.is_rejected() {
+            body["unknown_fields"] = serde_json::json!(outcome.unknown);
+            body["needs_reindex_fields"] = serde_json::json!(outcome.needs_reindex);
+            body["reason"] = serde_json::json!(describe_schema_refusal(outcome));
+        }
+
+        body
     }
 
     async fn orch_get_config(&self, index: &str) -> Result<JsonValue, OrchestratorError> {

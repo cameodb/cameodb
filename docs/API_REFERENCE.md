@@ -402,6 +402,54 @@ curl -s http://localhost:9480/api/books/_config
 }
 ```
 
+#### Change Field Indexing Flags
+Turn a field's `indexed` flag on or off on an existing schema.
+
+```bash
+PATCH /api/{index}/_schema
+```
+
+**Example:**
+```bash
+curl -s -X PATCH http://localhost:9480/api/books/_schema \
+  -H "Content-Type: application/json" \
+  -d '{"field_updates": {"publication_year": false}}'
+```
+
+**Response:**
+```json
+{
+  "acknowledged": true,
+  "index": "books",
+  "updated_fields": ["publication_year"],
+  "unchanged_fields": []
+}
+```
+
+The edit is all-or-nothing: if any named field is refused, nothing is written, and the request
+is answered with `409` rather than a partial success. An empty `field_updates` is a `400`.
+
+**What this endpoint cannot do, and why.** A field can only be made searchable if the index's
+Tantivy schema already has a column for it, and that schema is fixed when the index is created.
+Fields present on the **first** write are indexed then, because it is the last moment they can
+be. A field that first appears in a **later** document is recorded so that reads stay complete,
+but it has no column, and setting its flag would report success while leaving it unqueryable —
+so it is refused instead:
+
+```json
+{
+  "error": "Schema update refused, nothing was changed: cannot be made searchable on an index that is already built: notes. …",
+  "details": "…"
+}
+```
+
+Making such a field searchable means recreating the index with the field declared and
+re-ingesting. To avoid the situation, declare fields up front with `PUT /api/{index}/_config`,
+or make sure the first document written carries every field you intend to search.
+
+Demoting a field (`true` → `false`) always works and takes effect on the next write; documents
+already indexed under it stay searchable until the index is rebuilt.
+
 #### 🗑️ Delete Index
 Permanently delete an index and all its data across the cluster.
 
