@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-16
+
 ### Added
 
 - **Paging: `offset` on a search.** `total_hits` reported how many documents matched and there was

@@ -115,6 +115,73 @@ Signed off by:
 
 <!-- Newest first. Append a filled-in template per release. -->
 
+## v0.3.1 — 2026-08-16
+
+Commit: cb1b188 (dirty at build time — the version bump and changelog move were committed
+after staging; nothing else in the tree changed between build and this commit)
+Built targets: macOS arm64, x86_64-unknown-linux-musl (binary + `cameodb_0.3.1_amd64.deb` +
+`cameodb-0.3.1-1.x86_64.rpm`)
+
+Validation suite, host build (macOS arm64), 2026-08-16 15:00:50 → 15:03:08:
+
+```
+binary: /Users/gc/Code/cameodb/target/release/cameodb
+
+  PASS deps
+  PASS unit
+  PASS posture
+  PASS auth
+  PASS tls
+  PASS remote-sources
+  PASS artifact
+```
+
+`remote-sources` also run inside the musl builder container against
+`target/x86_64-unknown-linux-musl/release/cameodb`, invoked directly rather than through
+`scripts/validate/remote-sources.sh`: the builder image (`cameo-builder-base-amd64`) has
+neither `curl` nor `wget`, so the script's own reachability pre-check fails closed and skips
+the whole suite silently. All four checks the script would have made were run by hand and
+passed — fetched `dl.cameodb.com/cameodb.spdx.json` and a GitHub raw file, and a self-signed
+cert was rejected by default and accepted only with `--insecure-source`. Worth fixing in the
+builder image or the script before the next release, so this doesn't need doing by hand again.
+
+| Suite | Host build | musl | windows | notes |
+|-------|-----------|------|---------|-------|
+| deps           | PASS | n/a  | n/a  | workspace-wide, not per-target |
+| unit           | PASS | —    | —    | |
+| posture        | PASS | —    | —    | |
+| auth           | PASS | —    | —    | |
+| tls            | PASS | —    | —    | |
+| remote-sources | PASS | PASS (manual, see above) | not run | no Windows machine available this release |
+| artifact       | PASS | PASS | n/a  | musl binary passed `artifact.sh` inside `build-musl.sh` as a build gate |
+
+Advisory exceptions reviewed: RUSTSEC-2026-0118, RUSTSEC-2026-0119 (hickory-proto 0.25.x,
+transitive via libp2p 0.56.0, needs hickory-proto >=0.26.1), RUSTSEC-2024-0436 (`paste`
+unmaintained, transitive via libp2p → if-watch). All three review-by 2026-11-01 — not due,
+not renewed.
+
+`check-config` on both shipped configs (`cameodb.example.toml`,
+`crates/server/cameodb.toml`): OK, 3 accepted warnings each (plaintext, unauthenticated admin
+API, no auth) — the documented `internal`-profile posture, unchanged from 0.3.0.
+
+Skipped checks and why:
+- `remote-sources` on Windows — no Windows machine reachable. Same gap as 0.3.0 shipped with
+  initially.
+
+Not yet done, release is incomplete:
+- **No Windows build.** `dist/0.3.1/windows/cameodb.exe` was never produced. Build it on the
+  Windows machine, copy it to that path, re-run `scripts/release/release.sh --stage sign`
+  for that one artifact, then re-run `publish.sh`.
+- **`cameodb-web` has been published to but not committed.** `publish.sh --commit` copied the
+  six signed artifacts into `../cameodb-web/public/downloads`; that checkout is left dirty by
+  design (procedure step 10) for review before committing and pushing.
+- Two 0.3.0 packages (`cameodb_0.3.0_amd64.deb`, `cameodb-0.3.0-1.x86_64.rpm`) are still in
+  the published tree, unreferenced by this release. Left in place per `publish.sh`; remove by
+  hand if the site no longer links to them.
+
+Known gaps acknowledged: yes
+Signed off by:
+
 ## v0.3.0 — 2026-08-11
 
 Commit: f1285de
