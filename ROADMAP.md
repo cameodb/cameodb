@@ -305,6 +305,54 @@ index-design guidance.
     on top of B1's scoping. The only security stage left; C1 and C2 landed 2026-08-10, and it
     matters only for multi-tenant deployments
 
+#### Code health, reviewed at 0.3.1
+
+Reviewed 2026-08-16, after the paging and MCP work landed. Nothing here changes behaviour;
+each item is a place the code now says one thing twice, or where the next feature will cost
+more than it should. Ordered by what each buys, not by effort.
+
+12. **One scatter-gather, written twice.** `engine_search` and `orch_search` in
+    `node_orchestrator.rs` are ~150-line near-duplicates: the same shard fan-out, gather loop,
+    sort-key stamping, merge, window application, projection and response assembly. The paging
+    change had to be made in both, and was — which is the warning, not the reassurance: the next
+    change to one of them will be forgotten in the other. Extract the shared
+    gather-merge-respond into one function; the two callers differ only in where the shard map
+    comes from
+13. **The merge primitives deserve their own module.** `SearchWindow`, `order_hit_blocks`,
+    `order_shard_hits`, `compare_hits_by_field`, `stamp_sort_keys` and their tests are a
+    coherent, self-contained unit inside a 9,300-line `node_orchestrator.rs` — and they are the
+    unit every paging invariant lives in, imported by the HTTP and MCP surfaces alike. A
+    `search_merge` module shrinks the file everyone edits and gives those invariants one place
+    to be read. `storage/src/lib.rs` at 7,600 lines has the same disease and the same cure —
+    the sorted-collector logic, query preparation and schema description are separable
+14. **Cursor paging (`search_after`).** The deep-page refusal already tells callers to "sort on
+    a field that lets you resume from the last hit" — advice nothing implements. A
+    `search_after` parameter on a sorted search (resume past the last sort key, tie broken the
+    way the merge already breaks it) makes page *N* cost what page 1 costs, where offset paging
+    fetches and discards *N−1* pages from every source — the cost `SearchWindow::checked`
+    exists to refuse. The merge already threads `_sort_key` through every hit, which is most of
+    the cursor. Belongs beside MCP streaming (item 5): both answer "the result is larger than a
+    page", and building either changes how the other should work
+15. **The window bound is spelled twice.** `SearchWindow::checked` (server) and `check_limit` +
+    `check_offset_window` (the `mcp` crate) enforce the same rule with independently maintained
+    arithmetic and error text. The double check is deliberate — the schema is the `mcp` crate's
+    promise, and a promise nothing enforces describes nothing — but two spellings of one rule
+    drift, and the refusal text already differs between them. Keep both checks; share the
+    arithmetic and the test vectors, so a change to the rule cannot land in one crate only
+16. **Sort type conversion, four times inline.** `mcp/search.rs` converts
+    `cameodb_mcp::SortSpec` ↔ `storage::SortSpec` with the same written-out match in four
+    places. One pair of `From` impls, next to the type that owns the shape
+17. **The federated merge clones every hit.** `search_across_indexes` clones each hit out of
+    the response it already owns in order to stamp `_index_source` on the copy. Taking the
+    array with `as_array_mut` + `std::mem::take` stamps in place. Bounded by page size rather
+    than corpus size, so this is the hot line of the federated path being untidy rather than
+    slow — worth doing when the function is next open
+18. **The string-fast collector repeats the macro's body.** `collect_sorted!` in
+    `storage/src/lib.rs` covers the u64/i64/f64/date branches; the string-fast branch writes
+    the same MultiCollector block out by hand because its key type is `String` rather than a
+    copyable numeric. Fold it in by parameterizing the collector expression, so the next
+    change to how a sorted search counts its total touches one place
+
 #### Already settled
 
 1. ~~**A latency harness.**~~ ✅ Landed 2026-08-09 as `cameodb-bench` (`crates/bench`): percentiles for writes and searches, the node's `took_ms` beside the client-observed figure, and the worker-pool delta over the measured window. Closed-loop, so runs are comparable at equal concurrency rather than being an SLA
