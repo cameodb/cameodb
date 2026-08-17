@@ -51,9 +51,9 @@ fn success_response(id: Option<JsonValue>, result: JsonValue) -> JsonValue {
 
 /// A tool's result as the text block, compactly.
 ///
-/// Not indented. The result now travels as `structuredContent` too, so the text block is the
-/// backwards-compatible copy rather than the thing a human reads — and indentation would be a
-/// quarter of the message spent on whitespace, twice over.
+/// Not indented. The text block is the only channel a tool result travels on, so whatever is
+/// spent here is spent on every response — and indentation would be a quarter of the message
+/// spent on whitespace.
 fn json_to_text(value: &JsonValue) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
@@ -71,15 +71,13 @@ pub(crate) fn error_response(id: Option<JsonValue>, code: i64, message: String) 
 
 /// Answer one JSON-RPC message, or `None` where the protocol says there is no reply.
 ///
-/// `structured_results` is whether this caller reads `structuredContent` on a tool result — a
-/// property of the request's negotiated protocol revision, which only the transport can see.
-/// When false, a successful tool result also travels as the serialized copy in the text block,
-/// because that block is the only place such a client looks.
+/// The answer does not depend on the caller's negotiated revision. Tool results travel in
+/// `content` as a text block, which is valid in every revision this server speaks — see
+/// [`handle_tool_call`] for why that is the only channel used.
 pub(crate) async fn handle_rpc_request<S>(
     backend: S,
     request: JsonRpcRequest,
     authz: &McpAuthzRef,
-    structured_results: bool,
 ) -> Option<JsonValue>
 where
     S: McpBackend,
@@ -196,16 +194,7 @@ where
             request.id,
             json!({ "tools": visible_tools(authz, backend.max_search_limit()) }),
         )),
-        "tools/call" => Some(
-            handle_tool_call(
-                &backend,
-                request.id,
-                request.params,
-                authz,
-                structured_results,
-            )
-            .await,
-        ),
+        "tools/call" => Some(handle_tool_call(&backend, request.id, request.params, authz).await),
 
         other => Some(error_response(
             request.id,
@@ -226,7 +215,6 @@ async fn handle_tool_call<S>(
     id: Option<JsonValue>,
     params: JsonValue,
     authz: &McpAuthzRef,
-    structured_results: bool,
 ) -> JsonValue
 where
     S: McpBackend,
@@ -296,32 +284,35 @@ where
         },
     );
     match outcome {
-        // The result travels in the shape the caller's protocol revision defines, and only
-        // that shape. A client on the revision that introduced structured results gets
-        // `structuredContent` with `content` empty — the text copy would be the same JSON
-        // escaped into a string, doubling every response, and an agent's context is the scarce
-        // resource. A client predating that revision gets the serialized result in the text
-        // block and no `structuredContent` at all: the field does not exist in its revision,
-        // so sending it is bytes spent on something the client cannot read.
+        // One shape, for every client on every revision: the serialized result in the text
+        // block, and no `structuredContent`.
         //
-        // Either way `content` is present rather than omitted. It is a required array in every
-        // revision this server negotiates, and a client validating the envelope should find
-        // the field it expects rather than an error.
-        Ok(result) => {
-            let body = if structured_results {
-                json!({
-                    "content": [],
-                    "structuredContent": result,
-                    "isError": false,
-                })
-            } else {
-                json!({
-                    "content": [{ "type": "text", "text": json_to_text(&result) }],
-                    "isError": false,
-                })
-            };
-            success_response(id, body)
-        }
+        // Structured content is an optional feature and this server opts out of it. The
+        // alternative is not free: the spec asks a tool returning structured content to *also*
+        // serialize it into a text block, so opting in means sending every result twice —
+        // measured at 1038 bytes against 520 for a two-hit search — and an agent's context is
+        // the scarce resource.
+        //
+        // Sending only `structuredContent` is what this server used to do for clients that
+        // negotiated 2025-06-18, and it is the thing that broke: a client's revision says which
+        // spec it speaks, not which channel it reads, and several hosts negotiate 2025-06-18
+        // while rendering `content` alone. They saw an empty array and reported no results,
+        // which is indistinguishable from a query that matched nothing. There is no client
+        // capability for "I read structuredContent" — capabilities are `roots`, `sampling`,
+        // `elicitation` and `experimental` — so no version test can tell the two apart, and
+        // guessing wrong fails silently.
+        //
+        // `content` is a required array in every revision, so the one channel that is always
+        // read is the one always populated. `outputSchema` is not advertised either: it binds
+        // the server to returning conforming structured results, and a schema advertised
+        // without them is a promise to a client that cannot be kept.
+        Ok(result) => success_response(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": json_to_text(&result) }],
+                "isError": false,
+            }),
+        ),
         Err(err) => success_response(
             id,
             json!({
@@ -366,7 +357,6 @@ mod tests {
                 StubBackend::default(),
                 message(json!({ "jsonrpc": "2.0", "method": method })),
                 &caller(),
-                true,
             )
             .await;
             assert!(
@@ -384,7 +374,6 @@ mod tests {
             StubBackend::default(),
             message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" })),
             &caller(),
-            true,
         )
         .await
         .expect("initialize is answered");
@@ -405,7 +394,6 @@ mod tests {
             StubBackend::default(),
             message(json!({ "jsonrpc": "2.0", "id": 7, "method": "no/such/method" })),
             &caller(),
-            true,
         )
         .await
         .expect("a request carrying an id must be answered");
@@ -414,55 +402,49 @@ mod tests {
         assert_eq!(response["error"]["code"], json!(-32601));
     }
 
-    /// A tool result arrives in the one shape the caller's revision defines.
+    /// A tool result arrives as the serialized result in the text block, and nowhere else.
     ///
-    /// The revision that introduced `structuredContent` is where a client learned to look for
-    /// it; one negotiated earlier reads only the text block, so the result is serialized into
-    /// it and `structuredContent` is not sent at all — the field does not exist in that
-    /// revision. One negotiated at or after it gets the structured result once, with `content`
-    /// present — it is a required array — and empty.
+    /// The empty `content` this replaced is the bug it was reported for: a client that renders
+    /// `content` alone showed nothing, and nothing is what a query matching no documents looks
+    /// like too. So the assertion worth keeping is that the array is populated — a result no
+    /// client can read is worse than a verbose one.
     #[tokio::test]
-    async fn the_result_shape_follows_the_negotiated_revision() {
-        for structured_results in [true, false] {
-            let response = handle_rpc_request(
-                StubBackend::default(),
-                message(json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {"name": "list_indexes", "arguments": {}},
-                })),
-                &caller(),
-                structured_results,
-            )
-            .await
-            .expect("a tool call is answered");
+    async fn a_tool_result_carries_the_serialized_result_in_the_text_block() {
+        let response = handle_rpc_request(
+            StubBackend::default(),
+            message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "list_indexes", "arguments": {}},
+            })),
+            &caller(),
+        )
+        .await
+        .expect("a tool call is answered");
 
-            let result = &response["result"];
-            assert_eq!(result["isError"], json!(false), "{response}");
-            let content = result["content"].as_array().expect("content is required");
+        let result = &response["result"];
+        assert_eq!(result["isError"], json!(false), "{response}");
 
-            if structured_results {
-                assert!(
-                    result["structuredContent"].is_object(),
-                    "a structured-era client got no structured result: {result}"
-                );
-                assert!(
-                    content.is_empty(),
-                    "a client that reads structuredContent was sent the copy too: {result}"
-                );
-            } else {
-                assert!(
-                    result.get("structuredContent").is_none(),
-                    "a pre-structuredContent client was sent a field its revision does not \
-                     define: {result}"
-                );
-                let text = content[0]["text"].as_str().unwrap_or_default();
-                assert!(
-                    serde_json::from_str::<JsonValue>(text).is_ok_and(|value| value.is_object()),
-                    "the text block does not carry the serialized result: {result}"
-                );
-            }
-        }
+        let content = result["content"].as_array().expect("content is required");
+        assert_eq!(
+            content.len(),
+            1,
+            "a successful result is one text block: {result}"
+        );
+        assert_eq!(content[0]["type"], json!("text"), "{result}");
+        let text = content[0]["text"].as_str().unwrap_or_default();
+        assert!(
+            serde_json::from_str::<JsonValue>(text).is_ok_and(|value| value.is_object()),
+            "the text block does not carry the serialized result: {result}"
+        );
+
+        // Advertising no `outputSchema` and returning no `structuredContent` are one decision;
+        // this is the half of it a client can observe.
+        assert!(
+            result.get("structuredContent").is_none(),
+            "a result carried structuredContent for a server that advertises no outputSchema: \
+             {result}"
+        );
     }
 }

@@ -221,22 +221,19 @@ max_shards_per_node = 1
             .await;
         let result = &value["result"];
         let is_error = result["isError"].as_bool().unwrap_or(false);
-        // A successful result arrives as `structuredContent`, already parsed. A failure has no
-        // structured form — it is a message — so it comes back in the text block.
-        let parsed = if is_error {
-            let text = result["content"][0]["text"].as_str().unwrap_or("");
-            serde_json::from_str(text).unwrap_or(Value::String(text.to_string()))
-        } else {
-            result["structuredContent"].clone()
-        };
+        // Every result travels in the text block, success or failure — a success is the
+        // serialized JSON, a failure is a message that does not parse as any.
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let parsed = serde_json::from_str(text).unwrap_or(Value::String(text.to_string()));
         (is_error, parsed)
     }
 
     /// One JSON-RPC message, returning the whole response envelope.
     ///
-    /// Sent as a client on the revision that introduced `structuredContent` — the
-    /// `MCP-Protocol-Version` header is what tells the server so, and what these tests read
-    /// results from. `rpc_without_version` below is the client that predates it.
+    /// Sent as a client on the newest revision, stating it in the `MCP-Protocol-Version` header
+    /// the way the spec requires after `initialize`. The revision no longer decides the shape of
+    /// a result — `rpc_without_version` below is the same request without the header, and
+    /// `a_tool_result_has_one_shape_whatever_revision_the_client_speaks` holds the two together.
     async fn rpc(&self, body: Value) -> Value {
         let resp = http()
             .post(format!("{}/mcp", self.url))
@@ -1907,23 +1904,21 @@ max_response_bytes = 900
     );
 }
 
-/// A search result satisfies the schema its tool advertises, and arrives already parsed.
+/// A tool result arrives in the same shape whatever revision the client speaks.
 ///
-/// An `outputSchema` nobody checks is the same liability as an `inputSchema` nobody enforces: a
-/// client that trusts it and finds a required key missing has been misled by the catalogue. This
-/// reads the schema out of `tools/list` and holds a real response to it, so the two cannot drift
-/// in either direction.
+/// This is the regression test for the bug that made every search look empty. The server used to
+/// answer a client that negotiated `2025-06-18` with `structuredContent` and an empty `content`,
+/// on the reasoning that the revision says the client reads the structured field. It does not: a
+/// revision says which spec a client speaks, and several hosts speak `2025-06-18` while rendering
+/// `content` alone. They saw `[]` and reported no results, which is what a query matching nothing
+/// looks like too.
+///
+/// So the invariant is shape-identity — the same call, once stating the newest revision in the
+/// `MCP-Protocol-Version` header and once omitting it entirely, must come back byte-identical.
+/// Any future attempt to vary the result by revision fails here.
 #[tokio::test]
-async fn a_search_result_satisfies_the_schema_its_tool_advertises() {
+async fn a_tool_result_has_one_shape_whatever_revision_the_client_speaks() {
     let node = two_seeded_indexes().await;
-
-    let listing = node
-        .rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
-        .await;
-    let tools = listing["result"]["tools"]
-        .as_array()
-        .expect("tools")
-        .clone();
 
     for (tool, arguments) in [
         (
@@ -1935,95 +1930,85 @@ async fn a_search_result_satisfies_the_schema_its_tool_advertises() {
             json!({"indexes": [{"index": "alpha"}, {"index": "beta"}], "query": "title:record", "limit": 2}),
         ),
     ] {
-        let declared = tools
-            .iter()
-            .find(|entry| entry["name"] == json!(tool))
-            .and_then(|entry| entry.get("outputSchema"))
-            .unwrap_or_else(|| panic!("{tool} advertises no outputSchema"))
-            .clone();
+        // The whole envelope rather than the parsed text, so what is checked is the shape a
+        // client receives.
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments},
+        });
+        let stated = node.rpc(call.clone()).await;
+        let omitted = node.rpc_without_version(call).await;
 
-        // The whole envelope, not the parsed text, so the shape a client receives is what is
-        // checked.
-        let envelope = node
-            .rpc(json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {"name": tool, "arguments": arguments},
-            }))
-            .await;
-        let result = &envelope["result"];
-        assert_eq!(result["isError"], json!(false), "{tool}: {envelope}");
-
-        // A tool declaring an output schema must return the result structured, not only as text.
-        let structured = &result["structuredContent"];
-        assert!(
-            structured.is_object(),
-            "{tool} returned no structuredContent: {result}"
+        assert_eq!(
+            stated, omitted,
+            "{tool} answered two revisions differently: {stated} vs {omitted}"
         );
 
-        for required in declared["required"].as_array().expect("required") {
-            let key = required.as_str().expect("a required key is a string");
+        let result = &stated["result"];
+        assert_eq!(result["isError"], json!(false), "{tool}: {stated}");
+
+        // The text block is the only channel, so it must be populated. An empty `content` is
+        // precisely the failure this test exists for.
+        let content = result["content"].as_array().expect("content is required");
+        assert_eq!(content.len(), 1, "{tool}: {result}");
+        assert_eq!(content[0]["type"], json!("text"), "{tool}: {result}");
+        let text = content[0]["text"].as_str().unwrap_or_default();
+        assert!(
+            !text.is_empty(),
+            "{tool} returned an empty result: {result}"
+        );
+
+        // Nothing is sent that this server does not also advertise a schema for.
+        assert!(
+            result.get("structuredContent").is_none(),
+            "{tool} carried structuredContent while advertising no outputSchema: {result}"
+        );
+
+        // The keys the description promises a caller may rely on, with the types it promises
+        // them in. What `outputSchema` used to assert, asserted directly.
+        let parsed: Value = serde_json::from_str(text).unwrap_or_else(|err| {
+            panic!("{tool}: the text block is not the serialized result: {err}: {text}")
+        });
+        assert!(
+            parsed["hits"].is_array(),
+            "{tool}: 'hits' is not an array: {parsed}"
+        );
+        for key in ["hits_returned", "total_hits"] {
             assert!(
-                structured.get(key).is_some(),
-                "{tool} declares '{key}' as required and did not return it: {structured}"
+                parsed[key].is_u64(),
+                "{tool}: '{key}' is not an integer: {parsed}"
             );
         }
+    }
+}
 
-        // Every key the response does carry that the schema also names must match the declared
-        // type, so a description cannot say `integer` where a string arrives.
-        let properties = declared["properties"].as_object().expect("properties");
-        for (key, property) in properties {
-            let Some(value) = structured.get(key) else {
-                continue;
-            };
-            let matches = match property["type"].as_str() {
-                Some("array") => value.is_array(),
-                Some("integer") => value.is_i64() || value.is_u64(),
-                Some("string") => value.is_string(),
-                Some("boolean") => value.is_boolean(),
-                Some("object") => value.is_object(),
-                other => panic!("{tool}: unhandled declared type {other:?} for '{key}'"),
-            };
-            assert!(
-                matches,
-                "{tool}: '{key}' is declared {} and arrived as {value}",
-                property["type"]
-            );
-        }
+/// No tool advertises an `outputSchema`, because none returns structured results.
+///
+/// The two are one decision. Advertising a schema obliges the server to return structured results
+/// conforming to it — a `MUST` — so a schema left in the catalogue after `structuredContent` was
+/// dropped is a promise to any client that validates against it that cannot be kept. That is the
+/// asymmetry the old code shipped: `tools/list` took no protocol version, so every client was
+/// advertised a schema, while only some were sent the structured result it described.
+#[tokio::test]
+async fn the_catalogue_advertises_no_schema_the_server_will_not_honour() {
+    let node = two_seeded_indexes().await;
 
-        // For a client on the revision that introduced structured results, the result travels
-        // once: a text copy would be the same JSON escaped into a string, doubling every
-        // response to say nothing new, so `content` is present — it is a required array — and
-        // empty.
-        assert_eq!(
-            result["content"],
-            json!([]),
-            "{tool} carried a text copy of a result it already returned structured: {result}"
-        );
+    let listing = node
+        .rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await;
 
-        // A client that negotiated a revision predating structured results reads nothing but
-        // the text block, so for it the same call carries the serialized copy there — and no
-        // `structuredContent` field at all, because that field does not exist in its revision.
-        let envelope = node
-            .rpc_without_version(json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {"name": tool, "arguments": arguments},
-            }))
-            .await;
-        let result = &envelope["result"];
-        assert_eq!(result["isError"], json!(false), "{tool}: {envelope}");
+    for entry in listing["result"]["tools"].as_array().expect("tools") {
+        let name = entry["name"].as_str().unwrap_or("?");
         assert!(
-            result["structuredContent"].is_null(),
-            "{tool}: a pre-structuredContent client received structuredContent: {result}"
+            entry.get("outputSchema").is_none(),
+            "{name} advertises an outputSchema but results carry no structuredContent: {entry}"
         );
-        let text = result["content"][0]["text"].as_str().unwrap_or_default();
-        assert_eq!(
-            serde_json::from_str::<Value>(text).ok().as_ref(),
-            Some(structured),
-            "{tool}: a pre-structuredContent client did not get the text copy: {result}"
+        // The input side is unaffected and must stay: it is enforced on every call.
+        assert!(
+            entry["inputSchema"].is_object(),
+            "{name} lost its inputSchema: {entry}"
         );
     }
 }

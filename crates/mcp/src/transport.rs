@@ -26,10 +26,7 @@ use tracing::{debug, info};
 use crate::{
     authz::{McpAuthzRef, unrestricted},
     backend::McpBackend,
-    protocol::{
-        MCP_PROTOCOL_VERSION_HEADER, MCP_SESSION_ID_HEADER, SUPPORTED_PROTOCOL_VERSIONS,
-        supports_structured_results,
-    },
+    protocol::{MCP_PROTOCOL_VERSION_HEADER, MCP_SESSION_ID_HEADER, SUPPORTED_PROTOCOL_VERSIONS},
     rpc::{error_response, handle_rpc_request, method_of, parse_json_rpc_request},
     session::{
         McpShutdownHandle, McpTransportState, SessionAccess, SessionClaim, spawn_cleanup_task,
@@ -39,26 +36,6 @@ use crate::{
 /// The caller a request carries, or the unrestricted one if the host inserted none.
 fn caller(authz: Option<Extension<McpAuthzRef>>) -> McpAuthzRef {
     authz.map_or_else(unrestricted, |Extension(authz)| authz)
-}
-
-/// The protocol version this request carries in its `MCP-Protocol-Version` header, if any.
-fn header_protocol_version(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(MCP_PROTOCOL_VERSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-}
-
-/// Whether this request's client reads `structuredContent` on a tool result.
-///
-/// The request's own header speaks first — the spec has clients state their negotiated version
-/// on every request after `initialize`. A request without one falls back to the version its
-/// session negotiated, so a client that omits the header is still answered in the shape its
-/// revision defines. A request with neither predates both, and its tool results carry the text
-/// copy that is the only thing such a client reads.
-fn reads_structured_results(headers: &HeaderMap, session_version: Option<&str>) -> bool {
-    header_protocol_version(headers)
-        .or(session_version)
-        .is_some_and(supports_structured_results)
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,9 +97,8 @@ where
             .post(
                 |State(app_state): State<S>,
                  authz: Option<Extension<McpAuthzRef>>,
-                 headers: HeaderMap,
                  Json(payload): Json<JsonValue>| async move {
-                    process_mcp_http_message(app_state, caller(authz), headers, payload).await
+                    process_mcp_http_message(app_state, caller(authz), payload).await
                 },
             ),
         )
@@ -227,9 +203,7 @@ async fn process_mcp_message<B: McpBackend>(
             // Spawn background task to process message asynchronously
             tokio::spawn(async move {
                 let maybe_response = match parse_json_rpc_request(payload) {
-                    // The legacy HTTP+SSE transport is the 2024-11-05 revision, which predates
-                    // structured results — so its tool results always carry the text copy.
-                    Ok(request) => handle_rpc_request(app_state, request, &authz, false).await,
+                    Ok(request) => handle_rpc_request(app_state, request, &authz).await,
                     Err(err) => Some(error_response(
                         None,
                         -32600,
@@ -262,18 +236,13 @@ async fn process_mcp_message<B: McpBackend>(
 async fn process_mcp_http_message<B: McpBackend>(
     app_state: B,
     authz: McpAuthzRef,
-    headers: HeaderMap,
     payload: JsonValue,
 ) -> impl IntoResponse {
-    // No session travels on this route, so the header is the only statement of revision.
-    let structured_results = reads_structured_results(&headers, None);
     match parse_json_rpc_request(payload) {
-        Ok(request) => {
-            match handle_rpc_request(app_state, request, &authz, structured_results).await {
-                Some(response) => (StatusCode::OK, Json(response)).into_response(),
-                None => StatusCode::NO_CONTENT.into_response(),
-            }
-        }
+        Ok(request) => match handle_rpc_request(app_state, request, &authz).await {
+            Some(response) => (StatusCode::OK, Json(response)).into_response(),
+            None => StatusCode::NO_CONTENT.into_response(),
+        },
         Err(err) => (
             StatusCode::BAD_REQUEST,
             Json(error_response(
@@ -309,10 +278,9 @@ async fn process_streamable_http<B: McpBackend>(
     // with 404, which is what tells a client to start over with `initialize`. An `initialize`
     // carrying a stale id is already that fresh start, so it proceeds.
     let key_id = authz.key_id();
-    let mut session_version: Option<String> = None;
     if let Some(session_id) = session_id_of(&headers) {
         match state.claim_session(session_id, key_id.as_deref()).await {
-            SessionClaim::Granted(session) => session_version = session.protocol_version,
+            SessionClaim::Granted(_) => {}
             SessionClaim::WrongKey => return session_refusal(session_id).into_response(),
             SessionClaim::Unknown if is_initialize => {}
             SessionClaim::Unknown => return unknown_session_refusal(session_id).into_response(),
@@ -336,35 +304,25 @@ async fn process_streamable_http<B: McpBackend>(
             .into_response();
     }
 
-    let structured_results = reads_structured_results(&headers, session_version.as_deref());
     match parse_json_rpc_request(payload) {
-        Ok(request) => {
-            match handle_rpc_request(app_state, request, &authz, structured_results).await {
-                Some(response) => {
-                    if is_initialize {
-                        // Establish a session and advertise it via the MCP-Session-Id header.
-                        // The version the dispatcher just negotiated is read off the response
-                        // and remembered with the session, so later requests that omit the
-                        // version header are still answered in the shape this client's revision
-                        // defines.
-                        let negotiated = response["result"]["protocolVersion"]
-                            .as_str()
-                            .map(str::to_string);
-                        let session_id = state.create_session(key_id, negotiated).await;
-                        let mut response_headers = HeaderMap::new();
-                        if let Ok(value) = HeaderValue::from_str(&session_id) {
-                            response_headers
-                                .insert(HeaderName::from_static(MCP_SESSION_ID_HEADER), value);
-                        }
-                        (StatusCode::OK, response_headers, Json(response)).into_response()
-                    } else {
-                        (StatusCode::OK, Json(response)).into_response()
+        Ok(request) => match handle_rpc_request(app_state, request, &authz).await {
+            Some(response) => {
+                if is_initialize {
+                    // Establish a session and advertise it via the MCP-Session-Id header.
+                    let session_id = state.create_session(key_id).await;
+                    let mut response_headers = HeaderMap::new();
+                    if let Ok(value) = HeaderValue::from_str(&session_id) {
+                        response_headers
+                            .insert(HeaderName::from_static(MCP_SESSION_ID_HEADER), value);
                     }
+                    (StatusCode::OK, response_headers, Json(response)).into_response()
+                } else {
+                    (StatusCode::OK, Json(response)).into_response()
                 }
-                // No response body => JSON-RPC notification or response: 202 Accepted.
-                None => StatusCode::ACCEPTED.into_response(),
             }
-        }
+            // No response body => JSON-RPC notification or response: 202 Accepted.
+            None => StatusCode::ACCEPTED.into_response(),
+        },
         Err(err) => (
             StatusCode::BAD_REQUEST,
             Json(error_response(

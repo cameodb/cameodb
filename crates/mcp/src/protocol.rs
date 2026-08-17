@@ -35,23 +35,6 @@ pub(crate) fn negotiate_protocol_version(requested: Option<&str>) -> &'static st
     }
 }
 
-/// The first revision whose tool results travel as `structuredContent`.
-const FIRST_STRUCTURED_RESULT_VERSION: &str = "2025-06-18";
-
-/// Whether a client speaking `version` reads `structuredContent` on a tool result.
-///
-/// Decides what a successful tool result carries: a client on this revision or later gets the
-/// result once, structured; an earlier one gets the serialized copy in the text block, because
-/// that block is the only place it looks. Versions are dates in ISO form, so ordering them is
-/// comparing the strings.
-///
-/// The revision that introduced `structuredContent` is also the one that made the
-/// `MCP-Protocol-Version` header mandatory on every request after `initialize` — which is why
-/// a request carrying no version can be read as predating both.
-pub(crate) fn supports_structured_results(version: &str) -> bool {
-    version >= FIRST_STRUCTURED_RESULT_VERSION
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,14 +68,5 @@ mod tests {
     #[test]
     fn an_absent_version_falls_back_to_the_latest() {
         assert_eq!(negotiate_protocol_version(None), LATEST_PROTOCOL_VERSION);
-    }
-
-    #[test]
-    fn structured_results_start_at_the_revision_that_introduced_them() {
-        // The boundary itself, both supported revisions before it, and a hypothetical later one.
-        assert!(supports_structured_results("2025-06-18"));
-        assert!(supports_structured_results("2026-01-01"));
-        assert!(!supports_structured_results("2025-03-26"));
-        assert!(!supports_structured_results("2024-11-05"));
     }
 }

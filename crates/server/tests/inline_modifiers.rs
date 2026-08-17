@@ -143,16 +143,11 @@ max_shards_per_node = 1
         let value: Value = resp.json().await.expect("mcp json");
         let result = &value["result"];
         let is_error = result["isError"].as_bool().unwrap_or(false);
-        // A successful result arrives as `structuredContent`; only a failure has a text block,
-        // because only a failure is a message rather than data.
-        let text = if is_error {
-            result["content"][0]["text"]
-                .as_str()
-                .unwrap_or("")
-                .to_string()
-        } else {
-            serde_json::to_string(&result["structuredContent"]).unwrap_or_default()
-        };
+        // Every result travels in the text block, whether it is data or a message.
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         (is_error, text)
     }
 }

@@ -61,14 +61,11 @@ impl McpTransportState {
     /// Create a new Streamable HTTP session (no SSE push channel) and return its id.
     /// The id is a cryptographically random UUID per the MCP spec recommendation.
     ///
-    /// `protocol_version` is what `initialize` negotiated. It is remembered here because it is
-    /// a property of the session, not of each request: a client that omits the version header
-    /// on later requests is still owed answers in the shape its revision defines.
-    pub(crate) async fn create_session(
-        &self,
-        key_id: Option<String>,
-        protocol_version: Option<String>,
-    ) -> String {
+    /// The negotiated protocol version is deliberately not remembered. It decided the shape of
+    /// a tool result once, which is exactly the inference that broke: a revision says which
+    /// spec a client speaks, not which part of a result it reads. Every response now has one
+    /// shape, so nothing downstream has a version to ask about.
+    pub(crate) async fn create_session(&self, key_id: Option<String>) -> String {
         let session_id = Uuid::new_v4().to_string();
         let mut inner = self.inner.lock().await;
         inner.evict_idlest_if_full();
@@ -78,7 +75,6 @@ impl McpTransportState {
                 sender: None,
                 last_activity: std::time::Instant::now(),
                 key_id,
-                protocol_version,
             },
         );
         session_id
@@ -105,8 +101,6 @@ impl McpTransportState {
             sender: Some(tx.clone()),
             last_activity: std::time::Instant::now(),
             key_id,
-            // The legacy HTTP+SSE transport is the 2024-11-05 revision by definition.
-            protocol_version: Some("2024-11-05".to_string()),
         };
 
         let mut inner = self.inner.lock().await;
@@ -271,12 +265,6 @@ pub(crate) struct McpSession {
     /// over the stream); `None` for Streamable HTTP sessions where responses are
     /// returned inline on the POST request.
     pub(crate) sender: Option<mpsc::UnboundedSender<Event>>,
-    /// The protocol version `initialize` negotiated for this session, if one was recorded.
-    ///
-    /// What a later request falls back to when it carries no `MCP-Protocol-Version` header:
-    /// the shape of a tool result follows the revision the client speaks, and the session is
-    /// where that revision was agreed.
-    pub(crate) protocol_version: Option<String>,
     last_activity: std::time::Instant,
     /// The key that created this session, if the host identified one.
     ///
@@ -304,9 +292,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_belongs_to_the_key_that_created_it() {
         let state = McpTransportState::default();
-        let session = state
-            .create_session(Some("aabbccdd".to_string()), None)
-            .await;
+        let session = state.create_session(Some("aabbccdd".to_string())).await;
 
         assert!(matches!(
             state.claim_session(&session, Some("aabbccdd")).await,
@@ -330,9 +316,7 @@ mod tests {
     #[tokio::test]
     async fn another_key_cannot_end_someone_elses_session() {
         let state = McpTransportState::default();
-        let session = state
-            .create_session(Some("aabbccdd".to_string()), None)
-            .await;
+        let session = state.create_session(Some("aabbccdd".to_string())).await;
 
         assert_eq!(
             state.remove_session(&session, Some("11223344")).await,
@@ -358,7 +342,7 @@ mod tests {
         // Auth off: there is no key to bind to, and binding to "no key" would lock out the
         // caller that created the session.
         let state = McpTransportState::default();
-        let session = state.create_session(None, None).await;
+        let session = state.create_session(None).await;
         assert!(matches!(
             state.claim_session(&session, None).await,
             SessionClaim::Granted(_)
@@ -367,25 +351,6 @@ mod tests {
             state.claim_session(&session, Some("aabbccdd")).await,
             SessionClaim::Granted(_)
         ));
-    }
-
-    /// The version `initialize` negotiated comes back with the claimed session.
-    ///
-    /// It is what the transport falls back to when a request carries no version header: the
-    /// shape of a tool result follows the client's revision, and the session is where that
-    /// revision was agreed.
-    #[tokio::test]
-    async fn a_claimed_session_recalls_its_negotiated_version() {
-        let state = McpTransportState::default();
-        let session = state
-            .create_session(None, Some("2025-06-18".to_string()))
-            .await;
-        match state.claim_session(&session, None).await {
-            SessionClaim::Granted(session) => {
-                assert_eq!(session.protocol_version.as_deref(), Some("2025-06-18"));
-            }
-            _ => panic!("the session was not granted to its creator"),
-        }
     }
 
     /// A legacy SSE session id must not be guessable.
@@ -411,9 +376,9 @@ mod tests {
     async fn a_full_registry_evicts_rather_than_grows_or_refuses() {
         let state = McpTransportState::default();
         for _ in 0..MAX_SESSIONS {
-            state.create_session(None, None).await;
+            state.create_session(None).await;
         }
-        let newest = state.create_session(None, None).await;
+        let newest = state.create_session(None).await;
 
         let inner = state.inner.lock().await;
         assert_eq!(

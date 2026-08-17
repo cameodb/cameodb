@@ -12,8 +12,7 @@ use crate::{
         DescribeIndexArgs, GetCatalogStatsArgs, ListIndexesArgs, MAX_FEDERATED_INDEXES,
         SearchAcrossIndexesArgs, SearchIndexArgs, ValidateQueryArgs, describe_index_input_schema,
         get_catalog_stats_input_schema, list_indexes_input_schema,
-        search_across_indexes_input_schema, search_across_indexes_output_schema,
-        search_index_input_schema, search_index_output_schema, validate_query_input_schema,
+        search_across_indexes_input_schema, search_index_input_schema, validate_query_input_schema,
     },
 };
 
@@ -336,14 +335,18 @@ const CATALOG_STATS_DESCRIPTION: &str = "Totals across every CameoDB index this 
 /// `destructiveHint` and `idempotentHint` are deliberately absent. The spec scopes both to tools
 /// whose `readOnlyHint` is false, so on a read they are bytes in every catalogue listing that no
 /// client should act on. The test below requires them the moment a tool stops being a read.
+///
+/// `outputSchema` is absent for a different reason: advertising one obliges the server to return
+/// structured results conforming to it, and this server returns results as a text block only —
+/// see [`crate::rpc`] for why. A schema advertised without the structured results it describes is
+/// a promise to a client that validates it that cannot be kept, so the honest catalogue omits it.
 fn read_only_tool(
     name: &str,
     title: &str,
     description: JsonValue,
     input_schema: JsonValue,
-    output_schema: Option<JsonValue>,
 ) -> JsonValue {
-    let mut tool = json!({
+    json!({
         "name": name,
         "title": title,
         "description": description,
@@ -353,13 +356,7 @@ fn read_only_tool(
             "readOnlyHint": true,
             "openWorldHint": false
         }
-    });
-    if let Some(schema) = output_schema
-        && let Some(object) = tool.as_object_mut()
-    {
-        object.insert("outputSchema".to_string(), schema);
-    }
-    tool
+    })
 }
 
 pub(crate) fn mcp_tools(max_search_limit: usize) -> Vec<JsonValue> {
@@ -369,42 +366,36 @@ pub(crate) fn mcp_tools(max_search_limit: usize) -> Vec<JsonValue> {
             "Search Index",
             search_index_description().into(),
             search_index_input_schema(max_search_limit),
-            Some(search_index_output_schema()),
         ),
         read_only_tool(
             "search_across_indexes",
             "Federated Search",
             search_across_indexes_description().into(),
             search_across_indexes_input_schema(max_search_limit),
-            Some(search_across_indexes_output_schema()),
         ),
         read_only_tool(
             "describe_index",
             "Describe Index",
             DESCRIBE_INDEX_DESCRIPTION.into(),
             describe_index_input_schema(),
-            None,
         ),
         read_only_tool(
             "list_indexes",
             "List Indexes",
             LIST_INDEXES_DESCRIPTION.into(),
             list_indexes_input_schema(),
-            None,
         ),
         read_only_tool(
             "validate_query",
             "Validate Query",
             VALIDATE_QUERY_DESCRIPTION.into(),
             validate_query_input_schema(),
-            None,
         ),
         read_only_tool(
             "get_catalog_stats",
             "Catalog Statistics",
             CATALOG_STATS_DESCRIPTION.into(),
             get_catalog_stats_input_schema(),
-            None,
         ),
     ]
 }

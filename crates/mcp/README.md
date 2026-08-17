@@ -64,33 +64,47 @@ Bounds are advertised where they are enforced: the search tools carry a `maximum
 
 ### How a tool result arrives
 
-A successful call returns its result as `structuredContent` — already-parsed JSON, not a string to
-parse — with `content` present and empty:
+A successful call returns its result as the serialized JSON of a single text block in `content`:
 
 ```json
 {
   "result": {
-    "content": [],
-    "structuredContent": { "hits": [ ... ], "hits_returned": 2, "total_hits": 3, "limit": 2 },
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"hits\":[ ... ],\"hits_returned\":2,\"total_hits\":3,\"limit\":2}"
+      }
+    ],
     "isError": false
   }
 }
 ```
 
-The spec also permits a text copy of the result for clients predating structured results, and
-CameoDB sends one exactly to those clients. Whether a request is from one follows its
-`MCP-Protocol-Version` header: the `2025-06-18` revision introduced `structuredContent` and made
-the header mandatory after `initialize`, so a request carrying that version or later gets the
-result once, structured, with `content` empty — the copy would be the same JSON escaped into a
-string, doubling every response (measured at 1038 bytes against 520 for a two-hit search) to say
-nothing new, and an agent's context is the scarce resource. A request carrying an earlier version
-or no header, including everything on the legacy HTTP+SSE transport, gets the serialized copy in
-the text block, because that block is the only place such a client reads. `content` is present
-either way because it is a required field, so a client validating the envelope finds what it
-expects.
+**One shape, for every client.** The negotiated protocol revision does not change it, and neither
+does the `MCP-Protocol-Version` header: `2025-06-18`, `2025-03-26`, `2024-11-05` and the legacy
+HTTP+SSE transport all receive the response above.
 
-**A failure is the exception**, and keeps the text block, because a failure is a message rather
-than data:
+CameoDB does not use `structuredContent`, and advertises no `outputSchema`. Structured content is
+an optional feature, and opting into it is not free: the spec asks a tool that returns structured
+content to *also* serialize it into a text block, so a result would travel twice in every message —
+measured at 1038 bytes against 520 for a two-hit search — and an agent's context is the scarce
+resource.
+
+Sending *only* `structuredContent` is not an option either, which earlier versions learned the hard
+way. A client's revision states which spec it speaks, not which part of a result it reads, and
+several hosts negotiate `2025-06-18` while rendering `content` alone. Those clients received an
+empty array and reported that nothing matched — indistinguishable from a query that genuinely
+matched nothing. No header or capability distinguishes them (MCP's client capabilities are `roots`,
+`sampling`, `elicitation` and `experimental`), so the only channel that is always read is the one
+always populated.
+
+`outputSchema` is absent for the same reason and not separately: advertising one obliges the server
+to return conforming structured results, so a schema without them would be a promise to any client
+that validates it that could not be kept. `inputSchema` is unaffected and still enforced on every
+call.
+
+**A failure travels the same way**, with `isError` set and prose in place of the serialized result,
+because a failure is a message rather than data:
 
 ```json
 {
@@ -101,7 +115,8 @@ than data:
 }
 ```
 
-So: read `structuredContent` when `isError` is false, and `content[0].text` when it is true.
+So: read `content[0].text` either way, and let `isError` decide whether to parse it as the result
+or read it as an explanation.
 
 ### 1. `search_index`
 
