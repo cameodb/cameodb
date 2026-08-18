@@ -736,6 +736,69 @@ fn parse_exact_id_query(query: &str, schema: &IndexSchema) -> Option<(String, bo
     None
 }
 
+/// Longest token, in bytes, that `default` and `en_stem` keep.
+///
+/// Tantivy's own `default` and `en_stem` cap tokens at 40 bytes, which silently drops the long
+/// atoms this engine is routinely asked to match on — hex digests, base64 blobs, opaque keys.
+/// A dropped token is invisible: the document indexes, the field reports itself as indexed, and
+/// the term simply does not exist to be searched. Both are re-registered under their original
+/// names with this cap.
+///
+/// Deliberately a constant rather than a [`StorageConfig`] knob. The cap decides which terms
+/// exist on disk, so two shards holding the same data under different caps would answer the
+/// same query differently, and nothing in a response would say why.
+const MAX_INDEXED_TOKEN_LEN: usize = 128;
+
+/// Registers this engine's tokenizer overrides on an index.
+///
+/// A `TokenizerManager` is per-[`Index`]-instance and in-memory — nothing about it is persisted
+/// with the index — so every instance handed out must pass through here. Both constructors
+/// ([`open_tantivy_index`] and [`create_tantivy_index`]) do, and they are the only two in the
+/// workspace; an `Index` built any other way silently falls back to the 40-byte builtins and
+/// writes terms that disagree with the rest of the shard.
+fn register_tokenizers(index: &Index) {
+    use tantivy::tokenizer::{
+        Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer,
+    };
+
+    // `RemoveLongFilter` keeps tokens strictly shorter than its limit, so the limit is one past
+    // the longest token to keep. Off by one here and a digest of exactly the cap disappears.
+    let remove_long = || RemoveLongFilter::limit(MAX_INDEXED_TOKEN_LEN + 1);
+
+    // Filter order matches tantivy's own construction of these two analyzers. Term bytes are
+    // whatever the last filter emits, so a reordering here would not raise anything — it would
+    // just stop matching the terms already on disk.
+    index.tokenizers().register(
+        "default",
+        TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(remove_long())
+            .filter(LowerCaser)
+            .build(),
+    );
+    index.tokenizers().register(
+        "en_stem",
+        TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(remove_long())
+            .filter(LowerCaser) // The stemmer does not lowercase.
+            .filter(Stemmer::new(Language::English))
+            .build(),
+    );
+}
+
+/// Opens the Tantivy index at `path` with this engine's tokenizers registered.
+fn open_tantivy_index(path: &Path) -> Result<Index, StoreError> {
+    let index = Index::open_in_dir(path)?;
+    register_tokenizers(&index);
+    Ok(index)
+}
+
+/// Creates a Tantivy index at `path` with this engine's tokenizers registered.
+fn create_tantivy_index(path: &Path, schema: Schema) -> Result<Index, StoreError> {
+    let index = Index::create_in_dir(path, schema)?;
+    register_tokenizers(&index);
+    Ok(index)
+}
+
 /// The single token an analyzer produces from `text`, or None if it produces any other number.
 fn single_token(analyzer: &mut tantivy::tokenizer::TextAnalyzer, text: &str) -> Option<String> {
     use tantivy::tokenizer::TokenStream;
@@ -3451,13 +3514,13 @@ impl HybridStore {
         let open_start = Instant::now();
         let (tantivy_index, fields, sync_schema) = if index_path.join("meta.json").exists() {
             // Opening existing index: must use Field handles from the opened index's schema
-            let opened_index = Index::open_in_dir(&index_path)?;
+            let opened_index = open_tantivy_index(&index_path)?;
             let fields = Self::load_fields_from_existing_index(&opened_index)?;
             (opened_index, fields, false)
         } else {
             // Creating new index: use the schema and fields we just built
             fs::create_dir_all(&index_path)?;
-            let new_index = Index::create_in_dir(&index_path, schema)?;
+            let new_index = create_tantivy_index(&index_path, schema)?;
 
             // After creating the index, read back the actual Tantivy schema and sync it.
             // This ensures our cached schema matches exactly what Tantivy persisted.
@@ -4426,7 +4489,7 @@ impl HybridStore {
         let stored_schema = self.get_schema(index)?;
 
         if index_path.exists() {
-            let tantivy_index = Index::open_in_dir(&index_path)?;
+            let tantivy_index = open_tantivy_index(&index_path)?;
 
             // Derive schema from Tantivy (indexed fields only, excludes 'id')
             let tantivy_schema = Self::derive_index_schema_from_tantivy(&tantivy_index);
@@ -4618,7 +4681,7 @@ impl HybridStore {
         // live writer.
         let index_path = self.index_dir(index)?;
         let tantivy_schema = if index_path.join("meta.json").exists() {
-            Some(Index::open_in_dir(&index_path)?.schema())
+            Some(open_tantivy_index(&index_path)?.schema())
         } else {
             None
         };
@@ -4783,7 +4846,7 @@ impl HybridStore {
             .readers
             .entry(index.to_string())
             .or_try_insert_with(|| {
-                let tantivy_index = Index::open_in_dir(&index_path)?;
+                let tantivy_index = open_tantivy_index(&index_path)?;
 
                 // `ReloadPolicy::Manual`, deliberately. Every commit in this process goes
                 // through `commit_index`, which reloads the reader itself, so the alternative
@@ -6043,7 +6106,7 @@ impl HybridStore {
 
         // Opening reads `meta.json` for the schema; it does not take the writer lockfile, so this
         // is safe against a live writer.
-        match Index::open_in_dir(&index_path) {
+        match open_tantivy_index(&index_path) {
             Ok(opened) => opened
                 .schema()
                 .fields()
@@ -6078,7 +6141,7 @@ impl HybridStore {
             return HashSet::new();
         }
 
-        match Index::open_in_dir(&index_path) {
+        match open_tantivy_index(&index_path) {
             Ok(opened) => opened
                 .schema()
                 .fields()
@@ -6799,6 +6862,104 @@ mod tests {
             "a new searcher generation must be warmed, not skipped"
         );
         assert_eq!(third.num_docs, 2, "both documents should be searchable");
+    }
+
+    /// Both overridden analyzers must keep a token of exactly `MAX_INDEXED_TOKEN_LEN` bytes and
+    /// drop the one byte past it.
+    ///
+    /// Tantivy's builtins cap these at 40 bytes, so the lower bound fails without the override.
+    /// The upper bound is what pins `RemoveLongFilter`'s strictly-less-than limit: written
+    /// without the `+ 1`, a token of exactly the cap disappears and this test is the only thing
+    /// that says so.
+    #[test]
+    fn overridden_tokenizers_keep_tokens_up_to_the_cap() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            shard_path: temp_dir.path().to_path_buf(),
+            indexer_memory_budget: 32 * 1024 * 1024,
+            indexer_memory_min_mb: 16,
+            indexer_memory_max_mb: 256,
+            total_memory_limit_bytes: 2048 * 1024 * 1024,
+            memory_pressure_threshold_percent: 80,
+            indexer_num_threads: 1,
+            merge_num_threads: 1,
+            default_batch_size: 100_000,
+            wal_sync: true,
+        };
+
+        let store = HybridStore::new(config, 1).unwrap();
+        let index = "long_tokens";
+        let mut schema: IndexSchema = serde_json::from_value(serde_json::json!({
+            "fields": {
+                "title": {"field_type": "text", "indexed": true},
+                "body": {"field_type": "text", "indexed": true, "tokenizer": "en_stem"}
+            }
+        }))
+        .unwrap();
+        schema.normalize_after_deserialization();
+        store.store_schema_and_cache(index, &schema).unwrap();
+
+        let long_token = "a".repeat(MAX_INDEXED_TOKEN_LEN);
+        store
+            .apply_write(
+                index,
+                WalOp::Put {
+                    id: "doc-1".to_string(),
+                    json_blob: Some(serde_json::json!({ "title": long_token })),
+                },
+            )
+            .unwrap();
+        store.commit_index(index).unwrap();
+
+        store
+            .apply_write(
+                index,
+                WalOp::Put {
+                    id: "doc-2".to_string(),
+                    json_blob: Some(serde_json::json!({ "body": long_token })),
+                },
+            )
+            .unwrap();
+        store.commit_index(index).unwrap();
+
+        // One byte past the cap, in a third document, to fix where the boundary falls.
+        let over_cap = "b".repeat(MAX_INDEXED_TOKEN_LEN + 1);
+        store
+            .apply_write(
+                index,
+                WalOp::Put {
+                    id: "doc-3".to_string(),
+                    json_blob: Some(serde_json::json!({ "title": over_cap })),
+                },
+            )
+            .unwrap();
+        store.commit_index(index).unwrap();
+
+        let outcome = store
+            .search_documents(index, &format!("title:{long_token}"), 10, None)
+            .unwrap();
+        assert_eq!(
+            outcome.total_hits, 1,
+            "a {MAX_INDEXED_TOKEN_LEN}-byte token must be indexed and searchable"
+        );
+
+        // Same bound through the stemming tokenizer. Index-time and query-time analysis both
+        // resolve `en_stem` from this index, so the two stay symmetric by construction.
+        let stemmed = store
+            .search_documents(index, &format!("body:{long_token}"), 10, None)
+            .unwrap();
+        assert_eq!(
+            stemmed.total_hits, 1,
+            "en_stem must also keep {MAX_INDEXED_TOKEN_LEN}-byte tokens"
+        );
+
+        let dropped = store
+            .search_documents(index, &format!("title:{over_cap}"), 10, None)
+            .unwrap();
+        assert_eq!(
+            dropped.total_hits, 0,
+            "a token past the cap is dropped at index time, so nothing matches it"
+        );
     }
 
     /// A traversal index name must not create or remove anything outside the
