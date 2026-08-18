@@ -6769,11 +6769,14 @@ impl NodeOrchestrator {
 
         let mut errors = Vec::new();
 
-        // Writer threads must exit before storage shutdown to release IndexWriter locks
-        for (shard_id, shard) in self.shards.iter_mut() {
+        // Stop writer threads concurrently so they release their IndexWriter locks before
+        // storage shutdown. Each wait is bounded by `writer_shutdown_timeout_secs`; running
+        // them in parallel caps this phase at one timeout rather than the sum across shards.
+        join_all(self.shards.iter_mut().map(|(shard_id, shard)| {
             tracing::debug!(shard_id = %shard_id, "Shutting down shard writer thread");
-            shard.shutdown_writer().await;
-        }
+            shard.shutdown_writer()
+        }))
+        .await;
 
         // Parallel storage shutdown with per-shard 30s timeout
         let mut shard_ids = Vec::new();
