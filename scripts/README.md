@@ -364,6 +364,79 @@ Scripts respect these environment variables when available:
 - Verify Rust installation: `cargo --version`
 - Check dependencies: `cargo check --workspace`
 
+### Configuring Memory Limits for systemd
+
+CameoDB has proactive memory budgets (per-shard writer caps, cache sizing from
+`total_memory_limit_mb`, admission control via bounded worker semaphores) but no reactive
+runtime OOM defense — nothing polls RSS and sheds load when usage climbs. Without a
+systemd-level ceiling, a memory spike (bulk indexing on a many-shard node, a merge storm,
+or a burst of large queries) grows the process until the kernel OOM killer sends SIGKILL,
+which skips WAL drain and clean shutdown. The packaged unit
+(`/usr/lib/systemd/system/cameodb.service` on RPM distros, `/lib/systemd/system/` on DEB)
+ships without `MemoryHigh`/`MemoryMax` for that reason — add them per-host.
+
+**Production unit for a memory-boxed deployment** (edit the installed unit, or prefer a
+drop-in via `sudo systemctl edit cameodb.service` so package upgrades don't clobber it):
+
+```ini
+[Unit]
+Description=CameoDB Database Server
+After=network.target
+
+[Service]
+Type=simple
+MemoryHigh=140G
+MemoryMax=160G
+Environment=MALLOC_CONF=background_thread:true,percpu_arena:percpu,oversize_threshold:0,dirty_decay_ms:1000,muzzy_decay_ms:0
+ExecStartPre=/usr/local/bin/cameodb check-config --config /etc/cameodb/cameodb.toml
+ExecStart=/usr/local/bin/cameodb --config /etc/cameodb/cameodb.toml
+Restart=on-failure
+User=cameodb
+Group=cameodb
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**What each line does:**
+- `MemoryHigh=140G` — cgroup throttle: the kernel reclaims pages rather than killing.
+  First line of defense; set to the steady-state RSS you expect from the `[search]` budgets.
+- `MemoryMax=160G` — hard ceiling. systemd sends **SIGTERM** (graceful drain, WAL flush,
+  clean restart) instead of the kernel's SIGKILL. Set above `MemoryHigh` to leave a
+  throttle band before the kill.
+- `dirty_decay_ms:1000` (down from the default 2000) — returns dirty jemalloc pages to the
+  OS faster. Matters on hosts with many cores: `percpu_arena:percpu` creates one arena per
+  CPU, and each retains dirty pages for `dirty_decay_ms`. On a 64-core box the default
+  2000 ms can retain 10-20 GB across arenas during bulk indexing.
+- `ExecStartPre=... check-config` — refuses to start in a posture the config does not
+  satisfy, before the port opens. Do not drop this when editing the unit.
+
+**Sizing guidance.** `MemoryHigh` should sit above the process's expected steady-state RSS
+but below physical RAM minus OS/page-cache headroom. With 16 shards at
+`indexer_memory_max_mb = 2048` and `total_memory_limit_mb = 96000`, steady-state during
+bulk load is ~70-90 GB; `MemoryHigh=140G` / `MemoryMax=160G` on a 187 GB host leaves
+headroom for spikes, page cache, and the OS. With 0 swap, there is no cushion — the
+ceiling is the only thing between a spike and SIGKILL.
+
+**Apply and verify:**
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart cameodb
+systemctl show cameodb.service -p MemoryHigh -p MemoryMax -p ExecStartPre
+```
+`MemoryHigh` should report `150323855360` (140 GiB in bytes) and `MemoryMax`
+`171798691840` (160 GiB). If either shows `infinity`, the drop-in did not apply — check
+`systemctl status cameodb` for parse errors.
+
+**Watch after restart** (during the next bulk load):
+- `GET /_admin/memory` — `process.vm_rss_kb` and `jemalloc.resident` should plateau
+  around the sized steady state, not climb toward `MemoryMax`.
+- `GET /_admin/workers` — `in_flight` vs `in_flight_capacity` per worker. At-capacity
+  `in_flight` means the writer is the bottleneck (expected during bulk); deep
+  `queue_depth` beside low `in_flight` means the semaphore is too tight.
+
 ### Getting Help
 - Run `./scripts/setup/dev-info.sh` for project overview
 - Check individual script headers for usage examples
