@@ -130,6 +130,7 @@ This document outlines the current development priorities and optimization roadm
 - 🎯 **Phase 13 (Thread-Per-Core & Memory Ops)**: Stages 1, 2a, 2b, 2c, 2d, 2e completed; Stage 2f partially done (merge thread count control implemented via `IndexWriterOptions`; core pinning and per-arena stats planned). Shard placement reworked 2026-08-08: dense ordinals replace `xxh3(shard_id) % n` on both the dispatch and writer-pinning sides, and a single `CoreLayout` reconciles `get_core_ids()` with `available_parallelism()`. `/_admin/workers` reports the pin outcome per worker and per shard, not the request. **Verified on Linux (aarch64 container, 8 cores) 2026-08-08: 8/8 workers pinned to their target cores and all four writer threads to cores 0–3, confirmed independently against `Cpus_allowed_list` in `/proc/<pid>/task/*/status` — one CPU per worker thread, one per writer, no collisions.** Pinning is a no-op on macOS, so it must be validated on Linux; the whole suite passes there too. **Measured 2026-08-09 and re-measured 2026-08-10 (see "Worker concurrency, measured"): Stages 2d and 2e cost throughput rather than gaining it, and both flags stay off. The first diagnosis blamed the per-worker serial loop from Stage 2; that loop is gone as of 2026-08-10 and the flags still lose, so the cause is the affine constraint itself — a shard's jobs may only run on one worker, and skew leaves workers idle.**
 - 🔒 **Phase 14 (Security Hardening)**: A1–A5, B2, B3 completed and verified by `scripts/validate/`; posture presets added (`local` / `internal` / `external`); B1 (authentication) complete, landed 2026-08-08 — steps 1–5 plus hardening (6a) and documentation (6b): credential model, `keygen`, `[security]` config, enforcement at the HTTP/MCP ingress with capability and index scoping (so `external` can now start), `--api-key` / `--api-key-file` / `CAMEODB_API_KEY` on the bundled client, index list filtering, and MCP per-tool authorization with sessions bound to their key. C1 (MCP rate limiting) completed 2026-08-10 and C2 (audit trail) completed 2026-08-10 — `[security.limits]` and `[security.audit]`, both off by default, with `GET /_admin/audit` for reading the trail back. **C3 is the only stage still open**, and it shrank because B1 absorbed index scoping
 - 🎯 **Phase 15 (HA — Reindex, Replication & Migration)**: Scoped 2026-08-15 as enterprise work. It absorbs the index-rebuild item that was briefly filed as the MCP track's step 8 — engine work, not MCP work, and nothing in the track depends on it
+- 🎯 **Phase 16 (Boot & OOM Recovery at Scale)**: Analysed 2026-08-18 after a report of multi-minute recovery on a 30 TB / 16-shard node. The cost is cameodb's own WAL-replay bridge between redb and Tantivy, not either engine's recovery (both are near-zero individually). Six hot points identified and six stages proposed, ordered by cost-per-impact; Stage 1 (backfill `_recovery_meta`) is the highest-leverage and cheapest
 
 ### **Recommended Next Steps**
 
@@ -1460,3 +1461,250 @@ was briefly filed under — nothing here is surfaced by an MCP tool, and none of
 nothing from stages 2 and 3, and stage 1 has a documented workaround (declare fields up front,
 or `delete_index_data(delete_schema = false)` and re-ingest) that item 6 of the MCP track is
 responsible for teaching.
+
+---
+
+## Phase 16: Boot & OOM Recovery at Scale 🎯 PLANNED
+
+**Objective**: Bring OOM-kill recovery time on a 30 TB dataset spread across 16 shards down
+to the near-zero the underlying engines individually promise. Analysed 2026-08-18 after a
+report of multi-minute recovery on exactly that shape; the analysis follows, then the work.
+
+**Audience**: any deployment large enough that the WAL tail between Tantivy commits can grow
+past a few thousand entries per index before the supervisor idle timeout fires. The 30 TB /
+16-shard report is the case that surfaced it; the fixes are bounded by data volume rather than
+shard count, so a single very large shard hits the same wall.
+
+### Why this is a cameodb problem, not a redb or Tantivy one
+
+The redb and Tantivy recovery models each describe a *single-engine* boot:
+
+- **redb** uses shadow paging / copy-on-write. Uncommitted transactions are discarded by
+  pointing back at the last immutable commit root, so an unclean restart takes ~0 extra
+  seconds and scales with file-open latency, not transaction-log size. Verified in this
+  codebase: `HybridStore::new` calls `builder.open(&kv_path)` and nothing more — there is no
+  replay loop at the redb layer.
+- **Tantivy** keeps immutable segments on disk and memory-maps them, so boot has no warm-up
+  phase that parses data back into a managed heap. Uncommitted indexing queue work is lost on
+  OOM, safely reverting to the last `.commit()`. Verified: `open_tantivy_index` is
+  `Index::open_in_dir` plus tokenizer registration.
+
+cameodb does not treat Tantivy's commit as the durability boundary. It writes every op into
+its **own WAL** stored inside redb tables (`wal_<index>`), alongside a `data_<index>` table
+holding the full document, and batches Tantivy commits behind a threshold plus a supervisor
+idle timeout. The two commits — redb (WAL + data, `Durability::Immediate`) and Tantivy
+(index segment + fsync) — are **not atomic**. On OOM, redb has durable WAL entries that
+Tantivy never indexed, so **replay is required**, and that replay is the entire recovery
+cost. Neither library documents this pattern because neither was designed to be
+cross-synchronised with the other; the bridge is cameodb's.
+
+### Hot points, in boot order
+
+#### HP1 — `get_highest_indexed_seq` fallback: full TopDocs scan on huge indices
+
+When `get_persisted_committed_seq` returns `None` (no `_recovery_meta` entry — first boot
+after the feature shipped, or any index that has never had a successful `commit_index` since
+it landed), `recover_index` falls back to `get_highest_indexed_seq`, which runs
+`TopDocs::with_limit(1).order_by_u64_field("_seq", Order::Desc)` against `AllQuery`. On a
+~1.9 TB-per-shard index this is a fast-field scan across every segment — O(segments × docs)
+even though it returns one document. With many indices in this state, Phase 1 becomes a
+sequence of full-index searches before any replay starts.
+
+#### HP2 — Phase 1 opens a full `IndexWriter` per non-synced index, 16 shards concurrently
+
+`recover_indices` → `get_or_create_index` for every non-synced index. Each call opens the
+Tantivy index, creates an `IndexWriter` with `num_worker_threads` + `num_merge_threads` OS
+threads and `memory_budget_per_thread × num_worker_threads` of arena memory, then runs
+`recover_index`. For a "very large" index (>8 GB) `get_optimal_memory_budget` returns
+`max_budget_bytes` (up to 512 MB). Parallelism *within* a shard is capped at
+`available_parallelism()`, but **16 shards run their `recover_indices` concurrently** — each
+in its own `spawn_blocking`, fired from `MicroshardActor::start` without awaiting — so the
+node holds `16 × cores` IndexWriters, thread pools and arenas at once. On the same 30 TB
+dataset that just OOM'd, this is a strong candidate for re-triggering OOM during recovery.
+
+#### HP3 — Phase 2 warmup: `warm_segment` page-fault storm on every index
+
+Phase 2 walks **every** index (synced or not), sorted smallest-first, and for each calls
+`warm_segment` on every `SegmentReader`, forcing `segment_reader.inverted_index(field)` for
+every indexed field — building and caching term dictionaries. For a 1.9 TB shard this faults
+in a large mmap region. It runs on a single thread per shard (`warmup-shard-<id>`),
+sequentially across that shard's indices, so 16 threads × sequential huge-index warming is
+sustained random IO across the fleet for a long time.
+
+#### HP4 — WAL replay segment storm → post-recovery merge storm
+
+`recovery_commit_threshold` is `max(default_batch_size × 10, 25_000)`. Each threshold commit
+during replay seals a new Tantivy segment plus an fsync. If the OOM happened during a bulk
+import or high-throughput window, the WAL tail per index can be large (bounded by
+`should_commit_writer`, up to ~20× `default_batch_size`). Replaying 20k ops at a 25k
+threshold produces ~1 segment, but across many indices × 16 shards this yields hundreds of
+small segments → a Tantivy merge thread storm after recovery → slow queries and more memory
+pressure, exactly when the node is most fragile.
+
+#### HP5 — First-request inline recovery
+
+`MicroshardActor::start` does not await `recover_indices`, so a shard becomes routable while
+its background recovery is still running. The **first write** to an index that background
+recovery has not reached yet calls `get_or_create_index` → `recover_index` **synchronously
+on the writer thread**, blocking it for the full replay duration. The first read to an
+unwarm index opens a cold Tantivy reader via `get_reader`. "Routable" therefore does not
+mean "fast" — real traffic pays the recovery cost inline, and a write to a large un-recovered
+index can stall the writer thread for minutes.
+
+#### HP6 — `is_index_fully_synced` metadata churn
+
+For every index, `recover_indices` calls `is_index_fully_synced`, which opens two redb
+tables (`_recovery_meta` and `wal_<index>`) in separate read transactions. Metadata-only,
+but at scale (many indices × 16 shards) it is a long tail of small redb operations on a
+single `Database` per shard. Not the dominant cost, but it contributes.
+
+### Proposed work, ordered by cost-per-impact
+
+Each item is independently shippable. The first three are the cheapest and address the
+largest measured costs; the rest are bounded by data volume and matter most at the 30 TB
+shape.
+
+#### Stage 1 — Backfill `_recovery_meta` for existing indices (kills HP1)
+
+One-time migration at `HybridStore::new` time (or a separate `cameodb migrate` command): for
+each index with no `_recovery_meta` entry, run `get_highest_indexed_seq` **once, offline,
+with progress logging**, then write the result to `_recovery_meta`. After migration the
+`None` fallback path is dead code for existing data. Going forward,
+`persist_committed_seq` is already called on every `commit_index` via `checkpoint_committed`,
+so the entry stays current. This turns the O(segments × docs) scan into a one-time cost
+instead of a per-boot cost — the single highest-leverage change in this phase.
+
+- **Risk**: Low. Migration is idempotent and runs once.
+- **LOC**: ~80 (migration walker + progress logging + a `migrate` subcommand wiring)
+- **Prerequisite**: None
+- **Verification**: a node with N pre-feature indices boots and logs one
+  `migrated N indices to _recovery_meta` line; subsequent boots skip the Tantivy fallback
+  entirely (asserted by log inspection).
+
+#### Stage 2 — Bound recovery memory globally; skip writer creation for synced indices (kills HP2)
+
+Two changes, both in `recover_indices` and `get_or_create_index`:
+
+1. **Global semaphore across all shards' recovery tasks**, capping concurrent `IndexWriter`
+   creations at `min(cores, 4)` total rather than `16 × cores`. The per-shard semaphore in
+   `hydrate_existing_shards` already bounds *shard open* concurrency, but each shard's
+   `recover_indices` then fans out across its own cores with no awareness of the other 15.
+2. **Make `get_optimal_memory_budget` aware of `total_shards`** (today only
+   `calculate_cache_size` is). During recovery, cap per-index writer budget at
+   `max_budget / total_shards` so 16 × 512 MB = 8 GB of writer arenas alone cannot happen.
+
+- **Risk**: Medium. Changes the memory envelope during boot; needs the latency harness to
+  confirm recovery time drops without a steady-state throughput regression.
+- **LOC**: ~120 (semaphore plumbing + budget cap + config)
+- **Prerequisite**: Stage 1 (so the budget cap applies only to indices that actually need
+  replay, not to all indices)
+- **Verification**: recovery on a 16-shard node stays under the configured memory limit;
+  `/_admin/memory` during boot shows bounded RSS.
+
+#### Stage 3 — Make Phase 2 warmup lazy and bounded (kills HP3)
+
+Stop warming every index at boot. Three options, in increasing intrusiveness:
+
+1. **Time-budget Phase 2**: warm for a configurable window per shard (default 60s), then
+   stop. Remaining indices warm on demand via the existing `warm_index` on-access path,
+   which is already correct.
+2. **Hot-set warmup**: track a persistent "recently queried/written" index set and warm only
+   those at boot. Cold indices warm on first access.
+3. **Field-scoped warming**: for very large indices, warm only the `id` field (needed for
+   delete-term and exact-match) plus a configurable "hot fields" set, rather than every
+   indexed field.
+
+Option 1 is the cheapest and is recommended as the first cut; options 2 and 3 are
+follow-ons if 1 is insufficient at 30 TB.
+
+- **Risk**: Low (option 1) to Medium (option 3, which changes what "warm" means).
+- **LOC**: ~40 (option 1) / ~150 (option 2) / ~90 (option 3)
+- **Prerequisite**: None
+- **Verification**: boot-to-first-query latency drops; first-query latency for an unwarm
+  index is no worse than today's cold cost (asserted by the bench harness).
+
+#### Stage 4 — Reduce WAL tail and replay segment storm (kills HP4)
+
+Two complementary changes:
+
+1. **Raise `recovery_commit_threshold` during replay** to produce fewer, larger segments —
+   or, when the WAL tail fits in the writer's memory arena, replay it all into the buffer
+   and do a single final commit (the post-replay path already avoids committing
+   immediately; extend that to skip mid-replay commits when the buffer has room).
+2. **Add a max-WAL-size commit trigger** in steady state: commit if `wal_<index>` entries
+   exceed N regardless of the operation-count threshold, so a bursty writer cannot
+   accumulate a huge tail before `should_commit_writer` fires. Bounds the worst-case replay
+   at crash time.
+
+- **Risk**: Medium. The max-WAL trigger changes steady-state commit cadence; needs the
+  mixed read/write harness to confirm no regression.
+- **LOC**: ~70
+- **Prerequisite**: None
+- **Verification**: a forced OOM during a bulk import produces ≤ a handful of new segments
+  per index on restart, not hundreds; merge-thread count during recovery stays bounded.
+
+#### Stage 5 — Don't block first requests on recovery (kills HP5)
+
+For the **write** path: if background recovery has not reached an index yet, queue the write
+behind the recovery task for that index rather than running `recover_index` inline on the
+writer thread. Either publish a "recovered index" set that `apply_write` checks, or trigger
+recovery on a background pool and return a retryable "warming" response for writes to
+unrecovered indices. The read path already does not run WAL replay, so reads are correct but
+cold — Phase 2 warming (Stage 3) handles their latency.
+
+- **Risk**: Medium. Changes the write-path contract for the cold-start window; the
+  "retryable warming" response needs client-side handling or a short internal await.
+- **LOC**: ~110
+- **Prerequisite**: Stage 2 (so the background pool's concurrency is bounded)
+- **Verification**: a write to an un-recovered large index does not stall the writer thread
+  for the replay duration; the write either queues or returns a retryable status, never
+  blocks inline.
+
+#### Stage 6 — Batch the `is_index_fully_synced` check (kills HP6)
+
+Read the entire `_recovery_meta` table in one transaction (it is small — one row per index)
+and the `max_wal_id` for all `wal_<index>` tables in a single pass, then partition in memory.
+Today each index opens its own read transaction plus two table opens; at scale this is a long
+tail of small redb operations.
+
+- **Risk**: Low. Pure refactor of the partitioning loop.
+- **LOC**: ~50
+- **Prerequisite**: None
+- **Verification**: Phase 1 partitioning time drops with index count; no behavioural change
+  (asserted by the existing recovery tests).
+
+### Execution order & risk matrix
+
+| Order | Stage | Risk | LOC | Prerequisite | Gain |
+|-------|-------|------|-----|--------------|------|
+| **1** | Backfill `_recovery_meta` | Low | ~80 | None | Eliminates the O(segments×docs) Tantivy scan at boot |
+| **2** | Bound recovery memory globally | Medium | ~120 | Stage 1 | Prevents recovery-time OOM re-trigger on 16-shard nodes |
+| **3** | Lazy / bounded Phase 2 warmup | Low–Medium | ~40–150 | None | Cuts the post-recovery IO storm; boot-to-query drops |
+| **4** | Reduce WAL tail / segment storm | Medium | ~70 | None | Bounds post-recovery merge pressure |
+| **5** | Don't block first requests on recovery | Medium | ~110 | Stage 2 | Writer thread no longer hijacked by inline replay |
+| **6** | Batch `is_index_fully_synced` | Low | ~50 | None | Removes metadata-churn tail |
+
+### Success metrics
+
+- OOM-kill recovery time on a 30 TB / 16-shard node drops from "multi-minute" to **under
+  60 seconds for a clean WAL tail**, bounded by the size of the un-replayed tail rather than
+  by total corpus size.
+- Recovery does not re-trigger OOM on the same dataset that just OOM'd: peak RSS during boot
+  stays under the configured `total_memory_limit_mb`.
+- First-write latency to any index during the recovery window is bounded by the queue depth,
+  not by the replay duration of that index.
+- No steady-state throughput regression: the `cameodb-bench` mixed read/write arm at c16
+  matches the figures in "Mixed read/write load, measured" within run-to-run spread.
+
+### Non-goals, recorded so they are not re-litigated
+
+- **Removing the cameodb WAL.** It is the correctness boundary that makes the dual-engine
+  design safe: redb is the source of truth, Tantivy is a derived, eventually-consistent
+  search index. The work above makes the replay bounded, lazy and memory-safe, not absent.
+- **Atomic redb + Tantivy commit.** A two-phase commit across the engines would eliminate
+  the WAL tail entirely but pays a per-write fsync on both engines — the opposite of the
+  batching design that gives cameodb its write throughput. The WAL + checkpoint model is the
+  right trade; this phase makes its worst case cheap.
+- **Changing Tantivy's `ReloadPolicy::Manual`.** The manual reload is deliberate (no
+  per-index meta-file watcher thread, no cache-discarding redundant reloads) and is not the
+  cause of slow recovery. Phase 2 warming is the lever, not the reload policy.
