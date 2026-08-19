@@ -1418,6 +1418,16 @@ pub struct UpdateTopology {
 #[derive(Debug, Clone)]
 pub struct ShutdownAllShards;
 
+/// Message to shut down the dedicated read thread pool and wait for it.
+///
+/// Separate from [`ShutdownAllShards`] because the pool has to outlive the shards: their
+/// shutdown runs on it. Send this once that has returned.
+#[derive(Debug, Clone)]
+pub struct ShutdownReadRuntime {
+    /// How long to wait for in-flight reads before abandoning the threads.
+    pub timeout: Duration,
+}
+
 /// Commands sent to the dedicated writer thread via `tokio::sync::mpsc` channel.
 /// The writer thread calls blocking storage methods (`apply_write`, `apply_batch`)
 /// and sends results back via oneshot reply channels.
@@ -8474,12 +8484,60 @@ impl Message<ShutdownAllShards> for NodeOrchestrator {
     }
 }
 
-// Implement Drop to ensure read_runtime is properly shut down when NodeOrchestrator is destroyed.
-// This prevents resource leaks by cleaning up the dedicated read thread pool.
+impl Message<ShutdownReadRuntime> for NodeOrchestrator {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: ShutdownReadRuntime,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let Some(read_runtime) = self.read_runtime.take() else {
+            return;
+        };
+
+        // Only this actor holds the `Arc` — the shards and the worker pool were given
+        // `Handle` clones, which do not own the runtime. A surviving reference therefore
+        // means something outlived the shards, and there is nobody left to wait on it.
+        let runtime = match Arc::try_unwrap(read_runtime) {
+            Ok(runtime) => runtime,
+            Err(arc) => {
+                warn!(
+                    strong_count = Arc::strong_count(&arc),
+                    "Read runtime still referenced; abandoning its threads instead of waiting"
+                );
+                return;
+            }
+        };
+
+        info!("NodeOrchestrator: Shutting down dedicated read runtime");
+        let started = std::time::Instant::now();
+
+        // `shutdown_timeout` parks the calling thread until the reads finish, which is not
+        // allowed on a runtime worker — hence `spawn_blocking`. Its own timeout is the bound;
+        // the join below only reports what it did.
+        let timeout = msg.timeout;
+        let joined = tokio::task::spawn_blocking(move || runtime.shutdown_timeout(timeout)).await;
+
+        match joined {
+            Ok(()) => info!(
+                elapsed_ms = started.elapsed().as_millis(),
+                "Read runtime shut down"
+            ),
+            Err(e) => warn!(error = %e, "Read runtime shutdown task failed"),
+        }
+    }
+}
+
+// Fallback for the paths that never send `ShutdownReadRuntime` — a panic, or an emergency
+// exit. A graceful shutdown takes it first, leaving nothing here to do.
+//
+// `Drop` cannot wait: it may run on a runtime worker, where blocking is not allowed, so this
+// can only detach the threads. That is why the waiting version is a message.
 impl Drop for NodeOrchestrator {
     fn drop(&mut self) {
         if let Some(read_runtime) = self.read_runtime.take() {
-            tracing::info!("NodeOrchestrator: Shutting down dedicated read runtime");
+            tracing::info!("NodeOrchestrator: Shutting down dedicated read runtime (unwaited)");
             // Try to unwrap the Arc to get exclusive ownership.
             // If there are other Arc clones (held by shards), we can't force shutdown.
             // In that case, the runtime will be cleaned up when the last Arc is dropped.

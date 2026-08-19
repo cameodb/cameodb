@@ -87,7 +87,7 @@ const VNODE_COUNT: usize = 256;
 /// // Different UUIDs will have different tokens
 /// assert_ne!(identity.vnode_tokens, identity2.vnode_tokens);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeIdentity {
     /// Unique identifier for this node (UUID v4)
     pub uuid: Uuid,
@@ -191,14 +191,61 @@ impl NodeIdentity {
         }
     }
 
-    /// Save the identity to disk.
+    /// Save the identity to disk, atomically and owner-only.
+    ///
+    /// This file holds the node's libp2p private key, and the node's UUID is derived from it.
+    /// A torn write therefore costs more than the file: the next boot cannot parse it,
+    /// generates a fresh keypair, and comes up under a new UUID that the persisted shard
+    /// assignments no longer name. Hence temp-file-and-rename, and `0o600` rather than
+    /// whatever the umask allows for a private key.
     pub fn save(&self, path: &std::path::Path) -> Result<(), IdentityError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = File::create(path)?;
-        serde_json::to_writer_pretty(file, self)?;
+
+        // Alongside the target: across a mount boundary the rename would fail, not be atomic.
+        let tmp_path = path.with_extension("json.tmp");
+
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        // Scoped so the handle closes before the rename.
+        {
+            let mut file = options.open(&tmp_path)?;
+            serde_json::to_writer_pretty(&mut file, self)?;
+            // Before the rename, or it can land with the contents still in the page cache.
+            file.sync_all()?;
+        }
+
+        // `mode` only applies when the open creates the file, so a reused temp file could
+        // still carry a wider one.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+        }
+
+        fs::rename(&tmp_path, path)?;
         Ok(())
+    }
+
+    /// Whether the identity already on disk at `path` is exactly this one.
+    ///
+    /// Lets a caller skip a [`Self::save`] that would rewrite the key file with identical
+    /// bytes. Unreadable or unparseable reports `false`, since that file wants overwriting.
+    pub fn matches_stored(&self, path: &std::path::Path) -> bool {
+        match fs::read_to_string(path) {
+            Ok(data) => match serde_json::from_str::<NodeIdentity>(&data) {
+                Ok(stored) => &stored == self,
+                Err(_) => false,
+            },
+            Err(_) => false,
+        }
     }
 
     /// Returns Ok(identity) if found, otherwise Err.

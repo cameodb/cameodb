@@ -182,6 +182,50 @@ fn resolve_profile(config: &CameoDbConfig) -> Result<(Profile, bool), String> {
     }
 }
 
+/// Outcome for the `node_key` check: the mode on the node's libp2p private key.
+///
+/// A missing file is a `Pass` — on a first boot the node has not written it yet.
+fn node_key_outcome(config: &CameoDbConfig, profile: Profile) -> Outcome {
+    let Some(path) = config.storage.primary_path() else {
+        return Outcome::Pass("no data path configured".to_string());
+    };
+    let key_path = path.join("node_identity.json");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(&key_path) {
+            Ok(meta) => {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 == 0 {
+                    Outcome::Pass(format!("node_identity.json is {:04o} (owner only)", mode))
+                } else if profile == Profile::Local {
+                    Outcome::Warn(format!(
+                        "node_identity.json is {:04o}; the node's private key is readable by \
+                         other local accounts. chmod 600 {}",
+                        mode,
+                        key_path.display()
+                    ))
+                } else {
+                    Outcome::Warn(format!(
+                        "node_identity.json is {:04o}; this key is the node's cluster identity \
+                         and is readable beyond its owner. chmod 600 {}",
+                        mode,
+                        key_path.display()
+                    ))
+                }
+            }
+            Err(_) => Outcome::Pass("no node identity written yet".to_string()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (key_path, profile);
+        Outcome::Pass("permission check not available on this platform".to_string())
+    }
+}
+
 /// Evaluate every posture rule for this config.
 pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
     let (profile, inferred) = resolve_profile(config)?;
@@ -333,6 +377,12 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
             )),
         },
     );
+
+    // --- Node key file ----------------------------------------------------------
+    // `node_identity.json` holds the libp2p private key: the node's cluster identity, and
+    // what its UUID is derived from. Never a `Fail` — the file may be managed by an
+    // orchestrator, so this warns like `warn_if_psk_file_is_readable_by_others` does.
+    push("node_key", node_key_outcome(config, profile));
 
     // --- Authentication ---------------------------------------------------------
     push(
@@ -529,6 +579,57 @@ mod tests {
         assert!(failed.contains(&"tls"), "{:?}", failed);
         assert!(failed.contains(&"admin_api"), "{:?}", failed);
         assert!(failed.contains(&"auth"), "{:?}", failed);
+    }
+
+    /// The `node_key` outcome for a config whose data path holds a key file at `mode`, with
+    /// that directory for the caller to clean up.
+    #[cfg(unix)]
+    fn node_key_outcome_for(mode: Option<u32>) -> (Outcome, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir()
+            .join("cameodb_tests")
+            .join("posture_node_key")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+
+        if let Some(mode) = mode {
+            let key = dir.join("node_identity.json");
+            std::fs::write(&key, "{}").unwrap();
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        let mut c = config_for(Some(Profile::Local), "127.0.0.1");
+        c.storage.data_paths = vec![dir.clone()];
+
+        let outcome = evaluate(&c)
+            .unwrap()
+            .checks
+            .into_iter()
+            .find(|c| c.rule == "node_key")
+            .unwrap()
+            .outcome;
+        (outcome, dir)
+    }
+
+    /// A key left at the umask's `0644` is what this check exists for — the case an all-green
+    /// banner used to pass over in silence.
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_node_key_is_reported_and_an_owner_only_one_passes() {
+        let (loose, dir) = node_key_outcome_for(Some(0o644));
+        assert!(matches!(loose, Outcome::Warn(_)), "{:?}", loose);
+        assert!(loose.message().contains("chmod 600"), "{:?}", loose);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (tight, dir) = node_key_outcome_for(Some(0o600));
+        assert!(matches!(tight, Outcome::Pass(_)), "{:?}", tight);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A first boot has not written the file yet, and is about to write it at 0600.
+        let (absent, dir) = node_key_outcome_for(None);
+        assert!(matches!(absent, Outcome::Pass(_)), "{:?}", absent);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The `auth` outcome for a config, by rule name.

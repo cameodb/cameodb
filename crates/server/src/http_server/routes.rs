@@ -86,10 +86,12 @@ pub fn create_router(
         }
     });
 
-    // Build the CORS layer from config. `CameoDbConfig::validate` has already
-    // rejected empty lists, "*" mixed with specific origins, and origins that
-    // are not valid header values, so the parse below cannot silently drop an
-    // entry and leave a deny-all policy behind.
+    // Build the CORS layer from config. `CameoDbConfig::validate` has already rejected "*"
+    // mixed with specific origins, and origins that are not valid header values, so the parse
+    // below cannot silently drop an entry and turn a configured allow-list into deny-all.
+    //
+    // An empty list is not rejected there — it is the default, and deny-all is what it means.
+    // CORS governs browsers only, so no API or MCP client is affected.
     let cors_layer = if cors_allowed_origins.iter().any(|o| o == "*") {
         warn!("CORS: allowing any origin (cors_allowed_origins = [\"*\"])");
         CorsLayer::permissive()
@@ -98,7 +100,11 @@ pub fn create_router(
             .iter()
             .filter_map(|o| o.parse::<HeaderValue>().ok())
             .collect();
-        info!(origins = ?cors_allowed_origins, "CORS: restricting to configured origins");
+        if origins.is_empty() {
+            info!("CORS: no origins configured; browsers get no cross-origin access");
+        } else {
+            info!(origins = ?cors_allowed_origins, "CORS: restricting to configured origins");
+        }
         CorsLayer::new()
             .allow_origin(origins)
             .allow_methods([

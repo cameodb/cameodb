@@ -593,6 +593,22 @@ async fn create_production_swarm(
     })
 }
 
+/// Whether the identity file is already owner-only. A missing file reports `true` — there is
+/// nothing to tighten, and the content check decides that case.
+#[cfg(unix)]
+fn identity_file_is_owner_only(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.permissions().mode() & 0o077 == 0,
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn identity_file_is_owner_only(_path: &Path) -> bool {
+    true
+}
+
 /// Load existing keypair from node_identity.json or generate a new one
 pub fn load_or_generate_keypair(storage_path: &Path) -> Result<(Keypair, NodeIdentity)> {
     let identity_path = storage_path.join("node_identity.json");
@@ -645,8 +661,20 @@ pub fn load_or_generate_keypair(storage_path: &Path) -> Result<(Keypair, NodeIde
         identity.keypair = Some(bytes);
     }
 
-    // 5. Save the consolidated identity (overwrites old random UUID if it existed)
-    if let Err(e) = identity.save(&identity_path) {
+    // 5. Save the consolidated identity — but only when it differs from what is on disk
+    //    (this also overwrites an old random UUID, if one existed).
+    //
+    //    Everything above is derived from the keypair, so a boot that loaded a good file
+    //    rebuilds it byte for byte. Replacing the only copy of the node's private key to
+    //    write back what is already there is risk bought for nothing.
+    //
+    //    The mode counts as a difference: a file from an earlier build carries the umask's
+    //    `0644`, and skipping on content alone would leave it that way for good. One rewrite
+    //    settles it and later boots skip.
+    if identity.matches_stored(&identity_path) && identity_file_is_owner_only(&identity_path) {
+        info!("🔑 Node identity unchanged on disk, leaving it alone");
+        info!("✨ Node UUID (deterministic): {}", identity.uuid);
+    } else if let Err(e) = identity.save(&identity_path) {
         warn!(
             "⚠️  Failed to save consolidated identity to node_identity.json: {}",
             e

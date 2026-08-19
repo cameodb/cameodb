@@ -59,6 +59,9 @@ const MCP_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 /// Maximum time to wait for coordinator swarm shutdown.
 const COORDINATOR_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 
+/// Maximum time to wait for in-flight reads before abandoning the read pool's threads.
+const READ_RUNTIME_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
+
 /// Emergency shutdown timeout: forces process exit if total shutdown exceeds this time.
 /// Prevents indefinite hangs from stuck resources.
 const EMERGENCY_SHUTDOWN_TIMEOUT_SECS: u64 = 120;
@@ -738,7 +741,7 @@ async fn main() -> Result<()> {
 
     // Phase 1: Shutdown MCP sessions (timeout: 5s)
     tracing::info!(
-        "Phase 1/4: Closing MCP sessions (timeout: {}s)...",
+        "Phase 1/5: Closing MCP sessions (timeout: {}s)...",
         MCP_SHUTDOWN_TIMEOUT_SECS
     );
     match timeout(
@@ -762,7 +765,7 @@ async fn main() -> Result<()> {
 
     // Phase 2: Drain HTTP server (timeout: 10s)
     tracing::info!(
-        "Phase 2/4: Draining HTTP connections (timeout: {}s)...",
+        "Phase 2/5: Draining HTTP connections (timeout: {}s)...",
         HTTP_DRAIN_TIMEOUT_SECS
     );
     let _ = shutdown_tx.send(());
@@ -786,7 +789,7 @@ async fn main() -> Result<()> {
 
     // Phase 3: Shutdown all shards (timeout: 60s)
     tracing::info!(
-        "Phase 3/4: Shutting down all shards (timeout: {}s)...",
+        "Phase 3/5: Shutting down all shards (timeout: {}s)...",
         SHARD_SHUTDOWN_TIMEOUT_SECS
     );
     match timeout(
@@ -809,9 +812,41 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Phase 4: Shutdown coordinator (timeout: 10s)
+    // Phase 4: Shut down the dedicated read thread pool (timeout: 10s).
+    //
+    // After the shards, because their shutdown is what the last reads run against, and before
+    // the completion message, because `Drop` can only detach these threads — leaving the line
+    // that says the process is exiting cleanly to be printed while eight of them are still
+    // being torn down.
     tracing::info!(
-        "Phase 4/4: Shutting down coordinator (timeout: {}s)...",
+        "Phase 4/5: Shutting down read thread pool (timeout: {}s)...",
+        READ_RUNTIME_SHUTDOWN_TIMEOUT_SECS
+    );
+    // The handler's own bound is `READ_RUNTIME_SHUTDOWN_TIMEOUT_SECS`; this one is the
+    // backstop for a reply that never arrives, so it has to be the looser of the two or a
+    // shutdown that used its full budget would be reported as a hang.
+    let read_pool_reply_timeout = Duration::from_secs(READ_RUNTIME_SHUTDOWN_TIMEOUT_SECS + 5);
+    match timeout(
+        read_pool_reply_timeout,
+        orchestrator_ref.ask(crate::node_orchestrator::ShutdownReadRuntime {
+            timeout: Duration::from_secs(READ_RUNTIME_SHUTDOWN_TIMEOUT_SECS),
+        }),
+    )
+    .await
+    {
+        Ok(Ok(())) => tracing::info!("Read thread pool shut down successfully"),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "Could not reach the orchestrator to shut down the read thread pool")
+        }
+        Err(_) => tracing::error!(
+            "Read thread pool shutdown did not report back within {}s",
+            READ_RUNTIME_SHUTDOWN_TIMEOUT_SECS + 5
+        ),
+    }
+
+    // Phase 5: Shutdown coordinator (timeout: 10s)
+    tracing::info!(
+        "Phase 5/5: Shutting down coordinator (timeout: {}s)...",
         COORDINATOR_SHUTDOWN_TIMEOUT_SECS
     );
     match timeout(
