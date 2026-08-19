@@ -222,9 +222,13 @@ fn valid_queries_are_never_reported() {
         "\"12:30 rust\"",
         "title:\"a: b\"",
         "\"time: 12:30\" AND tag:active",
-        // Reserved fields present in the Tantivy schema but not in IndexSchema::fields.
+        // `id` is a reserved field: present in the Tantivy schema, absent from
+        // `IndexSchema::fields`, and still a legitimate thing to query.
+        //
+        // `_seq` used to be listed here for the same reason. It is not any more: indices built
+        // after the field stopped being declared genuinely do not have it, so a query naming it
+        // is an unknown-field query and reporting it is right. See the case below.
         "id:d1",
-        "_seq:>0",
         // JSON paths of any depth, which is what the absorbing field is legitimately for.
         "meta.source:api",
         "meta.nested.deep:value",
@@ -337,5 +341,23 @@ fn count_only_queries_are_checked_too() {
     assert!(
         !outcome.discarded.is_empty(),
         "count-only mode must apply the same check"
+    );
+}
+
+/// Querying `_seq` on an index built without it is reported like any other unknown field.
+///
+/// The field used to be forced into every index so the checkpoint scan had a column to order
+/// on, and a query naming it therefore resolved and silently matched nothing meaningful. New
+/// indices do not declare it, so the honest answer is that there is no such field — and saying
+/// so is what stops a caller wondering why their filter had no effect.
+#[test]
+fn the_retired_seq_field_is_reported_as_unknown() {
+    let temp = TempDir::new().expect("temp dir");
+    let store = store(&temp, "clean");
+
+    let notes = discarded(&store, "clean", "_seq:>0");
+    assert!(
+        notes.iter().any(|note| note.contains("_seq")),
+        "a query on the retired _seq field should be reported: {notes:?}"
     );
 }

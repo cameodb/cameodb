@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`PUT /api/{index}/_config` reported `_seq` as a field of the index.** `_seq` is the engine's
+  internal WAL sequence number. Every other listing hides it, but the create-config response is
+  the one that does not go through the shared field-describing path — and it normalizes the
+  submitted schema first, which *inserts* `_seq`. Creating an index therefore advertised a field
+  the caller never declared and cannot use.
+
+- **`sort=_seq` was accepted and silently returned a partial ordering.** The field is `fast`, so
+  every check in the sort path passed and results were ordered correctly *within* a shard. But
+  document bodies are served from redb, which has no `_seq` key, so no sort key was stamped on
+  the results and a scatter-gather merge across shards had nothing to order by. It is now refused
+  like any other unknown field, which is what `sortable_fields` already advertised.
+
 - **An index could be re-examined by recovery on every boot forever.** If the process stopped
   between a Tantivy commit and the WAL truncation that follows it, the WAL kept entries the
   checkpoint already covered. Recovery correctly replayed nothing — but it also left them there,
@@ -45,6 +57,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or two. WAL entries written by earlier builds still decode — only their id is taken — so an
   upgrade needs no migration of a tail left behind by the process that died.
 
+- **New indices no longer carry the `_seq` field.** It was a `stored` + `fast` u64 on every
+  document, costing 8 bytes in the row store plus a columnar entry re-merged on every segment
+  merge, and its only reader was the checkpoint scan that the commit payload replaced. Since the
+  Tantivy document holds just `id` and the indexed fields — bodies live in redb — it was a large
+  share of a narrow index's doc store.
+
+  Indices that already have the column keep it, are still written to, and still recover through
+  it, so no migration is required and no on-disk index changes shape. Rebuilding an index drops
+  the field. One visible consequence: `_seq` was always resolvable in a query and matched
+  nothing useful; on an index built without it, `_seq:>0` is now correctly reported as an unknown
+  field.
+
 - **Crash recovery is bounded by what was in flight, not by how much data the node holds.**
   Recovery on a large multi-shard node took minutes, because deciding whether an index needed
   replay could require opening it and ordering its `_seq` fast field — O(segments × docs) per
@@ -80,6 +104,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`HybridStore::has_open_writer`** — whether an index currently holds an `IndexWriter`, the
   expensive per-index resource. Distinguishes a boot that scales with in-flight writes from one
   that scales with stored data.
+
+### Documentation
+
+- **`wal_sync = false` is now described accurately** in the configuration guide, the example
+  config, and the "speed" profile that emits it. It was listed only as a risk of losing recent
+  writes. The sharper hazard is that redb's durability drops to `None`, so a kill can lose rows
+  Tantivy had already committed — leaving the derived search index *ahead* of the document store
+  it is derived from. Recovery only replays forward and cannot repair that, so searches return
+  hits whose documents no longer exist until they are rewritten or the index is rebuilt.
 
 ## [0.3.1] - 2026-08-16
 

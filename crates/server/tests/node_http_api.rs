@@ -542,6 +542,63 @@ async fn the_listing_describes_every_field_without_a_second_request() {
     );
 }
 
+/// Creating an index must not answer with `_seq`.
+///
+/// `PUT /api/{index}/_config` is the one listing that does not go through `describe_fields`,
+/// which is where every other endpoint filters the engine's internal WAL sequence field out.
+/// It also normalizes the submitted schema first, and normalization *inserts* `_seq` — so the
+/// response advertised a field the caller never declared, cannot query, and is told about
+/// nowhere else.
+#[tokio::test]
+async fn creating_an_index_does_not_report_the_internal_seq_field() {
+    let node = TestNode::start("").await;
+
+    let (status, body) = put_config(
+        &node,
+        "declared",
+        &json!({
+            "fields": {
+                "id": {"name": "id", "field_type": "text", "indexed": true},
+                "title": {"name": "title", "field_type": "text", "indexed": true}
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200, "creating a config should succeed: {body}");
+
+    let field_names = body["field_names"]
+        .as_array()
+        .unwrap_or_else(|| panic!("field_names should be an array: {body}"));
+
+    assert!(
+        field_names.iter().all(|name| name != "_seq"),
+        "`_seq` is WAL bookkeeping and must not be reported as a field: {field_names:?}"
+    );
+    assert!(
+        field_names.iter().any(|name| name == "title"),
+        "the fields the caller actually declared must still be reported: {field_names:?}"
+    );
+}
+
+async fn put_config(
+    node: &TestNode,
+    index: &str,
+    body: &serde_json::Value,
+) -> (u16, serde_json::Value) {
+    with_tls_provider();
+    let response = reqwest::Client::new()
+        .put(format!("{}/api/{index}/_config", node.url))
+        .json(body)
+        .send()
+        .await
+        .expect("put config request");
+
+    let status = response.status().as_u16();
+    let body = response.json().await.unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
 /// `/api/{index}/_config` describes a field exactly as the listing does.
 ///
 /// The two used to disagree on every property name — the schema keyed fields by map key with

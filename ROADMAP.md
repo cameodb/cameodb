@@ -1611,6 +1611,8 @@ budget proves too blunt.
 
 ### Stage 7 — Shrink the write path ✅ DONE 2026-08-19
 
+Two changes to what a write puts on disk, both of which the recovery rework made available.
+
 #### The WAL stopped storing the document
 
 A `wal_<index>` entry held the whole `WalOp` — body included — while the same redb transaction
@@ -1633,11 +1635,44 @@ trade for storing less.
 Entries written by earlier builds still decode — only their id is taken — so an upgrade replays a
 tail left behind by the previous build with no migration.
 
+#### `_seq` is no longer declared on new indices
+
+`STORED | FAST` u64 on every document: 8 bytes in the row store plus a columnar entry re-merged
+on every segment merge, disproportionate because the Tantivy document holds only `id` and the
+indexed fields. Its one reader was the checkpoint scan the commit payload replaced.
+
+Done the way this section previously argued it had to be — `SchemaFields::seq` is `Option<Field>`,
+`load_fields_from_existing_index` tolerates the field's absence, and both write paths and the
+replay path stamp it only when the index has it. An index built with the column keeps it, is
+still written to, and still recovers through it, so nothing on disk changes shape and no
+migration is required. Rebuilding an index drops the field. `checkpoint_seq` skips straight to 0
+when there is no column to scan, which is correct: an index without one was built after commits
+started carrying a payload, so the only way to reach that rung is an index that has never
+committed.
+
+Two behaviour changes fall out, both of them corrections. `normalize_after_deserialization` no
+longer invents a field the caller never declared. And `_seq:>0`, which used to resolve and match
+nothing meaningful, is now reported as an unknown field on any index built without it.
+
+#### The two bugs this audit turned up, both fixed
+
+- **`PUT /api/{index}/_config` answered with `_seq` in `field_names`** — it is the one listing
+  that bypasses `describe_fields`, where every other endpoint filters the field out, and it
+  normalizes the schema first, which used to insert it.
+- **`sort=_seq` was accepted and silently degraded across shards** — `fast`, so every check
+  passed and the shard-local order was right, but bodies come from redb, which has no `_seq` key,
+  so nothing was stamped for the scatter-gather merge to order by. Now refused like any unknown
+  field, matching what `sortable_fields` always advertised.
+
 #### What is still not covered by a test
 
-- **A legacy WAL tail replaying end to end.** `decode_wal_entry` is unit tested against both
-  formats, and the replay body above it is format-agnostic by construction, but no test opens a
-  tail written by the previous build.
+- **An index built by an older build, opened by this one.** The compatibility path is real and
+  exercised in the decoder unit tests, but an end-to-end fixture is unbuildable in-repo:
+  `create_schema_from_definition` no longer declares `_seq`, so there is no longer any way to
+  *create* a legacy-shaped index to open. Verifying it needs a checked-in fixture index or a
+  build-flag seam.
+- **A legacy WAL tail replaying end to end**, for the same reason. `decode_wal_entry` is unit
+  tested against both formats, and the replay body above it is format-agnostic by construction.
 
 ### Success metrics
 

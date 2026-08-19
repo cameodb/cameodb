@@ -113,6 +113,8 @@ seed_nodes = []
 [storage]
 data_paths = ["./data/cameodb"]
 disk_usage_threshold_percent = 90
+# fsync every redb commit. Leave this on: with it off, a crash can leave the search index
+# holding documents the document store lost, which recovery cannot repair.
 wal_sync = true
 wal_segment_size_mb = 64
 default_batch_size = 5000

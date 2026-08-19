@@ -143,7 +143,9 @@ data_paths = ["./data/cameodb"]
 # Disk usage alert threshold in percent (default: 90)
 disk_usage_threshold_percent = 90
 
-# Enable fsync after WAL batches for durability (default: true)
+# Enable fsync after WAL batches for durability (default: true).
+# Turning this off can leave the search index ahead of the document store after a crash —
+# see "What `wal_sync = false` actually costs" below.
 wal_sync = true
 
 # WAL segment size in MB (default: 64)
@@ -718,7 +720,8 @@ default_batch_size = 2000
 
 ```toml
 [storage]
-# Disable fsync for maximum write speed (less durable)
+# Disable fsync for maximum write speed. Only for data you can reload from elsewhere:
+# a crash can leave the search index ahead of the document store.
 wal_sync = false
 
 # Large WAL segments reduce overhead
@@ -740,9 +743,27 @@ search_threads = 32
 
 | Setting | Performance | Durability | Note |
 |---------|-------------|------------|------|
-| `wal_sync = false` | ⬆️ High | ⬇️ Low | Risk of data loss on crash |
+| `wal_sync = false` | ⬆️ High | ⬇️ Low | Recent writes can be lost **and** the search index can end up ahead of the document store — see below |
 | `indexer_memory_max_mb = 1024` | ⬆️ High | ➡️ Same | Uses more RAM |
 | `memory_pressure_threshold_percent = 90` | ⬆️ High | ➡️ Same | Higher memory usage |
+
+#### What `wal_sync = false` actually costs
+
+More than the row above can say in a cell, because it does not just lose data — it can make the
+two engines disagree.
+
+Crash recovery rests on redb being the authority: the Tantivy index is derived from it, so
+startup replays whatever redb has that Tantivy does not. `wal_sync = false` sets redb's
+durability to `None`, which means a committed transaction may never reach disk at all. A
+process kill can therefore lose WAL and document rows that Tantivy had *already committed to
+its own segments* — leaving the derived index ahead of the source of truth.
+
+Recovery cannot repair that. It only ever replays forward, so a search will return hits whose
+documents `GET /api/{index}/{id}` reports as missing, and it will keep doing so until those
+documents are rewritten or the index is rebuilt.
+
+Use it for bulk-loading data you can replay from an external source, and turn it back on before
+the node holds anything you cannot regenerate.
 
 ## Production Deployment
 

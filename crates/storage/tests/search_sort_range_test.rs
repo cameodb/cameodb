@@ -487,3 +487,42 @@ fn test_sort_by_string_field_orders_results_alphabetically() {
         "descending title sort order mismatch"
     );
 }
+
+/// `_seq` must not be usable as a sort field.
+///
+/// It is the engine's internal WAL sequence, and it is `FAST`, so every check the sort path
+/// makes would otherwise pass and the sort would work — but only within one shard. Document
+/// bodies are served from redb, which has no `_seq` key, so the router finds no sort key to
+/// stamp on the results and a scatter-gather merge has nothing to order by. The caller would
+/// get a partial ordering and no error. Every field listing already hides `_seq`, so it has to
+/// be refused here too, exactly as an unknown field is.
+#[test]
+fn the_internal_seq_field_cannot_be_used_as_a_sort_key() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = setup_index(&dir, "books", sample_docs());
+
+    for order in [SortOrder::Asc, SortOrder::Desc] {
+        let sort = SortSpec {
+            field: "_seq".to_string(),
+            order,
+        };
+        let result = store.search_documents("books", "rust", 10, Some(&sort));
+        assert!(
+            result.is_err(),
+            "sorting on _seq must be refused, got {:?}",
+            result.map(|outcome| ids(&outcome.hits))
+        );
+    }
+
+    // A sort on a real fast field still works, so the guard is not blocking sorting at large.
+    let sort = SortSpec {
+        field: "year".to_string(),
+        order: SortOrder::Asc,
+    };
+    assert!(
+        store
+            .search_documents("books", "rust", 10, Some(&sort))
+            .is_ok(),
+        "an ordinary fast field must still sort"
+    );
+}

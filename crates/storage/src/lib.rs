@@ -1913,20 +1913,11 @@ impl IndexSchema {
                 _ => {}
             }
         }
-        // Ensure reserved '_seq' field is always present (WAL sequence tracking)
-        self.fields
-            .entry("_seq".to_string())
-            .or_insert_with(|| FieldDef {
-                name: "_seq".to_string(),
-                field_type: TantivyFieldType::U64,
-                indexed: false,
-                stored: true,
-                fast: true,
-                is_shadow: false,
-                description: None,
-                tokenizer: None,
-                index_record_option: None,
-            });
+        // `_seq` is deliberately not inserted. It used to be forced into every schema so the
+        // Tantivy index would carry a column for the checkpoint scan to order on; the commit
+        // payload made that scan a fallback, so new indices no longer declare the field. A
+        // schema loaded from an index that already has it keeps it — it arrives in `fields`
+        // from disk and nothing here removes it.
 
         self.rebuild_shadow_fields_cache();
     }
@@ -2495,8 +2486,13 @@ fn filter_shadow_fields_owned(mut json_blob: JsonValue, schema: &IndexSchema) ->
 pub struct SchemaFields {
     /// Tantivy field for the document identifier
     id: Field,
-    /// Tantivy field for the WAL sequence number
-    seq: Field,
+    /// Tantivy field for the WAL sequence number, on indices that were built with one.
+    ///
+    /// `None` on anything built after the field stopped being declared. It exists only to let
+    /// `get_highest_indexed_seq` locate a checkpoint by scanning, and the commit payload does
+    /// that in O(1) now — so it is written when present, purely so an index built by an older
+    /// build keeps the column its own last-resort scan would read.
+    seq: Option<Field>,
     /// Map of schema field name -> Tantivy field (only indexed fields are present)
     indexed_fields: HashMap<String, Field>,
 }
@@ -3040,6 +3036,18 @@ impl HybridStore {
             return Ok(seq);
         }
 
+        // No `_seq` column, so there is nothing to scan and nothing to find. An index built
+        // without the field is one built after commits started carrying a payload, so the only
+        // way to reach here is an index that has never committed — which has nothing indexed,
+        // and whose checkpoint is therefore 0.
+        if tantivy_index.schema().get_field("_seq").is_err() {
+            tracing::debug!(
+                index = %index,
+                "No checkpoint recorded and no _seq column; index has never been committed"
+            );
+            return Ok(0);
+        }
+
         // Neither cheap source exists. Either this index was last committed by a build
         // predating both, or it has never been committed at all — a freshly created index
         // looks identical here, and the scan is what distinguishes them.
@@ -3186,9 +3194,8 @@ impl HybridStore {
         let id_field = schema
             .get_field("id")
             .map_err(|_| StoreError::FieldNotFound("id".to_string()))?;
-        let seq_field = schema
-            .get_field("_seq")
-            .map_err(|_| StoreError::FieldNotFound("_seq".to_string()))?;
+        // Absent on any index built without it. See `SchemaFields::seq`.
+        let seq_field = schema.get_field("_seq").ok();
 
         // Build indexed fields map
         let mut indexed_fields = HashMap::new();
@@ -3247,7 +3254,9 @@ impl HybridStore {
 
                     let mut tantivy_doc = tantivy::TantivyDocument::default();
                     tantivy_doc.add_text(id_field, &id);
-                    tantivy_doc.add_u64(seq_field, seq_id);
+                    if let Some(seq_field) = seq_field {
+                        tantivy_doc.add_u64(seq_field, seq_id);
+                    }
 
                     if let Some(json_obj) =
                         stored_doc.json_blob.as_ref().and_then(|v| v.as_object())
@@ -3463,9 +3472,10 @@ impl HybridStore {
         // ID field is always present - untokenized string for exact matching
         let id_field = schema_builder.add_text_field("id", STRING | STORED);
 
-        // Sequence field for WAL ordering - reserved field
-        // FAST is required for order_by_u64_field sorting
-        let seq_field = schema_builder.add_u64_field("_seq", STORED | FAST);
+        // No `_seq` field. It cost 8 stored bytes plus a fast column per document, and its
+        // only reader was the checkpoint scan that `order_by_u64_field` needs — which the
+        // commit payload replaced. Indices that already have the column keep it and keep
+        // being written to; nothing new grows one.
 
         let mut indexed_fields = HashMap::new();
 
@@ -3551,7 +3561,7 @@ impl HybridStore {
         let schema = schema_builder.build();
         let fields = SchemaFields {
             id: id_field,
-            seq: seq_field,
+            seq: None,
             indexed_fields,
         };
 
@@ -3566,9 +3576,10 @@ impl HybridStore {
             .get_field("id")
             .map_err(|_| StoreError::FieldNotFound("id".to_string()))?;
 
-        let seq = schema
-            .get_field("_seq")
-            .map_err(|_| StoreError::FieldNotFound("_seq".to_string()))?;
+        // Absent on any index built without it; that is not an error, it is the new normal.
+        // This runs on every open of an existing index, so treating it as required here is
+        // what would make an index built either way unopenable by the other.
+        let seq = schema.get_field("_seq").ok();
 
         let mut indexed_fields = HashMap::new();
         for (field, field_entry) in schema.fields() {
@@ -3600,6 +3611,12 @@ impl HybridStore {
             let name = field_entry.name();
             if name == "id" {
                 continue; // Skip the mandatory id field - it's implicit in Tantivy
+            }
+            if name == "_seq" {
+                // Present only on an index built before the field was retired. Carrying it
+                // into a derived schema would put it back into a document nobody declared it
+                // in, and every listing filters it out again downstream anyway.
+                continue;
             }
 
             let field_type = match field_entry.field_type() {
@@ -4397,10 +4414,10 @@ impl HybridStore {
                     let is_new_document = old_value.is_none();
 
                     // Step 3: Build tantivy document with ONLY indexed fields
-                    let mut tantivy_doc = doc!(
-                        fields.id => id.as_str(),
-                        fields.seq => seq_id // Inject the WAL sequence
-                    );
+                    let mut tantivy_doc = doc!(fields.id => id.as_str());
+                    if let Some(seq_field) = fields.seq {
+                        tantivy_doc.add_u64(seq_field, seq_id);
+                    }
 
                     // Step 4: Single-pass JSON traversal — skip shadows + extract Tantivy fields
                     if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
@@ -5526,6 +5543,16 @@ impl HybridStore {
             // Get field from schema to check type and FAST flag
             let schema = tantivy_index.schema();
 
+            // `_seq` is FAST, so it would otherwise satisfy every check below and sort — but
+            // only within one shard. Document bodies come from redb, which has no `_seq` key,
+            // so the router finds no sort key to stamp and the cross-shard merge has nothing
+            // to order by: the caller gets a partial ordering and no error. Every field
+            // listing already hides `_seq`, so refusing it here is what makes the engine
+            // agree with what `sortable_fields` advertises.
+            if sort_spec.field == "_seq" {
+                return Err(StoreError::FieldNotFound(sort_spec.field.clone()));
+            }
+
             let field = schema
                 .get_field(&sort_spec.field)
                 .map_err(|_| StoreError::FieldNotFound(sort_spec.field.clone()))?;
@@ -6025,10 +6052,10 @@ impl HybridStore {
                         }
 
                         // Step 3: Build tantivy document with ONLY indexed fields
-                        let mut tantivy_doc = doc!(
-                            fields.id => id.as_str(),
-                            fields.seq => seq_id // Inject the WAL sequence
-                        );
+                        let mut tantivy_doc = doc!(fields.id => id.as_str());
+                        if let Some(seq_field) = fields.seq {
+                            tantivy_doc.add_u64(seq_field, seq_id);
+                        }
 
                         // Step 4: Single-pass JSON traversal — skip shadows + extract Tantivy fields
                         if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
@@ -8006,16 +8033,16 @@ mod tests {
             "Non-indexed fields should not be enriched"
         );
 
-        // --- _seq: reserved WAL sequence field is always injected ---
-        let seq = schema.fields.get("_seq").unwrap();
-        assert_eq!(seq.name, "_seq");
-        assert_eq!(seq.field_type, TantivyFieldType::U64);
-        assert!(!seq.indexed, "_seq must not be indexed");
-        assert!(seq.stored, "_seq must be stored");
-        assert!(seq.fast, "_seq must be fast");
-        assert!(!seq.is_shadow);
-        assert!(seq.tokenizer.is_none());
-        assert!(seq.index_record_option.is_none());
+        // --- _seq: no longer injected ---
+        // Normalization used to force this field into every schema so the built index would
+        // carry a column for the checkpoint scan to order on. The commit payload answers that
+        // question in O(1) now, so a schema declares only what its author declared. Indices
+        // built while the field was injected still have the column and are still written to;
+        // nothing new grows one.
+        assert!(
+            !schema.fields.contains_key("_seq"),
+            "normalization must not invent a field the caller never declared"
+        );
 
         println!("✅ Schema enrichment correctly preserves explicit values and fills defaults!");
     }

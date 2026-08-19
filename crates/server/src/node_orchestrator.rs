@@ -5889,8 +5889,20 @@ impl NodeOrchestrator {
     }
 
     /// Produce sorted field names with "id" first (if present), others alphabetical.
+    ///
+    /// `_seq` is excluded for the same reason `describe_fields` excludes it: it is the engine's
+    /// internal WAL sequence, not something a caller declared or can use. It has to be filtered
+    /// *here* as well because this is the one listing that does not go through `describe_fields`
+    /// — and because the schema it is handed has just been through
+    /// `normalize_after_deserialization`, which inserts `_seq`. Without this, creating an index
+    /// answers with a field that every other endpoint hides.
     fn sorted_field_names(schema: &IndexSchema) -> Vec<String> {
-        let mut names: Vec<String> = schema.fields.keys().cloned().collect();
+        let mut names: Vec<String> = schema
+            .fields
+            .keys()
+            .filter(|name| name.as_str() != "_seq")
+            .cloned()
+            .collect();
         names.sort_by(|a, b| match (a.as_str(), b.as_str()) {
             ("id", "id") => std::cmp::Ordering::Equal,
             ("id", _) => std::cmp::Ordering::Less,
