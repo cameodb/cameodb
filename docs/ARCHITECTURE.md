@@ -118,7 +118,9 @@ To solve the trade-off between Search (Tantivy) and Retrieval (Redb), both engin
 Writes are durable only if committed to Redb. Tantivy is treated as a "View."
 1.  **Begin Redb Write Transaction.**
 2.  **Insert Data:** Store generic JSON blob in `TABLE_DATA` (Key -> Blob).
-3.  **Append Log:** Store operation in `TABLE_WAL` (SeqID -> `WalOp::Put`).
+3.  **Append Log:** Store the document *id* in `TABLE_WAL` (SeqID -> id). The document itself is
+    already going to `TABLE_DATA` in this same transaction, so the log records which document
+    changed and leaves the content to the one authoritative copy.
 4.  **Commit Redb.** (Data is safe).
 5.  **Update Tantivy:** Parse JSON, extract indexed fields, add to Inverted Index.
 
@@ -309,10 +311,50 @@ flowchart TB
 ## 9. Resilience & Recovery
 
 ### 9.1. Cold Boot / Crash Recovery
-1.  **Orchestrator** starts.
-2.  **Local Hydration:** Reads `redb` for the last committed WAL Sequence ID.
-3.  **Network Join:** Connects to DHT.
-4.  **Reconciliation:**
+
+Both engines recover themselves, and neither takes time proportional to the data it holds.
+redb uses shadow paging, so an unclean stop is resolved by pointing back at the last commit
+root; Tantivy opens the immutable segments its last commit published and memory-maps them.
+What cameodb has to recover is neither engine's state but the **gap between them**: redb is the
+ACID source of truth, the Tantivy index is derived from it, and writes are batched into Tantivy
+commits, so a kill can leave writes durable in redb that Tantivy never indexed.
+
+That gap is recorded in one place. Every Tantivy commit carries a **payload stamped with the
+redb WAL sequence it covers**, written inside the commit itself — so a checkpoint can never
+describe segments that are not on disk. Once the commit returns, the WAL entries it covers are
+deleted.
+
+The WAL itself holds **only the document id**, not the document. The id and the document row in
+`data_<index>` are written in the same redb transaction, so the row is always there to be read
+at replay time and a second copy in the WAL bought nothing while doubling the bytes each write
+serialised and fsynced. Recovery reads the id and lets the committed row decide the operation:
+a row means index the document as it now stands, no row means it was deleted. That makes replay
+a **convergence on committed state** rather than a re-enactment of a log — a document put and
+then deleted inside one tail, or updated twenty times, resolves in a single Tantivy operation.
+
+Those facts give boot its cheap test:
+
+1.  **Partition** — one redb read transaction per shard. For each index, look at whether
+    `wal_<index>` has a last entry. Empty means every write it ever took is in Tantivy, so the
+    index is skipped without opening Tantivy at all. A 30 TB index that was idle costs one
+    B-tree descent, the same as an empty one.
+2.  **Replay** — only for indices with a tail. Read the sequence from the Tantivy commit
+    payload, then for each distinct id in `wal_<index>` above it, apply that id's committed
+    row. Replay is idempotent (each put deletes its `id` term before adding), so a checkpoint
+    that lags is safe; one that leads would not be, which is why it lives inside the commit. A
+    global semaphore bounds how many indices hold an `IndexWriter` at once, since every shard
+    on the node starts at the same moment.
+3.  **Warmup** — latency only, never gating. Readers are faulted in smallest-index-first under
+    a time budget; whatever is not reached warms on first query.
+
+Recovery time therefore tracks **what was in flight when the process stopped**, not how much
+data the node stores.
+
+Around that, at the cluster level:
+
+1.  **Orchestrator** starts; shards recover as above and become routable.
+2.  **Network Join:** Connects to DHT.
+3.  **Reconciliation:**
     * Checks if it is still the owner of its shards in the Ring.
     * If yes, opens gates for writes.
     * If no (Cluster rebalanced while dead), enters `Forwarding` mode or deletes data (based on policy).

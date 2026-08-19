@@ -880,14 +880,30 @@ Status: Consistent (uncommitted operations lost)
 ```
 
 **WAL Recovery Implementation:**
-On startup, `recover_index()` performs deterministic recovery:
-1. Get max WAL sequence from redb B-tree (O(log n))
-2. Get highest committed _seq from Tantivy FAST field (O(1))
-3. Replay missing operations from (last_committed_seq+1) to max_wal_seq
-4. Commit replayed operations to Tantivy
-5. Initialize sequence counter to max(max_wal_seq, last_committed_seq)
 
-This standard approach ensures all committed redb data is indexed in Tantivy after recovery.
+Each Tantivy commit is stamped with the WAL sequence it covers, in the commit payload Tantivy
+writes into `meta.json`. Because the stamp is written by the operation that publishes the
+segments, it can never describe segments a crash prevented from landing. A commit then deletes
+the WAL entries it covers, which is what makes the WAL itself the signal:
+
+1. **Partition** (`recover_indices`) — one redb read transaction per shard. An index whose
+   `wal_<index>` has no last entry has everything it ever took in Tantivy, and is skipped
+   without opening Tantivy at all. This is a B-tree descent per index, not a scan, so an idle
+   multi-terabyte index costs the same as an empty one.
+2. **Replay** (`recover_index`) — only for indices with a tail. Read the checkpoint
+   (`checkpoint_seq`: commit payload, else the `_recovery_meta` fallback, else a one-time
+   `_seq` scan that backfills its answer), then apply every distinct id in `wal_<index>` above
+   it. A WAL entry is just an id; the committed `data_<index>` row for that id decides the
+   operation — a row means index the document as it stands, no row means it was deleted. Replay
+   converges on committed state rather than re-enacting a log, so repeated writes to one
+   document, or a put later deleted, cost one Tantivy operation instead of several.
+3. **Seed the sequence counter** to `max(max_wal_seq, checkpoint_seq)`. The checkpoint term is
+   required, not belt-and-braces: a clean stop leaves the WAL empty, so the WAL alone would
+   restart numbering at zero and reissue sequences the index already spent.
+
+Replay is idempotent — each put deletes its `id` term before adding the document — so a
+checkpoint that lags is safe and a crash mid-recovery resumes from the last stamp. Recovery
+cost therefore tracks what was in flight when the process stopped, not how much data is stored.
 
 #### Index Corruption
 ```

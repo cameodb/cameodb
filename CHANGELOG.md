@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An index could be re-examined by recovery on every boot forever.** If the process stopped
+  between a Tantivy commit and the WAL truncation that follows it, the WAL kept entries the
+  checkpoint already covered. Recovery correctly replayed nothing — but it also left them there,
+  and startup reads a non-empty WAL as "needs recovery", so the index opened an `IndexWriter` to
+  discover there was nothing to do at every subsequent boot, and only stopped once it happened to
+  take another write. Recovery now finishes the truncation, which it can prove is safe.
+
+- **Documents written after a clean restart could disappear from the search index.** The WAL
+  sequence counter was seeded from the WAL alone, and a commit truncates the WAL — so every
+  cleanly stopped index reopened with an empty one and restarted numbering at zero, reissuing
+  sequence numbers it had already spent. If the process was then killed before the next commit,
+  recovery compared that reissued tail against a checkpoint far above it, concluded there was
+  nothing to replay, and skipped it. redb still held the documents and `GET` by key returned
+  them; they were simply missing from every search. The counter is now seeded from the durable
+  checkpoint as well, which is monotonic across restarts by construction.
+
+### Changed
+
+- **The WAL no longer stores a second copy of every document.** A `wal_<index>` entry held the
+  whole operation, body included, while the same transaction wrote that body to `data_<index>` —
+  so every write serialised the document twice and fsynced it twice. Entries are now the document
+  id and one tag byte. On a 1 KB document that is roughly 6 bytes where there were over a
+  thousand, and it is on the hot path of every write.
+
+  Nothing is lost by it. The WAL's job is to say *which* documents Tantivy may be behind on, and
+  the authoritative body is in `data_<index>` in the same transaction. Recovery reads the id and
+  lets the committed row decide the operation: a row means index the document as it now stands,
+  no row means it was deleted — a put always writes the row and a delete always removes it, so
+  the two cases are exact.
+
+  Replay therefore converges on committed state instead of re-enacting a log, which makes it
+  strictly less work: each id is applied once, so a tail that wrote one document twenty times, or
+  put a document and then deleted it, resolves in a single Tantivy operation rather than twenty
+  or two. WAL entries written by earlier builds still decode — only their id is taken — so an
+  upgrade needs no migration of a tail left behind by the process that died.
+
+- **Crash recovery is bounded by what was in flight, not by how much data the node holds.**
+  Recovery on a large multi-shard node took minutes, because deciding whether an index needed
+  replay could require opening it and ordering its `_seq` fast field — O(segments × docs) per
+  index, on every boot, for any index not yet carrying recovery metadata.
+
+  The checkpoint now travels inside Tantivy's own commit payload, written by the same operation
+  that publishes the segments, so it cannot describe a segment set a crash prevented from
+  landing. Since a commit deletes the WAL entries it covers, an empty `wal_<index>` is now
+  sufficient proof that an index is in sync: startup partitions every index in a single redb
+  read transaction per shard, asking each WAL table for its last key. An idle 30 TB index costs
+  one B-tree descent, the same as an empty one, and no Tantivy index, writer or searcher is
+  opened for it. Only indices with an actual tail are replayed, and only over that tail.
+
+  Existing data needs no migration. An index whose last commit predates the stamp falls back to
+  the `_recovery_meta` row, and one with neither is scanned once and backfilled, so the
+  expensive path runs at most once per index rather than on every boot.
+
+- **Recovery can no longer re-trigger the OOM it is recovering from.** The number of indices
+  holding an `IndexWriter` during replay is now capped process-wide rather than per shard, so a
+  16-shard node no longer allocates 16 × cores indexing arenas at once to recover.
+
+- **Startup reader warmup runs under a 60-second budget.** Warming faults term dictionaries in
+  from mmap across every shard simultaneously; past that point the IO storm costs the queries
+  already arriving more than it saves the ones that have not. Indices are warmed smallest-first,
+  what is skipped is logged, and the remainder warms on first access as before.
+
+### Added
+
+- **`HybridStore::pending_wal_entries`** — how many writes are waiting for Tantivy to catch up on
+  an index. This is the quantity that decides recovery cost, and zero is what lets startup skip an
+  index entirely; a value that keeps climbing means commits are not keeping pace with writes.
+
+- **`HybridStore::has_open_writer`** — whether an index currently holds an `IndexWriter`, the
+  expensive per-index resource. Distinguishes a boot that scales with in-flight writes from one
+  that scales with stored data.
+
 ## [0.3.1] - 2026-08-16
 
 ### Added

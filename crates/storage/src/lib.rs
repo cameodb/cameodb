@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
@@ -108,9 +108,172 @@ const NAIVE_DATE_FORMATS: &[&str] = &["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%
 const TABLE_SCHEMA: TableDefinition<&str, &[u8]> = TableDefinition::new("schema");
 
 /// Recovery metadata table: maps index names to their last committed Tantivy sequence.
-/// Written after each successful commit_index(). Read at startup to skip Tantivy
-/// recovery checks for fully-synced indices without opening the index.
+///
+/// Written in the same transaction that truncates the WAL after a successful Tantivy commit.
+/// Since the checkpoint moved into Tantivy's own commit payload this is a fallback rather
+/// than the primary record: it is what tells recovery where an index stands when that index
+/// was last committed by a build that predates the payload stamp. Nothing on the boot path
+/// reads it for an index whose WAL is empty.
 const TABLE_RECOVERY_META: TableDefinition<&str, u64> = TableDefinition::new("_recovery_meta");
+
+/// Tag byte introducing a WAL entry that records only the document id.
+///
+/// The WAL exists to say *which documents* Tantivy may be behind on, and it is written in the
+/// same redb transaction as the `data_<index>` row for that document. The row is therefore
+/// always there to be read at replay time, and storing the document a second time in the WAL
+/// bought nothing while doubling the bytes every write serialises and fsyncs.
+///
+/// Recovery reads the id, looks it up in `data_<index>`, and lets the answer decide the
+/// operation: a row means the document should be indexed as it now stands, no row means it was
+/// deleted. That is not a weaker record than the old one — replay converges on the committed
+/// state of each id rather than re-enacting a log, so a put later overwritten, or deleted, in
+/// the same tail resolves in one step instead of several.
+///
+/// `0x01` cannot begin a legacy entry: those are JSON objects, so they begin with `{`.
+const WAL_ENTRY_ID_ONLY: u8 = 0x01;
+
+/// Encode a WAL entry: the tag byte followed by the document id.
+fn encode_wal_entry(id: &str) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(id.len() + 1);
+    encoded.push(WAL_ENTRY_ID_ONLY);
+    encoded.extend_from_slice(id.as_bytes());
+    encoded
+}
+
+/// Read the document id out of a WAL entry, in either format.
+///
+/// Entries written before the id-only format are whole `WalOp` JSON values. They still decode
+/// here — only their id is taken, and the document body they carry is ignored in favour of the
+/// `data_<index>` row, so one replay path serves both formats and an upgrade needs no migration
+/// of a WAL tail left behind by the previous build.
+fn decode_wal_entry(bytes: &[u8]) -> Result<String, StoreError> {
+    if let Some((&WAL_ENTRY_ID_ONLY, id_bytes)) = bytes.split_first() {
+        return std::str::from_utf8(id_bytes)
+            .map(str::to_string)
+            .map_err(|e| {
+                StoreError::Serialization(format!("WAL entry id is not valid UTF-8: {e}"))
+            });
+    }
+
+    let legacy: WalOp =
+        serde_json::from_slice(bytes).map_err(|e| StoreError::Serialization(e.to_string()))?;
+    Ok(match legacy {
+        WalOp::Put { id, .. } => id,
+        WalOp::Delete { id } => id,
+    })
+}
+
+/// Prefix of the string cameodb stamps into every Tantivy commit payload. The number after
+/// it is the `wal_<index>` sequence that commit covers.
+///
+/// Tantivy writes the payload into `meta.json` as part of the commit itself, which is the
+/// whole reason the checkpoint lives there. A checkpoint kept anywhere else is a second
+/// write that can be interrupted, and the two orderings fail differently: recorded too early
+/// it claims documents Tantivy never got, recorded too late it forces a replay of a tail
+/// Tantivy already has. Inside the commit there is no window at all — if the segments are on
+/// disk, so is the sequence that describes them.
+const CHECKPOINT_PAYLOAD_PREFIX: &str = "cameodb:wal_seq=";
+
+fn encode_checkpoint_payload(seq: u64) -> String {
+    format!("{CHECKPOINT_PAYLOAD_PREFIX}{seq}")
+}
+
+fn decode_checkpoint_payload(payload: &str) -> Option<u64> {
+    payload
+        .strip_prefix(CHECKPOINT_PAYLOAD_PREFIX)?
+        .parse()
+        .ok()
+}
+
+/// Commit `writer`, recording `seq` as the WAL sequence the commit covers.
+///
+/// Every Tantivy commit in the process goes through here. One that skips the stamp leaves
+/// the checkpoint behind on an index that is in fact up to date, and the next boot pays for
+/// it by replaying a tail that is already indexed.
+fn commit_writer_at(writer: &mut IndexWriter, seq: u64) -> Result<(), StoreError> {
+    let mut prepared = writer.prepare_commit()?;
+    prepared.set_payload(&encode_checkpoint_payload(seq));
+    prepared.commit()?;
+    Ok(())
+}
+
+/// The WAL sequence recorded in `tantivy_index`'s last commit.
+///
+/// Reads `meta.json` and nothing else, so the cost does not move with the size of the index.
+/// `None` means the last commit predates the stamp; the caller resolves those from redb.
+fn tantivy_checkpoint_seq(tantivy_index: &Index) -> Option<u64> {
+    tantivy_index
+        .load_metas()
+        .ok()?
+        .payload
+        .as_deref()
+        .and_then(decode_checkpoint_payload)
+}
+
+/// How long startup warmup may spend faulting in segment structures before it gives up on
+/// the indices it has not reached. Indices are warmed smallest-first, so the budget buys the
+/// largest number of warm indices it can and leaves the rest to warm on demand.
+const WARMUP_BUDGET: Duration = Duration::from_secs(60);
+
+/// Counting semaphore bounding how many indices replay their WAL tail at once, across every
+/// shard in the process.
+///
+/// Replay needs an `IndexWriter`, and an `IndexWriter` is worker threads plus an indexing
+/// arena that reaches hundreds of megabytes on a large index. Recovery is driven per shard
+/// and every shard on a node starts at the same moment, so a per-shard limit silently
+/// multiplies by the shard count — the 16-shard node that was just killed for using too much
+/// memory would answer by allocating 16 × cores arenas to recover from it. The cap is global
+/// for that reason.
+struct RecoveryGate {
+    permits: Mutex<usize>,
+    released: Condvar,
+}
+
+impl RecoveryGate {
+    fn acquire(&self) -> RecoveryPermit<'_> {
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *permits == 0 {
+            permits = self
+                .released
+                .wait(permits)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *permits -= 1;
+        RecoveryPermit { gate: self }
+    }
+}
+
+struct RecoveryPermit<'a> {
+    gate: &'a RecoveryGate,
+}
+
+impl Drop for RecoveryPermit<'_> {
+    fn drop(&mut self) {
+        let mut permits = self
+            .gate
+            .permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *permits += 1;
+        self.gate.released.notify_one();
+    }
+}
+
+/// Four concurrent replays is enough to keep the disk busy without letting the arenas add up
+/// to something the node cannot hold. It bounds a path that only runs at boot, and only for
+/// the handful of indices that were mid-write when the process stopped.
+static RECOVERY_GATE: LazyLock<RecoveryGate> = LazyLock::new(|| RecoveryGate {
+    permits: Mutex::new(
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .clamp(1, 4),
+    ),
+    released: Condvar::new(),
+});
 
 /// Configuration for the multi-tenant hybrid storage engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2694,7 +2857,11 @@ impl HybridStore {
                 };
                 if let Some(mut w) = writer {
                     tracing::debug!(index = %index, "Committing index during shutdown");
-                    match w.commit() {
+                    let outcome = match committed_seq {
+                        Some(seq) => commit_writer_at(&mut w, seq).map(|()| 0),
+                        None => w.commit().map_err(StoreError::from),
+                    };
+                    match outcome {
                         Ok(_) => {
                             // Release the writer lock before touching redb.
                             drop(w);
@@ -2753,6 +2920,15 @@ impl HybridStore {
         Ok(())
     }
 
+    /// Whether an `IndexWriter` is currently open for `index`.
+    ///
+    /// A writer is the expensive resource in this engine — worker threads plus an indexing
+    /// arena — so this answers "did that operation have to open one", which is the difference
+    /// between a boot that scales with in-flight writes and one that scales with stored data.
+    pub fn has_open_writer(&self, index: &str) -> bool {
+        self.writers.contains_key(index)
+    }
+
     /// Forcefully remove a writer from cache, even if locked.
     /// Last-resort operation for stuck writers. WARNING: May cause data loss.
     /// Returns true if writer was removed, false if not found.
@@ -2771,9 +2947,19 @@ impl HybridStore {
         }
     }
 
-    /// Get the highest indexed sequence number using FAST field ordering.
-    /// Leverages columnar FAST field storage for O(1) access instead of O(n) scanning.
-    fn get_highest_indexed_seq(&self, reader: &IndexReader) -> Result<u64, StoreError> {
+    /// Highest `_seq` present in the index, found by ordering on the `_seq` fast field.
+    ///
+    /// Last resort only. Despite returning a single document this reads the `_seq` column of
+    /// every segment, so it costs O(segments × docs) — on a multi-terabyte index, minutes.
+    /// It is reachable for one index at most once: an index that still has a WAL tail and
+    /// whose last commit carries neither a payload stamp nor a `_recovery_meta` row. The
+    /// commit that ends that replay stamps a payload, and the path is dead for that index
+    /// from then on.
+    fn get_highest_indexed_seq(&self, tantivy_index: &Index) -> Result<u64, StoreError> {
+        let reader: IndexReader = tantivy_index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()?;
         let searcher = reader.searcher();
         let schema = searcher.index().schema();
         let doc_count = searcher.num_docs();
@@ -2825,70 +3011,152 @@ impl HybridStore {
         Ok(0)
     }
 
-    /// Recover missing WAL operations.
-    /// 1. Get max seq from redb WAL table
-    /// 2. Get highest committed seq from Tantivy _seq FAST field
-    /// 3. Replay missing operations from (last_committed_seq+1) to max_wal_seq
+    /// The WAL sequence Tantivy has durably indexed for `index`.
     ///
-    /// Returns (replayed_count, max_wal_seq, last_committed_seq) so callers
-    /// can reuse these values without redundant lookups.
+    /// Three sources, in descending order of trust:
+    ///
+    /// 1. The Tantivy commit payload, written inside the commit, so it cannot describe a
+    ///    segment set that is not on disk.
+    /// 2. `_recovery_meta`, written in the transaction that truncates the WAL right after a
+    ///    successful commit. It can lag the payload by one commit but never lead it, because
+    ///    nothing writes it until the commit it describes has returned.
+    /// 3. The `_seq` fast field, scanned. Correct but expensive, available only on an index
+    ///    old enough to carry the field, and needed only when the two above have no answer.
+    ///
+    /// Taking the maximum is safe precisely because none of the three can report a sequence
+    /// Tantivy does not have, and it keeps a build transition from replaying a tail twice.
+    fn checkpoint_seq(&self, index: &str, tantivy_index: &Index) -> Result<u64, StoreError> {
+        let stamped = tantivy_checkpoint_seq(tantivy_index);
+        let persisted = self.get_persisted_committed_seq(index)?;
+
+        if let Some(seq) = stamped.into_iter().chain(persisted).max() {
+            tracing::debug!(
+                index = %index,
+                stamped = ?stamped,
+                persisted = ?persisted,
+                checkpoint_seq = seq,
+                "Resolved Tantivy checkpoint without scanning the index"
+            );
+            return Ok(seq);
+        }
+
+        // Neither cheap source exists. Either this index was last committed by a build
+        // predating both, or it has never been committed at all — a freshly created index
+        // looks identical here, and the scan is what distinguishes them.
+        let scan_start = Instant::now();
+        let scanned = self.get_highest_indexed_seq(tantivy_index)?;
+
+        if scanned == 0 {
+            // Nothing indexed, so there is no checkpoint to remember and the scan was free.
+            // This is the ordinary path for an index that was just created.
+            tracing::debug!(index = %index, "Index has no indexed documents; checkpoint is 0");
+            return Ok(0);
+        }
+
+        // Record what the scan found, so it is a one-time cost for this index rather than
+        // something every open repeats: the stamped payload only appears on the *next*
+        // commit, and an index that is read but never written again would otherwise pay the
+        // scan forever.
+        tracing::warn!(
+            index = %index,
+            checkpoint_seq = scanned,
+            elapsed_ms = scan_start.elapsed().as_millis(),
+            "No commit payload and no recovery metadata; scanned the _seq field to locate the \
+             checkpoint and backfilled it. This index will not scan again."
+        );
+
+        if let Err(e) = self.persist_committed_seq(index, scanned) {
+            tracing::warn!(
+                index = %index,
+                error = %e,
+                "Could not backfill the recovery checkpoint; the next open will scan again"
+            );
+        }
+
+        Ok(scanned)
+    }
+
+    /// Replay into Tantivy the writes redb has committed but Tantivy has not.
+    ///
+    /// redb is the ACID source of truth and the Tantivy index is derived from it, so the only
+    /// state that can be stale after an unclean stop is Tantivy's, and only by the writes redb
+    /// made durable after Tantivy's last commit. That difference is exactly the `wal_<index>`
+    /// entries above [`Self::checkpoint_seq`], and it is all this touches — both engines have
+    /// already finished their own recovery by the time it runs, and no part of the corpus is
+    /// read to work out where to start.
+    ///
+    /// The tail is small by construction: [`Self::checkpoint_committed`] deletes every WAL
+    /// entry a commit covers, so what remains is one commit interval's worth of writes at
+    /// most, whatever the size of the index underneath.
+    ///
+    /// Idempotent. Every replayed put deletes its `id` term before adding the document, so
+    /// replaying a range Tantivy already has changes nothing, which is what lets recovery
+    /// resume from a checkpoint that is behind rather than needing one that is exact.
+    ///
+    /// Returns `(replayed_count, max_wal_seq, checkpoint_seq)` so the caller can seed the
+    /// sequence counter without repeating the lookups.
     fn recover_index(
         &self,
         index: &str,
         writer: &mut IndexWriter,
-        reader: &IndexReader,
+        tantivy_index: &Index,
     ) -> Result<(usize, u64, u64), StoreError> {
         let max_wal_seq = self.get_max_wal_id_for_index(index)?;
 
         if max_wal_seq == 0 {
-            tracing::debug!(index = %index, "No WAL entries found, skipping recovery");
-            return Ok((0, 0, 0));
+            // Nothing is waiting. Read the checkpoint anyway, and fail the open if it cannot
+            // be read: it is the durable high-water mark of the sequence counter, and
+            // defaulting it to zero would hand out sequence numbers this index has already
+            // used — which a later crash reads as a tail already covered and never replays.
+            let checkpoint = self.checkpoint_seq(index, tantivy_index)?;
+            tracing::debug!(
+                index = %index,
+                checkpoint_seq = checkpoint,
+                "WAL tail is empty; index is in sync with redb"
+            );
+            return Ok((0, 0, checkpoint));
         }
 
-        // Fast path: use persisted committed seq from redb to skip Tantivy search.
-        // This avoids opening a searcher and running a TopDocs query when we already
-        // know the index is fully synced from a previous commit.
-        let last_committed_seq = match self.get_persisted_committed_seq(index)? {
-            Some(persisted_seq) if persisted_seq >= max_wal_seq => {
-                tracing::info!(
-                    index = %index,
-                    persisted_seq = persisted_seq,
-                    max_wal_seq = max_wal_seq,
-                    "Index fully synced (persisted seq >= max WAL seq), skipping Tantivy recovery"
-                );
-                return Ok((0, max_wal_seq, persisted_seq));
-            }
-            Some(persisted_seq) => {
-                tracing::info!(
-                    index = %index,
-                    persisted_seq = persisted_seq,
-                    max_wal_seq = max_wal_seq,
-                    "Recovery needed: persisted seq < max WAL seq"
-                );
-                persisted_seq
-            }
-            None => {
-                // No persisted seq (first startup or pre-migration) — fall back to Tantivy search
-                tracing::debug!(index = %index, "No persisted committed seq, falling back to Tantivy search");
-                self.get_highest_indexed_seq(reader)?
-            }
-        };
-
-        tracing::info!(
-            index = %index,
-            max_wal_seq = max_wal_seq,
-            last_committed_seq = last_committed_seq,
-            "WAL recovery check"
-        );
+        let last_committed_seq = self.checkpoint_seq(index, tantivy_index)?;
 
         // If all sequences are committed, nothing to recover
         if last_committed_seq >= max_wal_seq {
-            tracing::info!(index = %index, "All WAL sequences already committed to Tantivy");
+            tracing::info!(
+                index = %index,
+                checkpoint_seq = last_committed_seq,
+                max_wal_seq = max_wal_seq,
+                "WAL tail is already indexed; truncating it and skipping replay"
+            );
+
+            // Finish the truncation the commit that indexed these entries did not get to.
+            // A crash between the Tantivy commit and `checkpoint_committed` leaves entries
+            // behind that the checkpoint already covers, and without this they stay: the
+            // partition in `recover_indices` reads a non-empty WAL as "needs recovery", so
+            // the index would open a writer to discover there is nothing to do on *every*
+            // subsequent boot, and would only stop once it happened to take another write.
+            // The checkpoint proves these entries are in Tantivy, which is exactly the
+            // precondition `checkpoint_committed` asks of its caller.
+            if let Err(e) = self.checkpoint_committed(index, last_committed_seq) {
+                tracing::warn!(
+                    index = %index,
+                    error = %e,
+                    "Could not truncate the already-indexed WAL tail; recovery will look at it again next boot"
+                );
+            }
+
             return Ok((0, max_wal_seq, last_committed_seq));
         }
 
         // Start recovery from the first missing sequence
         let range_start = last_committed_seq + 1;
+
+        tracing::info!(
+            index = %index,
+            range_start = range_start,
+            max_wal_seq = max_wal_seq,
+            pending = max_wal_seq - last_committed_seq,
+            "Replaying the WAL tail redb committed after Tantivy's last commit"
+        );
 
         // Start a read transaction on Redb
         let read_txn = self.kv.begin_read()?;
@@ -2903,12 +3171,18 @@ impl HybridStore {
             }
         };
 
+        // The document bodies, read from the same snapshot as the WAL so the two cannot
+        // disagree about what was committed.
+        let data_table_name = format!("data_{}", index);
+        let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
+        let data_table = read_txn.open_table(data_table_def).ok();
+
         // Get schema for building documents
         let index_schema = self
             .get_schema_cached(index)?
             .unwrap_or_else(|| Arc::new(IndexSchema::default()));
 
-        let schema = reader.searcher().index().schema();
+        let schema = tantivy_index.schema();
         let id_field = schema
             .get_field("id")
             .map_err(|_| StoreError::FieldNotFound("id".to_string()))?;
@@ -2933,21 +3207,51 @@ impl HybridStore {
         // Zero-copy WAL replay: iterate range directly, process each entry in-place.
         // AccessGuard::value() returns &[u8] pointing directly into redb's mmap'd pages,
         // avoiding the need to allocate a Vec<u8> for every entry.
+        //
+        // Each id is applied once. A tail that touched the same document repeatedly — the
+        // shape a bursty updater produces, and the one most likely to be long — collapses to
+        // one Tantivy operation per distinct id, because every entry for that id resolves to
+        // the same committed row. Applying at the first occurrence rather than the last is
+        // what keeps the mid-replay checkpoints meaningful: everything below the stamped
+        // sequence really has been applied.
         let mut replayed_count = 0;
         let mut replayed_since_commit = 0u64;
-        for result in wal_table.range(range_start..)? {
+        let mut skipped_duplicates = 0usize;
+        let mut applied_ids: HashSet<String> = HashSet::new();
+
+        for result in wal_table.range(range_start..=max_wal_seq)? {
             let (seq_guard, wal_data_guard) = result?;
             let seq_id = seq_guard.value();
-            let wal_op: WalOp = serde_json::from_slice(wal_data_guard.value())
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            let id = decode_wal_entry(wal_data_guard.value())?;
 
-            match wal_op {
-                WalOp::Put { id, json_blob } => {
+            if !applied_ids.insert(id.clone()) {
+                skipped_duplicates += 1;
+                replayed_count += 1;
+                replayed_since_commit += 1;
+                continue;
+            }
+
+            // The committed state of this id decides the operation. A row means the document
+            // stands as written; no row means it was deleted. Nothing else can be true — a put
+            // always writes the row and a delete always removes it, in the same transaction
+            // that appended the WAL entry being read here.
+            let stored = match data_table.as_ref() {
+                Some(table) => table.get(id.as_str())?,
+                None => None,
+            };
+
+            match stored {
+                Some(doc_guard) => {
+                    let stored_doc: StoredDocOwned = serde_json::from_slice(doc_guard.value())
+                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
                     let mut tantivy_doc = tantivy::TantivyDocument::default();
                     tantivy_doc.add_text(id_field, &id);
                     tantivy_doc.add_u64(seq_field, seq_id);
 
-                    if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
+                    if let Some(json_obj) =
+                        stored_doc.json_blob.as_ref().and_then(|v| v.as_object())
+                    {
                         for (field_name, field_def) in &index_schema.fields {
                             if !field_def.indexed || field_def.is_shadow || field_name == "id" {
                                 continue;
@@ -2970,7 +3274,7 @@ impl HybridStore {
                     writer.delete_term(term);
                     writer.add_document(tantivy_doc)?;
                 }
-                WalOp::Delete { id } => {
+                None => {
                     let term = tantivy::Term::from_field_text(id_field, &id);
                     writer.delete_term(term);
                 }
@@ -2982,9 +3286,11 @@ impl HybridStore {
             // Periodic commit during replay, on a much coarser threshold than steady-state
             // writes: each commit seals a segment and fsyncs, so replaying a large WAL at the
             // normal batch threshold would produce hundreds of tiny segments and the merge
-            // storm that follows. Checkpointing after each commit is what makes these
-            // worthwhile — a crash mid-recovery resumes from the last checkpoint instead of
-            // replaying the whole tail again.
+            // storm that follows. Stamping the sequence into each one is what makes them
+            // worth taking — a crash mid-recovery resumes from the last stamp instead of
+            // replaying the tail from the start. Nothing is written to redb here; the WAL is
+            // being iterated inside an open read transaction, and the stamp already records
+            // the progress that a redb write would have.
             if replayed_since_commit >= recovery_commit_threshold {
                 tracing::info!(
                     index = %index,
@@ -2993,18 +3299,8 @@ impl HybridStore {
                     checkpoint_seq = seq_id,
                     "Recovery: threshold commit during WAL replay"
                 );
-                writer.commit()?;
+                commit_writer_at(writer, seq_id)?;
                 replayed_since_commit = 0;
-
-                // Persist progress only — the WAL is not truncated here because we are
-                // iterating it inside an open read transaction.
-                if let Err(e) = self.persist_committed_seq(index, seq_id) {
-                    tracing::warn!(
-                        index = %index,
-                        error = %e,
-                        "Failed to checkpoint recovery progress; replay will restart from the previous checkpoint"
-                    );
-                }
             }
 
             // Log progress every 1000 documents
@@ -3034,6 +3330,8 @@ impl HybridStore {
         tracing::info!(
             index = %index,
             replayed_count = replayed_count,
+            distinct_documents = applied_ids.len(),
+            skipped_duplicates = skipped_duplicates,
             uncommitted = replayed_since_commit,
             "WAL recovery completed - replayed missing operations"
         );
@@ -3601,19 +3899,13 @@ impl HybridStore {
 
         let writer_elapsed = writer_start.elapsed();
 
-        // WAL Recovery: Check if there are any operations in the WAL that need to be replayed
-        // This happens when the index was opened after a crash or restart
+        // Bring Tantivy up to what redb has already made durable. Normally this reads two
+        // numbers and stops. No reader is opened for it: the checkpoint comes from the commit
+        // payload in `meta.json`, so nothing here has to touch a searcher, and on a large
+        // index building one is real work that the query path would only have to redo.
         let recovery_start = Instant::now();
-        // Manual reload: this reader is local to recovery and is only read before any commit
-        // (`get_highest_indexed_seq`). See `get_reader` for why no reader here watches the
-        // directory.
-        let reader = tantivy_index
-            .reader_builder()
-            .reload_policy(tantivy::ReloadPolicy::Manual)
-            .try_into()?;
-
         let (replayed_count, max_wal_seq, last_committed_seq) =
-            self.recover_index(index, &mut writer, &reader)?;
+            self.recover_index(index, &mut writer, &tantivy_index)?;
 
         if replayed_count > 0 {
             tracing::info!(
@@ -3676,8 +3968,14 @@ impl HybridStore {
             .insert(index.to_string(), Arc::clone(&writer_arc));
         self.fields_cache.insert(index.to_string(), fields.clone());
 
-        // Initialize sequence counter for this index using values already computed
-        // by recover_index — avoids redundant lookups.
+        // Seed the sequence counter from what `recover_index` already read.
+        //
+        // Both terms matter. The WAL tail is empty on every clean restart, because the last
+        // commit truncated it, so `max_wal_seq` alone would restart numbering from zero and
+        // hand out sequences this index has already used — and the next crash would then find
+        // a checkpoint far *above* the reissued tail and skip replaying it, dropping those
+        // documents from the search index while redb still held them. The checkpoint is the
+        // durable high-water mark that keeps numbering monotonic across restarts.
         self.current_seq
             .entry(index.to_string())
             .or_insert_with(|| {
@@ -3869,7 +4167,17 @@ impl HybridStore {
                 tracing::error!(index = %index, "Writer mutex was poisoned during commit, recovering");
                 poisoned.into_inner()
             });
-            writer.commit()?;
+            // Stamp the sequence into the commit itself, so the checkpoint lands atomically
+            // with the segments rather than in a second write that a crash can separate them
+            // from. Writes that arrive between the capture above and this call may ride along
+            // in the commit without being covered by the stamp; that direction is safe,
+            // costing at most one redundant replay of an idempotent operation.
+            match committed_seq {
+                Some(seq) => commit_writer_at(&mut writer, seq)?,
+                None => {
+                    writer.commit()?;
+                }
+            }
             // Explicit drop to release lock before any other operations
             drop(writer);
         }
@@ -4009,9 +4317,12 @@ impl HybridStore {
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
         let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
 
-        // Write to WAL first
-        let wal_data =
-            serde_json::to_vec(&op).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        // The WAL records which document changed, not what it changed to: the `data_<index>`
+        // row written in this same transaction is the document, and recovery reads it there.
+        let wal_data = encode_wal_entry(match &op {
+            WalOp::Put { id, .. } => id,
+            WalOp::Delete { id } => id,
+        });
 
         // Evolve schema if new fields are present (declare outside transaction scope)
         let mut evolved_schema = None;
@@ -4715,6 +5026,24 @@ impl HybridStore {
         Ok((schema, outcome))
     }
 
+    /// How many WAL entries are waiting for Tantivy to catch up on this index.
+    ///
+    /// This is the quantity that decides recovery cost: it is what a replay would have to
+    /// read, and zero is what lets startup skip the index without opening Tantivy at all. In
+    /// steady state it returns to zero at every commit, so a value that keeps climbing means
+    /// commits are not keeping up with writes.
+    pub fn pending_wal_entries(&self, index: &str) -> Result<u64, StoreError> {
+        let wal_table_name = format!("wal_{}", index);
+        let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
+
+        let read_txn = self.kv.begin_read()?;
+        match read_txn.open_table(wal_table_def) {
+            Ok(table) => Ok(table.len()?),
+            // No table at all: the index has never been written to.
+            Err(_) => Ok(0),
+        }
+    }
+
     /// Get max WAL ID for a specific index
     /// Uses B-tree last() for O(log n) access instead of O(n) full table scan
     fn get_max_wal_id_for_index(&self, index: &str) -> Result<u64, StoreError> {
@@ -4746,37 +5075,11 @@ impl HybridStore {
         }
     }
 
-    /// Check if an index is fully synced (all WAL entries committed to Tantivy).
-    /// This allows us to skip expensive Tantivy index open for indices that don't need recovery.
-    /// Returns true if persisted_committed_seq >= max_wal_seq, meaning no uncommitted WAL entries exist.
-    fn is_index_fully_synced(&self, index: &str) -> Result<bool, StoreError> {
-        let persisted_seq = self.get_persisted_committed_seq(index)?;
-        let max_wal_seq = self.get_max_wal_id_for_index(index)?;
-
-        match persisted_seq {
-            Some(committed) => {
-                let is_synced = committed >= max_wal_seq;
-                if is_synced {
-                    tracing::info!(
-                        index = %index,
-                        committed_seq = committed,
-                        max_wal_seq = max_wal_seq,
-                        "Index is fully synced, can skip Tantivy open"
-                    );
-                }
-                Ok(is_synced)
-            }
-            None => {
-                // No persisted seq (first startup or pre-migration) - not fully synced
-                tracing::debug!(index = %index, "No persisted committed seq, index not fully synced");
-                Ok(false)
-            }
-        }
-    }
-
-    /// Persist the last committed Tantivy sequence for an index to the recovery metadata table.
-    /// Called after each successful commit_index() so that on restart we can skip
-    /// Tantivy recovery checks for fully-synced indices.
+    /// Record `seq` in the recovery metadata table on its own.
+    ///
+    /// Only the backfill in [`Self::checkpoint_seq`] uses this. The steady-state path writes
+    /// the same table through [`Self::checkpoint_committed`], together with the WAL truncation
+    /// the checkpoint authorises, so that the two can never be separated by a crash.
     fn persist_committed_seq(&self, index: &str, seq: u64) -> Result<(), StoreError> {
         let mut write_txn = self.kv.begin_write()?;
         {
@@ -4789,7 +5092,10 @@ impl HybridStore {
     }
 
     /// Read the persisted last committed sequence for an index from the recovery metadata table.
-    /// Returns None if no record exists (first startup or pre-migration data).
+    ///
+    /// The checkpoint now travels inside Tantivy's commit payload, so this is the fallback
+    /// [`Self::checkpoint_seq`] consults for an index whose last commit predates the stamp.
+    /// Returns `None` when no row exists.
     fn get_persisted_committed_seq(&self, index: &str) -> Result<Option<u64>, StoreError> {
         let read_txn = self.kv.begin_read()?;
         match read_txn.open_table(TABLE_RECOVERY_META) {
@@ -5219,6 +5525,7 @@ impl HybridStore {
         let (top_docs, total_hits) = if let Some(sort_spec) = _sort {
             // Get field from schema to check type and FAST flag
             let schema = tantivy_index.schema();
+
             let field = schema
                 .get_field(&sort_spec.field)
                 .map_err(|_| StoreError::FieldNotFound(sort_spec.field.clone()))?;
@@ -5633,11 +5940,9 @@ impl HybridStore {
                         json_blob
                     };
 
-                    let wal_bytes = serde_json::to_vec(&WalOp::Put {
-                        id: id.clone(),
-                        json_blob: filtered_json_blob.clone(),
-                    })
-                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                    // Id only: the document goes to `data_<index>` in the same transaction,
+                    // which is where recovery reads it from.
+                    let wal_bytes = encode_wal_entry(&id);
 
                     let doc_bytes = serde_json::to_vec(&StoredDoc {
                         json_blob: filtered_json_blob.as_ref(),
@@ -5654,8 +5959,7 @@ impl HybridStore {
                     });
                 }
                 WalOp::Delete { id } => {
-                    let wal_bytes = serde_json::to_vec(&WalOp::Delete { id: id.clone() })
-                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                    let wal_bytes = encode_wal_entry(&id);
 
                     prepared_ops.push(PreparedOp {
                         wal_bytes,
@@ -6178,12 +6482,19 @@ impl HybridStore {
         Ok(index_names)
     }
 
-    /// Phase 1 of startup: recover every index that has uncommitted WAL entries.
+    /// Phase 1 of startup: replay the WAL tail of every index that has one.
     ///
-    /// This is the only part of startup that must complete before queries are trustworthy —
-    /// an index with an unreplayed WAL tail answers searches without its most recent writes.
-    /// Indices already synced (their persisted checkpoint covers the whole WAL) are skipped
-    /// entirely, which is a metadata read rather than a Tantivy open.
+    /// redb and Tantivy have each finished their own recovery before this runs — redb by
+    /// pointing back at its last commit root, Tantivy by opening the segments its last commit
+    /// published. Neither costs time proportional to the data it holds. All that is left is
+    /// the gap between them, and this closes it.
+    ///
+    /// Finding the indices in that gap costs one redb read transaction for the whole shard.
+    /// A commit deletes the WAL entries it covers, so a non-empty `wal_<index>` is exactly
+    /// the set of writes Tantivy may be missing, and an empty one means the index is in sync:
+    /// no Tantivy open, no metadata lookup, no searcher. That is what keeps boot bounded by
+    /// how much was in flight when the process stopped rather than by how much data the node
+    /// holds — an idle 30 TB index is one B-tree descent, the same as an empty one.
     ///
     /// Returns the plan for phase 2. Recovery and warmup are deliberately split: recovery
     /// is a correctness requirement and blocks, warmup is a latency optimization and does
@@ -6197,31 +6508,30 @@ impl HybridStore {
             return Ok(WarmupPlan::default());
         }
 
-        // Partition on the persisted checkpoint. This costs two small redb reads per index
-        // and avoids opening Tantivy for indices that do not need it.
+        // One read transaction for the whole partition. Per-index transactions were a long
+        // tail of small redb operations at high index counts, and there is nothing to gain
+        // from them: this is a point-in-time question, and a single snapshot answers it for
+        // every index at once.
         let mut needs_recovery = Vec::new();
-        for index_name in &index_names {
-            match self.is_index_fully_synced(index_name) {
-                Ok(true) => {
+        {
+            let read_txn = self.kv.begin_read()?;
+            for index_name in &index_names {
+                let wal_table_name = format!("wal_{}", index_name);
+                let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
+                let has_tail = match read_txn.open_table(wal_table_def) {
+                    // `last()` descends to the rightmost leaf; it does not scan the table.
+                    Ok(table) => table.last()?.is_some(),
+                    // No table at all: the index has never been written to.
+                    Err(_) => false,
+                };
+
+                if has_tail {
+                    self.warmup_states
+                        .insert(index_name.clone(), IndexWarmupState::Recovering);
+                    needs_recovery.push(index_name.clone());
+                } else {
                     self.warmup_states
                         .insert(index_name.clone(), IndexWarmupState::Cold);
-                }
-                Ok(false) => {
-                    self.warmup_states
-                        .insert(index_name.clone(), IndexWarmupState::Recovering);
-                    needs_recovery.push(index_name.clone());
-                }
-                Err(e) => {
-                    // Cannot tell: assume the worst and replay. Recovery is idempotent, so
-                    // the cost of a false positive is time, not correctness.
-                    tracing::warn!(
-                        index = %index_name,
-                        error = %e,
-                        "Failed to check sync status, treating as needs recovery"
-                    );
-                    self.warmup_states
-                        .insert(index_name.clone(), IndexWarmupState::Recovering);
-                    needs_recovery.push(index_name.clone());
                 }
             }
         }
@@ -6229,49 +6539,46 @@ impl HybridStore {
         tracing::info!(
             total = index_names.len(),
             needs_recovery = needs_recovery.len(),
-            "Phase 1: recovering indices with uncommitted WAL entries"
+            partition_ms = start.elapsed().as_millis(),
+            "Phase 1: replaying the WAL tail of indices redb committed past Tantivy"
         );
 
         let mut recovered = Vec::new();
         let mut failed = Vec::new();
 
         if !needs_recovery.is_empty() {
-            // Recovery is CPU- and IO-heavy per index, so cap parallelism at the core count.
-            // Each recovering index holds a Tantivy writer with its own indexing arena.
-            let max_parallel = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(4)
-                .min(needs_recovery.len())
-                .max(1);
             let results = std::sync::Mutex::new(Vec::new());
 
+            // Every index that needs replay gets a thread, and `RECOVERY_GATE` decides how
+            // many of them hold an `IndexWriter` at once. The threads are the cheap part; the
+            // arenas are what has to be rationed, and rationing them here rather than by
+            // chunking means a slow replay does not hold back the rest of its chunk.
             std::thread::scope(|scope| {
-                for chunk in needs_recovery.chunks(max_parallel) {
-                    let handles: Vec<_> = chunk
-                        .iter()
-                        .map(|index_name| {
-                            let results = &results;
-                            scope.spawn(move || {
-                                // get_or_create_index runs recover_index as a side effect.
-                                let outcome = self.get_or_create_index(index_name);
-                                results
-                                    .lock()
-                                    .unwrap()
-                                    .push((index_name.clone(), outcome.is_ok()));
-                                if let Err(e) = outcome {
-                                    tracing::warn!(
-                                        index = %index_name,
-                                        error = %e,
-                                        "Recovery failed, index will retry on first access"
-                                    );
-                                }
-                            })
+                let handles: Vec<_> = needs_recovery
+                    .iter()
+                    .map(|index_name| {
+                        let results = &results;
+                        scope.spawn(move || {
+                            let _permit = RECOVERY_GATE.acquire();
+                            // get_or_create_index runs recover_index as a side effect.
+                            let outcome = self.get_or_create_index(index_name);
+                            results
+                                .lock()
+                                .unwrap()
+                                .push((index_name.clone(), outcome.is_ok()));
+                            if let Err(e) = outcome {
+                                tracing::warn!(
+                                    index = %index_name,
+                                    error = %e,
+                                    "Recovery failed, index will retry on first access"
+                                );
+                            }
                         })
-                        .collect();
+                    })
+                    .collect();
 
-                    for handle in handles {
-                        let _ = handle.join();
-                    }
+                for handle in handles {
+                    let _ = handle.join();
                 }
             });
 
@@ -6339,8 +6646,20 @@ impl HybridStore {
         let mut warmed = 0usize;
         let mut total_segments = 0usize;
         let mut total_docs = 0u64;
+        let mut skipped = 0usize;
 
-        for index in indices {
+        for (position, index) in indices.iter().enumerate() {
+            // Warming faults term dictionaries in from mmap, so on a multi-terabyte shard it
+            // is sustained random IO — and every shard on the node is doing it at the same
+            // time. Past this budget the storm costs the queries that are already arriving
+            // more than it saves the ones that have not. Whatever is left warms on first
+            // access through the same path, which is where an index nobody queries should
+            // have been paying anyway.
+            if start.elapsed() >= WARMUP_BUDGET {
+                skipped = indices.len() - position;
+                break;
+            }
+
             match self.warm_index(index) {
                 Ok(Some(stats)) => {
                     warmed += 1;
@@ -6361,9 +6680,20 @@ impl HybridStore {
             }
         }
 
+        if skipped > 0 {
+            tracing::warn!(
+                requested = indices.len(),
+                warmed = warmed,
+                skipped = skipped,
+                budget_secs = WARMUP_BUDGET.as_secs(),
+                "Phase 2 hit its time budget; the remaining indices will warm on first query"
+            );
+        }
+
         tracing::info!(
             requested = indices.len(),
             warmed = warmed,
+            skipped = skipped,
             segments = total_segments,
             documents = total_docs,
             elapsed_ms = start.elapsed().as_millis(),
@@ -6721,6 +7051,83 @@ mod index_dir_tests {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// An id-only WAL entry round-trips, whatever the id looks like.
+    ///
+    /// The empty id and one beginning with `{` are the two that could collide with the legacy
+    /// format if the tag byte were ever dropped in favour of sniffing the payload.
+    #[test]
+    fn a_wal_entry_round_trips_any_document_id() {
+        for id in ["doc-1", "", "{not-json", "ünïcodé", "a b\tc", "\u{1F600}"] {
+            let encoded = encode_wal_entry(id);
+            assert_eq!(encoded[0], WAL_ENTRY_ID_ONLY, "entry must carry its tag");
+            assert_eq!(
+                decode_wal_entry(&encoded).expect("decode"),
+                id,
+                "id must survive the round trip"
+            );
+        }
+    }
+
+    /// A WAL entry written by the previous build still decodes.
+    ///
+    /// Those entries are whole `WalOp` JSON values, and an upgrade can find a tail of them left
+    /// behind by the process that died. Only the id is taken — the body they carry is ignored in
+    /// favour of the `data_<index>` row — so one replay path serves both formats and no
+    /// migration of the tail is needed.
+    #[test]
+    fn a_legacy_wal_entry_still_yields_its_document_id() {
+        let legacy_put = serde_json::to_vec(&WalOp::Put {
+            id: "doc-7".to_string(),
+            json_blob: Some(serde_json::json!({ "title": "written by the old build" })),
+        })
+        .expect("serialize legacy put");
+        assert_eq!(
+            decode_wal_entry(&legacy_put).expect("decode legacy put"),
+            "doc-7"
+        );
+
+        let legacy_delete = serde_json::to_vec(&WalOp::Delete {
+            id: "doc-8".to_string(),
+        })
+        .expect("serialize legacy delete");
+        assert_eq!(
+            decode_wal_entry(&legacy_delete).expect("decode legacy delete"),
+            "doc-8"
+        );
+
+        // Legacy entries are JSON objects, so they cannot be mistaken for the tagged format.
+        assert_ne!(legacy_put[0], WAL_ENTRY_ID_ONLY);
+        assert_ne!(legacy_delete[0], WAL_ENTRY_ID_ONLY);
+    }
+
+    /// An id-only entry is a fraction of the bytes the old format wrote.
+    ///
+    /// This is the point of the change: the document was already being written to
+    /// `data_<index>` in the same transaction, so the copy in the WAL doubled what every write
+    /// serialised and fsynced for nothing.
+    #[test]
+    fn a_wal_entry_no_longer_carries_the_document() {
+        let body = serde_json::json!({
+            "title": "a representative document",
+            "body": "x".repeat(1024),
+            "tags": ["alpha", "beta", "gamma"],
+        });
+        let legacy = serde_json::to_vec(&WalOp::Put {
+            id: "doc-1".to_string(),
+            json_blob: Some(body),
+        })
+        .expect("serialize legacy put");
+        let current = encode_wal_entry("doc-1");
+
+        assert_eq!(current.len(), 6, "one tag byte plus the id");
+        assert!(
+            current.len() * 50 < legacy.len(),
+            "an id-only entry should be orders of magnitude smaller: {} vs {}",
+            current.len(),
+            legacy.len()
+        );
+    }
 
     /// A field type serializes under the name every other surface calls it.
     ///
