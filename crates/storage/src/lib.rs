@@ -559,11 +559,18 @@ pub struct SearchOutcome {
     /// taken by relevance and alphabetised afterwards, so the answer is the alphabetical order
     /// of the top-scoring `limit * 2` rather than of everything that matched. Separate from
     /// [`Self::discarded`] because the two mean different things and a caller acts on them
-    /// differently — a discarded clause means the query ran wider than it was written, while
+    /// differently — a discarded clause means the query that ran is not the one written, while
     /// this means the query ran as written and the *order* is a sample.
     ///
     /// `None` whenever the order is exact, which is every other sort and every unsorted search.
     pub approximate_sort: Option<String>,
+    /// Every clause was discarded, so the query that ran was empty and matched nothing.
+    ///
+    /// Distinct from a `discarded` list that still left something to run: those hits answer a
+    /// different question, while these are not an answer at all. The zero reported alongside
+    /// this says nothing about the data — read as "no document matches", it is a claim about a
+    /// query that never ran.
+    pub emptied: bool,
 }
 
 impl SearchOutcome {
@@ -575,12 +582,13 @@ impl SearchOutcome {
     /// A count with no documents attached, for `limit = 0`.
     ///
     /// Never approximate: a count is over every match, and no order was produced to approximate.
-    fn counted(total_hits: usize, discarded: Vec<String>) -> Self {
+    fn counted(total_hits: usize, discarded: Vec<String>, emptied: bool) -> Self {
         Self {
             hits: Vec::new(),
             total_hits,
             discarded,
             approximate_sort: None,
+            emptied,
         }
     }
 }
@@ -676,7 +684,7 @@ fn is_recovered_ambiguity(err: &tantivy::query::QueryParserError) -> bool {
 /// same field, the two notes are one string and collapse in [`describe_discarded_all`].
 fn unknown_field_note(field: &str) -> String {
     format!(
-        "unknown field '{field}' — the clause naming it had no effect, so this result set does \
+        "unknown field '{field}' — the clause naming it was dropped, so this result set does \
          not match what the query asked for"
     )
 }
@@ -684,9 +692,18 @@ fn unknown_field_note(field: &str) -> String {
 /// Note for a field present in the schema but not indexed, and so not queryable.
 fn non_indexed_field_note(field: &str) -> String {
     format!(
-        "field '{field}' exists but is not indexed, so the clause naming it had no effect and \
+        "field '{field}' exists but is not indexed, so the clause naming it was dropped and \
          this result set does not match what the query asked for"
     )
+}
+
+/// Whether the lenient parse left nothing to run.
+///
+/// Tantivy trims discarded clauses out of the AST and returns `EmptyQuery` when that removes
+/// every one of them. It matches no documents, which makes this the difference between having
+/// answered a different question and having asked nothing at all.
+fn nothing_survived(parsed: &dyn tantivy::query::Query) -> bool {
+    parsed.is::<tantivy::query::EmptyQuery>()
 }
 
 fn describe_discarded(err: &tantivy::query::QueryParserError) -> String {
@@ -2901,6 +2918,14 @@ impl HybridStore {
                 tracing::debug!(index = %index, "No pending operations, skipping commit during shutdown");
             }
         }
+
+        // Release what holds file handles, rather than leaving it to whenever the last `Arc`
+        // to this store happens to drop: `readers` holds every open index's mmaps and
+        // `writers` holds tantivy's `.tantivy-writer.lock` flock. Dropping an `IndexWriter`
+        // joins its merge threads, so that cost lands here — inside the caller's shutdown
+        // timeout — instead of on whichever thread outlives it.
+        self.writers.clear();
+        self.readers.clear();
 
         // Clear all caches
         self.schema_cache.clear();
@@ -5431,7 +5456,7 @@ impl HybridStore {
                 let exists = self.get_batch_by_keys(index, &[id_value])?.len();
                 let total_hits = if exists > 0 { 1 } else { 0 };
                 // No parse happens on this path, so nothing can be discarded.
-                return Ok(SearchOutcome::counted(total_hits, Vec::new()));
+                return Ok(SearchOutcome::counted(total_hits, Vec::new(), false));
             }
 
             let (normalized_query, prefix_notes, query_parser) =
@@ -5440,14 +5465,24 @@ impl HybridStore {
             let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
             discarded.extend(prefix_notes);
 
+            let emptied = !discarded.is_empty() && nothing_survived(parsed_query.as_ref());
+
             if !discarded.is_empty() {
-                // At `warn`: the count below answers a narrower query than the caller wrote.
-                warn!(
-                    index = %index,
-                    query = %normalized_query,
-                    discarded = ?discarded,
-                    "Count-only: query parser discarded clauses; the count is wider than the query"
-                );
+                if emptied {
+                    warn!(
+                        index = %index,
+                        query = %normalized_query,
+                        discarded = ?discarded,
+                        "Count-only: every clause was discarded; nothing was left to run and the count is zero"
+                    );
+                } else {
+                    warn!(
+                        index = %index,
+                        query = %normalized_query,
+                        discarded = ?discarded,
+                        "Count-only: query parser discarded clauses; the count does not answer the query as written"
+                    );
+                }
             }
 
             let count_collector = tantivy::collector::Count;
@@ -5459,7 +5494,7 @@ impl HybridStore {
                 "Count-only search completed (limit=0)"
             );
 
-            return Ok(SearchOutcome::counted(total_hits, discarded));
+            return Ok(SearchOutcome::counted(total_hits, discarded, emptied));
         }
 
         // Check if this is an exact ID lookup (id:field or shadow field) that can bypass Tantivy
@@ -5531,6 +5566,7 @@ impl HybridStore {
                 total_hits,
                 discarded: Vec::new(),
                 approximate_sort: None,
+                emptied: false,
             });
         }
 
@@ -5543,14 +5579,28 @@ impl HybridStore {
         let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
         discarded.extend(prefix_notes);
 
+        let emptied = !discarded.is_empty() && nothing_survived(parsed_query.as_ref());
+
         if !discarded.is_empty() {
-            // At `warn`: the results below answer a wider query than the caller wrote.
-            warn!(
-                index = %index,
-                query = %normalized_query,
-                discarded = ?discarded,
-                "Query parser discarded clauses; results are wider than the query"
-            );
+            // A dropped clause does not move the result set one way: it widens a conjunction,
+            // narrows a disjunction, and empties a query that had nothing else to run. Only the
+            // last is knowable from here, and it is the one worth separating — the zero an
+            // emptied query reports is not a negative answer, it is no answer at all.
+            if emptied {
+                warn!(
+                    index = %index,
+                    query = %normalized_query,
+                    discarded = ?discarded,
+                    "Every clause was discarded; nothing was left to run and the result set is empty"
+                );
+            } else {
+                warn!(
+                    index = %index,
+                    query = %normalized_query,
+                    discarded = ?discarded,
+                    "Query parser discarded clauses; the results do not answer the query as written"
+                );
+            }
         }
 
         // Flag set when sorting by a string field (post-fetch alphabetic sort).
@@ -5762,7 +5812,7 @@ impl HybridStore {
         };
 
         if is_empty {
-            return Ok(SearchOutcome::counted(total_hits, discarded));
+            return Ok(SearchOutcome::counted(total_hits, discarded, emptied));
         }
 
         // Step 1: Extract document IDs from Tantivy results using direct stored-field access
@@ -5925,6 +5975,7 @@ impl HybridStore {
             total_hits,
             discarded,
             approximate_sort,
+            emptied,
         })
     }
 

@@ -199,23 +199,25 @@ curl -s -X POST http://localhost:9480/api/books/search \
 ```
 
 > **Dropped clauses (`_discarded_clauses`):** a clause the query parser cannot interpret is
-> dropped and the rest of the query runs. In a conjunction that widens the result set; in a
-> negation it disables the exclusion. Neither is visible in the hits, so every dropped clause is
-> reported:
+> dropped and whatever is left runs. In a conjunction that widens the result set; in a
+> disjunction it narrows it; in a negation it disables the exclusion. None of that is visible in
+> the hits, so every dropped clause is reported:
 >
 > ```json
 > {
 >   "hits": [ /* ... */ ],
 >   "total_hits": 42,
 >   "_discarded_clauses": [
->     "unknown field 'athor' — the clause naming it had no effect, so this result set does not match what the query asked for"
+>     "unknown field 'athor' — the clause naming it was dropped, so this result set does not match what the query asked for"
 >   ]
 > }
 > ```
 >
 > The key is absent on a clean parse rather than present and empty, so testing for its presence is
 > enough. Execution stays lenient here — the hits are returned alongside the note, because a person
-> reading a result page can see it. The MCP tools make the opposite choice and fail the call, since
+> reading a result page can see it. The one exception is a query with *nothing* left after the
+> drop, which is refused with `400` instead: there are no hits to attach the note to, and the zero
+> it would otherwise report cannot be told apart from a search that ran and matched nothing. The MCP tools make the opposite choice and fail the call, since
 > an agent presents rows as fact. Causes include an unknown or unindexed field name, a value that
 > does not match its field's type, an unsupported form such as `field:*`, a lowercase `to` or `in`
 > where the keyword was meant, and an inline `return` or `sort` naming a field the index does not

@@ -248,6 +248,33 @@ async fn federated_search_refuses_rather_than_merging_widened_results() {
     );
 }
 
+/// The exception to the rule below: when *every* clause is discarded there are no hits to
+/// attach the list to. The query that reached the engine was empty, so the zero it produces is
+/// not a negative result — returned as a 200 it reads as "no document matches", which is a
+/// claim about data made by a query that never ran.
+#[tokio::test]
+async fn the_http_api_refuses_a_query_whose_every_clause_was_discarded() {
+    let node = TestNode::start().await;
+    node.seed("docs").await;
+
+    let (status, body) = node.http_search("docs", "nosuch:x").await;
+    assert_eq!(
+        status, 400,
+        "a query with nothing left to run must be refused, not answered: {body}"
+    );
+
+    let text = body.to_string();
+    assert!(
+        text.contains("nosuch"),
+        "the refusal must name the clause that left nothing behind, got: {text}"
+    );
+
+    // The same clause alongside one the engine can run still answers, because those hits are a
+    // real result set — just not the one asked for.
+    let (status, body) = node.http_search("docs", "tag:active AND nosuch:x").await;
+    assert_eq!(status, 200, "a partial drop still answers: {body}");
+}
+
 /// The HTTP API returns the hits and attaches the list rather than failing the request.
 #[tokio::test]
 async fn the_http_api_reports_discarded_clauses_instead_of_refusing() {

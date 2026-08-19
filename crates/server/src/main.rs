@@ -846,7 +846,7 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!(
-        elapsed_secs = shutdown_elapsed.as_secs(),
+        elapsed_ms = shutdown_elapsed.as_millis(),
         "Shutdown complete - process exiting cleanly"
     );
     Ok(())

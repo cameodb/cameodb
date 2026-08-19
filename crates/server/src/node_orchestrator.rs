@@ -1108,6 +1108,14 @@ pub enum OrchestratorError {
     /// reported in the first place.
     #[error("cannot sort by '{field}': {reason}")]
     UnsortableField { field: String, reason: String },
+
+    /// Every clause was discarded, so the query that reached the engine was empty.
+    ///
+    /// A 400 for the reason [`Self::UnsortableField`] is one: the engine cannot run what was
+    /// asked. Answered as a 200 it is a zero indistinguishable from a search that ran and
+    /// matched nothing, which is the reading that makes it dangerous.
+    #[error("no clause of this query can run against this index: {notes}")]
+    UnrunnableQuery { notes: String },
 }
 
 // Serialize/Deserialize via display string to satisfy remote message bounds without
@@ -1272,6 +1280,9 @@ impl From<OrchestratorError> for RemoteError {
             OrchestratorError::UnsortableField { field, reason } => {
                 RemoteError::InvalidInput(format!("cannot sort by '{field}': {reason}"))
             }
+            OrchestratorError::UnrunnableQuery { notes } => RemoteError::InvalidInput(format!(
+                "no clause of this query can run against this index: {notes}"
+            )),
         }
     }
 }
@@ -1316,6 +1327,13 @@ pub struct SearchReply {
     /// the same either way.
     #[serde(default)]
     pub approximate_sort: Option<String>,
+    /// Nothing survived the parse on this shard; see [`storage::SearchOutcome::emptied`].
+    ///
+    /// Defaulted for the same reason as `discarded`. A peer that does not send it reads as
+    /// "the query ran", which keeps an older peer answering rather than having its hits
+    /// refused on a claim it never made.
+    #[serde(default)]
+    pub emptied: bool,
 }
 
 /// Client operation messages for RouterActor.
@@ -2512,9 +2530,13 @@ impl OrchestratorEngine {
         // approximate order describes the whole answer. A shard with no built index reports
         // nothing, hence first-wins rather than agreement.
         let mut approximate_sort: Option<String> = None;
+        // One shard is enough. Shards can hold different schemas for the same index, and a
+        // query that one of them could not run at all is not answered by the ones that could.
+        let mut emptied = false;
         for (shard_id, result) in shard_results {
             match result {
                 Ok(r) => {
+                    emptied |= r.emptied;
                     total_hits_sum += r.total_hits;
                     for hit in r.hits {
                         results.push((shard_id, hit.score, hit.doc));
@@ -2585,6 +2607,15 @@ impl OrchestratorEngine {
             },
         });
         attach_shard_errors(&mut response, errors);
+        // Refuse instead of answering. An emptied query ran as nothing, so the zero it
+        // produces is not a negative result — reported as a 200 it cannot be told apart from
+        // "no document matches", which is the same confusion an unrunnable sort caused.
+        if emptied {
+            return Err(OrchestratorError::UnrunnableQuery {
+                notes: discarded.join("; "),
+            });
+        }
+
         discarded.extend(unknown_projection_fields(&schema, fields));
         attach_discarded(&mut response, discarded);
         attach_approximate_sort(&mut response, approximate_sort);
@@ -3306,6 +3337,7 @@ impl MicroshardActor {
             total_hits: outcome.total_hits,
             discarded: outcome.discarded,
             approximate_sort: outcome.approximate_sort,
+            emptied: outcome.emptied,
         })
     }
 
@@ -3587,6 +3619,7 @@ impl Message<SearchRequest> for MicroshardActor {
                 total_hits: result.total_hits,
                 discarded: result.discarded,
                 approximate_sort: result.approximate_sort,
+                emptied: result.emptied,
             })
             .map_err(RemoteError::from)
     }
@@ -6904,32 +6937,61 @@ impl NodeOrchestrator {
         }))
         .await;
 
+        // Take every store out first, then republish the engine snapshot before shutting any
+        // of them down. The worker pool routes through a *clone* of each shard actor
+        // (`OrchestratorEngine.shards`), and a cloned actor carries its own
+        // `Arc<HybridStore>` — so leaving the snapshot in place keeps every shard's index
+        // mmaps, tantivy writer lock and redb database alive past the shutdown that reports
+        // releasing them. Nothing routes through it at this point: HTTP drained a phase ago.
+        let mut taken: Vec<(Uuid, Arc<HybridStore>)> = Vec::new();
+        for (shard_id, shard) in self.shards.iter_mut() {
+            match shard.store.take() {
+                Some(store) => taken.push((*shard_id, store)),
+                None => {
+                    tracing::warn!(shard_id = %shard_id, "Shard store already taken, skipping shutdown")
+                }
+            }
+        }
+        self.publish_engine_state();
+
         // Parallel storage shutdown with per-shard 30s timeout
         let mut shard_ids = Vec::new();
         let mut shutdown_futures = Vec::new();
-        for (shard_id, shard) in self.shards.iter_mut() {
-            if let Some(store) = shard.store.take() {
-                let shard_id_clone = *shard_id;
+        for (shard_id, store) in taken {
+            let shard_id_clone = shard_id;
 
-                let future = tokio::time::timeout(
-                    Duration::from_secs(30),
-                    tokio::task::spawn_blocking(move || {
-                        tracing::info!(shard_id = %shard_id_clone, "Calling storage shutdown");
-                        if let Err(e) = store.shutdown() {
-                            tracing::error!(shard_id = %shard_id_clone, error = %e, "Storage shutdown failed");
-                            return Err(e);
+            let future = tokio::time::timeout(
+                Duration::from_secs(30),
+                tokio::task::spawn_blocking(move || {
+                    tracing::info!(shard_id = %shard_id_clone, "Calling storage shutdown");
+                    if let Err(e) = store.shutdown() {
+                        tracing::error!(shard_id = %shard_id_clone, error = %e, "Storage shutdown failed");
+                        return Err(e);
+                    }
+                    // Dropping this handle releases the index mmaps and the tantivy
+                    // writer lock only if it is the last one. The writer and warmup
+                    // threads hold clones of their own, so a surviving reference means
+                    // those file handles outlive the shutdown that reports releasing them.
+                    match Arc::try_unwrap(store) {
+                        Ok(store) => {
+                            // Dropped inside the blocking task, so the release happens
+                            // here rather than on whichever thread runs the last clone.
+                            drop(store);
+                            tracing::debug!(shard_id = %shard_id_clone, "Storage dropped, file handles released");
                         }
-                        // Drop inside blocking task ensures file handles are released deterministically
-                        drop(store);
-                        tracing::debug!(shard_id = %shard_id_clone, "Storage dropped successfully");
-                        Ok(())
-                    }),
-                );
-                shard_ids.push(shard_id_clone);
-                shutdown_futures.push(future);
-            } else {
-                tracing::warn!(shard_id = %shard_id, "Shard store already taken, skipping shutdown");
-            }
+                        Err(store) => {
+                            tracing::warn!(
+                                shard_id = %shard_id_clone,
+                                strong_count = Arc::strong_count(&store),
+                                "Storage still referenced after shutdown; file handles stay open until the last holder drops"
+                            );
+                        }
+                    }
+                    Ok(())
+                }),
+            );
+            shard_ids.push(shard_id_clone);
+            shutdown_futures.push(future);
         }
 
         let results = join_all(shutdown_futures).await;
@@ -7620,9 +7682,13 @@ impl NodeOrchestrator {
         // One shard reporting an approximate order describes the whole answer; see the same
         // gather in `engine_search`.
         let mut approximate_sort: Option<String> = None;
+        // One shard is enough. Shards can hold different schemas for the same index, and a
+        // query that one of them could not run at all is not answered by the ones that could.
+        let mut emptied = false;
         for (shard_id, result) in shard_results {
             match result {
                 Ok(r) => {
+                    emptied |= r.emptied;
                     total_hits_sum += r.total_hits;
                     for hit in r.hits {
                         results.push((shard_id, hit.score, hit.doc));
@@ -7690,6 +7756,15 @@ impl NodeOrchestrator {
             },
         });
         attach_shard_errors(&mut response, errors);
+        // Refuse instead of answering. An emptied query ran as nothing, so the zero it
+        // produces is not a negative result — reported as a 200 it cannot be told apart from
+        // "no document matches", which is the same confusion an unrunnable sort caused.
+        if emptied {
+            return Err(OrchestratorError::UnrunnableQuery {
+                notes: discarded.join("; "),
+            });
+        }
+
         discarded.extend(unknown_projection_fields(&schema, fields));
         attach_discarded(&mut response, discarded);
         attach_approximate_sort(&mut response, approximate_sort);

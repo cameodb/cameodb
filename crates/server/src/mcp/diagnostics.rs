@@ -135,8 +135,8 @@ pub(super) fn with_valid_fields(error: &str, index: &str, field_names: &[String]
 
 /// Turn a search response carrying dropped clauses into a tool execution error.
 ///
-/// The hits are real but answer a wider query than the caller wrote, and nothing in the payload
-/// marks them as such. MCP callers present results as fact, so they get an error naming the
+/// The hits are real but do not answer the query as written — wider, narrower, or empty,
+/// depending on where the dropped clause sat — and nothing in the payload marks them as such. MCP callers present results as fact, so they get an error naming the
 /// clause; the HTTP API keeps the hits and reports the same list as
 /// [`DISCARDED_CLAUSES_FIELD`].
 pub(super) fn refuse_if_clauses_discarded(response: &JsonValue) -> Result<(), String> {

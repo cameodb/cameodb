@@ -58,7 +58,8 @@ impl AppError {
     /// way whether it ran here or there.
     pub fn from_route(err: OrchestratorError) -> Self {
         let is_bad_request = match &err {
-            OrchestratorError::UnsortableField { .. } => true,
+            OrchestratorError::UnsortableField { .. }
+            | OrchestratorError::UnrunnableQuery { .. } => true,
             OrchestratorError::Io(io) => io.kind() == std::io::ErrorKind::InvalidInput,
             _ => false,
         };

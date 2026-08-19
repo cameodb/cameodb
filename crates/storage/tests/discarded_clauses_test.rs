@@ -222,6 +222,63 @@ fn a_discarded_clause_is_described_in_terms_the_caller_can_act_on() {
     );
 }
 
+/// A drop is not one-directional. Dropping a branch of a disjunction removes the matches that
+/// branch would have contributed, so the caller gets fewer rows than they asked for — the
+/// opposite of the widening a dropped conjunct causes.
+#[test]
+fn a_dropped_branch_of_a_disjunction_narrows_rather_than_widens() {
+    let temp = TempDir::new().unwrap();
+    let store = store_with_two_docs(&temp, "narrow");
+
+    // Both documents carry a title, so a working presence test would match the pair.
+    let intact = store
+        .search_documents("narrow", "title:rust OR tag:archived", 10, None)
+        .unwrap();
+    assert_eq!(intact.total_hits, 2, "fixture: the disjunction covers both");
+    assert!(intact.discarded.is_empty());
+
+    let dropped = store
+        .search_documents("narrow", "title:* OR tag:archived", 10, None)
+        .unwrap();
+    assert_eq!(
+        dropped.total_hits, 1,
+        "the dropped branch took its matches with it"
+    );
+    assert!(
+        !dropped.discarded.is_empty(),
+        "a narrowing drop must be reported like any other"
+    );
+    assert!(
+        !dropped.emptied,
+        "a branch survived, so the query ran as something"
+    );
+}
+
+/// The clause that was dropped was the only one, so tantivy trims the AST to `EmptyQuery` and
+/// the search matches nothing. The zero it reports answers no question: it is not "no document
+/// has this field", it is "the query never ran".
+#[test]
+fn a_query_whose_only_clause_is_dropped_matches_nothing() {
+    let temp = TempDir::new().unwrap();
+    let store = store_with_two_docs(&temp, "emptied");
+
+    let outcome = store
+        .search_documents("emptied", "title:*", 10, None)
+        .unwrap();
+    assert_eq!(
+        outcome.total_hits, 0,
+        "an emptied query cannot match; a non-zero count would mean it ran as something else"
+    );
+    assert!(
+        !outcome.discarded.is_empty(),
+        "the caller's only signal that this zero is not an answer"
+    );
+    assert!(
+        outcome.emptied,
+        "nothing survived the parse, and the flag is what lets a caller refuse this zero"
+    );
+}
+
 #[test]
 fn count_only_queries_report_discards_too() {
     // `limit = 0` takes a separate branch with its own parse.

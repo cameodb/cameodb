@@ -307,9 +307,11 @@ pub const RULES: &[&str] = &[
     "`AND`, `OR`, `NOT`, `TO` and `IN` are keywords in uppercase only. Lowercase is query text: \
      `to` and `in` break the clause around them and are reported, while `and`, `or` and `not` are \
      searched for as ordinary words and change what the query means without any warning.",
-    "A clause the engine cannot interpret is dropped and the rest of the query runs, which widens \
-     a conjunction and disables a negation. Every dropped clause is reported: the HTTP API \
-     attaches `_discarded_clauses` to the response, and an MCP tool call fails with the reason. \
+    "A clause the engine cannot interpret is dropped and whatever is left runs, which widens a \
+     conjunction, narrows a disjunction, disables a negation, and matches nothing at all when \
+     the dropped clause was the only one. Every dropped clause is reported: the HTTP API \
+     attaches `_discarded_clauses` to the response — or refuses with 400 when no clause \
+     survived at all — and an MCP tool call fails with the reason. \
      Results are never returned as though the query had been understood.",
 ];
 

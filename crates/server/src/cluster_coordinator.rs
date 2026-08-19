@@ -1377,7 +1377,12 @@ impl Message<ShutdownSwarm> for ClusterCoordinator {
         _msg: ShutdownSwarm,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Some(handle) = self.cluster.swarm_handle() {
+        // `swarm_handle` is Some even in standalone, where it holds an inert handle for a
+        // swarm that never started. `is_running()` is the predicate `Drop` already uses to
+        // tell the two apart.
+        if let Some(handle) = self.cluster.swarm_handle()
+            && handle.is_running()
+        {
             if let Err(err) = handle.shutdown() {
                 warn!(error = %err, "ClusterCoordinator: shutdown signal failed");
                 return;

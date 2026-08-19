@@ -136,7 +136,7 @@ Execute full-text search on a single CameoDB index.
 
   **Default search fields**: a query with no `field:` prefix searches only `text`, `string` and `json` fields. Numeric, date, boolean, ip and facet fields must be named explicitly.
 
-  **Dropped clauses**: a clause the engine cannot interpret is dropped and the rest of the query runs, which widens a conjunction and disables a negation. This tool fails rather than returning those results, naming the clause it could not use.
+  **Dropped clauses**: a clause the engine cannot interpret is dropped and whatever is left runs, which widens a conjunction, narrows a disjunction, disables a negation, and matches nothing at all when the dropped clause was the only one. This tool fails rather than returning those results, naming the clause it could not use.
 - `limit` (integer, optional): Maximum number of results to return, up to the node's configured ceiling (`[security.limits] max_search_limit`, 10000 by default). The tool's own `inputSchema` carries that number as its `maximum`, so read it there rather than assuming the default. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10. A larger value is refused, whether it arrives as this argument or as an inline `limit` modifier in the query.
 - `offset` (integer, optional): How many hits to skip before the first one returned. With `limit` as the page size, page N is `offset = N * limit`; there are more results when `offset + hits_returned < total_hits`. Defaults to 0. **The ceiling applies to `offset + limit`**, not to either alone: the engine fetches the whole window from the front of every shard and takes the page after merging them, so a deep page costs what a large limit costs and is refused the same way. An offset at or past `total_hits` is answered with an empty page and a `_warning` saying so, rather than an error — see [Paging](#paging).
 - `fields` (array of strings, optional): Field names to include in results (field projection)
@@ -478,7 +478,7 @@ schema, and the table below, which is generated and checked against the tables b
 - A field marked `shadow` is the name the source data used for its identifier. The value lives only in `id`, the key in both the key-value store and the search index, and is never stored or indexed again under the descriptive name — the schema carries the name and nothing carries a second copy of the data, which is what makes the field a shadow. Querying it is therefore querying `id`: `shadowfield:VALUE` on its own is the fastest retrieval CameoDB has, answered without the search index, and it is the only form that works — named inside a larger query the clause is dropped and reported, and a `*` in the value counts as part of the identifier rather than as a prefix, so it matches nothing. Results come back the same way round: every hit carries the identifier under the shadow name and has no `id` field, so name the shadow field in `fields` or `return`. Asking for `id` there returns a document with nothing in it, and no warning that the field it named is one no document has.
 - `_seq` is an internal sequence number used to track write-ahead-log position. It is present in every index and technically queryable, but it carries no meaning for a search and should be ignored.
 - `AND`, `OR`, `NOT`, `TO` and `IN` are keywords in uppercase only. Lowercase is query text: `to` and `in` break the clause around them and are reported, while `and`, `or` and `not` are searched for as ordinary words and change what the query means without any warning.
-- A clause the engine cannot interpret is dropped and the rest of the query runs, which widens a conjunction and disables a negation. Every dropped clause is reported: the HTTP API attaches `_discarded_clauses` to the response, and an MCP tool call fails with the reason. Results are never returned as though the query had been understood.
+- A clause the engine cannot interpret is dropped and whatever is left runs, which widens a conjunction, narrows a disjunction, disables a negation, and matches nothing at all when the dropped clause was the only one. Every dropped clause is reported: the HTTP API attaches `_discarded_clauses` to the response — or refuses with 400 when no clause survived at all — and an MCP tool call fails with the reason. Results are never returned as though the query had been understood.
 
 **Sorting**
 
@@ -512,8 +512,10 @@ Three behaviours are worth knowing before reading either, because they change re
 merely constraining syntax:
 
 - **A clause the engine cannot interpret is dropped, not rejected.** The rest of the query then
-  runs, which widens a conjunction and disables a negation. Every dropped clause is reported: the
-  HTTP API attaches `_discarded_clauses` to the response, and an MCP tool call fails naming the
+  runs, which widens a conjunction, narrows a disjunction, disables a negation, and matches
+  nothing at all when the dropped clause was the only one. Every dropped clause is reported: the
+  HTTP API attaches `_discarded_clauses` to the response — or refuses with 400 when no clause
+  survived at all — and an MCP tool call fails naming the
   clause. Results are never returned as though the query had been understood.
 - **Only indexed fields are queryable.** A field discovered from a document is added unindexed and
   stays that way until a schema update promotes it. `describe_index` reports the flag per field.
