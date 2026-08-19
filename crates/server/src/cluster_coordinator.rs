@@ -1191,7 +1191,10 @@ impl Message<InitSwarm> for ClusterCoordinator {
         let self_ref = ctx.actor_ref();
         match self.cluster.init_swarm().await {
             Ok((peer_id, events)) => {
-                info!(peer_id = %peer_id, "ClusterCoordinator: swarm initialized");
+                // Standalone's peer id is random: reachable at nothing, different every boot.
+                if self.cluster.cluster_config.enabled {
+                    info!(peer_id = %peer_id, "ClusterCoordinator: swarm initialized");
+                }
 
                 if let Some(mut rx) = events {
                     let coordinator = self_ref.clone();

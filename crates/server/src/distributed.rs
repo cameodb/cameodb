@@ -109,12 +109,16 @@ impl DistributedCluster {
     pub async fn init_swarm(
         &mut self,
     ) -> Result<(String, Option<UnboundedReceiver<CoordinatorEvent>>)> {
-        info!(
-            node_id = %self.local_node_id,
-            cluster_name = %self.cluster_config.cluster_name,
-            port = %self.cluster_config.cluster_port,
-            "Initializing kameo distributed swarm"
-        );
+        // Standalone gets a placeholder swarm — nothing binds the cluster port — so
+        // announcing one would name a socket that was never opened.
+        if self.cluster_config.enabled {
+            info!(
+                node_id = %self.local_node_id,
+                cluster_name = %self.cluster_config.cluster_name,
+                port = %self.cluster_config.cluster_port,
+                "Initializing kameo distributed swarm"
+            );
+        }
 
         // Initialize distributed swarm for peer communication
         let SwarmStartup {
@@ -136,12 +140,14 @@ impl DistributedCluster {
         self.swarm_handle = Some(runtime);
         self.bootstrap_successes += bootstrap_peer_count as u64;
 
-        info!("🌐 Kameo Distributed Framework Ready:");
-        info!("  📡 Cluster Port: {}", self.cluster_config.cluster_port);
-        info!("  🔍 Discovery: Kademlia DHT");
-        info!("  🏷️  Cluster Name: {}", self.cluster_config.cluster_name);
-        info!("  🎧 Listen Address: {}", listen_addr);
-        info!("  🚀 Bootstrap Peers Connected: {}", bootstrap_peer_count);
+        if self.cluster_config.enabled {
+            info!("🌐 Kameo Distributed Framework Ready:");
+            info!("  📡 Cluster Port: {}", self.cluster_config.cluster_port);
+            info!("  🔍 Discovery: Kademlia DHT");
+            info!("  🏷️  Cluster Name: {}", self.cluster_config.cluster_name);
+            info!("  🎧 Listen Address: {}", listen_addr);
+            info!("  🚀 Bootstrap Peers Connected: {}", bootstrap_peer_count);
+        }
 
         Ok((peer_id.to_string(), events))
     }

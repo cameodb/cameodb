@@ -393,6 +393,11 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
         Profile::Internal => 64 * 1024,
         Profile::External => 16 * 1024,
     };
+    // The ceiling bounds a flood; it does not ask whether the node can hold what it admits
+    // — the defaults land exactly on the external ceiling and pass it while allowing eight
+    // times the memory budget. A warning, not a failure: reaching it takes every admitted
+    // request carrying a full body at once, so a node sized for it is legitimate.
+    let memory_budget_mb = config.search.total_memory_limit_mb;
     push(
         "limits",
         if worst_case_mb > ceiling_mb {
@@ -405,6 +410,16 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
                 worst_case_mb,
                 ceiling_mb,
                 profile
+            ))
+        } else if profile != Profile::Local && worst_case_mb > memory_budget_mb {
+            Outcome::Warn(format!(
+                "max_concurrent_requests ({}) × body limit ({} MB) allows {} MB of in-flight \
+                 request data, over this node's total_memory_limit_mb ({} MB). Lower \
+                 max_concurrent_requests or max_record_size_mb, or raise the memory limit",
+                http.max_concurrent_requests,
+                config.effective_max_body_size_mb(),
+                worst_case_mb,
+                memory_budget_mb
             ))
         } else {
             Outcome::Pass(format!(
@@ -686,6 +701,35 @@ mod tests {
             .find(|k| k.rule == "limits")
             .unwrap();
         assert!(limits.outcome.is_fail(), "{:?}", limits);
+    }
+
+    #[test]
+    fn limits_warns_when_in_flight_data_outgrows_the_memory_budget() {
+        let limits = |c: &CameoDbConfig| {
+            evaluate(c)
+                .unwrap()
+                .checks
+                .into_iter()
+                .find(|k| k.rule == "limits")
+                .unwrap()
+                .outcome
+        };
+
+        let mut c = config_for(Some(Profile::Internal), "0.0.0.0");
+        c.network.http.cors_allowed_origins = vec![];
+        // 128 × (128 + 64) MB = 24 576 MB: under the 64 GB ceiling, over the memory budget.
+        c.max_record_size_mb = 128;
+        c.network.http.max_concurrent_requests = 128;
+        c.search.total_memory_limit_mb = 2048;
+        let internal = limits(&c);
+        assert!(matches!(internal, Outcome::Warn(_)), "{:?}", internal);
+        assert!(internal.message().contains("2048 MB"), "{:?}", internal);
+
+        // The same arithmetic on loopback is noise: nobody else can cause the flood.
+        c.node.profile = Some(Profile::Local);
+        c.network.http.bind_address = "127.0.0.1".to_string();
+        let local = limits(&c);
+        assert!(matches!(local, Outcome::Pass(_)), "{:?}", local);
     }
 
     #[test]
