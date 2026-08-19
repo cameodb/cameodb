@@ -1282,10 +1282,9 @@ impl From<RemoteError> for OrchestratorError {
             // The kind is kept for this one: a peer refusing the request — an unsortable sort
             // field, say — has to stay distinguishable from a peer that failed, because the
             // HTTP surface answers 400 for the first and 500 for the second.
-            RemoteError::InvalidInput(s) => OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                s,
-            )),
+            RemoteError::InvalidInput(s) => {
+                OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, s))
+            }
             RemoteError::Io(s)
             | RemoteError::Identity(s)
             | RemoteError::NotFound(s)
@@ -9502,9 +9501,7 @@ mod tests {
                 FieldDef::new(name.to_string(), field_type),
             );
         }
-        schema
-            .fields
-            .insert("doi".to_string(), shadow_field("doi"));
+        schema.fields.insert("doi".to_string(), shadow_field("doi"));
         schema.rebuild_shadow_fields_cache();
 
         let refused = |field: &str| {

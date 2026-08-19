@@ -682,7 +682,10 @@ async fn a_sort_on_a_field_the_index_cannot_order_by_is_refused() {
         )
         .await;
 
-        assert_eq!(status, 400, "sorting by '{field}' should be refused: {body}");
+        assert_eq!(
+            status, 400,
+            "sorting by '{field}' should be refused: {body}"
+        );
         let detail = body["details"].as_str().unwrap_or_default();
         assert!(
             detail.contains(field),
@@ -745,7 +748,10 @@ async fn a_shadow_field_sorts_by_the_key_it_stands_for() {
         .iter()
         .map(|id| json!({"id": id, "doc": {"id": id, "doi": id, "title": "a paper"}}))
         .collect();
-    client.bulk_index("papers", &docs).await.expect("bulk write");
+    client
+        .bulk_index("papers", &docs)
+        .await
+        .expect("bulk write");
     client.admin_index_commit("papers").await.expect("commit");
 
     let mut expected: Vec<String> = ids.iter().map(|id| id.to_string()).collect();

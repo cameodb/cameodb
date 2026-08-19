@@ -281,6 +281,112 @@ cargo test --workspace              # Unit tests
 ./scripts/ops/health-check.sh       # Health validation
 ```
 
+## Dependency and Toolchain Updates
+
+Nothing here is automated. Dependencies move when someone decides to move them, and that
+decision is worth making with the dry run in front of you — an update that quietly picks up
+a security fix and one that quietly picks up a storage-engine release produce the same
+`Cargo.lock` diff and the same green build.
+
+### Dry run — what would move, before anything moves
+
+```bash
+rustup check                                   # toolchains: installed vs. available
+cargo update --dry-run --verbose               # dependencies: what moves, what stays behind a major
+cargo outdated --workspace --root-deps-only    # narrowed to deps this workspace declares itself
+```
+
+`cargo update --dry-run` prints two kinds of line. `Updating a -> b` is a semver-compatible
+move it would make. `Unchanged x (available: y)`, which only appears under `--verbose`, is a
+crate held back by a major-version bound — those need a manifest edit and usually a code
+change, so they are never part of a routine update.
+
+⚠️ **Do not add `--workspace` to `cargo update`.** It does not mean "everything". It means
+"relock only the workspace members", which suppresses every transitive dependency. A run
+carrying that flag reported nothing to do while an advisory fix sat one line below the cut.
+
+To find out why a version is pinned where it is:
+
+```bash
+cargo tree --invert <crate>                    # who depends on it
+cargo tree --invert <crate>@<version>          # when two majors coexist in the graph
+```
+
+### Apply and verify
+
+```bash
+cargo update                                   # semver-compatible only; touches Cargo.lock, nothing else
+cargo check --workspace --all-targets
+scripts/validate/deps.sh                       # fmt, clippy -D warnings, cargo audit, cargo deny
+scripts/validate/unit.sh                       # cargo test --workspace
+```
+
+`Cargo.lock` should be the entire diff. If anything under `crates/*/Cargo.toml` also
+changed, it was not a routine update — see the next section. Revert at any point with
+`git checkout Cargo.lock`.
+
+A storage-engine bump (`redb`) earns one check that semver cannot give you, because a
+lockfile diff says nothing about whether existing databases still open:
+
+```bash
+R=$(echo ~/.cargo/registry/src/index.crates.io-*)
+diff "$R"/redb-<old>/src/tree_store/page_store/header.rs \
+     "$R"/redb-<new>/src/tree_store/page_store/header.rs
+```
+
+An unchanged `FILE_FORMAT_VERSION` is the claim worth having; the changelog alone is not.
+
+### Major bumps
+
+A crate behind a major version is its own change with its own commit. Before taking one,
+check whether it removes a version from the graph or merely adds one — a direct dependency
+bumped while transitive dependents still hold the old major leaves both compiled in, which
+costs build time and buys nothing:
+
+```bash
+cargo tree --invert <crate>@<current-version>  # anything here but our own crates means the old version stays
+cargo upgrade --incompatible -p <crate>        # cargo-edit; rewrites Cargo.toml
+```
+
+### Tooling
+
+The cargo subcommands the release and validation paths lean on are installed globally, not
+pinned by the repo, so they drift independently of `Cargo.lock` and nothing in a normal
+build notices.
+
+```bash
+for c in cargo-audit cargo-deny cargo-outdated cargo-edit \
+         cargo-deb cargo-generate-rpm cargo-zigbuild flamegraph; do
+    cargo search "$c" --limit 1 | grep "^$c "  # dry run: latest published version
+done
+cargo install --list                           # what is actually installed right now
+```
+
+⚠️ **Install one at a time.** `cargo install a b c` prints
+`Summary Successfully installed a, b, c!` and exits 0 whether or not it replaced anything —
+a batch of five was seen to replace exactly one and report all five as installed. The loop
+form, re-read against `cargo install --list`, is what actually tells you it worked:
+
+```bash
+for c in cargo-outdated cargo-edit cargo-deb; do cargo install "$c" --locked; done
+cargo install --list                           # trust this, not the summary line
+```
+
+`cargo-zigbuild` gets its own step, because rustc drops link arguments its linker refuses
+with only a warning — so a version change there is not proven by a build that succeeds.
+`build-musl.sh` takes the container path by default, which does not touch zigbuild at all;
+exercising the new one means asking for it:
+
+```bash
+cargo install cargo-zigbuild --locked
+BUILD_WITH=zig scripts/build/build-musl.sh
+scripts/validate/artifact.sh                   # the check that catches a silently dropped flag
+```
+
+Expect `artifact.sh` to report the aarch64 binary as static-but-not-PIE on this path; that
+is the documented zigbuild limitation, and it is why `release/build.sh` refuses
+`BUILD_WITH=zig` without `--allow-unhardened`. Releases ship from the container path.
+
 ## Configuration & Customization
 
 ### Default Settings
@@ -345,6 +451,17 @@ Scripts respect these environment variables when available:
 - **git**: Version control
 - **tree**: Directory structure visualization
 - **htop/ps**: Process monitoring
+
+### Cargo Subcommands
+Installed globally rather than pinned by the repo, so they drift on their own — see
+[Dependency and Toolchain Updates](#dependency-and-toolchain-updates) for the dry run and
+the one-at-a-time install.
+
+- **cargo-audit**, **cargo-deny**: required by `validate/deps.sh`; it skips the check if either is missing
+- **cargo-zigbuild**: the no-Docker fallback path in `build/build-musl.sh` (`BUILD_WITH=zig`)
+- **cargo-deb**, **cargo-generate-rpm**: distro packages (`build/build-packages.sh`)
+- **cargo-outdated**, **cargo-edit**: dependency surveys and manifest bumps
+- **flamegraph**: profiling
 
 ## Troubleshooting
 
