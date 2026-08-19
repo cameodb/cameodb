@@ -322,20 +322,19 @@ fn attach_discarded(response: &mut JsonValue, discarded: Vec<String>) {
     }
 }
 
-/// Notes for inline-modifier fields the index does not have.
+/// Notes for projected fields the index does not have.
 ///
-/// A projection drops an unknown field and a sort on one falls back to score, both without
-/// complaint, so a keyword lifted out of prose — `find tax return forms` — would otherwise answer
-/// with documents carrying no fields. Metadata names and `shard_id` are added by the response
-/// itself and so are always projectable.
+/// A projection drops an unknown field without complaint, so a keyword lifted out of prose —
+/// `find tax return forms` — would otherwise answer with documents carrying no fields. Metadata
+/// names and `shard_id` are added by the response itself and so are always projectable.
+///
+/// A sort is not noted here, because an unknown sort field is refused outright — see
+/// [`unsortable_sort_field`]. A dropped projection still leaves an answer worth returning; a
+/// dropped sort leaves the hits in an order the caller did not ask for.
 ///
 /// Skipped entirely for an index whose schema is not yet known, where every field would look
 /// unknown.
-fn unknown_modifier_fields(
-    schema: &IndexSchema,
-    fields: Option<&[String]>,
-    sort: Option<&SortSpec>,
-) -> Vec<String> {
+fn unknown_projection_fields(schema: &IndexSchema, fields: Option<&[String]>) -> Vec<String> {
     if schema.fields.is_empty() {
         return Vec::new();
     }
@@ -348,16 +347,52 @@ fn unknown_modifier_fields(
         )
     };
 
-    let mut notes: Vec<String> = fields
+    fields
         .unwrap_or_default()
         .iter()
         .filter(|field| !known(field))
         .map(|field| note("return", field))
-        .collect();
-    if let Some(spec) = sort.filter(|spec| !known(&spec.field)) {
-        notes.push(note("sort", &spec.field));
+        .collect()
+}
+
+/// The sort field a search cannot be answered with, if the caller named one.
+///
+/// A sort names a Tantivy column, and asking for one the index does not have fails in every
+/// shard at once. That is a request the caller got wrong rather than a partial outage, so it is
+/// caught here, before the fan-out, and returned as an error — a scatter-gather that lets it
+/// through answers 200 with an empty `hits` array and the reason buried in per-shard `errors`,
+/// which reads as "nothing matched".
+///
+/// What may be sorted on:
+/// - any field in the schema, `fast` or not. Without a fast column the order is approximate
+///   rather than refused, and [`APPROXIMATE_SORT_FIELD`] says so.
+/// - `id`, which every Tantivy schema carries and no `IndexSchema` lists.
+/// - a shadow field, which is the caller's name for `id`. The engine sorts by the key's column
+///   exactly as it queries by it, so both names order by the same values.
+///
+/// What may not: `_seq`, `_score`, or any other name absent from the schema. `_`-prefixed names
+/// are not waved through here the way [`unknown_projection_fields`] waves them through: a
+/// projection asking for response metadata is meaningful, a sort on it is not.
+///
+/// Skipped entirely for an index whose schema is not known yet, where every field would look
+/// unknown.
+fn unsortable_sort_field(
+    schema: &IndexSchema,
+    sort: Option<&SortSpec>,
+) -> Option<OrchestratorError> {
+    let field = &sort?.field;
+    if schema.fields.is_empty() || field == "id" {
+        return None;
     }
-    notes
+
+    if schema.fields.contains_key(field) {
+        return None;
+    }
+
+    Some(OrchestratorError::UnsortableField {
+        field: field.clone(),
+        reason: "the index has no column of that name".to_string(),
+    })
 }
 
 /// Collect the distinct dropped clauses from per-node responses.
@@ -438,11 +473,24 @@ fn normalize_sort_key(value: &JsonValue, field_def: Option<&FieldDef>) -> Option
 /// Attach the `SORT_KEY_FIELD` metadata value to each gathered hit, in place, so that
 /// downstream merges (local multi-shard and cross-node) have a projection-independent
 /// key to order by. No-op for hits lacking the sort field or an unparseable date.
+///
+/// The key is read under the name the *document* carries, which is not always the name the
+/// caller sorted by. A sort on the document key is the case: an index with shadow fields
+/// answers with the shadow name in place of `id`, so `sort=id` and `sort=<shadow>` both have to
+/// look for whichever of the two is on the hit. Reading only the caller's name leaves every hit
+/// unstamped, and an unstamped merge keeps each shard's block whole — a per-shard order
+/// presented as a global one.
 fn stamp_sort_keys(hits: &mut [(Uuid, f32, JsonValue)], spec: &SortSpec, schema: &IndexSchema) {
     let field_def = schema.fields.get(&spec.field);
+    let sorts_by_document_key = spec.field == "id" || schema.is_shadow_field(&spec.field);
+    let fallback = sorts_by_document_key.then(|| storage::document_key_field(schema));
+
     for (_, _, doc) in hits.iter_mut() {
         if let JsonValue::Object(o) = doc
-            && let Some(raw) = o.get(&spec.field)
+            && let Some(raw) = o
+                .get(&spec.field)
+                .or_else(|| fallback.as_deref().and_then(|name| o.get(name)))
+                .or_else(|| sorts_by_document_key.then(|| o.get("id")).flatten())
             && let Some(key) = normalize_sort_key(raw, field_def)
         {
             o.insert(SORT_KEY_FIELD.to_string(), key);
@@ -1009,6 +1057,16 @@ pub enum OrchestratorError {
 
     #[error("shard already exists: {shard_id}")]
     ShardAlreadyExists { shard_id: Uuid },
+
+    /// The caller asked to sort by a field the index cannot order on.
+    ///
+    /// Deliberately its own variant rather than the [`StoreError::FieldNotFound`] the engine
+    /// would raise: this is decided before the shards are asked, and the HTTP surface has to
+    /// answer 400 for it. Routed through `Io` — as every error crossing an actor boundary is —
+    /// it would have arrived as a per-shard failure string inside a 200, which is how this was
+    /// reported in the first place.
+    #[error("cannot sort by '{field}': {reason}")]
+    UnsortableField { field: String, reason: String },
 }
 
 // Serialize/Deserialize via display string to satisfy remote message bounds without
@@ -1170,6 +1228,9 @@ impl From<OrchestratorError> for RemoteError {
             OrchestratorError::ShardAlreadyExists { shard_id } => {
                 RemoteError::InvalidInput(format!("shard already exists: {shard_id}"))
             }
+            OrchestratorError::UnsortableField { field, reason } => {
+                RemoteError::InvalidInput(format!("cannot sort by '{field}': {reason}"))
+            }
         }
     }
 }
@@ -1177,10 +1238,16 @@ impl From<OrchestratorError> for RemoteError {
 impl From<RemoteError> for OrchestratorError {
     fn from(err: RemoteError) -> Self {
         match err {
+            // The kind is kept for this one: a peer refusing the request — an unsortable sort
+            // field, say — has to stay distinguishable from a peer that failed, because the
+            // HTTP surface answers 400 for the first and 500 for the second.
+            RemoteError::InvalidInput(s) => OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                s,
+            )),
             RemoteError::Io(s)
             | RemoteError::Identity(s)
             | RemoteError::NotFound(s)
-            | RemoteError::InvalidInput(s)
             | RemoteError::Other(s) => OrchestratorError::Io(std::io::Error::other(s)),
         }
     }
@@ -2365,6 +2432,13 @@ impl OrchestratorEngine {
             .map(|arc| (*arc).clone())
             .unwrap_or_default();
 
+        // Refuse a sort the index cannot answer before asking any shard: every shard would
+        // fail the same way, and a scatter-gather reports that as a partial failure inside a
+        // 200 rather than as the bad request it is.
+        if let Some(refusal) = unsortable_sort_field(&schema, sort) {
+            return Err(refusal);
+        }
+
         // Transform query to map shadow fields to canonical "id" field
         let transformed_query = transform_shadow_query(query, &schema);
 
@@ -2471,7 +2545,7 @@ impl OrchestratorEngine {
             },
         });
         attach_shard_errors(&mut response, errors);
-        discarded.extend(unknown_modifier_fields(&schema, fields, sort));
+        discarded.extend(unknown_projection_fields(&schema, fields));
         attach_discarded(&mut response, discarded);
         attach_approximate_sort(&mut response, approximate_sort);
         Ok(response)
@@ -7466,6 +7540,13 @@ impl NodeOrchestrator {
             .map(|arc| (*arc).clone())
             .unwrap_or_default();
 
+        // Refuse a sort the index cannot answer before asking any shard: every shard would
+        // fail the same way, and a scatter-gather reports that as a partial failure inside a
+        // 200 rather than as the bad request it is.
+        if let Some(refusal) = unsortable_sort_field(&schema, sort) {
+            return Err(refusal);
+        }
+
         // Transform query to map shadow fields to canonical "id" field
         let transformed_query = transform_shadow_query(query, &schema);
 
@@ -7569,7 +7650,7 @@ impl NodeOrchestrator {
             },
         });
         attach_shard_errors(&mut response, errors);
-        discarded.extend(unknown_modifier_fields(&schema, fields, sort));
+        discarded.extend(unknown_projection_fields(&schema, fields));
         attach_discarded(&mut response, discarded);
         attach_approximate_sort(&mut response, approximate_sort);
         Ok(response)

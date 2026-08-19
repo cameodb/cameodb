@@ -89,7 +89,8 @@ pub(super) async fn search_handler(
     let result = state
         .router
         .route_and_handle(client_op, None, OperationType::Read)
-        .await?;
+        .await
+        .map_err(AppError::from_route)?;
 
     // Handed to the auth middleware on the way out. It writes the request's single audit
     // record and cannot read a body — by the time it runs again this handler has consumed

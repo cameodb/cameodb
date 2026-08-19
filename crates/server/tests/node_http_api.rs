@@ -642,6 +642,164 @@ async fn the_schema_endpoint_and_the_listing_describe_a_field_identically() {
     );
 }
 
+/// A sort the index cannot answer is refused, not answered with an empty page.
+///
+/// Every shard fails the same way on a sort naming a column that is not there, and a
+/// scatter-gather reports that as a partial failure: `200`, `hits: []`, `total_hits: 0`, and the
+/// reason only in per-shard `errors`. A caller reading the hits — which is every caller — sees
+/// "nothing matched" for a request that was never run. The refusal is now decided before any
+/// shard is asked, so it arrives as a `400` naming the field.
+///
+/// `_seq` and `_score` are covered alongside an ordinary unknown name because they are the ones
+/// that look plausible: the first was a real column until it was retired, the second is a key
+/// every hit carries in the response. Neither is a column that can be ordered on.
+#[tokio::test]
+async fn a_sort_on_a_field_the_index_cannot_order_by_is_refused() {
+    let node = TestNode::start("").await;
+    seed_ordered(&node, "sorted", 5).await;
+
+    for field in ["no_such_field", "_seq", "_score"] {
+        let (status, body) = post_json(
+            &node,
+            "/api/sorted/search",
+            json!({"query": "body:page", "sort": {"field": field, "order": "asc"}}),
+        )
+        .await;
+
+        assert_eq!(status, 400, "sorting by '{field}' should be refused: {body}");
+        let detail = body["details"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains(field),
+            "the refusal should name the field it refused: {detail}"
+        );
+    }
+
+    // The guard refuses what cannot be ordered, and nothing else: a fast column sorts exactly,
+    // and a text field without one still sorts approximately rather than being refused.
+    for field in ["rank", "body", "id"] {
+        let (status, body) = post_json(
+            &node,
+            "/api/sorted/search",
+            json!({"query": "body:page", "sort": {"field": field, "order": "asc"}}),
+        )
+        .await;
+        assert_eq!(status, 200, "sorting by '{field}' must still work: {body}");
+        assert_eq!(
+            body["hits"].as_array().map(|h| h.len()),
+            Some(5),
+            "an accepted sort must still return the hits: {body}"
+        );
+    }
+}
+
+/// A shadow field sorts, and sorts identically to `id`.
+///
+/// A shadow field is the document key under the source's own name — the query path already maps
+/// it to `id`, and a sort maps the same way, so the two names order by the same values. Both are
+/// asserted, because the equivalence is the contract: a caller that only ever says `doi` should
+/// never have to learn that the engine calls it something else.
+///
+/// The order is checked across shards. A shadow index answers with the shadow name *instead of*
+/// `id`, so a merge that looked for `id` on the hits would find nothing to order by and hand
+/// back one shard's block after another — the right documents in the wrong order, which no
+/// status code would reveal.
+#[tokio::test]
+async fn a_shadow_field_sorts_by_the_key_it_stands_for() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "papers",
+        &json!({
+            "fields": {
+                "id": {"name": "id", "field_type": "text", "indexed": true},
+                "doi": {"name": "doi", "field_type": "text", "indexed": false, "is_shadow": true},
+                "title": {"name": "title", "field_type": "text", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "creating the config should succeed: {body}");
+
+    // Written in an order that is neither the ascending nor the descending one, so a sort that
+    // did nothing at all could not pass by accident.
+    let ids = ["p04", "p01", "p08", "p02", "p06", "p03", "p07", "p05"];
+    let docs: Vec<serde_json::Value> = ids
+        .iter()
+        .map(|id| json!({"id": id, "doc": {"id": id, "doi": id, "title": "a paper"}}))
+        .collect();
+    client.bulk_index("papers", &docs).await.expect("bulk write");
+    client.admin_index_commit("papers").await.expect("commit");
+
+    let mut expected: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+    expected.sort();
+
+    // The hits carry the shadow name in place of `id`, which is what a caller reads them by.
+    let keys = |body: &serde_json::Value| -> Vec<String> {
+        body["hits"]
+            .as_array()
+            .expect("hits array")
+            .iter()
+            .map(|hit| {
+                hit["doi"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a hit should carry its shadow key: {hit}"))
+                    .to_string()
+            })
+            .collect()
+    };
+
+    async fn sorted(node: &TestNode, field: &str, order: &str) -> serde_json::Value {
+        let (status, body) = post_json(
+            node,
+            "/api/papers/search",
+            json!({
+                "query": "title:paper",
+                "limit": 8,
+                "sort": {"field": field, "order": order}
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "sorting by '{field}' should work: {body}");
+        body
+    }
+
+    let by_shadow = sorted(&node, "doi", "asc").await;
+    assert_eq!(
+        keys(&by_shadow),
+        expected,
+        "a sort on the shadow field should order by the key it stands for: {by_shadow}"
+    );
+
+    // The same order under the engine's own name for the field.
+    let by_id = sorted(&node, "id", "asc").await;
+    assert_eq!(
+        keys(&by_id),
+        expected,
+        "sorting by 'id' must give the same order as sorting by the shadow field: {by_id}"
+    );
+
+    // And descending is the reverse rather than the same list, so the order is being applied
+    // rather than the documents merely arriving in key order.
+    let descending = sorted(&node, "doi", "desc").await;
+    let mut reversed = expected.clone();
+    reversed.reverse();
+    assert_eq!(
+        keys(&descending),
+        reversed,
+        "descending should be the reverse order: {descending}"
+    );
+
+    // The field has no fast column, so the order is reported as approximate — under the name
+    // the caller asked for, not the one the engine ordered on.
+    assert_eq!(
+        by_shadow["_approximate_sort"].as_str(),
+        Some("doi"),
+        "the approximate-order note should name the caller's field: {by_shadow}"
+    );
+}
+
 /// A GET against the node, decoded as raw JSON.
 async fn get_json(node: &TestNode, path: &str) -> serde_json::Value {
     with_tls_provider();

@@ -18,8 +18,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`sort=_seq` was accepted and silently returned a partial ordering.** The field is `fast`, so
   every check in the sort path passed and results were ordered correctly *within* a shard. But
   document bodies are served from redb, which has no `_seq` key, so no sort key was stamped on
-  the results and a scatter-gather merge across shards had nothing to order by. It is now refused
-  like any other unknown field, which is what `sortable_fields` already advertised.
+  the results and a scatter-gather merge across shards had nothing to order by. The engine now
+  refuses it like any other unknown field, which is what `sortable_fields` already advertised.
+
+- **A sort the index could not answer came back as an empty result page.** Any sort naming a
+  column that is not there — `_seq`, `_score`, a typo — failed in every shard at once, and a
+  scatter-gather reports that as a partial failure: `200`, `hits: []`, `total_hits: 0`, and the
+  reason only in per-shard `errors`. A caller reading the hits saw "nothing matched" for a query
+  that was never run.
+
+  The sort field is now checked against the schema before the fan-out, and an unusable one is a
+  `400` naming the field. Nothing that worked before is refused: a field with no fast column
+  still sorts approximately, as `_approximate_sort` reports, and `id` still sorts.
+
+- **`sort` by a shadow field did not work, and `sort=id` on an index that has one was ordered
+  per shard.** A shadow field is the document key under the source's own name, and the query
+  path already maps it to `id` — a sort did not, so `sort=sha1` named a column that does not
+  exist and matched the empty-page case above. It now maps the same way the query does, in the
+  engine, so every caller of `search_documents` gets it and not only the HTTP router.
+
+  The same mapping was missing on the way back, which is why `sort=id` was affected too:
+  reconstruction answers with the shadow name *instead of* `id`, so a merge looking for `id` on
+  the hits found no key to order by and returned each shard's block in turn — the right
+  documents in the wrong order, with nothing in the response saying so. The key is now read
+  under the name the document carries. `_approximate_sort` reports the field the caller asked
+  for rather than the column the engine ordered on.
 
 - **An index could be re-examined by recovery on every boot forever.** If the process stopped
   between a Tantivy commit and the WAL truncation that follows it, the WAL kept entries the

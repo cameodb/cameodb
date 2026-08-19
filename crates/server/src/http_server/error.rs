@@ -7,6 +7,8 @@ use axum::{
 };
 use tracing::{error, warn};
 
+use crate::node_orchestrator::OrchestratorError;
+
 /// Application error wrapper for consistent error handling.
 ///
 /// `status` short-circuits the string-sniffing classification below. Handlers
@@ -40,6 +42,31 @@ impl AppError {
         Self {
             error: anyhow::anyhow!("{}", msg.into()),
             status: Some(StatusCode::PAYLOAD_TOO_LARGE),
+        }
+    }
+
+    /// Classify an error the routing layer returned.
+    ///
+    /// Some of what routing refuses is the caller's fault rather than the node's — a sort on a
+    /// field the index does not have, decided before any shard is asked. Those carry a status
+    /// here instead of falling through to the text classification below, which would read
+    /// "field" and answer 500, or read "not found" and answer 404 for a request that was
+    /// simply malformed.
+    ///
+    /// `InvalidInput` is the same verdict reached on another node: a peer that refused the
+    /// request keeps that kind across the wire, so a routed search answers the caller the same
+    /// way whether it ran here or there.
+    pub fn from_route(err: OrchestratorError) -> Self {
+        let is_bad_request = match &err {
+            OrchestratorError::UnsortableField { .. } => true,
+            OrchestratorError::Io(io) => io.kind() == std::io::ErrorKind::InvalidInput,
+            _ => false,
+        };
+
+        if is_bad_request {
+            Self::bad_request(err.to_string())
+        } else {
+            Self::from(err)
         }
     }
 }

@@ -526,3 +526,99 @@ fn the_internal_seq_field_cannot_be_used_as_a_sort_key() {
         "an ordinary fast field must still sort"
     );
 }
+
+/// A sort on a shadow field orders by the key the shadow field stands for.
+///
+/// A shadow field is the document key under the source's own name: the query path maps it to
+/// `id`, so a sort has to map the same way or one name means two things. The engine owns that
+/// mapping — the router is not the only caller — so it is asserted here, against the order a
+/// sort on `id` produces.
+///
+/// Note what the hits carry: reconstruction answers with the shadow name *instead of* `id`, so
+/// the value ordered on comes back under `sha1`, and that is the name the post-fetch sort and
+/// every merge above it have to read.
+#[test]
+fn a_sort_on_a_shadow_field_orders_by_the_document_key() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = HybridStore::new(test_config(dir.path().to_path_buf()), 1).expect("store");
+
+    let mut schema = IndexSchema::default();
+    for (name, ty) in [
+        ("id", TantivyFieldType::Text),
+        ("title", TantivyFieldType::Text),
+    ] {
+        schema
+            .fields
+            .insert(name.to_string(), FieldDef::new(name.to_string(), ty));
+    }
+    let mut shadow = FieldDef::new("sha1".to_string(), TantivyFieldType::Text);
+    shadow.is_shadow = true;
+    shadow.indexed = false;
+    schema.fields.insert("sha1".to_string(), shadow);
+    schema.normalize_after_deserialization();
+
+    store
+        .store_schema_and_cache("files", &schema)
+        .expect("store schema");
+    // Written out of order, so an unsorted answer cannot pass by accident.
+    let docs = ["f3", "f1", "f4", "f2"]
+        .iter()
+        .map(|id| put(id, json!({"id": id, "title": "a file"})))
+        .collect();
+    store.apply_batch("files", docs).expect("write");
+    store.commit_index("files").expect("commit");
+
+    let keys = |outcome: &SearchOutcome| -> Vec<String> {
+        outcome
+            .hits
+            .iter()
+            .map(|(_, doc)| {
+                doc["sha1"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a hit should carry its shadow key: {doc}"))
+                    .to_string()
+            })
+            .collect()
+    };
+
+    let by_shadow = store
+        .search_documents(
+            "files",
+            "title:file",
+            10,
+            Some(&SortSpec {
+                field: "sha1".to_string(),
+                order: SortOrder::Asc,
+            }),
+        )
+        .expect("a sort on the shadow field is answered, not refused");
+    assert_eq!(
+        keys(&by_shadow),
+        vec!["f1", "f2", "f3", "f4"],
+        "the shadow field should order by the key it stands for"
+    );
+
+    let by_id = store
+        .search_documents(
+            "files",
+            "title:file",
+            10,
+            Some(&SortSpec {
+                field: "id".to_string(),
+                order: SortOrder::Asc,
+            }),
+        )
+        .expect("sorting by id");
+    assert_eq!(
+        keys(&by_id),
+        keys(&by_shadow),
+        "both names are the same field, so both orders are the same order"
+    );
+
+    // Reported under the name the caller used, not the column the engine ordered on.
+    assert_eq!(
+        by_shadow.approximate_sort.as_deref(),
+        Some("sha1"),
+        "the approximate-order note should name the caller's field"
+    );
+}

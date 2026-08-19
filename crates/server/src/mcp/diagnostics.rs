@@ -112,11 +112,13 @@ pub(super) fn approximate_sort_note(field: &str) -> String {
 /// Matched against specific signals rather than the word "field", which appears in unrelated
 /// errors such as the sort error for a non-FAST field.
 pub(super) fn names_a_missing_field(error: &str) -> bool {
-    const MISSING_FIELD_SIGNALS: [&str; 4] = [
+    const MISSING_FIELD_SIGNALS: [&str; 5] = [
         "does not exist",
         "FieldDoesNotExist",
         "unknown field",
         "not declared as indexed",
+        // A refused sort, which the router decides before any shard is asked.
+        "no column of that name",
     ];
     MISSING_FIELD_SIGNALS
         .iter()

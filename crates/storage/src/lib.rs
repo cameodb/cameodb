@@ -2370,6 +2370,24 @@ struct StoredDocOwned {
 /// Example:
 /// Input: {"id": "123", "title": "Book"} with shadow mapping {"book_id": "id"}
 /// Output: {"id": "123", "book_id": "123", "title": "Book"}  // book_id reconstructed
+/// The name a returned document carries its key under.
+///
+/// `id` normally, but an index with shadow fields answers with the shadow name *instead of*
+/// `id` — that is what a shadow field is for. Anything that reads the key back off a hit has to
+/// ask for it by this name: a post-fetch sort, a cross-shard merge, a projection.
+///
+/// Several shadow fields all stand for the same key and reconstruction writes every one of
+/// them, so any would do; the first in sorted order is chosen to keep one shard's answer the
+/// same as another's.
+pub fn document_key_field(schema: &IndexSchema) -> String {
+    schema
+        .shadow_fields
+        .iter()
+        .min()
+        .cloned()
+        .unwrap_or_else(|| "id".to_string())
+}
+
 pub fn reconstruct_shadow_fields_in_json(json_blob: &JsonValue, schema: &IndexSchema) -> JsonValue {
     if let Some(obj) = json_blob.as_object() {
         let shadow_mapping = schema.get_shadow_mapping();
@@ -5540,21 +5558,44 @@ impl HybridStore {
         let mut string_sort: Option<(String, SortOrder)> = None;
 
         let (top_docs, total_hits) = if let Some(sort_spec) = _sort {
+            // A sort names one value under two names, and on an index with a shadow field they
+            // are not the same name.
+            //
+            // A shadow field *is* the document key under the source's own name: the query path
+            // maps it to `id` (`transform_shadow_query`), so a sort maps the same way or the two
+            // disagree about what the caller's name means. That gives the column to order on.
+            // But the value the caller reads back is not under that name — shadow
+            // reconstruction *replaces* `id` with the shadow field on the way out (see
+            // `reconstruct_shadow_fields_owned`), so the post-fetch sort below, and every merge
+            // above this one, has to look for it under the name the document actually carries.
+            let sorts_by_document_key =
+                sort_spec.field == "id" || schema.is_shadow_field(&sort_spec.field);
+            let column_name: &str = if sorts_by_document_key {
+                "id"
+            } else {
+                &sort_spec.field
+            };
+            let document_name: String = if sorts_by_document_key {
+                document_key_field(&schema)
+            } else {
+                sort_spec.field.clone()
+            };
+
             // Get field from schema to check type and FAST flag
             let schema = tantivy_index.schema();
 
             // `_seq` is FAST, so it would otherwise satisfy every check below and sort — but
-            // only within one shard. Document bodies come from redb, which has no `_seq` key,
-            // so the router finds no sort key to stamp and the cross-shard merge has nothing
-            // to order by: the caller gets a partial ordering and no error. Every field
-            // listing already hides `_seq`, so refusing it here is what makes the engine
-            // agree with what `sortable_fields` advertises.
+            // only within one shard. Document bodies are served from redb, which has no `_seq`
+            // key, so nothing is stamped for a scatter-gather merge to order by: the caller
+            // gets a partial ordering and no error. Every field listing already hides `_seq`,
+            // so refusing it here is what makes the engine agree with what `sortable_fields`
+            // advertises.
             if sort_spec.field == "_seq" {
                 return Err(StoreError::FieldNotFound(sort_spec.field.clone()));
             }
 
             let field = schema
-                .get_field(&sort_spec.field)
+                .get_field(column_name)
                 .map_err(|_| StoreError::FieldNotFound(sort_spec.field.clone()))?;
 
             let field_entry = schema.get_field_entry(field);
@@ -5586,7 +5627,7 @@ impl HybridStore {
             macro_rules! collect_sorted {
                 ($t:ty) => {{
                     let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit)
-                        .order_by_fast_field::<$t>(&sort_spec.field, order);
+                        .order_by_fast_field::<$t>(column_name, order);
                     let count_collector = tantivy::collector::Count;
 
                     // Use MultiCollector to get both results and count in single query execution
@@ -5619,7 +5660,7 @@ impl HybridStore {
                 // which is what makes a deep page of a text sort mean anything.
                 tantivy::schema::FieldType::Str(_) if field_entry.is_fast() => {
                     let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit)
-                        .order_by_string_fast_field(&sort_spec.field, order);
+                        .order_by_string_fast_field(column_name, order);
                     let count_collector = tantivy::collector::Count;
                     let mut multi_collector = tantivy::collector::MultiCollector::new();
                     let top_docs_handle = multi_collector.add_collector(top_docs_collector);
@@ -5662,7 +5703,7 @@ impl HybridStore {
                          the alphabetical order of the top-scoring candidates, not of all matches"
                     );
                     let budget = limit.saturating_mul(2);
-                    string_sort = Some((sort_spec.field.clone(), sort_spec.order));
+                    string_sort = Some((document_name, sort_spec.order));
 
                     let top_docs_collector =
                         tantivy::collector::TopDocs::with_limit(budget).order_by_score();
@@ -5851,7 +5892,9 @@ impl HybridStore {
         // between runs, and every merge above it inherits that.
         // Read before the sort below consumes it: an approximate order is a property of the
         // answer, and the caller has to be able to see it on the answer.
-        let approximate_sort = string_sort.as_ref().map(|(field, _)| field.clone());
+        let approximate_sort = string_sort
+            .as_ref()
+            .and_then(|_| _sort.map(|spec| spec.field.clone()));
 
         if let Some((field, order)) = string_sort {
             let mut ranked: Vec<(usize, _)> = std::mem::take(&mut results)
