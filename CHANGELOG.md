@@ -21,15 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the results and a scatter-gather merge across shards had nothing to order by. The engine now
   refuses it like any other unknown field, which is what `sortable_fields` already advertised.
 
-- **A sort the index could not answer came back as an empty result page.** Any sort naming a
-  column that is not there — `_seq`, `_score`, a typo — failed in every shard at once, and a
-  scatter-gather reports that as a partial failure: `200`, `hits: []`, `total_hits: 0`, and the
-  reason only in per-shard `errors`. A caller reading the hits saw "nothing matched" for a query
-  that was never run.
+- **A sort the index could not answer came back as an empty result page.** A sort fails in every
+  shard at once or in none of them, and a scatter-gather reports the first as a partial failure:
+  `200`, `hits: []`, `total_hits: 0`, and the reason only in per-shard `errors`. A caller reading
+  the hits saw "nothing matched" for a query that was never run.
 
-  The sort field is now checked against the schema before the fan-out, and an unusable one is a
-  `400` naming the field. Nothing that worked before is refused: a field with no fast column
-  still sorts approximately, as `_approximate_sort` reports, and `id` still sorts.
+  The sort field is now checked before the fan-out and an unusable one is a `400` naming it. The
+  question asked is the engine's own — "can I order by this column?" — rather than the narrower
+  "does a column of this name exist", because both refusals reach the caller identically. So a
+  boolean or any other non-text field with no fast column is refused, and so is `_seq`, whose
+  schema record survives on every index built before the field was retired: looking the name up
+  in the schema found it there and passed it through, on precisely the indexes that have it.
+  Nothing that worked before is refused: a field with no fast column still sorts approximately,
+  as `_approximate_sort` reports, and `id` still sorts.
 
 - **`sort` by a shadow field did not work, and `sort=id` on an index that has one was ordered
   per shard.** A shadow field is the document key under the source's own name, and the query

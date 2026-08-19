@@ -357,22 +357,35 @@ fn unknown_projection_fields(schema: &IndexSchema, fields: Option<&[String]>) ->
 
 /// The sort field a search cannot be answered with, if the caller named one.
 ///
-/// A sort names a Tantivy column, and asking for one the index does not have fails in every
-/// shard at once. That is a request the caller got wrong rather than a partial outage, so it is
-/// caught here, before the fan-out, and returned as an error — a scatter-gather that lets it
-/// through answers 200 with an empty `hits` array and the reason buried in per-shard `errors`,
-/// which reads as "nothing matched".
+/// Why the engine will refuse to order by this field, if it will.
+///
+/// A sort fails in every shard at once or in none of them, and scatter-gather reports the first
+/// as a partial outage: 200, an empty `hits` array, and the reason buried in per-shard `errors`,
+/// which reads as "nothing matched". So a refusal the engine is certain to issue is issued here,
+/// before the fan-out, where it can be an error about the request.
+///
+/// The question asked is the engine's own — "can I order by this column?" — not the narrower
+/// "does a column of this name exist". Both refusals reach the caller identically, so checking
+/// only for the name lets the other kind through.
 ///
 /// What may be sorted on:
-/// - any field in the schema, `fast` or not. Without a fast column the order is approximate
-///   rather than refused, and [`APPROXIMATE_SORT_FIELD`] says so.
+/// - a field with a fast column, which the collector orders by.
+/// - a text or string field without one, which is ordered after the fetch. Approximate rather
+///   than refused, and [`APPROXIMATE_SORT_FIELD`] says so.
 /// - `id`, which every Tantivy schema carries and no `IndexSchema` lists.
 /// - a shadow field, which is the caller's name for `id`. The engine sorts by the key's column
 ///   exactly as it queries by it, so both names order by the same values.
 ///
-/// What may not: `_seq`, `_score`, or any other name absent from the schema. `_`-prefixed names
-/// are not waved through here the way [`unknown_projection_fields`] waves them through: a
-/// projection asking for response metadata is meaningful, a sort on it is not.
+/// What may not: a name absent from the schema, `_seq`, or a non-text field without a fast
+/// column. `_`-prefixed names are not waved through here the way [`unknown_projection_fields`]
+/// waves them through: a projection asking for response metadata is meaningful, a sort on it is
+/// not.
+///
+/// Decided from the declared schema, which is what a router holds without opening an index. That
+/// leaves one refusal undecidable here: `fast` is a declaration and the column is written from it
+/// at index time, so a numeric field declared `fast` after its index was built has no column to
+/// order by and only the built index knows. Every other refusal the engine can reach is reachable
+/// from the declaration.
 ///
 /// Skipped entirely for an index whose schema is not known yet, where every field would look
 /// unknown.
@@ -381,18 +394,46 @@ fn unsortable_sort_field(
     sort: Option<&SortSpec>,
 ) -> Option<OrchestratorError> {
     let field = &sort?.field;
-    if schema.fields.is_empty() || field == "id" {
+    if schema.fields.is_empty() {
         return None;
     }
 
-    if schema.fields.contains_key(field) {
+    // The document key, under its own name or under a shadow name that stands for it.
+    if field == "id" || schema.is_shadow_field(field) {
         return None;
     }
 
-    Some(OrchestratorError::UnsortableField {
-        field: field.clone(),
-        reason: "the index has no column of that name".to_string(),
-    })
+    let refuse = |reason: String| {
+        Some(OrchestratorError::UnsortableField {
+            field: field.clone(),
+            reason,
+        })
+    };
+
+    // Retired, and so present only in the schema record of an index built before it was retired
+    // — which is why its absence from the record cannot be what refuses it. Every field listing
+    // hides it, and the engine refuses it in each shard.
+    if field == "_seq" {
+        return refuse("the field is internal and no index reports it".to_string());
+    }
+
+    let Some(def) = schema.fields.get(field) else {
+        return refuse("the index has no column of that name".to_string());
+    };
+
+    if def.fast
+        || matches!(
+            def.field_type,
+            TantivyFieldType::Text | TantivyFieldType::String
+        )
+    {
+        return None;
+    }
+
+    refuse(format!(
+        "a {} field must be declared fast to sort, and this one is not",
+        def.field_type.to_string()
+    ))
 }
 
 /// Collect the distinct dropped clauses from per-node responses.
@@ -9438,5 +9479,75 @@ mod tests {
             assert!(hit.get("_score").is_some(), "other metadata preserved");
             assert!(hit.get("title").is_some(), "content preserved");
         }
+    }
+
+    /// A schema record that still declares `_seq` does not make it sortable.
+    ///
+    /// Only reachable as a unit test: the field is retired, so no index created now records it,
+    /// and every index created before the retirement still does. The engine refuses it in each
+    /// shard either way — so a guard that decides by looking the name up in the schema passes it
+    /// through on exactly the indexes that have the field, which is every index that predates
+    /// the change and none of the ones a test creates.
+    #[test]
+    fn a_retired_seq_column_in_the_schema_record_does_not_make_it_sortable() {
+        let mut schema = IndexSchema::default();
+        for (name, field_type) in [
+            ("rank", TantivyFieldType::U64),
+            ("title", TantivyFieldType::Text),
+            ("flag", TantivyFieldType::Boolean),
+            ("_seq", TantivyFieldType::U64),
+        ] {
+            schema.fields.insert(
+                name.to_string(),
+                FieldDef::new(name.to_string(), field_type),
+            );
+        }
+        schema
+            .fields
+            .insert("doi".to_string(), shadow_field("doi"));
+        schema.rebuild_shadow_fields_cache();
+
+        let refused = |field: &str| {
+            unsortable_sort_field(
+                &schema,
+                Some(&SortSpec {
+                    field: field.to_string(),
+                    order: SortOrder::Asc,
+                }),
+            )
+        };
+
+        // `_seq` is a fast u64 sitting in the record, so nothing about the declaration itself
+        // distinguishes it from `rank`. It is refused by name.
+        assert!(
+            refused("_seq").is_some(),
+            "a legacy _seq column must not be sortable"
+        );
+        // In the schema, no fast column, not text: the engine refuses this one too.
+        assert!(
+            refused("flag").is_some(),
+            "a non-text field with no fast column must not be sortable"
+        );
+        assert!(
+            refused("no_such_field").is_some(),
+            "a name absent from the schema must not be sortable"
+        );
+
+        for field in ["rank", "title", "id", "doi"] {
+            assert!(
+                refused(field).is_none(),
+                "'{field}' must still sort: a fast column, a text field, the key, and the key's \
+                 shadow name"
+            );
+        }
+    }
+
+    /// A shadow field as the schema records one: the caller's name for the key, carrying no
+    /// column of its own.
+    fn shadow_field(name: &str) -> FieldDef {
+        let mut def = FieldDef::new(name.to_string(), TantivyFieldType::Text);
+        def.indexed = false;
+        def.is_shadow = true;
+        def
     }
 }

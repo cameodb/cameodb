@@ -653,12 +653,28 @@ async fn the_schema_endpoint_and_the_listing_describe_a_field_identically() {
 /// `_seq` and `_score` are covered alongside an ordinary unknown name because they are the ones
 /// that look plausible: the first was a real column until it was retired, the second is a key
 /// every hit carries in the response. Neither is a column that can be ordered on.
+///
+/// `flag` covers the other half of the refusal, and the half a check for the *name* misses: the
+/// field is in the schema, so a guard asking whether a column of that name exists waves it
+/// through, and the engine then refuses it in every shard for having no fast column to order by
+/// — the same empty page, from a request that looked valid.
 #[tokio::test]
 async fn a_sort_on_a_field_the_index_cannot_order_by_is_refused() {
     let node = TestNode::start("").await;
     seed_ordered(&node, "sorted", 5).await;
 
-    for field in ["no_such_field", "_seq", "_score"] {
+    // A boolean is inferred without a fast column, which is what makes it unsortable.
+    let client = node.client();
+    client
+        .bulk_index(
+            "sorted",
+            &[json!({"id": "d005", "doc": {"id": "d005", "rank": 5, "body": "page", "flag": true}})],
+        )
+        .await
+        .expect("bulk write");
+    client.admin_index_commit("sorted").await.expect("commit");
+
+    for field in ["no_such_field", "_seq", "_score", "flag"] {
         let (status, body) = post_json(
             &node,
             "/api/sorted/search",
@@ -686,7 +702,7 @@ async fn a_sort_on_a_field_the_index_cannot_order_by_is_refused() {
         assert_eq!(status, 200, "sorting by '{field}' must still work: {body}");
         assert_eq!(
             body["hits"].as_array().map(|h| h.len()),
-            Some(5),
+            Some(6),
             "an accepted sort must still return the hits: {body}"
         );
     }
