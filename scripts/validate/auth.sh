@@ -20,9 +20,12 @@ SERVER_PID=""
 
 cleanup() {
     stop_server "$SERVER_PID"
-    rm -rf "$WORK"
+    discard_work "$WORK"
 }
 trap cleanup EXIT
+
+# Before anything binds: a leftover node on this port would answer every probe below.
+require_free_port "$PORT"
 
 # mint <role> <label> [indexes] — sets $KEY and $HASH. Called directly rather than through a
 # command substitution, because a subshell would swallow the second of the two.

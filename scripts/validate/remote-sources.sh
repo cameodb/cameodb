@@ -18,7 +18,7 @@ source "$SCRIPT_DIR/lib.sh"
 
 BIN="$(require_bin)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'discard_work "$WORK"' EXIT
 
 # Public sources this project actually loads from; override for an offline network.
 SOURCES=(

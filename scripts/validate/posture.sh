@@ -2,10 +2,15 @@
 # Live posture probes: start a node with deliberately tight limits and confirm the
 # hardening actually behaves that way over the wire.
 #
-# Every check here corresponds to a defect that shipped and was not caught by unit tests,
+# Most checks here correspond to a defect that shipped and was not caught by unit tests,
 # because each one only fails in a real HTTP stack: a body limit that applies to some
 # handlers and not others, a concurrency guard that starves the health endpoint, a
 # timeout that was configured but never wired into the router.
+#
+# The HTTP/2 section is the exception, and covers a gap rather than a regression: the
+# listener speaks h2c on the same port with nothing to opt into, over separate framing and
+# body-streaming code, on the schedule of a transitive dependency. Nothing else in the suite
+# has ever sent an h2 frame.
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,9 +25,12 @@ SERVER_PID=""
 
 cleanup() {
     stop_server "$SERVER_PID"
-    rm -rf "$WORK"
+    discard_work "$WORK"
 }
 trap cleanup EXIT
+
+# Before anything binds: a leftover node on this port would answer every probe below.
+require_free_port "$PORT"
 
 cat > "$WORK/node.toml" <<EOF
 max_record_size_mb = 1
@@ -190,17 +198,76 @@ if command -v ps > /dev/null; then
     fi
 fi
 
+section "HTTP/2"
+# The same port serves h2c, with no config to opt into it, so every limit checked above has a
+# second protocol it has to hold on. Framing and body streaming are a separate path inside
+# hyper for h2, and until this section existed nothing in the suite ever spoke it: an h2
+# bump could have broken negotiation outright and this file would still have reported a
+# clean run. The `h2` crate is a transitive dependency that moves on its own schedule, which
+# is exactly the kind of change no unit test here would notice.
+if ! curl -V | grep -i '^Features:' | grep -qw 'HTTP2'; then
+    skip "curl was built without HTTP/2; cannot probe h2c"
+else
+    # Prior knowledge rather than an Upgrade handshake: there is no TLS on this listener to
+    # carry ALPN, and prior knowledge is what a service-mesh or gRPC-style client actually
+    # sends to a plaintext backend. The negotiated version is asserted alongside the status
+    # because curl falls back to HTTP/1.1 without complaint — a check reading only the status
+    # would pass while never once speaking h2.
+    h2status() { curl -s -o /dev/null -w '%{http_version} %{http_code}' -m 30 --http2-prior-knowledge "$@"; }
+
+    check_eq "liveness answers over h2c" "2 200" "$(h2status "$BASE/_cluster/health")"
+    check_eq "an API route answers over h2c" "2 200" \
+        "$(h2status -X POST "$BASE/api/probe/search" -H "$json" -d '{"query":"x"}')"
+
+    # The wire-level body limit is a layer, not a handler, so it should not care which
+    # protocol carried the bytes. Asserted rather than assumed, because this is the very
+    # limit that already turned out to cover some handlers and not others.
+    check_eq "oversized body on /_bulk is rejected over h2c" "2 413" \
+        "$(h2status -X POST "$BASE/api/probe/_bulk" -H "$json" --data-binary @"$WORK/many.ndjson")"
+    check_eq "oversized body on /document/stream is rejected over h2c" "2 413" \
+        "$(h2status -X POST "$BASE/api/probe/document/stream" \
+            -H 'content-type: application/x-ndjson' --data-binary @"$WORK/many.ndjson")"
+fi
+
 section "concurrency guard and timeouts"
 # Saturate every permit with trickle uploads, then confirm the two behaviours that matter:
 # liveness still answers, and everything else sheds load politely.
-: > "$WORK/slow.ndjson"
-for i in $(seq 1 200); do printf '{"id":"s%d","doc":{"t":"y"}}\n' "$i" >> "$WORK/slow.ndjson"; done
+#
+# The body is fed slowly down a pipe rather than throttled with curl's `--limit-rate`, because
+# `--limit-rate` cannot be combined with a deadline. To hold the average rate curl sleeps for
+# as long as the bytes it has already sent require, and it does not wake to check `--max-time`
+# while sleeping: at 200 B/s it sailed 16 s past a 60 s deadline in one run out of three here
+# and then reported 000. A run that hits that reports "no response" and a minutes-long
+# elapsed, which is precisely what a timeout that never fired looks like — the check failing
+# in the shape of the defect it exists to detect. Feeding from a pipe leaves curl in poll(),
+# so the deadline holds and a real 408 comes back.
+trickle_body() {
+    local i
+    for i in $(seq 1 200); do
+        # Every one of these requests ends with the server timing it out and curl exiting, so
+        # losing the reader is the normal finish, not a fault: stop feeding instead of
+        # reporting a broken pipe 195 times and sleeping out the rest of the loop, which kept
+        # the subshell alive for 40 s and made `wait` below block on nothing.
+        printf '{"id":"s%d","doc":{"t":"y"}}\n' "$i" 2>/dev/null || return 0
+        sleep 0.2
+    done
+}
+# Chunked upload via `-T -`, so the request is genuinely in flight while the body dribbles in.
+# `--data-binary @-` would buffer stdin to the end first and send it all at once, which holds
+# no permit for any length of time and would make every check below vacuous.
+trickle_post() {
+    trickle_body | LC_ALL=C curl -s -o /dev/null -w '%{http_code} %{time_total}' -m 30 \
+        -X POST "$BASE/api/probe/document/stream" \
+        -H 'content-type: application/x-ndjson' -H 'expect:' -T - 2>/dev/null
+}
+
 TRICKLE_PIDS=()
 for _ in 1 2 3 4; do
-    curl -s -o /dev/null --limit-rate 300 -m 60 -X POST "$BASE/api/probe/document/stream" \
-        -H 'content-type: application/x-ndjson' -H 'expect:' --data-binary @"$WORK/slow.ndjson" &
+    trickle_post > /dev/null &
     TRICKLE_PIDS+=($!)
 done
+# The permits are only held until the server times these out at 5 s, so the three checks
+# below have to land inside that window — hence a short wait here, not a generous one.
 sleep 3
 
 check_eq "health stays available while saturated" "200" "$(status "$BASE/_cluster/health")"
@@ -217,12 +284,24 @@ wait "${TRICKLE_PIDS[@]}" 2>/dev/null
 sleep 1
 
 # On an idle server the same trickle upload must hit the request timeout, not hang.
-t_start=$(date +%s)
-code="$(status --limit-rate 200 -m 60 -X POST "$BASE/api/probe/document/stream" \
-    -H 'content-type: application/x-ndjson' -H 'expect:' --data-binary @"$WORK/slow.ndjson")"
-elapsed=$(( $(date +%s) - t_start ))
-check_eq "slow request times out with 408" "408" "$code"
-if [ "$elapsed" -le 10 ]; then
+#
+# Timed on curl's own clock rather than `date`: that is the clock `--max-time` is enforced
+# against, so the reading and the deadline cannot disagree about what happened.
+read -r code elapsed <<< "$(trickle_post)"
+# A bare `000` means no response line arrived at all, which is worth naming rather than
+# reporting as a status mismatch — it is what a dropped connection looks like, and it reads
+# identically to a timeout that never fired.
+if [ "$code" = "408" ]; then
+    pass "slow request times out with 408 ($code)"
+elif [ "$code" = "000" ]; then
+    fail "slow request times out with 408" \
+        "no response at all; connection dropped after ${elapsed}s on curl's clock"
+else
+    fail "slow request times out with 408" "expected '408', got '$code'"
+fi
+# curl reports fractional seconds; the threshold is coarse enough to compare on whole ones.
+secs="${elapsed%%.*}"
+if [ "${secs:-999}" -le 10 ]; then
     pass "timeout fired near the configured 5s (${elapsed}s)"
 else
     fail "timeout fired near the configured 5s" "took ${elapsed}s"

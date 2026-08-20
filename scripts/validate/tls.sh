@@ -19,9 +19,12 @@ SERVER_PID=""
 
 cleanup() {
     stop_server "$SERVER_PID"
-    rm -rf "$WORK"
+    discard_work "$WORK"
 }
 trap cleanup EXIT
+
+# Before anything binds: a leftover node on this port would answer every probe below.
+require_free_port "$PORT"
 
 if ! command -v openssl > /dev/null; then
     skip "openssl not available; cannot generate test certificates"
