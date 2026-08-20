@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-08-20
+
 ### Fixed
 
 - **`PUT /api/{index}/_config` reported `_seq` as a field of the index.** `_seq` is the engine's

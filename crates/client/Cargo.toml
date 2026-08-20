@@ -1,6 +1,6 @@
 [package]
 name = "client"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "MIT"
 
@@ -15,7 +15,7 @@ clap = { version = "4.6.0", features = ["derive", "env"] }
 rustyline = { workspace = true }
 dirs = "6.0.0"
 csv = "1.4"
-storage = { path = "../storage", version = "0.3.1" }
+storage = { path = "../storage", version = "0.3.2" }
 colored_json = "5.0.0"
 colored = "3.1.1"
 flate2 = "1.1.9"

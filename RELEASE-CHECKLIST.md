@@ -115,6 +115,80 @@ Signed off by:
 
 <!-- Newest first. Append a filled-in template per release. -->
 
+## v0.3.2 — 2026-08-20
+
+Commit: 84b5d90 (dirty at build time — the version bump and changelog move were not yet
+committed when the artifacts were staged, so `MANIFEST.txt` will record a commit that predates
+them; same situation as 0.3.1, and deliberate here to keep the staging tree ready for the
+Windows build)
+Built targets: macOS arm64, x86_64-unknown-linux-musl (binary + `cameodb_0.3.2_amd64.deb` +
+`cameodb-0.3.2-1.x86_64.rpm`). **Windows outstanding.**
+
+Validation suite, host build (macOS arm64), 2026-08-20 18:33:34 → 18:45:00:
+
+```
+binary: target/release/cameodb
+
+  PASS deps
+  PASS unit
+  PASS posture
+  PASS auth
+  PASS tls
+  PASS remote-sources
+  PASS artifact
+```
+
+That binary is byte-identical to the staged `dist/0.3.2/mac/cameodb`
+(sha256 `a810f9d4ef225bea54581d9abde12e77ac175ccae58170cce04d502f9ffe4adc`), so the result
+describes the artifact that ships rather than a neighbouring build of it.
+
+| Suite | Host build | musl | windows | notes |
+|-------|-----------|------|---------|-------|
+| deps           | PASS | n/a  | n/a  | workspace-wide, not per-target |
+| unit           | PASS | —    | —    | 553 tests across 31 targets |
+| posture        | PASS | —    | —    | 44 checks; gained an HTTP/2 section in 84b5d90 |
+| auth           | PASS | —    | —    | |
+| tls            | PASS | —    | —    | |
+| remote-sources | PASS | —    | —    | **outstanding on musl and Windows** — trust store differs per platform, so this result does not transfer (procedure step 5) |
+| artifact       | PASS | PASS | —    | see below; musl re-run at 18:56:31 against the 0.3.2 binary |
+
+The `artifact` PASS inside the 18:33 run inspected the *0.3.1* musl binary — the only one that
+existed at the time, built 2026-08-17. It passed while reporting `cameodb 0.3.1`, which is why
+the suite is not by itself evidence about this version. The 0.3.2 musl binary was then checked
+twice: by `artifact.sh` inside `build-musl.sh` as a build gate, and by a standalone re-run at
+18:56:31. Both 8/8, both reporting `cameodb 0.3.2`. Worth teaching the suite to compare the
+artifact's version against the manifests, since a stale binary passes every hardening check it
+has.
+
+Advisory exceptions reviewed: RUSTSEC-2026-0118, RUSTSEC-2026-0119 (hickory-proto 0.25.x,
+transitive via libp2p 0.56.0, needs hickory-proto >=0.26.1), RUSTSEC-2024-0436 (`paste`
+unmaintained, transitive via libp2p → if-watch). All three review-by 2026-11-01 — not due,
+not renewed. `cargo audit` clean over 578 crates.
+
+SBOM: SPDX 579 packages, CycloneDX 578 components against a 578-package `Cargo.lock`, no local
+paths in either header.
+
+`check-config` on both shipped configs (`cameodb.example.toml`, `crates/server/cameodb.toml`):
+OK — 5 and 4 accepted warnings. Both gained a `limits` warning since 0.3.1, from the middle
+verdict added in 5390e5f. The example config's fifth is `node_key` reporting a 0644
+`./data/cameodb/node_identity.json`; that is a local untracked file (gitignored at
+`.gitignore:124`) and not a property of the shipped config.
+
+Skipped checks and why:
+- `remote-sources` on musl and Windows (procedure step 5) — not run.
+
+Not yet done, release is incomplete:
+- **`dist/0.3.2/windows/cameodb.exe` does not exist.** Build it on the Windows machine and copy
+  it to exactly that path, then `--stage sign`.
+- `--stage sign` and `publish.sh` have not run, so there are no `.bundle`, `.sha256`,
+  `SHA256SUMS` or `MANIFEST.txt` files under `dist/0.3.2/` yet.
+- `cameodb-web` has not been updated.
+- The version bump and changelog move are still uncommitted; commit them before signing so the
+  recorded commit describes the artifacts.
+
+Known gaps acknowledged: yes
+Signed off by:
+
 ## v0.3.1 — 2026-08-16
 
 Commit: cb1b188 (dirty at build time — the version bump and changelog move were committed
