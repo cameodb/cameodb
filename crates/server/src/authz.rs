@@ -687,25 +687,91 @@ mod tests {
     use super::*;
     use crate::auth::{ApiKey, ApiKeyConfig, Role, SecurityConfig};
 
-    /// Every `.route("…")` literal in `source`, in the order they are mounted.
-    fn mounted_routes(source: &str) -> Vec<String> {
+    /// One `.route(…)` call: the path it mounts, and every method it answers.
+    struct MountedRoute {
+        path: String,
+        /// Uppercased to match `RouteRule::method`. More than one where the call chains
+        /// method routers, as `put(write).delete(remove)` does.
+        methods: Vec<String>,
+    }
+
+    /// Every route `source` mounts, in the order they are mounted.
+    ///
+    /// The method is parsed, not just the path. A row in `ROUTES` authorizes a *pair*, and
+    /// `classify` denies any pair it does not hold — so a check that only compared paths passed
+    /// happily while a second method on an already-classified path went unclassified, and every
+    /// request to it was refused authentication. Closed rather than open, but silent, and it is
+    /// exactly the shape a new verb on an existing resource takes.
+    fn mounted_routes(source: &str) -> Vec<MountedRoute> {
+        const METHODS: [&str; 5] = ["get", "post", "put", "patch", "delete"];
+
         let mut found = Vec::new();
         for fragment in source.split(".route(").skip(1) {
-            let trimmed = fragment.trim_start();
-            // `.route(HEALTH_PATH, …)` names a constant rather than a literal; it is
-            // asserted separately below so this stays a check and not a guess.
-            let Some(rest) = trimmed.strip_prefix('"') else {
+            // The call's own arguments, and nothing after it: `.route(` consumed one open
+            // paren, so the call ends where the depth returns to zero. Without this bound a
+            // fragment runs to the next `.route(` and picks up method names that belong to
+            // whatever follows the last route in the chain.
+            let mut depth = 1usize;
+            let mut end = fragment.len();
+            for (offset, ch) in fragment.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = offset;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let call = &fragment[..end];
+
+            let trimmed = call.trim_start();
+            // `.route(HEALTH_PATH, …)` names a constant rather than a literal. Resolved here
+            // rather than special-cased in the test, so it is checked like any other route.
+            let path = if let Some(rest) = trimmed.strip_prefix('"') {
+                let Some(quote) = rest.find('"') else {
+                    continue;
+                };
+                rest[..quote].to_string()
+            } else if trimmed.starts_with("HEALTH_PATH") {
+                crate::http_server::HEALTH_PATH.to_string()
+            } else {
+                // Left unparsed, which `every_route_call_is_accounted_for` turns into a failure
+                // rather than a silent omission.
                 continue;
             };
-            if let Some(end) = rest.find('"') {
-                found.push(rest[..end].to_string());
-            }
+
+            // `post(handler)` and the chained `.get(handler)` of a method router both count,
+            // which is how the MCP transport's three verbs on one path are seen. The boundary
+            // check is what keeps a handler named `set_budget(` from reading as a `get`.
+            let mentions_method = |method: &str| {
+                let needle = format!("{method}(");
+                call.match_indices(&needle).any(|(at, _)| {
+                    call[..at]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|before| !before.is_alphanumeric() && before != '_')
+                })
+            };
+
+            let methods = METHODS
+                .iter()
+                .filter(|method| mentions_method(method))
+                .map(|method| method.to_uppercase())
+                .collect();
+
+            found.push(MountedRoute { path, methods });
         }
         found
     }
 
-    fn is_classified(pattern: &str) -> bool {
-        ROUTES.iter().any(|rule| rule.pattern == pattern)
+    fn is_classified(method: &str, pattern: &str) -> bool {
+        ROUTES
+            .iter()
+            .any(|rule| rule.method == method && rule.pattern == pattern)
     }
 
     #[test]
@@ -715,27 +781,70 @@ mod tests {
         let router_source = include_str!("http_server/routes.rs");
         let unclassified: Vec<String> = mounted_routes(router_source)
             .into_iter()
-            .filter(|pattern| !is_classified(pattern))
+            .flat_map(|route| {
+                route
+                    .methods
+                    .into_iter()
+                    .map(move |method| (method, route.path.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|(method, path)| !is_classified(method, path))
+            .map(|(method, path)| format!("{method} {path}"))
             .collect();
         assert!(
             unclassified.is_empty(),
             "these routes are mounted but have no row in ROUTES: {:?}",
             unclassified
         );
+    }
 
-        // The one route mounted through a constant.
-        assert!(router_source.contains(".route(HEALTH_PATH"));
-        assert!(is_classified(crate::http_server::HEALTH_PATH));
+    /// The check above is only a check while it parses every route the router mounts.
+    ///
+    /// A call whose path it cannot read, or whose method it cannot find, contributes nothing to
+    /// the classification check and would take a whole route out of it. Both are failures here,
+    /// so a route mounted in a shape this parser does not know about is reported rather than
+    /// quietly skipped.
+    #[test]
+    fn every_route_call_is_accounted_for() {
+        let router_source = include_str!("http_server/routes.rs");
+        let mounted = mounted_routes(router_source);
 
-        // ...and every literal plus that constant accounts for every `.route(` call, so a
-        // second constant-named route cannot slip past the filter above.
-        let literal_count = mounted_routes(router_source).len();
-        let call_count = router_source.matches(".route(").count();
         assert_eq!(
-            call_count,
-            literal_count + 1,
-            "a route is mounted through a name this test does not know about"
+            mounted.len(),
+            router_source.matches(".route(").count(),
+            "a route is mounted through a path expression this test cannot read"
         );
+
+        let methodless: Vec<&str> = mounted
+            .iter()
+            .filter(|route| route.methods.is_empty())
+            .map(|route| route.path.as_str())
+            .collect();
+        assert!(
+            methodless.is_empty(),
+            "no HTTP method could be parsed for these routes: {:?}",
+            methodless
+        );
+    }
+
+    /// The guard above holds a route to a *pair*, not to a path.
+    ///
+    /// `classify` has always been method-sensitive — `method_is_part_of_the_classification`
+    /// covers that — but the guard that proves every mounted route is classified compared paths
+    /// alone, so a second verb on an already-classified path satisfied it while `classify`
+    /// denied every request to it. This is the property that was missing: a row covers one verb,
+    /// several rows can share a path, and a verb with no row of its own is not classified by its
+    /// siblings.
+    #[test]
+    fn a_path_is_not_classified_for_a_method_it_has_no_row_for() {
+        // Two verbs on one path, each classified by its own row.
+        assert!(is_classified("GET", "/api/{index}/_config"));
+        assert!(is_classified("PUT", "/api/{index}/_config"));
+
+        // And a verb with no row, on paths that are otherwise well covered.
+        assert!(!is_classified("TRACE", "/api/{index}/_config"));
+        assert!(is_classified("PUT", "/api/{index}/document"));
+        assert!(!is_classified("TRACE", "/api/{index}/document"));
     }
 
     /// The check above reads one file, so it is only a check while one file mounts everything.
@@ -767,29 +876,55 @@ mod tests {
         // MCP routes live in another crate and are nested, which is exactly why they are the
         // ones a reviewer forgets. Assert the prefix here rather than assuming it.
         assert!(include_str!("http_server/routes.rs").contains(".nest(\"/mcp\""));
-        for pattern in mounted_routes(include_str!("../../mcp/src/transport.rs")) {
-            let mounted = format!("/mcp{}", pattern.trim_end_matches('/'));
+        for (method, path) in mcp_routes_under_their_mount_point() {
             assert!(
-                is_classified(&mounted),
-                "MCP route {mounted} has no row in ROUTES"
+                is_classified(&method, &path),
+                "MCP route {method} {path} has no row in ROUTES"
             );
         }
+    }
+
+    /// The MCP transport's routes as they are reachable on this server: nested under `/mcp`, and
+    /// with the three verbs of its Streamable HTTP endpoint separated, since each needs its own
+    /// row. Its method routers chain — `post(…).get(…).delete(…)` on one path — which is the
+    /// shape a path-only check could never have told apart from a single route.
+    fn mcp_routes_under_their_mount_point() -> Vec<(String, String)> {
+        mounted_routes(include_str!("../../mcp/src/transport.rs"))
+            .into_iter()
+            .flat_map(|route| {
+                let path = format!("/mcp{}", route.path.trim_end_matches('/'));
+                route
+                    .methods
+                    .into_iter()
+                    .map(move |method| (method, path.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     #[test]
     fn no_row_classifies_a_route_that_is_not_mounted() {
         // The reverse direction: a stale row is a rule nothing enforces, and a reader would
-        // take it for coverage.
-        let mut mounted: Vec<String> = mounted_routes(include_str!("http_server/routes.rs"));
-        mounted.push(crate::http_server::HEALTH_PATH.to_string());
-        mounted.extend(
-            mounted_routes(include_str!("../../mcp/src/transport.rs"))
+        // take it for coverage. Per method as well as per path, so a verb that stops being
+        // mounted is reported rather than covered by its siblings on the same path.
+        let mut mounted: Vec<(String, String)> =
+            mounted_routes(include_str!("http_server/routes.rs"))
                 .into_iter()
-                .map(|p| format!("/mcp{}", p.trim_end_matches('/'))),
-        );
+                .flat_map(|route| {
+                    route
+                        .methods
+                        .into_iter()
+                        .map(move |method| (method, route.path.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+        mounted.extend(mcp_routes_under_their_mount_point());
+
         for rule in ROUTES {
             assert!(
-                mounted.iter().any(|m| m == rule.pattern),
+                mounted
+                    .iter()
+                    .any(|(method, path)| method == rule.method && path == rule.pattern),
                 "ROUTES classifies {} {}, which no router mounts",
                 rule.method,
                 rule.pattern
