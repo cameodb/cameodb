@@ -108,6 +108,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator | — | 2026-08-10 | 📋 |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field | — | 2026-08-13 | 📋 |
+| [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to | — | 2026-08-27 | 📋 |
 
 ---
 
@@ -639,7 +640,11 @@ so the next change to how a sorted search counts its total touches one place.
 repository until now.
 
 A `PUT /api/{index}/_config` declaring an i64 field with `"fast": false` reads back from
-`GET /api/{index}/_config` as `"fast": true`. Mechanism unconfirmed. `FieldDef::new` forces
+`GET /api/{index}/_config` as `"fast": true`. **Reproduced 2026-08-27** on a running node while
+auditing the sort rules, and it has a consequence worth recording: because every numeric and date
+field is forced fast, the refusal `unsortable_sort_field` exists to deliver — "a numeric field
+must be declared fast to sort" — is unreachable for those types. What reaches it in practice is a
+boolean, ip, json or facet field. Mechanism still unconfirmed. `FieldDef::new` forces
 `fast` for `I64` / `U64` / `F64` / `Date`, so the likely cause is a write path re-deriving a
 declared field through it rather than preserving what the caller declared — but the one
 schema-evolution call site that reaches `FieldDef::new` only adds fields not already present,
@@ -648,6 +653,35 @@ so the path has to be found before the fix is written.
 Not an MCP defect, and not a sort defect: the engine's fast-column guard refuses a genuinely
 non-fast sort correctly. What is wrong is that the config says one thing and the index does
 another, which is exactly the distinction `searchable` and `sortable` exist to report.
+
+### OB2 — A `facet` field cannot be written to
+
+📋 **Open**, found 2026-08-27 while auditing what the MCP syntax reference advertises.
+
+Every JSON value shape is refused. `staged_schema_validation` infers a type from the value and
+compares it with the declared one: a string infers `Text` (or `Date`, or `Ip`), a number infers a
+numeric type, an object infers `Json`, an array infers `Text`. Nothing infers `Facet`, so a
+document naming a declared facet field fails with `Type mismatch for field 'category': expected
+Facet, got Text` whatever it carries. Confirmed against `"/electronics/phones"`,
+`"electronics/phones"`, `["/electronics/phones"]` and `{"path": "…"}`.
+
+**Everything below the validator is already built.** `create_schema_from_definition` declares the
+column with `add_facet_field`, both write paths have a `TantivyFieldType::Facet` arm calling
+`add_facet`, `normalize_facet_query` quotes the path so the grammar accepts it, and the type
+round-trips through the schema record and back from Tantivy. The type is declarable, queryable in
+principle, and unwritable in fact.
+
+**Which makes it an advertised operator for a field no document can carry.** `field:/path/to/value`
+is in the operator table, `facet` is in the field-type table, `hint_for_type("facet")` renders a
+per-field hint, `describe_index` would show it in `query_hints` for any index declaring one, and
+the orchestrator skill tells an agent that a facet path matches everything under it. An agent
+following that guidance cannot be wrong about the syntax and cannot ever meet the data.
+
+The fix belongs in the validator — accept a string for a declared `Facet` field, and let the
+storage layer's existing arm index it — not in the reference, since deleting the operator would
+document a bug as a decision. Worth checking `ip` and `boolean` for the same shape while there:
+a string infers `Ip` only when it parses as an address, so a declared `ip` field is writable, but
+the inference is the same single-guess design.
 
 ---
 
