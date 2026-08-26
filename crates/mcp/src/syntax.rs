@@ -301,9 +301,6 @@ pub const RULES: &[&str] = &[
      `shadow`. Fields discovered from a document are added unindexed, and stay that way until a \
      schema update promotes them, so check the `indexed` flag before naming a field.",
     SHADOW_FIELD,
-    "`_seq` is an internal sequence number used to track write-ahead-log position. It is present \
-     in every index and technically queryable, but it carries no meaning for a search and should \
-     be ignored.",
     "`AND`, `OR`, `NOT`, `TO` and `IN` are keywords in uppercase only. Lowercase is query text: \
      `to` and `in` break the clause around them and are reported, while `and`, `or` and `not` are \
      searched for as ordinary words and change what the query means without any warning.",
@@ -583,6 +580,41 @@ pub fn markdown_reference() -> String {
 mod tests {
     use super::*;
 
+    /// Nothing here describes a field no index reports.
+    ///
+    /// `_seq` was documented as "present in every index and technically queryable" until
+    /// 2026-08-27, and by then it was neither: Stage 7 stopped declaring it on new indices,
+    /// `describe_fields`, `sorted_field_names`, `searchable_fields` and `sortable_fields` all
+    /// filter it, and a sort naming it is refused. The rule spent resident context telling an
+    /// agent to ignore a field it could not see.
+    ///
+    /// The reason it survived is that retiring a column swept the engine and not the prose, and
+    /// the reason it would come back is an index old enough to still carry the column. This is
+    /// the assertion that says the engine's silence about a field is the reference's silence too.
+    #[test]
+    fn no_rule_describes_a_field_the_engine_hides() {
+        for text in RULES {
+            assert!(
+                !text.contains("_seq"),
+                "a rule describes `_seq`, which no index reports and no listing shows: {text}"
+            );
+        }
+        for op in OPERATORS {
+            assert!(
+                !op.syntax.contains("_seq") && !op.summary.contains("_seq"),
+                "an operator names `_seq`: {}",
+                op.syntax
+            );
+        }
+        for rule in SORT_RULES {
+            assert!(
+                !rule.contains("_seq"),
+                "a sort rule names `_seq`, which is refused rather than sorted: {rule}"
+            );
+        }
+    }
+
+    /// A form that names no field type would be missing from every per-field hint, and a type no
     /// A form that names no field type would be missing from every per-field hint, and a type no
     /// operator claims would render a hint with nothing in it.
     #[test]
