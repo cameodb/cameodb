@@ -848,11 +848,53 @@ fn effective_routing_key(
         .or_else(|| derive_routing_key_from_doc(doc))
 }
 
+/// The key a delete is routed by, or the reason it cannot be routed.
+///
+/// A write reads its routing key out of the document, which outranks everything the caller sent.
+/// A delete has no document, so only two of those four rungs are left — and which of them applies
+/// is decided entirely by the schema:
+///
+/// - **The routing field is the key.** `id` by default, or a shadow field, whose value *is* the
+///   document key by definition. The id routes, exactly as the original write did.
+/// - **The routing field is some other field**, a tenant or a customer. The id says nothing about
+///   which shard holds the row, so the caller has to supply the same key the write used.
+///
+/// The refusal in that second case is deliberate and recorded as a non-goal: fanning a keyless
+/// delete out to every shard on every node is *correct*, since a shard without the id removes
+/// nothing, but it costs `shards × nodes` writer transactions to remove one row and the code
+/// already refuses to broadcast a write. The error names the field so the caller knows what to
+/// send, which it can read off the document with one search.
+fn effective_delete_routing_key(
+    schema: &IndexSchema,
+    id: &str,
+    routing_key: Option<String>,
+) -> Result<String, OrchestratorError> {
+    if let Some(key) = routing_key {
+        return Ok(key);
+    }
+
+    let routing_field = schema.get_routing_field();
+    if routing_field == "id" || schema.is_shadow_field(routing_field) {
+        return Ok(id.to_string());
+    }
+
+    Err(OrchestratorError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "index routes by '{routing_field}', which is not the document key, so a delete must              carry the same routing_key the write used — read it off the document with a search              for id:{id}"
+        ),
+    )))
+}
+
+/// Helper function to detect if an operation is a write operation
 /// Helper function to detect if an operation is a write operation
 fn is_write_operation(op: &ClientOp) -> bool {
     matches!(
         op,
-        ClientOp::Write { .. } | ClientOp::BulkWrite { .. } | ClientOp::DeleteIndex { .. }
+        ClientOp::Write { .. }
+            | ClientOp::BulkWrite { .. }
+            | ClientOp::Delete { .. }
+            | ClientOp::DeleteIndex { .. }
     )
 }
 
@@ -1403,6 +1445,20 @@ pub enum ClientOp {
     BulkWrite {
         index: String,
         docs: Vec<DocPayload>,
+    },
+    /// Remove one document by its key.
+    ///
+    /// A write with no document, which is what makes it the one operation the engine can always
+    /// serve: nothing here can grow a schema, so there is no `UseActor` path to fall back to.
+    ///
+    /// `routing_key` matters more than it does on a write. A write derives its key from the
+    /// document's own routing field; a delete has no document, so on an index that routes by a
+    /// field other than the key this is the only way to name the shard that holds the row. See
+    /// `effective_delete_routing_key`.
+    Delete {
+        index: String,
+        id: String,
+        routing_key: Option<String>,
     },
     /// Create or update index configuration/schema
     CreateConfig { index: String, schema: IndexSchema },
@@ -2388,6 +2444,11 @@ impl OrchestratorEngine {
                     .await,
                 )
             }
+            ClientOp::Delete {
+                index,
+                id,
+                routing_key,
+            } => WorkerOutcome::Done(self.engine_delete(&index, id, routing_key).await),
             // Bulk writes need `staged_schema_validation`, parallel routing and remote
             // forwarding; config and metadata ops are lightweight and rare. Both belong on
             // the actor, which owns the state they touch.
@@ -2497,6 +2558,56 @@ impl OrchestratorEngine {
             routing_key,
             doc,
         })
+    }
+
+    /// Remove one document by key.
+    ///
+    /// The only operation with no slow path. A delete carries no document, so it cannot present a
+    /// field the schema does not know and can never need `staged_schema_validation` — which is
+    /// why this returns the answer rather than a [`WorkerOutcome`] that might hand the op back.
+    ///
+    /// The schema is still needed, to decide what the id says about routing. It is read from the
+    /// engine's snapshot caches and only loaded through the shard as a last resort, exactly as
+    /// `engine_write` does.
+    async fn engine_delete(
+        &self,
+        index: &str,
+        id: String,
+        routing_key: Option<String>,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let shards = self.shards.load();
+        if shards.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards",
+            )));
+        }
+
+        let schema = if let Some(cached) = self.get_cached_schema(index) {
+            cached
+        } else {
+            Arc::new(self.load_schema(index).await?)
+        };
+
+        let routing_key = effective_delete_routing_key(&schema, &id, routing_key)?;
+
+        // The ring owns the placement decision here as it does for a write, and a delete cannot
+        // disagree with the hint the router dispatched on: both are this same key.
+        let target = self.route_write(&Some(routing_key.clone()))?;
+        let shard = shards.get(&target).ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Shard not found",
+            ))
+        })?;
+
+        let sequence = shard.handle_delete(index.to_string(), id.clone()).await?;
+        Ok(serde_json::json!({
+            "id": id,
+            "result": "deleted",
+            "version": sequence,
+            "shard_id": target.to_string(),
+        }))
     }
 
     /// Parallel scatter-gather search across all local shards.
@@ -3532,6 +3643,30 @@ impl MicroshardActor {
         Ok(seq_id)
     }
 
+    /// Removes one document, through the same writer thread a write goes through.
+    ///
+    /// Deliberately not its own storage path: the command is a `StorageCommand::Write` carrying a
+    /// `WalOp::Delete`, so the delete is coalesced into the same `apply_batch` as the puts that
+    /// arrived with it, takes the same single redb transaction, and counts toward the same commit
+    /// threshold. Ordering inside that batch is already correct — Tantivy applies `delete_term` to
+    /// documents added earlier in the same commit, and the redb `insert` then `remove` leaves
+    /// nothing behind — so a put and a delete of one id in the same batch resolve whichever order
+    /// they arrived in.
+    ///
+    /// The supervisor signal is what bounds visibility. A delete removes the redb row at once, so
+    /// an `id:VALUE` lookup stops finding it immediately, but the Tantivy `delete_term` only takes
+    /// effect at the next commit — without this signal a single delete on an otherwise idle index
+    /// would wait for unrelated traffic to trigger one.
+    pub async fn handle_delete(&self, index: String, id: String) -> Result<u64, OrchestratorError> {
+        let sequence = self
+            .handle_write_via_channel(index.clone(), WalOp::Delete { id })
+            .await?;
+
+        self.signal_supervisor(index).await;
+
+        Ok(sequence)
+    }
+
     /// Handles batch write requests via the dedicated writer thread.
     pub async fn handle_batch_write(
         &self,
@@ -3848,7 +3983,10 @@ impl RouterActor {
         if let Some(tx) = &self.worker_tx {
             let is_worker_eligible = matches!(
                 op,
-                ClientOp::Write { .. } | ClientOp::Search { .. } | ClientOp::Stream { .. }
+                ClientOp::Write { .. }
+                    | ClientOp::Delete { .. }
+                    | ClientOp::Search { .. }
+                    | ClientOp::Stream { .. }
             );
             if is_worker_eligible {
                 // Resolve shard affinity hint when shard-affine dispatch is enabled.
@@ -3857,7 +3995,11 @@ impl RouterActor {
                 // so affinity is None and dispatch falls back to round-robin.
                 let affinity_shard = if self.shard_affine.enabled {
                     match &op {
-                        ClientOp::Write { routing_key, .. } => {
+                        // A delete's key is the one the engine will route by, so unlike a write
+                        // — whose document may name a different one — the worker chosen here is
+                        // always the one co-located with the writer that serves it.
+                        ClientOp::Write { routing_key, .. }
+                        | ClientOp::Delete { routing_key, .. } => {
                             routing_key.as_ref().and_then(|key| {
                                 let ring = self.shard_affine.routing_ring.load();
                                 ring.get_owner(key)
@@ -7147,6 +7289,11 @@ impl NodeOrchestrator {
                 doc,
             } => self.orch_write(&index, id, routing_key, doc).await,
             ClientOp::BulkWrite { index, docs } => self.orch_bulk_write(&index, docs).await,
+            ClientOp::Delete {
+                index,
+                id,
+                routing_key,
+            } => self.orch_delete(&index, id, routing_key).await,
             ClientOp::CreateConfig { index, schema } => {
                 self.orch_create_config(&index, schema).await
             }
@@ -7374,6 +7521,50 @@ impl NodeOrchestrator {
             ),
             Err(e) => Err(e),
         }
+    }
+
+    /// [`engine_delete`](OrchestratorEngine::engine_delete) on the actor.
+    ///
+    /// Reached two ways: a peer forwarding the op over `cameo.orchestrator.client_op`, and the
+    /// mailbox fallback when a worker queue is full. Neither is the hot path, and both have to
+    /// route a delete the same way the engine does or the same id would resolve to two shards
+    /// depending on how busy the node was.
+    async fn orch_delete(
+        &self,
+        index: &str,
+        id: String,
+        routing_key: Option<String>,
+    ) -> Result<JsonValue, OrchestratorError> {
+        if self.shards.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards",
+            )));
+        }
+
+        let schema = if let Some(cached) = self.get_cached_schema(index) {
+            cached
+        } else {
+            Arc::new(self.load_schema(index).await?)
+        };
+
+        let routing_key = effective_delete_routing_key(&schema, &id, routing_key)?;
+
+        let target = self.route_write(&Some(routing_key))?;
+        let shard = self.shards.get(&target).ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Shard not found",
+            ))
+        })?;
+
+        let sequence = shard.handle_delete(index.to_string(), id.clone()).await?;
+        Ok(serde_json::json!({
+            "id": id,
+            "result": "deleted",
+            "version": sequence,
+            "shard_id": target.to_string(),
+        }))
     }
 
     async fn orch_bulk_write(
@@ -8655,6 +8846,77 @@ mod tests {
             effective_routing_key(&default_schema, "d1", None, &bare).as_deref(),
             Some("d1"),
             "routing_field defaults to `id`"
+        );
+    }
+
+    /// What a delete is routed by, and when it cannot be routed at all.
+    ///
+    /// A write reads its key out of the document, which is the authority. A delete has no
+    /// document, so the schema decides whether the id is enough: it is where the routing field is
+    /// the key — `id`, or a shadow field whose value *is* the key — and it is not where the index
+    /// routes by a tenant or a customer. The refusal in that case is deliberate; fanning out to
+    /// every shard is correct and costs shards × nodes transactions to remove one row.
+    #[test]
+    fn a_delete_routes_by_the_id_unless_the_index_routes_by_something_else() {
+        // The default: the routing field is the key, so the id is the key.
+        let default_schema = IndexSchema::default();
+        assert_eq!(
+            effective_delete_routing_key(&default_schema, "d1", None).expect("routable"),
+            "d1"
+        );
+
+        // A shadow index: the routing field is `sha1`, whose value is the document key, so the
+        // id routes exactly as the original write did.
+        let mut shadow = IndexSchema::default();
+        shadow.add_shadow_field("sha1".to_string(), TantivyFieldType::String);
+        shadow
+            .set_routing_field("sha1".to_string())
+            .expect("the field exists");
+        assert!(shadow.is_shadow_field("sha1"));
+        assert_eq!(
+            effective_delete_routing_key(&shadow, "abc123", None).expect("routable"),
+            "abc123"
+        );
+
+        // A tenant index: the id says nothing about which shard holds the row.
+        let mut tenanted = IndexSchema::default();
+        tenanted.fields.insert(
+            "tenant_id".to_string(),
+            FieldDef::new("tenant_id".to_string(), TantivyFieldType::String),
+        );
+        tenanted
+            .set_routing_field("tenant_id".to_string())
+            .expect("the field exists");
+
+        let refused = effective_delete_routing_key(&tenanted, "d1", None)
+            .expect_err("a keyless delete on a tenant index cannot be routed");
+        let message = refused.to_string();
+        assert!(
+            message.contains("tenant_id"),
+            "the refusal must name the field to supply: {message}"
+        );
+        assert!(
+            message.contains("id:d1"),
+            "and how to find its value: {message}"
+        );
+        assert!(
+            matches!(
+                &refused,
+                OrchestratorError::Io(io) if io.kind() == std::io::ErrorKind::InvalidInput
+            ),
+            "InvalidInput is what `AppError::from_route` turns into a 400 rather than a 500"
+        );
+
+        // ...and with the key supplied it routes by that, on any index.
+        assert_eq!(
+            effective_delete_routing_key(&tenanted, "d1", Some("acme".to_string()))
+                .expect("routable"),
+            "acme"
+        );
+        assert_eq!(
+            effective_delete_routing_key(&default_schema, "d1", Some("acme".to_string()))
+                .expect("routable"),
+            "acme"
         );
     }
 

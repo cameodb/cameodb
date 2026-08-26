@@ -1,14 +1,15 @@
-//! Getting documents in: one at a time, in bulk, and as an NDJSON stream.
+//! Getting documents in: one at a time, in bulk, and as an NDJSON stream — and taking one out.
 
 use axum::{
     Json,
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderValue, header},
     response::Response,
 };
 use bytes::BytesMut;
 use futures::StreamExt;
+use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tracing::{debug, info, warn};
 
@@ -46,6 +47,59 @@ pub(super) async fn write_handler(
         .router
         .route_and_handle(client_op, effective_routing_key, OperationType::Write)
         .await?;
+    Ok(Json(result))
+}
+
+/// What a delete names: the document, and optionally the shard.
+#[derive(Deserialize)]
+pub(super) struct DeleteDocumentParams {
+    id: String,
+    /// Required only where the index routes by a field that is not the document key; see
+    /// `effective_delete_routing_key`, which is where a missing one is refused.
+    #[serde(default)]
+    routing_key: Option<String>,
+}
+
+/// Handler for removing one document by its key.
+///
+/// The id travels in the query string rather than in a path segment or a body, and both
+/// alternatives were considered and rejected. `DELETE /api/{index}/document/{id}` would need a
+/// second placeholder in `authz::match_pattern` — the matcher every request is classified by —
+/// and an id is an arbitrary string, so authz reading the raw path while this handler reads the
+/// decoded one means an id containing `%2F` is two different documents to the two of them. A body
+/// on `DELETE` is the part proxies drop. Deleting an index already carries its parameters in the
+/// query, so this is the shape the API already has.
+pub(super) async fn delete_document_handler(
+    Path(index): Path<String>,
+    State(state): State<AppState>,
+    Query(params): Query<DeleteDocumentParams>,
+) -> Result<Json<JsonValue>, AppError> {
+    let DeleteDocumentParams { id, routing_key } = params;
+    debug!("Delete request - index: {}, doc_id: {}", index, id);
+
+    if id.trim().is_empty() {
+        return Err(AppError::bad_request(
+            "query parameter 'id' is required and cannot be empty",
+        ));
+    }
+
+    // As on a write, the key doubles as the routing hint so the operation is unicast rather than
+    // broadcast. Where the index routes by something other than the key this hint is wrong, and
+    // the schema-aware refusal downstream is what catches that — it is the only place the schema
+    // is in hand without paying for an extra lookup on every delete.
+    let effective_routing_key = routing_key.clone().or_else(|| Some(id.clone()));
+
+    let client_op = ClientOp::Delete {
+        index,
+        id,
+        routing_key,
+    };
+
+    let result = state
+        .router
+        .route_and_handle(client_op, effective_routing_key, OperationType::Write)
+        .await
+        .map_err(AppError::from_route)?;
     Ok(Json(result))
 }
 
