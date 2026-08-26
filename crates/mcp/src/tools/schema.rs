@@ -117,11 +117,11 @@ pub(crate) struct GetCatalogStatsArgs {}
 fn sort_schema() -> JsonValue {
     json!({
         "type": "object",
-        "description": "Sort results by a field. Supported types: u64, i64, f64, date (FAST fields), and text/string (alphabetic sort).",
+        "description": "Sort results by a field. Exact on a numeric or date field carrying a fast column, approximate on a text or string field without one, and refused with a 400 naming the field for any other type or an unknown name.",
         "properties": {
             "field": {
                 "type": "string",
-                "description": "Field name to sort by. Supports u64, i64, f64, date, and text/string fields."
+                "description": "Field name to sort by. `describe_index` reports which fields carry a fast column as `sortable`."
             },
             "order": {
                 "type": "string",

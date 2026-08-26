@@ -323,8 +323,13 @@ pub const RULES: &[&str] = &[
 /// How ordering behaves, which the `sort` modifier and parameter share.
 pub const SORT_RULES: &[&str] = &[
     "Sorting is exact on a field with a fast column, and `describe_index` reports which those are \
-     as `sortable`. A numeric or date field needs one to be sorted at all; a text or string field \
-     without one is sorted approximately rather than refused.",
+     as `sortable`. A text or string field without one is sorted approximately rather than \
+     refused; every other type without one is refused.",
+    "A sort the index cannot answer is a refusal, not a degraded result: the request fails with \
+     `cannot sort by 'FIELD'` and the reason — the index has no column of that name, or the type \
+     needs a fast column it does not have. It is decided before any shard runs, so no partial \
+     answer comes back with it. Boolean, ip, json and facet fields are the ones this catches in \
+     practice. Retry on a different field rather than re-sending.",
     "An approximate sort collects the top `2 × limit` matches by relevance and orders those \
      alphabetically, so the result is not the alphabetically first documents in the index and \
      paging through it re-orders a different sample on each page. The response says so: it \
