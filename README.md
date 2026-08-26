@@ -247,6 +247,7 @@ cameodb@localhost:9480 ▶ health
 cameodb@localhost:9480 ▶ schema detect ./examples/data/booksummaries.tsv
 cameodb@localhost:9480 ▶ data load books ./examples/data/booksummaries.tsv
 cameodb@localhost:9480 ▶ search books "title:Hitchhiker" limit 10
+cameodb@localhost:9480 ▶ delete books --id 12345
 cameodb@localhost:9480 ▶ admin memory stats
 cameodb@localhost:9480 ▶ admin memory purge --force
 ```

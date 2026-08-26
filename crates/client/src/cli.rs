@@ -1046,8 +1046,9 @@ impl IndexCompleter {
     }
 
     fn delete_flag_suggestions(&self, prefix: &str, tokens: &[&str]) -> Vec<Pair> {
-        self.flag_suggestion("--delete-schema", "--delete-schema", prefix, tokens)
+        ["--id", "--routing-key", "--delete-schema"]
             .into_iter()
+            .filter_map(|flag| self.flag_suggestion(flag, flag, prefix, tokens))
             .collect()
     }
 
@@ -1689,11 +1690,25 @@ pub enum ClientCommand {
         batch_size: usize,
     },
 
-    /// Delete an index (and optionally its schema)
+    /// Delete documents from an index, or the whole index
+    ///
+    /// With no `--id` and no `--ids-file`, deletes the index itself, which is what this
+    /// command has always meant. Naming documents deletes those instead and leaves the
+    /// index in place.
     Delete {
         /// Target index name
         index: String,
-        /// Also delete stored schema/config
+        /// Delete this document rather than the index. Repeatable.
+        #[arg(long = "id", value_name = "ID")]
+        ids: Vec<String>,
+        /// Delete the documents whose ids are in this file, one per line
+        #[arg(long, value_name = "PATH")]
+        ids_file: Option<String>,
+        /// Routing key for the named documents, where the index routes by a field that is
+        /// not the document key
+        #[arg(long, value_name = "KEY")]
+        routing_key: Option<String>,
+        /// Also delete stored schema/config. Only meaningful when deleting the index.
         #[arg(long, default_value_t = false)]
         delete_schema: bool,
     },
@@ -1777,6 +1792,60 @@ pub enum ListResource {
     Indexes,
     /// Show details for a single index (requires a name)
     Index,
+}
+
+/// The document ids a `delete` names, or `None` when it names none and therefore means the index.
+///
+/// Both sources are read together so `--id` and `--ids-file` compose; a file that contains no ids
+/// is an error rather than a silent fall-through to deleting the index, which is the one mistake
+/// this command must not make quietly.
+fn collect_delete_ids(ids: &[String], ids_file: Option<&str>) -> Result<Option<Vec<String>>> {
+    let mut named: Vec<String> = ids.iter().map(|id| id.trim().to_string()).collect();
+
+    if let Some(path) = ids_file {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read ids from '{}'", path))?;
+        let from_file: Vec<String> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_string)
+            .collect();
+        if from_file.is_empty() {
+            return Err(anyhow!(
+                "'{}' contains no ids; refusing to fall back to deleting the index",
+                path
+            ));
+        }
+        named.extend(from_file);
+    }
+
+    named.retain(|id| !id.is_empty());
+    Ok((!named.is_empty()).then_some(named))
+}
+
+/// Delete one document or many, choosing the endpoint that fits.
+///
+/// One id goes to the single-document route so the answer names the shard that served it; more
+/// than one goes to the bulk route, which groups them by shard and takes one transaction each.
+async fn delete_named_documents(
+    client: &CameoClient,
+    index: &str,
+    ids: &[String],
+    routing_key: Option<&str>,
+) -> Result<JsonValue> {
+    if let [only] = ids {
+        return client.delete_document(index, only, routing_key).await;
+    }
+
+    let entries: Vec<JsonValue> = ids
+        .iter()
+        .map(|id| match routing_key {
+            Some(key) => json!({"id": id, "routing_key": key}),
+            None => json!(id),
+        })
+        .collect();
+    client.delete_documents(index, &entries).await
 }
 
 pub async fn run_cli() -> Result<()> {
@@ -1890,10 +1959,30 @@ pub async fn run_cli() -> Result<()> {
         },
         ClientCommand::Delete {
             index,
+            ids,
+            ids_file,
+            routing_key,
             delete_schema,
         } => {
-            let result = client.delete_index(&index, delete_schema).await?;
-            print_json(&result)?;
+            let named = collect_delete_ids(&ids, ids_file.as_deref())?;
+            match named {
+                Some(named) => {
+                    if delete_schema {
+                        return Err(anyhow!(
+                            "--delete-schema deletes the index, which is not what naming \
+                             documents asks for; drop one of the two"
+                        ));
+                    }
+                    let result =
+                        delete_named_documents(&client, &index, &named, routing_key.as_deref())
+                            .await?;
+                    print_json(&result)?;
+                }
+                None => {
+                    let result = client.delete_index(&index, delete_schema).await?;
+                    print_json(&result)?;
+                }
+            }
         }
         ClientCommand::Admin { subcommand } => match subcommand {
             AdminCommand::Memory { operation, force } => match operation {
@@ -4489,7 +4578,7 @@ fn interactive_loop(
 
         if matches!(input.as_str(), "help" | "\\h") {
             println!(
-                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  admin memory stats\n  admin memory purge [--force]\n  admin index <name> commit\n  admin index <name> evict-writer\n  admin workers\n  connect <host[:port]>\n  key file <path>\n  key <api-key>\n  key show | key clear\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
+                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  delete <index> --id <ID>... [--routing-key <KEY>]\n  admin memory stats\n  admin memory purge [--force]\n  admin index <name> commit\n  admin index <name> evict-writer\n  admin workers\n  connect <host[:port]>\n  key file <path>\n  key <api-key>\n  key show | key clear\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
             );
             continue;
         }
@@ -4690,12 +4779,53 @@ async fn dispatch_interactive_command(
             }
         }
         "delete" => {
-            let index = parts
-                .next()
-                .ok_or_else(|| anyhow!("Usage: delete <index> [--delete-schema]"))?;
+            let index = parts.next().ok_or_else(|| {
+                anyhow!(
+                    "Usage: delete <index> [--delete-schema] | delete <index> --id <ID>… \
+                     [--routing-key <KEY>]"
+                )
+            })?;
 
-            // Parse optional flag --delete-schema
-            let delete_schema = parts.any(|p| p == "--delete-schema");
+            // Flags, in one pass: --id takes a value, the rest are switches.
+            let rest: Vec<&str> = parts.collect();
+            let mut ids: Vec<String> = Vec::new();
+            let mut routing_key: Option<String> = None;
+            let mut delete_schema = false;
+            let mut cursor = rest.iter();
+            while let Some(token) = cursor.next() {
+                match *token {
+                    "--delete-schema" => delete_schema = true,
+                    "--id" => {
+                        let value = cursor
+                            .next()
+                            .ok_or_else(|| anyhow!("--id needs a document id"))?;
+                        ids.push((*value).to_string());
+                    }
+                    "--routing-key" => {
+                        let value = cursor
+                            .next()
+                            .ok_or_else(|| anyhow!("--routing-key needs a value"))?;
+                        routing_key = Some((*value).to_string());
+                    }
+                    other => return Err(anyhow!("Unknown option '{}' for delete", other)),
+                }
+            }
+
+            // Naming documents deletes those; naming none still means the index, which is what
+            // this command has always meant and what the confirmation below is guarding.
+            if !ids.is_empty() {
+                if delete_schema {
+                    return Err(anyhow!(
+                        "--delete-schema deletes the index, which is not what naming documents \
+                         asks for; drop one of the two"
+                    ));
+                }
+                let result =
+                    delete_named_documents(session.client(), index, &ids, routing_key.as_deref())
+                        .await?;
+                print_json(&result)?;
+                return Ok(());
+            }
 
             // Use rustyline for confirmation to avoid stdin conflicts in interactive mode
             let prompt = format!("Delete index \"{}\"? [yes/NO]: ", index);
@@ -4844,6 +4974,47 @@ mod tests {
     use rustyline::history::MemHistory;
     use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
+
+    /// `delete <index>` still means the index; naming documents is what changes it.
+    ///
+    /// The dangerous direction is a caller who meant to delete documents and deletes the index
+    /// instead, so an ids file that yields nothing is an error rather than a fall-through — and
+    /// blank lines and comments are ignored, since an ids file is something a person edits.
+    #[test]
+    fn delete_names_documents_only_when_it_is_given_some() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert_eq!(
+            collect_delete_ids(&[], None).expect("no ids is the index"),
+            None
+        );
+        assert_eq!(
+            collect_delete_ids(&["b1".to_string()], None).expect("one id"),
+            Some(vec!["b1".to_string()])
+        );
+
+        // A file, with the shapes a hand-edited file actually has.
+        let path = dir.path().join("ids.txt");
+        std::fs::write(&path, "b2\n\n# a comment\n  b3  \n").expect("write");
+        assert_eq!(
+            collect_delete_ids(&["b1".to_string()], path.to_str()).expect("flags and file compose"),
+            Some(vec!["b1".to_string(), "b2".to_string(), "b3".to_string()])
+        );
+
+        // An empty file must not read as "delete the index".
+        let empty = dir.path().join("empty.txt");
+        std::fs::write(&empty, "# nothing but a comment\n").expect("write");
+        let refused = collect_delete_ids(&[], empty.to_str())
+            .expect_err("an ids file with no ids is an error");
+        assert!(
+            refused.to_string().contains("refusing"),
+            "the refusal must say why: {refused}"
+        );
+
+        let missing = collect_delete_ids(&[], Some("/no/such/ids/file"))
+            .expect_err("an unreadable ids file is an error");
+        assert!(missing.to_string().contains("Failed to read ids"));
+    }
 
     fn completer_with_index() -> IndexCompleter {
         let cache = Arc::new(RwLock::new(HashMap::new()));

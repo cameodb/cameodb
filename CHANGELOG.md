@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Record deletion.** CameoDB could delete an index and never a document. Two endpoints, both
+  needing `write` — a key that can write can already overwrite any document with anything, so
+  withholding removal protects nothing:
+
+  ```
+  DELETE /api/{index}/document?id=<id>[&routing_key=<key>]
+  POST   /api/{index}/_bulk/delete          body: ["b1", {"id": "b2", "routing_key": "acme"}]
+  ```
+
+  The single delete answers what a write answers, one word apart: the id, `"result": "deleted"`,
+  the sequence it took and the shard that served it. The bulk one answers as `_bulk` does, and
+  takes either entry shape — a list of bare ids is what almost every caller has, and making them
+  wrap each one in an object to say nothing extra is a worse API than accepting both.
+
+  The id travels in the query rather than in a path segment, and both alternatives were rejected
+  on their merits. `DELETE /api/{index}/document/{id}` would need a second placeholder in the
+  matcher that classifies every request for authorization, and an id is an arbitrary string:
+  authorization reads the raw path while the handler reads the decoded one, so an id containing
+  `%2F` is two different documents to the two of them. A body on `DELETE` is what proxies drop.
+  Deleting an index already carries its parameters in the query.
+
+  Almost none of this is new machinery. `WalOp::Delete` has always existed and both storage write
+  paths have always handled it, so a delete is coalesced into the same transaction as the writes
+  that arrive with it, counts toward the same commit threshold, and recovers through the same WAL
+  replay. It is also the first operation the engine can always serve: carrying no document, it
+  cannot present a field the schema does not know, so there is no schema-evolution path to defer
+  to the actor.
+
+  **Deleting is idempotent.** An id the index does not hold is answered as `deleted`, the same way
+  writing over an existing document is answered as `created`. A missing *index* is a 404, and the
+  delete creates nothing on its way to saying so.
+
+  **Visibility has two tiers, because two engines answer.** An `id:VALUE` lookup is served from the
+  key-value store, so a delete is visible there immediately; a content query is served by the
+  search index, where the removal lands at the next commit — the idle timeout, sooner under load,
+  or at once through the admin commit endpoint. Until then the document is counted in `total_hits`
+  but absent from `hits`, which is the honest reading of a mid-flight delete: reducing the count
+  instead would break the arithmetic that pages through results.
+
+  **Routing.** On a normal index, and on one with a shadow key such as `sha1`, the id routes the
+  delete on its own. On an index that routes by some other field — a tenant, a customer — the id
+  does not say which shard holds the row, so the delete must carry the same `routing_key` the
+  write used, and without it the request is refused with a `400` naming the field. Fanning a
+  keyless delete out to every shard would be correct and is deliberately not done: it costs
+  shards × nodes writer transactions to remove one row, and the router already refuses to
+  broadcast a write. Deleting by query is not available; the ids have to be named.
+
+- **`CameoClient::delete_document` and `CameoClient::delete_documents`**, and `delete <index>
+  --id <ID>…` in the CLI and the REPL, with `--ids-file <PATH>` for a list and `--routing-key
+  <KEY>` for a custom-routing index. `delete <index>` with no ids named still deletes the index,
+  which is what it has always meant; the mistake that had to be impossible is the other
+  direction, so an ids file that yields no ids is an error rather than a fall-through.
+
 ### Fixed
 
 - **A document read once and then updated or deleted kept serving its previous body.** The
@@ -53,6 +108,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A batch of deletions left the index size and document count stale** in `/_indexes` until the
   measurement cache expired: the invalidation asked whether the batch had written or updated a
   document, and a batch of pure deletions does neither.
+
+- **The route-authorization guard compared paths and ignored methods.** The test that proves
+  every mounted route has a row in the authorization table matched on the path alone, so a second
+  verb on an already-classified path satisfied it while every request to that verb was refused
+  authentication. Closed rather than open, but silent — and it is exactly the shape a new verb on
+  an existing resource takes, which is what record deletion needed. The guard now matches
+  (method, path) in both directions, and fails outright on a route it cannot parse rather than
+  quietly leaving it out of the check.
 
 - **One MCP test failed intermittently on a timing figure.** The regression test that pins a tool
   result to one shape whatever protocol revision a client states compared whole response
