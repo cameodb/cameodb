@@ -30,3 +30,6 @@ zeroize = "1.9"
 # The binary installs the ring provider in `main.rs`; a unit test that builds a reqwest
 # Client has to do the same or reqwest panics on construction.
 rustls = { workspace = true }
+# For the ids-file cases of `delete`: the shapes a hand-edited file has are worth asserting
+# against a real file rather than a fake reader.
+tempfile = "3.27.0"

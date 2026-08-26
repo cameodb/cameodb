@@ -41,7 +41,7 @@ on one.
 | 14 — Security hardening | ◐ Partial | Stage C3 only (per-index role overrides); complexity caps deferred |
 | 15 — HA: reindex, replication, migration | 📋 Planned | All three stages |
 | 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 4.2, Stage 3's deeper warming options, and the measurement on the reporting node |
-| 17 — Record deletion | ◐ Partial | The two prerequisite defects are fixed; the route guard, delete by id, bulk delete, and the client and docs remain |
+| 17 — Record deletion | ✅ Done | — |
 | Code health — reviewed at 0.3.1 | 📋 Planned | Seven items, none behavioural |
 
 ## Reconciliation, 2026-08-26
@@ -104,12 +104,6 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F1](#f1--the-cost-of-a-durable-commit-under-read-load) | The cost of a durable commit under read load | — | 2026-08-10 | 📋 |
 | [F2](#f2--an-open-loop-load-generator) | An open-loop load generator | — | 2026-08-10 | 📋 |
 | [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator | — | 2026-08-10 | 📋 |
-| [I1](#i1--the-document-read-cache-is-never-invalidated) | The document read cache is never invalidated | 17 | 2026-08-26 | ✅ |
-| [I2](#i2--the-shard-affine-hint-decides-the-shard-not-just-the-worker) | The shard-affine hint decides the shard, not just the worker | 17 | 2026-08-26 | ✅ |
-| [I3](#i3--the-route-classification-guard-compares-paths-not-methods) | The route-classification guard compares paths, not methods | 17 | 2026-08-26 | 📋 |
-| [I4](#i4--delete-a-document-by-id) | Delete a document by id | 17 | 2026-08-26 | 📋 |
-| [I5](#i5--delete-documents-in-bulk) | Delete documents in bulk | 17 | 2026-08-26 | 📋 |
-| [I6](#i6--deletion-in-the-sdk-the-cli-and-the-documentation) | Deletion in the SDK, the CLI and the documentation | 17 | 2026-08-26 | 📋 |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field | — | 2026-08-13 | 📋 |
 
@@ -270,6 +264,12 @@ uncertainty is why the latency harness comes first.
 **Bonus for 2f.3.** With `percpu_arena:percpu`, confining thread populations to disjoint core
 sets also separates their jemalloc arenas, making per-arena stats attributable to write
 versus read work instead of an undifferentiated total.
+
+**The hypothesis this asked for now exists.** `delete_term` reclaims no bytes until a merge
+rewrites the segment, so a delete-heavy index is the workload whose throughput is gated by merge
+capacity — the one case where two merge threads timesharing the writer's own core is the binding
+constraint rather than a curiosity. [Phase 17](#phase-17--record-deletion--done) shipped the
+operation; a delete-heavy arm in the load generator is what would falsify or confirm this.
 
 **Risks.** Linux-only; macOS keeps the current no-op, so the platforms genuinely differ. Mask
 save/restore around `IndexWriter` creation needs a drop guard. Below ~4 cores the split
@@ -554,283 +554,6 @@ so the path has to be found before the fix is written.
 Not an MCP defect, and not a sort defect: the engine's fast-column guard refuses a genuinely
 non-fast sort correctly. What is wrong is that the config says one thing and the index does
 another, which is exactly the distinction `searchable` and `sortable` exist to report.
-
----
-
-## I. Phase 17 — Record Deletion ◐ Partial
-
-Scoped 2026-08-26 against the tree. CameoDB can delete an *index* and has never been able to
-delete a *record*, which is the gap this phase closes.
-
-**The storage engine already does it.** `WalOp::Delete` exists and both write paths handle it:
-`apply_write` removes the `data_<index>` row and issues `delete_term` in the transaction that
-appends the WAL entry, and `apply_batch` does the same through `PreparedKind::Delete`. Recovery
-needs nothing either — Stage 7 made a WAL entry the document id alone and let the committed row
-decide the operation, so *no row means deleted* is already the replay rule. A delete also
-survives coalescing correctly without new code: put-then-delete of one id in a single batch
-resolves because Tantivy applies `delete_term` to documents added earlier in the same commit,
-and the redb `insert` then `remove` leaves nothing behind.
-
-What is missing is everything above the shard: no `ClientOp` variant, no route, no authorization
-row, no SDK or CLI, no docs. That part is small. What made this a phase rather than an item is
-that two defects in shipped code stood in front of it — one of them fatal to the feature, both of
-them already wrong before it — and looking for the delete path is what found them.
-
-Cost order below: those two first, since delete was unshippable without them and both are now
-fixed, then the guard that makes the new route's authorization row mandatory, then the feature.
-
-### I1 — The document read cache is never invalidated
-
-✅ **Done** 2026-08-26 — found, reproduced and fixed in the same pass.
-
-`HybridStore::read_cache` was populated by every search that hydrates a body — `get_by_key` and
-`get_batch_by_keys` both insert into it — and cleared in exactly one place, `delete_index_data`.
-Neither `apply_write` nor `apply_batch` touched it. So a row that changed under a cached entry was
-never noticed, up to the 1024-entries-per-index FIFO churning it out.
-
-Reproduced against the storage crate — put, read, put, read, delete, read:
-
-```
-after put v1   : {"json_blob":{"id":"d1","title":"v1"}}
-after put v2   : {"json_blob":{"id":"d1","title":"v1"}}   ← stale update
-after delete   : {"json_blob":{"id":"d1","title":"v1"}}   ← deleted document still served
-batch after del: 1 row
-```
-
-**It was a live correctness defect for updates, not only a blocker for deletion.** An updated
-document kept serving its previous body to any caller that had read it before the update. It
-stayed invisible because the entry point is a search's body hydration and the eviction is a FIFO,
-so the staleness had a short and unpredictable life on a busy index — and none at all on an index
-nobody reads twice.
-
-For deletion it would have been fatal rather than merely wrong. An `id:VALUE` query is answered
-entirely from redb by design, so with the cache stale a deleted record comes back indefinitely and
-the delete appears not to have happened.
-
-**What landed.** The touched ids are dropped from the cache by the same code that mutates the
-rows — `apply_write` for one id, `apply_batch` for the whole batch, borrowed out of `tantivy_ops`
-rather than collected into a second vector. One `DashMap` entry lock and a `HashMap` remove per
-id, on a path already inside a redb transaction.
-
-Removing the entries is not sufficient on its own, and the second half is the subtle one. The
-removal has to happen *after* the redb commit — invalidating first leaves a window where the row
-is still the old one — and a reader that opened its transaction before that commit legitimately
-still sees the pre-write row. If it caches that body after the removal, the staleness is back and
-nothing will take it out again. So `IndexReadCache` now carries a generation beside its entries:
-a reader reads it before opening its transaction and quotes it back to `insert_into_cache`, which
-declines anything a write has superseded since. Both sides touch the struct under the same
-`DashMap` entry guard, so the check and the insert cannot interleave with a bump and a removal —
-whichever side gets the guard first, no stale body survives. `delete_index_data` bumps rather than
-dropping the whole entry, for the same reason: a fresh entry starting from zero would re-admit a
-reader mid-flight.
-
-Two tests: `a_changed_row_is_not_served_from_the_read_cache` covers update and delete on both
-write paths, and `a_body_read_before_a_write_is_refused_by_the_cache` drives the two halves of the
-race in the order that produces it, since a single thread cannot interleave them.
-
-Fixed alongside, in the same file and for the same reason: `apply_batch` invalidated the per-index
-size cache only when a batch wrote or updated a row, so a batch of pure deletes left `/_indexes`
-reporting the pre-delete size until `index_cache_expiry`.
-
-### I2 — The shard-affine hint decides the shard, not just the worker
-
-✅ **Done** 2026-08-26 — found by reading the delete routing path, fixed in the same pass. It
-sat behind `shard_affine_dispatch`, which defaults `false`, so it was latent rather than active.
-
-`engine_write` derives the effective routing key from the document —
-`extract_routing_value(doc, schema.routing_field)` first — but then takes the target shard from
-`affinity_shard` whenever that hint names a live local shard, and the hint was computed by the
-router from `routing_key.or(id)`. On an index whose routing field is a real, non-key field those
-two disagree, and the hint wins.
-
-The consequence is a document on a shard the ring does not believe owns it. Searches still find
-it, because they are scatter-gather. What breaks is the next write of the same id through a path
-with no hint — the actor-mailbox fallback when a worker queue is full, for instance: that one
-routes by the routing field, lands on the other shard, and the id now exists twice. Scatter-gather
-returns both copies and a delete would remove one.
-
-**What landed.** The hint chooses the worker; the ring chooses the shard. `route_write` is an
-xxh3 and a `BTreeMap` range descent, which is not a saving worth a class of divergence in front of
-a redb transaction. Stage 2a's stated purpose — "eliminates 1 cross-core wakeup per write" — is
-dispatch, and dispatch is all it now decides: `try_send_affine` still routes by the shard's dense
-ordinal onto the worker co-located with its pinned writer thread.
-
-The divergence is now unrepresentable rather than merely unused. `affinity_shard` was removed from
-`OrchestratorEngine::execute` and from `engine_write` altogether, so nothing on the execution path
-holds a shard hint it could route by. It stays on `OrchestratorJob::Execute`, where dispatch reads
-it, and the worker closure binds it as `_affinity_shard` to say so.
-
-The routing rule it used to overrule was written out identically in three places — the engine fast
-path and both halves of `orch_write` — so it is now one `effective_routing_key` helper with the
-precedence documented as an ordered list, pinned by
-`the_routing_key_comes_from_the_document_before_the_caller`. A rule that has to agree with itself
-in three copies is not a rule.
-
-Delete inherits none of this and could not have reproduced it anyway: with no document to override
-the key, a delete's hint and its final routing key derive from the same value, so the hint always
-names the shard the ring names.
-
-### I3 — The route-classification guard compares paths, not methods
-
-📋 **Planned.** ~10 lines, in `authz.rs` tests.
-
-`every_mounted_route_is_classified` reads `http_server/routes.rs` and asserts every mounted path
-has a row in `ROUTES`. It compares *paths*: `is_classified` matches `rule.pattern` and ignores
-`rule.method`. So a second method on an already-classified path satisfies the guard with no row
-of its own — `classify` then returns `None`, which denies, so the failure is closed rather than
-open, but it is silent and it presents as every request to the new endpoint being refused
-authentication.
-
-Nothing exploits this today: `/api/{index}/_config` carries `PUT` and `GET` on separate `.route()`
-calls and both are classified. But nothing forces that, and I4 adds `DELETE` to a path that
-already has `PUT`, which is exactly the shape the guard cannot see. Make `mounted_routes` yield
-(method, path) pairs and match on both.
-
-### I4 — Delete a document by id
-
-📋 **Planned.**
-
-```
-DELETE /api/{index}/document?id=<id>[&routing_key=<key>]
-```
-
-Answers with what a write answers, one word apart:
-
-```json
-{"id":"book_001","result":"deleted","version":1042,"shard_id":"…"}
-```
-
-**Why the id is in the query and not in the path.** `DELETE /api/{index}/document/{id}` was the
-first shape considered and is rejected twice over. `authz::match_pattern` understands one
-placeholder, `{index}`, so a second segment means changing the matcher that decides every
-request's authorization — a poor trade for a URL shape. And ids here are arbitrary strings:
-authz classifies the raw path while the handler receives the decoded one, so an id containing
-`%2F` makes the two disagree about what is being deleted. A body on `DELETE` was the second
-candidate and loses to proxies that strip it. The query form has the precedent anyway —
-`DELETE /api/{index}?delete_schema=true` already carries its parameters there.
-
-**Capability: `Write`.** A key that can write can already overwrite any document with anything,
-so withholding deletion from it protects nothing. `auth.rs` also reserves "something in between"
-for per-index overrides (C1) rather than a fourth capability, and this is not the case to break
-that with.
-
-**The op.** A new `ClientOp::Delete { index, id, routing_key }`, routed exactly as a write is:
-`route_and_handle` with `OperationType::Write` and a routing hint of `routing_key.or(id)`, then
-`resolve_local`, the worker pool, `engine_delete`, the shard's `StorageCommand::Write` carrying a
-`WalOp::Delete`, and the writer thread, which coalesces it alongside concurrent puts to the same
-index. Three things follow from that alignment rather than from new code:
-
-- **Remote forwarding is free.** `try_remote` sends the `ClientOp` itself over
-  `cameo.orchestrator.client_op`, so a new variant crosses nodes with no transport work.
-- **`engine_delete` never defers to the actor.** A delete cannot evolve a schema, so it is the
-  first operation that is wholly engine-servable: no `WorkerOutcome::UseActor` arm, no
-  `&mut NodeOrchestrator`, no mailbox serialization point in front of it.
-- **Affinity applies unchanged**, provided `ClientOp::Delete` is added to *both* the
-  `is_worker_eligible` match and the affinity-hint arm in `RouterActor::handle_client_op`. Miss
-  the second and every delete lands on an arbitrary worker and cross-core-wakes the target
-  shard's pinned writer thread, which is the cost Stages 2a, 2d and 2e exist to remove.
-
-**Routing without a document.** A write reads its routing key out of the document; a delete has
-only an id. The schema decides, with no I/O:
-
-| Index shape | Route |
-|---|---|
-| `routing_field == "id"` — the default | key = id; unicast, exact |
-| `routing_field` is a shadow field (`sha1`, `sha256`, …) | the shadow value *is* the key, so key = id; unicast, exact |
-| custom non-key routing field, caller sent `routing_key` | key = `routing_key`; unicast, exact |
-| custom non-key routing field, no `routing_key` | **refused, 400, naming the field to supply** |
-
-Refusing the last case is deliberate — see the non-goals. The caller's path is the one the
-engine would have to take anyway: search `id:VALUE`, read the routing field off the document,
-delete with it.
-
-**Two guards the storage path needs.** `apply_write` opens through `get_or_create_index`, which
-*creates* the index when it is absent, so a delete naming an unknown index would bring one into
-existence; check first, and answer without creating anything. And `apply_batch` invalidates the
-per-index size cache only when a batch wrote or updated a row, so a batch of pure deletes leaves
-`/_indexes` reporting the pre-delete size until `index_cache_expiry` — cosmetic, bounded, fixed
-while passing.
-
-**Visibility, to be documented rather than smoothed over.** An `id:VALUE` lookup is immediately
-consistent, because that path is answered from redb and skips Tantivy entirely (once I1 is
-fixed). A query-matched hit is consistent within `supervisor_timeout_secs` — 5 seconds by
-default, sooner if the commit threshold arrives first, and the delete path must call
-`signal_supervisor` for that timer to exist at all. In between, the hit's body is skipped but
-`total_hits` still counts it, because the count comes from the Tantivy collector while bodies
-come from redb. Subtracting skipped documents from the count would trade a visible artifact for
-broken paging arithmetic; the artifact is the better of the two.
-
-### I5 — Delete documents in bulk
-
-📋 **Planned.**
-
-```
-POST /api/{index}/_bulk/delete
-```
-
-Body is a list of ids, or of `{"id", "routing_key"}` objects for a custom-routing index.
-`POST` rather than `DELETE` because a body on `DELETE` is what proxies mangle, and `_bulk`
-keeps the name the write side already uses. Answers as `_bulk` does:
-
-```json
-{"items_received":2,"items_deleted":2,"errors":[],"took_ms":3}
-```
-
-Mechanically it is `orch_bulk_write` with the document work removed: route each id by I4's rule,
-group by shard, hand each shard one `Vec<WalOp::Delete>` through
-`handle_batch_write_via_channel`, group the remainder by owning node and forward. One redb
-transaction per shard, the same coalescing, no new machinery.
-
-### I6 — Deletion in the SDK, the CLI and the documentation
-
-📋 **Planned.**
-
-- `sdk.rs`: `delete_document(index, id, routing_key)` and `delete_documents(index, ids)`,
-  alongside `write_document` and `bulk_index`.
-- CLI: an id on the existing `delete` command for the single case, and an ids file for the bulk
-  case. `delete <index>` continues to mean the index, which is what it means today.
-- `docs/API_REFERENCE.md` § Document Operations: both endpoints, the routing rule and its
-  refusal, and the visibility paragraph from I4 — the two-tier consistency is the thing a caller
-  will otherwise discover by being surprised.
-
-### Non-goals, recorded so they are not re-litigated
-
-- **Fanning a keyless delete out to every shard.** It is *correct* — a shard that lacks the id
-  removes nothing — and it is still refused. It costs `shards × nodes` writer transactions to
-  remove one row, it would vivify the index on every shard it touched, `handle_broadcast`'s
-  non-search arm returns the first successful response rather than merging, and
-  `route_and_handle_inner` already prohibits broadcasting a write in as many words. A caller
-  who cannot supply the routing key can find it with one search.
-- **Reporting whether the record existed.** Delete answers `"result": "deleted"` whether or not
-  a row went away, exactly as a write answers `"result": "created"` for an overwrite.
-  Distinguishing them means threading a per-operation outcome back through the writer thread's
-  reply-splitting loop, which is a change to the hot path for a status word.
-- **`_delete_by_query`.** The honest answer to the keyless case above, and a phase of its own:
-  it needs a search-then-delete loop, a decision about what consistency it promises while
-  documents are still arriving, and I1 fixed underneath it.
-- **An MCP delete tool.** The server's own instructions promise that "ingestion happens
-  elsewhere and no tool here writes". Deletion stays on the HTTP and SDK surface.
-- **Streaming deletion (`_bulk/delete/stream`).** Ids are small; a bulk POST carries a great
-  many of them. Worth revisiting only against a workload that overruns the body limit.
-
-### What deletion gives 2f.2
-
-B1 records that Tantivy's merge threads inherit the mask of whichever thread built the
-`IndexWriter`, so an index created by writing to it — the normal path — confines
-`merge_thread_*` and `segment_updater` to the same single core as the writer they contend with,
-and asks that 2f.2 not be attempted "without a specific hypothesis neither measurement covers".
-
-Deletion is that hypothesis. `delete_term` reclaims no bytes until a merge rewrites the segment,
-so a delete-heavy index is precisely the workload whose throughput is gated by merge capacity —
-the one case where `merge_num_threads = 2` meaning two threads timesharing one core is the
-binding constraint rather than a curiosity. Shipping this phase gives 2f.2 a workload that can
-falsify it.
-
-Nothing else about deletion touches the memory work: a delete allocates an id and a WAL entry of
-about six bytes, and its Tantivy side is an opstamp and a `Term` in the delete queue, with no
-document buffer. It does count as one operation toward `should_commit_writer`, whose threshold is
-sized in documents — which is asymmetric and correct, since a commit is what makes the delete
-searchable.
 
 ---
 
@@ -2110,6 +1833,310 @@ construction; the 30 TB / 16-shard figures above are still the target, not a res
 - **Changing Tantivy's `ReloadPolicy::Manual`.** The manual reload is deliberate (no
   per-index meta-file watcher thread, no cache-discarding redundant reloads) and is not the
   cause of slow recovery. Phase 2 warming is the lever, not the reload policy.
+
+## Phase 17 — Record Deletion ✅ Done
+
+Scoped and delivered 2026-08-26/27. CameoDB could delete an *index* and never a *record*; this
+phase is that gap, closed.
+
+**The storage engine already did it.** `WalOp::Delete` exists and both write paths handle it:
+`apply_write` removes the `data_<index>` row and issues `delete_term` in the transaction that
+appends the WAL entry, and `apply_batch` does the same through `PreparedKind::Delete`. Recovery
+needs nothing either — Stage 7 made a WAL entry the document id alone and let the committed row
+decide the operation, so *no row means deleted* is already the replay rule. A delete also
+survives coalescing correctly without new code: put-then-delete of one id in a single batch
+resolves because Tantivy applies `delete_term` to documents added earlier in the same commit,
+and the redb `insert` then `remove` leaves nothing behind.
+
+What was missing was everything above the shard: no `ClientOp` variant, no route, no
+authorization row, no SDK or CLI, no docs. That part was small. What made this a phase rather than
+an item is that two defects in shipped code stood in front of it — one of them fatal to the
+feature, both of them already wrong before it — and looking for the delete path is what found
+them. That is the entry worth reading here: the feature is ordinary, and what it turned up is not.
+
+The items are in the order they were done, which is cost order: the two defects first, since
+delete was unshippable without them, then the guard that makes the new route's authorization row
+mandatory, then the feature itself.
+
+### I1 — The document read cache is never invalidated
+
+✅ **Done** 2026-08-26 — found, reproduced and fixed in the same pass.
+
+`HybridStore::read_cache` was populated by every search that hydrates a body — `get_by_key` and
+`get_batch_by_keys` both insert into it — and cleared in exactly one place, `delete_index_data`.
+Neither `apply_write` nor `apply_batch` touched it. So a row that changed under a cached entry was
+never noticed, up to the 1024-entries-per-index FIFO churning it out.
+
+Reproduced against the storage crate — put, read, put, read, delete, read:
+
+```
+after put v1   : {"json_blob":{"id":"d1","title":"v1"}}
+after put v2   : {"json_blob":{"id":"d1","title":"v1"}}   ← stale update
+after delete   : {"json_blob":{"id":"d1","title":"v1"}}   ← deleted document still served
+batch after del: 1 row
+```
+
+**It was a live correctness defect for updates, not only a blocker for deletion.** An updated
+document kept serving its previous body to any caller that had read it before the update. It
+stayed invisible because the entry point is a search's body hydration and the eviction is a FIFO,
+so the staleness had a short and unpredictable life on a busy index — and none at all on an index
+nobody reads twice.
+
+For deletion it would have been fatal rather than merely wrong. An `id:VALUE` query is answered
+entirely from redb by design, so with the cache stale a deleted record comes back indefinitely and
+the delete appears not to have happened.
+
+**What landed.** The touched ids are dropped from the cache by the same code that mutates the
+rows — `apply_write` for one id, `apply_batch` for the whole batch, borrowed out of `tantivy_ops`
+rather than collected into a second vector. One `DashMap` entry lock and a `HashMap` remove per
+id, on a path already inside a redb transaction.
+
+Removing the entries is not sufficient on its own, and the second half is the subtle one. The
+removal has to happen *after* the redb commit — invalidating first leaves a window where the row
+is still the old one — and a reader that opened its transaction before that commit legitimately
+still sees the pre-write row. If it caches that body after the removal, the staleness is back and
+nothing will take it out again. So `IndexReadCache` now carries a generation beside its entries:
+a reader reads it before opening its transaction and quotes it back to `insert_into_cache`, which
+declines anything a write has superseded since. Both sides touch the struct under the same
+`DashMap` entry guard, so the check and the insert cannot interleave with a bump and a removal —
+whichever side gets the guard first, no stale body survives. `delete_index_data` bumps rather than
+dropping the whole entry, for the same reason: a fresh entry starting from zero would re-admit a
+reader mid-flight.
+
+Two tests: `a_changed_row_is_not_served_from_the_read_cache` covers update and delete on both
+write paths, and `a_body_read_before_a_write_is_refused_by_the_cache` drives the two halves of the
+race in the order that produces it, since a single thread cannot interleave them.
+
+Fixed alongside, in the same file and for the same reason: `apply_batch` invalidated the per-index
+size cache only when a batch wrote or updated a row, so a batch of pure deletes left `/_indexes`
+reporting the pre-delete size until `index_cache_expiry`.
+
+### I2 — The shard-affine hint decides the shard, not just the worker
+
+✅ **Done** 2026-08-26 — found by reading the delete routing path, fixed in the same pass. It
+sat behind `shard_affine_dispatch`, which defaults `false`, so it was latent rather than active.
+
+`engine_write` derives the effective routing key from the document —
+`extract_routing_value(doc, schema.routing_field)` first — but then takes the target shard from
+`affinity_shard` whenever that hint names a live local shard, and the hint was computed by the
+router from `routing_key.or(id)`. On an index whose routing field is a real, non-key field those
+two disagree, and the hint wins.
+
+The consequence is a document on a shard the ring does not believe owns it. Searches still find
+it, because they are scatter-gather. What breaks is the next write of the same id through a path
+with no hint — the actor-mailbox fallback when a worker queue is full, for instance: that one
+routes by the routing field, lands on the other shard, and the id now exists twice. Scatter-gather
+returns both copies and a delete would remove one.
+
+**What landed.** The hint chooses the worker; the ring chooses the shard. `route_write` is an
+xxh3 and a `BTreeMap` range descent, which is not a saving worth a class of divergence in front of
+a redb transaction. Stage 2a's stated purpose — "eliminates 1 cross-core wakeup per write" — is
+dispatch, and dispatch is all it now decides: `try_send_affine` still routes by the shard's dense
+ordinal onto the worker co-located with its pinned writer thread.
+
+The divergence is now unrepresentable rather than merely unused. `affinity_shard` was removed from
+`OrchestratorEngine::execute` and from `engine_write` altogether, so nothing on the execution path
+holds a shard hint it could route by. It stays on `OrchestratorJob::Execute`, where dispatch reads
+it, and the worker closure binds it as `_affinity_shard` to say so.
+
+The routing rule it used to overrule was written out identically in three places — the engine fast
+path and both halves of `orch_write` — so it is now one `effective_routing_key` helper with the
+precedence documented as an ordered list, pinned by
+`the_routing_key_comes_from_the_document_before_the_caller`. A rule that has to agree with itself
+in three copies is not a rule.
+
+Delete inherits none of this and could not have reproduced it anyway: with no document to override
+the key, a delete's hint and its final routing key derive from the same value, so the hint always
+names the shard the ring names.
+
+### I3 — The route-classification guard compares paths, not methods
+
+✅ **Done** 2026-08-26.
+
+`every_mounted_route_is_classified` reads `http_server/routes.rs` and asserts every mounted path
+has a row in `ROUTES`. It compares *paths*: `is_classified` matches `rule.pattern` and ignores
+`rule.method`. So a second method on an already-classified path satisfies the guard with no row
+of its own — `classify` then returns `None`, which denies, so the failure is closed rather than
+open, but it is silent and it presents as every request to the new endpoint being refused
+authentication.
+
+Nothing exploited it: `/api/{index}/_config` carries `PUT` and `GET` on separate `.route()` calls
+and both are classified. But nothing forced that, and I4 adds `DELETE` to a path that already has
+`PUT`, which is exactly the shape the guard could not see.
+
+**What landed.** `mounted_routes` yields (method, path) pairs, and both directions of the check
+match on both halves. Three things the parser needed beyond the method name itself: each `.route(`
+call is bounded by paren matching rather than by the next call, so method names cannot leak in from
+whatever follows the last route in a chain; the chained `.get(…)` of a method router counts as well
+as a bare `get(…)`, which is how the MCP transport's three verbs on one path are finally seen as
+three routes rather than one; and the token match requires a word boundary, so a handler named
+`set_budget(` does not read as a `get`. `HEALTH_PATH` is resolved in the parser instead of being
+special-cased by the test.
+
+A parser is only a guard while it parses everything, so `every_route_call_is_accounted_for` fails
+on a call whose path it cannot read or whose method it cannot find. That replaces the
+literal-count arithmetic it grew out of, and is stronger: it catches an unreadable path expression
+rather than only a second constant-named route.
+
+### I4 — Delete a document by id
+
+✅ **Done** 2026-08-26.
+
+```
+DELETE /api/{index}/document?id=<id>[&routing_key=<key>]
+```
+
+Answers with what a write answers, one word apart:
+
+```json
+{"id":"book_001","result":"deleted","version":1042,"shard_id":"…"}
+```
+
+**Why the id is in the query and not in the path.** `DELETE /api/{index}/document/{id}` was the
+first shape considered and is rejected twice over. `authz::match_pattern` understands one
+placeholder, `{index}`, so a second segment means changing the matcher that decides every
+request's authorization — a poor trade for a URL shape. And ids here are arbitrary strings:
+authz classifies the raw path while the handler receives the decoded one, so an id containing
+`%2F` makes the two disagree about what is being deleted. A body on `DELETE` was the second
+candidate and loses to proxies that strip it. The query form has the precedent anyway —
+`DELETE /api/{index}?delete_schema=true` already carries its parameters there.
+
+**Capability: `Write`.** A key that can write can already overwrite any document with anything,
+so withholding deletion from it protects nothing. `auth.rs` also reserves "something in between"
+for per-index overrides (C1) rather than a fourth capability, and this is not the case to break
+that with.
+
+**The op.** A new `ClientOp::Delete { index, id, routing_key }`, routed exactly as a write is:
+`route_and_handle` with `OperationType::Write` and a routing hint of `routing_key.or(id)`, then
+`resolve_local`, the worker pool, `engine_delete`, the shard's `StorageCommand::Write` carrying a
+`WalOp::Delete`, and the writer thread, which coalesces it alongside concurrent puts to the same
+index. Three things follow from that alignment rather than from new code:
+
+- **Remote forwarding is free.** `try_remote` sends the `ClientOp` itself over
+  `cameo.orchestrator.client_op`, so a new variant crosses nodes with no transport work.
+- **`engine_delete` never defers to the actor.** A delete cannot evolve a schema, so it is the
+  first operation that is wholly engine-servable: no `WorkerOutcome::UseActor` arm, no
+  `&mut NodeOrchestrator`, no mailbox serialization point in front of it.
+- **Affinity applies unchanged**, provided `ClientOp::Delete` is added to *both* the
+  `is_worker_eligible` match and the affinity-hint arm in `RouterActor::handle_client_op`. Miss
+  the second and every delete lands on an arbitrary worker and cross-core-wakes the target
+  shard's pinned writer thread, which is the cost Stages 2a, 2d and 2e exist to remove.
+
+**Routing without a document.** A write reads its routing key out of the document; a delete has
+only an id. The schema decides, with no I/O:
+
+| Index shape | Route |
+|---|---|
+| `routing_field == "id"` — the default | key = id; unicast, exact |
+| `routing_field` is a shadow field (`sha1`, `sha256`, …) | the shadow value *is* the key, so key = id; unicast, exact |
+| custom non-key routing field, caller sent `routing_key` | key = `routing_key`; unicast, exact |
+| custom non-key routing field, no `routing_key` | **refused, 400, naming the field to supply** |
+
+Refusing the last case is deliberate — see the non-goals. The caller's path is the one the
+engine would have to take anyway: search `id:VALUE`, read the routing field off the document,
+delete with it.
+
+**Two guards the storage path needs.** `apply_write` opens through `get_or_create_index`, which
+*creates* the index when it is absent, so a delete naming an unknown index would bring one into
+existence; check first, and answer without creating anything. And `apply_batch` invalidates the
+per-index size cache only when a batch wrote or updated a row, so a batch of pure deletes leaves
+`/_indexes` reporting the pre-delete size until `index_cache_expiry` — cosmetic, bounded, fixed
+while passing.
+
+**Visibility, to be documented rather than smoothed over.** An `id:VALUE` lookup is immediately
+consistent, because that path is answered from redb and skips Tantivy entirely (once I1 is
+fixed). A query-matched hit is consistent within `supervisor_timeout_secs` — 5 seconds by
+default, sooner if the commit threshold arrives first, and the delete path must call
+`signal_supervisor` for that timer to exist at all. In between, the hit's body is skipped but
+`total_hits` still counts it, because the count comes from the Tantivy collector while bodies
+come from redb. Subtracting skipped documents from the count would trade a visible artifact for
+broken paging arithmetic; the artifact is the better of the two.
+
+### I5 — Delete documents in bulk
+
+✅ **Done** 2026-08-27.
+
+```
+POST /api/{index}/_bulk/delete
+```
+
+Body is a list of ids, or of `{"id", "routing_key"}` objects for a custom-routing index, and the
+two shapes may be mixed — a list of bare ids is what almost every caller has, and making them wrap
+each one in an object to say nothing extra is a worse API than accepting both. `POST` rather than
+`DELETE` because a body on `DELETE` is what proxies mangle, and `_bulk` keeps the name the write
+side already uses. Answers as `_bulk` does:
+
+```json
+{"items_received":2,"items_deleted":2,"errors":[],"took_ms":3}
+```
+
+Mechanically it is `orch_bulk_write` with the document work removed: route each id by I4's rule,
+group by shard, hand each shard one `Vec<WalOp::Delete>` through
+`handle_batch_write_via_channel`, group the remainder by owning node and forward. One redb
+transaction per shard, the same coalescing, no new machinery.
+
+**What landed as designed**, with one decision the design had not settled: an id that cannot be
+routed is an error against that id rather than a failed batch. A batch may span tenants, so one id
+missing its routing key says nothing about the others, and refusing the whole request would throw
+away the work that was routable. An empty body is still a `400` — that is a malformed request, not
+a no-op.
+
+### I6 — Deletion in the SDK, the CLI and the documentation
+
+✅ **Done** 2026-08-27.
+
+- `sdk.rs`: `delete_document(index, id, routing_key)` and `delete_documents(index, ids)`, beside
+  `write_document` and `bulk_index`. They landed with I4 and I5 respectively, because the
+  end-to-end tests should drive the client that ships rather than a hand-rolled request.
+- CLI: `delete <index> --id <ID>…`, `--ids-file <PATH>` and `--routing-key <KEY>`, in both the
+  command line and the REPL, with completion and help text. `delete <index>` with no ids named
+  still means the index, which is what it has always meant — and the mistake that had to be made
+  impossible is the other direction, so an ids file that yields nothing is an error rather than a
+  fall-through to deleting the index. One id takes the single-document route, several take the
+  bulk one, and `--delete-schema` with ids named is refused as a contradiction.
+- `docs/API_REFERENCE.md` § Document Operations: both endpoints, the capability table, the
+  routing rule with the two-step that finds a routing key, and a **What deletion promises**
+  section — idempotence, the 404 for a missing index, and the two visibility tiers as a table.
+  That last one is what a caller would otherwise discover by being surprised.
+
+### Non-goals, recorded so they are not re-litigated
+
+- **Fanning a keyless delete out to every shard.** It is *correct* — a shard that lacks the id
+  removes nothing — and it is still refused. It costs `shards × nodes` writer transactions to
+  remove one row, it would vivify the index on every shard it touched, `handle_broadcast`'s
+  non-search arm returns the first successful response rather than merging, and
+  `route_and_handle_inner` already prohibits broadcasting a write in as many words. A caller
+  who cannot supply the routing key can find it with one search.
+- **Reporting whether the record existed.** Delete answers `"result": "deleted"` whether or not
+  a row went away, exactly as a write answers `"result": "created"` for an overwrite.
+  Distinguishing them means threading a per-operation outcome back through the writer thread's
+  reply-splitting loop, which is a change to the hot path for a status word.
+- **`_delete_by_query`.** The honest answer to the keyless case above, and a phase of its own:
+  it needs a search-then-delete loop, a decision about what consistency it promises while
+  documents are still arriving, and I1 fixed underneath it.
+- **An MCP delete tool.** The server's own instructions promise that "ingestion happens
+  elsewhere and no tool here writes". Deletion stays on the HTTP and SDK surface.
+- **Streaming deletion (`_bulk/delete/stream`).** Ids are small; a bulk POST carries a great
+  many of them. Worth revisiting only against a workload that overruns the body limit.
+
+### What deletion gives 2f.2
+
+B1 records that Tantivy's merge threads inherit the mask of whichever thread built the
+`IndexWriter`, so an index created by writing to it — the normal path — confines
+`merge_thread_*` and `segment_updater` to the same single core as the writer they contend with,
+and asks that 2f.2 not be attempted "without a specific hypothesis neither measurement covers".
+
+Deletion is that hypothesis. `delete_term` reclaims no bytes until a merge rewrites the segment,
+so a delete-heavy index is precisely the workload whose throughput is gated by merge capacity —
+the one case where `merge_num_threads = 2` meaning two threads timesharing one core is the
+binding constraint rather than a curiosity. Shipping this phase gives 2f.2 a workload that can
+falsify it.
+
+Nothing else about deletion touches the memory work: a delete allocates an id and a WAL entry of
+about six bytes, and its Tantivy side is an opstamp and a `Term` in the delete queue, with no
+document buffer. It does count as one operation toward `should_commit_writer`, whose threshold is
+sized in documents — which is asymmetric and correct, since a commit is what makes the delete
+searchable.
 
 ## 0.3.2 hardening, 2026-08-19/20 ✅ Done
 

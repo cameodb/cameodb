@@ -34,8 +34,10 @@ Both return `{"error": …, "message": …}`. An unknown path answers `401` with
 | `GET` | `/_indexes` | `read` |
 | `GET` | `/_cluster/_indexes` | `read` |
 | `PUT` | `/api/{index}/document` | `write` |
+| `DELETE` | `/api/{index}/document` | `write` |
 | `POST` | `/api/{index}/document/stream` | `write` |
 | `POST` | `/api/{index}/_bulk` | `write` |
+| `POST` | `/api/{index}/_bulk/delete` | `write` |
 | `PUT` | `/api/{index}/_config` | `index-admin` |
 | `PATCH` | `/api/{index}/_schema` | `index-admin` |
 | `DELETE` | `/api/{index}` | `index-admin` |
@@ -359,6 +361,80 @@ EOF
 ```
 
 > **Note:** Streaming write accepts NDJSON (one JSON document per line) for memory-efficient processing of large datasets.
+
+#### Delete Single Document
+Remove one document by its key.
+
+```bash
+DELETE /api/{index}/document?id=<id>[&routing_key=<key>]
+```
+
+**Example:**
+```bash
+curl -s -X DELETE "http://localhost:9480/api/books/document?id=book_001"
+```
+
+**Response:**
+```json
+{
+  "id": "book_001",
+  "result": "deleted",
+  "version": 1042,
+  "shard_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+}
+```
+
+#### Bulk Delete Documents
+Remove many documents in a single request.
+
+```bash
+POST /api/{index}/_bulk/delete
+```
+
+Each entry is either a bare id or an object naming its routing key, and the two may be mixed:
+
+**Example:**
+```bash
+curl -s -X POST http://localhost:9480/api/books/_bulk/delete \
+  -H "Content-Type: application/json" \
+  -d '["book_002", {"id": "book_003", "routing_key": "acme"}]'
+```
+
+**Response:**
+```json
+{
+  "items_received": 2,
+  "items_deleted": 2,
+  "errors": [],
+  "duration_ms": 3
+}
+```
+
+An id that cannot be routed is reported in `errors` against that id; the rest of the batch is still applied.
+
+#### What deletion promises
+
+**Deleting is idempotent.** An id the index does not hold is answered as `deleted`, the same way writing over an existing document is answered as `created`. A *missing index* is different: it is a 404, and the delete creates nothing on its way to saying so.
+
+**Visibility has two tiers, because two engines answer.** The document body lives in the key-value store and the searchable terms live in the index:
+
+| Query | When the delete shows |
+|---|---|
+| `id:VALUE` | **Immediately.** An exact key lookup is answered from the key-value store without consulting the search index. |
+| Any content query | **At the next commit** — the idle-commit timeout (`supervisor_timeout_secs`, 5 s by default), sooner under load, or at once via `POST /_admin/index/{index}/commit`. |
+
+Until that commit, a deleted document is counted in `total_hits` but absent from `hits`: the count comes from the search index while the bodies come from the key-value store. This is the honest reading of a mid-flight delete — reducing the count instead would break the arithmetic that pages through results.
+
+**Routing.** On a normal index, and on one with a shadow key such as `sha1`, the id routes the delete on its own and `routing_key` is unnecessary. On an index that routes by some *other* field — a tenant, a customer — the id does not say which shard holds the row, so the delete must carry the same `routing_key` the write used. Without it the request is refused with a `400` naming the field. Its value is on the document, one search away:
+
+```bash
+curl -s -X POST http://localhost:9480/api/orders/search \
+  -H "Content-Type: application/json" -d '{"query": "id:order_77", "limit": 1}'
+# → read tenant_id off the hit, then:
+curl -s -X DELETE "http://localhost:9480/api/orders/document?id=order_77&routing_key=acme"
+```
+
+Deleting *by query* is not available; the ids have to be named.
 
 ### ⚙️ Index Management
 
