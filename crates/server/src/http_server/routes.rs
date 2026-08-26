@@ -37,7 +37,8 @@ use crate::http_server::catalogue::{
 use crate::http_server::health::health_handler;
 use crate::http_server::search::{search_handler, search_stream_handler};
 use crate::http_server::write::{
-    bulk_write_handler, delete_document_handler, write_handler, write_stream_handler,
+    bulk_delete_handler, bulk_write_handler, delete_document_handler, write_handler,
+    write_stream_handler,
 };
 use crate::state::AppState;
 
@@ -138,6 +139,7 @@ pub fn create_router(
         .route("/api/{index}/document", delete(delete_document_handler))
         .route("/api/{index}/document/stream", post(write_stream_handler))
         .route("/api/{index}/_bulk", post(bulk_write_handler))
+        .route("/api/{index}/_bulk/delete", post(bulk_delete_handler))
         .route("/api/{index}/_config", put(create_config_handler))
         .route("/api/{index}/_config", get(get_config_handler))
         // Schema maintenance
