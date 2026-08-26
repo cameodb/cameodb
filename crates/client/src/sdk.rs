@@ -481,6 +481,49 @@ impl CameoClient {
         resp.json().await.context("Failed to parse write response")
     }
 
+    /// Remove one document by its key.
+    ///
+    /// `routing_key` is needed only where the index routes by a field that is not the document
+    /// key — a tenant or a customer id. On a default index, and on one with a shadow key such as
+    /// `sha1`, the key routes on its own and `None` is correct.
+    ///
+    /// Idempotent: an id the index does not hold is answered as deleted, the same way writing
+    /// over an existing document is answered as created. An index that does not exist is a 404.
+    pub async fn delete_document(
+        &self,
+        index: &str,
+        id: &str,
+        routing_key: Option<&str>,
+    ) -> Result<JsonValue> {
+        let mut url = self
+            .base_url
+            .join(&format!("api/{}/document", index))
+            .context("Invalid delete document URL")?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("id", id);
+            if let Some(key) = routing_key {
+                query.append_pair("routing_key", key);
+            }
+        }
+
+        let resp = self.http.delete(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Delete document failed: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
+        }
+
+        resp.json()
+            .await
+            .context("Failed to parse delete document response")
+    }
+
     pub async fn bulk_index(&self, index: &str, batch: &[JsonValue]) -> Result<JsonValue> {
         let url = self
             .base_url

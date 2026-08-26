@@ -99,6 +99,9 @@ const ROUTES: &[RouteRule] = &[
 
     // Write
     rule("PUT",    "/api/{index}/document",             Access::Needs(Capability::Write)),
+    // Deleting a document needs `Write`, not a capability of its own: a key that can write can
+    // already overwrite any document with anything, so withholding removal protects nothing.
+    rule("DELETE", "/api/{index}/document",             Access::Needs(Capability::Write)),
     rule("POST",   "/api/{index}/document/stream",      Access::Needs(Capability::Write)),
     rule("POST",   "/api/{index}/_bulk",                Access::Needs(Capability::Write)),
 

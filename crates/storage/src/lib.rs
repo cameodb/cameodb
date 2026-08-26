@@ -4422,8 +4422,37 @@ impl HybridStore {
         Ok((result, committed))
     }
 
+    /// Whether this shard knows `index` at all, without opening or creating anything.
+    ///
+    /// The schema table is the registry — `get_index_names` enumerates exactly it — so a row
+    /// there means the index was created, whether or not a document has ever been written to it.
+    /// The writer cache is checked first because an index taking writes is the common case and
+    /// answering from it costs no transaction.
+    pub fn index_exists(&self, index: &str) -> bool {
+        if self.writers.contains_key(index) || self.schema_cache.contains_key(index) {
+            return true;
+        }
+        let Ok(read_txn) = self.kv.begin_read() else {
+            return false;
+        };
+        match read_txn.open_table(TABLE_SCHEMA) {
+            Ok(schema_table) => matches!(schema_table.get(index), Ok(Some(_))),
+            // No schema table yet, so no index has ever been created here.
+            Err(_) => false,
+        }
+    }
+
     /// Multi-tenant apply_write method
     pub fn apply_write(&self, index: &str, op: WalOp) -> Result<u64, StoreError> {
+        // A delete must not bring an index into existence. `get_or_create_index` below creates
+        // one when it is absent, which is what a put wants and the opposite of what removing a
+        // document that cannot be there wants — an empty index and a Tantivy directory would be
+        // the trace left by deleting nothing. A put is unaffected: it is the caller that
+        // legitimately creates.
+        if matches!(op, WalOp::Delete { .. }) && !self.index_exists(index) {
+            return Err(StoreError::IndexNotFound(index.to_string()));
+        }
+
         // Get or create the index
         let (writer_arc, fields) = self.get_or_create_index(index)?;
 
@@ -6087,6 +6116,12 @@ impl HybridStore {
             "HybridStore: Starting apply_batch"
         );
 
+        // See the guard in `apply_write`. A batch carrying even one put may create the index,
+        // because that put is a caller asking for it; a batch of nothing but deletes may not.
+        if ops.iter().all(|op| matches!(op, WalOp::Delete { .. })) && !self.index_exists(index) {
+            return Err(StoreError::IndexNotFound(index.to_string()));
+        }
+
         // Get or create the index
         let (writer_arc, fields) = self.get_or_create_index(index)?;
 
@@ -7280,6 +7315,84 @@ mod tests {
                 "id must survive the round trip"
             );
         }
+    }
+
+    /// A delete must not bring an index into existence.
+    ///
+    /// The write path opens through `get_or_create_index`, which creates an index when it is
+    /// absent — right for a put, which is a caller asking for the index, and wrong for a delete,
+    /// where an empty index and a Tantivy directory on disk would be the trace left by removing
+    /// nothing. Asserted on both write paths, and on the batch rule that a put in the same batch
+    /// still creates.
+    #[test]
+    fn deleting_from_an_unknown_index_creates_nothing() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+        let indices = temp_dir.path().join("indices");
+
+        for op in [
+            WalOp::Delete {
+                id: "d1".to_string(),
+            },
+            WalOp::Delete {
+                id: "d2".to_string(),
+            },
+        ] {
+            let refused = store.apply_write("ghost", op);
+            assert!(
+                matches!(refused, Err(StoreError::IndexNotFound(_))),
+                "a delete against an unknown index must be refused: {refused:?}"
+            );
+        }
+        assert!(
+            matches!(
+                store.apply_batch(
+                    "ghost",
+                    vec![WalOp::Delete {
+                        id: "d1".to_string()
+                    }]
+                ),
+                Err(StoreError::IndexNotFound(_))
+            ),
+            "and so must a batch of nothing but deletes"
+        );
+        assert!(
+            !indices.join("ghost").exists(),
+            "nothing may be created on disk for an index that was never created"
+        );
+        assert!(!store.index_exists("ghost"));
+
+        // A created index accepts a delete for a document it does not hold: the id is absent,
+        // which is not the same as the index being absent, and deletion is idempotent.
+        store
+            .store_schema_and_cache("real", &IndexSchema::default())
+            .unwrap();
+        assert!(store.index_exists("real"));
+        store
+            .apply_write(
+                "real",
+                WalOp::Delete {
+                    id: "never-written".to_string(),
+                },
+            )
+            .expect("a delete of an absent id is not an error");
+
+        // A batch carrying a put still creates, because that put asked for the index.
+        store
+            .apply_batch(
+                "fresh",
+                vec![
+                    WalOp::Put {
+                        id: "d1".to_string(),
+                        json_blob: Some(serde_json::json!({"id": "d1"})),
+                    },
+                    WalOp::Delete {
+                        id: "d1".to_string(),
+                    },
+                ],
+            )
+            .expect("a batch with a put creates the index");
+        assert!(indices.join("fresh").exists());
     }
 
     /// The read cache must not outlive the row it mirrors.

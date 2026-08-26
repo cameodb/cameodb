@@ -179,6 +179,120 @@ async fn a_written_document_is_retrievable_by_id() {
     assert_eq!(hits[0]["title"], "Dune");
 }
 
+/// A deleted document is gone from the key-value path at once, and from the index at the commit.
+///
+/// Both halves matter and they are not the same moment. An `id:VALUE` query is answered from redb
+/// without consulting Tantivy, so the row's removal is immediately visible; a content query is
+/// answered by Tantivy, where `delete_term` only takes effect when a commit publishes it. The
+/// second assertion is what the read cache defect would have broken — the cached body outlived
+/// the row and the document kept coming back.
+#[tokio::test]
+async fn a_deleted_document_is_gone_by_id_at_once_and_by_content_at_the_commit() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    client
+        .write_document("books", "b1", &json!({"id": "b1", "title": "Dune"}), None)
+        .await
+        .expect("write");
+    client.admin_index_commit("books").await.expect("commit");
+
+    // Read it first, which is what puts the body in the cache that used to outlive it.
+    let found = client
+        .search("books", "id:b1", Some(10), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(found["hits"].as_array().map(|h| h.len()), Some(1));
+
+    let removed = client
+        .delete_document("books", "b1", None)
+        .await
+        .expect("delete");
+    assert_eq!(removed["result"], "deleted");
+    assert_eq!(removed["id"], "b1");
+    assert!(
+        removed["version"].as_u64().unwrap_or(0) > 0,
+        "a delete takes a sequence number like any other write: {removed}"
+    );
+
+    let by_id = client
+        .search("books", "id:b1", Some(10), None, None, None)
+        .await
+        .expect("search by id");
+    assert_eq!(
+        by_id["hits"].as_array().map(|h| h.len()),
+        Some(0),
+        "the row is gone from redb, so the key lookup must miss immediately: {by_id}"
+    );
+
+    client
+        .admin_index_commit("books")
+        .await
+        .expect("commit the delete");
+    let by_content = client
+        .search("books", "title:Dune", Some(10), None, None, None)
+        .await
+        .expect("search by content");
+    assert_eq!(
+        by_content["total_hits"].as_u64(),
+        Some(0),
+        "once committed, the document is out of the index too: {by_content}"
+    );
+}
+
+/// Deleting is idempotent, and deleting from an index that does not exist is a 404.
+///
+/// The asymmetry is deliberate. An id the index does not hold is answered as deleted, exactly as
+/// writing over an existing document is answered as created — reporting per-record existence
+/// would mean threading an outcome back through the writer thread's reply splitting. A missing
+/// *index* is different: it is a name that was never created, and answering "deleted" would hide
+/// a typo. It must also not bring the index into existence on its way to answering.
+#[tokio::test]
+async fn deleting_is_idempotent_and_an_unknown_index_is_refused() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    client
+        .write_document("books", "b1", &json!({"id": "b1", "title": "Dune"}), None)
+        .await
+        .expect("write");
+
+    for round in 1..=2 {
+        let removed = client
+            .delete_document("books", "b1", None)
+            .await
+            .unwrap_or_else(|e| panic!("delete round {round} failed: {e}"));
+        assert_eq!(removed["result"], "deleted", "round {round}");
+    }
+    let absent = client
+        .delete_document("books", "never-written", None)
+        .await
+        .expect("deleting an id the index does not hold is not an error");
+    assert_eq!(absent["result"], "deleted");
+
+    let refused = client
+        .delete_document("no-such-index", "b1", None)
+        .await
+        .expect_err("an unknown index must be refused");
+    assert!(
+        refused.to_string().contains("404"),
+        "an unknown index is a 404, not a success or a 500: {refused}"
+    );
+
+    // ...and the refusal created nothing: the listing still knows only `books`.
+    let listing = client.list_indexes(false).await.expect("listing");
+    let names: Vec<&str> = listing
+        .indexes
+        .iter()
+        .map(|index| index.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["books"],
+        "a refused delete must not create the index it names"
+    );
+}
+
 /// A content query needs a committed segment. The node commits on an idle timeout, but a
 /// test should not sleep for it — `admin_index_commit` is the deterministic path, and this
 /// pins the fact that an explicit commit makes a write searchable by content.
