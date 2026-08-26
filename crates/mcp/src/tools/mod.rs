@@ -289,9 +289,11 @@ fn check_index(authz: &McpAuthzRef, index: &str) -> Result<(), String> {
 /// actionable, because a tool description sits in the caller's context for the whole session.
 fn search_index_description() -> String {
     format!(
-        "Full-text search over one CameoDB index.\n\n         Results carry `_score` and, when a projection was requested, only the named fields in \
+        "Full-text search over one CameoDB index.\n\n\
+         Results carry `_score` and, when a projection was requested, only the named fields in \
          the order given. A query the engine cannot fully interpret fails rather than returning \
-         partial results, and the error names the clause it could not use.\n\n         Call `describe_index` for an index's fields and their types before constructing a query \
+         partial results, and the error names the clause it could not use.\n\n\
+         Call `describe_index` for an index's fields and their types before constructing a query \
          against unfamiliar data.\n\n{}",
         crate::syntax::compact_reference()
     )
@@ -299,7 +301,8 @@ fn search_index_description() -> String {
 
 /// What `search_across_indexes` adds over `search_index`. The syntax is identical, so it is not repeated.
 fn search_across_indexes_description() -> String {
-    "Full-text search over several CameoDB indexes at once, executed concurrently and merged.\n\n     Each hit carries `_index_source` naming the index it came from. Per-index `fields` and \
+    "Full-text search over several CameoDB indexes at once, executed concurrently and merged.\n\n\
+     Each hit carries `_index_source` naming the index it came from. Per-index `fields` and \
      `sort` parameters override the equivalent inline modifiers, as they do on `search_index`. \
      One query string is applied to every index, so a field that exists in only some of them \
      will not match in the rest.\n\n     Query syntax is the same as `search_index`; see that tool's description, or call \
@@ -464,6 +467,41 @@ mod tests {
         }
     }
 
+    /// A description carries no run of spaces the source indentation put there.
+    ///
+    /// A `\` at the end of a line in a Rust string swallows the newline *and* the indentation
+    /// that follows; a `\n` written into the string does not — it keeps every space after it, and
+    /// two descriptions shipped nine and five of them after each paragraph break. Harmless to
+    /// read and not harmless to send: a tool description sits in the caller's context for the
+    /// whole session, and this is the one class of defect in it that no reviewer notices, because
+    /// the source looks exactly right.
+    ///
+    /// The syntax reference is a padded two-column table, so runs of spaces are how it lines up.
+    /// The check is therefore on prose: a run of two or more spaces that is not part of a line
+    /// the table indents.
+    #[test]
+    fn no_description_leaks_the_indentation_of_its_source() {
+        for tool in mcp_tools(DEFAULT_MAX_SEARCH_LIMIT) {
+            let name = tool["name"].as_str().unwrap_or("?").to_string();
+            let description = tool["description"].as_str().unwrap_or_default();
+
+            for (number, line) in description.lines().enumerate() {
+                // The rendered reference indents its rows by two spaces and pads its first
+                // column; those lines are the table, and their runs are deliberate.
+                if line.starts_with("  ") {
+                    continue;
+                }
+                assert!(
+                    !line.contains("  "),
+                    "{name}'s description has a run of spaces from its source indentation on \
+                     line {}: {line:?}",
+                    number + 1
+                );
+            }
+        }
+    }
+
+    /// The hints a read does not need are absent, and become required if a tool stops being one.
     /// The hints a read does not need are absent, and become required if a tool stops being one.
     ///
     /// The spec scopes `destructiveHint` and `idempotentHint` to tools whose `readOnlyHint` is
