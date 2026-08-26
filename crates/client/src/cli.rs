@@ -1046,7 +1046,7 @@ impl IndexCompleter {
     }
 
     fn delete_flag_suggestions(&self, prefix: &str, tokens: &[&str]) -> Vec<Pair> {
-        ["--id", "--routing-key", "--delete-schema"]
+        ["--id", "--ids-file", "--routing-key", "--delete-schema"]
             .into_iter()
             .filter_map(|flag| self.flag_suggestion(flag, flag, prefix, tokens))
             .collect()
@@ -1698,10 +1698,12 @@ pub enum ClientCommand {
     Delete {
         /// Target index name
         index: String,
-        /// Delete this document rather than the index. Repeatable.
-        #[arg(long = "id", value_name = "ID")]
+        /// Delete these documents rather than the index: one id, or several comma-separated.
+        /// Repeatable.
+        #[arg(long = "id", value_name = "ID[,ID...]")]
         ids: Vec<String>,
-        /// Delete the documents whose ids are in this file, one per line
+        /// Delete the documents whose ids are in this file, one per line. A line is one id
+        /// taken whole, so this is where an id containing a comma can be named.
         #[arg(long, value_name = "PATH")]
         ids_file: Option<String>,
         /// Routing key for the named documents, where the index routes by a field that is
@@ -1794,13 +1796,46 @@ pub enum ListResource {
     Index,
 }
 
+/// One `--id` value, which may name several ids: `--id b1,b2` and `--id b1 --id b2` are the same
+/// request.
+///
+/// Commas rather than spaces, because a space-separated list would need quoting to survive the
+/// shell and would be ambiguous against the positional index name. Blank segments are dropped, so
+/// a trailing comma or a doubled one costs nothing.
+///
+/// Shared with the REPL, which parses its own flags: one rule, or the two syntaxes drift.
+fn split_ids(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// The document ids a `delete` names, or `None` when it names none and therefore means the index.
 ///
 /// Both sources are read together so `--id` and `--ids-file` compose; a file that contains no ids
 /// is an error rather than a silent fall-through to deleting the index, which is the one mistake
 /// this command must not make quietly.
+///
+/// A `--id` value may name several ids at once, comma-separated. A file line may not: it is one
+/// id, taken whole. That asymmetry is deliberate — an id containing a comma is a legal id, and
+/// the file is where it can still be named.
+///
+/// The rule is uniform in the direction that matters: naming ids in *any* form and yielding none
+/// is an error, and only naming none at all means the index.
 fn collect_delete_ids(ids: &[String], ids_file: Option<&str>) -> Result<Option<Vec<String>>> {
-    let mut named: Vec<String> = ids.iter().map(|id| id.trim().to_string()).collect();
+    let mut named: Vec<String> = ids.iter().flat_map(|value| split_ids(value)).collect();
+
+    // `--id` was given and named nothing usable — `--id ,` or `--id ""`. Falling through would
+    // delete the *index*, which is the one direction this command must never take by accident,
+    // and it is the same refusal an ids file with no ids gets below.
+    if !ids.is_empty() && named.is_empty() {
+        return Err(anyhow!(
+            "--id named no document ids; refusing to fall back to deleting the index"
+        ));
+    }
 
     if let Some(path) = ids_file {
         let contents = fs::read_to_string(path)
@@ -4578,7 +4613,7 @@ fn interactive_loop(
 
         if matches!(input.as_str(), "help" | "\\h") {
             println!(
-                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  delete <index> --id <ID>... [--routing-key <KEY>]\n  admin memory stats\n  admin memory purge [--force]\n  admin index <name> commit\n  admin index <name> evict-writer\n  admin workers\n  connect <host[:port]>\n  key file <path>\n  key <api-key>\n  key show | key clear\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
+                "Available commands:\n  health\n  list indexes [--extended] [--data-size]\n  list index <name> [--extended] [--data-size]\n  search <index> <query> [limit]\n  schema detect <file> [--delimiter <delim>]\n  schema load <index> <file> [--delimiter <delim>]\n  data load <index> <file> [--delimiter <delim>] [--batch-size <n>]\n  delete <index> [--delete-schema]\n  delete <index> (--id <ID[,ID...]> | --ids-file <path>) [--routing-key <KEY>]\n  admin memory stats\n  admin memory purge [--force]\n  admin index <name> commit\n  admin index <name> evict-writer\n  admin workers\n  connect <host[:port]>\n  key file <path>\n  key <api-key>\n  key show | key clear\n  exit | quit | \\q\n\nSupported source formats for schema/data commands:\n  CSV, TSV, semicolon-delimited CSV, JSON object, JSON array, JSONL/NDJSON"
             );
             continue;
         }
@@ -4781,14 +4816,19 @@ async fn dispatch_interactive_command(
         "delete" => {
             let index = parts.next().ok_or_else(|| {
                 anyhow!(
-                    "Usage: delete <index> [--delete-schema] | delete <index> --id <ID>… \
-                     [--routing-key <KEY>]"
+                    "Usage: delete <index> [--delete-schema] | delete <index> \
+                     (--id <ID[,ID…]> | --ids-file <PATH>) [--routing-key <KEY>]"
                 )
             })?;
 
-            // Flags, in one pass: --id takes a value, the rest are switches.
+            // Flags, in one pass: --id, --ids-file and --routing-key take values, the rest are
+            // switches. The `--id` values are kept raw and handed to `collect_delete_ids`, which
+            // is what splits them and what decides whether any ids were named at all — the same
+            // function the command line uses, so neither the comma rule nor the refusal below
+            // can drift between the two entry points.
             let rest: Vec<&str> = parts.collect();
-            let mut ids: Vec<String> = Vec::new();
+            let mut raw_ids: Vec<String> = Vec::new();
+            let mut ids_file: Option<String> = None;
             let mut routing_key: Option<String> = None;
             let mut delete_schema = false;
             let mut cursor = rest.iter();
@@ -4799,7 +4839,13 @@ async fn dispatch_interactive_command(
                         let value = cursor
                             .next()
                             .ok_or_else(|| anyhow!("--id needs a document id"))?;
-                        ids.push((*value).to_string());
+                        raw_ids.push((*value).to_string());
+                    }
+                    "--ids-file" => {
+                        let value = cursor
+                            .next()
+                            .ok_or_else(|| anyhow!("--ids-file needs a path"))?;
+                        ids_file = Some((*value).to_string());
                     }
                     "--routing-key" => {
                         let value = cursor
@@ -4811,9 +4857,9 @@ async fn dispatch_interactive_command(
                 }
             }
 
-            // Naming documents deletes those; naming none still means the index, which is what
-            // this command has always meant and what the confirmation below is guarding.
-            if !ids.is_empty() {
+            // Naming documents deletes those; naming none at all still means the index, which is
+            // what this command has always meant and what the confirmation below is guarding.
+            if let Some(named) = collect_delete_ids(&raw_ids, ids_file.as_deref())? {
                 if delete_schema {
                     return Err(anyhow!(
                         "--delete-schema deletes the index, which is not what naming documents \
@@ -4821,7 +4867,7 @@ async fn dispatch_interactive_command(
                     ));
                 }
                 let result =
-                    delete_named_documents(session.client(), index, &ids, routing_key.as_deref())
+                    delete_named_documents(session.client(), index, &named, routing_key.as_deref())
                         .await?;
                 print_json(&result)?;
                 return Ok(());
@@ -4993,12 +5039,52 @@ mod tests {
             Some(vec!["b1".to_string()])
         );
 
+        // One `--id` may name several, and the flag still repeats: the two syntaxes are the same
+        // request, and they compose.
+        assert_eq!(
+            collect_delete_ids(&["b1,b2,b3".to_string()], None).expect("comma-separated"),
+            Some(vec!["b1".to_string(), "b2".to_string(), "b3".to_string()])
+        );
+        assert_eq!(
+            collect_delete_ids(&["b1,b2".to_string(), "b3".to_string()], None)
+                .expect("both syntaxes at once"),
+            Some(vec!["b1".to_string(), "b2".to_string(), "b3".to_string()])
+        );
+
+        // Whitespace around a comma is the shape a person types, and a stray or trailing comma
+        // costs nothing rather than producing an empty id the server would refuse.
+        assert_eq!(
+            collect_delete_ids(&[" b1 , b2,, b3 ,".to_string()], None).expect("sloppy list"),
+            Some(vec!["b1".to_string(), "b2".to_string(), "b3".to_string()])
+        );
+        // A `--id` that names nothing usable must not fall through to deleting the index. Same
+        // refusal as an ids file with no ids in it, for the same reason.
+        for empty_value in [",", "", "  ", ",,"] {
+            let refused = collect_delete_ids(&[empty_value.to_string()], None).expect_err(
+                "--id naming no usable id must be refused, not read as 'delete the index'",
+            );
+            assert!(
+                refused.to_string().contains("refusing"),
+                "the refusal must say why, for '{empty_value}': {refused}"
+            );
+        }
+
         // A file, with the shapes a hand-edited file actually has.
         let path = dir.path().join("ids.txt");
         std::fs::write(&path, "b2\n\n# a comment\n  b3  \n").expect("write");
         assert_eq!(
             collect_delete_ids(&["b1".to_string()], path.to_str()).expect("flags and file compose"),
             Some(vec!["b1".to_string(), "b2".to_string(), "b3".to_string()])
+        );
+
+        // A file line is one id, taken whole. That is what keeps an id containing a comma
+        // nameable at all, now that `--id` splits on them.
+        let commas = dir.path().join("commas.txt");
+        std::fs::write(&commas, "a,b\n").expect("write");
+        assert_eq!(
+            collect_delete_ids(&[], commas.to_str()).expect("a line is not a list"),
+            Some(vec!["a,b".to_string()]),
+            "an id containing a comma survives the file path"
         );
 
         // An empty file must not read as "delete the index".

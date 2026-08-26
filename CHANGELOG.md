@@ -57,8 +57,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   broadcast a write. Deleting by query is not available; the ids have to be named.
 
 - **`CameoClient::delete_document` and `CameoClient::delete_documents`**, and `delete <index>
-  --id <ID>…` in the CLI and the REPL, with `--ids-file <PATH>` for a list and `--routing-key
-  <KEY>` for a custom-routing index. `delete <index>` with no ids named still deletes the index,
+  --id <ID[,ID…]>` in the CLI and the REPL, with `--ids-file <PATH>` for a longer list and
+  `--routing-key <KEY>` for a custom-routing index. One `--id` may name several ids
+  comma-separated, and the flag also repeats: `--id b1,b2` and `--id b1 --id b2` are the same
+  request, and they compose. A file line is one id taken whole rather than a list, which is what
+  keeps an id containing a comma nameable at all.
+
+  `delete <index>` naming no documents still deletes the index, which is what it has always
+  meant. The direction that had to be made impossible is the other one, so *naming* ids and
+  yielding none — an empty ids file, `--id ,`, `--id ""` — is refused rather than falling through
+  to deleting the index. The command line and the REPL share the one function that decides this,
+  so the comma rule and the refusal cannot drift apart; the REPL gained `--ids-file` on the way,
+  which it had not had. `delete <index>` with no ids named still deletes the index,
   which is what it has always meant; the mistake that had to be impossible is the other
   direction, so an ids file that yields no ids is an error rather than a fall-through.
 
