@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::cluster_coordinator::OperationType;
 use crate::http_server::error::AppError;
-use crate::node_orchestrator::{ClientOp, DocPayload};
+use crate::node_orchestrator::{ClientOp, DeletePayload, DocPayload};
 use crate::state::AppState;
 
 /// Handler for document write operations
@@ -98,6 +98,44 @@ pub(super) async fn delete_document_handler(
     let result = state
         .router
         .route_and_handle(client_op, effective_routing_key, OperationType::Write)
+        .await
+        .map_err(AppError::from_route)?;
+    Ok(Json(result))
+}
+
+/// Handler for removing many documents in one request.
+///
+/// `POST` rather than `DELETE` because the ids are a body, and a body on `DELETE` is the part
+/// proxies drop. The path keeps the `_bulk` prefix the write side uses, so the two halves of
+/// bulk ingest read as a pair.
+pub(super) async fn bulk_delete_handler(
+    Path(index): Path<String>,
+    State(state): State<AppState>,
+    Json(docs): Json<Vec<DeletePayload>>,
+) -> Result<Json<JsonValue>, AppError> {
+    info!(
+        "Bulk delete request - index: {}, ids: {}",
+        index,
+        docs.len()
+    );
+
+    if docs.is_empty() {
+        return Err(AppError::bad_request(
+            "no ids to delete: the body must be a non-empty array",
+        ));
+    }
+
+    // The first id keeps the request unicast where the whole batch belongs to one shard, which
+    // is the common case; anything else is grouped and forwarded by the orchestrator.
+    let routing_hint = docs
+        .first()
+        .map(|first| first.routing_key().unwrap_or(first.id()).to_string());
+
+    let client_op = ClientOp::BulkDelete { index, docs };
+
+    let result = state
+        .router
+        .route_and_handle(client_op, routing_hint, OperationType::Write)
         .await
         .map_err(AppError::from_route)?;
     Ok(Json(result))

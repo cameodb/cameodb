@@ -524,6 +524,37 @@ impl CameoClient {
             .context("Failed to parse delete document response")
     }
 
+    /// Remove many documents by key, in one request.
+    ///
+    /// Each entry is either a bare id or `{"id": …, "routing_key": …}`, the latter for an index
+    /// that routes by a field other than the key. Ids belonging to different shards are grouped
+    /// and dispatched by the node, so one call covers a batch that spans the cluster.
+    ///
+    /// The reply counts what was deleted and lists per-id errors: an id that cannot be routed is
+    /// reported against that id rather than failing the batch.
+    pub async fn delete_documents(&self, index: &str, ids: &[JsonValue]) -> Result<JsonValue> {
+        let url = self
+            .base_url
+            .join(&format!("api/{}/_bulk/delete", index))
+            .context("Invalid bulk delete URL")?;
+
+        let resp = self.http.post(url).json(&ids).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Bulk delete failed: {} - {}{}",
+                status,
+                text,
+                self.refusal_hint(status)
+            );
+        }
+
+        resp.json()
+            .await
+            .context("Failed to parse bulk delete response")
+    }
+
     pub async fn bulk_index(&self, index: &str, batch: &[JsonValue]) -> Result<JsonValue> {
         let url = self
             .base_url

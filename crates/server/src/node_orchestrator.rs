@@ -894,6 +894,7 @@ fn is_write_operation(op: &ClientOp) -> bool {
         ClientOp::Write { .. }
             | ClientOp::BulkWrite { .. }
             | ClientOp::Delete { .. }
+            | ClientOp::BulkDelete { .. }
             | ClientOp::DeleteIndex { .. }
     )
 }
@@ -1251,6 +1252,42 @@ pub struct DocPayload {
     pub doc: JsonValue,
 }
 
+/// One document to remove, as a bulk delete names it.
+///
+/// A bare id is the whole of it on an index that routes by the key. `routing_key` carries the
+/// same value the write used where the index routes by something else, and is per item because a
+/// batch may span tenants — see `effective_delete_routing_key`.
+///
+/// Deserialized from either shape: `"b1"` or `{"id": "b1", "routing_key": "acme"}`. A list of
+/// bare ids is what almost every caller has, and making them wrap each one in an object to say
+/// nothing extra is a worse API than accepting both.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DeletePayload {
+    Id(String),
+    Keyed {
+        id: String,
+        #[serde(default)]
+        routing_key: Option<String>,
+    },
+}
+
+impl DeletePayload {
+    pub fn id(&self) -> &str {
+        match self {
+            DeletePayload::Id(id) => id,
+            DeletePayload::Keyed { id, .. } => id,
+        }
+    }
+
+    pub fn routing_key(&self) -> Option<&str> {
+        match self {
+            DeletePayload::Id(_) => None,
+            DeletePayload::Keyed { routing_key, .. } => routing_key.as_deref(),
+        }
+    }
+}
+
 /// Write request message for MicroshardActor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteRequest {
@@ -1445,6 +1482,16 @@ pub enum ClientOp {
     BulkWrite {
         index: String,
         docs: Vec<DocPayload>,
+    },
+    /// Remove many documents by key, in one request.
+    ///
+    /// Routed and grouped exactly as [`ClientOp::BulkWrite`] is, so each shard takes one batch in
+    /// one redb transaction. A document that cannot be routed is reported as an error against
+    /// that id rather than failing the batch, since a batch may span tenants and one unroutable
+    /// id says nothing about the rest.
+    BulkDelete {
+        index: String,
+        docs: Vec<DeletePayload>,
     },
     /// Remove one document by its key.
     ///
@@ -3665,6 +3712,35 @@ impl MicroshardActor {
         self.signal_supervisor(index).await;
 
         Ok(sequence)
+    }
+
+    /// Removes many documents in one transaction, through the same writer thread.
+    ///
+    /// One `StorageCommand::BatchWrite` of `WalOp::Delete`s, so the whole batch is one redb
+    /// transaction and one set of Tantivy term deletes — the same path a bulk write takes, which
+    /// is why nothing here is specific to deletion beyond the ops it carries.
+    pub async fn handle_batch_delete(
+        &self,
+        index: String,
+        ids: Vec<String>,
+    ) -> Result<usize, OrchestratorError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let ops: Vec<WalOp> = ids.into_iter().map(|id| WalOp::Delete { id }).collect();
+        let expected = ops.len();
+
+        let (sequences, _new_docs) = self
+            .handle_batch_write_via_channel(index.clone(), ops)
+            .await?;
+
+        self.signal_supervisor(index).await;
+
+        // One sequence per op, so the count is the storage layer's own answer rather than an
+        // echo of what was asked for.
+        debug_assert_eq!(sequences.len(), expected);
+        Ok(sequences.len())
     }
 
     /// Handles batch write requests via the dedicated writer thread.
@@ -7294,6 +7370,7 @@ impl NodeOrchestrator {
                 id,
                 routing_key,
             } => self.orch_delete(&index, id, routing_key).await,
+            ClientOp::BulkDelete { index, docs } => self.orch_bulk_delete(&index, docs).await,
             ClientOp::CreateConfig { index, schema } => {
                 self.orch_create_config(&index, schema).await
             }
@@ -7565,6 +7642,225 @@ impl NodeOrchestrator {
             "version": sequence,
             "shard_id": target.to_string(),
         }))
+    }
+
+    /// Remove many documents in one request.
+    ///
+    /// The same shape as [`orch_bulk_write`](Self::orch_bulk_write) with the document work taken
+    /// out: route each id, group by shard, hand each local shard one batch and each owning peer
+    /// one forwarded op. What is absent is the point — no schema validation and no evolution,
+    /// because a delete carries nothing that could grow a schema — so the schema is read once,
+    /// for routing, and never written.
+    ///
+    /// An id that cannot be routed is an error against that id, not a failed batch: a batch may
+    /// span tenants, and one id missing its routing key says nothing about the others.
+    async fn orch_bulk_delete(
+        &self,
+        index: &str,
+        docs: Vec<DeletePayload>,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let start = std::time::Instant::now();
+        if self.shards.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards",
+            )));
+        }
+
+        let items_received = docs.len();
+        let schema = if let Some(cached) = self.get_cached_schema(index) {
+            cached
+        } else {
+            Arc::new(self.load_schema(index).await?)
+        };
+
+        let shard_assignments = if let Some(coord) = &self.coordinator {
+            coord.ask(GetShardAssignments).await.unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        let mut errors: Vec<String> = Vec::new();
+        // Local work is a plain list of ids per shard: the routing key has already done its job
+        // by the time a shard is chosen, and the storage layer deletes by key.
+        let mut local_by_shard: HashMap<Uuid, Vec<String>> = HashMap::new();
+        let mut remote_by_node: HashMap<Uuid, Vec<DeletePayload>> = HashMap::new();
+
+        for payload in docs {
+            let id = payload.id().to_string();
+            if id.trim().is_empty() {
+                errors.push("an entry carried an empty id".to_string());
+                continue;
+            }
+            let routing_key = payload.routing_key().map(str::to_string);
+
+            let key = match effective_delete_routing_key(&schema, &id, routing_key) {
+                Ok(key) => key,
+                Err(err) => {
+                    errors.push(format!("{id}: {err}"));
+                    continue;
+                }
+            };
+
+            let Some(target) = self
+                .select_shard_for_key(&key)
+                .or_else(|| self.first_shard_id())
+            else {
+                errors.push(format!("{id}: no shard available for routing"));
+                continue;
+            };
+
+            if self.shards.contains_key(&target) {
+                local_by_shard.entry(target).or_default().push(id);
+            } else if let Some(shard_meta) = shard_assignments.get(&target) {
+                remote_by_node
+                    .entry(shard_meta.node_id)
+                    .or_default()
+                    .push(payload);
+            } else {
+                errors.push(format!(
+                    "{id}: no shard assignment for shard {target}, so it was not deleted"
+                ));
+            }
+        }
+
+        let mut deleted = 0usize;
+
+        // Local shards in parallel, serial within each: every shard has its own writer thread,
+        // and one batch per shard is what makes this one transaction per shard.
+        let local_futures: Vec<_> = local_by_shard
+            .into_iter()
+            .map(|(shard_id, ids)| {
+                let shard = self.shards.get(&shard_id).cloned();
+                let index_name = index.to_string();
+                async move {
+                    let shard = shard.ok_or_else(|| {
+                        OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Local shard {shard_id} not found"),
+                        ))
+                    })?;
+                    shard.handle_batch_delete(index_name, ids).await
+                }
+            })
+            .collect();
+
+        for result in futures::future::join_all(local_futures).await {
+            match result {
+                Ok(count) => deleted += count,
+                Err(err) => errors.push(format!("local shard delete failed: {err}")),
+            }
+        }
+
+        // Peers that own the rest.
+        if !remote_by_node.is_empty() {
+            let peer_addrs: HashMap<Uuid, String> = if let Some(coord) = &self.coordinator {
+                coord
+                    .ask(GetKnownPeers)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|peer| (peer.node_id, peer.address))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+
+            let mut remote_futures = Vec::new();
+            for (node_id, payloads) in remote_by_node {
+                match peer_addrs.get(&node_id) {
+                    Some(addr) => {
+                        let addr = addr.clone();
+                        remote_futures.push(async move {
+                            self.forward_bulk_delete_to_remote(node_id, &addr, index, payloads)
+                                .await
+                        });
+                    }
+                    None => errors.push(format!("no peer address for node {node_id}")),
+                }
+            }
+
+            for result in futures::future::join_all(remote_futures).await {
+                match result {
+                    Ok(count) => deleted += count,
+                    Err(err) => errors.push(format!("remote forwarding failed: {err}")),
+                }
+            }
+        }
+
+        let duration = start.elapsed();
+        info!(
+            index = %index,
+            items_received = items_received,
+            items_deleted = deleted,
+            errors = errors.len(),
+            duration_ms = duration.as_millis(),
+            "BulkDelete completed"
+        );
+
+        Ok(serde_json::json!({
+            "items_received": items_received,
+            "items_deleted": deleted,
+            "errors": errors,
+            "duration_ms": duration.as_millis(),
+        }))
+    }
+
+    /// Hand a peer the part of a bulk delete its shards own.
+    async fn forward_bulk_delete_to_remote(
+        &self,
+        node_id: Uuid,
+        peer_addr: &str,
+        index: &str,
+        docs: Vec<DeletePayload>,
+    ) -> Result<usize, OrchestratorError> {
+        debug!(
+            %node_id,
+            %peer_addr,
+            count = docs.len(),
+            "Forwarding bulk delete batch to remote node"
+        );
+
+        let pool = self.remote_peer_pool.as_ref().ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::other("Remote peer pool not initialized"))
+        })?;
+
+        let remote = pool
+            .get_orchestrator(node_id, ConnectionChannel::Operations)
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+            .ok_or_else(|| {
+                OrchestratorError::Io(std::io::Error::other(format!(
+                    "Remote orchestrator for node {node_id} not found"
+                )))
+            })?;
+
+        let op = ClientOp::BulkDelete {
+            index: index.to_string(),
+            docs,
+        };
+
+        let answer: JsonValue = remote
+            .ask(&op)
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+
+        // Its errors are the caller's errors too, so surface them rather than counting only
+        // what succeeded.
+        if let Some(remote_errors) = answer.get("errors").and_then(|e| e.as_array())
+            && !remote_errors.is_empty()
+        {
+            warn!(
+                %node_id,
+                error_count = remote_errors.len(),
+                "Remote node reported errors deleting its share of the batch"
+            );
+        }
+
+        Ok(answer
+            .get("items_deleted")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize)
     }
 
     async fn orch_bulk_write(
@@ -8849,6 +9145,43 @@ mod tests {
         );
     }
 
+    /// A bulk delete entry is either a bare id or an object naming its routing key.
+    ///
+    /// Untagged enums resolve by trying each variant in order, which is exactly the kind of
+    /// deserialization that works until someone reorders the variants. Both shapes and both
+    /// accessors are pinned here, along with the rejection of an entry that is neither.
+    #[test]
+    fn a_delete_entry_reads_as_a_bare_id_or_as_an_object() {
+        let parsed: Vec<DeletePayload> = serde_json::from_value(json!([
+            "b1",
+            {"id": "b2"},
+            {"id": "b3", "routing_key": "acme"},
+        ]))
+        .expect("both shapes deserialize");
+
+        let seen: Vec<(&str, Option<&str>)> = parsed
+            .iter()
+            .map(|entry| (entry.id(), entry.routing_key()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![("b1", None), ("b2", None), ("b3", Some("acme")),]
+        );
+
+        // A bare id round-trips as a bare id, so a forwarded batch reaches a peer in the shape
+        // the caller sent.
+        assert_eq!(
+            serde_json::to_value(&parsed[0]).expect("serialize"),
+            json!("b1")
+        );
+
+        assert!(
+            serde_json::from_value::<Vec<DeletePayload>>(json!([{"document": "b1"}])).is_err(),
+            "an entry that names no id is refused rather than read as something else"
+        );
+    }
+
+    /// What a delete is routed by, and when it cannot be routed at all.
     /// What a delete is routed by, and when it cannot be routed at all.
     ///
     /// A write reads its key out of the document, which is the authority. A delete has no

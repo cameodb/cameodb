@@ -293,6 +293,80 @@ async fn deleting_is_idempotent_and_an_unknown_index_is_refused() {
     );
 }
 
+/// A bulk delete removes what it names, takes both entry shapes, and reports what it could not do.
+///
+/// The per-id error rather than a failed batch is the property worth pinning: a batch may span
+/// tenants, so one id that cannot be routed says nothing about the rest of them.
+#[tokio::test]
+async fn a_bulk_delete_removes_many_and_reports_what_it_could_not() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let batch: Vec<serde_json::Value> = (1..=4)
+        .map(|n| json!({"id": format!("b{n}"), "doc": {"id": format!("b{n}"), "title": "Dune"}}))
+        .collect();
+    client.bulk_index("books", &batch).await.expect("seed");
+    client.admin_index_commit("books").await.expect("commit");
+
+    // Both entry shapes in one call: a bare id, and one that spells out its routing key.
+    let removed = client
+        .delete_documents(
+            "books",
+            &[
+                json!("b1"),
+                json!({"id": "b2"}),
+                json!({"id": "b3", "routing_key": "b3"}),
+                json!("never-written"),
+            ],
+        )
+        .await
+        .expect("bulk delete");
+
+    assert_eq!(removed["items_received"], 4);
+    assert_eq!(
+        removed["items_deleted"], 4,
+        "every id is applied, including one the index does not hold: {removed}"
+    );
+    assert_eq!(
+        removed["errors"].as_array().map(|e| e.len()),
+        Some(0),
+        "nothing here is unroutable: {removed}"
+    );
+
+    for id in ["b1", "b2", "b3"] {
+        let found = client
+            .search("books", &format!("id:{id}"), Some(10), None, None, None)
+            .await
+            .expect("search");
+        assert_eq!(
+            found["hits"].as_array().map(|h| h.len()),
+            Some(0),
+            "{id} should be gone: {found}"
+        );
+    }
+
+    // The one that was not named is untouched.
+    let survivor = client
+        .search("books", "id:b4", Some(10), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(
+        survivor["hits"].as_array().map(|h| h.len()),
+        Some(1),
+        "a document the batch did not name must survive it: {survivor}"
+    );
+
+    // An empty body is a bad request rather than a no-op success.
+    let refused = client
+        .delete_documents("books", &[])
+        .await
+        .expect_err("an empty batch is refused");
+    assert!(
+        refused.to_string().contains("400"),
+        "an empty batch is a 400: {refused}"
+    );
+}
+
 /// A content query needs a committed segment. The node commits on an idle timeout, but a
 /// test should not sleep for it — `admin_index_commit` is the deterministic path, and this
 /// pins the fact that an explicit commit makes a write searchable by content.
