@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A document read once and then updated or deleted kept serving its previous body.** The
+  per-index read cache in front of redb is populated by every search that hydrates a document
+  body, and until now it was cleared in exactly one place: deleting the whole index. Neither the
+  single-write path nor the batch path touched it, so a row that changed under a cached entry was
+  never noticed — an update served the body from before it, and the only thing that eventually
+  corrected either was the 1024-entries-per-index FIFO evicting the entry.
+
+  The window was short and unpredictable, which is why it went unseen: the entry point is a search
+  hydration, so it needed the same document to be read and then written. It is now impossible.
+  The ids a write touched are dropped from the cache by the same code that writes the rows, after
+  the redb transaction commits rather than before.
+
+  Removing the entries is not sufficient on its own. A reader that opened its transaction before
+  the write committed legitimately still sees the pre-write row, and if it installs that body
+  after the removal, nothing will take it out again. Each index's cache therefore carries a
+  generation: a reader reads it before opening its transaction and quotes it back when it caches,
+  and an insert whose generation a write has moved on from is declined. Both sides touch the cache
+  under the same entry guard, so the check and the insert cannot interleave with a write's bump and
+  removal.
+
+  Two regression tests cover it — update and delete on both write paths, and the two halves of the
+  reader/writer race driven in the order that produces it, which a single thread cannot interleave.
+
+- **Shard-affine dispatch could place a document on a shard the routing ring did not own.** The
+  hint that picks a worker is computed from the request's routing key before any schema is loaded,
+  while the write itself routes by the document's own routing field, which outranks it. On an index
+  whose routing field is a real, non-key field the two disagree — and the write took the hint. The
+  result was a document on a shard the ring believed belonged elsewhere: invisible to searches,
+  which are scatter-gather, until the same id was written again through a path that carries no hint
+  and landed on the shard the ring does name, leaving one id in two places for a search to return
+  twice.
+
+  The hint now chooses only the worker, which is what it exists for and what actually saves the
+  cross-core wakeup; the ring always chooses the shard. It is no longer possible to express the
+  divergence: the hint is not passed to the engine at all. Only deployments with
+  `shard_affine_dispatch = true`, which is not the default, could reach this.
+
+  The routing rule the hint used to overrule was written out identically in three places, so it is
+  now one function with its precedence documented and pinned by a test: the document's routing
+  field, then the caller's routing key, then the id, then a hash of the document.
+
+- **A batch of deletions left the index size and document count stale** in `/_indexes` until the
+  measurement cache expired: the invalidation asked whether the batch had written or updated a
+  document, and a batch of pure deletions does neither.
+
+- **One MCP test failed intermittently on a timing figure.** The regression test that pins a tool
+  result to one shape whatever protocol revision a client states compared whole response
+  envelopes, `took_ms` included — so two calls that agreed on every hit, score and count failed
+  the comparison when one took 10 ms and the other 1 ms. Durations are now flattened on both sides
+  before the comparison; everything else still has to match exactly.
+
 ## [0.3.2] - 2026-08-20
 
 ### Fixed
