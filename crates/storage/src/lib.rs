@@ -2541,6 +2541,25 @@ struct IndexSizeCache {
     timestamp: Instant,
 }
 
+/// One index's cached document bodies, and the generation that says whether they are current.
+///
+/// The bodies mirror rows in `data_<index>`, so any write to that table makes the entries for
+/// the ids it touched wrong. Removing those entries is not enough on its own: a reader that
+/// began its redb transaction before the write commits legitimately sees the pre-write row, and
+/// if it caches that body *after* the write has invalidated it, the stale value is back and
+/// nothing will remove it again.
+///
+/// `generation` closes that window. A reader reads it before opening its transaction and passes
+/// it back to `insert_into_cache`, which declines to cache anything if a write has bumped it
+/// since. Reader and writer both hold the same `DashMap` entry guard while they touch this
+/// struct, so the check and the insert cannot interleave with a bump and a removal — whichever
+/// side takes the guard first, the outcome is a cache without a stale body in it.
+#[derive(Default)]
+struct IndexReadCache {
+    entries: HashMap<String, Vec<u8>>,
+    generation: u64,
+}
+
 /// Result of batch index size measurement
 struct IndexSizes {
     tantivy_bytes: u64,
@@ -2645,7 +2664,7 @@ pub struct HybridStore {
     /// Operation counters for smart commits per index
     operations_counter: Arc<DashMap<String, AtomicU64>>,
     /// Simple per-index read cache for frequently accessed documents
-    read_cache: Arc<DashMap<String, HashMap<String, Vec<u8>>>>,
+    read_cache: Arc<DashMap<String, IndexReadCache>>,
     /// Cache of optimal memory budgets per index to avoid frequent syscalls
     budget_cache: Arc<DashMap<String, usize>>,
     /// Cache of schemas per index to avoid repeated redb reads
@@ -3488,22 +3507,70 @@ impl HybridStore {
 
     /// Get a value from the read cache if present.
     fn get_from_cache(&self, index: &str, key: &str) -> Option<Vec<u8>> {
-        self.read_cache.get(index)?.get(key).cloned()
+        self.read_cache.get(index)?.entries.get(key).cloned()
+    }
+
+    /// The generation a reader must quote back to `insert_into_cache`.
+    ///
+    /// Read *before* the redb transaction the body will come out of, so that a write landing in
+    /// between is detectable. An index with no cache yet reads as 0, which the first write to it
+    /// bumps like any other — see [`IndexReadCache`].
+    fn cache_generation(&self, index: &str) -> u64 {
+        self.read_cache
+            .get(index)
+            .map(|cache| cache.generation)
+            .unwrap_or(0)
     }
 
     /// Insert a value into the read cache with a simple per-index size bound.
-    fn insert_into_cache(&self, index: &str, key: &str, value: Vec<u8>) {
+    ///
+    /// `seen_generation` is what [`cache_generation`](Self::cache_generation) returned before the
+    /// read that produced `value`. A mismatch means a write committed in between, so `value` is a
+    /// pre-write body and caching it would reinstate exactly the staleness the write removed.
+    /// Dropping it costs one cache miss; keeping it costs a wrong answer until the FIFO evicts it.
+    fn insert_into_cache(&self, index: &str, key: &str, value: Vec<u8>, seen_generation: u64) {
         const MAX_CACHE_ENTRIES_PER_INDEX: usize = 1024;
 
         let mut index_cache = self.read_cache.entry(index.to_string()).or_default();
 
-        if index_cache.len() >= MAX_CACHE_ENTRIES_PER_INDEX
-            && let Some(first_key) = index_cache.keys().next().cloned()
-        {
-            index_cache.remove(&first_key);
+        if index_cache.generation != seen_generation {
+            return;
         }
 
-        index_cache.insert(key.to_string(), value);
+        if index_cache.entries.len() >= MAX_CACHE_ENTRIES_PER_INDEX
+            && let Some(first_key) = index_cache.entries.keys().next().cloned()
+        {
+            index_cache.entries.remove(&first_key);
+        }
+
+        index_cache.entries.insert(key.to_string(), value);
+    }
+
+    /// Drop the cached bodies for ids a write has just changed, and bump the generation.
+    ///
+    /// **Call after the redb transaction commits, never before.** Invalidating first leaves a
+    /// window in which a reader still sees the pre-write row and can cache it again; the
+    /// generation bump is what makes such a reader decline to.
+    ///
+    /// The generation is bumped even when nothing was cached, because a reader that found no
+    /// cache read generation 0 and would otherwise be free to install a body this write has
+    /// already superseded.
+    fn invalidate_read_cache<'a, I>(&self, index: &str, ids: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut index_cache = self.read_cache.entry(index.to_string()).or_default();
+        index_cache.generation = index_cache.generation.wrapping_add(1);
+        for id in ids {
+            index_cache.entries.remove(id);
+        }
+    }
+
+    /// [`invalidate_read_cache`](Self::invalidate_read_cache) for a change that touched every id.
+    fn invalidate_read_cache_all(&self, index: &str) {
+        let mut index_cache = self.read_cache.entry(index.to_string()).or_default();
+        index_cache.generation = index_cache.generation.wrapping_add(1);
+        index_cache.entries.clear();
     }
 
     /// Build Tantivy schema and field map from index schema definition using native Tantivy types.
@@ -4386,6 +4453,9 @@ impl HybridStore {
 
         // Evolve schema if new fields are present (declare outside transaction scope)
         let mut evolved_schema = None;
+        // The id this write changed, moved out of the op by whichever arm ran, so the read cache
+        // can be invalidated once the transaction below has committed.
+        let touched_id: String;
 
         let mut write_txn = self.kv.begin_write()?;
         {
@@ -4591,6 +4661,7 @@ impl HybridStore {
                     }
                     // Add the document (new or updated)
                     writer.add_document(tantivy_doc)?;
+                    touched_id = id;
                 }
                 WalOp::Delete { id } => {
                     let mut data_table = write_txn.open_table(data_table_def)?;
@@ -4603,11 +4674,16 @@ impl HybridStore {
                         poisoned.into_inner()
                     });
                     writer.delete_term(term);
+                    touched_id = id;
                 }
             }
         }
 
         write_txn.commit()?;
+
+        // The cached body for this id is now the previous one. Removing it after the commit
+        // rather than before is what makes the removal stick — see `invalidate_read_cache`.
+        self.invalidate_read_cache(index, [touched_id.as_str()]);
 
         // Persist schema evolution in separate transaction with Immediate durability
         if let Some(evolved) = evolved_schema {
@@ -4654,7 +4730,9 @@ impl HybridStore {
         self.writers.remove(index);
         self.readers.remove(index);
         self.current_seq.remove(index);
-        self.read_cache.remove(index);
+        // Cleared rather than removed: a reader mid-flight read this index's generation and
+        // must be refused its insert, which a fresh entry starting from zero would allow.
+        self.invalidate_read_cache_all(index);
         self.schema_cache.remove(index);
         self.fields_cache.remove(index);
         self.budget_cache.remove(index);
@@ -4726,13 +4804,16 @@ impl HybridStore {
         let data_table_name = format!("data_{}", index);
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
 
+        // Read before the transaction opens: the snapshot this returns may predate a write that
+        // is committing right now, and the generation is how `insert_into_cache` finds out.
+        let seen_generation = self.cache_generation(index);
         let read_txn = self.kv.begin_read()?;
 
         match read_txn.open_table(data_table_def) {
             Ok(data_table) => match data_table.get(key)? {
                 Some(value) => {
                     let bytes = value.value().to_vec();
-                    self.insert_into_cache(index, key, bytes.clone());
+                    self.insert_into_cache(index, key, bytes.clone(), seen_generation);
                     Ok(Some(bytes))
                 }
                 None => Ok(None),
@@ -4755,7 +4836,9 @@ impl HybridStore {
         let data_table_name = format!("data_{}", index);
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
 
-        // Single read transaction for all keys
+        // Single read transaction for all keys. The generation is read first, for the reason
+        // given in `get_by_key`.
+        let seen_generation = self.cache_generation(index);
         let read_txn = self.kv.begin_read()?;
         let data_table = match read_txn.open_table(data_table_def) {
             Ok(table) => table,
@@ -4774,7 +4857,7 @@ impl HybridStore {
             // Fetch from redb
             if let Some(value) = data_table.get(key.as_str())? {
                 let bytes = value.value().to_vec();
-                self.insert_into_cache(index, key, bytes.clone());
+                self.insert_into_cache(index, key, bytes.clone(), seen_generation);
                 results.push((key.clone(), bytes));
             }
             // Skip keys that don't exist (document may have been deleted)
@@ -6282,6 +6365,11 @@ impl HybridStore {
 
         write_txn.commit()?;
 
+        // Every id in this batch had its row written or removed, so any cached body for it is
+        // the previous one. Done after the commit and before the Tantivy work, with the ids
+        // still borrowed out of `tantivy_ops` rather than collected into a second vector.
+        self.invalidate_read_cache(index, tantivy_ops.iter().map(|(_, _, id)| id.as_str()));
+
         // Apply all tantivy operations with optimized selective deletes
         {
             let writer = writer_arc.lock().unwrap_or_else(|poisoned| {
@@ -6338,8 +6426,12 @@ impl HybridStore {
             drop(writer);
         }
 
-        // Invalidate size cache for this index to ensure fresh stats on next query
-        if new_documents_count > 0 || !updated_document_ids.is_empty() {
+        // Invalidate size cache for this index to ensure fresh stats on next query.
+        //
+        // Unconditional, where this used to ask for a new or updated document first: a batch of
+        // pure deletes satisfies neither test and still changes every figure in there. An empty
+        // batch cannot reach this point — `ops.is_empty()` returned at the top.
+        {
             let mut size_cache = self.index_size_cache.lock().unwrap();
             size_cache.retain(|key, _| !key.contains(&format!(":{}", index)));
         }
@@ -7187,6 +7279,191 @@ mod tests {
                 id,
                 "id must survive the round trip"
             );
+        }
+    }
+
+    /// The read cache must not outlive the row it mirrors.
+    ///
+    /// Its only writer is a body hydration on the read path, and until 2026-08-26 its only
+    /// invalidation was dropping an entire index. So a document read once and then updated kept
+    /// serving its previous body, and a document read once and then deleted kept being served at
+    /// all — which is fatal for deletion, since an `id:VALUE` lookup is answered from redb and
+    /// never consults Tantivy. Both halves are asserted here on the single-write path and on the
+    /// batch path, because each does its own invalidation.
+    #[test]
+    fn a_changed_row_is_not_served_from_the_read_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+
+        let body = |index: &str, id: &str| -> Option<String> {
+            store
+                .get_by_key(index, id)
+                .expect("read")
+                .map(|bytes| String::from_utf8(bytes).expect("utf-8"))
+        };
+
+        // --- single-write path
+        let single = "cache_single";
+        store
+            .apply_write(
+                single,
+                WalOp::Put {
+                    id: "d1".to_string(),
+                    json_blob: Some(serde_json::json!({"id": "d1", "title": "v1"})),
+                },
+            )
+            .unwrap();
+        assert!(
+            body(single, "d1").expect("v1 present").contains("v1"),
+            "the first read populates the cache"
+        );
+
+        store
+            .apply_write(
+                single,
+                WalOp::Put {
+                    id: "d1".to_string(),
+                    json_blob: Some(serde_json::json!({"id": "d1", "title": "v2"})),
+                },
+            )
+            .unwrap();
+        let updated = body(single, "d1").expect("v2 present");
+        assert!(
+            updated.contains("v2") && !updated.contains("v1"),
+            "an update must be visible, not shadowed by the cached body: {updated}"
+        );
+
+        store
+            .apply_write(
+                single,
+                WalOp::Delete {
+                    id: "d1".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            body(single, "d1"),
+            None,
+            "a deleted document must not be served from the cache"
+        );
+        assert!(
+            store
+                .get_batch_by_keys(single, &["d1".to_string()])
+                .unwrap()
+                .is_empty(),
+            "the batch path hydrates search hits and must agree"
+        );
+
+        // --- batch path
+        let batch = "cache_batch";
+        store
+            .apply_batch(
+                batch,
+                vec![
+                    WalOp::Put {
+                        id: "d1".to_string(),
+                        json_blob: Some(serde_json::json!({"id": "d1", "title": "v1"})),
+                    },
+                    WalOp::Put {
+                        id: "d2".to_string(),
+                        json_blob: Some(serde_json::json!({"id": "d2", "title": "keep"})),
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(body(batch, "d1").is_some() && body(batch, "d2").is_some());
+
+        store
+            .apply_batch(
+                batch,
+                vec![
+                    WalOp::Put {
+                        id: "d1".to_string(),
+                        json_blob: Some(serde_json::json!({"id": "d1", "title": "v2"})),
+                    },
+                    WalOp::Delete {
+                        id: "d2".to_string(),
+                    },
+                ],
+            )
+            .unwrap();
+        let updated = body(batch, "d1").expect("v2 present");
+        assert!(
+            updated.contains("v2") && !updated.contains("v1"),
+            "a batched update must be visible: {updated}"
+        );
+        assert_eq!(body(batch, "d2"), None, "a batched delete must be visible");
+    }
+
+    /// A reader whose snapshot predates a write must not install that snapshot's body.
+    ///
+    /// Removing the entry is not sufficient on its own: the removal happens after the redb
+    /// commit, and a reader that opened its transaction earlier legitimately still sees the
+    /// pre-write row. If it caches that body after the removal, the staleness is back and
+    /// nothing will remove it a second time. The generation is what makes such a reader decline,
+    /// and the interleaving that needs it cannot be produced from a single thread — so this
+    /// drives the two halves directly, in the order the race would put them.
+    #[test]
+    fn a_body_read_before_a_write_is_refused_by_the_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+        let index = "cache_generation";
+
+        store
+            .apply_write(
+                index,
+                WalOp::Put {
+                    id: "d1".to_string(),
+                    json_blob: Some(serde_json::json!({"id": "d1", "title": "v1"})),
+                },
+            )
+            .unwrap();
+
+        // What a reader would have captured before opening its transaction.
+        let seen_generation = store.cache_generation(index);
+
+        // The write it is about to race, committed and invalidated.
+        store
+            .apply_write(
+                index,
+                WalOp::Delete {
+                    id: "d1".to_string(),
+                },
+            )
+            .unwrap();
+
+        // The reader, arriving late with a body that was true when it looked.
+        store.insert_into_cache(index, "d1", b"stale".to_vec(), seen_generation);
+
+        assert_eq!(
+            store.get_from_cache(index, "d1"),
+            None,
+            "a body read before the write must be refused, not installed"
+        );
+
+        // A reader that saw the current generation is still served by the cache, or the guard
+        // would have turned the cache off rather than made it correct.
+        let current = store.cache_generation(index);
+        store.insert_into_cache(index, "d1", b"fresh".to_vec(), current);
+        assert_eq!(
+            store.get_from_cache(index, "d1").as_deref(),
+            Some(&b"fresh"[..]),
+            "a body read after the write must still be cacheable"
+        );
+    }
+
+    fn read_cache_config(temp_dir: &TempDir) -> StorageConfig {
+        StorageConfig {
+            shard_path: temp_dir.path().to_path_buf(),
+            indexer_memory_budget: 32 * 1024 * 1024,
+            indexer_memory_min_mb: 16,
+            indexer_memory_max_mb: 256,
+            total_memory_limit_bytes: 2048 * 1024 * 1024,
+            memory_pressure_threshold_percent: 80,
+            indexer_num_threads: 1,
+            merge_num_threads: 1,
+            default_batch_size: 100_000,
+            wal_sync: true,
         }
     }
 
