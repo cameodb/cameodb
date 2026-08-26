@@ -183,22 +183,27 @@ answers with the shadow name *instead of* `id`. So `id` should stop being offere
 to *project*, while remaining something to query, and something to sort by. Opened by
 completion track item 3.
 
-**Sorting**, found by the syntax audit on 2026-08-27. `id` is declared `STRING | STORED` and
-never `FAST`, so `sortable_fields` does not contain it and the listing reports
-`"sortable": false` — for `id` and for the shadow name that stands for it. Sorting by either is
-a supported contract with an end-to-end test (`a_shadow_field_sorts_by_the_key_it_stands_for`,
-0.3.2): `unsortable_sort_field` lets both through deliberately, and the result is an approximate
-text sort that reports itself as one. Meanwhile `SORT_RULES` tells an agent that `sortable` is
-how it knows what can be ordered. So the one field an agent most wants to sort a shadow index by
-is advertised as unsortable, and an agent that believes the guidance will never try it.
+**Sorting** ✅ **Done** 2026-08-27, and smaller than this item first claimed. The audit filed it
+as "`sortable: false` is wrong for `id` and its shadow name". Verification against a running node
+narrowed it twice, and the correction is worth keeping: `sortable` means *exactly* sortable by
+design — `the_schema_reports_which_fields_can_be_sorted_exactly` asserts `sortable: false` for a
+text field with no fast column — so the flag was not lying, and the rule added to `SORT_RULES` in
+the same session ("a text or string field without one is sorted approximately rather than
+refused") already covers `id`, whose declared type is text.
 
-The fix is to stop deriving that flag from the fast column alone and report what the engine
-actually accepts — which means `id`, a shadow name, and any text or string field are sortable
-*approximately*, and only a numeric or date field needs `fast`. Three states rather than two, or
-one flag plus the honesty about which kind of sort it is.
+What was genuinely missing was narrower and shadow-specific. A shadow field reads
+`indexed: false, fast: false, sortable: false`, and the guidance says an unindexed field matches
+nothing — so nothing told an agent that sorting by it works at all, let alone that it orders by
+the identifier. Confirmed on a node: `sort=doi` on a shadow index returns the right order and
+reports `_approximate_sort: "doi"`, the caller's own name rather than `id`. `SHADOW_FIELD` and the
+orchestrator skill now say so, which is one edit propagating to the per-field `query_hint`, the
+README, `validate_query` and the served prompt.
 
-Do it with [A2](#a2--the-documentation-pass), since the fix and the prose describing field
-shapes land in the same place.
+No flag changed. Reporting `sortable: true` for an approximate sort would break a contract a test
+names, and adding a third state is not worth it while `fast` already answers "how well".
+
+**Still open: the projection half above.** Do it with [A2](#a2--the-documentation-pass), since the
+fix and the prose describing field shapes land in the same place.
 
 ### A5 — Semantic routing
 
