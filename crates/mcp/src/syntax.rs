@@ -118,7 +118,8 @@ pub const OPERATORS: &[Operator] = &[
         caveat: Some(
             "Runs as a lexicographic range, so a short prefix scans a wide slice of the term \
              dictionary. On a stemmed field the prefix is stemmed too, which can move where it \
-             lands.",
+             lands. A value the analyzer cannot reduce to one term is matched as that term \
+             exactly instead, and reported.",
         ),
     },
     Operator {
@@ -227,7 +228,10 @@ pub const OPERATORS: &[Operator] = &[
         summary: "Match a facet path.",
         examples: &["category:/electronics/phones", "category:/electronics"],
         types: &[TYPE_FACET],
-        caveat: Some("Hierarchical: a parent path matches its descendants."),
+        caveat: Some(
+            "Hierarchical: a parent path matches its descendants. The path ends at the first \
+             space, so a path containing one cannot be queried.",
+        ),
     },
     Operator {
         syntax: "id:value",
@@ -301,15 +305,19 @@ pub const RULES: &[&str] = &[
      `shadow`. Fields discovered from a document are added unindexed, and stay that way until a \
      schema update promotes them, so check the `indexed` flag before naming a field.",
     SHADOW_FIELD,
-    "`AND`, `OR`, `NOT`, `TO` and `IN` are keywords in uppercase only. Lowercase is query text: \
-     `to` and `in` break the clause around them and are reported, while `and`, `or` and `not` are \
-     searched for as ordinary words and change what the query means without any warning.",
-    "A clause the engine cannot interpret is dropped and whatever is left runs, which widens a \
-     conjunction, narrows a disjunction, disables a negation, and matches nothing at all when \
-     the dropped clause was the only one. Every dropped clause is reported: the HTTP API \
-     attaches `_discarded_clauses` to the response — or refuses with 400 when no clause \
-     survived at all — and an MCP tool call fails with the reason. \
-     Results are never returned as though the query had been understood.",
+    "Every date literal form works wherever a date value goes: alone, in a range, after a \
+     comparison, and in an `IN` set. But a date matched *alone* is an exact instant, so \
+     `created:2024-06-15` means midnight precisely and matches nothing unless a document sits on \
+     that second. A day, a month or a year is a range: `created:[2024-06-15 TO 2024-06-16}`, \
+     `created:[2024 TO 2025}`.",
+    "A date literal containing a space must be quoted — `created:\"2024-06-15 12:00:00\"` — \
+     because an unquoted value ends at the first space, and the remainder is read as a new \
+     clause: `created:2024-06-15 12:00:00` reports `12` as an unknown field. Writing the `T` \
+     avoids the question: `created:2024-06-15T12:00:00`.",
+    "A date outside the range Tantivy represents is clamped to the nearest bound rather than \
+     refused, on the way in and in a query: before 1677-09-21 becomes that instant, after \
+     2262-04-11 becomes that one. So a far-future sentinel compares as though it were \
+     2262-04-11, and `created:>9999-01-01` matches nothing rather than erroring.",
 ];
 
 /// How ordering behaves, which the `sort` modifier and parameter share.
@@ -337,7 +345,8 @@ pub const INLINE_MODIFIERS: &[(&str, &str, &str)] = &[
     ),
     (
         "limit N",
-        "Cap the number of results.",
+        "Cap the number of results. `limit 0` is count-only: `total_hits` and no hits, skipping \
+         the key-value store, which is the cheapest way to ask how many documents match.",
         "title:rust limit 5",
     ),
     (
@@ -377,7 +386,9 @@ pub const FIELD_TYPES: &[(&str, &str)] = &[
     (TYPE_F64, "64-bit float."),
     (
         TYPE_DATE,
-        "Date or datetime. `YYYY-MM-DD` and RFC3339 are both accepted.",
+        "Date or datetime, given as RFC3339, a datetime with no zone, a date, a month, a year, \
+         a compact form such as `20240615` or `20240615143000`, or Unix epoch seconds. `/` and \
+         `.` may replace `-` throughout, and a value with no zone is read as UTC.",
     ),
     (TYPE_BOOLEAN, "`true` or `false`."),
     (TYPE_IP, "IPv4 or IPv6 address."),
