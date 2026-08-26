@@ -1904,6 +1904,41 @@ max_response_bytes = 900
     );
 }
 
+/// The same value with every `took_ms` flattened to zero, however deeply it is nested.
+///
+/// Tool results carry their payload as a JSON string inside the text block, so the durations to
+/// neutralise are inside that string rather than in the envelope — it is parsed, rewritten and
+/// re-serialized. Both sides of a comparison go through this, so key order stays consistent.
+fn without_durations(mut value: Value) -> Value {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if let Some(took) = map.get_mut("took_ms") {
+                    *took = json!(0);
+                }
+                for nested in map.values_mut() {
+                    strip(nested);
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(strip),
+            // A tool result's payload travels as text, so the durations are in here.
+            Value::String(text) => {
+                if let Ok(mut payload) = serde_json::from_str::<Value>(text)
+                    && payload.is_object()
+                {
+                    strip(&mut payload);
+                    if let Ok(rewritten) = serde_json::to_string(&payload) {
+                        *text = rewritten;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    strip(&mut value);
+    value
+}
+
 /// A tool result arrives in the same shape whatever revision the client speaks.
 ///
 /// This is the regression test for the bug that made every search look empty. The server used to
@@ -1941,8 +1976,13 @@ async fn a_tool_result_has_one_shape_whatever_revision_the_client_speaks() {
         let stated = node.rpc(call.clone()).await;
         let omitted = node.rpc_without_version(call).await;
 
+        // How long the search took is not part of its shape, and it is the one field two calls
+        // cannot agree on. Compared raw, this assertion failed intermittently on envelopes that
+        // were otherwise byte-identical — 10 ms against 1 ms — for a reason it does not exist to
+        // catch. Everything else still has to match exactly.
         assert_eq!(
-            stated, omitted,
+            without_durations(stated.clone()),
+            without_durations(omitted.clone()),
             "{tool} answered two revisions differently: {stated} vs {omitted}"
         );
 
