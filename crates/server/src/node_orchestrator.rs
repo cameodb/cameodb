@@ -823,6 +823,31 @@ fn transform_shadow_fields_recursive(
     }
 }
 
+/// The key a write is routed by, in the order of precedence that decides it.
+///
+/// Written out identically in three places before this existed — the engine fast path and both
+/// halves of the actor path — which is a rule that has to agree with itself to be a rule at all.
+/// Whatever routes a document has to reach the same shard every time, or the same id lands in
+/// two places and a search returns it twice.
+///
+/// 1. **The document's own routing field.** The schema names it, and it is the authority: a
+///    shadow index routes by the source's name for the key, a tenant index by the tenant.
+/// 2. **What the caller asked for.** Honoured only where the document does not answer, so a
+///    caller cannot move a document off the shard its schema puts it on.
+/// 3. **The id**, which is what the routing field resolves to on a default index anyway.
+/// 4. **A hash of the document**, so an unkeyed write is still deterministic rather than random.
+fn effective_routing_key(
+    schema: &IndexSchema,
+    id: &str,
+    routing_key: Option<String>,
+    doc: &JsonValue,
+) -> Option<String> {
+    extract_routing_value(doc, schema.get_routing_field())
+        .or(routing_key)
+        .or_else(|| (!id.is_empty()).then(|| id.to_string()))
+        .or_else(|| derive_routing_key_from_doc(doc))
+}
+
 /// Helper function to detect if an operation is a write operation
 fn is_write_operation(op: &ClientOp) -> bool {
     matches!(
@@ -2298,19 +2323,17 @@ impl OrchestratorEngine {
     /// document moves into the `WriteRequest`; on the path that defers, it moves into the
     /// reconstructed op. Neither copies.
     ///
-    /// `affinity_shard` is a pre-resolved shard hint from shard-affine dispatch.
-    /// When `Some`, `engine_write` skips the redundant ring lookup.
-    pub async fn execute(&self, op: ClientOp, affinity_shard: Option<Uuid>) -> WorkerOutcome {
+    /// The shard-affine hint deliberately does not reach here. It picked the *worker* in
+    /// `try_send_affine`, which is what it is for; letting it also pick the *shard* let a write
+    /// land somewhere the ring disagreed with. See the routing comment in `engine_write`.
+    pub async fn execute(&self, op: ClientOp) -> WorkerOutcome {
         match op {
             ClientOp::Write {
                 index,
                 id,
                 routing_key,
                 doc,
-            } => match self
-                .engine_write(&index, id, routing_key, doc, affinity_shard)
-                .await
-            {
+            } => match self.engine_write(&index, id, routing_key, doc).await {
                 Ok(WriteOutcome::Done(value)) => WorkerOutcome::Done(Ok(value)),
                 Ok(WriteOutcome::NeedsActor {
                     id,
@@ -2385,7 +2408,6 @@ impl OrchestratorEngine {
         id: String,
         routing_key: Option<String>,
         doc: JsonValue,
-        affinity_shard: Option<Uuid>,
     ) -> Result<WriteOutcome, OrchestratorError> {
         let shards = self.shards.load();
         if shards.is_empty() {
@@ -2425,25 +2447,25 @@ impl OrchestratorEngine {
                 }
 
                 // Schema-based routing
-                let routing_field = schema.get_routing_field().to_string();
-                let effective_routing_key = extract_routing_value(&doc, &routing_field)
-                    .or(routing_key)
-                    .or_else(|| (!id.is_empty()).then(|| id.clone()))
-                    .or_else(|| derive_routing_key_from_doc(&doc));
+                let effective_routing_key = effective_routing_key(&schema, &id, routing_key, &doc);
 
-                // Use pre-resolved shard from shard-affine dispatch when available,
-                // skipping the redundant ring lookup. Fall back to route_write when
-                // affinity is None (round-robin dispatch) or the hinted shard is gone.
-                let target = if let Some(hint) = affinity_shard {
-                    if shards.contains_key(&hint) {
-                        hint
-                    } else {
-                        // Shard was removed or reassigned — re-resolve via ring
-                        self.route_write(&effective_routing_key)?
-                    }
-                } else {
-                    self.route_write(&effective_routing_key)?
-                };
+                // The ring decides the shard, always — never the dispatch hint.
+                //
+                // The hint is `owner(routing_key.or(id))`, computed by the router before the
+                // schema was in hand, while the key above prefers the document's own routing
+                // field. On an index whose routing field is a real, non-key field those two
+                // disagree, and taking the hint used to put the document on a shard the ring
+                // does not believe owns it. Nothing looked wrong — searches are scatter-gather
+                // and found it anyway — until the same id was written again through a path with
+                // no hint (the actor-mailbox fallback when a worker queue is full), which routed
+                // by the ring, landed elsewhere, and left the id on two shards at once.
+                //
+                // What the hint is for is choosing the worker, and it still does that in
+                // `try_send_affine`: same dense shard ordinal, same co-located writer thread,
+                // same saved cross-core wakeup. This lookup is an xxh3 and a `BTreeMap` range
+                // descent, which is not a saving worth a class of divergence in front of a redb
+                // transaction.
+                let target = self.route_write(&effective_routing_key)?;
                 let shard = shards.get(&target).ok_or_else(|| {
                     OrchestratorError::Io(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
@@ -6403,9 +6425,10 @@ impl NodeOrchestrator {
             let counters = Arc::clone(&worker_stats[worker_id]);
             // What the worker does with a job it has admitted. Cloned per operation, so it
             // holds an `Arc` rather than borrowing the engine.
-            let run_op = move |op: Box<ClientOp>, affinity_shard: Option<Uuid>| {
+            let run_op = move |op: Box<ClientOp>, _affinity_shard: Option<Uuid>| {
                 let engine = Arc::clone(&engine);
-                async move { engine.execute(*op, affinity_shard).await }
+                // The hint chose this worker. It has no say in which shard the op reaches.
+                async move { engine.execute(*op).await }
             };
 
             if let Some(target_core) = pin_workers
@@ -7278,11 +7301,7 @@ impl NodeOrchestrator {
                 }
 
                 // Schema-based routing
-                let routing_field = schema.get_routing_field().to_string();
-                let effective_routing_key = extract_routing_value(&doc, &routing_field)
-                    .or(routing_key)
-                    .or_else(|| (!id.is_empty()).then(|| id.clone()))
-                    .or_else(|| derive_routing_key_from_doc(&doc));
+                let effective_routing_key = effective_routing_key(&schema, &id, routing_key, &doc);
 
                 let target = self.route_write(&effective_routing_key)?;
                 let shard = self.shards.get(&target).ok_or_else(|| {
@@ -7334,11 +7353,7 @@ impl NodeOrchestrator {
         }
 
         // Schema-based routing
-        let routing_field = schema_mut.get_routing_field().to_string();
-        let effective_routing_key = extract_routing_value(&doc, &routing_field)
-            .or(routing_key)
-            .or_else(|| (!id.is_empty()).then(|| id.clone()))
-            .or_else(|| derive_routing_key_from_doc(&doc));
+        let effective_routing_key = effective_routing_key(&schema_mut, &id, routing_key, &doc);
 
         let target = self.route_write(&effective_routing_key)?;
         let shard = self.shards.get(&target).ok_or_else(|| {
@@ -8584,6 +8599,65 @@ mod tests {
         }
     }
 
+    /// What a write is routed by, and in which order.
+    ///
+    /// The document's routing field outranks the caller's `routing_key`, and that precedence is
+    /// the whole reason the shard-affine hint may not choose the shard: the hint is computed from
+    /// `routing_key.or(id)` before any schema is in hand, so on an index that routes by a
+    /// non-key field the two disagree. Taking the hint used to put such a document on a shard the
+    /// ring did not own, and a later write of the same id through a hintless path put a second
+    /// copy on the shard that did. The hint now picks only the worker; this pins the rule it used
+    /// to be able to overrule.
+    #[test]
+    fn the_routing_key_comes_from_the_document_before_the_caller() {
+        let mut schema = IndexSchema::default();
+        schema.fields.insert(
+            "tenant_id".to_string(),
+            FieldDef::new("tenant_id".to_string(), TantivyFieldType::String),
+        );
+        schema
+            .set_routing_field("tenant_id".to_string())
+            .expect("the field exists");
+
+        let doc = json!({"id": "d1", "tenant_id": "acme", "title": "Dune"});
+
+        assert_eq!(
+            effective_routing_key(&schema, "d1", Some("d1".to_string()), &doc).as_deref(),
+            Some("acme"),
+            "the schema's routing field decides, even against an explicit routing_key"
+        );
+        assert_eq!(
+            effective_routing_key(&schema, "d1", None, &doc).as_deref(),
+            Some("acme"),
+            "and with no routing_key at all"
+        );
+
+        // A document that does not carry the routing field falls through the rest of the order.
+        let bare = json!({"id": "d1", "title": "Dune"});
+        assert_eq!(
+            effective_routing_key(&schema, "d1", Some("caller".to_string()), &bare).as_deref(),
+            Some("caller"),
+            "the caller's key is honoured only where the document is silent"
+        );
+        assert_eq!(
+            effective_routing_key(&schema, "d1", None, &bare).as_deref(),
+            Some("d1"),
+            "then the id"
+        );
+        assert!(
+            effective_routing_key(&schema, "", None, &bare).is_some(),
+            "and finally a hash of the document, so an unkeyed write is still deterministic"
+        );
+
+        // The default index routes by the key, which is what makes a delete-by-id unicast.
+        let default_schema = IndexSchema::default();
+        assert_eq!(
+            effective_routing_key(&default_schema, "d1", None, &bare).as_deref(),
+            Some("d1"),
+            "routing_field defaults to `id`"
+        );
+    }
+
     /// The engine cannot evolve a schema — it holds snapshots, not `&mut NodeOrchestrator`.
     /// What matters is that declining returns the *op*, not a sentinel error: the caller
     /// moved the op into the job and has nothing left to retry with otherwise. A write to an
@@ -8593,17 +8667,14 @@ mod tests {
         let engine = bare_engine();
 
         let outcome = engine
-            .execute(
-                ClientOp::BulkWrite {
-                    index: "books".to_string(),
-                    docs: vec![DocPayload {
-                        id: "b1".to_string(),
-                        routing_key: None,
-                        doc: json!({"title": "Dune"}),
-                    }],
-                },
-                None,
-            )
+            .execute(ClientOp::BulkWrite {
+                index: "books".to_string(),
+                docs: vec![DocPayload {
+                    id: "b1".to_string(),
+                    routing_key: None,
+                    doc: json!({"title": "Dune"}),
+                }],
+            })
             .await;
 
         match outcome {
@@ -9067,12 +9138,9 @@ mod tests {
         let engine = bare_engine();
 
         let outcome = engine
-            .execute(
-                ClientOp::GetConfig {
-                    index: "books".to_string(),
-                },
-                None,
-            )
+            .execute(ClientOp::GetConfig {
+                index: "books".to_string(),
+            })
             .await;
 
         assert!(
