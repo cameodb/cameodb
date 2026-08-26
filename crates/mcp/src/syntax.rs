@@ -295,7 +295,10 @@ pub const SHADOW_FIELD: &str = "A field marked `shadow` is the name the source d
      rather than as a prefix, so it matches nothing. Results come back the same way round: every \
      hit carries the identifier under the shadow name and has no `id` field, so name the shadow \
      field in `fields` or `return`. Asking for `id` there returns a document with nothing in it, \
-     and no warning that the field it named is one no document has.";
+     and no warning that the field it named is one no document has. Sorting by a shadow field \
+     works and orders by the identifier, which is the one thing an unindexed field can be used \
+     for beyond the key lookup: the order is approximate, as it is for any text field with no \
+     fast column, and `_approximate_sort` names the field you asked for rather than `id`.";
 
 /// Facts about querying that belong to no single operator.
 pub const RULES: &[&str] = &[
