@@ -36,7 +36,7 @@ on one.
 | 10 — Field projection | ✅ Done | — |
 | 11 — Read/write hot-path optimizations | ✅ Done | — |
 | 11.5 — Jemalloc memory management | ✅ Done | — |
-| 12 — MCP server integration | ◐ Partial | Streaming, semantic routing, the documentation pass, compliance tests and benchmarks, one field-description defect |
+| 12 — MCP server integration | ◐ Partial | Streaming, semantic routing, the documentation pass, compliance tests and benchmarks, two schema-listing defects, and the syntax reference's drift from the engine |
 | 13 — Thread-per-core & memory operations | ◐ Partial | Stage 2f.2 (CPU arenas) and 2f.3 (per-arena jemalloc stats) — both with the evidence against 2f.2 |
 | 14 — Security hardening | ◐ Partial | Stage C3 only (per-index role overrides); complexity caps deferred |
 | 15 — HA: reindex, replication, migration | 📋 Planned | All three stages |
@@ -88,8 +88,10 @@ first written down here, so the chronology stays visible under the cost ordering
 | [A1](#a1--mcp-streaming) | MCP streaming | 12 | 2026-08-15 | 📋 |
 | [A2](#a2--the-documentation-pass) | The documentation pass | 12 | 2026-08-15 | ◐ |
 | [A3](#a3--protocol-compliance-tests-and-agent-query-benchmarks) | Protocol-compliance tests and agent-query benchmarks | 12 | 2026-08-15 | ◐ |
-| [A4](#a4--id-should-stop-being-offered-for-projection-on-a-shadow-index) | `id` should stop being offered for projection on a shadow index | 12 | 2026-08-15 | 📋 |
+| [A4](#a4--what-a-schema-listing-says-about-id-for-projection-and-for-sorting) | What a schema listing says about `id`, for projection and for sorting | 12 | 2026-08-15 | 📋 |
 | [A5](#a5--semantic-routing) | Semantic routing | 12 | 2026-08-05 | 📋 |
+| [A6](#a6--the-syntax-reference-has-drifted-from-the-engine) | The syntax reference has drifted from the engine | 12 | 2026-08-27 | 📋 |
+| [A7](#a7--a-short-page-and-a-stale-count-say-nothing-about-why) | A short page and a stale count say nothing about why | 12 | 2026-08-27 | 📋 |
 | [B1](#b1--2f2--cpu-arenas-for-write--read--merge) | 2f.2 — CPU arenas for write / read / merge | 13 | 2026-08-08 | 📋 |
 | [B2](#b2--2f3--per-arena-jemalloc-stats) | 2f.3 — per-arena jemalloc stats | 13 | 2026-08-08 | 📋 |
 | [C1](#c1--per-index-role-overrides) | Per-index role overrides | 14 | 2026-07-30 | 📋 |
@@ -170,20 +172,112 @@ Also carried from Phase 12 step 9 and not yet started: **example datasets shaped
 workflows**, which is what a benchmark of agent query patterns needs to run against and what
 [A2](#a2--the-documentation-pass)'s index-design guidance would demonstrate.
 
-### A4 — `id` should stop being offered for projection on a shadow index
+### A4 — What a schema listing says about `id`, for projection and for sorting
 
-📋 **Planned.** On an index with a shadow field, `describe_fields` in `node_orchestrator.rs`
+📋 **Planned.** Two halves, both about the same field and both fixed in `describe_fields`.
+
+**Projection.** On an index with a shadow field, `describe_fields` in `node_orchestrator.rs`
 still describes `id` as an ordinary field although no document returns one — reconstruction
 answers with the shadow name *instead of* `id`. So `id` should stop being offered as something
 to *project*, while remaining something to query, and something to sort by. Opened by
-completion track item 3; do it with [A2](#a2--the-documentation-pass), since the fix and the
-prose describing field shapes land in the same place.
+completion track item 3.
+
+**Sorting**, found by the syntax audit on 2026-08-27. `id` is declared `STRING | STORED` and
+never `FAST`, so `sortable_fields` does not contain it and the listing reports
+`"sortable": false` — for `id` and for the shadow name that stands for it. Sorting by either is
+a supported contract with an end-to-end test (`a_shadow_field_sorts_by_the_key_it_stands_for`,
+0.3.2): `unsortable_sort_field` lets both through deliberately, and the result is an approximate
+text sort that reports itself as one. Meanwhile `SORT_RULES` tells an agent that `sortable` is
+how it knows what can be ordered. So the one field an agent most wants to sort a shadow index by
+is advertised as unsortable, and an agent that believes the guidance will never try it.
+
+The fix is to stop deriving that flag from the fast column alone and report what the engine
+actually accepts — which means `id`, a shadow name, and any text or string field are sortable
+*approximately*, and only a numeric or date field needs `fast`. Three states rather than two, or
+one flag plus the honesty about which kind of sort it is.
+
+Do it with [A2](#a2--the-documentation-pass), since the fix and the prose describing field
+shapes land in the same place.
 
 ### A5 — Semantic routing
 
 📋 **Planned.** Auto-select the best index or indexes for a query's intent, so an agent that
 does not know the catalogue does not have to enumerate it. Carried from Phase 12 step 5;
 nothing depends on it and nothing blocks it.
+
+### A6 — The syntax reference has drifted from the engine
+
+📋 **Planned**, audited 2026-08-27 against the query path. Cheapest item in this section and the
+one that changes most agent behaviour per line edited, so it goes first.
+
+**The machinery is sound and that is the point.** `crates/mcp/src/syntax.rs` is the single source
+rendered into four surfaces — the `search_index` description, the reference `validate_query`
+returns, the per-field and per-type `query_hint` on `describe_index` and `list_indexes`, and the
+README block that `crates/mcp/tests/readme_syntax.rs` holds equal to it. `guidance.rs` is
+test-pinned *not* to name query forms so the prose cannot drift either. Every correction below
+lands in one file and propagates. What has drifted is content, not structure.
+
+**Two entries are now false.**
+
+- **`_seq`.** The rule says it is "present in every index and technically queryable". Stage 7
+  retired it: a new index never declares it, `sort=_seq` is refused by name, and every listing
+  filters it — `describe_fields`, `sorted_field_names`, `searchable_fields`, `sortable_fields`.
+  The rule spends resident context telling an agent to ignore a field it cannot see. Delete it
+  rather than correct it.
+- **A refused sort is not described as a refusal.** 0.3.2 made a numeric or date field without a
+  fast column a `400` naming the field, decided before any shard is asked. `SORT_RULES` says only
+  that such a field "needs one to be sorted at all", which does not tell an agent whether the
+  request errors or degrades — and that is the distinction that decides whether it retries with a
+  different field or reads the results it got.
+
+**Two entries understate what the engine accepts**, which costs an agent a conversion it did not
+need to make, or a query form it avoided for no reason.
+
+- **Dates.** The reference says "`YYYY-MM-DD` and RFC3339 are both accepted".
+  `parse_date_str_to_tantivy` also takes naive datetimes (space or `T`, optional fractional
+  seconds, dash or slash separators), `YYYY/MM/DD`, `YYYY.MM.DD`, `YYYYMMDD`, compact
+  `YYYYMMDDHHMM` and `YYYYMMDDHHMMSS`, Unix epoch seconds at 10–11 digits, `YYYY-MM`, and a bare
+  `YYYY`. The query path runs literals through the same parser, so every one of those works in a
+  range, a comparison and an `IN` set: `created:2024` and `created:[2024-06 TO 2024-08]` are legal
+  and undocumented. A literal outside Tantivy's representable range is silently clamped, which is
+  also unstated.
+- **Count-only.** `limit 0` returns `total_hits` and skips the key-value store entirely — the
+  cheapest answer to "how many?" the engine has. It is documented only in the hand-written
+  `search_index` schema string, so it is missing from `INLINE_MODIFIERS` and therefore from the
+  README and from `validate_query`'s reference.
+
+**Two caveats are thinner than the behaviour.** A prefix that cannot be rewritten as a range
+matches the term exactly instead, and says so through the discarded-clause channel — which fails
+an MCP call, so the agent needs to recognise it. And a facet path cannot contain a space: the
+normalizer ends the path at whitespace or `)`.
+
+**Verified aligned, recorded so it is not re-audited:** the `id:value` fast-path caveat matches
+`parse_exact_id_query` condition for condition; a discarded clause does fail an MCP call;
+`offset` and its `offset + limit` bound; the approximate-sort mechanics and `_approximate_sort`;
+the shadow-field prose; `deny_unknown_fields` on every tool's arguments; the read-only hints and
+the deliberate absence of `outputSchema`. The read-only claims in `INSTRUCTIONS` and the
+orchestrator skill survive Phase 17 unchanged — deletion is a write, and no tool here writes.
+
+### A7 — A short page and a stale count say nothing about why
+
+📋 **Planned**, and new with [Phase 17](#phase-17--record-deletion--done): deletion made a
+transient state ordinary that used to be almost unreachable.
+
+A search counts matches in Tantivy and fetches bodies from redb. A delete removes the redb row at
+once and the Tantivy term at the next commit, so for the seconds in between a hit is counted and
+has no body — `total_hits` says five and four hits arrive. `annotate_search_response` explains an
+empty page, a page past the end and an approximate sort, and says nothing about
+`hits_returned < min(limit, total_hits − offset)`, which is exactly this case.
+
+The same divergence reaches the catalogue: `document_count` is Tantivy's `num_docs`, so
+`list_indexes`, `describe_index` and `get_catalog_stats` over-report a deleted document until the
+commit lands and the measurement cache expires.
+
+It matters because of what the session instructions promise — *"never present an incomplete
+result as a whole one"* — which an agent cannot honour on a signal it is not given. Two decisions
+to make rather than one fix: whether the short page earns a `_warning` note (cheap, and the
+existing channel), and whether a document count should be honest about uncommitted deletions at
+all, given that the alternative is reading a count from redb that no search agrees with.
 
 ---
 
@@ -848,7 +942,7 @@ that validates nothing, and in both cases the cause sat under the tool.
    shadow half kept because a shadow field names the identifier, which is answered from redb
    rather than the search index.
    Still open, and carried forward as
-   [A4](#a4--id-should-stop-being-offered-for-projection-on-a-shadow-index): on an index with a shadow field, `id` is described as
+   [A4](#a4--what-a-schema-listing-says-about-id-for-projection-and-for-sorting): on an index with a shadow field, `id` is described as
    an ordinary field although no document returns one — the identifier comes back under the shadow
    name — so `id` should stop being offered as something to *project*, while remaining something
    to query.
