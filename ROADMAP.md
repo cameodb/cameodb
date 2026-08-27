@@ -43,6 +43,7 @@ on one.
 | 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 4.2, Stage 3's deeper warming options, and the measurement on the reporting node |
 | 17 — Record deletion | ✅ Done | — |
 | 18 — Field types: Facet and JSON | ◐ Partial | J1, J2 and J3 — a facet field cannot be written to, a json field behaves exactly like a text one. The prerequisite (OB1, `fast` three-state on the wire) is done. No migration: neither type holds anything today |
+| 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | Code health — reviewed at 0.3.1 | 📋 Planned | Seven items, none behavioural |
 
 ## Reconciliation, 2026-08-26
@@ -113,6 +114,9 @@ first written down here, so the chronology stays visible under the cost ordering
 | [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
 | [J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly) | The flattening lane, and the reference that describes neither | 18 | 2026-08-27 | 📋 |
 | [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to — the evidence behind J1 | 18 | 2026-08-27 | 📋 |
+| [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
+| [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
+| [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
 
 ---
 
@@ -875,8 +879,9 @@ write. Neither blocks the item.
 
 **Explicit non-goal: facet counts.** `FacetCollector` is not used anywhere and is not part of
 making the type work. Counting documents per level is an aggregation feature, and CameoDB has no
-aggregations — which is worth saying plainly, because per-level counts are what most people mean
-when they ask for facets. What this item delivers is a hierarchical *filter*.
+aggregations — [Phase 19](#k-phase-19--field-metrics-min-and-max--planned) adds min and max on a
+fast field and nothing else — which is worth saying plainly, because per-level counts are what most
+people mean when they ask for facets. What this item delivers is a hierarchical *filter*.
 
 ### J2 — A JSON field should mean subfield addressing
 
@@ -1046,6 +1051,134 @@ literal, regexes are disabled, and the clause is dropped and reported — while 
 facet field works only because `normalize_facet_query` quotes it first. So a caller storing paths
 in a text field must write `f:"/electronics/phones"`. That is true today, undocumented today, and
 independent of everything else in this phase.
+
+---
+
+## K. Phase 19 — Field metrics: min and max 📋 Planned
+
+Scoped 2026-08-27, measured against tantivy 0.26.1 — the version already pinned — rather than read
+off its documentation. Opened because the question "what is the lowest and highest value of this
+field" has no answer in the API today, and it is not an exotic one.
+
+**What exists today, and it is not nothing.** A match-all sorted to one hit gives the exact
+extreme: `{"query": "*", "sort": {"field": "score", "order": "asc"}, "limit": 1}` for the minimum,
+`"desc"` for the maximum. Measured the same day: `*` is a match-all, `*:*` is **not** — its clause
+is dropped and reported — and a document missing the field sorts **last in both directions**, so it
+never comes back as a false extreme. Two searches, exact values, and the value arrives from redb
+rather than from a column, which matters below. What it costs is a full search per extreme, and it
+answers only for a field the index can sort on.
+
+**Why an aggregation instead.** Tantivy ships `tantivy::aggregation` in its default feature set, so
+this needs no dependency change: `MinAggregation` and `MaxAggregation` are requested as
+Elasticsearch-compatible JSON and return `SingleMetricResult { value: Option<f64> }`. It reads the
+fast column instead of collecting documents, and — the reason it is worth building rather than
+documenting the sort trick — it answers both extremes in one pass over the matching set, honouring
+the query, which the sort trick cannot do without two round trips.
+
+**Measured, 2026-08-27**, by running min and max over an in-RAM index of two documents. Everything
+in this table is a fact the implementation has to respect, and three of them are surprises:
+
+| Field | Result | What it means for this phase |
+|---|---|---|
+| `i64` with `FAST` | `{"lo": -5.0, "hi": 42.0}` | works, exact in this range |
+| `i64` without `FAST` | `InvalidArgument: 'Field "i64_plain" is not configured as fast field'` | the column is required, exactly as it is for a sort |
+| `f64` with `FAST` | `-1.6666666666666667` / `14.0` | works, and the native type is already `f64` |
+| `u64` above 2⁵³ | `9007199254740993` → **`9007199254740992.0`** | **lossy.** The result is an `f64`, so an integer past 2⁵³ comes back wrong |
+| `date` with `FAST` | `1.767225595e+18` | **nanoseconds since the epoch**, in an `f64` |
+| `text` without `FAST` | same not-a-fast-field error | refused, not answered |
+| `string` **with** `FAST` | `{"lo": null, "hi": null}` | **silently empty.** No error, no panic — a null that reads as "no data" |
+
+Three consequences follow, and they are the substance of the phase rather than details of it:
+
+- **The `f64` return is not a formality.** For `i64` and `u64` the exact value is in the column and
+  is destroyed on the way out. Either the phase documents the 2⁵³ boundary, or a caller who needs
+  an exact integer extreme is pointed at the sorted-top-1 path, which reads the value from redb and
+  is exact at any magnitude. Recommended: report the metric, document the boundary, and say plainly
+  which path is exact — inventing a lossless path through an API that returns `f64` is not
+  available.
+- **A date must be rendered, not returned.** `1.767225595e+18` is not an answer any caller wants,
+  and it is not a form CameoDB accepts back as a query literal. The metric on a date field must
+  come back as RFC3339, which is what every other date surface uses. The `f64` step at 2026 is
+  ~256 ns, so second and millisecond precision survive and nanosecond precision does not — worth
+  one sentence in the reference and no more.
+- **A fast text field must be refused by type**, not passed through. It returns `null`, which is
+  indistinguishable from "the field is empty" and is the worst of the three outcomes: the caller
+  gets a shaped, confident, meaningless answer. No panic risk was found here — checked
+  deliberately, because `panic = "abort"` in the release profile makes a thread panic a node
+  outage, and [OB2](#ob2--a-facet-field-cannot-be-written-to) records one such panic reached from a
+  document body. Tantivy's own conversion helper *does* panic on a non-numeric column type, so the
+  absence of a panic here is a property of how the metric resolves its accessor, not a guarantee to
+  rely on: refusing by type keeps it from being tested in production.
+
+### K1 — min and max in the engine
+
+📋 **Planned.** One entry point in `crates/storage`, alongside `search_documents` and sharing its
+query path so a metric is over the same matching set a search would return: query parsing, shadow
+mapping and clause discarding all behave identically or the two disagree about what the query
+meant.
+
+The guard is the interesting part, and it already has a shape to copy. `unsortable_sort_field` in
+`node_orchestrator.rs` refuses an unsortable sort **before any shard runs**, so the caller gets a
+`400` naming the field instead of an empty page assembled from per-shard failures. A metric on a
+field with no fast column is the same class of request and gets the same treatment, with the same
+`fast` / `sortable` distinction reported: `fast` is the declaration, the column is what the built
+index carries, and only the second one can answer. A metric on a field whose *type* cannot produce
+one — text, string, bytes, ip, facet — is refused there too, by type, before the null can be
+returned.
+
+Empty is `null`, not `0`: a query matching nothing has no minimum, and `0` is a value.
+
+### K2 — the merge across shards and nodes
+
+📋 **Planned**, and straightforward, which is worth stating explicitly so it is not over-built: the
+minimum of the shard minima is the minimum, the maximum of the maxima is the maximum, and `null`
+from a shard that matched nothing is skipped rather than treated as zero. Both levels of the
+existing fan-out need it — shards within a node, then nodes through the `RouterActor` — and both
+already merge search results, so the metric rides the same responses.
+
+Two things to keep in view. A partial failure has to stay visible: a metric merged from three
+shards when four answered is wrong in a way that no shape of the response reveals, so it follows
+the same `errors` convention the federated search already uses rather than being silently narrowed.
+And if this ever grows past min and max, merging final results stops being correct — an average of
+averages is not an average — at which point tantivy's own path is
+`DistributedAggregationCollector`, which returns `IntermediateAggregationResults` for merging and
+`into_final_result()` at the end. Min and max do not need it; anything with a denominator does.
+
+### K3 — the surface
+
+📋 **Planned.** The recommendation is a `metrics` block on the existing search request rather than a
+new endpoint, because the query, the routing, the authorization, the scatter-gather and the MCP
+search tool all already exist and a separate endpoint would duplicate every one of them:
+
+```json
+{"query": "status:active", "limit": 0, "metrics": {"min": ["score"], "max": ["score", "created"]}}
+```
+
+`limit: 0` is already count-only — `total_hits` and no hits, skipping the body fetches — so it
+composes into "aggregate only" with nothing new invented. The same request with a real limit
+returns hits and metrics together, which is the common case for a UI that shows a range alongside a
+page.
+
+What the surface work is: the request and response types, the client SDK and one CLI flag, then the
+MCP side — the tool schema, and a line in `syntax.rs`, which is the single source rendered into the
+`search_index` description, the `validate_query` reference, the per-type `query_hint` and the README
+block. An agent that cannot see the metric will not ask for it, so the reference entry is not
+optional polish; it is how the feature becomes reachable. `describe_index` already reports `fast`
+and `sortable` per field, and a metric is answerable exactly when `sortable` is true and the type is
+numeric or a date — so nothing new has to be advertised per field.
+
+**Non-goals, so the phase does not grow into a framework.** No average, sum, count-distinct,
+percentiles, histograms or terms aggregation, and no facet counts — the last is already a recorded
+non-goal of [J1](#j1--a-facet-field-cannot-be-written-to). Min and max are worth their surface
+because they answer a question about a field's range that nothing else in the API answers; the rest
+are a different phase with a different design question, and each one merges differently.
+
+**Rejected, and recorded so it is not proposed again.** `Column::min_value()` and `max_value()` in
+`tantivy-columnar` give whole-column extremes with no scan at all, which is tempting and wrong:
+they ignore the query and they ignore deleted documents, whose rows are removed from redb at once
+and from the index at the next commit. They answer "what did this column ever hold", not "what does
+this query match" — a different question, and one that gets more wrong the longer an index has been
+written to.
 
 ---
 
