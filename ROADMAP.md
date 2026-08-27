@@ -703,6 +703,15 @@ directions — a stored `"fast": true` or `false` reads back as `Some(..)`, and 
 resolved value emits the same concrete boolean any existing reader expects — so no schema on disk
 changes shape.
 
+**Fixing it is not retroactive**, which is worth knowing before it is fixed.
+`orch_create_config` normalizes *before* storing, so the forced `true` is already baked into every
+stored schema record and the column was built to match — record and index agree on every index
+that exists. So the fix changes nothing for existing data: it only lets a *new* index express
+`false`, and then that index gets no column. What follows for such an index is exactly the
+contract already documented — ranges and comparisons keep working, since those need no column, and
+a sort on the field is refused with a 400 naming it. The refusal becomes reachable rather than
+changing.
+
 Now a prerequisite rather than a curiosity: [J2](#j2--a-json-field-should-mean-subfield-addressing)
 defaults a `json` field to `fast` and lets a caller turn it off, which is precisely the override
 this defect eats.
@@ -871,6 +880,21 @@ currently"*. So `set_fast` is not the optional extra for sorting it first appear
 what a numeric comparison on a subfield requires, and comparisons are a large part of why anyone
 addresses a subfield at all. Treat the fast column as part of the feature rather than as a later
 stage.
+
+**And a JSON subfield is the exception, not the rule** — measured on a plain `i64` field built
+without a column, which is the state a declared `"fast": false` describes:
+
+| | plain numeric field | JSON subfield |
+|---|---|---|
+| `year:2020` / `blob.size:42` | works | works |
+| `year:>2020`, `[a TO b]`, `{a TO b}`, `[a TO *]` | **all work, no column** | **needs the column** |
+| sort | needs the column | needs the column |
+
+A range on an ordinary numeric field is answered from the inverted index and needs nothing; the
+reference already says so ("the `fast` flag is needed for sorting, not for ranges") and that is
+now verified. A range *inside* a JSON field is the case that does not, which is the whole argument
+for defaulting the column on here and the reason the reference will need an exception written into
+that caveat once J2 lands.
 
 **Decisions this item has to make, none of them forced by the code:**
 
