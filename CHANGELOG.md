@@ -72,7 +72,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is what it has always meant; the mistake that had to be impossible is the other
   direction, so an ids file that yields no ids is an error rather than a fall-through.
 
+### Changed
+
+- **The MCP query-syntax reference now describes the engine it documents.** It is a single source
+  rendered into four surfaces — the `search_index` description, the answer `validate_query`
+  returns, the per-field `query_hint` on `describe_index` and `list_indexes`, and the crate
+  README — so an agent builds queries from it rather than from experiment, and a wrong entry is
+  wrong in four places. An audit against the query path, then against a running node, found:
+
+  - **`_seq` was documented as "present in every index and technically queryable"**, having been
+    retired: a new index never declares it, every field listing filters the name, and a sort
+    naming it is refused. The rule is deleted, not corrected — an agent never sees the field.
+  - **Date literals were understated to two of about ten forms.** A datetime with no zone,
+    `YYYY/MM/DD`, `YYYY.MM.DD`, `YYYYMMDD`, `YYYYMMDDHHMM`, `YYYYMMDDHHMMSS`, Unix epoch
+    seconds, a bare month and a bare year all parse, and all work in a range, a comparison and an
+    `IN` set. Two rules came out of probing rather than reading: a bare date is an **exact
+    instant**, so `created:2024-06-15` means midnight and matches nothing unless a document sits
+    on that second — a day is a range — and a literal containing a space **must be quoted**, or
+    the value ends at the space and `12:00:00` is read as a new clause. A literal outside the
+    representable range is clamped rather than refused.
+  - **An unsortable field is a refusal, not a degraded result.** The rules said such a field
+    "needs a fast column to be sorted at all"; the request actually fails with `cannot sort by
+    'FIELD'` and the reason, before any shard runs. Boolean, ip, json and facet are the types
+    this catches in practice.
+  - **A shadow field can be sorted**, approximately, ordering by the identifier it stands for and
+    reporting `_approximate_sort` under the caller's own name. The shadow rule covered querying
+    and projection and was silent on the third thing the field is for.
+  - **`limit 0` — count-only, and the cheapest way to ask how many documents match** — was
+    documented only in a hand-written schema string, so it was missing from the reference and the
+    README.
+  - Two caveats gained the behaviour they were thinner than: a prefix the analyzer cannot reduce
+    to one term is matched as that term exactly and reported, and a facet path ends at the first
+    space.
+
 ### Fixed
+
+- **A search that could not return every document it counted said nothing about it.** A search
+  counts matches in the search index and fetches bodies from the key-value store, and a deletion
+  clears the store first — so between a delete and the next commit a match is counted and has no
+  body, and `total_hits` of five arrives with four hits. Reachable in ordinary operation only
+  since record deletion shipped, and invisible in the hits themselves, every one of which is
+  real. An MCP search now carries a `_warning` saying how many documents could not be read back
+  and why, on the one condition paging cannot explain: fewer hits than `min(limit, total_hits −
+  offset)`. Silent on a full page, a last page holding the remainder, an empty result and a
+  count-only query.
+
+  Document counts keep their number and gain a stated boundary. `document_count` is the count in
+  the search index as of its last commit, which is exactly what `total_hits` is — reading redb
+  instead would give a figure no search agrees with, and two honest-looking numbers that never
+  match is worse than one number with its meaning written down. `describe_index`, `list_indexes`
+  and `get_catalog_stats` now say so.
+
+- **Two tool descriptions shipped runs of nine and five literal spaces** after every paragraph
+  break. A `\` at the end of a line in a Rust string swallows the indentation that follows; a
+  `\n` written into the string keeps it. A tool description sits in the caller's context for the
+  whole session, and this is the one class of defect in it that no reviewer notices, because the
+  source looks right. A test now walks every description and refuses a run of two spaces outside
+  the syntax reference's own padded table.
 
 - **A document read once and then updated or deleted kept serving its previous body.** The
   per-index read cache in front of redb is populated by every search that hydrates a document

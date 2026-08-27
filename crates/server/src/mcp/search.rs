@@ -8,7 +8,7 @@ use cameodb_mcp::McpIndexSearchRequest;
 use crate::cluster_coordinator::OperationType;
 use crate::mcp::diagnostics::{
     approximate_sort_note, names_a_missing_field, paged_past_the_end, refuse_if_clauses_discarded,
-    with_valid_fields, zero_results_advice,
+    short_page_note, with_valid_fields, zero_results_advice,
 };
 use crate::mcp::schema::absent_index_reason;
 use crate::node_orchestrator::{APPROXIMATE_SORT_FIELD, ClientOp, SearchWindow, order_hit_blocks};
@@ -151,6 +151,18 @@ fn annotate_search_response(
             None if window.limit > 0 => notes.extend(zero_results_advice(query)),
             None => {}
         }
+    }
+
+    // A page that is short for a reason paging does not explain. Checked after the empty-page
+    // cases and before the ordering note, which is the order a reader needs: what is here, why
+    // some of it is not, then how far to trust the arrangement of what is.
+    if let Some(note) = short_page_note(
+        hits_returned as usize,
+        total_hits,
+        window.offset,
+        window.limit,
+    ) {
+        notes.push(note);
     }
 
     if let Some(field) = response
