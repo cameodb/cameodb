@@ -41,7 +41,7 @@ use serde_json::Value as JsonValue;
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, QueryParserError};
 use tantivy::schema::{
-    Document, FAST, Field, INDEXED, STORED, STRING, Schema, TEXT, Value as TantivyValue,
+    Document, FAST, Facet, Field, INDEXED, STORED, STRING, Schema, TEXT, Value as TantivyValue,
 };
 use tantivy::{DateTime, Index, IndexReader, IndexWriter, Order, doc};
 use thiserror::Error;
@@ -2327,6 +2327,12 @@ pub enum StoreError {
 
     #[error("invalid index name: {0}")]
     InvalidIndexName(String),
+
+    /// A document value the field's type cannot hold. The caller's fault, not the node's, which
+    /// is why it is its own variant rather than an `Io` — the HTTP layer answers `400` on the
+    /// `InvalidInput` kind and would otherwise call a bad document an internal error.
+    #[error("invalid value for field '{field}': {reason}")]
+    InvalidFieldValue { field: String, reason: String },
 }
 
 /// Resolve an index name to its on-disk directory under `indices_base`.
@@ -2351,6 +2357,34 @@ fn resolve_index_dir(indices_base: &Path, index: &str) -> Result<PathBuf, StoreE
     Ok(indices_base.join(index))
 }
 
+/// A facet path Tantivy will accept, or the reason it will not.
+///
+/// **The panic this exists to prevent is not hypothetical machinery.** `Facet: From<&str>` is
+/// `Facet::from_text(path).unwrap()`, and `from_text` refuses a value that is empty or does not
+/// begin with `/`. So `add_facet(field, "electronics/phones")` panics — on the shard's writer
+/// thread, from a document body, with `panic = "abort"` in the release profile, which takes the
+/// process down rather than the request.
+///
+/// Nothing reaches it today: the orchestrator's schema validation infers `Text` from every JSON
+/// string and refuses it against a declared `Facet` field, which is why facet fields cannot be
+/// written to at all (ROADMAP OB2). That refusal is load-bearing by accident, and it is the wrong
+/// thing to be relying on — the value is checked here, at the point it enters the index, so that
+/// making facets writable is a change to what is accepted rather than a new way to abort a node.
+///
+/// Delegates to `from_text` rather than checking the shape by hand: escaping (`\/` for a literal
+/// slash inside a segment) is its rule to define, and a second implementation of it here would be
+/// a second implementation to drift.
+fn facet_value(field: &str, value: &str) -> Result<Facet, StoreError> {
+    Facet::from_text(value).map_err(|_| StoreError::InvalidFieldValue {
+        field: field.to_string(),
+        reason: format!(
+            "'{value}' is not a facet path; a facet path begins with '/' and names its levels in \
+             order, as in '/electronics/phones'. Escape a literal slash inside a level as '\\/'"
+        ),
+    })
+}
+
+/// Write-Ahead Log operations for atomic dual-write.
 /// Write-Ahead Log operations for atomic dual-write.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOp {
@@ -3497,8 +3531,22 @@ impl HybridStore {
                 tantivy_doc.add_text(tantivy_field, &json_str);
             }
             TantivyFieldType::Facet => {
+                // Replay, not ingest: this value is already committed to redb, so refusing it
+                // here would fail the index open rather than the write that accepted it — and
+                // an index that cannot open serves nothing. The field is skipped and named; the
+                // rest of the document is indexed. Ingest refuses the same value outright,
+                // which is where a caller can act on it.
                 if let Some(s) = field_value.as_str() {
-                    tantivy_doc.add_facet(tantivy_field, s);
+                    match facet_value(&field_def.name, s) {
+                        Ok(facet) => tantivy_doc.add_facet(tantivy_field, facet),
+                        Err(err) => tracing::warn!(
+                            field = %field_def.name,
+                            value = %s,
+                            error = %err,
+                            "Replay skipped a stored value that is not a facet path; the \
+                             document is indexed without that field"
+                        ),
+                    }
                 }
             }
         }
@@ -4670,7 +4718,8 @@ impl HybridStore {
                                 }
                                 TantivyFieldType::Facet => {
                                     if let Some(s) = field_value.as_str() {
-                                        tantivy_doc.add_facet(*tantivy_field, &s);
+                                        tantivy_doc
+                                            .add_facet(*tantivy_field, facet_value(field_name, s)?);
                                     }
                                 }
                             }
@@ -6381,7 +6430,10 @@ impl HybridStore {
                                     }
                                     TantivyFieldType::Facet => {
                                         if let Some(s) = field_value.as_str() {
-                                            tantivy_doc.add_facet(*tantivy_field, &s);
+                                            tantivy_doc.add_facet(
+                                                *tantivy_field,
+                                                facet_value(field_name, s)?,
+                                            );
                                         }
                                     }
                                 }
@@ -7317,7 +7369,105 @@ mod tests {
         }
     }
 
-    /// A delete must not bring an index into existence.
+    /// A value that is not a facet path is refused, not handed to a constructor that panics.
+    ///
+    /// `Facet: From<&str>` unwraps `from_text`, so `add_facet(field, "electronics/phones")` panics
+    /// — on a shard's writer thread, from a document body, and with `panic = "abort"` in the
+    /// release profile that ends the process rather than the request. Nothing reaches it today
+    /// because the orchestrator refuses every value against a declared facet field, which makes
+    /// that refusal load-bearing by accident; this is the guard that means it does not have to be.
+    ///
+    /// Driven straight at the write paths, since the orchestrator is what currently stops a facet
+    /// value getting this far and the point is what happens when it does.
+    #[test]
+    fn a_value_that_is_not_a_facet_path_is_refused_rather_than_fatal() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+
+        let mut schema = IndexSchema::default();
+        schema.fields.insert(
+            "id".to_string(),
+            FieldDef::new("id".to_string(), TantivyFieldType::Text),
+        );
+        schema.fields.insert(
+            "cat".to_string(),
+            FieldDef::new("cat".to_string(), TantivyFieldType::Facet),
+        );
+        schema.normalize_after_deserialization();
+        store.store_schema_and_cache("shop", &schema).unwrap();
+
+        // Every shape `from_text` rejects: no leading slash, and empty.
+        for bad in ["electronics/phones", ""] {
+            let refused = store.apply_write(
+                "shop",
+                WalOp::Put {
+                    id: "x".to_string(),
+                    json_blob: Some(serde_json::json!({"id": "x", "cat": bad})),
+                },
+            );
+            match refused {
+                Err(StoreError::InvalidFieldValue { field, reason }) => {
+                    assert_eq!(field, "cat", "the refusal names the field");
+                    assert!(
+                        reason.contains("facet path") && reason.contains("/electronics/phones"),
+                        "and says what one looks like: {reason}"
+                    );
+                }
+                other => panic!("{bad:?} should be refused as a bad value, got {other:?}"),
+            }
+
+            // The batch path builds its documents separately and needs its own guard.
+            assert!(
+                matches!(
+                    store.apply_batch(
+                        "shop",
+                        vec![WalOp::Put {
+                            id: "y".to_string(),
+                            json_blob: Some(serde_json::json!({"id": "y", "cat": bad})),
+                        }]
+                    ),
+                    Err(StoreError::InvalidFieldValue { .. })
+                ),
+                "the batch path must refuse {bad:?} too"
+            );
+        }
+
+        // A real path is accepted on both, and the ancestors Tantivy indexes are what make a
+        // parent match its descendants.
+        store
+            .apply_write(
+                "shop",
+                WalOp::Put {
+                    id: "a".to_string(),
+                    json_blob: Some(serde_json::json!({"id": "a", "cat": "/electronics/phones"})),
+                },
+            )
+            .expect("a facet path is accepted");
+        store
+            .apply_batch(
+                "shop",
+                vec![WalOp::Put {
+                    id: "b".to_string(),
+                    json_blob: Some(
+                        serde_json::json!({"id": "b", "cat": "/electronics/phones/cases"}),
+                    ),
+                }],
+            )
+            .expect("and in a batch");
+        store.commit_index("shop").expect("commit");
+
+        let parent = store
+            .search_documents("shop", "cat:/electronics", 10, None)
+            .expect("search the parent path");
+        assert_eq!(
+            parent.hits.len(),
+            2,
+            "a parent path matches both descendants: {:?}",
+            parent.discarded
+        );
+    }
+
+    /// A delete must not bring an index into existence.    /// A delete must not bring an index into existence.
     ///
     /// The write path opens through `get_or_create_index`, which creates an index when it is
     /// absent — right for a put, which is a caller asking for the index, and wrong for a delete,

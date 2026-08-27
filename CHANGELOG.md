@@ -107,6 +107,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A facet value the type could not hold would have aborted the node.**
+  `Facet: From<&str>` is `Facet::from_text(path).unwrap()`, and a facet path must be non-empty and
+  begin with `/` — so `add_facet(field, "electronics/phones")` panics, on the shard's writer
+  thread, from a document body. With `panic = "abort"` in the release profile that ends the
+  process rather than the request.
+
+  Nothing reached it: the orchestrator infers `Text` from every JSON string and refuses it against
+  a declared `facet` field, which is why a facet field cannot be written to at all. That refusal
+  was load-bearing by accident, and the wrong thing to rely on — making facets writable would have
+  turned a dead field type into a way to stop a node from a document. The value is now checked
+  where it enters the index, on both write paths, and refused as a bad value naming the field and
+  what a facet path looks like. The replay path skips it with a warning instead: the value is
+  already committed, and failing an index open over one field of one document serves nobody.
+
+- **A malformed document answered `500 Internal server error`.** Every document-validation
+  refusal — a missing inner `id`, a value the declared type cannot hold — is the caller's fault,
+  and `500` is both wrong about that and an instruction to retry a request that cannot succeed.
+  They are now `400`s naming the field.
+
+  Two things were in the way. The write handlers classified errors by text rather than through
+  `AppError::from_route`, and `io::ErrorKind::InvalidData` — which every one of those refusals
+  carries — was not among the kinds it read as a bad request. Worse, `ask_orchestrator` formatted
+  the actor's error into a string and wrapped it in `io::Error::other`, flattening the kind to
+  `Other`, so *any* operation answered through the actor mailbox arrived at the HTTP layer
+  unclassifiable. It now returns the handler's own error unchanged and describes only the delivery
+  failures, which the handler cannot describe for itself.
+
 - **A search that could not return every document it counted said nothing about it.** A search
   counts matches in the search index and fetches bodies from the key-value store, and a deletion
   clears the store first — so between a delete and the next commit a match is counted and has no

@@ -60,7 +60,19 @@ impl AppError {
         let is_bad_request = match &err {
             OrchestratorError::UnsortableField { .. }
             | OrchestratorError::UnrunnableQuery { .. } => true,
-            OrchestratorError::Io(io) => io.kind() == std::io::ErrorKind::InvalidInput,
+            // `InvalidData` as well as `InvalidInput`: every producer of the former is a
+            // document the caller sent that the schema refuses — a missing inner `id`, a type
+            // that does not match a declared field. Those answered `500 Internal server error`,
+            // which is both wrong about whose fault it is and an instruction to retry something
+            // that cannot succeed.
+            OrchestratorError::Io(io) => matches!(
+                io.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
+            ),
+            // A value the field's type cannot hold is the document's fault too, and the text
+            // classification below would read "invalid value for field" as neither a 404 nor a
+            // parse error and answer 500.
+            OrchestratorError::Storage(storage::StoreError::InvalidFieldValue { .. }) => true,
             _ => false,
         };
 

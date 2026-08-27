@@ -46,7 +46,8 @@ pub(super) async fn write_handler(
     let result = state
         .router
         .route_and_handle(client_op, effective_routing_key, OperationType::Write)
-        .await?;
+        .await
+        .map_err(AppError::from_route)?;
     Ok(Json(result))
 }
 
@@ -173,7 +174,8 @@ pub(super) async fn bulk_write_handler(
     let result = state
         .router
         .route_and_handle(client_op, routing_hint, OperationType::Write)
-        .await?;
+        .await
+        .map_err(AppError::from_route)?;
 
     // Debug: Log response size to identify potential serialization issues
     let response_str = serde_json::to_string(&result).unwrap_or_default();
