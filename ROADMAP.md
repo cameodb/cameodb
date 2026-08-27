@@ -108,11 +108,11 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F2](#f2--an-open-loop-load-generator) | An open-loop load generator | — | 2026-08-10 | 📋 |
 | [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator | — | 2026-08-10 | 📋 |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
+| [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — **lands before J2**, whose override it would otherwise eat | 18 | 2026-08-13 | 📋 |
 | [J1](#j1--a-facet-field-cannot-be-written-to) | A facet field cannot be written to | 18 | 2026-08-27 | 📋 |
 | [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
 | [J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly) | The flattening lane, and the reference that describes neither | 18 | 2026-08-27 | 📋 |
-| [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — mechanism found, and a J2 prerequisite | — | 2026-08-13 | 📋 |
-| [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to | — | 2026-08-27 | 📋 |
+| [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to — the evidence behind J1 | 18 | 2026-08-27 | 📋 |
 
 ---
 
@@ -674,12 +674,20 @@ so the next change to how a sorted search counts its total touches one place.
 
 ---
 
-## H. Observed, not yet scoped
+## H. Observed
+
+Defects found outside a phase's own work. An entry keeps its evidence here even once it is
+scoped — OB1 is the first item of Phase 18 and OB2 is what J1 fixes — because the observation and
+the plan answer different questions, and splitting one across two places loses the reason it was
+opened.
 
 ### OB1 — `fast: false` is not honoured on a numeric field
 
 📋 **Open**, observed 2026-08-13 and filed here 2026-08-26; it had been carried outside the
-repository until now.
+repository until now. **Scheduled 2026-08-27 as the first item of
+[Phase 18](#j-phase-18--field-types-facet-and-json--planned)**, ahead of
+[J2](#j2--a-json-field-should-mean-subfield-addressing), whose `fast` override it would otherwise
+eat. The evidence stays here; the ordering is there.
 
 A `PUT /api/{index}/_config` declaring an i64 field with `"fast": false` reads back from
 `GET /api/{index}/_config` as `"fast": true`. **Reproduced 2026-08-27** on a running node while
@@ -773,6 +781,16 @@ their names promise. `facet` cannot be written to at all. `json` can, and behave
 `text` — same terms, same matches, no subfield addressing. Both are one write-path change away
 from working, and neither change is only a fix: each alters what an index means, which is why they
 are planned rather than patched.
+
+**The order is fixed, and one item is a prerequisite rather than a preference.**
+[OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) lands first: J2 defaults a `json` field
+to `fast` and lets a schema turn it off, and OB1 is the defect that eats exactly that override —
+an unconditional assignment over a `bool` that cannot express "unset". Building J2's default the
+way the numeric types build theirs would reproduce it, and the promised override would silently not
+exist. Then J1, which is independent and small; then J2; then J3, which describes what the first
+three did.
+
+    OB1 fix the override  →  J1 facet writable  →  J2 json subfields  →  J3 the reference
 
 **Neither needs a migration**, which is what keeps the phase small. Nothing can be written to a
 `facet` field, and a `json` field expresses nothing a `text` field does not, so there is no
@@ -939,8 +957,9 @@ that caveat once J2 lands.
   `fast` the way the numeric types do it is what causes that defect: an unconditional assignment
   in `normalize_after_deserialization`, over a `bool` that cannot express "unset". Implemented the
   same way here, a caller's `"fast": false` on a json field would be silently overwritten and the
-  override this item promises would not exist. So OB1's fix — three-state on the wire — comes
-  first, or lands with this.
+  override this item promises would not exist. OB1's fix — three-state on the wire — **lands
+  before this item**, not alongside it: it is a change to how every field's `fast` is resolved, and
+  landing it under a new field type would mean debugging both at once.
 
   `sortable` would then have to report per path rather than per field, which is a listing question
   [A4](#a4--what-a-schema-listing-says-about-id-for-projection-and-for-sorting) already has open.
