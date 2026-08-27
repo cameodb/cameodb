@@ -111,7 +111,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [J1](#j1--a-facet-field-cannot-be-written-to) | A facet field cannot be written to | 18 | 2026-08-27 | 📋 |
 | [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
 | [J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly) | The flattening lane, and the reference that describes neither | 18 | 2026-08-27 | 📋 |
-| [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field | — | 2026-08-13 | 📋 |
+| [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — mechanism found, and a J2 prerequisite | — | 2026-08-13 | 📋 |
 | [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to | — | 2026-08-27 | 📋 |
 
 ---
@@ -686,11 +686,26 @@ A `PUT /api/{index}/_config` declaring an i64 field with `"fast": false` reads b
 auditing the sort rules, and it has a consequence worth recording: because every numeric and date
 field is forced fast, the refusal `unsortable_sort_field` exists to deliver — "a numeric field
 must be declared fast to sort" — is unreachable for those types. What reaches it in practice is a
-boolean, ip, json or facet field. Mechanism still unconfirmed. `FieldDef::new` forces
-`fast` for `I64` / `U64` / `F64` / `Date`, so the likely cause is a write path re-deriving a
-declared field through it rather than preserving what the caller declared — but the one
-schema-evolution call site that reaches `FieldDef::new` only adds fields not already present,
-so the path has to be found before the fix is written.
+boolean, ip, json or facet field.
+
+**Mechanism confirmed 2026-08-27**, and it is not `FieldDef::new` — it is
+`normalize_after_deserialization`, which ends its numeric arm with an unconditional
+`field_def.fast = true;` under a comment reading "should be fast by default for range queries".
+A default is what it meant; an assignment is what it is, and it runs on every deserialization, so
+a declared `false` is overwritten every time the schema is read.
+
+**The reason it cannot simply be made conditional** is one line above it in the struct:
+`#[serde(default)] pub fast: bool`. A `bool` with a serde default cannot tell an absent key from
+an explicit `false` — both arrive as `false` — so there is nothing for a condition to test. The
+fix is therefore structural rather than a one-word edit: `fast` has to be three-state on the wire,
+`Option<bool>`, resolved to a concrete value once during normalization. That is compatible in both
+directions — a stored `"fast": true` or `false` reads back as `Some(..)`, and serializing a
+resolved value emits the same concrete boolean any existing reader expects — so no schema on disk
+changes shape.
+
+Now a prerequisite rather than a curiosity: [J2](#j2--a-json-field-should-mean-subfield-addressing)
+defaults a `json` field to `fast` and lets a caller turn it off, which is precisely the override
+this defect eats.
 
 Not an MCP defect, and not a sort defect: the engine's fast-column guard refuses a genuinely
 non-fast sort correctly. What is wrong is that the config says one thing and the index does
@@ -887,8 +902,24 @@ stage.
 - **Indexing options for the string leaves** — `set_indexing_options` takes the same
   `TextFieldIndexing` a text field does, so tokenizer and position choices apply per JSON field
   rather than per leaf.
-- **`set_fast`**, which is what would let a subfield be sorted on, and which `sortable` would then
-  have to report for a path rather than a field.
+- **`set_fast` — decided: on by default, and a caller may turn it off.** A comparison on a
+  subfield needs the column, and offering subfield addressing without comparisons would be
+  offering half a feature, so the default carries the cost and a schema that does not want it says
+  so. Two consequences to keep in view. It is a real cost: a fast JSON field builds columnar
+  storage for *every leaf* the documents contain, which for a wide or deep blob is not a rounding
+  error against the same data in a text field. And `set_fast` takes an optional tokenizer name for
+  the string leaves — `None` keeps the untokenized value, which is what an ordering wants —
+  whereas numeric leaves need no such choice.
+
+  **This depends on [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field).** Defaulting
+  `fast` the way the numeric types do it is what causes that defect: an unconditional assignment
+  in `normalize_after_deserialization`, over a `bool` that cannot express "unset". Implemented the
+  same way here, a caller's `"fast": false` on a json field would be silently overwritten and the
+  override this item promises would not exist. So OB1's fix — three-state on the wire — comes
+  first, or lands with this.
+
+  `sortable` would then have to report per path rather than per field, which is a listing question
+  [A4](#a4--what-a-schema-listing-says-about-id-for-projection-and-for-sorting) already has open.
 
 **The two term spaces are disjoint, and that decides the migration** — measured by writing one
 document each way into the same field and querying both:
