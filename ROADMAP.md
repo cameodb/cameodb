@@ -840,7 +840,11 @@ rejected and reported as a discarded clause, so a caller learns. On a `json` fie
 hits with no note — indistinguishable from "nothing matched". An agent reading that reports an
 empty answer to a question the index could have answered.
 
-**The change** is `add_object` with the actual map instead of `add_text` with its serialization.
+**The change is one arm of the write path**, and only that one. Each declared type has its own
+arm; the `Json` arm calls `add_text` with a serialization and becomes `add_object` with the map.
+The `Text` arm — which serializes a non-string value and indexes it as prose — is untouched, so a
+JSON value in a `text` field behaves in every respect as it does today. Nothing about this change
+reaches a field the caller declared `text`.
 Each leaf is then indexed under its own path and by its own JSON type — measured on the term
 dictionary, `{"color":"red","size":42,"nested":{"brand":"acme"}}` writes `color·s red`,
 `nested|brand·s acme` and `size·i 42`, where `|` separates path levels and `·s` / `·i` mark the
@@ -855,13 +859,31 @@ stage.
 
 **Decisions this item has to make, none of them forced by the code:**
 
-- **`expand_dots`.** With it, `{"k8s.node.id": 5}` indexes as though it were nested, and
-  `k8s.node.id:5` finds it. Without it, a literal dot inside a key must be escaped. CameoDB
-  already documents a dotted *field name* as written unescaped (`k8s.node:worker-1`), and
-  `find_field` tries the whole path as a field name **before** splitting, so the two coexist and
-  the field name wins. The one genuine ambiguity is an index holding both a `json` field `k8s` and
-  a real field `k8s.node`; the resolution order decides it silently, and the reference will have
-  to say which way.
+- **`expand_dots`, and it is narrower than it first looked.** A dotted query path is split on the
+  dots *whatever* this option says, so `k8s.node.id:5` already reaches a genuinely nested
+  `{"k8s": {"node": {"id": 5}}}` without it. What the option changes is the *document* side: a
+  flat key that itself contains dots. Measured on two documents in one field —
+  `nested = {"node": {"id": 5}}` and `flatkey = {"node.id": 7}`:
+
+  | Query | `expand_dots` off | `expand_dots` on |
+  |---|---|---|
+  | `k8s.node.id:5` | nested | nested |
+  | `k8s.node.id:7` | — | flatkey |
+  | `k8s.node\.id:7` | flatkey | flatkey |
+  | `k8s.node\.id:5` | — | nested |
+
+  So off, the two shapes stay distinguishable and a literal dotted key is addressed by escaping;
+  on, they collapse — every form finds both. That collapse is the ambiguity Tantivy warns about,
+  and whether it is a cost depends entirely on the data: it is a loss only if a caller needs to
+  tell a dotted key from nesting, and a gain if they never should have to. **Flat dotted keys are
+  what log and telemetry shippers emit**, which is the case that wants it on.
+- **A dotted field name shadows a JSON path, and that is the right way round.** Measured on an
+  index holding a `json` field `k8s` *and* a text field literally named `k8s.node.id`:
+  `k8s.node.id:5` answers from the text field, and the JSON path needs `k8s.node\.id:5`. So the
+  rule CameoDB already documents — a dotted field name is written unescaped — keeps working and
+  keeps precedence, and no existing index changes meaning. What it costs is that a dotted field
+  name prefixed by a JSON field's name makes that part of the JSON unreachable except by escaping,
+  which is a schema-design rule to state rather than a defect to fix.
 - **Indexing options for the string leaves** — `set_indexing_options` takes the same
   `TextFieldIndexing` a text field does, so tokenizer and position choices apply per JSON field
   rather than per leaf.
