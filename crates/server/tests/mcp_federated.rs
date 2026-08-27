@@ -100,9 +100,10 @@ max_shards_per_node = 1
 
     /// An index whose `created` field is a date the engine can sort on.
     ///
-    /// `fast` is set explicitly: it defaults to false over the wire, and a sort on a date field
-    /// that is not FAST does not order the results — which would make the sort tests pass for
-    /// the wrong reason.
+    /// `fast` is set explicitly rather than left to the default. A date field defaults to fast, so
+    /// this changes nothing today; it is written out because a sort on a date field without the
+    /// column does not order the results, and a test that relied on the default would pass for the
+    /// wrong reason if the default ever moved.
     async fn create_index(&self, index: &str) {
         let status = http()
             .put(format!("{}/api/{index}/_config", self.url))

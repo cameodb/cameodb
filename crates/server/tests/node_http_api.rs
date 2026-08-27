@@ -1515,8 +1515,12 @@ async fn a_numeric_field_can_decline_the_fast_column_it_gets_by_default() {
     let (status, body) =
         post_json(&node, "/api/declined/search", json!({"query": "rank:>=1"})).await;
     assert_eq!(status, 200, "a range on a field with no column: {body}");
+    // Sorted here, not asserted in the order it arrived: the query names no sort, so the shards
+    // merge in whatever order they answer in and the sequence is not part of the contract.
+    let mut matched = hit_ids(&body);
+    matched.sort();
     assert_eq!(
-        hit_ids(&body),
+        matched,
         vec!["d001".to_string(), "d002".to_string()],
         "the range is answered in full: {body}"
     );
@@ -1538,6 +1542,89 @@ async fn a_numeric_field_can_decline_the_fast_column_it_gets_by_default() {
             .contains("rank"),
         "the refusal names the field: {body}"
     );
+}
+
+/// Declaring `fast` on a type that can carry no column is refused as a sort, not answered empty.
+///
+/// The index builder adds a boolean, bytes, ip, json or facet field without reading `fast` at all,
+/// so a declared `true` on one had no column behind it — and the guard that refuses an unsortable
+/// sort reads the declaration, so it waved these through. Measured before the fix: `200`,
+/// `hits: []`, `total_hits: 0`, and the reason only in per-shard `errors` — the exact failure that
+/// guard exists to prevent, reached through a declaration the build path ignores.
+///
+/// Both halves are asserted here, because either one alone leaves the caller misinformed: the
+/// config has to stop reporting a column that was never built, and the sort has to be refused with
+/// a reason the caller can act on rather than one telling them to declare a flag that changes
+/// nothing.
+#[tokio::test]
+async fn a_type_that_can_carry_no_column_is_refused_rather_than_answered_empty() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    client
+        .put_index_config(
+            "unsortable",
+            &json!({
+                "fields": {
+                    "id": {"field_type": "text", "indexed": true, "stored": true},
+                    "body": {"field_type": "text", "indexed": true, "stored": true},
+                    "flag": {"field_type": "boolean", "indexed": true, "fast": true},
+                    "addr": {"field_type": "ip", "indexed": true, "fast": true}
+                }
+            }),
+        )
+        .await
+        .expect("put schema");
+    client
+        .bulk_index(
+            "unsortable",
+            &[json!({"id": "d1", "doc": {
+                "id": "d1", "body": "page", "flag": true, "addr": "10.0.0.1"}})],
+        )
+        .await
+        .expect("write");
+    client
+        .admin_index_commit("unsortable")
+        .await
+        .expect("commit");
+
+    let config = get_json(&node, "/api/unsortable/_config").await;
+    let field = |name: &str| {
+        config["fields"]
+            .as_array()
+            .and_then(|f| f.iter().find(|f| f["name"] == name))
+            .cloned()
+            .unwrap_or_else(|| panic!("field {name} in {config}"))
+    };
+
+    for name in ["flag", "addr"] {
+        assert_eq!(
+            field(name)["fast"],
+            json!(false),
+            "the config must not report a column the index never builds for {name}"
+        );
+        assert_eq!(field(name)["sortable"], json!(false));
+
+        let (status, body) = post_json(
+            &node,
+            "/api/unsortable/search",
+            json!({"query": "body:page", "sort": {"field": name, "order": "asc"}}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "sorting by '{name}' must be refused before any shard runs: {body}"
+        );
+        let detail = body["details"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains(name),
+            "the refusal names the field: {detail}"
+        );
+        assert!(
+            detail.contains("cannot give it one"),
+            "and says the declaration cannot fix it, rather than asking for one: {detail}"
+        );
+    }
 }
 
 /// Sorting on a text field with no fast column says so in the response.

@@ -1577,14 +1577,40 @@ impl FieldDef {
         )
     }
 
+    /// Whether a field of this type can carry a fast column at all.
+    ///
+    /// Five types cannot, and the reason is in the index builder rather than in Tantivy: a
+    /// boolean, bytes, ip, json or facet field is added with `add_bool_field`, `add_bytes_field`,
+    /// `add_ip_addr_field`, `add_json_field` and `add_facet_field`, none of which consults `fast`
+    /// — so a schema asking for a column on one gets no column, and a `fast: true` that reads back
+    /// as `true` is a claim the index cannot honour. Text and string can: `set_fast` on them builds
+    /// the string column an exact alphabetical sort orders on.
+    ///
+    /// A declaration this returns `false` for is not refused at the door — a schema is a
+    /// description of intent and a caller may well be declaring a field for a rebuild — it is
+    /// resolved to `false`, so what the config reports and what the index does are the same thing.
+    pub fn can_be_fast(field_type: &TantivyFieldType) -> bool {
+        matches!(
+            field_type,
+            TantivyFieldType::Text
+                | TantivyFieldType::String
+                | TantivyFieldType::I64
+                | TantivyFieldType::U64
+                | TantivyFieldType::F64
+                | TantivyFieldType::Date
+        )
+    }
+
     /// Resolved `fast`: what the caller declared, or the default for the type when they declared
     /// nothing.
     ///
     /// This is the only correct way to read `fast`, because [`FieldDef::fast`] is three-state and
-    /// `None` does not mean `false`. A shadow field is never fast whatever it says: it is not
-    /// added to the Tantivy index at all, so there is no column to build.
+    /// `None` does not mean `false`. Two kinds of field are never fast whatever they declare, and
+    /// for the same reason — there is no column behind the declaration. A shadow field is not added
+    /// to the Tantivy index at all, and a type [`FieldDef::can_be_fast`] rejects is added without
+    /// its `fast` ever being read.
     pub fn is_fast(&self) -> bool {
-        if self.is_shadow {
+        if self.is_shadow || !Self::can_be_fast(&self.field_type) {
             return false;
         }
         self.fast
