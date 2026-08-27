@@ -28,7 +28,7 @@ fn config(path: std::path::PathBuf) -> StorageConfig {
 
 fn field(field_type: TantivyFieldType, fast: bool, indexed: bool) -> FieldDef {
     let mut def = FieldDef::new("placeholder".to_string(), field_type);
-    def.fast = fast;
+    def.fast = Some(fast);
     def.indexed = indexed;
     def.stored = false;
     def

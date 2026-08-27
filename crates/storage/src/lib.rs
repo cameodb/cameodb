@@ -1510,8 +1510,20 @@ pub struct FieldDef {
     pub indexed: bool,
     #[serde(default)]
     pub stored: bool,
-    #[serde(default)]
-    pub fast: bool,
+    /// Whether this field gets a Tantivy *fast column* — the columnar copy a sort orders on.
+    ///
+    /// Three-state on purpose. `None` means the caller said nothing and the default for the type
+    /// applies; `Some(false)` means a caller said no. A plain `bool` with a serde default cannot
+    /// tell those apart — an absent key and an explicit `false` both arrive as `false` — which is
+    /// how a declared `"fast": false` on a numeric field came to be overwritten every time the
+    /// schema was read.
+    ///
+    /// Read it through [`FieldDef::is_fast`] rather than directly, which resolves the default;
+    /// [`IndexSchema::normalize_after_deserialization`] materializes it into `Some(..)` so a
+    /// stored schema always names a concrete boolean and every reader of the serialised form
+    /// sees the same shape it saw before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
     /// Shadow field flag: true if this field preserves original field name when ID is copied to canonical "id" field
     /// Shadow fields are NOT indexed and NOT stored in Tantivy, but preserved in schema for query mapping
     /// Default is false for backward compatibility with existing schemas
@@ -1535,13 +1547,7 @@ impl FieldDef {
         // Only ID field should be stored in Tantivy
         // All other fields are indexed-only, complete data comes from redb
         let stored = name == "id";
-        let fast = matches!(
-            field_type,
-            TantivyFieldType::I64
-                | TantivyFieldType::U64
-                | TantivyFieldType::F64
-                | TantivyFieldType::Date
-        );
+        let fast = Some(Self::fast_by_default(&field_type));
 
         Self {
             name,
@@ -1554,6 +1560,35 @@ impl FieldDef {
             tokenizer: None,           // Will be set when creating from actual Tantivy schema
             index_record_option: None, // Will be set when creating from actual Tantivy schema
         }
+    }
+
+    /// Whether a field of this type gets a fast column when nothing says either way.
+    ///
+    /// Numeric and date fields do: a range or a sort on them is the ordinary reason to declare
+    /// one, and the column is what a sort orders on. Everything else does not — a text field
+    /// pays for a full copy of every value, so it gets a column only when asked.
+    pub fn fast_by_default(field_type: &TantivyFieldType) -> bool {
+        matches!(
+            field_type,
+            TantivyFieldType::I64
+                | TantivyFieldType::U64
+                | TantivyFieldType::F64
+                | TantivyFieldType::Date
+        )
+    }
+
+    /// Resolved `fast`: what the caller declared, or the default for the type when they declared
+    /// nothing.
+    ///
+    /// This is the only correct way to read `fast`, because [`FieldDef::fast`] is three-state and
+    /// `None` does not mean `false`. A shadow field is never fast whatever it says: it is not
+    /// added to the Tantivy index at all, so there is no column to build.
+    pub fn is_fast(&self) -> bool {
+        if self.is_shadow {
+            return false;
+        }
+        self.fast
+            .unwrap_or_else(|| Self::fast_by_default(&self.field_type))
     }
 
     /// Infer field type from JSON value for schema evolution
@@ -1570,13 +1605,7 @@ impl FieldDef {
         let field_type = Self::infer_type_from_value(value);
         // Only ID field should be stored in Tantivy
         let stored = name == "id";
-        let fast = matches!(
-            field_type,
-            TantivyFieldType::I64
-                | TantivyFieldType::U64
-                | TantivyFieldType::F64
-                | TantivyFieldType::Date
-        );
+        let fast = Some(Self::fast_by_default(&field_type));
 
         Self {
             name,
@@ -1597,10 +1626,10 @@ impl FieldDef {
         Self {
             name,
             field_type,
-            indexed: false,  // Shadow fields are never indexed
-            stored: false,   // Shadow fields are never stored
-            fast: false,     // Shadow fields don't need fast access
-            is_shadow: true, // This is a shadow field
+            indexed: false,    // Shadow fields are never indexed
+            stored: false,     // Shadow fields are never stored
+            fast: Some(false), // Shadow fields don't need fast access
+            is_shadow: true,   // This is a shadow field
             description: None,
             tokenizer: None,
             index_record_option: None,
@@ -1885,6 +1914,19 @@ impl IndexSchema {
             }
             normalize_description(&mut field_def.description);
 
+            // `fast` is three-state on the wire, and this is where it stops being. `None` — the
+            // caller said nothing — becomes the default for the type; a value the caller did
+            // declare, `true` or `false`, is left exactly as it arrived. Resolved before the
+            // arms below so no arm can reach an unresolved value, and before the `id` and
+            // shadow shortcuts so every field in a normalized schema names a concrete boolean.
+            //
+            // The numeric arm used to end with an unconditional `field_def.fast = true;`. It
+            // read as a default and behaved as an assignment, so a declared `false` was
+            // overwritten on every deserialization — the schema said one thing and the index
+            // did another.
+            let resolved_fast = field_def.is_fast();
+            field_def.fast = Some(resolved_fast);
+
             // The 'id' field has fixed Tantivy attributes regardless of user input
             if key == "id" {
                 field_def.indexed = true;
@@ -1920,13 +1962,8 @@ impl IndexSchema {
                         field_def.index_record_option = Some("Basic".to_string());
                     }
                 }
-                TantivyFieldType::I64
-                | TantivyFieldType::U64
-                | TantivyFieldType::F64
-                | TantivyFieldType::Date => {
-                    // Numeric and date types should be fast by default for range queries
-                    field_def.fast = true;
-                }
+                // Numeric, date and the remaining types need no enrichment here. Their one
+                // default — the fast column — is resolved above, from `fast_by_default`.
                 _ => {}
             }
         }
@@ -3666,41 +3703,41 @@ impl HybridStore {
                     // sort candidates by relevance and reorder them afterwards — an ordering that
                     // is only approximately right and cannot be paged through. See the sort
                     // branch there.
-                    if field_def.fast {
+                    if field_def.is_fast() {
                         options = options.set_fast(None);
                     }
                     schema_builder.add_text_field(name, options)
                 }
                 TantivyFieldType::String => {
-                    if field_def.fast {
+                    if field_def.is_fast() {
                         schema_builder.add_text_field(name, STRING | FAST)
                     } else {
                         schema_builder.add_text_field(name, STRING)
                     }
                 }
                 TantivyFieldType::I64 => {
-                    if field_def.fast {
+                    if field_def.is_fast() {
                         schema_builder.add_i64_field(name, INDEXED | FAST)
                     } else {
                         schema_builder.add_i64_field(name, INDEXED)
                     }
                 }
                 TantivyFieldType::U64 => {
-                    if field_def.fast {
+                    if field_def.is_fast() {
                         schema_builder.add_u64_field(name, INDEXED | FAST)
                     } else {
                         schema_builder.add_u64_field(name, INDEXED)
                     }
                 }
                 TantivyFieldType::F64 => {
-                    if field_def.fast {
+                    if field_def.is_fast() {
                         schema_builder.add_f64_field(name, INDEXED | FAST)
                     } else {
                         schema_builder.add_f64_field(name, INDEXED)
                     }
                 }
                 TantivyFieldType::Date => {
-                    if field_def.fast {
+                    if field_def.is_fast() {
                         schema_builder.add_date_field(name, INDEXED | FAST)
                     } else {
                         schema_builder.add_date_field(name, INDEXED)
@@ -3854,7 +3891,9 @@ impl HybridStore {
                     field_type,
                     indexed,
                     stored,
-                    fast,
+                    // Derived from the built index, so this is what the index actually has
+                    // rather than what a schema asked for: concrete, never unresolved.
+                    fast: Some(fast),
                     is_shadow: false, // Fields derived from Tantivy schema are not shadow fields
                     // Tantivy stores no description; one lives only in the schema record.
                     description: None,
@@ -3868,7 +3907,7 @@ impl HybridStore {
             .values()
             .filter(|f| matches!(f.field_type, TantivyFieldType::Text))
             .count();
-        let fast_count = fields.values().filter(|f| f.fast).count();
+        let fast_count = fields.values().filter(|f| f.is_fast()).count();
         tracing::debug!(
             total_fields = fields.len(),
             text_fields = text_count,
@@ -4019,7 +4058,7 @@ impl HybridStore {
                         field_type: TantivyFieldType::Text,
                         indexed: true,
                         stored: true,
-                        fast: false,
+                        fast: Some(false),
                         is_shadow: false, // The canonical 'id' field is not a shadow field
                         description: None,
                         tokenizer: Some("raw".to_string()),
@@ -8192,26 +8231,26 @@ mod tests {
         assert_eq!(text_field.field_type, TantivyFieldType::Text);
         assert!(text_field.indexed);
         assert!(!text_field.stored); // Only "id" field is stored in Tantivy
-        assert!(!text_field.fast); // Text fields are not fast by default
+        assert!(!text_field.is_fast()); // Text fields are not fast by default
 
         let i64_field = FieldDef::new("count".to_string(), TantivyFieldType::I64);
         assert_eq!(i64_field.field_type, TantivyFieldType::I64);
         assert!(i64_field.indexed);
         assert!(!i64_field.stored); // Only "id" field is stored in Tantivy
-        assert!(i64_field.fast); // Numeric fields are fast by default
+        assert!(i64_field.is_fast()); // Numeric fields are fast by default
 
         // Test the "id" field special case
         let id_field = FieldDef::new("id".to_string(), TantivyFieldType::Text);
         assert_eq!(id_field.field_type, TantivyFieldType::Text);
         assert!(id_field.indexed);
         assert!(id_field.stored); // "id" field is stored in Tantivy
-        assert!(!id_field.fast); // Text fields are not fast by default
+        assert!(!id_field.is_fast()); // Text fields are not fast by default
 
         let json_field = FieldDef::new("metadata".to_string(), TantivyFieldType::Json);
         assert_eq!(json_field.field_type, TantivyFieldType::Json);
         assert!(json_field.indexed);
         assert!(!json_field.stored); // Only "id" field is stored in Tantivy
-        assert!(!json_field.fast); // JSON fields are not fast by default
+        assert!(!json_field.is_fast()); // JSON fields are not fast by default
 
         println!("✅ FieldDef creation works correctly!");
     }
@@ -8341,7 +8380,7 @@ mod tests {
         let count_field = schema.fields.get("count").unwrap();
         assert_eq!(count_field.field_type, TantivyFieldType::I64);
         assert!(!count_field.indexed, "New fields should be non-indexed");
-        assert!(count_field.fast, "Numeric fields should be fast");
+        assert!(count_field.is_fast(), "Numeric fields should be fast");
 
         let timestamp_field = schema.fields.get("timestamp").unwrap();
         assert_eq!(timestamp_field.field_type, TantivyFieldType::Date);
@@ -8618,7 +8657,7 @@ mod tests {
         assert_eq!(score.field_type, TantivyFieldType::F64);
         assert!(score.indexed);
         assert!(
-            score.fast,
+            score.is_fast(),
             "Numeric fields should be enriched with fast=true"
         );
         assert!(
@@ -8632,7 +8671,7 @@ mod tests {
         assert_eq!(created.field_type, TantivyFieldType::Date);
         assert!(created.indexed, "indexed defaults to true");
         assert!(
-            created.fast,
+            created.is_fast(),
             "Date fields should be enriched with fast=true"
         );
 

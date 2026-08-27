@@ -1452,6 +1452,94 @@ async fn the_schema_reports_which_fields_can_be_sorted_exactly() {
     );
 }
 
+/// A numeric field can decline the fast column it would otherwise get, and the config says so.
+///
+/// This is the symptom OB1 was filed for: a `PUT` declaring an i64 field `"fast": false` read
+/// back from `GET .../_config` as `"fast": true`. The declaration was overwritten by
+/// `normalize_after_deserialization`, which runs on the write path before the schema is stored —
+/// so the config and the index agreed with each other and disagreed with the caller, which no
+/// response could reveal.
+///
+/// Both directions are asserted from the same index, because the fix has to leave the default
+/// alone: a numeric field that says nothing still gets a column, and only a caller who said
+/// `false` gets no column.
+#[tokio::test]
+async fn a_numeric_field_can_decline_the_fast_column_it_gets_by_default() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    client
+        .put_index_config(
+            "declined",
+            &json!({
+                "fields": {
+                    "id": {"field_type": "text", "indexed": true, "stored": true},
+                    "body": {"field_type": "text", "indexed": true, "stored": true},
+                    "rank": {"field_type": "i64", "indexed": true, "fast": false},
+                    "score": {"field_type": "i64", "indexed": true}
+                }
+            }),
+        )
+        .await
+        .expect("put schema");
+    seed_ordered(&node, "declined", 3).await;
+
+    let config = get_json(&node, "/api/declined/_config").await;
+    let field = |name: &str| {
+        config["fields"]
+            .as_array()
+            .and_then(|f| f.iter().find(|f| f["name"] == name))
+            .cloned()
+            .unwrap_or_else(|| panic!("field {name} in {config}"))
+    };
+
+    assert_eq!(
+        field("rank")["fast"],
+        json!(false),
+        "the config reports the declaration the caller made"
+    );
+    assert_eq!(
+        field("rank")["sortable"],
+        json!(false),
+        "and the index was built to match it, so there is no column to sort on"
+    );
+    assert_eq!(
+        field("score")["fast"],
+        json!(true),
+        "a numeric field that declared nothing still gets a column by default"
+    );
+    assert_eq!(field("score")["sortable"], json!(true));
+
+    // What declining costs is the sort, and nothing else: a range on the field is answered from
+    // the inverted index, which never needed a column.
+    let (status, body) =
+        post_json(&node, "/api/declined/search", json!({"query": "rank:>=1"})).await;
+    assert_eq!(status, 200, "a range on a field with no column: {body}");
+    assert_eq!(
+        hit_ids(&body),
+        vec!["d001".to_string(), "d002".to_string()],
+        "the range is answered in full: {body}"
+    );
+
+    let (status, body) = post_json(
+        &node,
+        "/api/declined/search",
+        json!({"query": "body:page", "sort": {"field": "rank", "order": "asc"}}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a sort on a field the caller declared unsortable is refused: {body}"
+    );
+    assert!(
+        body["details"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("rank"),
+        "the refusal names the field: {body}"
+    );
+}
+
 /// Sorting on a text field with no fast column says so in the response.
 ///
 /// The hits are real and look exactly like an exact answer, so nothing about them reveals

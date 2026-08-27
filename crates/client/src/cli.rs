@@ -2325,7 +2325,7 @@ async fn detect_schema_from_csv(
             field_type: TantivyFieldType::Text,
             indexed: true,
             stored: true,
-            fast: false,
+            fast: Some(false),
             is_shadow: false, // The canonical 'id' field is not a shadow field
             description: None,
             tokenizer: Some("raw".to_string()),
@@ -2725,7 +2725,7 @@ fn build_schema_from_effective_json_documents(
             field_type: TantivyFieldType::Text,
             indexed: true,
             stored: true,
-            fast: false,
+            fast: Some(false),
             is_shadow: false,
             description: None,
             tokenizer: Some("raw".to_string()),

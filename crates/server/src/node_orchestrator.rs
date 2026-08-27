@@ -421,7 +421,7 @@ fn unsortable_sort_field(
         return refuse("the index has no column of that name".to_string());
     };
 
-    if def.fast
+    if def.is_fast()
         || matches!(
             def.field_type,
             TantivyFieldType::Text | TantivyFieldType::String
@@ -6363,7 +6363,7 @@ impl NodeOrchestrator {
                 );
                 entry.insert("indexed".to_string(), JsonValue::Bool(field.indexed));
                 entry.insert("stored".to_string(), JsonValue::Bool(field.stored));
-                entry.insert("fast".to_string(), JsonValue::Bool(field.fast));
+                entry.insert("fast".to_string(), JsonValue::Bool(field.is_fast()));
                 entry.insert("shadow".to_string(), JsonValue::Bool(field.is_shadow));
                 entry.insert(
                     "searchable".to_string(),

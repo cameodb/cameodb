@@ -43,7 +43,7 @@ fn build_schema(title_is_fast: bool) -> IndexSchema {
         );
     }
     if let Some(title) = schema.fields.get_mut("title") {
-        title.fast = title_is_fast;
+        title.fast = Some(title_is_fast);
     }
     schema.normalize_after_deserialization();
     schema
