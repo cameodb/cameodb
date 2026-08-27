@@ -42,7 +42,7 @@ on one.
 | 15 — HA: reindex, replication, migration | 📋 Planned | All three stages |
 | 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 4.2, Stage 3's deeper warming options, and the measurement on the reporting node |
 | 17 — Record deletion | ✅ Done | — |
-| 18 — Field types: Facet and JSON | 📋 Planned | All of it — a facet field cannot be written to, a json field behaves exactly like a text one |
+| 18 — Field types: Facet and JSON | 📋 Planned | All of it — a facet field cannot be written to, a json field behaves exactly like a text one. No migration: neither type holds anything today |
 | Code health — reviewed at 0.3.1 | 📋 Planned | Seven items, none behavioural |
 
 ## Reconciliation, 2026-08-26
@@ -750,6 +750,11 @@ their names promise. `facet` cannot be written to at all. `json` can, and behave
 from working, and neither change is only a fix: each alters what an index means, which is why they
 are planned rather than patched.
 
+**Neither needs a migration**, which is what keeps the phase small. Nothing can be written to a
+`facet` field, and a `json` field expresses nothing a `text` field does not, so there is no
+behaviour any existing index depends on — see J2's own section for the measurement and the
+boundary that follows from it. `text` holding JSON is untouched throughout.
+
 **The shape this phase settles**, and the reason it is worth stating before any of it is built:
 
 | Declared type | What it is for | How it is queried |
@@ -792,6 +797,10 @@ property of what was *written*, not of the query. Tantivy's `FacetTokenizer` emi
 every one of its ancestors, so `/electronics/phones/cases` writes four terms and a parent query is
 an ordinary single-term lookup. One term per level per document; no prefix scan, no range.
 
+**No migration, and not merely a small one.** A facet field has never accepted a document, so no
+index holds facet data and there is nothing to reindex, reconcile or read two ways. The type gains
+a behaviour where it had none.
+
 **Decisions inside this item.** Whether a facet field should also be `fast` — today a sort naming
 one is refused, and nothing has asked for it. Whether `/` remains the only separator a caller may
 write. Neither blocks the item.
@@ -832,8 +841,17 @@ hits with no note — indistinguishable from "nothing matched". An agent reading
 empty answer to a question the index could have answered.
 
 **The change** is `add_object` with the actual map instead of `add_text` with its serialization.
-Typed subfields then come free, because Tantivy indexes each leaf by its own JSON type: strings
-tokenized as text, numbers as numbers, so `blob.size:>40` becomes a real range.
+Each leaf is then indexed under its own path and by its own JSON type — measured on the term
+dictionary, `{"color":"red","size":42,"nested":{"brand":"acme"}}` writes `color·s red`,
+`nested|brand·s acme` and `size·i 42`, where `|` separates path levels and `·s` / `·i` mark the
+leaf's type.
+
+**Equality on a subfield comes with it; a range does not.** `blob.size:42` matches, and
+`blob.size:>40` fails outright — *"RangeQuery on JSON is only supported for fast fields
+currently"*. So `set_fast` is not the optional extra for sorting it first appeared to be: it is
+what a numeric comparison on a subfield requires, and comparisons are a large part of why anyone
+addresses a subfield at all. Treat the fast column as part of the feature rather than as a later
+stage.
 
 **Decisions this item has to make, none of them forced by the code:**
 
@@ -850,14 +868,33 @@ tokenized as text, numbers as numbers, so `blob.size:>40` becomes a real range.
 - **`set_fast`**, which is what would let a subfield be sorted on, and which `sortable` would then
   have to report for a path rather than a field.
 
-**The migration is the hard half, and it cannot be made tolerant.** An existing index with a
-`json` field holds the stringified terms. After the change, documents written earlier keep those
-and documents written later carry path terms — one index where neither query form is complete, and
-no way to tell from a result which half answered. Unlike the `_seq` retirement, which could read
-both formats, the terms here are genuinely different. So this needs either
-[D1 (reindex)](#d1--reindex) in front of it, or a stated boundary: the change applies to indexes
-created after it, and an existing `json` field keeps its old behaviour until rebuilt. Deciding
-that is part of the item, not a detail of it.
+**The two term spaces are disjoint, and that decides the migration** — measured by writing one
+document each way into the same field and querying both:
+
+| Query | Document written as text (today) | Document written as an object (J2) |
+|---|---|---|
+| `blob:red` | matches | **no match** |
+| `blob:color` | matches — the *key* is a token | no match |
+| `blob.color:red` | no match | matches |
+| `blob.size:42` | no match | matches |
+
+A query with no path reaches only the empty path; a query with one reaches only that path. Nothing
+overlaps. So J2 does change what an existing query against a `json` field finds, and there is no
+version of it that reads both forms.
+
+**It needs no migration path anyway, and this is the point of the phase.** Neither type holds
+anything worth preserving. A `facet` field cannot be written to at all, so no index anywhere holds
+facet data. And a `json` field is today *indistinguishable from a `text` one* — same terms, same
+matches — so nothing is expressible through it that a `text` field does not already express, and
+nobody choosing bag-of-words search had a reason to reach for it. What the phase changes is what
+the type will mean, not what any existing index relies on.
+
+So: **a stated boundary, not [reindex](#d1--reindex) first.** An existing `json` field's documents
+keep the terms they were written with and stay findable by the query that finds them today; they
+gain paths when they are next written. `text` holding JSON is untouched in every respect — same
+declaration, same terms, same queries — which is the lane any existing deployment is actually
+using. Recording it here so the absence of a migration is a decision with a reason behind it
+rather than an omission.
 
 **What does not change**, and it is what keeps the risk down: nothing about what a search
 *returns*. Document bodies come from redb, so a hit's `blob` field is the object as written either
