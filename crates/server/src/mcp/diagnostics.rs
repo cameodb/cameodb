@@ -90,6 +90,46 @@ pub(super) fn paged_past_the_end(offset: usize, total_hits: usize) -> Option<Str
     ))
 }
 
+/// A page holding fewer hits than the count says it should, and why.
+///
+/// The count and the bodies come from different engines: Tantivy counts what matched, and the
+/// documents are fetched from the key-value store by key. A delete removes the row at once and
+/// the indexed term only at the next commit, so between the two a match is counted and has no
+/// body to return — the count runs ahead of the documents by however many were deleted since.
+///
+/// Reachable in ordinary operation only since record deletion shipped, which is why nothing
+/// explained it before. It matters because the session instructions tell an agent never to
+/// present an incomplete result as a whole one, and this is the one shortfall it cannot see: the
+/// hits are real, the count is real, and nothing in the response relates them.
+///
+/// `expected` is what the window should have yielded — `limit`, or what is left after `offset`,
+/// whichever is smaller. Silent when the page is full, and silent for a count-only query, which
+/// asks for no hits at all.
+pub(super) fn short_page_note(
+    hits_returned: usize,
+    total_hits: usize,
+    offset: usize,
+    limit: usize,
+) -> Option<String> {
+    if limit == 0 {
+        return None;
+    }
+    let expected = limit.min(total_hits.saturating_sub(offset));
+    if hits_returned >= expected {
+        return None;
+    }
+    let missing = expected - hits_returned;
+    Some(format!(
+        "This page carries {hits_returned} of the {expected} hit(s) the count implies, so \
+         {missing} matching document(s) could not be read back. The count comes from the search \
+         index and the documents from the key-value store, and a deletion clears the store first \
+         — so a document deleted since the index was last committed is still counted and no \
+         longer there. Treat {total_hits} as the count at the last commit, not as the number of \
+         documents you can retrieve."
+    ))
+}
+
+/// What an approximate sort order means for the caller holding it.
 /// What an approximate sort order means for the caller holding it.
 ///
 /// Attached whenever the engine reports [`crate::node_orchestrator::APPROXIMATE_SORT_FIELD`],
@@ -347,7 +387,7 @@ pub(super) fn cameodb_syntax_reference() -> JsonValue {
 /// anywhere else, so they are pinned here.
 #[cfg(test)]
 mod zero_results_advice_tests {
-    use super::zero_results_advice;
+    use super::{short_page_note, zero_results_advice};
 
     /// Zero hits is usually the true answer, and a warning attached to it claims the query asked
     /// for less than it meant to. Terms alone never do: they are ORed, so a query of bare terms
@@ -399,7 +439,56 @@ mod zero_results_advice_tests {
         );
     }
 
-    /// The two ways to narrow that are not the word `AND`. With terms ORed, `+` is what a caller
+    /// A page shorter than the count implies is explained; a page that is merely paged is not.
+    ///
+    /// The distinction is the whole value of the note. `total_hits` above `limit` is the ordinary
+    /// case and says nothing is wrong; `hits_returned` below what the window should have yielded
+    /// is the case a deletion produces between the redb removal and the Tantivy commit, and it is
+    /// invisible in the hits themselves — every one of them is real.
+    #[test]
+    fn only_a_page_shorter_than_its_window_is_explained() {
+        // Full pages, paged or not.
+        assert!(short_page_note(10, 10, 0, 10).is_none(), "exactly full");
+        assert!(
+            short_page_note(10, 500, 0, 10).is_none(),
+            "a first page of many is not short"
+        );
+        assert!(
+            short_page_note(10, 500, 100, 10).is_none(),
+            "nor is a later one"
+        );
+        assert!(
+            short_page_note(5, 105, 100, 10).is_none(),
+            "a last page holds what is left of the count, which is fewer than the limit"
+        );
+        assert!(
+            short_page_note(0, 0, 0, 10).is_none(),
+            "nothing matched, which zero_results_advice speaks to instead"
+        );
+        assert!(
+            short_page_note(0, 50, 0, 0).is_none(),
+            "a count-only query asks for no hits, so it is never short"
+        );
+
+        // The shortfall a deletion leaves behind: five counted, four readable.
+        let note = short_page_note(4, 5, 0, 10).expect("four of five is short");
+        assert!(
+            note.contains("4 of the 5") && note.contains("1 matching document"),
+            "the note should say how many are missing: {note}"
+        );
+        assert!(
+            note.contains("deleted") && note.contains("last commit"),
+            "and why, and what the count now means: {note}"
+        );
+
+        // Short within a later page, where the offset decides what was expected.
+        assert!(
+            short_page_note(7, 200, 100, 10).is_some(),
+            "a mid-result page missing three documents is short too"
+        );
+    }
+
+    /// The two ways to narrow that are not the word `AND`.    /// The two ways to narrow that are not the word `AND`. With terms ORed, `+` is what a caller
     /// reaches for to require a clause, and it is easy to leave on one that need not be.
     #[test]
     fn required_and_excluded_clauses_are_recognised_as_narrowing() {

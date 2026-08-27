@@ -36,7 +36,7 @@ on one.
 | 10 — Field projection | ✅ Done | — |
 | 11 — Read/write hot-path optimizations | ✅ Done | — |
 | 11.5 — Jemalloc memory management | ✅ Done | — |
-| 12 — MCP server integration | ◐ Partial | Streaming, semantic routing, the documentation pass, compliance tests and benchmarks, two schema-listing defects, and the syntax reference's drift from the engine |
+| 12 — MCP server integration | ◐ Partial | Streaming, semantic routing, the documentation pass, compliance tests and benchmarks, and one schema-listing defect (`id` offered for projection on a shadow index) |
 | 13 — Thread-per-core & memory operations | ◐ Partial | Stage 2f.2 (CPU arenas) and 2f.3 (per-arena jemalloc stats) — both with the evidence against 2f.2 |
 | 14 — Security hardening | ◐ Partial | Stage C3 only (per-index role overrides); complexity caps deferred |
 | 15 — HA: reindex, replication, migration | 📋 Planned | All three stages |
@@ -90,8 +90,8 @@ first written down here, so the chronology stays visible under the cost ordering
 | [A3](#a3--protocol-compliance-tests-and-agent-query-benchmarks) | Protocol-compliance tests and agent-query benchmarks | 12 | 2026-08-15 | ◐ |
 | [A4](#a4--what-a-schema-listing-says-about-id-for-projection-and-for-sorting) | What a schema listing says about `id`, for projection and for sorting | 12 | 2026-08-15 | 📋 |
 | [A5](#a5--semantic-routing) | Semantic routing | 12 | 2026-08-05 | 📋 |
-| [A6](#a6--the-syntax-reference-has-drifted-from-the-engine) | The syntax reference has drifted from the engine | 12 | 2026-08-27 | 📋 |
-| [A7](#a7--a-short-page-and-a-stale-count-say-nothing-about-why) | A short page and a stale count say nothing about why | 12 | 2026-08-27 | 📋 |
+| [A6](#a6--the-syntax-reference-has-drifted-from-the-engine) | The syntax reference has drifted from the engine | 12 | 2026-08-27 | ✅ |
+| [A7](#a7--a-short-page-and-a-stale-count-say-nothing-about-why) | A short page and a stale count say nothing about why | 12 | 2026-08-27 | ✅ |
 | [B1](#b1--2f2--cpu-arenas-for-write--read--merge) | 2f.2 — CPU arenas for write / read / merge | 13 | 2026-08-08 | 📋 |
 | [B2](#b2--2f3--per-arena-jemalloc-stats) | 2f.3 — per-arena jemalloc stats | 13 | 2026-08-08 | 📋 |
 | [C1](#c1--per-index-role-overrides) | Per-index role overrides | 14 | 2026-07-30 | 📋 |
@@ -213,8 +213,8 @@ nothing depends on it and nothing blocks it.
 
 ### A6 — The syntax reference has drifted from the engine
 
-📋 **Planned**, audited 2026-08-27 against the query path. Cheapest item in this section and the
-one that changes most agent behaviour per line edited, so it goes first.
+✅ **Done** 2026-08-27, audited against the query path and then against a running node — which is
+the part worth keeping, because probing corrected two claims that reading the code had produced.
 
 **The machinery is sound and that is the point.** `crates/mcp/src/syntax.rs` is the single source
 rendered into four surfaces — the `search_index` description, the reference `validate_query`
@@ -257,6 +257,29 @@ matches the term exactly instead, and says so through the discarded-clause chann
 an MCP call, so the agent needs to recognise it. And a facet path cannot contain a space: the
 normalizer ends the path at whitespace or `)`.
 
+**What the node said that the source did not.** Two of the date claims above were wrong when
+first written, and both corrections are now rules in their own right: a bare date literal is an
+*exact instant*, so `created:2024-06-15` means midnight and matches nothing unless a document
+sits on that second — the most natural date query to write and the least likely to work — and a
+literal containing a space must be quoted, because an unquoted value ends at the first space and
+`12:00:00` is then read as a new clause reporting `12` as an unknown field. The sort refusal was
+checked the same way, which is how the item learned that boolean, ip, json and facet are the
+types that actually reach it, numeric ones being unreachable while [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field)
+stands. `crates/storage/tests/date_query_forms_test.rs` pins all of it.
+
+**One defect found while looking**, and fixed here because it is the same surface: two tool
+descriptions shipped runs of nine and five literal spaces after each paragraph break. A `\` at
+the end of a line in a Rust string swallows the following indentation; a `\n` written into the
+string keeps it. A description sits in the caller's context for a whole session, and this is the
+one class of defect there that no reviewer catches, because the source looks right. A test now
+walks every tool description and refuses a run of two spaces outside the reference's own padded
+table.
+
+**Two more, filed rather than fixed:** [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field)
+reproduced, and [OB2](#ob2--a-facet-field-cannot-be-written-to) — a `facet` field cannot be
+written to at all, which makes `field:/path/to/value` an operator advertised in four MCP surfaces
+for a field type no document can carry.
+
 **Verified aligned, recorded so it is not re-audited:** the `id:value` fast-path caveat matches
 `parse_exact_id_query` condition for condition; a discarded clause does fail an MCP call;
 `offset` and its `offset + limit` bound; the approximate-sort mechanics and `_approximate_sort`;
@@ -266,7 +289,7 @@ orchestrator skill survive Phase 17 unchanged — deletion is a write, and no to
 
 ### A7 — A short page and a stale count say nothing about why
 
-📋 **Planned**, and new with [Phase 17](#phase-17--record-deletion--done): deletion made a
+✅ **Done** 2026-08-27. New with [Phase 17](#phase-17--record-deletion--done): deletion made a
 transient state ordinary that used to be almost unreachable.
 
 A search counts matches in Tantivy and fetches bodies from redb. A delete removes the redb row at
@@ -280,10 +303,20 @@ The same divergence reaches the catalogue: `document_count` is Tantivy's `num_do
 commit lands and the measurement cache expires.
 
 It matters because of what the session instructions promise — *"never present an incomplete
-result as a whole one"* — which an agent cannot honour on a signal it is not given. Two decisions
-to make rather than one fix: whether the short page earns a `_warning` note (cheap, and the
-existing channel), and whether a document count should be honest about uncommitted deletions at
-all, given that the alternative is reading a count from redb that no search agrees with.
+result as a whole one"* — which an agent cannot honour on a signal it is not given.
+
+**What landed.** `short_page_note` joins the `_warning` notes, on the one condition paging cannot
+explain: fewer hits than `min(limit, total_hits − offset)`. It says how many are missing, why the
+two numbers can disagree, and what the count then means. Silent on a full page, on a last page
+holding the remainder, on an empty result — which `zero_results_advice` already speaks to — and
+on a count-only query, which asks for no hits at all. Verified through `tools/call` across all
+four states of one delete: clean, short, count-only, and after the commit.
+
+**The count keeps its number**, which was the other decision and the less obvious one. It is
+Tantivy's `num_docs`, so it is the count *as of the last commit* — and that is exactly what
+`total_hits` is too. Making it read redb instead would give a number no search agrees with, and
+two honest-looking figures that never match is worse than one figure with a stated boundary. So
+`describe_index`, `list_indexes` and `get_catalog_stats` now say what their counts are counts of.
 
 ---
 
