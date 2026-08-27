@@ -482,6 +482,67 @@ async fn a_document_without_an_inner_id_is_refused() {
         err.to_string().contains("id"),
         "the error should name the missing field, got: {err}"
     );
+    // A malformed document is the caller's fault. It used to answer 500 Internal server error,
+    // which is both wrong about whose fault it is and an instruction to retry a request that
+    // cannot succeed.
+    assert!(
+        err.to_string().contains("400"),
+        "a refused document should be a 400, got: {err}"
+    );
+}
+
+/// A document whose value the declared type cannot hold is refused as a bad request.
+///
+/// The type mismatch is caught by the orchestrator, and the storage layer has its own guard
+/// underneath for the one type whose constructor panics on a bad value — see
+/// `a_value_that_is_not_a_facet_path_is_refused_rather_than_fatal`. Either way the caller gets a
+/// 400 naming the field rather than a 500, and the node stays up.
+#[tokio::test]
+async fn a_value_the_declared_type_cannot_hold_is_a_bad_request() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "typed",
+        &json!({
+            "fields": {
+                "id": {"field_type": "text", "indexed": true},
+                "count": {"field_type": "i64", "indexed": true},
+                "cat": {"field_type": "facet", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "creating the config should succeed: {body}");
+
+    for (field, value) in [("count", json!("not a number")), ("cat", json!("no-slash"))] {
+        let refused = client
+            .write_document(
+                "typed",
+                "t1",
+                &json!({"id": "t1", field: value.clone()}),
+                None,
+            )
+            .await
+            .expect_err(&format!("{field}={value} should be refused"));
+        let message = refused.to_string();
+        assert!(
+            message.contains("400"),
+            "{field}={value} is the caller's fault and should say so: {message}"
+        );
+        assert!(
+            message.contains(field),
+            "and should name the field: {message}"
+        );
+    }
+
+    // The node is still serving, which is the half of this that a panic would break.
+    let health = get_json(&node, "/_cluster/health").await;
+    assert!(
+        health.get("status").is_some(),
+        "the node should still answer"
+    );
 }
 
 /// `PATCH /api/{index}/_schema` on an index that has been written to.

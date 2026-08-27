@@ -4144,9 +4144,17 @@ impl RouterActor {
     }
 
     /// Forward an operation through the actor mailbox (serialized path).
+    ///
+    /// The handler's own error is returned unchanged. It used to be formatted into a string and
+    /// wrapped in `io::Error::other`, which flattened the kind to `Other` — so every refusal an
+    /// op earned on the actor path arrived at the HTTP layer unclassifiable, and a document the
+    /// schema rejected answered `500 Internal server error` instead of a `400` naming what was
+    /// wrong with it. Only the delivery failures need a description; the handler already wrote
+    /// one for its own.
     async fn ask_orchestrator(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
         match self.orchestrator.ask(op).await {
             Ok(result) => Ok(result),
+            Err(kameo::error::SendError::HandlerError(err)) => Err(err),
             Err(e) => Err(OrchestratorError::Io(std::io::Error::other(format!(
                 "Actor error: {}",
                 e

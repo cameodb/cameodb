@@ -721,6 +721,17 @@ document a bug as a decision. Worth checking `ip` and `boolean` for the same sha
 a string infers `Ip` only when it parses as an address, so a declared `ip` field is writable, but
 the inference is the same single-guess design.
 
+**The panic underneath it is fixed** (2026-08-27), and had to be first. `Facet: From<&str>` is
+`from_text(..).unwrap()`, so `add_facet` panics on a value that is empty or does not begin with
+`/` — on the shard's writer thread, from a document body, and with `panic = "abort"` in the
+release profile that ends the process. This item was the only thing preventing it, which made the
+defect load-bearing: relaxing the validator without fixing the constructor call would have turned
+an unusable field type into a way to stop a node with one document. Values are now checked where
+they enter the index, on both write paths, and refused by name; the replay path skips and warns
+instead, since the value is already committed and failing an index open over one field serves
+nobody. So this item is now free to be a decision about whether the type earns its place rather
+than a decision about safety.
+
 ---
 
 # Part II — Archive
