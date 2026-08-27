@@ -286,6 +286,72 @@ struct BroadcastStats {
 /// is stripped from every hit at the client boundary (`route_and_handle`).
 const SORT_KEY_FIELD: &str = "_sort_key";
 
+/// Whether a shard's failure is the request's fault rather than this node's.
+///
+/// Everything crossing a shard actor arrives as an `io::Error` carrying a kind and a message —
+/// `handle_search` maps the engine's error into one — so the kind is the whole classification.
+/// `InvalidInput` and `InvalidData` are what the engine raises for a query or a field the index
+/// cannot answer; anything else is this node failing to read data it owns, which says nothing
+/// about what was asked.
+fn is_caller_error(err: &OrchestratorError) -> bool {
+    match err {
+        OrchestratorError::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
+        ),
+        OrchestratorError::UnsortableField { .. }
+        | OrchestratorError::UnrunnableQuery { .. }
+        | OrchestratorError::NoShardAnswered { .. } => true,
+        OrchestratorError::Storage(storage::StoreError::InvalidFieldValue { .. }) => true,
+        _ => false,
+    }
+}
+
+/// The refusal a scatter-gather owes its caller when not one shard could run the query.
+///
+/// A failed shard alongside a successful one is a partial answer, and reporting it as hits plus
+/// `errors` is right: some of the data was read. With no successful shard there is no answer to
+/// qualify — only a `200` whose empty `hits` array is indistinguishable from a search that ran
+/// everywhere and matched nothing, with the reason in a key most callers never read.
+///
+/// The reasons are deduplicated and the shard ids dropped: every shard runs the same query
+/// against the same schema, so they fail the same way, and repeating one reason per shard reads
+/// as several different problems.
+fn no_shard_answered(
+    index: &str,
+    shard_success: usize,
+    failures: &[(Uuid, OrchestratorError)],
+) -> Option<OrchestratorError> {
+    if shard_success > 0 || failures.is_empty() {
+        return None;
+    }
+
+    let mut reasons: Vec<String> = Vec::new();
+    for (_, err) in failures {
+        let reason = match err {
+            OrchestratorError::Io(io) => io.to_string(),
+            other => other.to_string(),
+        };
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+
+    Some(OrchestratorError::NoShardAnswered {
+        index: index.to_string(),
+        reasons: reasons.join("; "),
+        caller_error: failures.iter().all(|(_, err)| is_caller_error(err)),
+    })
+}
+
+/// The per-shard failures as a response reports them, one line each, naming the shard.
+fn shard_error_notes(failures: &[(Uuid, OrchestratorError)]) -> Vec<String> {
+    failures
+        .iter()
+        .map(|(shard_id, err)| format!("Shard {}: {}", shard_id, err))
+        .collect()
+}
+
 /// Report the shards that could not be read, and only then.
 ///
 /// Absent means every shard answered, which is what makes its presence worth reading — the same
@@ -1198,6 +1264,24 @@ pub enum OrchestratorError {
     /// matched nothing, which is the reading that makes it dangerous.
     #[error("no clause of this query can run against this index: {notes}")]
     UnrunnableQuery { notes: String },
+
+    /// No shard could run the query, so the empty result it produced is not an answer.
+    ///
+    /// A scatter-gather reports a failed shard as a partial outage — the hits it did get, plus
+    /// `errors` naming what it did not — which is right when *some* shard answered. When none
+    /// did, the same shape is a `200` with an empty `hits` array and the reason in a key most
+    /// callers never read, indistinguishable from a search that ran everywhere and matched
+    /// nothing.
+    ///
+    /// `caller_error` decides the status, and the distinction is real: a sort naming a column the
+    /// index never built is a request to fix, while a shard that could not open its index is this
+    /// node's problem and says nothing about the request.
+    #[error("no shard could run this query against '{index}': {reasons}")]
+    NoShardAnswered {
+        index: String,
+        reasons: String,
+        caller_error: bool,
+    },
 }
 
 // Serialize/Deserialize via display string to satisfy remote message bounds without
@@ -1401,6 +1485,21 @@ impl From<OrchestratorError> for RemoteError {
             OrchestratorError::UnrunnableQuery { notes } => RemoteError::InvalidInput(format!(
                 "no clause of this query can run against this index: {notes}"
             )),
+            // A peer whose shards all refused the request passes that on as a refusal; one whose
+            // shards all failed passes on a failure. Collapsing both into `Io` would make a
+            // requesting node answer 500 for a query the caller could fix.
+            OrchestratorError::NoShardAnswered {
+                index,
+                reasons,
+                caller_error,
+            } => {
+                let text = format!("no shard could run this query against '{index}': {reasons}");
+                if caller_error {
+                    RemoteError::InvalidInput(text)
+                } else {
+                    RemoteError::Io(text)
+                }
+            }
         }
     }
 }
@@ -2725,7 +2824,9 @@ impl OrchestratorEngine {
             .await;
 
         let mut results: Vec<(Uuid, f32, JsonValue)> = Vec::new();
-        let mut errors = Vec::new();
+        // Kept as values rather than formatted here: whether nothing ran at all, and whose fault
+        // that was, is decided from the errors themselves once the gather is complete.
+        let mut failures: Vec<(Uuid, OrchestratorError)> = Vec::new();
         let mut shard_success = 0usize;
         let mut total_hits_sum = 0usize;
         // Every shard parses the same query string, so collect the distinct set.
@@ -2755,10 +2856,20 @@ impl OrchestratorEngine {
                 }
                 Err(err) => {
                     warn!(%shard_id, error = %err, "Engine scatter search shard failed");
-                    errors.push(format!("Shard {}: {}", shard_id, err));
+                    failures.push((shard_id, err));
                 }
             }
         }
+
+        // Nothing ran, so there is nothing to qualify: refuse rather than answer with the empty
+        // page a partial outage would produce. This is where the one refusal the sort guard above
+        // cannot make lands — `fast` is a declaration and the column is written from it when the
+        // index is built, so a field declared fast after the fact has no column to order by, and
+        // only the built index knows that.
+        if let Some(refusal) = no_shard_answered(index, shard_success, &failures) {
+            return Err(refusal);
+        }
+        let errors = shard_error_notes(&failures);
 
         // Order merged results: by the requested sort field when provided, otherwise by
         // score descending. Each shard already returned field-sorted results, so a global
@@ -3527,6 +3638,15 @@ impl MicroshardActor {
             .await?
             .map_err(|e: StoreError| match e {
                 StoreError::Io(io_err) => OrchestratorError::Io(io_err),
+                // A field this index does not carry, or a query it cannot parse, is the
+                // request's fault rather than the node's — and the distinction has to survive
+                // the crossing, because an error leaves this actor as a string and everything
+                // downstream reads its `ErrorKind` to decide who is at fault. Flattened to
+                // `other`, a sort naming a column the index never built read as an internal
+                // failure, which is how it came back as a partial outage inside a `200`.
+                StoreError::FieldNotFound(_) | StoreError::QueryParser(_) => OrchestratorError::Io(
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
+                ),
                 _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
             })?;
 
@@ -8208,7 +8328,9 @@ impl NodeOrchestrator {
             .await;
 
         let mut results: Vec<(Uuid, f32, JsonValue)> = Vec::new();
-        let mut errors = Vec::new();
+        // Kept as values rather than formatted here: whether nothing ran at all, and whose fault
+        // that was, is decided from the errors themselves once the gather is complete.
+        let mut failures: Vec<(Uuid, OrchestratorError)> = Vec::new();
         let mut shard_success = 0usize;
         let mut total_hits_sum = 0usize;
         // Every shard parses the same query string, so collect the distinct set.
@@ -8237,10 +8359,20 @@ impl NodeOrchestrator {
                 }
                 Err(err) => {
                     warn!(%shard_id, error = %err, "Scatter search shard failed");
-                    errors.push(format!("Shard {}: {}", shard_id, err));
+                    failures.push((shard_id, err));
                 }
             }
         }
+
+        // Nothing ran, so there is nothing to qualify: refuse rather than answer with the empty
+        // page a partial outage would produce. This is where the one refusal the sort guard above
+        // cannot make lands — `fast` is a declaration and the column is written from it when the
+        // index is built, so a field declared fast after the fact has no column to order by, and
+        // only the built index knows that.
+        if let Some(refusal) = no_shard_answered(index, shard_success, &failures) {
+            return Err(refusal);
+        }
+        let errors = shard_error_notes(&failures);
 
         // Order merged results: by the requested sort field when provided, otherwise by
         // score descending. Each shard already returned field-sorted results, so a global
@@ -10404,6 +10536,82 @@ mod tests {
         assert!(
             refusal("rank").is_none(),
             "a u64 field declared fast does carry a column and must still sort"
+        );
+    }
+
+    /// A gather with no successful shard refuses, and carries whose fault it was.
+    ///
+    /// The verdict decides the status — 400 for a request the caller can fix, 500 for a node that
+    /// could not read its own data — and it cannot be recovered from the message text, which is
+    /// how "field not found: added" used to be classified as a missing resource and answered 404.
+    #[test]
+    fn a_gather_that_answered_nowhere_refuses_and_says_whose_fault_it_was() {
+        let shard = Uuid::nil();
+        let refused = |kind, text: &str| {
+            (
+                shard,
+                OrchestratorError::Io(std::io::Error::new(kind, text.to_string())),
+            )
+        };
+
+        // One shard answering makes the rest a partial outage, which is reported as hits plus
+        // `errors` rather than as a refusal.
+        assert!(
+            no_shard_answered(
+                "papers",
+                1,
+                &[refused(
+                    std::io::ErrorKind::InvalidInput,
+                    "field not found: x"
+                )]
+            )
+            .is_none(),
+            "a partial answer is still an answer"
+        );
+        assert!(
+            no_shard_answered("papers", 0, &[]).is_none(),
+            "no shards and no failures is an empty index, not a refusal"
+        );
+
+        // Every shard runs the same query against the same schema, so they fail identically —
+        // and one reason repeated per shard would read as several distinct problems.
+        let Some(OrchestratorError::NoShardAnswered {
+            index,
+            reasons,
+            caller_error,
+        }) = no_shard_answered(
+            "papers",
+            0,
+            &[
+                refused(std::io::ErrorKind::InvalidInput, "field not found: added"),
+                refused(std::io::ErrorKind::InvalidInput, "field not found: added"),
+            ],
+        )
+        else {
+            panic!("a gather no shard could answer must refuse");
+        };
+        assert_eq!(index, "papers");
+        assert_eq!(reasons, "field not found: added");
+        assert!(
+            caller_error,
+            "a field the index has no column for is the request's to fix"
+        );
+
+        // One node-level failure is enough to stop calling it the caller's fault: the request may
+        // have been perfectly good and unreadable data is not an answer about it.
+        let Some(OrchestratorError::NoShardAnswered { caller_error, .. }) = no_shard_answered(
+            "papers",
+            0,
+            &[
+                refused(std::io::ErrorKind::InvalidInput, "field not found: added"),
+                refused(std::io::ErrorKind::PermissionDenied, "cannot open index"),
+            ],
+        ) else {
+            panic!("still a refusal");
+        };
+        assert!(
+            !caller_error,
+            "a shard that could not read its data is this node's problem"
         );
     }
 

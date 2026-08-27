@@ -1627,6 +1627,84 @@ async fn a_type_that_can_carry_no_column_is_refused_rather_than_answered_empty()
     }
 }
 
+/// A sort on a column the index was never built with is refused, not answered with an empty page.
+///
+/// This is the one refusal `unsortable_sort_field` cannot make. `fast` is a declaration and the
+/// column is written from it when the index is built, so a field declared `fast` onto an index
+/// that already holds data has a declaration and no column — and only the built index knows.
+/// Every shard then fails the same way, which a scatter-gather used to report as a partial
+/// outage: `200`, `hits: []`, `total_hits: 0`, with `errors` naming the field. A caller reading
+/// the hits — which is every caller — saw "nothing matched" for a query that ran nowhere.
+///
+/// The schema listing already told the truth about it, and still does: `fast: true` beside
+/// `sortable: false` is exactly the gap those two flags exist to expose.
+#[tokio::test]
+async fn a_sort_on_a_column_the_index_was_not_built_with_is_refused() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    client
+        .put_index_config(
+            "lagging",
+            &json!({"fields": {
+                "id": {"field_type": "text", "indexed": true, "stored": true},
+                "body": {"field_type": "text", "indexed": true, "stored": true}
+            }}),
+        )
+        .await
+        .expect("put schema");
+    seed_ordered(&node, "lagging", 3).await;
+
+    // Declared onto an index that already has data, so the column cannot exist for it.
+    let (status, body) = put_config(
+        &node,
+        "lagging",
+        &json!({"fields": {
+            "id": {"field_type": "text", "indexed": true, "stored": true},
+            "body": {"field_type": "text", "indexed": true, "stored": true},
+            "added": {"field_type": "i64", "indexed": true, "fast": true}
+        }}),
+    )
+    .await;
+    assert_eq!(status, 200, "declaring the field must be accepted: {body}");
+
+    let config = get_json(&node, "/api/lagging/_config").await;
+    let added = config["fields"]
+        .as_array()
+        .and_then(|f| f.iter().find(|f| f["name"] == "added"))
+        .cloned()
+        .expect("the declared field");
+    assert_eq!(added["fast"], json!(true), "the declaration is honoured");
+    assert_eq!(
+        added["sortable"],
+        json!(false),
+        "and the built index has no column for it, which is the gap under test: {added}"
+    );
+
+    let (status, body) = post_json(
+        &node,
+        "/api/lagging/search",
+        json!({"query": "body:page", "sort": {"field": "added", "order": "asc"}}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a query no shard could run must be refused, not answered empty: {body}"
+    );
+    let detail = body["details"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("added"),
+        "the refusal names the field: {detail}"
+    );
+
+    // The same index still answers everything it can, so the refusal is about this query rather
+    // than about the index having a declaration it cannot honour.
+    let (status, body) =
+        post_json(&node, "/api/lagging/search", json!({"query": "body:page"})).await;
+    assert_eq!(status, 200, "an unsorted search is unaffected: {body}");
+    assert_eq!(body["hits"].as_array().map(|h| h.len()), Some(3));
+}
+
 /// Sorting on a text field with no fast column says so in the response.
 ///
 /// The hits are real and look exactly like an exact answer, so nothing about them reveals

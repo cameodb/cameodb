@@ -60,6 +60,11 @@ impl AppError {
         let is_bad_request = match &err {
             OrchestratorError::UnsortableField { .. }
             | OrchestratorError::UnrunnableQuery { .. } => true,
+            // A query no shard could run carries its own verdict: the shards refused what was
+            // asked, or they failed. Only the first is the caller's to fix, and the text
+            // classification below cannot tell them apart — it would read "field not found: x"
+            // as a missing resource and answer 404.
+            OrchestratorError::NoShardAnswered { caller_error, .. } => *caller_error,
             // `InvalidData` as well as `InvalidInput`: every producer of the former is a
             // document the caller sent that the schema refuses — a missing inner `id`, a type
             // that does not match a declared field. Those answered `500 Internal server error`,
