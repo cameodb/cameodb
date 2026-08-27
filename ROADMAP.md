@@ -42,6 +42,7 @@ on one.
 | 15 — HA: reindex, replication, migration | 📋 Planned | All three stages |
 | 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 4.2, Stage 3's deeper warming options, and the measurement on the reporting node |
 | 17 — Record deletion | ✅ Done | — |
+| 18 — Field types: Facet and JSON | 📋 Planned | All of it — a facet field cannot be written to, a json field behaves exactly like a text one |
 | Code health — reviewed at 0.3.1 | 📋 Planned | Seven items, none behavioural |
 
 ## Reconciliation, 2026-08-26
@@ -107,6 +108,9 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F2](#f2--an-open-loop-load-generator) | An open-loop load generator | — | 2026-08-10 | 📋 |
 | [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator | — | 2026-08-10 | 📋 |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
+| [J1](#j1--a-facet-field-cannot-be-written-to) | A facet field cannot be written to | 18 | 2026-08-27 | 📋 |
+| [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
+| [J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly) | The flattening lane, and the reference that describes neither | 18 | 2026-08-27 | 📋 |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field | — | 2026-08-13 | 📋 |
 | [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to | — | 2026-08-27 | 📋 |
 
@@ -694,7 +698,9 @@ another, which is exactly the distinction `searchable` and `sortable` exist to r
 
 ### OB2 — A `facet` field cannot be written to
 
-📋 **Open**, found 2026-08-27 while auditing what the MCP syntax reference advertises.
+📋 **Open**, found 2026-08-27 while auditing what the MCP syntax reference advertises. Scoped the
+same day as [J1](#j1--a-facet-field-cannot-be-written-to); the evidence stays here, the plan is
+there.
 
 Every JSON value shape is refused. `staged_schema_validation` infers a type from the value and
 compares it with the declared one: a string infers `Text` (or `Date`, or `Ip`), a number infers a
@@ -730,7 +736,156 @@ an unusable field type into a way to stop a node with one document. Values are n
 they enter the index, on both write paths, and refused by name; the replay path skips and warns
 instead, since the value is already committed and failing an index open over one field serves
 nobody. So this item is now free to be a decision about whether the type earns its place rather
-than a decision about safety.
+than a decision about safety. That decision is [J1](#j1--a-facet-field-cannot-be-written-to).
+
+---
+
+## J. Phase 18 — Field types: Facet and JSON 📋 Planned
+
+Scoped 2026-08-27, measured against a running engine rather than read off the source.
+
+Two field types exist in the schema, are advertised in the query reference, and do not do what
+their names promise. `facet` cannot be written to at all. `json` can, and behaves exactly like
+`text` — same terms, same matches, no subfield addressing. Both are one write-path change away
+from working, and neither change is only a fix: each alters what an index means, which is why they
+are planned rather than patched.
+
+**The shape this phase settles**, and the reason it is worth stating before any of it is built:
+
+| Declared type | What it is for | How it is queried |
+|---|---|---|
+| `text` holding an object | Search everything in a blob without declaring its shape. Deliberate, and staying. | `blob:red` — keys and values alike, one bag of words |
+| `json` | Subfield addressing, with the subfield's own type | `blob.color:red`, `blob.size:>40` |
+| `facet` | One hierarchical path per document, matched at any level | `cat:/electronics` matches every descendant |
+
+The first two are not competitors. Declaring `text` is a decision to treat a blob as prose;
+declaring `json` is a decision to address inside it. Both remain, and the reference has to say
+which is which — today it describes only the second, and describes it wrongly.
+
+### J1 — A facet field cannot be written to
+
+📋 **Planned.** Smallest item here: one arm in the validator, then documentation.
+
+`staged_schema_validation` infers a type from each JSON value and compares it with the declared
+one. Nothing infers `Facet` — a string infers `Text`, a number a numeric type — so every document
+naming a declared facet field is refused with a type mismatch, whatever it carries. Filed as
+[OB2](#ob2--a-facet-field-cannot-be-written-to).
+
+**Everything else is already built**, which is what makes this small. `create_schema_from_definition`
+declares the column with `add_facet_field`, both write paths call `add_facet`,
+`normalize_facet_query` quotes the path so the grammar accepts it (without which `cat:/a/b` parses
+as a *regex* — see J3), and since 2026-08-27 a value that is not a path is refused by name rather
+than panicking the writer thread.
+
+**What Tantivy's facet gives, measured** on `a=/electronics/phones`, `b=/electronics/phones/cases`,
+`c=/electronics`, `d=/refurb/electronics/phones`, `e=/Electronics/Phones`:
+
+| Query | Matches | |
+|---|---|---|
+| `cat:/electronics` | a, b, c | a parent matches every descendant |
+| `cat:/electronics/phones` | a, b | at any level |
+| `cat:/Electronics/Phones` | e | case-sensitive: no tokenizer runs |
+| — | **not d** | anchored at the root, and matched on level boundaries |
+
+The mechanism is worth recording because it is not what a reader assumes: the hierarchy is a
+property of what was *written*, not of the query. Tantivy's `FacetTokenizer` emits the value and
+every one of its ancestors, so `/electronics/phones/cases` writes four terms and a parent query is
+an ordinary single-term lookup. One term per level per document; no prefix scan, no range.
+
+**Decisions inside this item.** Whether a facet field should also be `fast` — today a sort naming
+one is refused, and nothing has asked for it. Whether `/` remains the only separator a caller may
+write. Neither blocks the item.
+
+**Explicit non-goal: facet counts.** `FacetCollector` is not used anywhere and is not part of
+making the type work. Counting documents per level is an aggregation feature, and CameoDB has no
+aggregations — which is worth saying plainly, because per-level counts are what most people mean
+when they ask for facets. What this item delivers is a hierarchical *filter*.
+
+### J2 — A JSON field should mean subfield addressing
+
+📋 **Planned.** The substantive item, and the one with a migration in it.
+
+**Today `json` and `text` are the same field.** Measured on one document carrying
+`{"color":"red","size":42,"nested":{"brand":"acme"},"tags":["a","b"]}` in both:
+
+| Query | `json` field | `text` field |
+|---|---|---|
+| `f:red` | matches | matches |
+| `f:color` | matches | matches |
+| `f:acme` | matches | matches |
+| `f:42` | matches | matches |
+| `f.color:red` | **no match, silently** | no match, **reported** |
+
+The cause is one line: the write path serializes the value with `serde_json::to_string` and calls
+`add_text` on a field declared with `add_json_field`. A JSON field is handed a string, so it holds
+one text blob and no paths. The type costs a different schema declaration and delivers nothing.
+
+**The query half already works.** Tantivy's `Schema::find_field` splits `f.color` into a field and
+a JSON path, so a subfield query parses today and reaches the right field — it simply finds
+nothing there. `unresolvable_fields` deliberately lets a dotted name through when its root is a
+real field ("whether the path is valid for that field's type is the parser's judgement"), so
+nothing upstream objects either.
+
+**Which makes the current failure the worst of the three shapes.** On a `text` field a path is
+rejected and reported as a discarded clause, so a caller learns. On a `json` field it returns zero
+hits with no note — indistinguishable from "nothing matched". An agent reading that reports an
+empty answer to a question the index could have answered.
+
+**The change** is `add_object` with the actual map instead of `add_text` with its serialization.
+Typed subfields then come free, because Tantivy indexes each leaf by its own JSON type: strings
+tokenized as text, numbers as numbers, so `blob.size:>40` becomes a real range.
+
+**Decisions this item has to make, none of them forced by the code:**
+
+- **`expand_dots`.** With it, `{"k8s.node.id": 5}` indexes as though it were nested, and
+  `k8s.node.id:5` finds it. Without it, a literal dot inside a key must be escaped. CameoDB
+  already documents a dotted *field name* as written unescaped (`k8s.node:worker-1`), and
+  `find_field` tries the whole path as a field name **before** splitting, so the two coexist and
+  the field name wins. The one genuine ambiguity is an index holding both a `json` field `k8s` and
+  a real field `k8s.node`; the resolution order decides it silently, and the reference will have
+  to say which way.
+- **Indexing options for the string leaves** — `set_indexing_options` takes the same
+  `TextFieldIndexing` a text field does, so tokenizer and position choices apply per JSON field
+  rather than per leaf.
+- **`set_fast`**, which is what would let a subfield be sorted on, and which `sortable` would then
+  have to report for a path rather than a field.
+
+**The migration is the hard half, and it cannot be made tolerant.** An existing index with a
+`json` field holds the stringified terms. After the change, documents written earlier keep those
+and documents written later carry path terms — one index where neither query form is complete, and
+no way to tell from a result which half answered. Unlike the `_seq` retirement, which could read
+both formats, the terms here are genuinely different. So this needs either
+[D1 (reindex)](#d1--reindex) in front of it, or a stated boundary: the change applies to indexes
+created after it, and an existing `json` field keeps its old behaviour until rebuilt. Deciding
+that is part of the item, not a detail of it.
+
+**What does not change**, and it is what keeps the risk down: nothing about what a search
+*returns*. Document bodies come from redb, so a hit's `blob` field is the object as written either
+way. `add_object` changes only what matches.
+
+### J3 — The flattening lane, and the reference that describes neither lane correctly
+
+📋 **Planned.** Documentation, plus one type-dependent rule.
+
+A JSON value on a `text` field is serialized and tokenized as prose. That is by design and stays:
+it is how a caller says "make this blob searchable without declaring its shape", and it costs one
+field and no schema work. Its properties are worth writing down rather than leaving to be
+discovered — keys are indexed alongside values, so `blob:color` matches; nothing is typed, so
+`blob:42` is the string `42`; and there are no paths.
+
+**The reference is wrong about both lanes.** It documents `json` as "searchable only as
+unstructured text — its keys and values are indexed as a bag of words and paths into it cannot be
+queried", which is an accurate description of *today's json field* and will be an inaccurate one
+the moment J2 lands. And it says nothing at all about the text-flattening lane, which is the
+pattern actually in use. After J2, `field.subfield:value` stops being a single entry in
+`NOT_SUPPORTED` and becomes type-dependent: supported on `json`, reported as an error on `text`.
+
+**One trap belongs here regardless of J1 and J2.** A path-shaped value is read as a *regex* by the
+query grammar: `f:/electronics/phones` on a text or string field parses `/electronics/` as a regex
+literal, regexes are disabled, and the clause is dropped and reported — while the same syntax on a
+facet field works only because `normalize_facet_query` quotes it first. So a caller storing paths
+in a text field must write `f:"/electronics/phones"`. That is true today, undocumented today, and
+independent of everything else in this phase.
 
 ---
 
