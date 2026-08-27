@@ -430,6 +430,20 @@ fn unsortable_sort_field(
         return None;
     }
 
+    // Two different refusals, because a caller can act on one of them and not the other. A
+    // numeric or date field is one schema edit and a rebuild away from sorting; a boolean, bytes,
+    // ip, json or facet field is never getting a column, since the index builder adds those types
+    // without reading `fast` at all. Telling the second kind to "declare it fast" sends the caller
+    // to make an edit that changes nothing — and one that used to *look* like it worked, because
+    // the declaration was reported back as `true` while the guard waved the sort through to fail
+    // in every shard.
+    if !FieldDef::can_be_fast(&def.field_type) {
+        return refuse(format!(
+            "a {} field has no column to sort on, and declaring it fast cannot give it one",
+            def.field_type.to_string()
+        ));
+    }
+
     refuse(format!(
         "a {} field must be declared fast to sort, and this one is not",
         def.field_type.to_string()
@@ -10341,6 +10355,56 @@ mod tests {
                  shadow name"
             );
         }
+    }
+
+    /// A declaration cannot make a column exist, and the refusal says which case it is.
+    ///
+    /// The guard reads the declaration, and for these five types the index builder never reads it
+    /// back — `add_bool_field`, `add_bytes_field`, `add_ip_addr_field`, `add_json_field` and
+    /// `add_facet_field` take no `fast`. So a declared `fast: true` passed the guard and was then
+    /// refused by every shard, which a scatter-gather reports as `200` with an empty page. Refused
+    /// here instead, with a reason that does not send the caller off to declare a flag that
+    /// changes nothing.
+    #[test]
+    fn a_declared_fast_on_a_type_with_no_column_is_still_refused() {
+        let mut schema = IndexSchema::default();
+        for (name, field_type) in [
+            ("flag", TantivyFieldType::Boolean),
+            ("addr", TantivyFieldType::Ip),
+            ("blob", TantivyFieldType::Json),
+            ("category", TantivyFieldType::Facet),
+            ("raw", TantivyFieldType::Bytes),
+            ("rank", TantivyFieldType::U64),
+        ] {
+            let mut def = FieldDef::new(name.to_string(), field_type);
+            def.fast = Some(true);
+            schema.fields.insert(name.to_string(), def);
+        }
+
+        let refusal = |field: &str| {
+            unsortable_sort_field(
+                &schema,
+                Some(&SortSpec {
+                    field: field.to_string(),
+                    order: SortOrder::Asc,
+                }),
+            )
+        };
+
+        for field in ["flag", "addr", "blob", "category", "raw"] {
+            let Some(OrchestratorError::UnsortableField { reason, .. }) = refusal(field) else {
+                panic!("'{field}' declares a column its type cannot carry and must be refused");
+            };
+            assert!(
+                reason.contains("cannot give it one"),
+                "the reason must not ask for a declaration that already exists: {reason}"
+            );
+        }
+
+        assert!(
+            refusal("rank").is_none(),
+            "a u64 field declared fast does carry a column and must still sort"
+        );
     }
 
     /// A shadow field as the schema records one: the caller's name for the key, carrying no

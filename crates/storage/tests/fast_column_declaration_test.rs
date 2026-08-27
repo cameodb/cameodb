@@ -231,3 +231,51 @@ fn a_shadow_field_is_never_fast_however_it_is_declared() {
         "resolved rather than left as asked, so the stored schema says what the index does"
     );
 }
+
+/// A type whose column is never built is never fast, whatever the schema declares.
+///
+/// The index builder adds a boolean, bytes, ip, json or facet field with `add_bool_field` and
+/// friends, none of which reads `fast`. So a declared `true` on one of those was reported back by
+/// `_config` as `true` with no column behind it — and the sort guard, which reads the declaration,
+/// waved the sort through to be refused separately by every shard: a `200` with an empty page for a
+/// request that never ran. Resolving it to `false` here is what makes the config and the index
+/// agree, and what makes the guard refuse the sort itself.
+#[test]
+fn a_type_that_can_carry_no_column_is_never_fast() {
+    for type_name in ["boolean", "bytes", "ip", "json", "facet"] {
+        let mut schema: IndexSchema = serde_json::from_value(json!({
+            "fields": {
+                "asked": {"field_type": type_name, "indexed": true, "fast": true}
+            }
+        }))
+        .unwrap_or_else(|e| panic!("a schema declaring a {type_name} field: {e}"));
+        schema.normalize_after_deserialization();
+
+        let field = &schema.fields["asked"];
+        assert!(
+            !field.is_fast(),
+            "a {type_name} field cannot have a column, so it cannot be fast"
+        );
+        assert_eq!(
+            field.fast,
+            Some(false),
+            "and the stored schema says so, rather than repeating a claim the index cannot back"
+        );
+        assert!(!FieldDef::can_be_fast(&field.field_type));
+    }
+
+    // The types that *can* carry one are untouched by the same rule.
+    for type_name in ["text", "string", "i64", "u64", "f64", "date"] {
+        let mut schema: IndexSchema = serde_json::from_value(json!({
+            "fields": {
+                "asked": {"field_type": type_name, "indexed": true, "fast": true}
+            }
+        }))
+        .unwrap();
+        schema.normalize_after_deserialization();
+        assert!(
+            schema.fields["asked"].is_fast(),
+            "a {type_name} field declared fast keeps its column"
+        );
+    }
+}
