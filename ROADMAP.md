@@ -42,7 +42,7 @@ on one.
 | 15 — HA: reindex, replication, migration | 📋 Planned | All three stages |
 | 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 4.2, Stage 3's deeper warming options, and the measurement on the reporting node |
 | 17 — Record deletion | ✅ Done | — |
-| 18 — Field types: Facet and JSON | 📋 Planned | All of it — a facet field cannot be written to, a json field behaves exactly like a text one. No migration: neither type holds anything today |
+| 18 — Field types: Facet and JSON | ◐ Partial | J1, J2 and J3 — a facet field cannot be written to, a json field behaves exactly like a text one. The prerequisite (OB1, `fast` three-state on the wire) is done. No migration: neither type holds anything today |
 | Code health — reviewed at 0.3.1 | 📋 Planned | Seven items, none behavioural |
 
 ## Reconciliation, 2026-08-26
@@ -108,7 +108,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F2](#f2--an-open-loop-load-generator) | An open-loop load generator | — | 2026-08-10 | 📋 |
 | [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator | — | 2026-08-10 | 📋 |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
-| [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — **lands before J2**, whose override it would otherwise eat | 18 | 2026-08-13 | 📋 |
+| [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
 | [J1](#j1--a-facet-field-cannot-be-written-to) | A facet field cannot be written to | 18 | 2026-08-27 | 📋 |
 | [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
 | [J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly) | The flattening lane, and the reference that describes neither | 18 | 2026-08-27 | 📋 |
@@ -269,7 +269,8 @@ literal containing a space must be quoted, because an unquoted value ends at the
 `12:00:00` is then read as a new clause reporting `12` as an unknown field. The sort refusal was
 checked the same way, which is how the item learned that boolean, ip, json and facet are the
 types that actually reach it, numeric ones being unreachable while [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field)
-stands. `crates/storage/tests/date_query_forms_test.rs` pins all of it.
+stood — fixed 2026-08-27, so a numeric field that declines its column now reaches the refusal too.
+`crates/storage/tests/date_query_forms_test.rs` pins all of it.
 
 **One defect found while looking**, and fixed here because it is the same surface: two tool
 descriptions shipped runs of nine and five literal spaces after each paragraph break. A `\` at
@@ -677,17 +678,17 @@ so the next change to how a sorted search counts its total touches one place.
 ## H. Observed
 
 Defects found outside a phase's own work. An entry keeps its evidence here even once it is
-scoped — OB1 is the first item of Phase 18 and OB2 is what J1 fixes — because the observation and
+scoped — OB1 was Phase 18's first item and OB2 is what J1 fixes — because the observation and
 the plan answer different questions, and splitting one across two places loses the reason it was
 opened.
 
 ### OB1 — `fast: false` is not honoured on a numeric field
 
-📋 **Open**, observed 2026-08-13 and filed here 2026-08-26; it had been carried outside the
-repository until now. **Scheduled 2026-08-27 as the first item of
-[Phase 18](#j-phase-18--field-types-facet-and-json--planned)**, ahead of
+✅ **Done** 2026-08-27, as the first item of
+[Phase 18](#j-phase-18--field-types-facet-and-json--partial) and ahead of
 [J2](#j2--a-json-field-should-mean-subfield-addressing), whose `fast` override it would otherwise
-eat. The evidence stays here; the ordering is there.
+have eaten. Observed 2026-08-13, carried outside the repository, filed here 2026-08-26. The
+evidence below is what was found; what landed is at the end of the entry.
 
 A `PUT /api/{index}/_config` declaring an i64 field with `"fast": false` reads back from
 `GET /api/{index}/_config` as `"fast": true`. **Reproduced 2026-08-27** on a running node while
@@ -720,13 +721,37 @@ contract already documented — ranges and comparisons keep working, since those
 a sort on the field is refused with a 400 naming it. The refusal becomes reachable rather than
 changing.
 
-Now a prerequisite rather than a curiosity: [J2](#j2--a-json-field-should-mean-subfield-addressing)
-defaults a `json` field to `fast` and lets a caller turn it off, which is precisely the override
-this defect eats.
+A prerequisite rather than a curiosity, which is why it went first:
+[J2](#j2--a-json-field-should-mean-subfield-addressing) defaults a `json` field to `fast` and lets
+a caller turn it off, which is precisely the override this defect ate.
 
 Not an MCP defect, and not a sort defect: the engine's fast-column guard refuses a genuinely
-non-fast sort correctly. What is wrong is that the config says one thing and the index does
+non-fast sort correctly. What was wrong is that the config said one thing and the index did
 another, which is exactly the distinction `searchable` and `sortable` exist to report.
+
+**What landed.** `fast` is `Option<bool>` on the wire, skipped when absent, and
+`FieldDef::is_fast()` is now the only correct way to read it — `None` resolves through
+`FieldDef::fast_by_default`, which states each type's default in one place instead of leaving it
+implicit in an arm. `normalize_after_deserialization` resolves the value once, before any per-type
+arm can reach it, and writes the concrete result back; the numeric arm that did the overwriting is
+gone. A shadow field resolves to `false` whatever it declared, since it is never added to the
+Tantivy index and a column it cannot have is not a claim worth reporting.
+
+The compatibility prediction held in both directions: a normalized schema still serialises a plain
+boolean for every field, so `_config`, the index listing and the MCP schema surfaces read exactly
+what they read before, and no stored schema changes shape. So did the contract prediction — on a
+field that declined its column, equality, ranges and comparisons all work and only the sort is
+refused, naming the field.
+
+Pinned by `crates/storage/tests/fast_column_declaration_test.rs` — the declaration survives, the
+default still applies to a field that declared nothing, the built index carries no column for the
+one that declined, and the sort is refused while the ranges are not — and by
+`a_numeric_field_can_decline_the_fast_column_it_gets_by_default` in
+`crates/server/tests/node_http_api.rs`, which is the reported symptom end to end: `PUT` with
+`"fast": false`, `GET` reads `false`, `sortable` is `false`, a range returns its hits and a sort is
+a `400`. All four storage tests were run against the restored override before the fix and all four
+failed, the index-level one reporting `{"defaulted", "asked", "declined"}` as the sortable set.
+`docs/API_REFERENCE.md` now documents the three states and what declining a column costs.
 
 ### OB2 — A `facet` field cannot be written to
 
@@ -772,7 +797,7 @@ than a decision about safety. That decision is [J1](#j1--a-facet-field-cannot-be
 
 ---
 
-## J. Phase 18 — Field types: Facet and JSON 📋 Planned
+## J. Phase 18 — Field types: Facet and JSON ◐ Partial
 
 Scoped 2026-08-27, measured against a running engine rather than read off the source.
 
@@ -782,15 +807,16 @@ their names promise. `facet` cannot be written to at all. `json` can, and behave
 from working, and neither change is only a fix: each alters what an index means, which is why they
 are planned rather than patched.
 
-**The order is fixed, and one item is a prerequisite rather than a preference.**
-[OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) lands first: J2 defaults a `json` field
-to `fast` and lets a schema turn it off, and OB1 is the defect that eats exactly that override —
-an unconditional assignment over a `bool` that cannot express "unset". Building J2's default the
-way the numeric types build theirs would reproduce it, and the promised override would silently not
-exist. Then J1, which is independent and small; then J2; then J3, which describes what the first
-three did.
+**The order is fixed, and one item was a prerequisite rather than a preference.**
+[OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) went first and **landed 2026-08-27**: J2
+defaults a `json` field to `fast` and lets a schema turn it off, and OB1 was the defect that ate
+exactly that override — an unconditional assignment over a `bool` that cannot express "unset".
+Building J2's default the way the numeric types built theirs would have reproduced it, and the
+promised override would silently not have existed. With `fast` three-state on the wire and
+resolved in one place, J2 declares its default rather than assigning one. Then J1, which is
+independent and small; then J2; then J3, which describes what the first three did.
 
-    OB1 fix the override  →  J1 facet writable  →  J2 json subfields  →  J3 the reference
+    OB1 ✅ the override holds  →  J1 facet writable  →  J2 json subfields  →  J3 the reference
 
 **Neither needs a migration**, which is what keeps the phase small. Nothing can be written to a
 `facet` field, and a `json` field expresses nothing a `text` field does not, so there is no
@@ -953,13 +979,14 @@ that caveat once J2 lands.
   the string leaves — `None` keeps the untokenized value, which is what an ordering wants —
   whereas numeric leaves need no such choice.
 
-  **This depends on [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field).** Defaulting
-  `fast` the way the numeric types do it is what causes that defect: an unconditional assignment
-  in `normalize_after_deserialization`, over a `bool` that cannot express "unset". Implemented the
-  same way here, a caller's `"fast": false` on a json field would be silently overwritten and the
-  override this item promises would not exist. OB1's fix — three-state on the wire — **lands
-  before this item**, not alongside it: it is a change to how every field's `fast` is resolved, and
-  landing it under a new field type would mean debugging both at once.
+  **This depended on [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field), which landed
+  2026-08-27.** Defaulting `fast` the way the numeric types used to do it is what caused that
+  defect: an unconditional assignment in `normalize_after_deserialization`, over a `bool` that
+  could not express "unset". Implemented the same way here, a caller's `"fast": false` on a json
+  field would have been silently overwritten and the override this item promises would not have
+  existed. It is now a two-line change instead: add `Json` to `FieldDef::fast_by_default`, and read
+  the value through `FieldDef::is_fast()` like every other type. Nothing in this item resolves
+  `fast` itself.
 
   `sortable` would then have to report per path rather than per field, which is a listing question
   [A4](#a4--what-a-schema-listing-says-about-id-for-projection-and-for-sorting) already has open.

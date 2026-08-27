@@ -36,7 +36,7 @@ fn field(field_type: TantivyFieldType, indexed: bool) -> FieldDef {
             | TantivyFieldType::Date
     );
     let mut def = FieldDef::new("placeholder".to_string(), field_type);
-    def.fast = fast;
+    def.fast = Some(fast);
     def.indexed = indexed;
     def.stored = false;
     def

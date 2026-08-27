@@ -482,6 +482,17 @@ one is refused with `400` naming the offending field, since a description trunca
 still reads as the whole statement. A blank description is stored as no description, and an
 absent one is omitted from the schema entirely rather than serialised as null.
 
+**Fast columns.** `fast` is optional on each field and has three states, not two. Omit it and the
+default for the type applies: a numeric or date field gets a fast column, because a range or a
+sort on one is the ordinary reason to declare it, and a text field does not, because a column
+costs a full copy of every value. Set it to `true` on a text field to make its sort exact rather
+than approximate. Set it to `false` on a numeric or date field to decline the column — the field
+keeps its equality, ranges and comparisons, which are answered from the inverted index and never
+needed one; what it loses is sorting, which is then refused with `400` naming the field. The
+column is written when the index is built, so the declaration has to be in place before the data
+is written; `GET /api/{index}/_config` reports what the caller declared as `fast` and what the
+built index actually carries as `sortable`.
+
 **Response:**
 ```json
 {
@@ -528,7 +539,7 @@ has one description. `fields` is ordered with `id` first, then alphabetically.
 | `indexed` | What the schema **declares** |
 | `searchable` | Whether the built index can actually match on it. Differs from `indexed` for a field declared after the index was built — see `PATCH /api/{index}/_schema` |
 | `sortable` | Whether the built index can sort on it exactly. The same distinction `searchable` draws, for the fast column a sort orders on: `fast` is the declaration, this is whether the column exists. A numeric sort on a field that is `fast` but not `sortable` fails; a text sort on one returns an approximate order |
-| `fast` | Required to sort on a numeric or date field |
+| `fast` | Whether the field **declares** a fast column. Required to sort on a numeric or date field, where it is also the default; declaring `false` on one declines the column and gives up sorting it, keeping its ranges and comparisons |
 | `shadow` | The field carries the identifier under its original name; queried through `id` |
 | `stored` | Kept in the search index as well as the document store |
 
