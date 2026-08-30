@@ -1957,3 +1957,229 @@ async fn a_rejected_document_does_not_cost_the_rest_of_its_batch() {
         "the rejected document must not have been written: {found}"
     );
 }
+
+/// The key is the same field however a schema declares it.
+///
+/// `id` is the one field the index builder creates itself: raw-tokenized, stored and never
+/// fast, whatever the schema says. A declared type is fiction, and the engine believed it in
+/// three places — `_config` reported it, the slow write validation compared the `Text` it
+/// infers for a key against the declaration, and a sort merge keyed the field by its declared
+/// type. So an index declaring `id` as `i64` refused every document of a batch large enough to
+/// take the slow path, and one declaring it `date` returned an arbitrary order from a sort that
+/// reported no error. Both are pinned here against the declaration that provoked them.
+#[tokio::test]
+async fn a_declared_id_type_does_not_contradict_the_key_the_index_builds() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    for declared in ["text", "i64", "date"] {
+        let index = format!("keyed_{declared}");
+        let (status, body) = put_config(
+            &node,
+            &index,
+            &json!({
+                "fields": {
+                    "id": {"name": "id", "field_type": declared, "indexed": true},
+                    "title": {"name": "title", "field_type": "text", "indexed": true}
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "declaring id as {declared} should be accepted: {body}"
+        );
+
+        // Reported as what the index actually carries, not as what was asked for.
+        let described =
+            serde_json::to_value(client.get_index_config(&index).await.expect("config")).unwrap();
+        let id_field = described["fields"]
+            .as_array()
+            .expect("fields")
+            .iter()
+            .find(|f| f["name"] == "id")
+            .unwrap_or_else(|| panic!("no id field: {described}"));
+        assert_eq!(
+            id_field["type"].as_str(),
+            Some("text"),
+            "the key is a raw string whatever was declared: {described}"
+        );
+        assert_eq!(
+            id_field["fast"].as_bool(),
+            Some(false),
+            "the key never gets a fast column, so it must not claim one: {described}"
+        );
+
+        // Enough documents to take the slow validation path, which infers `Text` for the key.
+        let docs: Vec<serde_json::Value> = (0..1_100)
+            .map(|n| {
+                let id = format!("k{n:05}");
+                json!({"id": id, "doc": {"id": id, "title": "a record"}})
+            })
+            .collect();
+        let written = client.bulk_index(&index, &docs).await.expect("bulk write");
+        assert_eq!(
+            written["items_written"].as_u64(),
+            Some(1_100),
+            "a declared id type must not refuse the documents it keys: {written}"
+        );
+        client.admin_index_commit(&index).await.expect("commit");
+
+        // And a sort on the key orders by the key, rather than by a type it does not have.
+        let sorted = client
+            .search(
+                &index,
+                "title:record",
+                Some(3),
+                None,
+                None,
+                Some(storage::SortSpec {
+                    field: "id".into(),
+                    order: storage::SortOrder::Asc,
+                }),
+            )
+            .await
+            .expect("sorted search");
+        let keys: Vec<&str> = sorted["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .map(|hit| hit["id"].as_str().unwrap_or("<missing>"))
+            .collect();
+        assert_eq!(
+            keys,
+            ["k00000", "k00001", "k00002"],
+            "declared as {declared}, the sort must still order by the identifier: {sorted}"
+        );
+    }
+}
+
+/// Declaring `id` explicitly does not displace the shadow name as the key documents answer by.
+///
+/// The shadow tests elsewhere let the config endpoint insert `id` itself. A schema that names it
+/// takes a different route — enrichment runs the key's branch over a caller-supplied definition,
+/// tokenizer and all — and the question is whether anything downstream then reads `id` as an
+/// ordinary field. It must not: the identifier still travels under the shadow name, and both
+/// spellings of a query, a projection and a sort still mean the key.
+#[tokio::test]
+async fn a_declared_id_beside_a_shadow_field_is_still_the_shadow_name() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "files",
+        &json!({
+            "fields": {
+                "id":     {"name": "id",     "field_type": "text", "indexed": true,  "stored": true,  "tokenizer": "raw"},
+                "sha256": {"name": "sha256", "field_type": "text", "indexed": false, "stored": false, "is_shadow": true, "tokenizer": "raw"},
+                "title":  {"name": "title",  "field_type": "text", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "creating the config should succeed: {body}");
+
+    let ids = ["aa11", "bb22", "cc33"];
+    let docs: Vec<serde_json::Value> = ids
+        .iter()
+        .map(|k| json!({"id": k, "doc": {"id": k, "sha256": k, "title": "a record"}}))
+        .collect();
+    client.bulk_index("files", &docs).await.expect("bulk write");
+    client.admin_index_commit("files").await.expect("commit");
+
+    // The description relates the two names, exactly as it does when `id` is inserted for the
+    // caller rather than declared by it.
+    let described =
+        serde_json::to_value(client.get_index_config("files").await.expect("config")).unwrap();
+    let field = |name: &str| -> serde_json::Value {
+        described["fields"]
+            .as_array()
+            .expect("fields")
+            .iter()
+            .find(|f| f["name"] == name)
+            .unwrap_or_else(|| panic!("no {name}: {described}"))
+            .clone()
+    };
+    assert_eq!(
+        field("id")["returned_as"].as_str(),
+        Some("sha256"),
+        "a declared `id` still names what the hits carry: {described}"
+    );
+    assert_eq!(
+        field("sha256")["shadow"].as_bool(),
+        Some(true),
+        "{described}"
+    );
+
+    // Both spellings of the key answer, and every hit comes back under the shadow name.
+    for query in [
+        "sha256:bb22",
+        "id:bb22",
+        "sha256:bb22 AND title:record",
+        "title:record AND id:bb22",
+    ] {
+        let found = client
+            .search("files", query, Some(10), None, None, None)
+            .await
+            .expect("search");
+        assert_eq!(
+            found["total_hits"].as_u64(),
+            Some(1),
+            "{query:?} should find the document: {found}"
+        );
+        let hit = &found["hits"][0];
+        assert_eq!(hit["sha256"].as_str(), Some("bb22"), "{hit}");
+        assert!(hit.get("id").is_none(), "no hit carries `id`: {hit}");
+    }
+
+    // A projection naming either one, and a sort by either one, both mean the key.
+    for asked in ["id", "sha256"] {
+        let projected = client
+            .search(
+                "files",
+                "sha256:bb22",
+                Some(1),
+                None,
+                Some(vec![asked.to_string()]),
+                None,
+            )
+            .await
+            .expect("projection");
+        assert_eq!(
+            projected["hits"][0]["sha256"].as_str(),
+            Some("bb22"),
+            "projecting {asked:?} returns the identifier: {projected}"
+        );
+
+        let sorted = client
+            .search(
+                "files",
+                "title:record",
+                Some(3),
+                None,
+                None,
+                Some(storage::SortSpec {
+                    field: asked.into(),
+                    order: storage::SortOrder::Asc,
+                }),
+            )
+            .await
+            .expect("sorted search");
+        assert_eq!(
+            sorted["_approximate_sort"].as_str(),
+            Some("sha256"),
+            "the order is reported under the name the hits carry: {sorted}"
+        );
+        let keys: Vec<&str> = sorted["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .map(|hit| hit["sha256"].as_str().unwrap_or("<missing>"))
+            .collect();
+        assert_eq!(
+            keys, ids,
+            "sorting by {asked:?} orders by the identifier: {sorted}"
+        );
+    }
+}

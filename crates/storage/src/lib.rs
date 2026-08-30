@@ -2127,8 +2127,18 @@ impl IndexSchema {
             let resolved_fast = field_def.is_fast();
             field_def.fast = Some(resolved_fast);
 
-            // The 'id' field has fixed Tantivy attributes regardless of user input
+            // The 'id' field has fixed Tantivy attributes regardless of user input, and the
+            // type is one of them. The index builder skips `id` entirely and creates the key
+            // itself: raw-tokenized, stored, never fast, whatever the schema declared. A
+            // declared type is therefore fiction the rest of the engine goes on believing —
+            // `describe_index` reports it, the slow write validation infers `Text` for the key
+            // and refuses every document against an `i64` declaration, and a sort merge asked
+            // to key a `date` field parses identifiers as dates, fails, and returns an
+            // arbitrary order. Pinning both here is what keeps the schema and the index the
+            // same shape, as `can_be_fast` does for the types that carry no column.
             if key == "id" {
+                field_def.field_type = TantivyFieldType::Text;
+                field_def.fast = Some(false);
                 field_def.indexed = true;
                 field_def.stored = true;
                 field_def.tokenizer = Some("raw".to_string());
