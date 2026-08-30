@@ -36,7 +36,7 @@ on one.
 | 10 — Field projection | ✅ Done | — |
 | 11 — Read/write hot-path optimizations | ✅ Done | — |
 | 11.5 — Jemalloc memory management | ✅ Done | — |
-| 12 — MCP server integration | ◐ Partial | Streaming, semantic routing, the documentation pass, compliance tests and benchmarks, and one schema-listing defect (`id` offered for projection on a shadow index) |
+| 12 — MCP server integration | ◐ Partial | Streaming, semantic routing, the documentation pass, and compliance tests and benchmarks |
 | 13 — Thread-per-core & memory operations | ◐ Partial | Stage 2f.2 (CPU arenas) and 2f.3 (per-arena jemalloc stats) — both with the evidence against 2f.2 |
 | 14 — Security hardening | ◐ Partial | Stage C3 only (per-index role overrides); complexity caps deferred |
 | 15 — HA: reindex, replication, migration | 📋 Planned | All three stages |
@@ -90,7 +90,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [A1](#a1--mcp-streaming) | MCP streaming | 12 | 2026-08-15 | 📋 |
 | [A2](#a2--the-documentation-pass) | The documentation pass | 12 | 2026-08-15 | ◐ |
 | [A3](#a3--protocol-compliance-tests-and-agent-query-benchmarks) | Protocol-compliance tests and agent-query benchmarks | 12 | 2026-08-15 | ◐ |
-| [A4](#a4--what-a-schema-listing-says-about-id-for-projection-and-for-sorting) | What a schema listing says about `id`, for projection and for sorting | 12 | 2026-08-15 | 📋 |
+| [A4](#a4--what-a-schema-listing-says-about-id-for-projection-and-for-sorting) | What a schema listing says about `id`, for projection and for sorting | 12 | 2026-08-15 | ✅ |
 | [A5](#a5--semantic-routing) | Semantic routing | 12 | 2026-08-05 | 📋 |
 | [A6](#a6--the-syntax-reference-has-drifted-from-the-engine) | The syntax reference has drifted from the engine | 12 | 2026-08-27 | ✅ |
 | [A7](#a7--a-short-page-and-a-stale-count-say-nothing-about-why) | A short page and a stale count say nothing about why | 12 | 2026-08-27 | ✅ |
@@ -183,13 +183,20 @@ workflows**, which is what a benchmark of agent query patterns needs to run agai
 
 ### A4 — What a schema listing says about `id`, for projection and for sorting
 
-📋 **Planned.** Two halves, both about the same field and both fixed in `describe_fields`.
+✅ **Done** 2026-08-31. Two halves, both about the same field.
 
-**Projection.** On an index with a shadow field, `describe_fields` in `node_orchestrator.rs`
-still describes `id` as an ordinary field although no document returns one — reconstruction
-answers with the shadow name *instead of* `id`. So `id` should stop being offered as something
-to *project*, while remaining something to query, and something to sort by. Opened by
-completion track item 3.
+**Projection** ✅ **Done** 2026-08-31, and the remedy is the opposite of the one this item
+proposed. The plan was that `id` "should stop being offered as something to *project*, while
+remaining something to query". Withdrawing it from the listing turned out to be the worse of the
+two options: `id:VALUE` still answers on a shadow index, so a description without `id` makes
+`validate_query` report the working form as an unknown field — trading a silent empty projection
+for a confident wrong warning.
+
+So `id` stays listed, and the projection was made to work instead. A projection naming `id` is
+rewritten to the name the hits carry before it is checked or applied, and the `id` entry carries
+`returned_as` naming that field, on `describe_index` and on `validate_query`'s `available_fields`
+alike. That is the only thing relating the two names on a surface where they otherwise read as
+two searchable text fields of the same type. Opened by completion track item 3.
 
 **Sorting** ✅ **Done** 2026-08-27, and smaller than this item first claimed. The audit filed it
 as "`sortable: false` is wrong for `id` and its shadow name". Verification against a running node
@@ -203,9 +210,14 @@ What was genuinely missing was narrower and shadow-specific. A shadow field read
 `indexed: false, fast: false, sortable: false`, and the guidance says an unindexed field matches
 nothing — so nothing told an agent that sorting by it works at all, let alone that it orders by
 the identifier. Confirmed on a node: `sort=doi` on a shadow index returns the right order and
-reports `_approximate_sort: "doi"`, the caller's own name rather than `id`. `SHADOW_FIELD` and the
-orchestrator skill now say so, which is one edit propagating to the per-field `query_hint`, the
-README, `validate_query` and the served prompt.
+reports `_approximate_sort: "doi"`. `SHADOW_FIELD` and the orchestrator skill now say so, which is
+one edit propagating to the per-field `query_hint`, the README, `validate_query` and the served
+prompt.
+
+Amended 2026-08-31: that name is the one the *hits carry*, not the one the request used. The two
+differ when a caller sorts a shadow index by `id`, where reporting `id` named the single field
+absent from every hit in the same response — leaving nothing to check the order against. Both
+spellings now report the shadow name.
 
 No flag changed. Reporting `sortable: true` for an approximate sort would break a contract a test
 names, and adding a third state is not worth it while `fast` already answers "how well".
@@ -994,7 +1006,8 @@ that caveat once J2 lands.
   `fast` itself.
 
   `sortable` would then have to report per path rather than per field, which is a listing question
-  [A4](#a4--what-a-schema-listing-says-about-id-for-projection-and-for-sorting) already has open.
+  no item currently holds — [A4](#a4--what-a-schema-listing-says-about-id-for-projection-and-for-sorting)
+  was the nearest and closed without touching it, since a JSON subfield is not the case it was about.
 
 **The two term spaces are disjoint, and that decides the migration** — measured by writing one
 document each way into the same field and querying both:
@@ -1472,11 +1485,12 @@ that validates nothing, and in both cases the cause sat under the tool.
    silence. `is_queryable()` was `indexed || is_shadow`; it is `searchable || is_shadow` now, the
    shadow half kept because a shadow field names the identifier, which is answered from redb
    rather than the search index.
-   Still open, and carried forward as
-   [A4](#a4--what-a-schema-listing-says-about-id-for-projection-and-for-sorting): on an index with a shadow field, `id` is described as
-   an ordinary field although no document returns one — the identifier comes back under the shadow
-   name — so `id` should stop being offered as something to *project*, while remaining something
-   to query.
+   Carried forward as
+   [A4](#a4--what-a-schema-listing-says-about-id-for-projection-and-for-sorting) and closed there
+   on 2026-08-31, the other way round: `id` stays offered, because `id:VALUE` still answers on such
+   an index and withdrawing it would make `validate_query` call the working form unknown. The
+   projection was made to work instead, and the `id` entry carries `returned_as` naming the field
+   the hits use in its place.
 
 4. ~~**Paging: `offset` on a search.**~~ ✅ Landed 2026-08-15. `offset` on both HTTP search routes,
    both MCP tools, the SDK, a `--offset` flag and the query grammar (`limit 10 offset 20`) — the

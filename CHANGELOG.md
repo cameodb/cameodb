@@ -96,8 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     'FIELD'` and the reason, before any shard runs. Boolean, ip, json and facet are the types
     this catches in practice.
   - **A shadow field can be sorted**, approximately, ordering by the identifier it stands for and
-    reporting `_approximate_sort` under the caller's own name. The shadow rule covered querying
-    and projection and was silent on the third thing the field is for.
+    reporting `_approximate_sort` under the name the hits carry it by. The shadow rule covered
+    querying and projection and was silent on the third thing the field is for.
   - **`limit 0` — count-only, and the cheapest way to ask how many documents match** — was
     documented only in a hand-written schema string, so it was missing from the reference and the
     README.
@@ -105,7 +105,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     to one term is matched as that term exactly and reported, and a facet path ends at the first
     space.
 
+- **A bulk write no longer stores documents that failed validation.** It collected the validation
+  errors, logged that it would continue with the valid documents, and then did neither: nothing
+  was dropped, so an invalid document was written exactly as if it had passed, and nothing was
+  reported, so the response counted it among the successes. A single write refused the same
+  document outright, which made the rule a property of which endpoint the caller used rather than
+  of the index.
+
+  The validation summary now carries each failure's position in the batch, the rejected rows are
+  left unwritten, and their reasons reach the caller in the response's `errors` — so
+  `items_received` minus `items_written` is accounted for. Rejecting the whole batch was the other
+  defensible policy and is not this one's: a bulk write already reports partial success, and one
+  unstorable row in an import is no reason to discard the rows around it.
+
+  **This changes what an existing pipeline sees.** A caller that was writing documents which fail
+  schema validation — a type mismatch, or a shadow field disagreeing with the identifier — will
+  see `items_written` fall and `errors` appear where neither did before. Those documents were
+  being stored wrong, and the count that called them written was the thing that was false.
+
+- **A document whose shadow field disagrees with its identifier is refused.** A shadow field is
+  the document key under the source's own name and nothing holds a second copy of the value: the
+  write path strips the field out of the stored body and the read path writes the key back under
+  it. That round trip returns what was written only while the two agree, so a document saying
+  otherwise had the value it carried silently and unrecoverably discarded —
+  `{"id": "AAA", "md5": "BBB"}` came back as `md5: "AAA"`, and `md5:BBB` matched nothing while
+  `md5:AAA` matched. Both write paths now refuse it, naming the field and both values.
+
+  The rest of the design already rested on this invariant: `document_key_field` picks any one
+  shadow name to read the key back under and reconstruction writes the key under every one, both
+  defensible only if all of them mean the key. The bundled importer checks it before promoting a
+  column to shadow; this is the same rule for a write arriving by any other route. A document may
+  still omit the shadow field entirely, which is the ordinary shape of a rewritten document.
+
 ### Fixed
+
+- **A shadow field only worked alone.** It is the document key under the source's own name, and
+  only the bare `sha256:VALUE` lookup ever resolved: named inside a larger query the clause was
+  dropped and reported, and a projection asking for `id` returned a document with nothing in it.
+  The code meant to handle this parsed the query as a JSON query DSL that this engine does not
+  speak, so it matched nothing and had never done anything.
+
+  A shadow reference is now rewritten to `id` before the parser sees it, so it composes like any
+  other clause — in a conjunction, a negation, a range, a set or a prefix — and a projection
+  naming `id` is rewritten to the name the hits carry. Sorting by either name orders by the
+  identifier and reports `_approximate_sort` under the name the documents use.
+
+- **The key-value fast path and the parser disagreed about the same identifier.** A whole-query
+  `id:VALUE` is answered from the key-value store without parsing, and it took the value
+  literally: `sha256:urn\:x\:1` looked up a key with the backslash still in it and found
+  nothing, while the same clause inside a conjunction reached the parser, which resolves the
+  escape, and returned the document. `sha256:VALUE^2` missed for the same reason — a boost is
+  syntax the key-value store cannot answer.
+
+  Escapes are resolved before the lookup, and `^` now falls through to the search index, which
+  understands it. An identifier that genuinely contains one stays reachable by escaping it, and
+  identically from both paths. `~` is deliberately left on the fast path: Tantivy reads it as
+  slop only after a quoted phrase, so against a bare term it is an ordinary character an
+  identifier may contain.
+
+- **`validate_query` reported fields the query did not name.** Three separate scanners answered
+  "where are the field names in this query", and the one furthest from the engine knew nothing of
+  phrases, ranges, or where a value begins. It read `00` out of an RFC3339 timestamp and `https`
+  out of a URL, so a working query came back with two or three confident warnings about fields
+  the index does not have — from the tool the guidance sends an agent to when it doubts a query,
+  which is the one place a false alarm is indistinguishable from a real one.
+
+  There is now one scanner, in the engine: the shadow rewriter splices over its spans, the schema
+  check classifies its names, and the MCP layer lists them, so the three cannot drift. It also
+  splits a token at `(`, since a parenthesis ends one clause and begins another without needing a
+  space — read whole, `AND(sha256:x)` named a field called `AND(sha256`.
+
+- **`describe_index` listed `id` and a shadow field as unrelated fields.** On such an index both
+  are searchable text fields standing for the same value, and `id` is the one an agent reaches
+  for — it is the field every other index has, and the syntax reference calls it the fastest
+  retrieval there is. Querying it works, so the description cannot simply drop it; without
+  something relating the two, hits carrying no `id` had no explanation.
+
+  The `id` entry now carries `returned_as`, naming the field the hits use in its place, on
+  `describe_index` and on `validate_query`'s `available_fields`. Omitting `id` instead was
+  rejected: `id:VALUE` still answers on such an index, so a description without it would make
+  `validate_query` report the working form as an unknown field.
+
+- **A declared `id` type contradicted the key the index builds.** The index builder skips `id` and
+  creates the key itself — raw-tokenized, stored, never fast, whatever the schema declared — but
+  enrichment pinned only the indexed, stored and tokenizer flags. The declared type and `fast`
+  survived, and three readers trusted them: `_config` reported the declaration, the slow write
+  validation compared it against the `Text` it infers for a key, and a sort merge built its key
+  from it.
+
+  An index declaring `id` as `i64` therefore refused every document of a batch large enough to
+  take the slow path — 1200 sent, 1200 rejected against a type the index does not use. One
+  declaring it `date` answered an ascending sort with `k20, k30, k10`, because the merge key
+  parsed each identifier as a date, got nothing, and sorted every hit last. Neither reported an
+  error. `_config` also showed `fast: true` next to `sortable: false`, the mismatch `can_be_fast`
+  already settles for the types that carry no column. Enrichment now pins the type and `fast`
+  alongside the other three.
 
 - **A facet value the type could not hold would have aborted the node.**
   `Facet: From<&str>` is `Facet::from_text(path).unwrap()`, and a facet path must be non-empty and
