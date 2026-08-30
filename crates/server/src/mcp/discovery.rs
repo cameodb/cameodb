@@ -183,6 +183,13 @@ pub(super) fn validate_query(
                 {
                     obj.insert("description".to_string(), JsonValue::String(text.clone()));
                 }
+                // Carried through for the same reason `describe_index` reports it: it is the
+                // only thing relating `id` to the shadow name beside it.
+                if let Some(name) = &info.returned_as
+                    && let Some(obj) = entry.as_object_mut()
+                {
+                    obj.insert("returned_as".to_string(), JsonValue::String(name.clone()));
+                }
                 entry
             })
             .collect();

@@ -546,6 +546,7 @@ has one description. `fields` is ordered with `id` first, then alphabetically.
 | `sortable` | Whether the built index can sort on it exactly. The same distinction `searchable` draws, for the fast column a sort orders on: `fast` is the declaration, this is whether the column exists. A numeric sort on a field that is `fast` but not `sortable` fails; a text sort on one returns an approximate order |
 | `fast` | Whether the field **declares** a fast column. Required to sort on a numeric or date field, where it is also the default; declaring `false` on one declines the column and gives up sorting it, keeping its ranges and comparisons. Always `false` on a `boolean`, `bytes`, `ip`, `json` or `facet` field, which carry no column |
 | `shadow` | The field carries the identifier under its original name; queried through `id` |
+| `returned_as` | Present on `id` alone, and only on an index that has a shadow field: names the field hits carry the identifier under instead, since no hit on such an index carries an `id` |
 | `stored` | Kept in the search index as well as the document store |
 
 #### Change Field Indexing Flags

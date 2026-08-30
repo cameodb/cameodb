@@ -23,6 +23,7 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -635,10 +636,14 @@ fn prepare_query_parser(
     schema: &IndexSchema,
     query: &str,
 ) -> (String, Vec<String>, tantivy::query::QueryParser) {
+    // Shadow names first, so every later rewriter — and the parser — sees only fields the
+    // Tantivy schema actually carries.
+    let query = rewrite_shadow_fields(query, schema);
+
     // Normalize date literals against the schema so naive inputs match indexed Date fields,
     // then facets, then rewrite single-term prefixes into ranges.
     let (normalized_query, prefix_notes) = normalize_prefix_query(
-        &normalize_facet_query(&normalize_date_query(query, schema), schema),
+        &normalize_facet_query(&normalize_date_query(&query, schema), schema),
         tantivy_index,
     );
 
@@ -793,6 +798,133 @@ fn first_unescaped_colon(token: &str) -> Option<usize> {
     None
 }
 
+/// One field name a query references, and where it sits in the query string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldReference<'a> {
+    /// Byte range of the name as written, escapes included.
+    ///
+    /// What a rewriter splices over. Kept separate from `name` because the two differ whenever
+    /// the query escaped something: `k8s\.node` occupies ten bytes and names a nine-byte field.
+    pub span: std::ops::Range<usize>,
+    /// The name to look the schema up by, with the query's escapes resolved.
+    pub name: Cow<'a, str>,
+}
+
+/// Every field name a query references, in the order they appear.
+///
+/// Shared so the readers of this question cannot disagree about what a query says: the shadow
+/// rewriter splices over the span, [`unresolvable_fields`] classifies the name against the
+/// schema, and the MCP layer lists the names for an agent.
+///
+/// A reference is the text before the first unescaped colon of a segment, after any leading
+/// `+`, `-` or `!`, and a segment yields at most one. The rules that are not obvious:
+///
+/// - **Only the first colon splits.** A colon occurs inside values too, so taking every
+///   name-then-colon run would read `2024-06-15T00` out of `created:2024-06-15T00:00:00Z` and
+///   `https` out of `url:https://x`.
+/// - **A segment is a whitespace token split again at `(` and `)`,** since a parenthesis ends
+///   one clause and begins another without needing a space: `AND(sha1:x)` references `sha1`.
+/// - **Only *leading* occurrence operators are stripped** — `content-type` is a name a `-` sits
+///   inside.
+/// - **Phrases, ranges and sets hold values, so nothing inside one is read.** Depth is tracked
+///   for `[`/`{` only; parentheses group clauses and deliberately do not count.
+///
+/// The result borrows from `query`, and `name` allocates only for a name that was escaped.
+pub fn field_references(query: &str) -> Vec<FieldReference<'_>> {
+    let mut found = Vec::new();
+    let mut inside_phrase = false;
+    // Depth of `[ ]` and `{ }` only. Parentheses group clauses and do contain field references.
+    let mut value_depth = 0i32;
+
+    for (token_start, token) in whitespace_tokens(query) {
+        // Read before the token's own delimiters are counted, so a token that opens a range
+        // still offers the field name in front of it: `created:[2024-01-01` names `created`.
+        let readable_position = !inside_phrase && value_depth == 0;
+
+        for (offset, segment) in clause_segments(token) {
+            if readable_position
+                && let Some(reference) = leading_field_reference(segment, token_start + offset)
+            {
+                found.push(reference);
+            }
+        }
+
+        // Then track what this token opened or closed for the tokens after it.
+        let mut escaped = false;
+        for ch in token.chars() {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => inside_phrase = !inside_phrase,
+                '[' | '{' => value_depth += 1,
+                ']' | '}' => value_depth = (value_depth - 1).max(0),
+                _ => {}
+            }
+        }
+    }
+
+    found
+}
+
+/// Whitespace-separated tokens with their byte offsets, which `split_whitespace` drops.
+fn whitespace_tokens(query: &str) -> impl Iterator<Item = (usize, &str)> {
+    query.split_whitespace().scan(0usize, |cursor, token| {
+        // The gap between tokens is whitespace alone, so the token's first occurrence at or
+        // after the cursor is its position.
+        let start = *cursor
+            + query[*cursor..]
+                .find(token)
+                .expect("tokens come from this string");
+        *cursor = start + token.len();
+        Some((start, token))
+    })
+}
+
+/// A token split at its parentheses, each piece with its offset within the token.
+///
+/// A parenthesis ends one clause and begins another without needing a space, so the pieces
+/// either side of it are separate candidates for a field reference.
+fn clause_segments(token: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut offset = 0;
+    token
+        .split_inclusive(['(', ')'])
+        .map(move |piece| {
+            let start = offset;
+            offset += piece.len();
+            (start, piece.trim_end_matches(['(', ')']))
+        })
+        .filter(|(_, piece)| !piece.is_empty())
+}
+
+/// The field reference a segment opens with, if it opens with one.
+///
+/// `at` is the segment's byte offset in the whole query, so the returned span is absolute.
+fn leading_field_reference(segment: &str, at: usize) -> Option<FieldReference<'_>> {
+    let sigils = segment.len() - segment.trim_start_matches(['+', '-', '!']).len();
+    let segment = &segment[sigils..];
+
+    // A field reference never opens a phrase, a range or a set.
+    if segment.starts_with(['"', '[', '{']) {
+        return None;
+    }
+    let colon = first_unescaped_colon(segment)?;
+    let name = &segment[..colon];
+    if name.is_empty() {
+        return None;
+    }
+
+    let start = at + sigils;
+    Some(FieldReference {
+        span: start..start + name.len(),
+        // Escapes are the query's, not the field's: `k8s\.node` names the field `k8s.node`.
+        name: if name.contains('\\') {
+            Cow::Owned(name.replace('\\', ""))
+        } else {
+            Cow::Borrowed(name)
+        },
+    })
+}
+
 /// Why a field name a query references cannot answer it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FieldIssue {
@@ -809,15 +941,9 @@ enum FieldIssue {
 /// it: the clause parses cleanly, matches nothing, and produces no error. A clause lost that
 /// way is as ineffective as a dropped one, and in a negation it disables the exclusion.
 ///
-/// A candidate is the text before the first unescaped colon of a whitespace-separated token,
-/// after any leading `+`, `-`, `(` or `!`. Only tokens in a position where a field name can
-/// appear are read, since a colon also occurs inside values — an RFC3339 timestamp, a URL —
-/// and reading one of those as a field name would refuse a valid query at the MCP layer.
-/// Excluded on that basis: tokens inside a quoted phrase, and tokens inside a range or set,
-/// which hold values rather than field references.
-///
-/// Nothing is claimed either when the schema is empty, or for a dotted name whose root is a real
-/// field, since the parser judges the path itself.
+/// Which names a query references is [`field_references`]'s question; this one only says what
+/// the schema makes of each. Nothing is claimed when the schema is empty, or for a dotted name
+/// whose root is a real field, since the parser judges the path itself.
 fn unresolvable_fields(query: &str, schema: &IndexSchema) -> Vec<(String, FieldIssue)> {
     // An index with no stored schema yields an empty one; everything would look unresolvable.
     if schema.fields.is_empty() {
@@ -825,44 +951,16 @@ fn unresolvable_fields(query: &str, schema: &IndexSchema) -> Vec<(String, FieldI
     }
 
     let mut found: Vec<(String, FieldIssue)> = Vec::new();
-    let mut inside_phrase = false;
-    // Depth of `[ ]` and `{ }` only. Parentheses group clauses and do contain field references.
-    let mut value_depth = 0i32;
 
-    for token in query.split_whitespace() {
-        let readable_position = !inside_phrase && value_depth == 0;
-        if token.matches('"').count() % 2 == 1 {
-            inside_phrase = !inside_phrase;
-        }
-        value_depth += token.matches(['[', '{']).count() as i32;
-        value_depth -= token.matches([']', '}']).count() as i32;
-        value_depth = value_depth.max(0);
-        if !readable_position {
-            continue;
-        }
-
-        let token = token.trim_start_matches(['+', '-', '(', '!']);
-        // A field reference never opens a phrase, a range or a set.
-        if token.starts_with(['"', '[', '{']) {
-            continue;
-        }
-        let Some(colon) = first_unescaped_colon(token) else {
-            continue;
-        };
-        let candidate = &token[..colon];
-        if candidate.is_empty() {
-            continue;
-        }
-
-        // Escapes are the query's, not the field's: `k8s\.node` names the field `k8s.node`.
-        let name = candidate.replace('\\', "");
+    for reference in field_references(query) {
+        let name = reference.name;
 
         // `id` and `_seq` are added to every Tantivy schema, not to `IndexSchema::fields`.
         if name == "id" || name == "_seq" {
             continue;
         }
 
-        let issue = match schema.fields.get(&name) {
+        let issue = match schema.fields.get(name.as_ref()) {
             // Shadow fields are rewritten to `id` before a query reaches the engine.
             Some(def) if def.indexed || def.is_shadow => continue,
             Some(_) => FieldIssue::NotIndexed,
@@ -878,42 +976,119 @@ fn unresolvable_fields(query: &str, schema: &IndexSchema) -> Vec<(String, FieldI
         };
 
         if !found.iter().any(|(seen, _)| *seen == name) {
-            found.push((name, issue));
+            found.push((name.into_owned(), issue));
         }
     }
 
     found
 }
 
-/// Parse exact ID queries (id:value or shadow_field:value) that can bypass Tantivy.
-/// Returns Some((id_value, true)) for exact ID queries, None otherwise.
+/// Characters that make a value the parser's business rather than the key-value store's.
+///
+/// Each one is syntax — a space, quote or parenthesis ends the value, `*` is the prefix operator
+/// and `^` the boost — and the key-value store can only look a key up whole, so a value carrying
+/// one falls through to the search index instead.
+///
+/// Matched *before* escapes are removed, so an escaped operator goes to the parser too. That is
+/// what keeps an identifier genuinely containing one reachable: the parser resolves `id:d1\^2`
+/// to the literal `d1^2`, bare and inside a larger query alike.
+///
+/// `~` is deliberately absent. Tantivy reads it as slop only after a quoted phrase; against a
+/// bare term it is an ordinary character an identifier may contain.
+const QUERY_SYNTAX_IN_VALUE: &[char] = &[' ', '"', '(', ')', '*', '^'];
+
+/// The identifier a whole-query `id:VALUE` or `shadowfield:VALUE` lookup names, or `None` when
+/// the query is not that shape.
+///
+/// This is the one path that answers without the search index, so it has to read the query the
+/// way the parser would — otherwise a bare lookup and the same clause inside a larger query
+/// disagree about which document was named. Two things keep them aligned:
+///
+/// - The field name ends at the first *unescaped* colon, the same position
+///   [`rewrite_shadow_fields`] and [`unresolvable_fields`] read it at.
+/// - Escapes in the value are removed, because the parser removes them: `id:urn\:x\:1` names
+///   the key `urn:x:1`.
+///
+/// A value carrying anything in [`QUERY_SYNTAX_IN_VALUE`] is not a whole key and is left to the
+/// parser.
 fn parse_exact_id_query(query: &str, schema: &IndexSchema) -> Option<(String, bool)> {
     let query = query.trim();
 
-    // Check for simple id:value pattern (no AND/OR operators)
-    if let Some(colon_pos) = query.find(':') {
-        let field_part = &query[..colon_pos].trim();
-        let value_part = &query[colon_pos + 1..].trim();
+    let colon = first_unescaped_colon(query)?;
+    let field_part = query[..colon].trim();
+    let value_part = query[colon + 1..].trim();
 
-        // Must be a simple query with no operators
-        if value_part.contains(&[' ', '"', '(', ')'][..]) {
-            return None;
-        }
-
-        // Check if it's the id field or a shadow field
-        if *field_part == "id" {
-            return Some((value_part.to_string(), true));
-        }
-
-        // Check shadow fields
-        if let Some(field_def) = schema.fields.get(*field_part)
-            && field_def.is_shadow
-        {
-            return Some((value_part.to_string(), true));
-        }
+    if value_part.contains(QUERY_SYNTAX_IN_VALUE) {
+        return None;
     }
 
-    None
+    // The document key under its own name, or under a shadow name that stands for it.
+    if field_part != "id" && !schema.is_shadow_field(field_part) {
+        return None;
+    }
+
+    Some((unescape_query_value(value_part), true))
+}
+
+/// A query value with the parser's escapes removed: `\x` is the literal `x`.
+///
+/// Tantivy's grammar reads a backslash as "the next character is data, not syntax", and drops
+/// the backslash when it builds the term. Anything comparing a value against stored data has to
+/// do the same, or the two see different strings. A trailing lone backslash is kept, since there
+/// is no character after it for it to have been escaping.
+fn unescape_query_value(value: &str) -> String {
+    if !value.contains('\\') {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some(escaped) => out.push(escaped),
+                None => out.push('\\'),
+            },
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Rewrite each shadow field reference in a query string to the canonical `id` field it stands
+/// for.
+///
+/// A shadow field is the identifier under its source name: the value lives in `id`, which every
+/// Tantivy schema carries indexed, so the name can appear anywhere a field name can — alone,
+/// where [`parse_exact_id_query`] answers from the key-value store without parsing, or inside a
+/// larger query, where it is rewritten here and runs against the search index like any other
+/// clause.
+///
+/// Only the name in field-reference position is replaced, as [`field_references`] finds it, so
+/// a shadow name inside a phrase or a range stays the value it is. The replacement is spliced
+/// by byte range, leaving the rest of the query — whitespace, quoting, escapes — untouched.
+fn rewrite_shadow_fields(query: &str, schema: &IndexSchema) -> String {
+    if schema.shadow_fields.is_empty() {
+        return query.to_string();
+    }
+
+    let spans: Vec<std::ops::Range<usize>> = field_references(query)
+        .into_iter()
+        .filter(|reference| schema.is_shadow_field(&reference.name))
+        .map(|reference| reference.span)
+        .collect();
+    if spans.is_empty() {
+        return query.to_string();
+    }
+
+    let mut rewritten = String::with_capacity(query.len());
+    let mut cursor = 0;
+    for span in spans {
+        rewritten.push_str(&query[cursor..span.start]);
+        rewritten.push_str("id");
+        cursor = span.end;
+    }
+    rewritten.push_str(&query[cursor..]);
+    rewritten
 }
 
 /// Longest token, in bytes, that `default` and `en_stem` keep.
@@ -1904,7 +2079,6 @@ pub struct IndexSchema {
     #[serde(default = "default_routing_field")]
     pub routing_field_name: String,
     /// Pre-computed set of shadow field names for O(1) lookup.
-    /// Eliminates per-document HashMap scan in get_shadow_mapping().
     /// Rebuilt from fields on deserialization via rebuild_shadow_fields_cache().
     #[serde(skip)]
     pub shadow_fields: HashSet<String>,
@@ -2206,16 +2380,6 @@ impl IndexSchema {
         self.shadow_fields.contains(field_name)
     }
 
-    /// Get mapping of shadow field names to canonical "id" field
-    /// All shadow fields map to "id" for query transformation
-    pub fn get_shadow_mapping(&self) -> HashMap<String, String> {
-        self.fields
-            .iter()
-            .filter(|(_, def)| def.is_shadow)
-            .map(|(name, _)| (name.clone(), "id".to_string()))
-            .collect()
-    }
-
     /// Determine if a field should evolve to a new type (static version to avoid borrowing issues)
     fn should_evolve_field_static(current: &FieldDef, new_type: TantivyFieldType) -> bool {
         // Don't evolve if types are the same
@@ -2502,41 +2666,7 @@ pub fn document_key_field(schema: &IndexSchema) -> String {
         .unwrap_or_else(|| "id".to_string())
 }
 
-pub fn reconstruct_shadow_fields_in_json(json_blob: &JsonValue, schema: &IndexSchema) -> JsonValue {
-    if let Some(obj) = json_blob.as_object() {
-        let shadow_mapping = schema.get_shadow_mapping();
-
-        // Capacity optimization: pre-allocate for shadow + original fields
-        let mut out = JsonMap::with_capacity(obj.len() + shadow_mapping.len());
-
-        // OPTIMIZATION 1: Use get() instead of get().cloned() to avoid temporary allocation
-        if let Some(id_val) = obj.get("id") {
-            // Insert canonical id first (Enforces Order)
-            out.insert("id".to_string(), id_val.clone());
-
-            // Then shadow fields
-            for (shadow_field, canonical_field) in shadow_mapping.iter() {
-                // Check if mapping targets "id" and field doesn't already exist
-                if canonical_field == "id" && !obj.contains_key(shadow_field) {
-                    out.insert(shadow_field.clone(), id_val.clone());
-                }
-            }
-        }
-
-        // Then remaining original fields (skip id since we added it)
-        for (k, v) in obj {
-            if k != "id" {
-                out.insert(k.clone(), v.clone());
-            }
-        }
-
-        JsonValue::Object(out)
-    } else {
-        json_blob.clone()
-    }
-}
-
-/// Optimized: Reconstruct shadow fields by consuming the input (Ownership Transfer).
+/// Reconstruct shadow fields by consuming the input (Ownership Transfer).
 ///
 /// The `doc_id` parameter provides the canonical document identifier from the redb key
 /// or tantivy stored field. This is used as the authoritative ID source when the blob
@@ -2558,10 +2688,8 @@ pub fn reconstruct_shadow_fields_owned(
         _ => return json_blob,
     };
 
-    let shadow_mapping = schema.get_shadow_mapping();
-
     // CASE 1: No Shadow Fields -> Strict ID Ordering
-    if shadow_mapping.is_empty() {
+    if schema.shadow_fields.is_empty() {
         // Fast Path: Check if 'id' is already first (O(1) check)
         if let Some(first_key) = obj.keys().next()
             && first_key == "id"
@@ -2580,18 +2708,19 @@ pub fn reconstruct_shadow_fields_owned(
     }
 
     // CASE 2: Shadow Fields Exist -> Replace ID with Shadow Field(s)
-    let mut out = JsonMap::with_capacity(obj.len() + shadow_mapping.len());
 
     // Resolve the canonical ID: prefer blob's "id", fall back to doc_id (redb key)
     let id_val = obj
         .remove("id")
         .unwrap_or_else(|| serde_json::Value::String(doc_id.to_string()));
 
-    // Insert Shadow Fields FIRST
-    for (shadow_field, canonical_field) in shadow_mapping {
-        if canonical_field == "id" {
-            out.insert(shadow_field, id_val.clone());
-        }
+    // Sorted, so a hit's field order does not depend on set iteration order.
+    let mut shadow_names: Vec<&String> = schema.shadow_fields.iter().collect();
+    shadow_names.sort_unstable();
+
+    let mut out = JsonMap::with_capacity(obj.len() + shadow_names.len());
+    for name in shadow_names {
+        out.insert(name.clone(), id_val.clone());
     }
     // Note: We deliberately SKIP inserting "id" here.
     // The shadow field replaces it in the presentation layer.
@@ -5612,6 +5741,17 @@ impl HybridStore {
             .get_schema_cached(index)?
             .unwrap_or_else(|| Arc::new(IndexSchema::default()));
 
+        // An exact id or shadow-field lookup never reaches the parser on the search path —
+        // `parse_exact_id_query` answers it from the key-value store — so validating it must
+        // not report the identifier's field as a discarded clause.
+        if parse_exact_id_query(query, &schema).is_some() {
+            return Ok(Some(QueryValidation {
+                normalized_query: query.to_string(),
+                syntax_errors: Vec::new(),
+                discarded: Vec::new(),
+            }));
+        }
+
         let (normalized_query, prefix_notes, query_parser) =
             prepare_query_parser(tantivy_index, &fields, &schema, query);
 
@@ -5838,7 +5978,7 @@ impl HybridStore {
             // are not the same name.
             //
             // A shadow field *is* the document key under the source's own name: the query path
-            // maps it to `id` (`transform_shadow_query`), so a sort maps the same way or the two
+            // maps it to `id` (`rewrite_shadow_fields`), so a sort maps the same way or the two
             // disagree about what the caller's name means. That gives the column to order on.
             // But the value the caller reads back is not under that name — shadow
             // reconstruction *replaces* `id` with the shadow field on the way out (see
@@ -6168,9 +6308,13 @@ impl HybridStore {
         // between runs, and every merge above it inherits that.
         // Read before the sort below consumes it: an approximate order is a property of the
         // answer, and the caller has to be able to see it on the answer.
-        let approximate_sort = string_sort
-            .as_ref()
-            .and_then(|_| _sort.map(|spec| spec.field.clone()));
+        //
+        // Named as the *documents* name it, not as the request did. The two differ only when
+        // the sort is on the document key of a shadow index, where a caller may say `id` and
+        // every hit comes back carrying the shadow name instead — reporting `id` there names a
+        // field absent from every hit in the same response, which is the one thing a caller
+        // cannot check the order against.
+        let approximate_sort = string_sort.as_ref().map(|(name, _)| name.clone());
 
         if let Some((field, order)) = string_sort {
             let mut ranked: Vec<(usize, _)> = std::mem::take(&mut results)

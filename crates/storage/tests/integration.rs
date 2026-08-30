@@ -251,19 +251,17 @@ fn test_shadow_field_preservation_during_evolution() {
     println!("   ✅ Shadow field preserved during evolution");
     println!("   ✅ Other fields added normally");
 
-    // Step 4: Verify shadow mapping works
-    println!("4. Testing shadow mapping...");
-    let shadow_mapping = schema.get_shadow_mapping();
+    // Step 4: Verify the shadow field is recognised as one
+    println!("4. Testing shadow field recognition...");
     assert!(
-        shadow_mapping.contains_key("book_id"),
-        "book_id should be in shadow mapping"
+        schema.is_shadow_field("book_id"),
+        "book_id should be recognised as a shadow field"
     );
-    assert_eq!(
-        shadow_mapping.get("book_id").unwrap(),
-        "id",
-        "book_id should map to 'id'"
+    assert!(
+        !schema.is_shadow_field("title"),
+        "title is an ordinary field, not a shadow"
     );
-    println!("   ✅ Shadow mapping works correctly");
+    println!("   ✅ Shadow field recognised correctly");
 
     // Step 5: Simulate the CSV import finalization process (like in detect_schema_from_csv)
     println!("5. Testing CSV import finalization process...");

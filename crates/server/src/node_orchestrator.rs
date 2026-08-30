@@ -73,6 +73,7 @@ use crate::cluster_coordinator::{
     RequestBootstrapRedial, RouteOperation, RoutingDecision, ShardMetadata,
 };
 use crate::config::{MessagingConfig, SearchConfig};
+use crate::query::parse_query_keywords;
 use crate::remote_peer_pool::{ConnectionChannel, RemotePeerPool};
 
 // Re-export SortSpec and SortOrder from storage crate
@@ -198,35 +199,6 @@ fn calculate_doc_fingerprint(doc: &JsonValue) -> u64 {
         combined.extend_from_slice(key.as_bytes());
     }
     xxh3_64(&combined)
-}
-
-/// Transform search query to map shadow fields to canonical "id" field
-///
-/// This function replaces shadow field references in queries with "id" field references
-/// to enable searching by original field names while using the efficient canonical ID index.
-///
-/// Example transformations:
-/// - {"term": {"book_id": "book_123"}} → {"term": {"id": "book_123"}}
-/// - {"term": {"sha256": "abc123"}} → {"term": {"id": "abc123"}}
-///
-/// The transformation preserves the query structure while ensuring all shadow field searches
-/// use the optimized "id" field index in Tantivy.
-fn transform_shadow_query(query: &str, schema: &IndexSchema) -> String {
-    let shadow_mapping = schema.get_shadow_mapping();
-
-    if shadow_mapping.is_empty() {
-        // No shadow fields, return original query
-        return query.to_string();
-    }
-
-    // Parse the query as JSON to transform field names
-    if let Ok(mut query_json) = serde_json::from_str::<JsonValue>(query) {
-        transform_shadow_fields_recursive(&mut query_json, &shadow_mapping);
-        serde_json::to_string(&query_json).unwrap_or_else(|_| query.to_string())
-    } else {
-        // If parsing fails, return original query
-        query.to_string()
-    }
 }
 
 /// Apply field projection to a JSON document, keeping only specified fields.
@@ -419,6 +391,71 @@ fn unknown_projection_fields(schema: &IndexSchema, fields: Option<&[String]>) ->
         .filter(|field| !known(field))
         .map(|field| note("return", field))
         .collect()
+}
+
+/// The projection as the documents can answer it.
+///
+/// On an index with a shadow field the identifier travels under the shadow name and no hit
+/// carries `id`, so a projection naming `id` is rewritten to the name the hits have. Everywhere
+/// else the rewrite is identity: `document_key_field` is `id` on a plain index. Done once,
+/// before the list is checked or applied, so `return id` on a shadow index finds the field
+/// rather than reporting it missing and returning a document with nothing in it.
+fn normalize_projection_fields(schema: &IndexSchema, fields: &[String]) -> Vec<String> {
+    let key = storage::document_key_field(schema);
+    if key == "id" {
+        return fields.to_vec();
+    }
+    fields
+        .iter()
+        .map(|field| {
+            if field == "id" {
+                key.clone()
+            } else {
+                field.clone()
+            }
+        })
+        .collect()
+}
+
+/// Why a document's shadow fields cannot be stored as written, if they cannot.
+///
+/// A shadow field is the document key under the source's own name, and nothing holds a second
+/// copy of the value: the write path strips the field out of the stored blob
+/// (`filter_shadow_fields_owned`) and the read path writes the key back under it
+/// (`reconstruct_shadow_fields_owned`). That round trip returns what was written only while the
+/// two agree, so a document saying otherwise has that value silently and unrecoverably
+/// discarded — it is refused here rather than accepted and destroyed.
+///
+/// The rest of the design already rests on this: `document_key_field` picks any one shadow name
+/// to read the key back under and reconstruction writes the key under every one, both defensible
+/// only if all of them mean the key. The bundled importer checks it before promoting a column to
+/// shadow; this is the same rule for a write arriving by any other route.
+///
+/// Absence is not disagreement. A document may omit a shadow field entirely — the ordinary case
+/// for a rewritten document — and reconstruction supplies it on the way out.
+fn disagreeing_shadow_field(doc: &JsonValue, schema: &IndexSchema) -> Option<String> {
+    if schema.shadow_fields.is_empty() {
+        return None;
+    }
+    let obj = doc.as_object()?;
+    let id = obj.get("id")?;
+
+    // Sorted, so a document disagreeing under two names names the same one every time.
+    let mut names: Vec<&String> = schema.shadow_fields.iter().collect();
+    names.sort_unstable();
+
+    names.into_iter().find_map(|name| {
+        let value = obj.get(name)?;
+        (value != id).then(|| {
+            format!(
+                "field '{name}' is a shadow of 'id' and must carry the same value, but this \
+                 document has {name}={value} and id={id}. A shadow field is a name for the \
+                 identifier rather than a field of its own, so nothing would store {value} and \
+                 a later read would report {id} under '{name}'. Write the value under a \
+                 different field name, or correct the identifier."
+            )
+        })
+    })
 }
 
 /// The sort field a search cannot be answered with, if the caller named one.
@@ -860,49 +897,6 @@ pub(crate) fn order_hit_blocks(
         .collect()
 }
 
-/// Recursively transform shadow field names in JSON query structure
-fn transform_shadow_fields_recursive(
-    value: &mut JsonValue,
-    shadow_mapping: &std::collections::HashMap<String, String>,
-) {
-    match value {
-        JsonValue::Object(map) => {
-            // Check if this is a field reference that needs transformation
-            if let Some((field_name, field_value)) = map.iter_mut().next() {
-                // Handle common query patterns: {"term": {"field": "value"}}
-                if (field_name == "term" || field_name == "terms" || field_name == "exists")
-                    && let JsonValue::Object(field_map) = field_value
-                {
-                    for shadow_field in shadow_mapping.keys() {
-                        if let Some(shadow_value) = field_map.remove(shadow_field) {
-                            // Replace shadow field with canonical "id" field
-                            field_map.insert("id".to_string(), shadow_value);
-                            break; // Only one field per term query
-                        }
-                    }
-                }
-
-                // Recursively process nested objects
-                transform_shadow_fields_recursive(field_value, shadow_mapping);
-            }
-
-            // Process all key-value pairs in the object
-            for (_, v) in map.iter_mut() {
-                transform_shadow_fields_recursive(v, shadow_mapping);
-            }
-        }
-        JsonValue::Array(arr) => {
-            // Process array elements
-            for item in arr.iter_mut() {
-                transform_shadow_fields_recursive(item, shadow_mapping);
-            }
-        }
-        _ => {
-            // Primitive values, no transformation needed
-        }
-    }
-}
-
 /// The key a write is routed by, in the order of precedence that decides it.
 ///
 /// Written out identically in three places before this existed — the engine fast path and both
@@ -1147,7 +1141,11 @@ pub struct SchemaValidationSummary {
     pub valid_docs: usize,
     pub evolution_needed: bool,
     pub all_new_fields: HashSet<(String, TantivyFieldType)>,
-    pub errors: Vec<String>,
+    /// Each document that failed validation, by its position in the batch, with the reason.
+    ///
+    /// The position is what lets a bulk write keep the documents that validated and drop the
+    /// ones that did not; a reason on its own can only be logged.
+    pub errors: Vec<(usize, String)>,
 }
 
 /// Type alias for shard hydration task results
@@ -2793,15 +2791,17 @@ impl OrchestratorEngine {
             .map(|arc| (*arc).clone())
             .unwrap_or_default();
 
+        // The identifier travels under the shadow name on the way out, so the projection is
+        // rewritten before it is checked or applied.
+        let fields = fields.map(|list| normalize_projection_fields(&schema, list));
+        let fields = fields.as_deref();
+
         // Refuse a sort the index cannot answer before asking any shard: every shard would
         // fail the same way, and a scatter-gather reports that as a partial failure inside a
         // 200 rather than as the bad request it is.
         if let Some(refusal) = unsortable_sort_field(&schema, sort) {
             return Err(refusal);
         }
-
-        // Transform query to map shadow fields to canonical "id" field
-        let transformed_query = transform_shadow_query(query, &schema);
 
         let shard_targets: Vec<(Uuid, MicroshardActor)> = shards
             .iter()
@@ -2813,7 +2813,7 @@ impl OrchestratorEngine {
                 // them may hold all of it. The skip is applied once, below.
                 let req = SearchRequest {
                     index: index.to_string(),
-                    query: transformed_query.clone(),
+                    query: query.to_string(),
                     limit: Some(window.fetch_count()),
                     sort: sort.cloned(),
                 };
@@ -5775,9 +5775,11 @@ impl NodeOrchestrator {
             errors: Vec::new(),
         };
 
-        for result in validation_results {
+        // `parallel_validate_schema` answers in the order it was asked, so the position of a
+        // result is the position of the document it judged.
+        for (position, result) in validation_results.into_iter().enumerate() {
             if let Some(err) = result.validation_error {
-                summary.errors.push(err);
+                summary.errors.push((position, err));
             } else {
                 summary.valid_docs += 1;
                 if result.needs_evolution {
@@ -5917,7 +5919,16 @@ impl NodeOrchestrator {
             };
         }
 
-        // Check 2: Validate against existing schema (no evolution in fast path)
+        // Check 2: A shadow field is a name for the identifier, so it has to carry it.
+        if let Some(err) = disagreeing_shadow_field(doc, schema_cache) {
+            return SchemaValidationResult {
+                needs_evolution: false,
+                new_fields: Vec::new(),
+                validation_error: Some(err),
+            };
+        }
+
+        // Check 3: Validate against existing schema (no evolution in fast path)
         if let Some(obj) = doc.as_object() {
             for (key, value) in obj {
                 if key == "id" {
@@ -6002,10 +6013,19 @@ impl NodeOrchestrator {
             };
         }
 
+        // Check 2: A shadow field is a name for the identifier, so it has to carry it.
+        if let Some(err) = disagreeing_shadow_field(doc, schema_cache) {
+            return SchemaValidationResult {
+                needs_evolution: false,
+                new_fields: Vec::new(),
+                validation_error: Some(err),
+            };
+        }
+
         let mut needs_evolution = false;
         let mut new_fields = Vec::new();
 
-        // Check 2: Validate fields and identify new ones
+        // Check 3: Validate fields and identify new ones
         if let Some(obj) = doc.as_object() {
             for (key, value) in obj {
                 let inferred_type = if key == "id" {
@@ -6476,6 +6496,16 @@ impl NodeOrchestrator {
     /// a sample. Only the engine can see which, so a caller choosing a field to sort on reads
     /// `sortable`, not `fast`.
     ///
+    /// `returned_as` appears on `id` alone, and only on an index with a shadow field, naming
+    /// what the hits carry in its place. The key is the only field whose two names can differ,
+    /// and on such an index they always do — so without it the description lists two searchable
+    /// text fields with nothing relating them, and an agent that picks `id` gets hits carrying
+    /// no `id` and no account of why.
+    ///
+    /// Omitting `id` there is the other way to remove the ambiguity and it is worse: `id:VALUE`
+    /// still answers on such an index, so a description without `id` would make `validate_query`
+    /// report the working form as an unknown field.
+    ///
     /// `_seq` is omitted everywhere. It is WAL bookkeeping, and offering it as a queryable field
     /// invites a query that cannot mean anything. Filtering it in one place also settles an
     /// inconsistency where one response reported two different field counts.
@@ -6484,6 +6514,7 @@ impl NodeOrchestrator {
         searchable: &HashSet<String>,
         sortable: &HashSet<String>,
     ) -> Vec<JsonValue> {
+        let document_key = storage::document_key_field(schema);
         Self::sorted_field_names(schema)
             .into_iter()
             .filter(|name| name != "_seq")
@@ -6507,6 +6538,14 @@ impl NodeOrchestrator {
                     "sortable".to_string(),
                     JsonValue::Bool(sortable.contains(&name)),
                 );
+                // The key under a name that is not its own, which happens on a shadow index
+                // and nowhere else.
+                if name == "id" && document_key != "id" {
+                    entry.insert(
+                        "returned_as".to_string(),
+                        JsonValue::String(document_key.clone()),
+                    );
+                }
                 if let Some(description) = &field.description {
                     entry.insert(
                         "description".to_string(),
@@ -7712,9 +7751,15 @@ impl NodeOrchestrator {
         }
 
         if !validation_summary.errors.is_empty() {
+            // One document, so its position adds nothing to the message.
             return Err(OrchestratorError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                validation_summary.errors.join("; "),
+                validation_summary
+                    .errors
+                    .into_iter()
+                    .map(|(_, reason)| reason)
+                    .collect::<Vec<_>>()
+                    .join("; "),
             )));
         }
 
@@ -8039,18 +8084,40 @@ impl NodeOrchestrator {
             self.put_cached_schema(index, &schema_cache);
         }
 
-        // Check for validation errors
-        if !validation_summary.errors.is_empty() {
-            tracing::warn!(
-                error_count = validation_summary.errors.len(),
-                total_docs = validation_summary.total_docs,
-                "Some documents failed schema validation"
-            );
-            // Continue processing valid documents, errors are tracked separately
-        }
-
         // Group documents by target shard using parallel routing for better performance
         let items_received = docs.len();
+
+        // Documents that failed validation are dropped, and their reasons travel to the caller
+        // in the response's `errors`. Rejecting the whole batch is the other defensible policy
+        // and not this one's: a bulk write already reports partial success, and one bad row in
+        // an import is no reason to discard the rest.
+        let mut rejections: Vec<String> = Vec::new();
+        let docs = if validation_summary.errors.is_empty() {
+            docs
+        } else {
+            tracing::warn!(
+                index = %index,
+                error_count = validation_summary.errors.len(),
+                total_docs = validation_summary.total_docs,
+                "Some documents failed schema validation and were not written"
+            );
+            let refused: HashSet<usize> = validation_summary
+                .errors
+                .iter()
+                .map(|(position, _)| *position)
+                .collect();
+            rejections.extend(
+                validation_summary
+                    .errors
+                    .iter()
+                    .map(|(position, reason)| format!("document {position}: {reason}")),
+            );
+            docs.into_iter()
+                .enumerate()
+                .filter(|(position, _)| !refused.contains(position))
+                .map(|(_, doc)| doc)
+                .collect()
+        };
 
         // First, route all documents to determine local vs remote
         let mut local_docs = Vec::new();
@@ -8155,7 +8222,10 @@ impl NodeOrchestrator {
         let mut local_batches = HashMap::new();
         let mut remote_batches = Vec::new();
         let mut written = 0usize;
-        let mut errors = Vec::new();
+        // Seeded with the documents validation refused, so the response accounts for every
+        // item it received: `items_written` counts what was stored, and each of the rest has a
+        // reason here.
+        let mut errors = rejections;
 
         // Process local batches from parallel routing
         for (shard_id, batch) in batches {
@@ -8296,15 +8366,17 @@ impl NodeOrchestrator {
             .map(|arc| (*arc).clone())
             .unwrap_or_default();
 
+        // The identifier travels under the shadow name on the way out, so the projection is
+        // rewritten before it is checked or applied.
+        let fields = fields.map(|list| normalize_projection_fields(&schema, list));
+        let fields = fields.as_deref();
+
         // Refuse a sort the index cannot answer before asking any shard: every shard would
         // fail the same way, and a scatter-gather reports that as a partial failure inside a
         // 200 rather than as the bad request it is.
         if let Some(refusal) = unsortable_sort_field(&schema, sort) {
             return Err(refusal);
         }
-
-        // Transform query to map shadow fields to canonical "id" field
-        let transformed_query = transform_shadow_query(query, &schema);
 
         let shard_targets: Vec<(Uuid, MicroshardActor)> = self
             .shards
@@ -8316,7 +8388,7 @@ impl NodeOrchestrator {
             // `SearchWindow::fetch_count` — the skip cannot be pushed down here either.
             let req = SearchRequest {
                 index: index.to_string(),
-                query: transformed_query.clone(),
+                query: query.to_string(),
                 limit: Some(window.fetch_count()),
                 sort: sort.cloned(),
             };
@@ -8757,11 +8829,17 @@ impl NodeOrchestrator {
         index: &str,
         query: &str,
     ) -> Result<JsonValue, OrchestratorError> {
+        // A search strips inline modifiers before the engine sees the query (HTTP and MCP both
+        // do), so validation parses what a search would run rather than treating `limit 5` as
+        // two more terms. The verdict then covers the modifier-free query, which is also the
+        // only form in which an exact id lookup is recognizable.
+        let engine_query = parse_query_keywords(query).query;
+
         for shard in self.shards.values() {
             let Some(store) = &shard.store else { continue };
             let store = Arc::clone(store);
             let idx = index.to_string();
-            let q = query.to_string();
+            let q = engine_query.clone();
 
             let outcome = tokio::task::spawn_blocking(move || store.validate_query(&idx, &q))
                 .await
@@ -8787,7 +8865,7 @@ impl NodeOrchestrator {
             "index": index,
             "query": query,
             "valid": JsonValue::Null,
-            "normalized_query": query,
+            "normalized_query": engine_query,
             "syntax_errors": [],
             "discarded": [],
             "note": "This index has no documents yet, so the query could not be checked against \
@@ -9878,6 +9956,45 @@ mod tests {
         assert!(!shadow.indexed, "a shadow field is never indexed");
         assert!(!shadow.stored, "a shadow field is never stored");
         assert!(schema.fields["title"].indexed, "ordinary fields still are");
+    }
+
+    /// The identifier travels under the shadow name on the way out, so a projection naming `id`
+    /// has to be rewritten to that name before it is applied. The rewrite is the only crossing
+    /// point between the two names on read, and it has to hold for both directions of the
+    /// mapping: `id` becomes the shadow name, the shadow name is left alone, and unrelated
+    /// fields pass through untouched. On a plain index the rewrite is identity, so the helper
+    /// is a no-op there.
+    #[test]
+    fn normalize_projection_fields_rewrites_id_to_the_shadow_name() {
+        let mut shadow = IndexSchema::default();
+        shadow.add_shadow_field("sha1".to_string(), TantivyFieldType::String);
+        shadow.fields.insert(
+            "title".to_string(),
+            FieldDef::new("title".to_string(), TantivyFieldType::String),
+        );
+
+        assert_eq!(
+            normalize_projection_fields(&shadow, &["id".to_string(), "title".to_string()]),
+            vec!["sha1".to_string(), "title".to_string()],
+            "`id` is rewritten to the shadow name; other fields are left alone"
+        );
+        assert_eq!(
+            normalize_projection_fields(&shadow, &["sha1".to_string()]),
+            vec!["sha1".to_string()],
+            "the shadow name is already the name hits carry, so it is a no-op"
+        );
+        assert_eq!(
+            normalize_projection_fields(&shadow, &[]),
+            Vec::<String>::new(),
+            "an empty projection stays empty"
+        );
+
+        let plain = IndexSchema::default();
+        assert_eq!(
+            normalize_projection_fields(&plain, &["id".to_string(), "title".to_string()]),
+            vec!["id".to_string(), "title".to_string()],
+            "on a plain index the key is `id`, so the rewrite is identity"
+        );
     }
 
     /// Metadata ops are never dispatched to the pool today, but if one ever is, it must be

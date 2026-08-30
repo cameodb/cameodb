@@ -240,8 +240,13 @@ pub const OPERATORS: &[Operator] = &[
         types: &[],
         caveat: Some(
             "Reads the key-value store and skips the search index, but only when the whole query \
-             is exactly `id:value`, with no other clause and no space, quote or parenthesis in \
-             the value.",
+             is exactly `id:value`, with no other clause and no space, quote, parenthesis, `*` \
+             or `^` in the value — those are syntax, so the query runs on the search index \
+             instead, where a trailing `*` is a prefix over the identifiers and `^` is a boost. \
+             An escape resolves the same way on both paths, so an identifier containing one of \
+             them is reached by escaping it: `id:doc\\^2`. A `shadow` field is the identifier \
+             under its source name and works the same way, alone or rewritten to `id` inside a \
+             larger query.",
         ),
     },
 ];
@@ -290,15 +295,19 @@ pub const SHADOW_FIELD: &str = "A field marked `shadow` is the name the source d
      or indexed again under the descriptive name — the schema carries the name and nothing carries \
      a second copy of the data, which is what makes the field a shadow. Querying it is therefore \
      querying `id`: `shadowfield:VALUE` on its own is the fastest retrieval CameoDB has, answered \
-     without the search index, and it is the only form that works — named inside a larger query \
-     the clause is dropped and reported, and a `*` in the value counts as part of the identifier \
-     rather than as a prefix, so it matches nothing. Results come back the same way round: every \
+     from the key-value store without the search index, and named inside a larger query the \
+     reference is rewritten to `id` and runs against the search index like any other clause. A \
+     trailing `*` is a prefix over the identifiers, which a short one pays for in the term \
+     dictionary the way any prefix query does. Results come back the same way round: every \
      hit carries the identifier under the shadow name and has no `id` field, so name the shadow \
-     field in `fields` or `return`. Asking for `id` there returns a document with nothing in it, \
-     and no warning that the field it named is one no document has. Sorting by a shadow field \
+     field in `fields` or `return` — asking for `id` there is rewritten to the shadow name and \
+     returns the identifier all the same. `describe_index` says which name that is: on such an \
+     index the `id` field carries `returned_as`, naming the shadow field the hits use in its \
+     place, and it is the only thing relating the two. Sorting by a shadow field \
      works and orders by the identifier, which is the one thing an unindexed field can be used \
      for beyond the key lookup: the order is approximate, as it is for any text field with no \
-     fast column, and `_approximate_sort` names the field you asked for rather than `id`.";
+     fast column, and `_approximate_sort` names the field the hits carry that order under — \
+     the shadow name, whichever of the two names you sorted by.";
 
 /// Facts about querying that belong to no single operator.
 pub const RULES: &[&str] = &[
@@ -539,8 +548,9 @@ pub fn compact_reference() -> String {
          `AND` `OR` `NOT` `TO` `IN` count only in uppercase; lowercase is searched for as a word, \
          and for `and`, `or` and `not` that happens silently.\n  \
          An unindexed field cannot be queried; check the `indexed` flag from `describe_index`. The \
-         exception is a `shadow` field, which is the identifier under another name: query it as \
-         `field:VALUE` on its own, and expect it in results in place of `id`.\n  \
+         exception is a `shadow` field, which is the identifier under another name: `field:VALUE` \
+         on its own is the key-value fast path, inside a larger query it is rewritten to `id`, \
+         and results carry it in place of `id`.\n  \
          Sorting a text or string field is approximate, and sets every `_score` to 1.0.\n  \
          A modifier is searched for as text unless its whole run parses, so give a field list its \
          commas and a sort an `asc` or `desc`.\n",

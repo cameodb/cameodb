@@ -226,3 +226,117 @@ fn an_index_that_was_never_written_to_cannot_be_validated_against() {
         "an unmaterialised index should report that it cannot answer, not a verdict"
     );
 }
+
+/// An index whose key is declared under its source name: `sha1` is the shadow of `id`, so
+/// `sha1:VALUE` on its own is the key-value fast path, and named inside a larger query the
+/// reference is rewritten to `id` and runs against the search index.
+fn store_with_shadow(temp: &TempDir, index: &str) -> HybridStore {
+    let store = HybridStore::new(config(temp.path().to_path_buf()), 1).unwrap();
+
+    let mut fields = HashMap::new();
+    fields.insert("id".into(), field(TantivyFieldType::Text, true));
+    fields.insert("title".into(), field(TantivyFieldType::Text, true));
+    let mut shadow = field(TantivyFieldType::Text, false);
+    shadow.is_shadow = true;
+    fields.insert("sha1".into(), shadow);
+
+    let mut schema = IndexSchema {
+        fields,
+        ..Default::default()
+    };
+    schema.rebuild_shadow_fields_cache();
+    store.store_schema_and_cache(index, &schema).unwrap();
+
+    store
+        .apply_write(
+            index,
+            WalOp::Put {
+                id: "d1".to_string(),
+                json_blob: Some(serde_json::json!({"id": "d1", "title": "a file"})),
+            },
+        )
+        .unwrap();
+    store.commit_index(index).unwrap();
+    store
+}
+
+/// A shadow field on its own is the key-value fast path, which never reaches the parser on the
+/// search path — so validation must not report the identifier's own field as dropped. Before
+/// this check existed the validator contradicted the search it exists to predict: it called the
+/// clause dropped while the search answered it.
+#[test]
+fn a_standalone_shadow_lookup_validates_as_the_fast_path_it_is() {
+    let temp = TempDir::new().unwrap();
+    let store = store_with_shadow(&temp, "files");
+
+    for query in ["sha1:d1", "id:d1"] {
+        let outcome = store.validate_query("files", query).unwrap().unwrap();
+        assert!(
+            outcome.is_valid(),
+            "{query:?} is the fastest query the engine has; got {outcome:?}"
+        );
+    }
+}
+
+/// The identifier under its source name combines with other fields: the shadow reference is
+/// rewritten to `id` and runs against the search index, where `id` is indexed. The negative
+/// case is what proves the clause ran rather than being dropped — a dropped clause would widen
+/// the conjunction and return the document the identifier excludes.
+#[test]
+fn a_shadow_field_in_a_larger_query_is_rewritten_to_id() {
+    let temp = TempDir::new().unwrap();
+    let store = store_with_shadow(&temp, "files");
+
+    let query = "sha1:d1 AND title:file";
+    let validated = store.validate_query("files", query).unwrap().unwrap();
+    let searched = store.search_documents("files", query, 10, None).unwrap();
+
+    assert!(
+        validated.discarded.is_empty() && searched.discarded.is_empty(),
+        "nothing is dropped from {query:?}: validate {:?}, search {:?}",
+        validated.discarded,
+        searched.discarded
+    );
+    assert!(
+        validated.normalized_query.contains("id:d1")
+            && !validated.normalized_query.contains("sha1"),
+        "validation should show the rewrite the engine runs: {:?}",
+        validated.normalized_query
+    );
+    assert_eq!(searched.total_hits, 1, "{query:?} should match d1");
+
+    // If the shadow clause were dropped instead of run, this would match d1 on title alone.
+    let excluded = store
+        .search_documents("files", "sha1:nope AND title:file", 10, None)
+        .unwrap();
+    assert_eq!(
+        excluded.total_hits, 0,
+        "the identifier must actually constrain the result"
+    );
+    assert!(excluded.discarded.is_empty(), "{:?}", excluded.discarded);
+}
+
+/// A `*` in the value keeps the query off the key-value fast path and runs it as a prefix over
+/// the identifiers, which the search index can answer and the key-value store cannot.
+#[test]
+fn a_shadow_prefix_query_matches_the_identifiers_it_prefixes() {
+    let temp = TempDir::new().unwrap();
+    let store = store_with_shadow(&temp, "files");
+
+    for query in ["sha1:d*", "id:d*", "sha1:d* AND title:file"] {
+        let outcome = store.search_documents("files", query, 10, None).unwrap();
+        assert_eq!(outcome.total_hits, 1, "{query:?} should prefix-match d1");
+        assert!(
+            outcome.discarded.is_empty(),
+            "{query:?} discarded a clause: {:?}",
+            outcome.discarded
+        );
+    }
+
+    // And an exact lookup is still exact: the asterisk is not silently literal.
+    let exact = store
+        .search_documents("files", "sha1:d1", 10, None)
+        .unwrap();
+    assert_eq!(exact.total_hits, 1);
+    assert!(exact.discarded.is_empty());
+}

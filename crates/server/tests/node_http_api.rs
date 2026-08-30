@@ -1754,3 +1754,206 @@ async fn an_approximate_sort_is_reported_on_the_response_that_carries_it() {
         "an exact sort should not be flagged, got {exact}"
     );
 }
+
+/// A shadow field that disagrees with the identifier is refused, not silently emptied.
+///
+/// A shadow field is a name for the key rather than a field of its own: the write path drops it
+/// from the stored document and the read path writes the key back under it. A document that
+/// says something else under that name therefore has that something else discarded — with no
+/// error, no warning, and a later read reporting the identifier in its place, so the loss is
+/// invisible from both ends. The write is refused instead, and the refusal names both values so
+/// the caller can see which of the two it meant.
+///
+/// Both write paths are checked: a single write validates inline, a bulk write through the
+/// staged path, and the rule belongs to the index rather than to whichever endpoint was used.
+#[tokio::test]
+async fn a_shadow_field_disagreeing_with_the_identifier_is_refused() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "files",
+        &json!({
+            "fields": {
+                "id": {"name": "id", "field_type": "text", "indexed": true},
+                "sha1": {"name": "sha1", "field_type": "text", "indexed": false, "is_shadow": true},
+                "title": {"name": "title", "field_type": "text", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "creating the config should succeed: {body}");
+
+    // A single write whose shadow field carries something the index cannot keep.
+    let refused = client
+        .write_document(
+            "files",
+            "AAA",
+            &json!({"id": "AAA", "sha1": "BBB", "title": "a record"}),
+            None,
+        )
+        .await;
+    let message = format!("{:?}", refused.expect_err("the write must be refused"));
+    assert!(
+        message.contains("sha1") && message.contains("BBB") && message.contains("AAA"),
+        "the refusal has to name the field and both values, or the caller cannot tell which of \
+         them was wrong: {message}"
+    );
+
+    // And the same document through the bulk path, which validates elsewhere.
+    let bulk = client
+        .bulk_index(
+            "files",
+            &[json!({"id": "AAA", "doc": {"id": "AAA", "sha1": "BBB", "title": "a record"}})],
+        )
+        .await;
+    let bulk_body = bulk.expect("a bulk write reports per-document outcomes rather than failing");
+    assert_eq!(
+        bulk_body["items_written"].as_u64(),
+        Some(0),
+        "a bulk write must be held to the same rule as a single one: {bulk_body}"
+    );
+    assert!(
+        bulk_body["errors"].to_string().contains("sha1"),
+        "and must say why the document it received was not written: {bulk_body}"
+    );
+
+    // Nothing was stored under either route.
+    client.admin_index_commit("files").await.expect("commit");
+    let found = client
+        .search("files", "title:record", Some(10), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(
+        found["total_hits"].as_u64(),
+        Some(0),
+        "a refused write must leave nothing behind: {found}"
+    );
+}
+
+/// The agreeing cases, which have to keep working: the rule is about disagreement alone.
+///
+/// A document may carry the shadow field with the identifier's value, or omit it entirely and
+/// let reconstruction supply it on the way out. Several shadow names are legal too — that is
+/// what makes them names for one key rather than fields — so long as they all agree.
+#[tokio::test]
+async fn a_shadow_field_agreeing_with_the_identifier_is_accepted() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "files",
+        &json!({
+            "fields": {
+                "id": {"name": "id", "field_type": "text", "indexed": true},
+                "sha1": {"name": "sha1", "field_type": "text", "indexed": false, "is_shadow": true},
+                "md5": {"name": "md5", "field_type": "text", "indexed": false, "is_shadow": true},
+                "title": {"name": "title", "field_type": "text", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "creating the config should succeed: {body}");
+
+    client
+        .bulk_index(
+            "files",
+            &[
+                // Every shadow name spelled out, all agreeing.
+                json!({"id": "AAA", "doc": {"id": "AAA", "sha1": "AAA", "md5": "AAA", "title": "a record"}}),
+                // The shadow names omitted, which is the ordinary shape of a rewritten document.
+                json!({"id": "BBB", "doc": {"id": "BBB", "title": "a record"}}),
+            ],
+        )
+        .await
+        .expect("both documents should be accepted");
+    client.admin_index_commit("files").await.expect("commit");
+
+    let found = client
+        .search("files", "title:record", Some(10), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(
+        found["total_hits"].as_u64(),
+        Some(2),
+        "both documents should have been stored: {found}"
+    );
+
+    // Both come back carrying the key under every shadow name and none under `id`, whether or
+    // not the write spelled them out.
+    for hit in found["hits"].as_array().expect("hits") {
+        let key = hit["sha1"].as_str().expect("a hit carries the shadow name");
+        assert_eq!(
+            hit["md5"].as_str(),
+            Some(key),
+            "both names are the key: {hit}"
+        );
+        assert!(hit.get("id").is_none(), "no hit carries `id`: {hit}");
+    }
+}
+
+/// One bad document in a batch costs that document, not the batch.
+///
+/// A bulk write reports partial success — `items_received` against `items_written`, with a
+/// reason for each shortfall — so a single unstorable row in an import is no reason to discard
+/// the rows around it. What it may not do is write the bad row anyway.
+#[tokio::test]
+async fn a_rejected_document_does_not_cost_the_rest_of_its_batch() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "files",
+        &json!({
+            "fields": {
+                "id": {"name": "id", "field_type": "text", "indexed": true},
+                "sha1": {"name": "sha1", "field_type": "text", "indexed": false, "is_shadow": true},
+                "title": {"name": "title", "field_type": "text", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "creating the config should succeed: {body}");
+
+    let written = client
+        .bulk_index(
+            "files",
+            &[
+                json!({"id": "AAA", "doc": {"id": "AAA", "sha1": "AAA", "title": "a record"}}),
+                json!({"id": "BBB", "doc": {"id": "BBB", "sha1": "WRONG", "title": "a record"}}),
+                json!({"id": "CCC", "doc": {"id": "CCC", "sha1": "CCC", "title": "a record"}}),
+            ],
+        )
+        .await
+        .expect("the batch as a whole should be accepted");
+
+    assert_eq!(
+        written["items_received"].as_u64(),
+        Some(3),
+        "every document received is accounted for: {written}"
+    );
+    assert_eq!(
+        written["items_written"].as_u64(),
+        Some(2),
+        "the two storable documents should be stored: {written}"
+    );
+    let errors = written["errors"].to_string();
+    assert!(
+        errors.contains("sha1") && errors.contains("WRONG"),
+        "the one that was not stored needs its reason: {written}"
+    );
+
+    client.admin_index_commit("files").await.expect("commit");
+    let found = client
+        .search("files", "title:record", Some(10), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(
+        found["total_hits"].as_u64(),
+        Some(2),
+        "the rejected document must not have been written: {found}"
+    );
+}
