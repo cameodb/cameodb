@@ -1030,6 +1030,11 @@ async fn a_shadow_field_is_described_as_the_queryable_alias_of_id() {
         !warnings.contains("will not match"),
         "the query does match, and this warning is why an agent would not send it: {validated}"
     );
+    assert!(
+        !names("discarded_clauses").join(" ").contains("sha1"),
+        "validation reports what a search drops, and the search above just answered this query \
+         from the key-value store: {validated}"
+    );
 
     let listed = validated["available_fields"]
         .as_array()
@@ -1055,9 +1060,9 @@ async fn a_shadow_field_is_described_as_the_queryable_alias_of_id() {
 /// The other direction, which is where the name does the surprising work.
 ///
 /// A shadow field stores nothing: the value moved into `id` on write, and on read `id` comes back
-/// under the descriptive name instead. So the identifier an agent must project and pivot on is the
-/// shadow name, and asking for `id` — the obvious thing to ask for — returns a document with
-/// nothing in it and no explanation. The hint has to say so, which means this has to stay true.
+/// under the descriptive name instead. The rule is uniform — whatever name the request used,
+/// the identifier travels under the shadow name: in a bare hit, in a projection that names the
+/// shadow field, in a projection that names `id`, and in the answer to an `id:` query.
 #[tokio::test]
 async fn a_shadow_index_returns_its_identifier_under_the_shadow_name() {
     let node = TestNode::start().await;
@@ -1084,8 +1089,8 @@ async fn a_shadow_index_returns_its_identifier_under_the_shadow_name() {
          way to read the identifier, and the guidance would be overstating the case: {result}"
     );
 
-    // What an agent that trusts `id` gets instead. Pinned because the hint promises this, not
-    // because an empty projection is desirable.
+    // The same rule holds for an agent that asks for `id`: the projection is rewritten to the
+    // name the hits carry, so the identifier comes back under the shadow name either way.
     let (_, projected) = node
         .call_tool(
             "search_index",
@@ -1093,20 +1098,39 @@ async fn a_shadow_index_returns_its_identifier_under_the_shadow_name() {
         )
         .await;
     let hit = &projected["hits"][0];
+    assert_eq!(
+        hit["sha1"].as_str(),
+        Some("deadbeef01"),
+        "projecting `id` on a shadow index returns the identifier under the shadow name: \
+         {projected}"
+    );
     assert!(
-        hit.get("id").is_none() && hit.get("sha1").is_none(),
-        "projecting `id` on a shadow index returns nothing, which is what the hint tells an \
-         agent to expect: {projected}"
+        hit.get("id").is_none(),
+        "the identifier has one name on the way out: {projected}"
+    );
+
+    // And an agent that queries by `id` — which is indexed, and the name the engine spells
+    // internally — gets the same uniform response shape.
+    let (is_error, by_id) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "files", "query": "id:deadbeef01"}),
+        )
+        .await;
+    assert!(!is_error, "querying by id must work: {by_id}");
+    assert_eq!(
+        by_id["hits"][0]["sha1"].as_str(),
+        Some("deadbeef01"),
+        "the answer to an id query carries the identifier under the shadow name: {by_id}"
     );
 }
 
-/// The restriction that comes with it, pinned so the guidance stays checkable.
-///
-/// The key-value bypass recognises `field:VALUE` and nothing else, so the same clause inside a
-/// boolean query is dropped by the parser — which is what makes the whole-query form worth
-/// naming rather than describing the field as generally searchable.
+/// The key-value bypass recognises `field:VALUE` alone; the same reference inside a boolean
+/// query is rewritten to `id` and runs against the search index, where the identifier is
+/// indexed. The negative case is the proof: a dropped clause would widen the conjunction and
+/// return the document the identifier excludes.
 #[tokio::test]
-async fn a_shadow_field_inside_a_larger_query_is_reported_rather_than_answered() {
+async fn a_shadow_field_inside_a_larger_query_is_rewritten_to_id_and_answered() {
     let node = TestNode::start().await;
     node.create_shadow_index("files").await;
     node.seed_shadow("files", &["deadbeef01"]).await;
@@ -1118,14 +1142,83 @@ async fn a_shadow_field_inside_a_larger_query_is_reported_rather_than_answered()
         )
         .await;
     assert!(
-        is_error,
-        "the sha1 clause was dropped and the hits came from title alone; answering as though \
-         the query had run is the failure mode the dropped-clause report exists to prevent: \
-         {result}"
+        !is_error,
+        "a shadow reference combined with other fields must run, not be dropped: {result}"
     );
+    assert_eq!(
+        result["total_hits"].as_u64(),
+        Some(1),
+        "the compound query should find the document: {result}"
+    );
+    assert_eq!(
+        result["hits"][0]["sha1"].as_str(),
+        Some("deadbeef01"),
+        "the identifier still comes back under the shadow name: {result}"
+    );
+
+    // If the sha1 clause were dropped rather than run, this would match on title alone.
+    let (_, excluded) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "files", "query": "sha1:cafe02 AND title:record"}),
+        )
+        .await;
+    assert_eq!(
+        excluded["total_hits"].as_u64(),
+        Some(0),
+        "the identifier must actually constrain the result: {excluded}"
+    );
+
+    // Validation tells the same story beforehand: nothing dropped, and the rewritten form shown.
+    let (_, validated) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "files", "query": "sha1:deadbeef01 AND title:record"}),
+        )
+        .await;
+    let analysis = &validated["query_analysis"];
     assert!(
-        result.to_string().contains("sha1"),
-        "the refusal must name the clause that was dropped: {result}"
+        analysis["discarded_clauses"].to_string().contains("null")
+            || analysis["discarded_clauses"]
+                .as_array()
+                .is_some_and(|d| d.is_empty()),
+        "nothing is dropped from a query the engine can run as written: {analysis}"
+    );
+    let normalized = analysis["normalized_query"].as_str().unwrap_or("");
+    assert!(
+        normalized.contains("id:deadbeef01") && !normalized.contains("sha1"),
+        "validation should show the rewrite the engine runs: {analysis}"
+    );
+}
+
+/// A search strips inline modifiers before the engine sees the query, so validation has to
+/// strip them too — otherwise the fastest lookup in the index fails validation the moment it
+/// carries a limit, and the normalized form claims the engine runs `limit` as a term.
+#[tokio::test]
+async fn validate_query_reads_a_shadow_lookup_with_modifiers_as_the_lookup() {
+    let node = TestNode::start().await;
+    node.create_shadow_index("files").await;
+    node.seed_shadow("files", &["deadbeef01"]).await;
+
+    let (is_error, validated) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "files", "query": "sha1:deadbeef01 limit 5"}),
+        )
+        .await;
+    assert!(!is_error, "{validated}");
+
+    let analysis = &validated["query_analysis"];
+    assert_eq!(analysis["parses"], json!(true), "{analysis}");
+    assert_eq!(
+        analysis["normalized_query"], "sha1:deadbeef01",
+        "validation reports the query the engine runs, modifiers off: {analysis}"
+    );
+    let discarded = analysis["discarded_clauses"].to_string();
+    assert!(
+        !discarded.contains("sha1"),
+        "a search strips the modifier and answers this from the key-value store, so nothing is \
+         dropped: {analysis}"
     );
 }
 
@@ -2534,4 +2627,221 @@ max_search_limit = 100
         )
         .await;
     assert!(!is_error, "a window inside the ceiling is served: {result}");
+}
+
+/// `validate_query` must not invent fields out of the values in a working query.
+///
+/// A colon occurs inside values as often as it separates a field from one — an RFC3339
+/// timestamp carries two, a URL one — and a scanner that reads every name-then-colon run finds
+/// fields called `00` and `https`. This tool is where the guidance sends an agent that doubts a
+/// query, so answering a correct query with confident warnings about fields the index does not
+/// have is worse than answering nothing: it sends the agent to rewrite what already worked,
+/// and it is indistinguishable from the report of a real mistake.
+#[tokio::test]
+async fn validate_query_reads_values_as_values_rather_than_as_field_names() {
+    let node = TestNode::start().await;
+    node.create_index("records").await;
+    node.seed("records", &[("r1", "2024-06-15T00:00:00Z")])
+        .await;
+
+    for query in [
+        // Two colons inside the value, and no brackets to hide behind.
+        "title:record AND created:2024-06-15T12:30:00Z",
+        // The same inside a range, where both bounds carry them.
+        "created:[2024-01-01T00:00:00Z TO 2024-12-31T00:00:00Z]",
+        // A colon inside a phrase, which holds text.
+        "title:\"a:b\" AND created:2024-06-15T00:00:00Z",
+        // And the identifier form, whose value is allowed to contain colons of its own.
+        "id:urn:x:1",
+    ] {
+        let (_, validated) = node
+            .call_tool(
+                "validate_query",
+                json!({"index": "records", "query": query}),
+            )
+            .await;
+        let analysis = &validated["query_analysis"];
+        assert_eq!(
+            analysis["unknown_fields"].as_array().map(Vec::len),
+            Some(0),
+            "{query:?} names no field the index lacks, so nothing may be reported: {validated}"
+        );
+        assert!(
+            !analysis["warnings"].to_string().contains("Unknown field"),
+            "{query:?} must not be warned about: {validated}"
+        );
+    }
+
+    // The tool still has to report a field that genuinely is missing, or it would have been
+    // fixed by going blind.
+    let (_, validated) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "records", "query": "nosuchfield:x AND created:2024-06-15T00:00:00Z"}),
+        )
+        .await;
+    let unknown = validated["query_analysis"]["unknown_fields"].to_string();
+    assert!(
+        unknown.contains("nosuchfield"),
+        "a real unknown field must still be reported: {validated}"
+    );
+    assert!(!unknown.contains("00"), "and only that one: {validated}");
+}
+
+/// A parenthesis begins a clause without needing a space in front of it.
+///
+/// `AND(sha1:x)` references `sha1`. Reading the whitespace token whole reads it as a field
+/// called `AND(sha1` instead, which leaves the shadow name unrewritten and reports a field
+/// name the caller never wrote alongside the real syntax problem.
+#[tokio::test]
+async fn a_clause_opening_straight_after_a_parenthesis_is_read_as_one() {
+    let node = TestNode::start().await;
+    node.create_shadow_index("files").await;
+    node.seed_shadow("files", &["deadbeef01"]).await;
+
+    let (_, validated) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "files", "query": "(sha1:deadbeef01)AND(title:record)"}),
+        )
+        .await;
+    let analysis = &validated["query_analysis"];
+    assert_eq!(
+        analysis["unknown_fields"].as_array().map(Vec::len),
+        Some(0),
+        "both clauses name fields this index has: {validated}"
+    );
+    let recognized = analysis["recognized_fields"].to_string();
+    assert!(
+        recognized.contains("sha1") && recognized.contains("title"),
+        "and both should be recognised: {validated}"
+    );
+}
+
+/// `describe_index` has to relate `id` to the shadow name beside it.
+///
+/// On a shadow index both are searchable text fields standing for the same value, and `id` is
+/// the one an agent reaches for — it is the field every other index has, and the syntax
+/// reference calls it the fastest retrieval there is. Querying it works, so the description
+/// cannot simply drop it; what it can do is say where the value comes back. Without that the
+/// two fields are unrelated in every surface an agent reads, and hits carrying no `id` have no
+/// explanation.
+#[tokio::test]
+async fn describe_index_relates_id_to_the_shadow_name_that_replaces_it() {
+    let node = TestNode::start().await;
+    node.create_shadow_index("files").await;
+    node.seed_shadow("files", &["deadbeef01"]).await;
+
+    let (_, described) = node
+        .call_tool("describe_index", json!({"index": "files"}))
+        .await;
+    let field = |name: &str| -> Value {
+        described["fields"]
+            .as_array()
+            .expect("fields")
+            .iter()
+            .find(|f| f["name"] == name)
+            .unwrap_or_else(|| panic!("no entry for '{name}': {described}"))
+            .clone()
+    };
+
+    assert_eq!(
+        field("id")["returned_as"].as_str(),
+        Some("sha1"),
+        "the `id` entry must name the field the hits carry instead: {described}"
+    );
+    assert!(
+        field("sha1")["returned_as"].is_null(),
+        "a field answering under its own name says nothing: {described}"
+    );
+    assert!(
+        field("title")["returned_as"].is_null(),
+        "and neither does an ordinary field: {described}"
+    );
+
+    // The claim has to be true of the hits, not just present in the description.
+    let (_, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "files", "query": "title:record"}),
+        )
+        .await;
+    let hit = &result["hits"][0];
+    assert!(hit["sha1"].is_string(), "{result}");
+    assert!(hit.get("id").is_none(), "{result}");
+
+    // `validate_query` reads the same schema, so it carries the same relation.
+    let (_, validated) = node
+        .call_tool(
+            "validate_query",
+            json!({"index": "files", "query": "id:deadbeef01"}),
+        )
+        .await;
+    let listed = validated["available_fields"].as_array().expect("fields");
+    let id_entry = listed
+        .iter()
+        .find(|f| f["name"] == "id")
+        .unwrap_or_else(|| panic!("id missing: {validated}"));
+    assert_eq!(
+        id_entry["returned_as"].as_str(),
+        Some("sha1"),
+        "{validated}"
+    );
+}
+
+/// A plain index says nothing, because on one the key answers under its own name.
+#[tokio::test]
+async fn a_plain_index_reports_no_substitution_for_its_key() {
+    let node = TestNode::start().await;
+    node.create_index("records").await;
+    node.seed("records", &[("r1", "2024-06-15T00:00:00Z")])
+        .await;
+
+    let (_, described) = node
+        .call_tool("describe_index", json!({"index": "records"}))
+        .await;
+    for entry in described["fields"].as_array().expect("fields") {
+        assert!(
+            entry["returned_as"].is_null(),
+            "nothing is substituted on a plain index: {described}"
+        );
+    }
+}
+
+/// `_approximate_sort` must name a field the hits in the same response actually carry.
+///
+/// A caller may sort a shadow index by `id`, which the engine answers by ordering on the key,
+/// and every hit comes back carrying the shadow name instead. Reporting the order as being on
+/// `id` would name the one field absent from every hit, leaving the caller nothing to check it
+/// against. Both spellings of the sort report the name the documents use.
+#[tokio::test]
+async fn an_approximate_order_names_the_field_the_hits_carry() {
+    let node = TestNode::start().await;
+    node.create_shadow_index("files").await;
+    node.seed_shadow("files", &["d3", "d1", "d2"]).await;
+
+    for sort_field in ["id", "sha1"] {
+        let (_, result) = node
+            .call_tool(
+                "search_index",
+                json!({
+                    "index": "files",
+                    "query": "title:record",
+                    "sort": {"field": sort_field, "order": "asc"}
+                }),
+            )
+            .await;
+        assert_eq!(
+            result["_approximate_sort"].as_str(),
+            Some("sha1"),
+            "sorting by {sort_field:?} orders on the key, which the hits carry as `sha1`: {result}"
+        );
+        let named = result["_approximate_sort"].as_str().expect("field named");
+        for hit in result["hits"].as_array().expect("hits") {
+            assert!(
+                hit.get(named).is_some(),
+                "the field the order is reported on must be on every hit: {result}"
+            );
+        }
+    }
 }

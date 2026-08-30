@@ -79,6 +79,12 @@ pub(super) struct FieldInfo {
     pub(super) sortable: bool,
     /// What the field records, if anyone wrote it down. Never inferred.
     pub(super) description: Option<String>,
+    /// The name a hit carries this field's value under, when it is not the field's own name.
+    ///
+    /// Set on `id` alone, and only on an index with a shadow field, where the identifier
+    /// travels under the source's name and no hit carries an `id`. Everywhere else a field
+    /// answers under its own name and this is `None`.
+    pub(super) returned_as: Option<String>,
 }
 
 impl FieldInfo {
@@ -128,6 +134,10 @@ pub(super) fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
                         .unwrap_or(false),
                     description: def
                         .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    returned_as: def
+                        .get("returned_as")
                         .and_then(|v| v.as_str())
                         .map(str::to_string),
                 })
@@ -227,8 +237,11 @@ pub(super) fn field_type_query_hint(field_type: &str) -> String {
 
 /// What this particular field supports.
 ///
-/// A shadow field takes the shadow rule rather than its type's operator list: it is not in the
-/// search index, so none of the forms its type would otherwise support reach it.
+/// A shadow field takes the shadow rule rather than its declared type's operator list, because
+/// what it supports is `id`'s repertoire: the identifier is a raw string however the field is
+/// declared, so exact matches, prefixes, ranges and sets work and phrases and slop do not. The
+/// rule also carries the two things no operator list says — that a bare lookup skips the search
+/// index, and that hits come back under this name instead of `id`.
 pub(super) fn field_query_hint(info: &FieldInfo) -> String {
     if info.is_shadow {
         cameodb_mcp::syntax::SHADOW_FIELD.to_string()

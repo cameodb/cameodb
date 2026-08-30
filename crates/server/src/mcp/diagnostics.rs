@@ -8,11 +8,6 @@ use serde_json::Value as JsonValue;
 use crate::mcp::schema::{FieldInfo, field_query_hint};
 use crate::query::parse_query_keywords;
 
-/// Whether a query contains a phrase or a conjunction, and so could be usefully relaxed after
-/// matching nothing.
-///
-/// `AND` counts only as a standalone token, the way the parser reads it, so it is not found
-/// inside a value such as `status:ANDROID`.
 /// Why a search that matched nothing may have asked for less than it meant to, or `None` when
 /// the query gives no reason to think so.
 ///
@@ -22,7 +17,9 @@ use crate::query::parse_query_keywords;
 /// use, reads as a finding about the data — worse than silence, since zero hits is usually the
 /// true answer.
 ///
-/// Inline modifiers are stripped first, so `limit` and `sort` are not read as query terms.
+/// Inline modifiers are stripped first, so `limit` and `sort` are not read as query terms, and
+/// `AND` counts only as a standalone token, the way the parser reads it — so it is not found
+/// inside a value such as `status:ANDROID`.
 ///
 /// The behaviour these sentences rest on is stated in [`cameodb_mcp::syntax`]; this is the
 /// diagnosis of one query rather than a second copy of the reference, hence the wording as
@@ -129,7 +126,6 @@ pub(super) fn short_page_note(
     ))
 }
 
-/// What an approximate sort order means for the caller holding it.
 /// What an approximate sort order means for the caller holding it.
 ///
 /// Attached whenever the engine reports [`crate::node_orchestrator::APPROXIMATE_SORT_FIELD`],
@@ -245,8 +241,7 @@ pub(super) fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> Json
         );
     }
 
-    // Extract field references (handle phrases and parens gracefully)
-    let referenced_fields = extract_query_fields(query_text);
+    let referenced_fields = referenced_field_names(query_text);
 
     let queryable_names: Vec<&str> = field_infos
         .iter()
@@ -323,51 +318,19 @@ pub(super) fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> Json
     })
 }
 
-pub(super) fn extract_query_fields(query: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let reserved = ["AND", "OR", "NOT", "TO", "return", "limit"];
-    let chars: Vec<char> = query.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-
-    while i < len {
-        match chars[i] {
-            '"' => {
-                // Skip quoted strings
-                i += 1;
-                while i < len && chars[i] != '"' {
-                    i += 1;
-                }
-                i += 1;
-            }
-            '(' | ')' | '[' | ']' => {
-                i += 1;
-            }
-            _ if chars[i].is_alphanumeric() || chars[i] == '_' => {
-                let start = i;
-                while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.')
-                {
-                    i += 1;
-                }
-                let token = &query[start..i];
-
-                // Check if followed by ':' (field reference)
-                if i < len && chars[i] == ':' {
-                    if !reserved.iter().any(|kw| kw.eq_ignore_ascii_case(token))
-                        && !fields.contains(&token.to_string())
-                    {
-                        fields.push(token.to_string());
-                    }
-                    i += 1; // skip the colon
-                }
-            }
-            _ => {
-                i += 1;
-            }
+/// The distinct field names a query references, in the order they first appear.
+///
+/// Ordering and dedup over [`storage::field_references`], deliberately the same scanner the
+/// engine reads a query with: this tool is where an agent is sent when it doubts a query, so a
+/// verdict it reaches by its own reading could tell the agent a working query is wrong.
+fn referenced_field_names(query: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for reference in storage::field_references(query) {
+        if !names.iter().any(|seen| seen == reference.name.as_ref()) {
+            names.push(reference.name.into_owned());
         }
     }
-
-    fields
+    names
 }
 
 /// The full query syntax reference, as `validate_query` returns it.

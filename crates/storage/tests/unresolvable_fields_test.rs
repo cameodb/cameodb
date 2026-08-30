@@ -361,3 +361,47 @@ fn the_retired_seq_field_is_reported_as_unknown() {
         "a query on the retired _seq field should be reported: {notes:?}"
     );
 }
+
+/// A clause opening straight after `(` is read as a clause, not swallowed by the token in
+/// front of it.
+///
+/// Whitespace alone does not separate clauses: a parenthesis ends one and begins another. Read
+/// as one token, `AND(nosuch:x)` names a field called `AND(nosuch` — a name no index has, so
+/// the report blames something the caller never wrote and says nothing about what it did.
+///
+/// The parser rejects this spacing on its own account, so the query fails either way. What is
+/// pinned here is which field the report names alongside that syntax error, since a caller
+/// reading `unknown field 'AND(nosuch'` is sent to fix the wrong thing.
+#[test]
+fn a_clause_opening_straight_after_a_parenthesis_is_read_as_one() {
+    let temp = TempDir::new().unwrap();
+    let store = store(&temp, "parens");
+
+    let notes = discarded(&store, "parens", "title:rust AND(nosuch:x)").join(" ");
+    assert!(
+        notes.contains("unknown field 'nosuch'"),
+        "the field the caller actually named must be reported: {notes:?}"
+    );
+    assert!(
+        !notes.contains("AND(nosuch"),
+        "and not the token it was written against: {notes:?}"
+    );
+
+    // A non-indexed field is reached the same way, and reported for its own reason.
+    let notes = discarded(&store, "parens", "(title:rust)AND(hidden:x)").join(" ");
+    assert!(
+        notes.contains("hidden") && notes.contains("not indexed"),
+        "a non-indexed field after a parenthesis is still reported: {notes:?}"
+    );
+
+    // Spaced, the same shapes parse, and a scanner that reads a parenthesis correctly has
+    // nothing to report about any of them.
+    for query in [
+        "title:rust AND (tag:active)",
+        "(title:rust) AND (tag:active)",
+        "(title:rust OR tag:active) AND (year:[2020 TO 2025])",
+    ] {
+        let notes = discarded(&store, "parens", query);
+        assert!(notes.is_empty(), "{query:?} was reported: {notes:?}");
+    }
+}
