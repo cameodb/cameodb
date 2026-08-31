@@ -1240,3 +1240,25 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod key_id_digest_tests {
+    use super::Credential;
+
+    /// A `key_id` is the first four bytes of SHA-256 over the key, in hex, and a server stores
+    /// the whole digest in its configuration as `sha256:<hex>`. Both are on-disk contracts: if
+    /// what the hash produces ever changes, every deployed key stops matching its stored digest,
+    /// and no round-trip test can see it because both sides move together. Pinned against a
+    /// value computed outside this codebase:
+    ///
+    /// ```text
+    /// printf 'cameo_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' | shasum -a 256
+    /// 373ce68d26ee121548841ac21adf2706dbe4cb3e28e65b1574b4653a1ac9982a
+    /// ```
+    #[test]
+    fn a_key_id_is_the_sha256_prefix_and_does_not_move_with_the_hash_crate() {
+        let credential = Credential::parse(&format!("cameo_v1_{}", "A".repeat(43)))
+            .expect("a well-formed key parses");
+        assert_eq!(credential.key_id(), "373ce68d");
+    }
+}

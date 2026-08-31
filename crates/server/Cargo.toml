@@ -44,7 +44,6 @@ tokio-util = { workspace = true }
 chrono = { version = "0.4.44", features = ["serde"] }
 core_affinity = "0.8"
 libc = "0.2"
-yamux = { workspace = true }
 # API key authentication (crates/server/src/auth.rs). All six were already in Cargo.lock as
 # transitive dependencies of rustls, libp2p, and reqwest, so nothing new enters the audit or
 # licence surface. `getrandom` rather than `rand`: a key needs 32 bytes of OS entropy once,

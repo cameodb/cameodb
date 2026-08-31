@@ -48,7 +48,6 @@ tokio-util = { version = "0.7.18", features = ["codec", "io"] }
 rustyline = "18"
 rayon = "1.12"
 sysinfo = "0.39.3"
-yamux = "0.14"
 
 [profile.release]
 opt-level = 3           # Maximum optimization
