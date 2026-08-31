@@ -528,7 +528,7 @@ fn infer_field_type(value: &JsonValue) -> TantivyFieldType {
 /// with the field silently unindexed.
 ///
 /// Values whose *shape* rather than type decides the answer — a list, a null, a text or json
-/// field that takes anything — are settled by `unstorable_value_type` before this is asked.
+/// field that takes anything, a facet path — are settled by `unstorable_value` before this is asked.
 fn scalar_type_is_storable(declared: &TantivyFieldType, inferred: &TantivyFieldType) -> bool {
     if declared == inferred {
         return true;
@@ -543,7 +543,7 @@ fn scalar_type_is_storable(declared: &TantivyFieldType, inferred: &TantivyFieldT
     )
 }
 
-/// The reading of a value that the field cannot hold, if there is one.
+/// Why the field cannot hold this value, if it cannot.
 ///
 /// The question is what the write path can store, which is a wider question than whether two
 /// type names match — see `storage::add_json_value_to_doc`, which is the other half of this
@@ -566,10 +566,7 @@ fn scalar_type_is_storable(declared: &TantivyFieldType, inferred: &TantivyFieldT
 /// query matches it, and the document reads back exactly as written — so refusing a document
 /// for carrying an explicit null where it could have omitted the key would be a distinction
 /// without a difference to anything downstream.
-fn unstorable_value_type(
-    declared: &TantivyFieldType,
-    value: &JsonValue,
-) -> Option<TantivyFieldType> {
+fn unstorable_value(field: &str, declared: &TantivyFieldType, value: &JsonValue) -> Option<String> {
     if value.is_null() {
         return None;
     }
@@ -578,22 +575,57 @@ fn unstorable_value_type(
         // Takes the value whole, whatever shape it has.
         TantivyFieldType::Text | TantivyFieldType::Json => None,
         // Takes a list of byte values, and only that.
-        TantivyFieldType::Bytes => value.as_array().is_none().then(|| infer_field_type(value)),
+        TantivyFieldType::Bytes => {
+            (!value.is_array()).then(|| type_mismatch(field, declared, value))
+        }
         _ => match value.as_array() {
             // Several values of the field, each held to the declared type on its own.
-            Some(items) => items.iter().find_map(|item| {
-                if item.is_null() {
-                    return None;
-                }
-                let inferred = infer_field_type(item);
-                (!scalar_type_is_storable(declared, &inferred)).then_some(inferred)
-            }),
-            None => {
-                let inferred = infer_field_type(value);
-                (!scalar_type_is_storable(declared, &inferred)).then_some(inferred)
-            }
+            Some(items) => items
+                .iter()
+                .find_map(|item| unstorable_scalar(field, declared, item)),
+            None => unstorable_scalar(field, declared, value),
         },
     }
+}
+
+/// Why the field cannot hold one value of it, if it cannot.
+///
+/// Split out so that a list and a scalar are judged identically: the writer flattens a list into
+/// one `add_*` call per element, so an element the field cannot hold is exactly as unstorable in
+/// a list of three as it is on its own.
+///
+/// A facet is the one type whose *value* rather than type decides the answer — `"/a/b"` and
+/// `"a/b"` are both strings and only one is a path — so it is asked of the parser the writer
+/// uses, `storage::facet_path_error`, rather than of `infer_field_type`, which reads every
+/// facet path as text and would refuse the whole type.
+fn unstorable_scalar(
+    field: &str,
+    declared: &TantivyFieldType,
+    value: &JsonValue,
+) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+
+    if matches!(declared, TantivyFieldType::Facet) {
+        return match value.as_str() {
+            Some(path) => {
+                storage::facet_path_error(path).map(|why| format!("field '{field}': {why}"))
+            }
+            None => Some(type_mismatch(field, declared, value)),
+        };
+    }
+
+    let inferred = infer_field_type(value);
+    (!scalar_type_is_storable(declared, &inferred)).then(|| type_mismatch(field, declared, value))
+}
+
+/// The one wording for a value whose type the field cannot hold.
+fn type_mismatch(field: &str, declared: &TantivyFieldType, value: &JsonValue) -> String {
+    format!(
+        "Type mismatch for field '{field}': expected {declared:?}, got {:?}",
+        infer_field_type(value)
+    )
 }
 
 /// The sort field a search cannot be answered with, if the caller named one.
@@ -6054,16 +6086,12 @@ impl NodeOrchestrator {
 
                 match schema_cache.fields.get(key) {
                     Some(existing_field) => {
-                        if let Some(unstorable) =
-                            unstorable_value_type(&existing_field.field_type, value)
+                        if let Some(why) = unstorable_value(key, &existing_field.field_type, value)
                         {
                             return SchemaValidationResult {
                                 needs_evolution: false,
                                 new_fields: Vec::new(),
-                                validation_error: Some(format!(
-                                    "Type mismatch for field '{}': expected {:?}, got {:?}",
-                                    key, existing_field.field_type, unstorable
-                                )),
+                                validation_error: Some(why),
                             };
                         }
                     }
