@@ -204,6 +204,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An NDJSON import survives a line it cannot use.** `POST /api/{index}/document/stream` commits
+  its micro-batches as the body is read, so aborting on a bad line left documents written that
+  the response never reported: a `400`, no counts, and nothing to resume from. A line that will
+  not parse, or that is larger than one record may be, is now answered the way `_bulk` has always
+  answered a bad row — a reason naming it, and the rest of the file still loaded.
+
+  Reasons name the line as it sits in the file. They were numbered against the micro-batch, so
+  `document 3` meant the fourth document of some five hundred and pointed at nothing an operator
+  could open; and blank lines were not counted, so even the line numbers that did appear were
+  short by however many blanks preceded them. Both fixed: `line 41` is what `sed -n 41p` prints.
+  The renumbering is the same function the bulk path uses for a peer's reasons.
+
+  A body where nothing parsed and nothing was written is still a `400` — that request was the
+  wrong shape entirely, which is the one thing a caller cannot tell from a partial success. A
+  body that stops arriving mid-request still fails outright; there is no honest answer to give
+  about a request that did not finish.
+
+  `items_written` plus the reasons is the number of documents the body held, checked by
+  `debug_assert_eq!` as the bulk path is.
+
 - **A bulk write accounts for every item it received.** `items_written` plus one reason per
   document that was not written now equals `items_received`, and each reason names the document
   by the position the caller sent it in. The response already claimed this and only delivered it

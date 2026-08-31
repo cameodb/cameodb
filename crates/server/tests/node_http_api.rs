@@ -3155,3 +3155,143 @@ async fn a_bulk_write_accounts_for_every_item_it_received() {
         "the refused documents are named by position: {body}"
     );
 }
+
+/// An NDJSON import survives a line it cannot use, and names the line by its place in the file.
+///
+/// Micro-batches commit as the body is read, so aborting on a bad line left documents written
+/// that the response never reported — a 400, no counts, and nothing to resume from. And the
+/// reasons that did come back were numbered against the micro-batch, so `document 3` meant the
+/// fourth document of some five hundred and pointed at nothing an operator could open.
+#[tokio::test]
+async fn a_write_stream_reports_a_bad_line_and_loads_the_rest() {
+    // A batch size of two, so the failures land in different micro-batches and the numbering has
+    // something to get wrong.
+    let node = TestNode::start("stream_batch_size = 2").await;
+
+    let (status, body) = put_config(
+        &node,
+        "feed",
+        &json!({
+            "fields": {
+                "id": {"field_type": "text", "indexed": true},
+                "n": {"field_type": "i64", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "declaring the config should succeed: {body}");
+
+    // Line 3 is blank, line 5 will not parse, line 7 parses but the schema refuses it.
+    let ndjson = concat!(
+        "{\"id\":\"a\",\"doc\":{\"n\":1}}\n",
+        "{\"id\":\"b\",\"doc\":{\"n\":2}}\n",
+        "\n",
+        "{\"id\":\"c\",\"doc\":{\"n\":3}}\n",
+        "{\"id\":\"d\",\"doc\":{\"n\":\n",
+        "{\"id\":\"e\",\"doc\":{\"n\":5}}\n",
+        "{\"id\":\"f\",\"doc\":{\"n\":\"six\"}}\n",
+        "{\"id\":\"g\",\"doc\":{\"n\":7}}\n",
+    );
+
+    let (status, body) = post_ndjson(&node, "/api/feed/document/stream", ndjson).await;
+    assert_eq!(status, 200, "a bad line does not fail the import: {body}");
+    assert_eq!(body["status"], "partial", "and it is reported: {body}");
+
+    let received = body["lines_received"].as_u64().expect("lines_received");
+    let written = body["items_written"].as_u64().expect("items_written");
+    let errors = body["errors"].as_array().expect("errors array");
+
+    assert_eq!(received, 7, "the blank line is not a document: {body}");
+    assert_eq!(written, 5, "every usable document is loaded: {body}");
+    assert_eq!(
+        written + errors.len() as u64,
+        received,
+        "and each of the rest has exactly one reason: {body}"
+    );
+
+    // Physical lines, blank one included, so `line 5` is what `sed -n 5p` prints.
+    let mut lines: Vec<u64> = errors
+        .iter()
+        .filter_map(|e| e.as_str())
+        .filter_map(|e| e.strip_prefix("line "))
+        .filter_map(|rest| rest.split_once(": "))
+        .filter_map(|(line, _)| line.parse().ok())
+        .collect();
+    lines.sort_unstable();
+    assert_eq!(
+        lines,
+        vec![5, 7],
+        "the unusable lines are named where they sit in the file: {body}"
+    );
+
+    // The documents really are there, not merely counted.
+    let client = node.client();
+    client.admin_index_commit("feed").await.expect("commit");
+    let found = client
+        .search("feed", "n:[1 TO 7]", Some(10), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(
+        found["hits"].as_array().map(|h| h.len()),
+        Some(5),
+        "the loaded documents are searchable: {found}"
+    );
+}
+
+/// A line larger than one record may be is skipped, not fatal, and the file keeps loading.
+#[tokio::test]
+async fn a_write_stream_skips_an_oversized_line() {
+    let node = TestNode::start("").await;
+
+    // One line past the default 64 MB record ceiling, between two ordinary ones.
+    let big = "x".repeat(70 * 1024 * 1024);
+    let ndjson = format!(
+        "{{\"id\":\"a\",\"doc\":{{\"t\":\"one\"}}}}\n\
+         {{\"id\":\"big\",\"doc\":{{\"t\":\"{big}\"}}}}\n\
+         {{\"id\":\"c\",\"doc\":{{\"t\":\"three\"}}}}\n"
+    );
+
+    let (status, body) = post_ndjson(&node, "/api/huge/document/stream", &ndjson).await;
+    assert_eq!(status, 200, "an oversized line does not fail the import: {body}");
+    assert_eq!(body["items_written"], 2, "the ordinary lines load: {body}");
+
+    let errors = body["errors"].as_array().expect("errors array");
+    assert_eq!(errors.len(), 1, "and only the big one is refused: {body}");
+    assert!(
+        errors[0]
+            .as_str()
+            .is_some_and(|e| e.starts_with("line 2:") && e.contains("single-record limit")),
+        "named by its line and its reason: {body}"
+    );
+}
+
+/// A body that is not NDJSON at all is the wrong request, not a partial success.
+#[tokio::test]
+async fn a_body_that_is_not_ndjson_is_refused_outright() {
+    let node = TestNode::start("").await;
+
+    let (status, body) = post_ndjson(
+        &node,
+        "/api/notndjson/document/stream",
+        "[{\"id\":\"a\"},\n{\"id\":\"b\"}]\n",
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "nothing parsed and nothing was written, so the body was the wrong shape: {body}"
+    );
+}
+
+/// POST a raw NDJSON body, returning the status and the decoded response.
+async fn post_ndjson(node: &TestNode, path: &str, body: &str) -> (u16, serde_json::Value) {
+    with_tls_provider();
+    let resp = reqwest::Client::new()
+        .post(format!("{}{path}", node.url))
+        .header("content-type", "application/x-ndjson")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(json!(null)))
+}
