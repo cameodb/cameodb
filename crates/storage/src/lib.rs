@@ -2786,11 +2786,26 @@ fn resolve_index_dir(indices_base: &Path, index: &str) -> Result<PathBuf, StoreE
 fn facet_value(field: &str, value: &str) -> Result<Facet, StoreError> {
     Facet::from_text(value).map_err(|_| StoreError::InvalidFieldValue {
         field: field.to_string(),
-        reason: format!(
-            "'{value}' is not a facet path; a facet path begins with '/' and names its levels in \
-             order, as in '/electronics/phones'. Escape a literal slash inside a level as '\\/'"
-        ),
+        reason: bad_facet_path(value),
     })
+}
+
+/// Why this string is not a facet path, if it is not.
+///
+/// Public so that the write path's validator can refuse a bad path before any shard is asked,
+/// against the same parser that would refuse it here. Two readings of what a facet path is
+/// would be one reading too many: the validator waving through what the writer skips is how a
+/// document ends up stored with a field silently unindexed.
+pub fn facet_path_error(value: &str) -> Option<String> {
+    Facet::from_text(value).err().map(|_| bad_facet_path(value))
+}
+
+/// The one wording for a value that is not a facet path.
+fn bad_facet_path(value: &str) -> String {
+    format!(
+        "'{value}' is not a facet path; a facet path begins with '/' and names its levels in \
+         order, as in '/electronics/phones'. Escape a literal slash inside a level as '\\/'"
+    )
 }
 
 /// Write-Ahead Log operations for atomic dual-write.

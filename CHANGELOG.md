@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A declared `facet` field can now be written to.** Everything under the write was already
+  built for it — `add_json_value_to_doc` has a facet arm, `normalize_facet_query` quotes a path
+  so the parser resolves it to a facet term, and the type is declarable as `facet`, `category`
+  or `tag`. The validator refused every value before any of it ran: a facet path is a string,
+  `infer_field_type` reads a string as text, and text was not a type a facet field accepted. So
+  the type was declarable and unusable, and `{"cat": "/electronics/phones"}` answered
+  `400 Type mismatch for field 'cat': expected Facet, got Text`.
+
+  A facet is the one type whose *value* rather than type decides the answer, so the validator
+  now asks the parser the writer uses — `storage::facet_path_error`, one reading of what a path
+  is, shared by both. A list is several values of the field as it is everywhere else: each
+  element is held to the parser on its own, so `{"cat": ["/electronics/laptops", "/clearance"]}`
+  is found by either path, and one unparseable element refuses the document wherever it sits.
+
+  Judged in the validator rather than left to the writer, which is what makes a bad path a
+  per-document `document 1: …` rejection in a bulk write instead of a failure of the whole shard
+  batch. `infer_field_type` still never *infers* a facet: a path-shaped string in a field the
+  schema has not seen is text, because a Unix path is not a hierarchy anyone asked for.
+
 - **An index is identified by its name, and by nothing else.** A reverse lookup keyed by a hash
   of the field names sat in front of the schema cache and answered with whichever index of that
   shape had been cached last, without checking the index being written to:

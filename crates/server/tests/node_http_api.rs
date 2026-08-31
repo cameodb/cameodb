@@ -967,7 +967,14 @@ async fn a_value_the_declared_type_cannot_hold_is_a_bad_request() {
     .await;
     assert_eq!(status, 200, "creating the config should succeed: {body}");
 
-    for (field, value) in [("count", json!("not a number")), ("cat", json!("no-slash"))] {
+    // The reason matters as much as the refusal. A facet is refused for the *value* not being a
+    // path, never for the type: every facet path is a string, so refusing the type refuses the
+    // whole field, which is what made facets unwritable.
+    for (field, value, expected) in [
+        ("count", json!("not a number"), "expected I64"),
+        ("cat", json!("no-slash"), "is not a facet path"),
+        ("cat", json!(7), "expected Facet"),
+    ] {
         let refused = client
             .write_document(
                 "typed",
@@ -985,6 +992,10 @@ async fn a_value_the_declared_type_cannot_hold_is_a_bad_request() {
         assert!(
             message.contains(field),
             "and should name the field: {message}"
+        );
+        assert!(
+            message.contains(expected),
+            "{field}={value} should be refused for {expected:?}: {message}"
         );
     }
 
@@ -2819,7 +2830,10 @@ async fn a_bulk_write_teaches_its_own_index_the_fields_it_carries() {
         }),
     )
     .await;
-    assert_eq!(status, 200, "declaring the first index should succeed: {body}");
+    assert_eq!(
+        status, 200,
+        "declaring the first index should succeed: {body}"
+    );
 
     let (status, body) = post_json(
         &node,
@@ -2828,7 +2842,10 @@ async fn a_bulk_write_teaches_its_own_index_the_fields_it_carries() {
     )
     .await;
     assert_eq!(status, 200, "the bulk write should succeed: {body}");
-    assert_eq!(body["items_written"], 1, "and should write its document: {body}");
+    assert_eq!(
+        body["items_written"], 1,
+        "and should write its document: {body}"
+    );
 
     let derived = get_json(&node, "/api/derived/_config").await;
     let names: Vec<&str> = derived["fields"]
@@ -2838,5 +2855,140 @@ async fn a_bulk_write_teaches_its_own_index_the_fields_it_carries() {
     assert!(
         names.contains(&"n"),
         "a written field belongs in the schema of the index that took it: {derived}"
+    );
+}
+
+/// A declared facet field takes a facet path, and the query side finds it.
+///
+/// Everything under the write was already built for this — `add_json_value_to_doc` has a facet
+/// arm, `normalize_facet_query` quotes a path so the parser resolves it to a facet term, and the
+/// type is declarable as `facet`, `category` or `tag`. The validator refused every value before
+/// any of it ran: a facet path is a string, `infer_field_type` reads it as text, and text was
+/// not a type a facet field would accept. So the whole type was declarable and unusable.
+#[tokio::test]
+async fn a_facet_field_takes_a_path_and_a_list_of_them() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "catalogue",
+        &json!({
+            "fields": {
+                "id": {"field_type": "text", "indexed": true},
+                "cat": {"field_type": "facet", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "declaring a facet field should succeed: {body}");
+
+    client
+        .write_document(
+            "catalogue",
+            "p1",
+            &json!({"id": "p1", "cat": "/electronics/phones"}),
+            None,
+        )
+        .await
+        .expect("a valid facet path is storable");
+
+    // A list is several values of the field, exactly as it is for a number: the writer flattens
+    // it into one `add_facet` per element, so either path finds the document.
+    client
+        .write_document(
+            "catalogue",
+            "p2",
+            &json!({"id": "p2", "cat": ["/electronics/laptops", "/clearance"]}),
+            None,
+        )
+        .await
+        .expect("a list of facet paths is several values of the field");
+
+    client
+        .admin_index_commit("catalogue")
+        .await
+        .expect("explicit commit");
+
+    for (query, expected) in [
+        ("cat:/electronics/phones", vec!["p1"]),
+        ("cat:/electronics/laptops", vec!["p2"]),
+        ("cat:/clearance", vec!["p2"]),
+        // A facet matches its own path and everything beneath it.
+        ("cat:/electronics", vec!["p1", "p2"]),
+    ] {
+        let found = client
+            .search("catalogue", query, Some(10), None, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{query} should run: {e}"));
+        let mut ids: Vec<String> = found["hits"]
+            .as_array()
+            .map(|hits| {
+                hits.iter()
+                    .filter_map(|h| h["id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        assert_eq!(ids, expected, "{query} should match {expected:?}: {found}");
+    }
+}
+
+/// One bad element refuses the document, wherever it sits in the list.
+///
+/// The element decides, not the shape: a list of facets is judged the same way a list of numbers
+/// is, so a path that will not parse is as unstorable in a list of three as it is on its own.
+#[tokio::test]
+async fn one_unparseable_path_refuses_a_list_of_facets() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "mixed",
+        &json!({
+            "fields": {
+                "id": {"field_type": "text", "indexed": true},
+                "cat": {"field_type": "facet", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "declaring the config should succeed: {body}");
+
+    for value in [
+        json!(["/good/path", "no-slash"]),
+        json!(["no-slash", "/good/path"]),
+    ] {
+        let refused = client
+            .write_document("mixed", "m1", &json!({"id": "m1", "cat": value}), None)
+            .await
+            .expect_err(&format!("{value} should be refused"));
+        let message = refused.to_string();
+        assert!(
+            message.contains("400") && message.contains("is not a facet path"),
+            "{value} should be refused as a bad path, not as a bad type: {message}"
+        );
+    }
+
+    // And the refusal is per document rather than per batch: a bulk write reports which one.
+    let (status, body) = post_json(
+        &node,
+        "/api/mixed/_bulk",
+        json!([
+            {"id": "ok", "doc": {"cat": "/fine"}},
+            {"id": "bad", "doc": {"cat": ["/fine", "no-slash"]}}
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200, "a bulk write reports partial success: {body}");
+    assert_eq!(body["items_written"], 1, "the good document is written: {body}");
+    let errors = body["errors"].as_array().expect("errors array");
+    assert_eq!(errors.len(), 1, "and only the bad one is refused: {body}");
+    assert!(
+        errors[0]
+            .as_str()
+            .is_some_and(|e| e.starts_with("document 1:") && e.contains("is not a facet path")),
+        "naming its position and its reason: {body}"
     );
 }
