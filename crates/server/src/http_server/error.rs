@@ -48,7 +48,18 @@ impl AppError {
     /// `InvalidInput` is the same verdict reached on another node: a peer that refused the
     /// request keeps that kind across the wire, so a routed search answers the caller the same
     /// way whether it ran here or there.
+    ///
+    /// Every classification here is on the error's type. It used to fall through to reading the
+    /// message text, which cannot tell a caller's mistake from the node's: any error whose text
+    /// contained "not found" answered 404, so a write that failed because a *shard* was missing
+    /// told the caller their index did not exist, and any text containing "parse" answered 400
+    /// "Invalid query format" whatever it was really about.
     pub fn from_route(err: OrchestratorError) -> Self {
+        // The one thing that is actually absent rather than broken.
+        if let OrchestratorError::Storage(storage::StoreError::IndexNotFound(_)) = &err {
+            return Self::not_found(err.to_string());
+        }
+
         let is_bad_request = match &err {
             OrchestratorError::UnsortableField { .. }
             | OrchestratorError::UnrunnableQuery { .. } => true,
@@ -66,10 +77,13 @@ impl AppError {
                 io.kind(),
                 std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
             ),
-            // A value the field's type cannot hold is the document's fault too, and the text
-            // classification below would read "invalid value for field" as neither a 404 nor a
-            // parse error and answer 500.
-            OrchestratorError::Storage(storage::StoreError::InvalidFieldValue { .. }) => true,
+            // A value the field's type cannot hold is the document's fault too, as is a query
+            // that will not parse and a name no index may have.
+            OrchestratorError::Storage(
+                storage::StoreError::InvalidFieldValue { .. }
+                | storage::StoreError::QueryParser(_)
+                | storage::StoreError::InvalidIndexName(_),
+            ) => true,
             _ => false,
         };
 
@@ -85,15 +99,12 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let error_msg = self.error.to_string();
 
-        // An explicit status wins; otherwise fall back to classifying the text.
-        let (status, message) = if let Some(status) = self.status {
-            (status, error_msg.as_str())
-        } else if error_msg.contains("NotFound") || error_msg.contains("not found") {
-            (StatusCode::NOT_FOUND, "Resource not found")
-        } else if error_msg.contains("QueryParserError") || error_msg.contains("parse") {
-            (StatusCode::BAD_REQUEST, "Invalid query format")
-        } else {
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+        // A handler that knows whose fault an error is says so; anything else is this node's
+        // problem. Guessing from the message text is what this replaced, and it guessed wrong in
+        // both directions — see `from_route`, which classifies on the error's type instead.
+        let (status, message) = match self.status {
+            Some(status) => (status, error_msg.as_str()),
+            None => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
         };
 
         // Log at appropriate level: DEBUG for 404 (expected), WARN for client errors, ERROR for server errors

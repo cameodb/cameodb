@@ -204,6 +204,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A field first seen holding a list is typed by what the list holds.** Every tantivy field is
+  multivalued, so a list of numbers is a numeric field with several values in it — the reading
+  the rest of the write path already takes, since a list is checked element by element and the
+  writer adds one value per element. Typing the list itself as text made the two disagree on the
+  case that matters: `{"risk_score": [9, 12]}` arriving at a field nobody had declared produced a
+  text field, and no range query ever matched it again. A list whose elements disagree, or which
+  holds lists or objects, is still text; a `null` element is passed over rather than counted
+  against the type, because the writer stores nothing for one.
+
+  Fixing it turned up why it was possible: there were **two** implementations of "what type is
+  this value", one in the orchestrator and `FieldDef::infer_type_from_value` in storage, and the
+  second is the one that runs when a write creates an index. They agreed only for as long as
+  nobody edited one of them. There is one now.
+
+- **A date field takes a timestamp counted as well as one written.** `infer_type_from_value`
+  knows only the written form — it reads a number as an integer — so a declared date field
+  refused every epoch timestamp, which is the shape most exporters emit. Seconds, never
+  milliseconds: no value says which was meant, and guessing by magnitude turns a date in 2033
+  into one in 1970 with nothing to show for it. A caller holding milliseconds sends a string.
+
+- **HTTP status codes are decided by an error's type, not by its text.** The fallback classifier
+  read the message: anything containing "not found" answered `404` with the message replaced by
+  "Resource not found", so a write that failed because a *shard* was missing told the caller
+  their index did not exist; anything containing "parse" answered `400 Invalid query format`
+  whatever it was about. Both are now typed — `StoreError::IndexNotFound` is a 404,
+  `QueryParser` and `InvalidIndexName` are 400s — the catalogue handlers classify through
+  `from_route` like every other route, and an error nobody classified is this node's problem and
+  says so.
+
 - **An NDJSON import survives a line it cannot use.** `POST /api/{index}/document/stream` commits
   its micro-batches as the body is read, so aborting on a bad line left documents written that
   the response never reported: a `400`, no counts, and nothing to resume from. A line that will
