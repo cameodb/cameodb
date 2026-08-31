@@ -94,7 +94,8 @@ pub(super) async fn list_cluster_indexes_handler(
     let mut result = state
         .router
         .route_and_handle(client_op, None, OperationType::Read)
-        .await?;
+        .await
+        .map_err(AppError::from_route)?;
     if let Some(Extension(authz)) = authz {
         crate::authz::filter_index_listing(&mut result, &authz);
     }
@@ -120,7 +121,8 @@ pub(super) async fn create_config_handler(
     let result = state
         .router
         .route_and_handle(client_op, None, OperationType::Write)
-        .await?;
+        .await
+        .map_err(AppError::from_route)?;
     Ok(Json(result))
 }
 
@@ -136,7 +138,8 @@ pub(super) async fn get_config_handler(
     let result = state
         .router
         .route_and_handle(client_op, None, OperationType::Read)
-        .await?;
+        .await
+        .map_err(AppError::from_route)?;
     Ok(Json(result))
 }
 
@@ -158,7 +161,8 @@ pub(super) async fn list_indexes_handler(
     let mut result = state
         .router
         .route_and_handle(client_op, None, OperationType::Read)
-        .await?;
+        .await
+        .map_err(AppError::from_route)?;
     if let Some(Extension(authz)) = authz {
         crate::authz::filter_index_listing(&mut result, &authz);
     }
@@ -201,7 +205,8 @@ pub(super) async fn update_schema_handler(
             None,
             OperationType::Write,
         )
-        .await?;
+        .await
+        .map_err(AppError::from_route)?;
 
     // The engine reports a refusal rather than raising it, because which HTTP status it deserves
     // is this layer's question. Nothing was written in that case, and only an unknown field

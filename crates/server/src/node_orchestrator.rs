@@ -77,7 +77,6 @@ use crate::query::parse_query_keywords;
 use crate::remote_peer_pool::{ConnectionChannel, RemotePeerPool};
 
 // Re-export SortSpec and SortOrder from storage crate
-use chrono::{NaiveDate, NaiveDateTime};
 use cluster::{ConsistentRing, IdentityError, NodeIdentity, generate_tokens};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use storage::{
@@ -585,43 +584,17 @@ fn disagreeing_shadow_field(doc: &JsonValue, schema: &IndexSchema, id: &str) -> 
 
 /// The field type a value would be given if the schema had never seen the field.
 ///
-/// One reading of a JSON value, shared by every write path. It is deliberately not applied to
-/// `id`: the document key is text whatever it looks like, and inferring `i64` from a numeric
-/// identifier is how an index came to declare `id` as a type the key it builds does not use.
+/// `FieldDef::infer_type_from_value` is the one reading of this, shared with the storage layer's
+/// own evolution and with the sampling that builds an index's first schema. It was two: this had
+/// its own copy of the same match, and the two agreed only for as long as nobody edited one of
+/// them — which is how a list came to be typed by its elements on a write to an existing field
+/// and as text on the write that created the index.
 ///
-/// A string is examined before it is called text, because the shapes that follow are what the
-/// engine can index as something better: an RFC3339 or naive timestamp is a date, and an
-/// address is an ip. An array reads as text — the write path serializes it into a text field
-/// and tokenizes that — and an object as json. Null reads as text because null is the absence
-/// of a value, and text is the only type that can hold the absence of one.
+/// It is deliberately not applied to `id`: the document key is text whatever it looks like, and
+/// inferring `i64` from a numeric identifier is how an index came to declare `id` as a type the
+/// key it builds does not use.
 fn infer_field_type(value: &JsonValue) -> TantivyFieldType {
-    match value {
-        JsonValue::String(s) => {
-            if chrono::DateTime::parse_from_rfc3339(s).is_ok()
-                || is_naive_datetime(s)
-                || is_naive_date(s)
-            {
-                TantivyFieldType::Date
-            } else if s.parse::<std::net::IpAddr>().is_ok() {
-                TantivyFieldType::Ip
-            } else {
-                TantivyFieldType::Text
-            }
-        }
-        JsonValue::Number(n) => {
-            if n.is_i64() {
-                TantivyFieldType::I64
-            } else if n.is_u64() {
-                TantivyFieldType::U64
-            } else {
-                TantivyFieldType::F64
-            }
-        }
-        JsonValue::Bool(_) => TantivyFieldType::Boolean,
-        JsonValue::Array(_) => TantivyFieldType::Text,
-        JsonValue::Object(_) => TantivyFieldType::Json,
-        JsonValue::Null => TantivyFieldType::Text,
-    }
+    FieldDef::infer_type_from_value(value)
 }
 
 /// Whether a field declared as one type can hold a single value that reads as another.
@@ -726,6 +699,13 @@ fn unstorable_scalar(
             }
             None => Some(type_mismatch(field, declared, value)),
         };
+    }
+
+    // A date is written or counted, and `infer_field_type` only knows the written form: it reads
+    // a number as an integer, which the declared type does not match, so every timestamp sent as
+    // epoch seconds — the shape most exporters emit — was refused.
+    if matches!(declared, TantivyFieldType::Date) {
+        return (!storage::is_date_value(value)).then(|| type_mismatch(field, declared, value));
     }
 
     let inferred = infer_field_type(value);
@@ -1371,38 +1351,6 @@ fn mark_initial_fields_indexed(schema: &mut IndexSchema) {
 // ============================================================================
 // Date Parsing Helper Functions
 // ============================================================================
-
-/// Check common naive datetime formats (no timezone) such as
-/// - 2024-05-01 12:30:00
-/// - 2024-05-01 12:30
-/// - 2024-05-01T12:30:00
-/// - 2024-05-01T12:30:00.123
-fn is_naive_datetime(s: &str) -> bool {
-    const NAIVE_DATETIME_FORMATS: &[&str] = &[
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S%.f",
-    ];
-
-    NAIVE_DATETIME_FORMATS
-        .iter()
-        .any(|fmt| NaiveDateTime::parse_from_str(s, fmt).is_ok())
-}
-
-/// Check common date-only formats such as
-/// - 2024-05-01
-/// - 2024/05/01
-/// - 20240501
-fn is_naive_date(s: &str) -> bool {
-    const NAIVE_DATE_FORMATS: &[&str] = &["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%Y-%m", "%Y"];
-
-    NAIVE_DATE_FORMATS
-        .iter()
-        .any(|fmt| NaiveDate::parse_from_str(s, fmt).is_ok())
-}
 
 // ============================================================================
 // Schema Validation Types
@@ -8929,9 +8877,12 @@ impl NodeOrchestrator {
             "Schema not found in any shard"
         );
 
-        Err(OrchestratorError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Schema for index '{}' not found", index),
+        // Typed rather than an `Io` of kind `NotFound`, which is the kind this node also raises
+        // for its own missing pieces — a shard it cannot find, a peer it cannot reach. The HTTP
+        // layer has to answer 404 for the first and 500 for the second, and it cannot tell them
+        // apart from an error kind shared by both.
+        Err(OrchestratorError::Storage(StoreError::IndexNotFound(
+            index.to_string(),
         )))
     }
 

@@ -3252,7 +3252,10 @@ async fn a_write_stream_skips_an_oversized_line() {
     );
 
     let (status, body) = post_ndjson(&node, "/api/huge/document/stream", &ndjson).await;
-    assert_eq!(status, 200, "an oversized line does not fail the import: {body}");
+    assert_eq!(
+        status, 200,
+        "an oversized line does not fail the import: {body}"
+    );
     assert_eq!(body["items_written"], 2, "the ordinary lines load: {body}");
 
     let errors = body["errors"].as_array().expect("errors array");
@@ -3294,4 +3297,150 @@ async fn post_ndjson(node: &TestNode, path: &str, body: &str) -> (u16, serde_jso
         .expect("request");
     let status = resp.status().as_u16();
     (status, resp.json().await.unwrap_or(json!(null)))
+}
+
+/// A date field takes a timestamp counted as well as one written.
+///
+/// `infer_field_type` only knows the written form — it reads a number as an integer — so a
+/// declared date field refused every epoch timestamp, which is the shape most exporters emit.
+/// Seconds, never milliseconds: guessing the unit by magnitude turns a date in 2033 into one in
+/// 1970 with nothing to show for it.
+#[tokio::test]
+async fn a_date_field_takes_epoch_seconds() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "events",
+        &json!({
+            "fields": {
+                "id": {"field_type": "text", "indexed": true},
+                "at": {"field_type": "date", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "declaring a date field should succeed: {body}");
+
+    // The same instant, counted and written.
+    client
+        .write_document(
+            "events",
+            "counted",
+            &json!({"id": "counted", "at": 1767225600}),
+            None,
+        )
+        .await
+        .expect("epoch seconds are a date");
+    client
+        .write_document(
+            "events",
+            "written",
+            &json!({"id": "written", "at": "2026-01-01T00:00:00Z"}),
+            None,
+        )
+        .await
+        .expect("a formatted timestamp is a date");
+
+    client.admin_index_commit("events").await.expect("commit");
+
+    let found = client
+        .search(
+            "events",
+            "at:[2025-12-31T00:00:00Z TO 2026-01-02T00:00:00Z]",
+            Some(10),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("search");
+    assert_eq!(
+        found["hits"].as_array().map(|h| h.len()),
+        Some(2),
+        "both spellings land on the same day and are found by a range: {found}"
+    );
+
+    // A word is still not a date, and neither is a fraction of a second.
+    for value in [json!("yesterday"), json!(1.5)] {
+        client
+            .write_document(
+                "events",
+                "bad",
+                &json!({"id": "bad", "at": value.clone()}),
+                None,
+            )
+            .await
+            .expect_err(&format!("{value} is not a date"));
+    }
+}
+
+/// A field first seen holding a list is typed by what the list holds.
+///
+/// Every tantivy field is multivalued, so a list of numbers is a numeric field with several
+/// values in it — the reading the rest of the write path already takes. Typing the list itself
+/// as text made the two disagree on the case that matters: a numeric list arriving at a field
+/// nobody had declared produced a text field, and no range query ever matched it again.
+#[tokio::test]
+async fn a_new_field_holding_a_list_is_typed_by_its_elements() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    client
+        .write_document(
+            "scores",
+            "s1",
+            &json!({
+                "id": "s1",
+                "risk": [9, 12],
+                "flags": [true, false],
+                "mixed": [1, "two"],
+                "nested": [[1, 2]],
+                "sparse": [9, null, 12]
+            }),
+            None,
+        )
+        .await
+        .expect("write");
+
+    let schema = get_json(&node, "/api/scores/_config").await;
+    let typed = |name: &str| -> Option<String> {
+        schema["fields"]
+            .as_array()?
+            .iter()
+            .find(|f| f["name"] == name)?["type"]
+            .as_str()
+            .map(str::to_string)
+    };
+
+    assert_eq!(typed("risk").as_deref(), Some("i64"), "{schema}");
+    assert_eq!(typed("flags").as_deref(), Some("boolean"), "{schema}");
+    assert_eq!(
+        typed("sparse").as_deref(),
+        Some("i64"),
+        "a null stores nothing, so it is not evidence against the type: {schema}"
+    );
+    assert_eq!(
+        typed("mixed").as_deref(),
+        Some("text"),
+        "elements that do not agree leave text, the only type holding both: {schema}"
+    );
+    assert_eq!(
+        typed("nested").as_deref(),
+        Some("text"),
+        "the writer flattens one level, so a list of lists has no element type: {schema}"
+    );
+
+    // The point of all this: the numeric list is range-queryable.
+    client.admin_index_commit("scores").await.expect("commit");
+    let found = client
+        .search("scores", "risk:[10 TO 20]", Some(10), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(
+        found["hits"].as_array().map(|h| h.len()),
+        Some(1),
+        "a range matches the document on its second value: {found}"
+    );
 }

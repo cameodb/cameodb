@@ -1866,9 +1866,62 @@ impl FieldDef {
                     TantivyFieldType::Text
                 }
             }
-            JsonValue::Array(_) => TantivyFieldType::Text, // Arrays as text for compatibility
+            JsonValue::Array(items) => {
+                Self::infer_element_type(items).unwrap_or(TantivyFieldType::Text)
+            }
             JsonValue::Object(_) => TantivyFieldType::Json, // Nested objects as JSON
             JsonValue::Null => TantivyFieldType::Text,
+        }
+    }
+
+    /// The one type every element of a list can be held as, if there is one.
+    ///
+    /// Every tantivy field is multivalued, so a list of numbers is a numeric field with several
+    /// values in it — the reading the write path already takes, since it adds one value per
+    /// element. Typing the list itself as text made the two disagree on the case that matters:
+    /// `{"risk_score": [9, 12]}` arriving at a field nobody had declared produced a text field,
+    /// and no range query ever matched it again.
+    ///
+    /// Nulls are passed over rather than counted against it: the writer stores nothing for one,
+    /// so `[9, null, 12]` is two values of a numeric field. A list of only nulls, an empty one,
+    /// one whose elements disagree, or one holding lists or objects has no element type — the
+    /// writer flattens exactly one level, and text is the only type that holds both of anything.
+    fn infer_element_type(items: &[JsonValue]) -> Option<TantivyFieldType> {
+        let mut agreed: Option<TantivyFieldType> = None;
+
+        for item in items {
+            if item.is_null() {
+                continue;
+            }
+            if matches!(item, JsonValue::Array(_) | JsonValue::Object(_)) {
+                return None;
+            }
+            let inferred = Self::infer_type_from_value(item);
+            agreed = match agreed {
+                None => Some(inferred),
+                Some(current) => Some(Self::wider_of(current, inferred)?),
+            };
+        }
+
+        agreed
+    }
+
+    /// The type that holds both of these, if one does.
+    ///
+    /// The same widening a declared field gets: `4` and `4.5` in one list is a source being
+    /// loose about a number, not a list that cannot be stored as one.
+    fn wider_of(a: TantivyFieldType, b: TantivyFieldType) -> Option<TantivyFieldType> {
+        if a == b {
+            return Some(a);
+        }
+        match (&a, &b) {
+            (TantivyFieldType::String, TantivyFieldType::Text)
+            | (TantivyFieldType::Text, TantivyFieldType::String) => Some(TantivyFieldType::Text),
+            (TantivyFieldType::I64 | TantivyFieldType::U64, TantivyFieldType::F64)
+            | (TantivyFieldType::F64, TantivyFieldType::I64 | TantivyFieldType::U64) => {
+                Some(TantivyFieldType::F64)
+            }
+            _ => None,
         }
     }
 
@@ -2048,13 +2101,18 @@ pub(crate) fn add_json_value_to_doc(
                 }
             }
             TantivyFieldType::Date => {
-                if let Some(s) = value.as_str()
-                    && let Some((tantivy_dt, ts, clamped)) = parse_date_str_to_tantivy(s)
-                {
+                // A date arrives written or counted: a formatted string, or a whole number of
+                // seconds since the epoch, which is the shape most exporters emit and the unit
+                // every timestamp in this file is already in.
+                let parsed = match value {
+                    JsonValue::String(s) => parse_date_str_to_tantivy(s),
+                    _ => value.as_i64().map(epoch_seconds_to_tantivy),
+                };
+                if let Some((tantivy_dt, ts, clamped)) = parsed {
                     if ts != clamped {
                         tracing::debug!(
                             field = %field_name,
-                            input = %s,
+                            input = %value,
                             original_ts = %ts,
                             clamped_ts = %clamped,
                             "Date clamped to Tantivy safe range"
@@ -2100,6 +2158,27 @@ pub(crate) fn add_json_value_to_doc(
     }
 
     Ok(())
+}
+
+/// A whole number of seconds since the epoch, as tantivy holds it.
+///
+/// Seconds, never milliseconds. Guessing the unit from the magnitude is how a timestamp in 2033
+/// becomes one in 1970 and nobody notices, and there is no value that says which was meant — a
+/// caller with milliseconds sends a string, or divides.
+pub(crate) fn epoch_seconds_to_tantivy(secs: i64) -> (DateTime, i64, i64) {
+    let clamped = secs.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
+    (DateTime::from_timestamp_secs(clamped), secs, clamped)
+}
+
+/// Whether a value is one a date field can hold: a parseable string, or epoch seconds.
+///
+/// Public so the write path's validator asks the same question the writer answers, rather than
+/// asking `infer_field_type`, which reads a number as an integer and would refuse it.
+pub fn is_date_value(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::String(s) => parse_date_str_to_tantivy(s).is_some(),
+        _ => value.as_i64().is_some(),
+    }
 }
 
 fn parse_date_str_to_tantivy(s: &str) -> Option<(DateTime, i64, i64)> {
@@ -8329,8 +8408,20 @@ mod tests {
             (json!(std::f64::consts::PI), TantivyFieldType::F64),
             (json!(true), TantivyFieldType::Boolean),
             (json!(null), TantivyFieldType::Text),
-            (json!([1, 2, 3]), TantivyFieldType::Text),
             (json!({"key": "value"}), TantivyFieldType::Json),
+            // A list is several values of one field, so it is typed by what it holds. Nulls
+            // store nothing, so they are not evidence against the type; elements that disagree,
+            // and lists or objects inside a list, leave text as the only type holding both.
+            (json!([1, 2, 3]), TantivyFieldType::I64),
+            (json!([1, null, 3]), TantivyFieldType::I64),
+            (json!([1, 2.5]), TantivyFieldType::F64),
+            (json!([true, false]), TantivyFieldType::Boolean),
+            (json!(["2023-01-01T00:00:00Z"]), TantivyFieldType::Date),
+            (json!([1, "two"]), TantivyFieldType::Text),
+            (json!([[1, 2]]), TantivyFieldType::Text),
+            (json!([{"k": 1}]), TantivyFieldType::Text),
+            (json!([]), TantivyFieldType::Text),
+            (json!([null]), TantivyFieldType::Text),
         ];
 
         for (value, expected_type) in test_cases {
