@@ -125,8 +125,82 @@ const ORCHESTRATOR_WORKER_QUEUE_CAPACITY: usize = SHARD_WRITER_CHANNEL_CAPACITY 
 /// `in_flight_capacity` on `/_admin/workers`.
 const ORCHESTRATOR_WORKER_MAX_IN_FLIGHT: usize = 8;
 
-/// Type alias for routing results to reduce complexity
-type RoutingResult = Result<(DocPayload, Option<String>, Option<Uuid>), OrchestratorError>;
+/// The prefix a per-document reason carries: its place in the batch it was sent in.
+const DOCUMENT_PREFIX: &str = "document ";
+
+/// Split `document 7: reason` into its position and its reason, if that is what it is.
+fn split_document_reason(error: &str) -> Option<(usize, &str)> {
+    let rest = error.strip_prefix(DOCUMENT_PREFIX)?;
+    let (position, reason) = rest.split_once(": ")?;
+    Some((position.parse().ok()?, reason))
+}
+
+/// What a peer's answer means for the documents this node forwarded to it.
+///
+/// One reason per document the peer did not write, which is what keeps the coordinating node's
+/// own answer addable: `items_written` plus `errors` is `items_received`, on one node or five.
+///
+/// A peer numbers its reasons against the batch *it* received, so each is renumbered to the
+/// position the caller used — a position from someone else's batch is worse than none, because
+/// it names a real document that is fine. A reason in any other shape is about the request
+/// rather than one document, so it is attached to the documents it cost rather than reported
+/// beside them.
+///
+/// The last case is a peer whose numbers do not add up: fewer reasons than documents it failed
+/// to write. It cannot happen between two nodes running this code, and it is stated rather than
+/// left as a silent shortfall when it does, because a caller cannot act on a gap it has to infer
+/// by subtracting.
+fn remote_rejections(
+    node_id: Uuid,
+    positions: &[usize],
+    written: usize,
+    reasons: &[String],
+) -> Vec<String> {
+    let unwritten = positions.len().saturating_sub(written);
+    let mut rejections = Vec::with_capacity(unwritten);
+
+    for reason in reasons {
+        if rejections.len() == unwritten {
+            break;
+        }
+        match split_document_reason(reason) {
+            Some((theirs, why)) if theirs < positions.len() => {
+                rejections.push(format!("document {}: {why}", positions[theirs]));
+            }
+            // Not about one document, or numbered against a batch this is not: kept as what the
+            // node said, against a document it did not write.
+            _ => rejections.push(format!("node {node_id}: {reason}")),
+        }
+    }
+
+    while rejections.len() < unwritten {
+        rejections.push(format!(
+            "a document forwarded to node {node_id} was neither written nor refused: it reported \
+             {written} written of {} with {} reasons",
+            positions.len(),
+            reasons.len()
+        ));
+    }
+
+    rejections
+}
+
+/// A document on its way to a shard, still carrying where it sat in the batch that arrived.
+///
+/// The position is what lets every reason name the document it is about. It used to be dropped
+/// the moment validation's rejects were filtered out, so nothing past that point could say
+/// `document N:` — a routing failure or a failed shard batch went to the log and left the
+/// response reporting fewer documents written than it received with nothing to explain the
+/// difference.
+#[derive(Debug, Clone)]
+struct Placed {
+    position: usize,
+    doc: DocPayload,
+    routing_key: Option<String>,
+}
+
+/// Where one document is going, or why it is going nowhere.
+type RoutingResult = Result<(Placed, Uuid), (usize, String)>;
 
 /// Type alias for single write commands enqueued in the writer thread
 type WriteCommand = (WalOp, tokio::sync::oneshot::Sender<Result<u64, StoreError>>);
@@ -6248,10 +6322,16 @@ impl NodeOrchestrator {
     ///
     /// Each shard actor processes its messages sequentially from its own queue,
     /// preventing concurrent access to shared storage resources.
+    /// Returns what was written and one reason for every document that was not.
+    ///
+    /// A shard batch succeeds or fails whole — the writer thread applies it in one transaction —
+    /// so a failure loses every document in it. Reported as one error per document rather than
+    /// one per batch: a caller reading `errors` to decide what to retry cannot act on a single
+    /// line standing for five hundred rows, and the count no longer matches what was lost.
     async fn parallel_local_shard_processing(
         &self,
         index: &str,
-        local_batches: HashMap<Uuid, Vec<(DocPayload, Option<String>)>>,
+        local_batches: HashMap<Uuid, Vec<Placed>>,
     ) -> Result<(usize, Vec<String>), OrchestratorError> {
         if local_batches.is_empty() {
             return Ok((0, Vec::new()));
@@ -6283,38 +6363,45 @@ impl NodeOrchestrator {
                     "Processing bulk write batch for local shard"
                 );
 
-                let shard = shard.ok_or_else(|| {
-                    OrchestratorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("Local shard {} not found", shard_id),
-                    ))
-                })?;
+                // Kept so a failure can name every document it took down with it.
+                let positions: Vec<usize> = batch.iter().map(|placed| placed.position).collect();
 
-                let docs: Vec<DocPayload> = batch
-                    .into_iter()
-                    .map(|(d, effective_routing_key)| DocPayload {
-                        id: d.id,
-                        routing_key: effective_routing_key,
-                        doc: d.doc,
-                    })
-                    .collect();
+                let outcome = async {
+                    let shard = shard.ok_or_else(|| {
+                        OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Local shard {} not found", shard_id),
+                        ))
+                    })?;
 
-                // Each shard handles its own writes serially via its dedicated writer thread
-                // This prevents IndexWriter lock contention within the same shard
-                shard
-                    .handle_batch_write(BatchWriteRequest {
-                        index: index_name,
-                        docs,
-                    })
-                    .await
-                    .map(|seq_ids| (shard_id, seq_ids))
+                    let docs: Vec<DocPayload> = batch
+                        .into_iter()
+                        .map(|placed| DocPayload {
+                            id: placed.doc.id,
+                            routing_key: placed.routing_key,
+                            doc: placed.doc.doc,
+                        })
+                        .collect();
+
+                    // Each shard handles its own writes serially via its dedicated writer thread
+                    // This prevents IndexWriter lock contention within the same shard
+                    shard
+                        .handle_batch_write(BatchWriteRequest {
+                            index: index_name,
+                            docs,
+                        })
+                        .await
+                }
+                .await;
+
+                (shard_id, positions, outcome)
             });
         }
 
         let local_results = futures::future::join_all(local_futures).await;
-        for result in local_results {
-            match result {
-                Ok((shard_id, seq_ids)) => {
+        for (shard_id, positions, outcome) in local_results {
+            match outcome {
+                Ok(seq_ids) => {
                     tracing::info!(
                         shard_id = %shard_id,
                         written_count = seq_ids.len(),
@@ -6323,9 +6410,15 @@ impl NodeOrchestrator {
                     total_written += seq_ids.len();
                 }
                 Err(e) => {
-                    let error_msg = format!("{}", e);
-                    tracing::warn!(error = %error_msg, "Local shard batch processing failed");
-                    all_errors.push(error_msg);
+                    tracing::warn!(
+                        shard_id = %shard_id,
+                        count = positions.len(),
+                        error = %e,
+                        "Local shard batch processing failed"
+                    );
+                    all_errors.extend(positions.into_iter().map(|position| {
+                        format!("document {position}: shard {shard_id} did not take the batch this document was in: {e}")
+                    }));
                 }
             }
         }
@@ -6350,20 +6443,36 @@ impl NodeOrchestrator {
     }
 
     /// Forward a bulk batch to a remote node's orchestrator.
+    ///
+    /// Returns what the peer wrote and a reason for every document it did not. The peer's own
+    /// reasons used to be read off the response and thrown away — only `items_written` was kept
+    /// — so a node refusing half a batch contributed nothing to `errors`, and the coordinating
+    /// node answered 200 with a shortfall it could not explain.
+    ///
     /// Uses the cached RemotePeerPool to avoid repeated swarm registry lookups.
     async fn forward_bulk_to_remote(
         &self,
         node_id: Uuid,
         peer_addr: &str,
         index: &str,
-        docs: Vec<DocPayload>,
-    ) -> Result<usize, OrchestratorError> {
+        batch: Vec<Placed>,
+    ) -> Result<(usize, Vec<String>), OrchestratorError> {
         info!(
             "🔎 Forwarding bulk batch to remote: node_id={}, addr={}, docs={}",
             node_id,
             peer_addr,
-            docs.len()
+            batch.len()
         );
+
+        let positions: Vec<usize> = batch.iter().map(|placed| placed.position).collect();
+        let docs: Vec<DocPayload> = batch
+            .into_iter()
+            .map(|placed| DocPayload {
+                id: placed.doc.id,
+                routing_key: placed.routing_key,
+                doc: placed.doc.doc,
+            })
+            .collect();
 
         let pool = self.remote_peer_pool.as_ref().ok_or_else(|| {
             OrchestratorError::Io(std::io::Error::other("Remote peer pool not initialized"))
@@ -6394,14 +6503,28 @@ impl NodeOrchestrator {
             .await
             .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
 
-        // Extract the number of items written from the response
-        if let Some(items_written) = res.get("items_written").and_then(|v| v.as_u64()) {
-            Ok(items_written as usize)
-        } else {
-            Err(OrchestratorError::Io(std::io::Error::other(
+        let Some(items_written) = res.get("items_written").and_then(|v| v.as_u64()) else {
+            return Err(OrchestratorError::Io(std::io::Error::other(
                 "Invalid response from remote bulk write",
-            )))
-        }
+            )));
+        };
+        let written = (items_written as usize).min(positions.len());
+
+        let reasons: Vec<String> = res
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok((
+            written,
+            remote_rejections(node_id, &positions, written, &reasons),
+        ))
     }
 
     /// Fetch a schema from cache if present (lock-free).
@@ -8042,8 +8165,8 @@ impl NodeOrchestrator {
         // and not this one's: a bulk write already reports partial success, and one bad row in
         // an import is no reason to discard the rest.
         let mut rejections: Vec<String> = Vec::new();
-        let docs = if validation_summary.errors.is_empty() {
-            docs
+        let refused: HashSet<usize> = if validation_summary.errors.is_empty() {
+            HashSet::new()
         } else {
             tracing::warn!(
                 index = %index,
@@ -8051,23 +8174,32 @@ impl NodeOrchestrator {
                 total_docs = validation_summary.total_docs,
                 "Some documents failed schema validation and were not written"
             );
-            let refused: HashSet<usize> = validation_summary
-                .errors
-                .iter()
-                .map(|(position, _)| *position)
-                .collect();
             rejections.extend(
                 validation_summary
                     .errors
                     .iter()
                     .map(|(position, reason)| format!("document {position}: {reason}")),
             );
-            docs.into_iter()
-                .enumerate()
-                .filter(|(position, _)| !refused.contains(position))
-                .map(|(_, doc)| doc)
+            validation_summary
+                .errors
+                .iter()
+                .map(|(position, _)| *position)
                 .collect()
         };
+
+        // The position travels with the document from here on. Everything downstream that can
+        // lose one — routing, a shard that will not take its batch, a peer that refuses part of
+        // what it was sent — reports it by the number the caller used.
+        let pending: Vec<Placed> = docs
+            .into_iter()
+            .enumerate()
+            .filter(|(position, _)| !refused.contains(position))
+            .map(|(position, doc)| Placed {
+                position,
+                doc,
+                routing_key: None,
+            })
+            .collect();
 
         // First, route all documents to determine local vs remote
         let mut local_docs = Vec::new();
@@ -8089,64 +8221,57 @@ impl NodeOrchestrator {
 
         // Route documents in parallel
         let routing_results: Vec<RoutingResult> = tokio::task::spawn_blocking(move || {
-            docs.into_par_iter()
-                .map(|doc| {
+            pending
+                .into_par_iter()
+                .map(|mut placed| {
                     // Calculate effective routing key using schema's routing field
-                    let effective_routing_key = extract_routing_value(&doc.doc, &routing_field)
-                        .or_else(|| doc.routing_key.clone())
-                        .or_else(|| (!doc.id.is_empty()).then(|| doc.id.clone()))
-                        .or_else(|| derive_routing_key_from_doc(&doc.doc));
+                    placed.routing_key = extract_routing_value(&placed.doc.doc, &routing_field)
+                        .or_else(|| placed.doc.routing_key.clone())
+                        .or_else(|| (!placed.doc.id.is_empty()).then(|| placed.doc.id.clone()))
+                        .or_else(|| derive_routing_key_from_doc(&placed.doc.doc));
 
                     // Route to shard using consistent hash ring
-                    let target_shard =
-                        match effective_routing_key.as_ref() {
-                            Some(key) => routing_ring
-                                .get_owner(key)
-                                .or(first_shard_id)
-                                .ok_or_else(|| {
-                                    OrchestratorError::Io(std::io::Error::new(
-                                        std::io::ErrorKind::NotFound,
-                                        "No shard available for routing",
-                                    ))
-                                })?,
-                            None => {
-                                return Err(OrchestratorError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidInput,
-                                    "Missing routing key for document",
-                                )));
-                            }
-                        };
+                    let Some(key) = placed.routing_key.as_ref() else {
+                        return Err((
+                            placed.position,
+                            "no routing key could be derived for this document".to_string(),
+                        ));
+                    };
+                    let Some(target_shard) = routing_ring.get_owner(key).or(first_shard_id) else {
+                        return Err((
+                            placed.position,
+                            "no shard is available to route this document to".to_string(),
+                        ));
+                    };
 
-                    Ok((doc, effective_routing_key, Some(target_shard)))
+                    Ok((placed, target_shard))
                 })
                 .collect::<Vec<RoutingResult>>()
         })
         .await
         .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
 
-        // Separate local and remote documents
+        // Separate local and remote documents. A document that routes nowhere is refused rather
+        // than logged and forgotten: it was received, it will not be written, and the response
+        // has to say so or the counts stop adding up.
         for result in routing_results {
             match result {
-                Ok((doc, routing_key, Some(target_shard))) => {
-                    // Check if this shard is local
+                Ok((placed, target_shard)) => {
                     if self.shards.contains_key(&target_shard) {
-                        local_docs.push((doc, routing_key, target_shard));
+                        local_docs.push((placed, target_shard));
                     } else {
-                        remote_docs.push((doc, routing_key, target_shard));
+                        remote_docs.push((placed, target_shard));
                     }
                 }
-                Ok((doc, _, None)) => {
-                    // No target shard - this shouldn't happen but handle gracefully
-                    tracing::warn!("Document routed to no shard: {}", doc.id);
-                }
-                Err(e) => {
-                    tracing::warn!("Routing error: {}", e);
+                Err((position, reason)) => {
+                    tracing::warn!(position, reason, "Routing error");
+                    rejections.push(format!("document {position}: {reason}"));
                 }
             }
         }
 
         // Group local documents by shard
-        let batches = self.group_local_documents(local_docs).await?;
+        let batches = Self::group_local_documents(local_docs);
         let unique_shards = batches.len();
 
         tracing::debug!(
@@ -8183,38 +8308,38 @@ impl NodeOrchestrator {
         }
 
         // Group remote documents by owning node
-        let mut remote_by_node: HashMap<Uuid, Vec<DocPayload>> = HashMap::new();
-        for (doc, routing_key, target_shard) in remote_docs {
-            if let Some(shard_meta) = shard_assignments.get(&target_shard) {
-                let owner_node = shard_meta.node_id;
-                let doc_payload = DocPayload {
-                    id: doc.id.clone(),
-                    routing_key,
-                    doc: doc.doc,
-                };
-                remote_by_node
-                    .entry(owner_node)
+        let mut remote_by_node: HashMap<Uuid, Vec<Placed>> = HashMap::new();
+        for (placed, target_shard) in remote_docs {
+            match shard_assignments.get(&target_shard) {
+                Some(shard_meta) => remote_by_node
+                    .entry(shard_meta.node_id)
                     .or_default()
-                    .push(doc_payload);
-            } else {
-                errors.push(format!(
-                    "No shard assignment for shard {}; dropping document",
-                    target_shard
-                ));
+                    .push(placed),
+                None => errors.push(format!(
+                    "document {}: shard {target_shard} owns this document and no node claims \
+                     that shard",
+                    placed.position
+                )),
             }
         }
 
         // Convert remote batches to the expected format
-        for (node_id, docs) in remote_by_node {
-            if let Some(addr) = peer_addrs.get(&node_id) {
-                tracing::debug!(
-                    node = %node_id,
-                    count = docs.len(),
-                    "Forwarding bulk write batch to remote node"
-                );
-                remote_batches.push((node_id, addr.clone(), docs));
-            } else {
-                errors.push(format!("No peer address for node {}", node_id));
+        for (node_id, batch) in remote_by_node {
+            match peer_addrs.get(&node_id) {
+                Some(addr) => {
+                    tracing::debug!(
+                        node = %node_id,
+                        count = batch.len(),
+                        "Forwarding bulk write batch to remote node"
+                    );
+                    remote_batches.push((node_id, addr.clone(), batch));
+                }
+                None => errors.extend(batch.iter().map(|placed| {
+                    format!(
+                        "document {}: node {node_id} owns this document and has no known address",
+                        placed.position
+                    )
+                })),
             }
         }
 
@@ -8231,26 +8356,42 @@ impl NodeOrchestrator {
 
             let remote_futures: Vec<_> = remote_batches
                 .into_iter()
-                .map(|(node_id, addr, docs_for_remote)| async move {
-                    self.forward_bulk_to_remote(node_id, &addr, index, docs_for_remote)
-                        .await
-                        .map(|items| (node_id, items))
+                .map(|(node_id, addr, batch)| async move {
+                    // Kept so a call that never reached the node can still name what it carried.
+                    let positions: Vec<usize> =
+                        batch.iter().map(|placed| placed.position).collect();
+                    let outcome = self
+                        .forward_bulk_to_remote(node_id, &addr, index, batch)
+                        .await;
+                    (node_id, positions, outcome)
                 })
                 .collect();
 
             let remote_results = join_all(remote_futures).await;
 
-            for result in remote_results {
-                match result {
-                    Ok((_, items)) => {
+            for (node_id, positions, outcome) in remote_results {
+                match outcome {
+                    Ok((items, reasons)) => {
                         written += items;
+                        errors.extend(reasons);
                     }
-                    Err(e) => {
-                        errors.push(format!("Remote forwarding failed: {}", e));
-                    }
+                    // The batch never got an answer, so none of it was written.
+                    Err(e) => errors.extend(positions.into_iter().map(|position| {
+                        format!("document {position}: forwarding to node {node_id} failed: {e}")
+                    })),
                 }
             }
         }
+
+        // Every item is either written or explained. Each path above accounts for what it
+        // loses, so this is a check on that rather than a repair — a batch that reaches here
+        // unbalanced has a path that stopped saying what it dropped, which is the defect this
+        // arithmetic exists to catch.
+        debug_assert_eq!(
+            written + errors.len(),
+            items_received,
+            "a bulk write must account for every item it received"
+        );
 
         let duration = start.elapsed();
         info!(
@@ -8279,20 +8420,14 @@ impl NodeOrchestrator {
     }
 
     /// Helper method to group local documents by shard
-    async fn group_local_documents(
-        &self,
-        local_docs: Vec<(DocPayload, Option<String>, Uuid)>,
-    ) -> Result<HashMap<Uuid, Vec<(DocPayload, Option<String>)>>, OrchestratorError> {
-        let mut batches: HashMap<Uuid, Vec<(DocPayload, Option<String>)>> = HashMap::new();
+    fn group_local_documents(local_docs: Vec<(Placed, Uuid)>) -> HashMap<Uuid, Vec<Placed>> {
+        let mut batches: HashMap<Uuid, Vec<Placed>> = HashMap::new();
 
-        for (doc, routing_key, shard_id) in local_docs {
-            batches
-                .entry(shard_id)
-                .or_default()
-                .push((doc, routing_key));
+        for (placed, shard_id) in local_docs {
+            batches.entry(shard_id).or_default().push(placed);
         }
 
-        Ok(batches)
+        batches
     }
 
     async fn orch_search(
@@ -10688,5 +10823,84 @@ mod tests {
         def.indexed = false;
         def.is_shadow = true;
         def
+    }
+
+    /// A peer numbers its reasons against the batch it received, not the one the caller sent.
+    #[test]
+    fn a_peers_reasons_are_renumbered_into_this_batch() {
+        let node = Uuid::nil();
+        // Positions 4 and 9 of the caller's batch were the ones forwarded.
+        let reasons = vec!["document 1: bad field".to_string()];
+        assert_eq!(
+            remote_rejections(node, &[4, 9], 1, &reasons),
+            vec!["document 9: bad field".to_string()],
+            "the peer's document 1 is the caller's document 9"
+        );
+    }
+
+    /// A reason that is not about one document still stands for a document that was not written.
+    #[test]
+    fn a_peers_batch_level_reason_is_attributed_rather_than_dropped() {
+        let node = Uuid::nil();
+        let reasons = vec!["index is read-only".to_string()];
+        assert_eq!(
+            remote_rejections(node, &[0, 1], 1, &reasons),
+            vec![format!("node {node}: index is read-only")]
+        );
+    }
+
+    /// A position from someone else's batch is worse than none: it names a document that is fine.
+    #[test]
+    fn a_position_outside_this_batch_is_not_taken_as_one() {
+        let node = Uuid::nil();
+        let reasons = vec!["document 7: bad field".to_string()];
+        let rejections = remote_rejections(node, &[0, 1], 1, &reasons);
+        assert_eq!(rejections.len(), 1);
+        assert!(
+            rejections[0].starts_with(&format!("node {node}:")),
+            "it is kept as what the node said, not renumbered onto a document: {rejections:?}"
+        );
+    }
+
+    /// A peer whose numbers do not add up leaves a shortfall, and the shortfall is stated.
+    #[test]
+    fn a_shortfall_a_peer_did_not_explain_is_still_reported() {
+        let node = Uuid::nil();
+        // Three forwarded, one written, and the node gave only one reason for the other two.
+        let reasons = vec!["document 0: bad field".to_string()];
+        let rejections = remote_rejections(node, &[10, 11, 12], 1, &reasons);
+        assert_eq!(
+            rejections.len(),
+            2,
+            "one reason per document not written: {rejections:?}"
+        );
+        assert_eq!(rejections[0], "document 10: bad field");
+        assert!(
+            rejections[1].contains("neither written nor refused"),
+            "and the one it did not explain says so: {rejections:?}"
+        );
+    }
+
+    /// A peer that wrote everything leaves nothing to report, whatever it said.
+    #[test]
+    fn nothing_is_reported_for_a_batch_the_peer_wrote_whole() {
+        let node = Uuid::nil();
+        assert!(remote_rejections(node, &[0, 1, 2], 3, &[]).is_empty());
+        // More reasons than documents unwritten cannot inflate the count either.
+        assert!(
+            remote_rejections(node, &[0], 1, &["document 0: stale".to_string()]).is_empty(),
+            "a reason for a document the node also says it wrote is not an extra rejection"
+        );
+    }
+
+    #[test]
+    fn a_document_reason_is_split_only_when_that_is_what_it_is() {
+        assert_eq!(
+            split_document_reason("document 12: because"),
+            Some((12, "because"))
+        );
+        assert_eq!(split_document_reason("documents 12: because"), None);
+        assert_eq!(split_document_reason("document twelve: because"), None);
+        assert_eq!(split_document_reason("index is read-only"), None);
     }
 }

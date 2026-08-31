@@ -204,6 +204,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A bulk write accounts for every item it received.** `items_written` plus one reason per
+  document that was not written now equals `items_received`, and each reason names the document
+  by the position the caller sent it in. The response already claimed this and only delivered it
+  for documents validation refused; three paths past that point logged what they lost and left
+  the caller a 200 with a shortfall and nothing to explain it.
+
+  A peer's rejections were thrown away — `forward_bulk_to_remote` read `items_written` off the
+  response and dropped its `errors`, so a node refusing half a batch contributed nothing. They
+  are now forwarded, renumbered from the batch the peer received into the batch the caller sent,
+  because a position from someone else's batch names a real document that is fine. A reason in
+  any other shape is attributed to the node against a document it did not write, and a peer
+  whose own numbers do not add up leaves a stated shortfall rather than a silent one.
+
+  A failed shard batch was one error for however many documents it held. A shard applies its
+  batch in one transaction, so a failure loses all of them, and they are now reported one by
+  one: a caller cannot act on a single line standing for five hundred rows.
+
+  A document that routes nowhere was logged and forgotten. Both arms now refuse it by position.
+  Neither is reachable today — `derive_routing_key_from_doc` only fails if serialising a
+  `JsonValue` fails — but a path that drops a document silently is the thing being fixed.
+
+  The position travels with the document from validation through routing, grouping, the local
+  write and the forward, which is what any of this needed; it used to be discarded the moment
+  validation's rejects were filtered out. `debug_assert_eq!` on the arithmetic makes a path that
+  stops accounting a test failure rather than a quiet shortfall in production.
+
 - **Every element of a `bytes` field is checked as a byte.** The validator asked only whether the
   value was an array, and the writer then read it with `filter_map(as_u64).map(|n| n as u8)`. A
   list of words was accepted and indexed as nothing; a list of numbers over 255 was accepted and
