@@ -21,7 +21,6 @@ profile = "internal"
 bind_address = "0.0.0.0"
 port = 9480
 request_timeout_secs = 30
-max_body_size_mb = 64
 max_concurrent_requests = 128
 # Browser origins allowed to call this node, e.g. ["https://console.example.com"].
 # Empty = no cross-origin browser access (does not affect API/MCP clients).
@@ -41,6 +40,24 @@ admin_enabled = true
 # A key is scoped by its role and, optionally, by allowed_indexes — which holds through
 # enumeration too: /_indexes and the MCP catalog return only what a key may see. MCP is
 # authorized per tool and per index, and a session belongs to the key that opened it.
+# How large a thing may get on this node, as opposed to what one caller may ask for — that is
+# [security.limits] below. max_record_size_mb is the source of truth: the HTTP body ceiling, the
+# inter-node message size, the request timeout and the largest MCP response all derive from it,
+# so raising it for large documents moves them together. `cameodb check-config` prints what each
+# one resolved to.
+[limits]
+max_record_size_mb = 64
+# 0 derives it from max_record_size_mb (+64 MB for framing). Set it to pin the body ceiling on
+# its own; max_concurrent_requests multiplied by it has to fit inside total_memory_limit_mb,
+# because in-flight bodies are held in memory.
+max_body_size_mb = 0
+# The node's memory budget: the indexer pool is sized from it and startup weighs the body
+# ceiling against it.
+total_memory_limit_mb = 4096
+# Largest MCP search response in bytes. Unset it follows the body ceiling; set it below that
+# where the callers are agents whose context is smaller than what the node can send.
+# max_response_bytes = 16777216
+
 [security]
 enabled = false
 
@@ -65,8 +82,6 @@ enabled = false
 # tool_calls_per_minute = 120           # 0 (default) disables limiting entirely
 # tool_call_burst = 30                  # spendable at once; 0 means one minute's worth
 # max_search_limit = 10000              # largest `limit` an MCP search may ask for
-# max_response_bytes = 1048576          # largest MCP search response; unset, it follows
-#                                       # max_record_size_mb like every other message limit
 
 # Audit trail — who read what. Refusals have always been logged; without this a node cannot
 # say who legitimately read which index, which is the question an incident asks. Reads and
@@ -139,7 +154,6 @@ worker_core_affinity = false
 [search]
 indexer_memory_min_mb = 32
 indexer_memory_max_mb = 512
-total_memory_limit_mb = 4096
 memory_pressure_threshold_percent = 80
 search_threads = 8
 enable_streaming_search = true

@@ -76,6 +76,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The size and memory ceilings live together, under `[limits]`.** `max_record_size_mb` was a
+  bare top-level key — it had no section because no subsystem owns it: it is the source of truth
+  the HTTP body ceiling, the inter-node message size, the request timeout and the largest MCP
+  response all derive from. The three values that override one of those derivations were filed
+  with whichever subsystem enforced them, so setting a size meant knowing which of four places
+  to look in.
+
+  ```toml
+  [limits]
+  max_record_size_mb = 64      # was top level
+  max_body_size_mb = 0         # was network.http.max_body_size_mb
+  total_memory_limit_mb = 2048 # was search.total_memory_limit_mb
+  # max_response_bytes         # was security.limits.max_response_bytes
+  ```
+
+  `[security.limits]` stays where it is and keeps `max_search_limit`: it bounds what one caller
+  may ask of the node, where `[limits]` bounds what the node can do at all. `total_memory_limit_mb`
+  moves because it is the node's budget rather than a search setting — startup already weighs it
+  against `max_body_size_mb × max_concurrent_requests`, which is now one section's arithmetic
+  instead of three.
+
+  **The old spellings still work, until 0.4.0.** A file written for an earlier build starts
+  unchanged and resolves to the same ceilings — nothing is quietly reverted to a default, which
+  matters most for `max_record_size_mb`, where the alternative is a node that starts and then
+  refuses the writes it was configured for. Each one warns where it went:
+
+  ```
+  WARN cameodb.toml: max_record_size_mb has moved to limits.max_record_size_mb; applying 420.
+       Move it before 0.4.0, when the old spelling goes.
+  ```
+
+  `[limits]` wins where it names the setting itself. Unknown keys inside `[limits]` are still
+  refused outright, so a typo cannot leave a ceiling silently at its default, and
+  `[security.limits]` keeps the same strictness it has always had.
+
+  `cameodb check-config` now prints what each limit resolved to, since most of them are derived
+  rather than written:
+
+  ```
+  Limits: record 420MB, HTTP body 512MB, remote msg 525MB, MCP response 16MB, timeout 90s, memory budget 96000MB
+  ```
+
+  `CAMEODB_MAX_RECORD_SIZE_MB`, `CAMEODB_MAX_BODY_SIZE_MB`, `CAMEODB_TOTAL_MEMORY_LIMIT_MB` and
+  their `--flag` forms are unchanged.
+
 - **The MCP query-syntax reference now describes the engine it documents.** It is a single source
   rendered into four surfaces — the `search_index` description, the answer `validate_query`
   returns, the per-field `query_hint` on `describe_index` and `list_indexes`, and the crate

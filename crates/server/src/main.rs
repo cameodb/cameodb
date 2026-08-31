@@ -138,6 +138,19 @@ async fn main() -> Result<()> {
         let cli_overrides = config::CliOverrides::parse(args.into_iter().skip(2))?;
         let cameodb_config = CameoDbConfig::load_unvalidated(&cli_overrides)?;
 
+        // The resolved size limits, because most of them are derived rather than written: an
+        // operator reading the file cannot tell what the node will actually enforce.
+        println!(
+            "Limits: record {}MB, HTTP body {}MB, remote msg {}MB, MCP response {}MB, \
+             timeout {}s, memory budget {}MB",
+            cameodb_config.limits.max_record_size_mb,
+            cameodb_config.effective_max_body_size_mb(),
+            cameodb_config.effective_remote_message_size_bytes() / (1024 * 1024),
+            cameodb_config.effective_max_response_bytes() / (1024 * 1024),
+            cameodb_config.effective_request_timeout_secs(),
+            cameodb_config.limits.total_memory_limit_mb,
+        );
+
         // Render the matrix before deciding, so a failure arrives with the context of
         // everything that passed rather than as a single line.
         let warnings = match posture::evaluate(&cameodb_config) {
@@ -276,7 +289,7 @@ async fn main() -> Result<()> {
         max_shards: cameodb_config.storage.max_shards_per_node,
         indexer_memory_min_mb: cameodb_config.search.indexer_memory_min_mb,
         indexer_memory_max_mb: cameodb_config.search.indexer_memory_max_mb,
-        total_memory_limit_mb: cameodb_config.search.total_memory_limit_mb,
+        total_memory_limit_mb: cameodb_config.limits.total_memory_limit_mb,
         memory_pressure_threshold_percent: cameodb_config.search.memory_pressure_threshold_percent,
         search_threads: cameodb_config.search.search_threads,
         wal_sync: cameodb_config.storage.wal_sync,
@@ -518,7 +531,7 @@ async fn main() -> Result<()> {
         router: router_actor,
         coordinator: coordinator_actor.clone(),
         stream_batch_size: cameodb_config.search.stream_batch_size,
-        max_record_size_bytes: cameodb_config.max_record_size_mb * 1024 * 1024,
+        max_record_size_bytes: cameodb_config.limits.max_record_size_mb * 1024 * 1024,
         tool_limiter: std::sync::Arc::new(ratelimit::ToolRateLimiter::new(
             cameodb_config.security.limits.clone(),
         )),
@@ -606,11 +619,11 @@ async fn main() -> Result<()> {
     );
     println!(
         "  Total Memory Limit: {}MB",
-        cameodb_config.search.total_memory_limit_mb
+        cameodb_config.limits.total_memory_limit_mb
     );
     println!(
         "  Max Record Size: {}MB (HTTP body: {}MB, remote msg: {}MB, timeout: {}s)",
-        cameodb_config.max_record_size_mb,
+        cameodb_config.limits.max_record_size_mb,
         cameodb_config.effective_max_body_size_mb(),
         cameodb_config.effective_remote_message_size_bytes() / (1024 * 1024),
         cameodb_config.effective_request_timeout_secs()

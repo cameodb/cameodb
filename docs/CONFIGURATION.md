@@ -41,10 +41,12 @@ port = 9480
 [storage]
 data_paths = ["./data/cameodb"]
 
+[limits]
+total_memory_limit_mb = 2048
+
 [search]
 indexer_memory_min_mb = 64
 indexer_memory_max_mb = 512
-total_memory_limit_mb = 2048
 default_search_limit = 10
 ```
 
@@ -86,15 +88,82 @@ port = 9480
 # Bind address for HTTP (default: "0.0.0.0")
 bind_address = "0.0.0.0"
 
-# Request timeout in seconds (default: 30)
+# Request timeout in seconds (default: 30). Left at the default it is derived from
+# limits.max_record_size_mb instead; see Size and memory limits below.
 request_timeout_secs = 30
-
-# Maximum request body size in MB (default: 200)
-max_body_size_mb = 200
 
 # CORS allowed origins (default: ["*"])
 cors_allowed_origins = ["*"]
 ```
+
+### Size and memory limits
+
+```toml
+[limits]
+# Largest single record in MB (default: 64). The source of truth for message size.
+max_record_size_mb = 64
+
+# HTTP body ceiling in MB. 0 (default) derives it from max_record_size_mb.
+max_body_size_mb = 0
+
+# The node's memory budget in MB (default: 2048).
+total_memory_limit_mb = 2048
+
+# Largest MCP search response in bytes. Unset, it follows the HTTP body ceiling.
+# max_response_bytes = 16777216
+```
+
+`max_record_size_mb` is the only one of these an operator usually sets, because the rest derive
+from it:
+
+| Derived limit | Formula | At the default 64 MB |
+|---|---|---|
+| HTTP max body size | `max_record_size_mb + 64` MB | 128 MB |
+| Inter-node message max | `max_record_size_mb × 1.25` | 80 MB |
+| HTTP request timeout | `max(60, max_record_size_mb / 10)` s | 60 s |
+| Largest MCP search response | the HTTP body size | 128 MB |
+
+Each derived value can be pinned on its own — `limits.max_body_size_mb`,
+`limits.max_response_bytes`, `network.http.request_timeout_secs` — and an explicit value always
+wins. Because most of them are *not* written in the file, `cameodb check-config` prints what the
+node resolved:
+
+```
+Limits: record 420MB, HTTP body 512MB, remote msg 525MB, MCP response 16MB, timeout 90s, memory budget 96000MB
+```
+
+**`max_body_size_mb × network.http.max_concurrent_requests` has to fit inside
+`total_memory_limit_mb`.** In-flight request bodies are held in memory, so a large body ceiling
+and a high concurrency limit multiply into a way to run the node out of memory from outside.
+Startup and `check-config` weigh the product and warn:
+
+```
+[WARN] limits   max_concurrent_requests (128) × body limit (484 MB) allows 61952 MB of in-flight
+                request data, over this node's limits.total_memory_limit_mb (2048 MB)
+```
+
+`[limits]` is what this node can hold; [`[security.limits]`](#rate-limiting-mcp-tool-calls-securitylimits)
+is what one caller may ask of it. Unknown keys inside `[limits]` are refused at startup rather
+than ignored, so a typo cannot leave a limit silently at its default.
+
+#### The spellings these replaced
+
+These four were scattered across three tables and the file root before 0.3.3. A file still using
+the old names starts, applies them, and says where each one went:
+
+| Old | New |
+|---|---|
+| `max_record_size_mb` (file root) | `limits.max_record_size_mb` |
+| `network.http.max_body_size_mb` | `limits.max_body_size_mb` |
+| `search.total_memory_limit_mb` | `limits.total_memory_limit_mb` |
+| `security.limits.max_response_bytes` | `limits.max_response_bytes` |
+
+```
+WARN cameodb.toml: max_record_size_mb has moved to limits.max_record_size_mb; applying 420.
+     Move it before 0.4.0, when the old spelling goes.
+```
+
+`[limits]` wins where it names the setting itself. The old names are removed in 0.4.0.
 
 ### Node Configuration
 
@@ -117,10 +186,8 @@ indexer_memory_min_mb = 64
 # Maximum memory for each indexer thread in MB (default: 512)
 indexer_memory_max_mb = 512
 
-# Total memory limit for all search operations in MB (default: 2048)
-total_memory_limit_mb = 2048
-
-# Threshold for memory pressure (percent, default: 80)
+# Threshold for memory pressure (percent, default: 80). Measured against
+# limits.total_memory_limit_mb.
 memory_pressure_threshold_percent = 80
 
 # Maximum searches running concurrently on this node
@@ -401,8 +468,10 @@ you only discover on the day you turn authentication on. These all refuse to sta
 tool_calls_per_minute = 120   # 0 (the default) disables limiting entirely
 tool_call_burst = 30          # spendable at once; 0 means one minute's worth
 max_search_limit = 10000      # largest `limit` an MCP search may ask for
-# max_response_bytes = 1048576  # optional; defaults to the node's HTTP body size
 ```
+
+The companion size ceiling, `max_response_bytes`, lives in [`[limits]`](#size-and-memory-limits)
+with the other message sizes it derives from.
 
 Authentication answers *who*, and `allowed_indexes` answers *what*. Neither says anything
 about **how often**, and the caller this matters for is not an attacker: it is a legitimate
@@ -455,12 +524,16 @@ each hit is a redb lookup, a merge entry and a serialized document.
 - **`0` is refused**, not read as unlimited. A bound whose zero inverts its meaning is a trap;
   an operator who wants a high ceiling writes a high number.
 
-#### `max_response_bytes` — how large one response may be
+#### `limits.max_response_bytes` — how large one response may be
+
+Set under [`[limits]`](#size-and-memory-limits) rather than here, because it is a message size
+and derives from one; it is documented alongside `max_search_limit` because the two bound the
+same request from different directions.
 
 `max_search_limit` bounds how many hits come back; nothing bounds how large they are. A search
 well inside it can still be more bytes than this node carries in one message.
 
-**Leave it unset.** It then derives from `max_record_size_mb`, the single source of truth for
+**Leave it unset.** It then derives from `limits.max_record_size_mb`, the single source of truth for
 message size — the same place the HTTP body limit, the inter-node message size and the request
 timeout come from. What a node accepts in one message is what it will send in one: with the
 default 64 MB record size that is **128 MB**, and raising the record size for large documents
@@ -475,7 +548,7 @@ everything will report it as everything.
 
 - Set it explicitly only to go **below** the message size, which is worth doing when the
   callers are agents whose context is smaller than what the node can send. To go above it,
-  raise `max_record_size_mb` and every limit moves together.
+  raise `limits.max_record_size_mb` and every limit moves together.
 - `total_hits` still counts what matched. `hits_returned` counts what came back.
 - One hit always survives, even one larger than the whole allowance: a response trimmed to
   nothing is indistinguishable from a query that matched nothing.
@@ -636,10 +709,14 @@ clear, only digests. That variable is read by the **client**.
 ### Storage Configuration
 - `CAMEODB_DATA_PATHS`: Colon-separated list of data paths
 
+### Limits
+- `CAMEODB_MAX_RECORD_SIZE_MB`: Largest single record; the other message sizes derive from it
+- `CAMEODB_MAX_BODY_SIZE_MB`: HTTP body ceiling, overriding the derived one
+- `CAMEODB_TOTAL_MEMORY_LIMIT_MB`: The node's memory budget
+
 ### Search Configuration
 - `CAMEODB_INDEXER_MEMORY_MIN_MB`: Minimum indexer memory
 - `CAMEODB_INDEXER_MEMORY_MAX_MB`: Maximum indexer memory
-- `CAMEODB_TOTAL_MEMORY_LIMIT_MB`: Total memory limit
 - `CAMEODB_MEMORY_PRESSURE_THRESHOLD_PERCENT`: Memory pressure threshold
 - `CAMEODB_DEFAULT_SEARCH_LIMIT`: Default search result limit
 
@@ -674,9 +751,11 @@ disk_usage_threshold_percent = 85
 wal_segment_size_mb = 128
 max_shards_per_node = 50
 
+[limits]
+total_memory_limit_mb = 4096
+
 [search]
 indexer_memory_max_mb = 512
-total_memory_limit_mb = 4096
 # Sized for a host with at least this many cores — see "Sizing the read pool" below.
 # Exceeding the core count costs the write path more than it gains the read path.
 search_threads = 16
@@ -701,11 +780,13 @@ search_threads = 16
 #### Memory Configuration
 
 ```toml
+[limits]
+total_memory_limit_mb = 8192
+
 [search]
 # Higher memory allocation for better write performance
 indexer_memory_min_mb = 64
 indexer_memory_max_mb = 1024
-total_memory_limit_mb = 8192
 
 # Aggressive memory usage
 memory_pressure_threshold_percent = 90
@@ -781,7 +862,6 @@ profile = "external"
 port = 9480
 bind_address = "0.0.0.0"
 request_timeout_secs = 60
-max_body_size_mb = 50
 cors_allowed_origins = []  # "*" is rejected by internal and external
 admin_enabled = false      # required off by the external profile
 
@@ -814,10 +894,13 @@ writer_core_affinity = true
 shard_affine_dispatch = false   # measured a regression; see "CPU affinity" above
 worker_core_affinity = false    # ditto
 
+[limits]
+max_body_size_mb = 50
+total_memory_limit_mb = 2048
+
 [search]
 indexer_memory_min_mb = 64
 indexer_memory_max_mb = 512
-total_memory_limit_mb = 2048
 memory_pressure_threshold_percent = 80
 search_threads = 8
 default_search_limit = 10
@@ -867,8 +950,10 @@ Monitor these key metrics:
 
 **Solution**:
 ```toml
-[search]
+[limits]
 total_memory_limit_mb = 4096  # Increase limit
+
+[search]
 memory_pressure_threshold_percent = 90  # Allow higher usage
 ```
 
