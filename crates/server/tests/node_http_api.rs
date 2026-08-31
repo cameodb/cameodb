@@ -3025,7 +3025,10 @@ async fn every_element_of_a_bytes_field_is_a_byte() {
         }),
     )
     .await;
-    assert_eq!(status, 200, "declaring a bytes field should succeed: {body}");
+    assert_eq!(
+        status, 200,
+        "declaring a bytes field should succeed: {body}"
+    );
 
     for (name, value) in [
         ("a word", json!(["not", "bytes"])),
@@ -3035,7 +3038,12 @@ async fn every_element_of_a_bytes_field_is_a_byte() {
         ("one bad element among good ones", json!([104, 105, 300])),
     ] {
         let refused = client
-            .write_document("blobs", "b1", &json!({"id": "b1", "blob": value.clone()}), None)
+            .write_document(
+                "blobs",
+                "b1",
+                &json!({"id": "b1", "blob": value.clone()}),
+                None,
+            )
             .await
             .expect_err(&format!("{name} should be refused"));
         let message = refused.to_string();
@@ -3077,5 +3085,73 @@ async fn every_element_of_a_bytes_field_is_a_byte() {
         hits[0]["blob"],
         json!([104, 105, 0, 255]),
         "and reads back exactly as written: {found}"
+    );
+}
+
+/// A bulk write accounts for every item it received.
+///
+/// `items_written` plus one reason per document that was not written equals `items_received`,
+/// and each reason names the document by the position the caller used. Held as arithmetic
+/// rather than as a description because the paths that break it break it quietly: a document
+/// that routes nowhere, a shard that will not take its batch, a peer that refuses half of what
+/// it was sent were each logged and dropped, leaving a 200 with a shortfall and nothing to
+/// explain it. A loader reading `errors` to decide what to retry saw nothing to retry.
+#[tokio::test]
+async fn a_bulk_write_accounts_for_every_item_it_received() {
+    let node = TestNode::start("").await;
+
+    let (status, body) = put_config(
+        &node,
+        "ledger",
+        &json!({
+            "fields": {
+                "id": {"field_type": "text", "indexed": true},
+                "n": {"field_type": "i64", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "declaring the config should succeed: {body}");
+
+    let (status, body) = post_json(
+        &node,
+        "/api/ledger/_bulk",
+        json!([
+            {"id": "a", "doc": {"n": 1}},
+            {"id": "b", "doc": {"n": "twelve"}},
+            {"id": "",  "doc": {"n": 3}},
+            {"id": "d", "doc": {"n": 4}},
+            {"id": "e", "doc": {"n": [5, "six"]}}
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200, "a bulk write reports partial success: {body}");
+
+    let received = body["items_received"].as_u64().expect("items_received");
+    let written = body["items_written"].as_u64().expect("items_written");
+    let errors = body["errors"].as_array().expect("errors array");
+
+    assert_eq!(received, 5, "every item is counted as received: {body}");
+    assert_eq!(written, 2, "the two storable documents are written: {body}");
+    assert_eq!(
+        written + errors.len() as u64,
+        received,
+        "and each of the rest has exactly one reason: {body}"
+    );
+
+    // Every reason names its document by the position in the batch as sent, which is what makes
+    // one addressable once the batch is gone.
+    let mut positions: Vec<u64> = errors
+        .iter()
+        .filter_map(|e| e.as_str())
+        .filter_map(|e| e.strip_prefix("document "))
+        .filter_map(|rest| rest.split_once(": "))
+        .filter_map(|(position, _)| position.parse().ok())
+        .collect();
+    positions.sort_unstable();
+    assert_eq!(
+        positions,
+        vec![1, 2, 4],
+        "the refused documents are named by position: {body}"
     );
 }
