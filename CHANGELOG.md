@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An index is identified by its name, and by nothing else.** A reverse lookup keyed by a hash
+  of the field names sat in front of the schema cache and answered with whichever index of that
+  shape had been cached last, without checking the index being written to:
+
+  ```rust
+  fn get_schema_by_fingerprint(&self, fingerprint: u64) -> Option<Arc<IndexSchema>> {
+      let fp_map = self.fingerprint_index.load();
+      if let Some(index_name) = fp_map.get(&fingerprint) {
+          return self.schema_cache.load().get(index_name).cloned();
+      }
+  ```
+
+  Two indexes of the same shape are ordinary — a monthly partition, a per-tenant index, a
+  re-import beside the original — and `IndexSchema::calculate_fingerprint` hashes field names,
+  so they collide by design. All three write paths consulted it first, so a write to one index
+  could be judged by another's schema. It armed on any schema carrying a non-zero fingerprint:
+  one a `PATCH /_schema` computed, or one a caller supplied through `PUT /_config` — which the
+  bundled importer did on every import.
+
+  Three symptoms, each now a test. A fresh index refusing a value its own schema would have
+  accepted (`Type mismatch for field 'n': expected I64, got Text`). A fresh index refusing an
+  ordinary column because a different index declares that name a shadow of its key. And the
+  quiet one: where the other schema *accepted* the document, validation reported no new field,
+  so the index the document was written to never learned it — `items_written: 1, errors: []`,
+  and the field unqueryable.
+
+  The lookup is now by index name, which every caller already holds. That is also faster: on a
+  batch of 1000 documents of 20 fields, building the hash key cost 858µs against 19ns for the
+  name lookup it replaced, because `extract_field_names` cloned every key of every document.
+
+- **`IndexSchema.fingerprint` is computed rather than stored.** Nothing compared two
+  fingerprints anywhere, and the value could not have been compared: the orchestrator's own
+  evolution path never recomputed it, so a schema's fingerprint routinely described a shape it
+  no longer had. `calculate_fingerprint()` is 724ns for a twenty-field schema, so there is
+  nothing to save by carrying it. Field names are now separated by a NUL when hashed, so
+  `{"ab", "c"}` and `{"a", "bc"}` no longer collide.
+
+  Nothing to migrate. An existing schema blob carries the key and it is ignored on read; a new
+  one omits it, and an older build reads the absence as `0` — the one value that build refuses
+  to register, so a downgrade disarms the lookup rather than restoring it.
+
 ## [0.3.3] - 2026-08-31
 
 ### Added

@@ -85,7 +85,6 @@ use storage::{
     StoreError, TantivyFieldType, WalOp,
 };
 pub use storage::{SortOrder, SortSpec};
-use xxhash_rust::xxh3::xxh3_64;
 
 /// Sample limit for enhanced schema detection during initial creation
 const SCHEMA_SAMPLE_LIMIT: usize = 200;
@@ -160,45 +159,6 @@ pub fn extract_routing_value(doc: &JsonValue, field_name: &str) -> Option<String
         JsonValue::Bool(b) => Some(b.to_string()),
         _ => None,
     }
-}
-
-/// Extract unique field names from a batch of documents (lightweight operation)
-fn extract_field_names(docs: &[DocPayload]) -> HashSet<String> {
-    let mut field_names = HashSet::new();
-    for doc in docs {
-        if let Some(obj) = doc.doc.as_object() {
-            field_names.extend(obj.keys().cloned());
-        }
-    }
-    field_names
-}
-
-/// Calculate fingerprint from sorted field names using xxh3_64 one-shot API
-fn calculate_batch_fingerprint(field_names: &HashSet<String>) -> u64 {
-    let mut sorted_names: Vec<&String> = field_names.iter().collect();
-    sorted_names.sort();
-    let mut combined = Vec::new();
-    for name in &sorted_names {
-        combined.extend_from_slice(name.as_bytes());
-    }
-    xxh3_64(&combined)
-}
-
-/// Calculate fingerprint directly from a JSON document's keys.
-/// Avoids the intermediate `HashSet<String>` allocation used by
-/// `extract_field_names` + `calculate_batch_fingerprint`.
-fn calculate_doc_fingerprint(doc: &JsonValue) -> u64 {
-    let obj = match doc.as_object() {
-        Some(o) => o,
-        None => return 0,
-    };
-    let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
-    keys.sort_unstable();
-    let mut combined = Vec::with_capacity(keys.len() * 8);
-    for key in keys {
-        combined.extend_from_slice(key.as_bytes());
-    }
-    xxh3_64(&combined)
 }
 
 /// Apply field projection to a JSON document, keeping only specified fields.
@@ -2598,9 +2558,11 @@ pub struct OrchestratorEngine {
     /// `ArcSwap::store` on topology changes; readers always see the latest snapshot.
     pub routing_ring: Arc<ArcSwap<ConsistentRing>>,
     /// Per-index schema cache (lock-free via ArcSwap).
+    ///
+    /// Keyed by index name, which is the only thing that identifies an index. A reverse
+    /// lookup keyed by a hash of the field names used to sit in front of this and answered
+    /// with whichever index of that shape was cached last — see `IndexSchema::calculate_fingerprint`.
     pub schema_cache: Arc<ArcSwap<HashMap<String, Arc<IndexSchema>>>>,
-    /// Fingerprint → index_name reverse lookup (lock-free via ArcSwap).
-    pub fingerprint_index: Arc<ArcSwap<HashMap<u64, String>>>,
     /// Coordinator actor reference for shard assignments and peer lookups.
     #[allow(dead_code)] // Used when bulk write is moved to engine
     pub coordinator: Option<ActorRef<ClusterCoordinator>>,
@@ -2634,32 +2596,12 @@ impl OrchestratorEngine {
     fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
         let schema_arc = Arc::new(schema.clone());
         let index_str = index.to_string();
-        let fingerprint = schema.fingerprint;
 
         self.schema_cache.rcu(|old| {
             let mut new = (**old).clone();
             new.insert(index_str.clone(), schema_arc.clone());
             new
         });
-
-        if fingerprint != 0 {
-            let idx = index_str;
-            self.fingerprint_index.rcu(|old| {
-                let mut new = (**old).clone();
-                new.insert(fingerprint, idx.clone());
-                new
-            });
-        }
-    }
-
-    /// Get schema by fingerprint (lock-free instant cache hit).
-    fn get_schema_by_fingerprint(&self, fingerprint: u64) -> Option<Arc<IndexSchema>> {
-        let fp_map = self.fingerprint_index.load();
-        if let Some(index_name) = fp_map.get(&fingerprint) {
-            let cache = self.schema_cache.load();
-            return cache.get(index_name).cloned();
-        }
-        None
     }
 
     /// Load schema from first shard's storage.
@@ -2822,13 +2764,8 @@ impl OrchestratorEngine {
             )));
         }
 
-        // Inline fingerprint from doc keys
-        let doc_fingerprint = calculate_doc_fingerprint(&doc);
-
-        // Lock-free schema lookup by fingerprint, then by index name
-        let schema = if let Some(cached) = self.get_schema_by_fingerprint(doc_fingerprint) {
-            cached
-        } else if let Some(cached) = self.get_cached_schema(index) {
+        // Lock-free schema lookup, by the one thing that identifies an index: its name.
+        let schema = if let Some(cached) = self.get_cached_schema(index) {
             cached
         } else {
             Arc::new(self.load_schema(index).await?)
@@ -5785,9 +5722,6 @@ pub struct NodeOrchestrator {
     /// Per-index schema cache to avoid repeated metadata reads (lock-free via ArcSwap).
     /// Wrapped in Arc so it can be shared with the OrchestratorEngine worker pool.
     schema_cache: Arc<ArcSwap<HashMap<String, Arc<IndexSchema>>>>,
-    /// Fingerprint → index_name reverse lookup for instant cache hits (lock-free via ArcSwap).
-    /// Wrapped in Arc so it can be shared with the OrchestratorEngine worker pool.
-    fingerprint_index: Arc<ArcSwap<HashMap<u64, String>>>,
     /// Default search result limit when not specified in request
     default_search_limit: usize,
     max_concurrent_shard_searches: usize,
@@ -6445,33 +6379,12 @@ impl NodeOrchestrator {
     fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
         let schema_arc = Arc::new(schema.clone());
         let index_str = index.to_string();
-        let fingerprint = schema.fingerprint;
 
         self.schema_cache.rcu(|old| {
             let mut new = (**old).clone();
             new.insert(index_str.clone(), schema_arc.clone());
             new
         });
-
-        // Maintain fingerprint reverse lookup
-        if fingerprint != 0 {
-            let idx = index_str;
-            self.fingerprint_index.rcu(|old| {
-                let mut new = (**old).clone();
-                new.insert(fingerprint, idx.clone());
-                new
-            });
-        }
-    }
-
-    /// Get schema by fingerprint (lock-free instant cache hit).
-    fn get_schema_by_fingerprint(&self, fingerprint: u64) -> Option<Arc<IndexSchema>> {
-        let fp_map = self.fingerprint_index.load();
-        if let Some(index_name) = fp_map.get(&fingerprint) {
-            let cache = self.schema_cache.load();
-            return cache.get(index_name).cloned();
-        }
-        None
     }
 
     /// Produce sorted field names with "id" first (if present), others alphabetical.
@@ -6711,7 +6624,6 @@ impl NodeOrchestrator {
             core_layout: CoreLayout::detect(),
             placement: Arc::new(ArcSwap::from_pointee(ShardPlacement::default())),
             schema_cache: Arc::new(ArcSwap::from_pointee(HashMap::new())),
-            fingerprint_index: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             default_search_limit,
             max_concurrent_shard_searches,
             engine: None,
@@ -6777,7 +6689,6 @@ impl NodeOrchestrator {
             shards: ArcSwap::from_pointee(self.shards.clone()),
             routing_ring: Arc::clone(&self.shared_routing_ring),
             schema_cache: Arc::clone(&self.schema_cache),
-            fingerprint_index: Arc::clone(&self.fingerprint_index),
             coordinator: self.coordinator.clone(),
             identity: self.identity.clone(),
             default_search_limit: self.default_search_limit,
@@ -7659,25 +7570,14 @@ impl NodeOrchestrator {
             }
         }
 
-        // Clear schema cache and fingerprint index for this index (lock-free)
+        // Clear this index's cached schema (lock-free).
         {
-            let old_cache = self.schema_cache.load();
-            if let Some(schema) = old_cache.get(index) {
-                let fingerprint = schema.fingerprint;
-                let idx = index.to_string();
-                self.schema_cache.rcu(|old| {
-                    let mut new = (**old).clone();
-                    new.remove(&idx);
-                    new
-                });
-                if fingerprint != 0 {
-                    self.fingerprint_index.rcu(|old| {
-                        let mut new = (**old).clone();
-                        new.remove(&fingerprint);
-                        new
-                    });
-                }
-            }
+            let idx = index.to_string();
+            self.schema_cache.rcu(|old| {
+                let mut new = (**old).clone();
+                new.remove(&idx);
+                new
+            });
         }
 
         Ok(serde_json::json!({
@@ -7703,13 +7603,8 @@ impl NodeOrchestrator {
             )));
         }
 
-        // Inline fingerprint from doc keys — no HashSet<String> allocation
-        let doc_fingerprint = calculate_doc_fingerprint(&doc);
-
-        // Lock-free schema lookup by fingerprint, then by index name
-        let schema = if let Some(cached) = self.get_schema_by_fingerprint(doc_fingerprint) {
-            cached
-        } else if let Some(cached) = self.get_cached_schema(index) {
+        // Lock-free schema lookup, by the one thing that identifies an index: its name.
+        let schema = if let Some(cached) = self.get_cached_schema(index) {
             cached
         } else {
             Arc::new(self.load_schema(index).await?)
@@ -8092,23 +7987,14 @@ impl NodeOrchestrator {
             )));
         }
 
-        // Fingerprint-based schema lookup: check cache before loading from shard
-        let batch_field_names = extract_field_names(&docs);
-        let batch_fingerprint = calculate_batch_fingerprint(&batch_field_names);
-
-        let mut schema_cache =
-            if let Some(cached) = self.get_schema_by_fingerprint(batch_fingerprint) {
-                (*cached).clone()
-            } else {
-                self.load_schema(index).await?
-            };
+        // `load_schema` answers from the cache when it can, and reads a shard when it cannot.
+        let mut schema_cache = self.load_schema(index).await?;
 
         // Use staged schema validation: parallel validation + sequential evolution
         let validation_summary = self
             .staged_schema_validation(index, &docs, &mut schema_cache)
             .await?;
 
-        // Update cache (also populates fingerprint_index for future lookups)
         if validation_summary.evolution_needed || self.get_cached_schema(index).is_none() {
             self.put_cached_schema(index, &schema_cache);
         }
@@ -9338,7 +9224,6 @@ mod tests {
             shards: ArcSwap::from_pointee(HashMap::new()),
             routing_ring: Arc::new(ArcSwap::from_pointee(ConsistentRing::new())),
             schema_cache: Arc::new(ArcSwap::from_pointee(HashMap::new())),
-            fingerprint_index: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             coordinator: None,
             identity: NodeIdentity::new(),
             default_search_limit: 10,

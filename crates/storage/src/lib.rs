@@ -2226,8 +2226,6 @@ pub struct IndexSchema {
     pub fields: HashMap<String, FieldDef>,
     #[serde(default = "default_version")]
     pub version: u64,
-    #[serde(default)]
-    pub fingerprint: u64,
     #[serde(default = "default_timestamp")]
     pub created_at: i64,
     #[serde(default = "default_timestamp")]
@@ -2253,7 +2251,6 @@ impl Default for IndexSchema {
         Self {
             fields: HashMap::new(),
             version: 1,
-            fingerprint: 0,
             created_at: now,
             updated_at: now,
             description: None,
@@ -2349,13 +2346,26 @@ impl IndexSchema {
         self.rebuild_shadow_fields_cache();
     }
 
-    /// Calculate deterministic fingerprint from sorted field names
+    /// A hash of this schema's field names, for comparing two schemas cheaply.
+    ///
+    /// Computed on demand rather than stored, which is what keeps it honest: a value carried
+    /// in the struct has to be recomputed everywhere `fields` changes, and it was not — the
+    /// orchestrator's own evolution path never touched it, so a schema's fingerprint routinely
+    /// described a shape it no longer had. At 724ns for a twenty-field schema there is nothing
+    /// to save by caching it.
+    ///
+    /// This answers "are these the same fields?", never "which schema is this?". An index is
+    /// identified by its name, which every caller already holds; a hash used as a lookup key
+    /// instead collides across indexes of the same shape, and a reverse lookup that did exactly
+    /// that handed one index's schema to another. Names are separated by a byte no field name
+    /// may contain, so `{"ab", "c"}` and `{"a", "bc"}` no longer hash alike.
     pub fn calculate_fingerprint(&self) -> u64 {
         let mut sorted_names: Vec<&String> = self.fields.keys().collect();
         sorted_names.sort();
         let mut combined = Vec::new();
         for name in sorted_names {
             combined.extend_from_slice(name.as_bytes());
+            combined.push(0);
         }
         xxh3_64(&combined)
     }
@@ -2526,7 +2536,6 @@ impl IndexSchema {
         };
 
         if changed {
-            self.fingerprint = self.calculate_fingerprint();
             self.updated_at = chrono::Utc::now().timestamp();
         }
 
@@ -4140,7 +4149,6 @@ impl HybridStore {
         IndexSchema {
             fields,
             version: 1,
-            fingerprint: 0,
             created_at: now,
             updated_at: now,
             description: None,
@@ -5334,7 +5342,6 @@ impl HybridStore {
                 field_def.indexed = updates[field_name];
             }
         }
-        schema.fingerprint = schema.calculate_fingerprint();
         schema.updated_at = chrono::Utc::now().timestamp();
 
         // Persist without re-creating the index. A field in `pending_reindex` deliberately does
@@ -8802,17 +8809,15 @@ mod tests {
         assert_eq!(schema.fields["notes"].description, None);
 
         // Evolution rewrites a field's type; it must not rewrite what the field means.
-        // The fingerprint is taken first: a schema decoded from JSON carries none, and
-        // `evolve_field` computes one, which would look like a change caused by this call.
-        schema.fingerprint = schema.calculate_fingerprint();
-        let before = schema.fingerprint;
+        let before = schema.calculate_fingerprint();
         assert!(schema.evolve_field("notes".to_string(), &serde_json::json!(7)));
         assert_eq!(
             schema.fields["title"].description.as_deref(),
             Some("Filing headline")
         );
         assert_eq!(
-            schema.fingerprint, before,
+            schema.calculate_fingerprint(),
+            before,
             "the fingerprint is over field names, so nothing here should have moved it"
         );
 
