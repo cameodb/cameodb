@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-08-31
+
 ### Added
 
 - **Record deletion.** CameoDB could delete an index and never a document. Two endpoints, both
