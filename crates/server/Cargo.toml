@@ -1,6 +1,6 @@
 [package]
 name = "server"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 license = "Apache-2.0"
 description = "A high-performance distributed hybrid-search database"
@@ -26,10 +26,10 @@ tower = { workspace = true }
 tower-http = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
-cameodb_mcp = { path = "../mcp", version = "0.3.2" }
-client = { path = "../client", version = "0.3.2" }
-cluster = { path = "../cluster", version = "0.3.2" }
-storage = { path = "../storage", version = "0.3.2" }
+cameodb_mcp = { path = "../mcp", version = "0.3.3" }
+client = { path = "../client", version = "0.3.3" }
+cluster = { path = "../cluster", version = "0.3.3" }
+storage = { path = "../storage", version = "0.3.3" }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
