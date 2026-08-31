@@ -1911,14 +1911,18 @@ pub fn parse_date_to_timestamp_secs(s: &str) -> Option<i64> {
 }
 
 /// Parse a date string (RFC3339, naive datetime, date-only, year-month, or year-only) into Tantivy DateTime
-/// What a facet value the type cannot hold should cost.
+/// What a value the field's type cannot hold should cost.
 ///
 /// Ingest refuses it, because the caller is right there and can be told which field and which
 /// value. Replay cannot: the value is already committed to redb, so refusing it would fail the
 /// index open rather than the write that accepted it, and an index that will not open serves
 /// nothing.
+///
+/// Two types need this, and for the same reason: a facet path and a byte value are both checked
+/// by their *content* rather than their JSON type, so a document written by a build that did not
+/// check can still be sitting in redb.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum BadFacet {
+pub(crate) enum BadValue {
     Refuse,
     SkipAndWarn,
 }
@@ -1955,7 +1959,7 @@ pub(crate) fn add_json_value_to_doc(
     field_name: &str,
     field_type: &TantivyFieldType,
     field_value: &JsonValue,
-    bad_facet: BadFacet,
+    bad_value: BadValue,
 ) -> Result<(), StoreError> {
     // The types that take the value whole, whatever shape it arrived in.
     match field_type {
@@ -1976,15 +1980,39 @@ pub(crate) fn add_json_value_to_doc(
             return Ok(());
         }
         TantivyFieldType::Bytes => {
-            if let Some(arr) = field_value.as_array() {
-                let bytes: Vec<u8> = arr
-                    .iter()
-                    .filter_map(|item| item.as_u64())
-                    .map(|n| n as u8)
-                    .collect();
-                if !bytes.is_empty() {
-                    tantivy_doc.add_bytes(tantivy_field, bytes.as_slice());
+            let Some(arr) = field_value.as_array() else {
+                return Ok(());
+            };
+
+            // Every element or none. A byte array is one value, not several — dropping the
+            // element that would not fit rewrites the value rather than losing one of a set,
+            // which is why replay skips the whole field here where it skips a single facet.
+            let mut bytes = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item.as_u64().and_then(|n| u8::try_from(n).ok()) {
+                    Some(byte) => bytes.push(byte),
+                    None => {
+                        let err = StoreError::InvalidFieldValue {
+                            field: field_name.to_string(),
+                            reason: not_a_byte(item),
+                        };
+                        match bad_value {
+                            BadValue::Refuse => return Err(err),
+                            BadValue::SkipAndWarn => {
+                                tracing::warn!(
+                                    field = %field_name,
+                                    error = %err,
+                                    "Skipping a byte array with a value outside 0-255 during replay"
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
                 }
+            }
+
+            if !bytes.is_empty() {
+                tantivy_doc.add_bytes(tantivy_field, bytes.as_slice());
             }
             return Ok(());
         }
@@ -2055,9 +2083,9 @@ pub(crate) fn add_json_value_to_doc(
                 if let Some(s) = value.as_str() {
                     match facet_value(field_name, s) {
                         Ok(facet) => tantivy_doc.add_facet(tantivy_field, facet),
-                        Err(err) => match bad_facet {
-                            BadFacet::Refuse => return Err(err),
-                            BadFacet::SkipAndWarn => tracing::warn!(
+                        Err(err) => match bad_value {
+                            BadValue::Refuse => return Err(err),
+                            BadValue::SkipAndWarn => tracing::warn!(
                                 field = %field_name,
                                 error = %err,
                                 "Skipping a value that is not a valid facet path during replay"
@@ -2798,6 +2826,24 @@ fn facet_value(field: &str, value: &str) -> Result<Facet, StoreError> {
 /// document ends up stored with a field silently unindexed.
 pub fn facet_path_error(value: &str) -> Option<String> {
     Facet::from_text(value).err().map(|_| bad_facet_path(value))
+}
+
+/// Why this element of a byte array is not a byte, if it is not.
+///
+/// Public for the same reason `facet_path_error` is: the validator refuses it before a shard is
+/// asked, against the same rule the writer applies. Reading it with `as u64 as u8` instead
+/// truncated silently — 300 was stored as 44 — and dropped anything that was not a number at
+/// all, leaving the field unindexed with nothing said.
+pub fn byte_value_error(value: &JsonValue) -> Option<String> {
+    match value.as_u64().and_then(|n| u8::try_from(n).ok()) {
+        Some(_) => None,
+        None => Some(not_a_byte(value)),
+    }
+}
+
+/// The one wording for an element a byte array cannot hold.
+fn not_a_byte(value: &JsonValue) -> String {
+    format!("{value} is not a byte; every element of a bytes field is a whole number 0-255")
 }
 
 /// The one wording for a value that is not a facet path.
@@ -3760,7 +3806,7 @@ impl HybridStore {
                                     field_name,
                                     &field_def.field_type,
                                     field_value,
-                                    BadFacet::SkipAndWarn,
+                                    BadValue::SkipAndWarn,
                                 )?;
                             }
                         }
@@ -4916,7 +4962,7 @@ impl HybridStore {
                                 field_name,
                                 &field_def.field_type,
                                 field_value,
-                                BadFacet::Refuse,
+                                BadValue::Refuse,
                             )?;
                         }
                     }
@@ -6551,7 +6597,7 @@ impl HybridStore {
                                     field_name,
                                     &field_def.field_type,
                                     field_value,
-                                    BadFacet::Refuse,
+                                    BadValue::Refuse,
                                 )?;
                             }
                         }

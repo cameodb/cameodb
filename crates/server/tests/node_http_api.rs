@@ -2881,7 +2881,10 @@ async fn a_facet_field_takes_a_path_and_a_list_of_them() {
         }),
     )
     .await;
-    assert_eq!(status, 200, "declaring a facet field should succeed: {body}");
+    assert_eq!(
+        status, 200,
+        "declaring a facet field should succeed: {body}"
+    );
 
     client
         .write_document(
@@ -2982,7 +2985,10 @@ async fn one_unparseable_path_refuses_a_list_of_facets() {
     )
     .await;
     assert_eq!(status, 200, "a bulk write reports partial success: {body}");
-    assert_eq!(body["items_written"], 1, "the good document is written: {body}");
+    assert_eq!(
+        body["items_written"], 1,
+        "the good document is written: {body}"
+    );
     let errors = body["errors"].as_array().expect("errors array");
     assert_eq!(errors.len(), 1, "and only the bad one is refused: {body}");
     assert!(
@@ -2990,5 +2996,86 @@ async fn one_unparseable_path_refuses_a_list_of_facets() {
             .as_str()
             .is_some_and(|e| e.starts_with("document 1:") && e.contains("is not a facet path")),
         "naming its position and its reason: {body}"
+    );
+}
+
+/// A bytes field holds bytes, and says so when it is handed something else.
+///
+/// The validator checked only that the value was an array, and the writer then read it with
+/// `filter_map(as_u64).map(|n| n as u8)` — so a list of words was accepted and indexed as
+/// nothing, and a list of numbers over 255 was accepted and truncated. `[300, 70000]` stored as
+/// bytes 44 and 112: not a value the caller sent, and no error to say so.
+///
+/// A list means something different under this type than under any other. `[1, 2]` in an `i64`
+/// field is two values of the field and matches a query for either; under `bytes` it is one
+/// two-byte value. So an element that does not fit refuses the value rather than itself.
+#[tokio::test]
+async fn every_element_of_a_bytes_field_is_a_byte() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "blobs",
+        &json!({
+            "fields": {
+                "id": {"field_type": "text", "indexed": true},
+                "blob": {"field_type": "bytes", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "declaring a bytes field should succeed: {body}");
+
+    for (name, value) in [
+        ("a word", json!(["not", "bytes"])),
+        ("over 255", json!([300, 70000])),
+        ("negative", json!([-1])),
+        ("fractional", json!([1.5])),
+        ("one bad element among good ones", json!([104, 105, 300])),
+    ] {
+        let refused = client
+            .write_document("blobs", "b1", &json!({"id": "b1", "blob": value.clone()}), None)
+            .await
+            .expect_err(&format!("{name} should be refused"));
+        let message = refused.to_string();
+        assert!(
+            message.contains("400") && message.contains("blob"),
+            "{name} is the caller's fault and should name the field: {message}"
+        );
+        assert!(
+            message.contains("is not a byte"),
+            "{name} should be refused for the element, not the shape: {message}"
+        );
+    }
+
+    // A scalar is still the wrong shape entirely, and says so differently.
+    let refused = client
+        .write_document("blobs", "b1", &json!({"id": "b1", "blob": 5}), None)
+        .await
+        .expect_err("a scalar is not a byte array");
+    assert!(
+        refused.to_string().contains("expected Bytes"),
+        "a scalar is a type mismatch: {refused}"
+    );
+
+    // What a bytes field is for, and the empty case, which is the absence of a value.
+    for (id, value) in [("ok", json!([104, 105, 0, 255])), ("empty", json!([]))] {
+        client
+            .write_document("blobs", id, &json!({"id": id, "blob": value.clone()}), None)
+            .await
+            .unwrap_or_else(|e| panic!("{value} should be storable: {e}"));
+    }
+
+    let found = client
+        .search("blobs", "id:ok", Some(10), None, None, None)
+        .await
+        .expect("the document reads back");
+    let hits = found["hits"].as_array().expect("hits array");
+    assert_eq!(hits.len(), 1, "the document just written should come back");
+    assert_eq!(
+        hits[0]["blob"],
+        json!([104, 105, 0, 255]),
+        "and reads back exactly as written: {found}"
     );
 }
