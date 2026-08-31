@@ -574,10 +574,17 @@ fn unstorable_value(field: &str, declared: &TantivyFieldType, value: &JsonValue)
     match declared {
         // Takes the value whole, whatever shape it has.
         TantivyFieldType::Text | TantivyFieldType::Json => None,
-        // Takes a list of byte values, and only that.
-        TantivyFieldType::Bytes => {
-            (!value.is_array()).then(|| type_mismatch(field, declared, value))
-        }
+        // Takes a list of byte values, and only that. Not routed through the element-wise
+        // branch below, because a list means something different here: `[1, 2]` under an `i64`
+        // is two values of the field, while under `bytes` it is one two-byte value. So every
+        // element has to fit, and one that does not refuses the value rather than itself.
+        TantivyFieldType::Bytes => match value.as_array() {
+            Some(items) => items
+                .iter()
+                .find_map(storage::byte_value_error)
+                .map(|why| format!("field '{field}': {why}")),
+            None => Some(type_mismatch(field, declared, value)),
+        },
         _ => match value.as_array() {
             // Several values of the field, each held to the declared type on its own.
             Some(items) => items

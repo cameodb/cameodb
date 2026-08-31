@@ -7,68 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **A declared `facet` field can now be written to.** Everything under the write was already
-  built for it — `add_json_value_to_doc` has a facet arm, `normalize_facet_query` quotes a path
-  so the parser resolves it to a facet term, and the type is declarable as `facet`, `category`
-  or `tag`. The validator refused every value before any of it ran: a facet path is a string,
-  `infer_field_type` reads a string as text, and text was not a type a facet field accepted. So
-  the type was declarable and unusable, and `{"cat": "/electronics/phones"}` answered
-  `400 Type mismatch for field 'cat': expected Facet, got Text`.
-
-  A facet is the one type whose *value* rather than type decides the answer, so the validator
-  now asks the parser the writer uses — `storage::facet_path_error`, one reading of what a path
-  is, shared by both. A list is several values of the field as it is everywhere else: each
-  element is held to the parser on its own, so `{"cat": ["/electronics/laptops", "/clearance"]}`
-  is found by either path, and one unparseable element refuses the document wherever it sits.
-
-  Judged in the validator rather than left to the writer, which is what makes a bad path a
-  per-document `document 1: …` rejection in a bulk write instead of a failure of the whole shard
-  batch. `infer_field_type` still never *infers* a facet: a path-shaped string in a field the
-  schema has not seen is text, because a Unix path is not a hierarchy anyone asked for.
-
-- **An index is identified by its name, and by nothing else.** A reverse lookup keyed by a hash
-  of the field names sat in front of the schema cache and answered with whichever index of that
-  shape had been cached last, without checking the index being written to:
-
-  ```rust
-  fn get_schema_by_fingerprint(&self, fingerprint: u64) -> Option<Arc<IndexSchema>> {
-      let fp_map = self.fingerprint_index.load();
-      if let Some(index_name) = fp_map.get(&fingerprint) {
-          return self.schema_cache.load().get(index_name).cloned();
-      }
-  ```
-
-  Two indexes of the same shape are ordinary — a monthly partition, a per-tenant index, a
-  re-import beside the original — and `IndexSchema::calculate_fingerprint` hashes field names,
-  so they collide by design. All three write paths consulted it first, so a write to one index
-  could be judged by another's schema. It armed on any schema carrying a non-zero fingerprint:
-  one a `PATCH /_schema` computed, or one a caller supplied through `PUT /_config` — which the
-  bundled importer did on every import.
-
-  Three symptoms, each now a test. A fresh index refusing a value its own schema would have
-  accepted (`Type mismatch for field 'n': expected I64, got Text`). A fresh index refusing an
-  ordinary column because a different index declares that name a shadow of its key. And the
-  quiet one: where the other schema *accepted* the document, validation reported no new field,
-  so the index the document was written to never learned it — `items_written: 1, errors: []`,
-  and the field unqueryable.
-
-  The lookup is now by index name, which every caller already holds. That is also faster: on a
-  batch of 1000 documents of 20 fields, building the hash key cost 858µs against 19ns for the
-  name lookup it replaced, because `extract_field_names` cloned every key of every document.
-
-- **`IndexSchema.fingerprint` is computed rather than stored.** Nothing compared two
-  fingerprints anywhere, and the value could not have been compared: the orchestrator's own
-  evolution path never recomputed it, so a schema's fingerprint routinely described a shape it
-  no longer had. `calculate_fingerprint()` is 724ns for a twenty-field schema, so there is
-  nothing to save by carrying it. Field names are now separated by a NUL when hashed, so
-  `{"ab", "c"}` and `{"a", "bc"}` no longer collide.
-
-  Nothing to migrate. An existing schema blob carries the key and it is ignored on read; a new
-  one omits it, and an older build reads the absence as `0` — the one value that build refuses
-  to register, so a downgrade disarms the lookup rather than restoring it.
-
 ## [0.3.3] - 2026-08-31
 
 ### Added
@@ -265,6 +203,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contradicting the id the response reported. The refusal names both values.
 
 ### Fixed
+
+- **Every element of a `bytes` field is checked as a byte.** The validator asked only whether the
+  value was an array, and the writer then read it with `filter_map(as_u64).map(|n| n as u8)`. A
+  list of words was accepted and indexed as nothing; a list of numbers over 255 was accepted and
+  truncated, so `[300, 70000]` was stored as bytes 44 and 112 — not a value the caller sent, and
+  no error to say so.
+
+  Both sides now use one rule, `storage::byte_value_error`. A list means something different
+  under this type than under any other — `[1, 2]` in an `i64` field is two values of the field,
+  while under `bytes` it is one two-byte value — so an element that does not fit refuses the
+  value rather than itself, and on replay the whole field is skipped rather than the element,
+  since dropping one byte rewrites the value instead of losing one of a set.
+
+  `BadFacet` is now `BadValue`: a facet path and a byte value are both checked by content rather
+  than by JSON type, so both need the same ingest-refuses/replay-warns split.
+
+- **A declared `facet` field can now be written to.** Everything under the write was already
+  built for it — `add_json_value_to_doc` has a facet arm, `normalize_facet_query` quotes a path
+  so the parser resolves it to a facet term, and the type is declarable as `facet`, `category`
+  or `tag`. The validator refused every value before any of it ran: a facet path is a string,
+  `infer_field_type` reads a string as text, and text was not a type a facet field accepted. So
+  the type was declarable and unusable, and `{"cat": "/electronics/phones"}` answered
+  `400 Type mismatch for field 'cat': expected Facet, got Text`.
+
+  A facet is the one type whose *value* rather than type decides the answer, so the validator
+  now asks the parser the writer uses — `storage::facet_path_error`, one reading of what a path
+  is, shared by both. A list is several values of the field as it is everywhere else: each
+  element is held to the parser on its own, so `{"cat": ["/electronics/laptops", "/clearance"]}`
+  is found by either path, and one unparseable element refuses the document wherever it sits.
+
+  Judged in the validator rather than left to the writer, which is what makes a bad path a
+  per-document `document 1: …` rejection in a bulk write instead of a failure of the whole shard
+  batch. `infer_field_type` still never *infers* a facet: a path-shaped string in a field the
+  schema has not seen is text, because a Unix path is not a hierarchy anyone asked for.
+
+- **An index is identified by its name, and by nothing else.** A reverse lookup keyed by a hash
+  of the field names sat in front of the schema cache and answered with whichever index of that
+  shape had been cached last, without checking the index being written to:
+
+  ```rust
+  fn get_schema_by_fingerprint(&self, fingerprint: u64) -> Option<Arc<IndexSchema>> {
+      let fp_map = self.fingerprint_index.load();
+      if let Some(index_name) = fp_map.get(&fingerprint) {
+          return self.schema_cache.load().get(index_name).cloned();
+      }
+  ```
+
+  Two indexes of the same shape are ordinary — a monthly partition, a per-tenant index, a
+  re-import beside the original — and `IndexSchema::calculate_fingerprint` hashes field names,
+  so they collide by design. All three write paths consulted it first, so a write to one index
+  could be judged by another's schema. It armed on any schema carrying a non-zero fingerprint:
+  one a `PATCH /_schema` computed, or one a caller supplied through `PUT /_config` — which the
+  bundled importer did on every import.
+
+  Three symptoms, each now a test. A fresh index refusing a value its own schema would have
+  accepted (`Type mismatch for field 'n': expected I64, got Text`). A fresh index refusing an
+  ordinary column because a different index declares that name a shadow of its key. And the
+  quiet one: where the other schema *accepted* the document, validation reported no new field,
+  so the index the document was written to never learned it — `items_written: 1, errors: []`,
+  and the field unqueryable.
+
+  The lookup is now by index name, which every caller already holds. That is also faster: on a
+  batch of 1000 documents of 20 fields, building the hash key cost 858µs against 19ns for the
+  name lookup it replaced, because `extract_field_names` cloned every key of every document.
+
+- **`IndexSchema.fingerprint` is computed rather than stored.** Nothing compared two
+  fingerprints anywhere, and the value could not have been compared: the orchestrator's own
+  evolution path never recomputed it, so a schema's fingerprint routinely described a shape it
+  no longer had. `calculate_fingerprint()` is 724ns for a twenty-field schema, so there is
+  nothing to save by carrying it. Field names are now separated by a NUL when hashed, so
+  `{"ab", "c"}` and `{"a", "bc"}` no longer collide.
+
+  Nothing to migrate. An existing schema blob carries the key and it is ignored on read; a new
+  one omits it, and an older build reads the absence as `0` — the one value that build refuses
+  to register, so a downgrade disarms the lookup rather than restoring it.
 
 - **A document written in the shape the API documents was refused for having no `id`.** The write
   API carries the key beside the body — `{"id": "...", "doc": {...}}`, on both
