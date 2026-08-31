@@ -2700,3 +2700,143 @@ async fn a_declared_id_beside_a_shadow_field_is_still_the_shadow_name() {
         );
     }
 }
+
+/// An index is identified by its name, and by nothing else.
+///
+/// A reverse lookup keyed by a hash of the field names used to sit in front of the schema
+/// cache, and it answered with whichever index of that shape had been cached last. Two indexes
+/// of the same shape are ordinary — a monthly partition, a per-tenant index, a re-import beside
+/// the original — so a write to one was judged by the other's schema.
+///
+/// The trigger was any schema that carried a non-zero fingerprint: one the caller supplied
+/// through `PUT /_config` (which the bundled importer did on every import), or one a
+/// `PATCH /_schema` computed. Each of the three cases below is a symptom that was reproducible
+/// against a real node.
+#[tokio::test]
+async fn a_fresh_index_is_not_judged_by_another_index_of_the_same_shape() {
+    let node = TestNode::start("").await;
+
+    // `alpha` declares n as i64, and the config carries a fingerprint of its own field names —
+    // the shape a document with keys {id, n} hashes to.
+    let (status, body) = put_config(
+        &node,
+        "alpha",
+        &json!({
+            "fingerprint": 4190626629970713083u64,
+            "fields": {
+                "id": {"field_type": "text", "indexed": true},
+                "n": {"field_type": "i64", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "declaring alpha should succeed: {body}");
+
+    let client = node.client();
+    client
+        .write_document("alpha", "a1", &json!({"id": "a1", "n": 5}), None)
+        .await
+        .expect("alpha takes an i64");
+
+    // `beta` has no schema at all, so n is whatever the first document says it is.
+    client
+        .write_document("beta", "b1", &json!({"id": "b1", "n": "a word"}), None)
+        .await
+        .expect("a fresh index types n from the document, not from alpha");
+
+    let beta = get_json(&node, "/api/beta/_config").await;
+    let n_type = beta["fields"]
+        .as_array()
+        .and_then(|fields| fields.iter().find(|f| f["name"] == "n"))
+        .and_then(|f| f["type"].as_str())
+        .map(str::to_string);
+    assert_eq!(
+        n_type.as_deref(),
+        Some("text"),
+        "beta types n from its own document: {beta}"
+    );
+}
+
+/// A shadow field belongs to the index that declares it.
+///
+/// `sha256` naming the document key in one index says nothing about `sha256` being an ordinary
+/// column in another. Through the reverse lookup it did: a fresh index writing a file hash as
+/// data was refused for disagreeing with an identifier it had never heard of.
+#[tokio::test]
+async fn a_shadow_field_does_not_reach_an_index_that_never_declared_it() {
+    let node = TestNode::start("").await;
+
+    let (status, body) = put_config(
+        &node,
+        "hashed",
+        &json!({
+            "fingerprint": 12540683531433093633u64,
+            "fields": {
+                "id": {"field_type": "text", "indexed": true},
+                "sha256": {"field_type": "text", "indexed": true, "is_shadow": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "declaring hashed should succeed: {body}");
+
+    let client = node.client();
+    client
+        .write_document("hashed", "h1", &json!({"id": "h1", "sha256": "h1"}), None)
+        .await
+        .expect("a shadow field carrying the key is fine");
+
+    client
+        .write_document(
+            "files",
+            "f1",
+            &json!({"id": "f1", "sha256": "deadbeefcafe"}),
+            None,
+        )
+        .await
+        .expect("sha256 is ordinary data on an index that never declared it a shadow");
+}
+
+/// A bulk write records its fields in the schema of the index it was written to.
+///
+/// The quiet symptom, and the worst: where the other index's schema happened to *accept* the
+/// document, nothing was refused. Validation ran against a schema that already knew the field,
+/// so `needs_evolution` stayed false, and the index the document was actually written to never
+/// learned it. The write answered `items_written: 1, errors: []` and the field was unqueryable.
+#[tokio::test]
+async fn a_bulk_write_teaches_its_own_index_the_fields_it_carries() {
+    let node = TestNode::start("").await;
+
+    let (status, body) = put_config(
+        &node,
+        "declared",
+        &json!({
+            "fingerprint": 4190626629970713083u64,
+            "fields": {
+                "id": {"field_type": "text", "indexed": true},
+                "n": {"field_type": "i64", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "declaring the first index should succeed: {body}");
+
+    let (status, body) = post_json(
+        &node,
+        "/api/derived/_bulk",
+        json!([{"id": "g1", "doc": {"id": "g1", "n": 7}}]),
+    )
+    .await;
+    assert_eq!(status, 200, "the bulk write should succeed: {body}");
+    assert_eq!(body["items_written"], 1, "and should write its document: {body}");
+
+    let derived = get_json(&node, "/api/derived/_config").await;
+    let names: Vec<&str> = derived["fields"]
+        .as_array()
+        .map(|fields| fields.iter().filter_map(|f| f["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        names.contains(&"n"),
+        "a written field belongs in the schema of the index that took it: {derived}"
+    );
+}
