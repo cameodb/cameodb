@@ -292,6 +292,13 @@ curl -s -X PUT http://localhost:9480/api/books/document \
 }
 ```
 
+> **The `id` beside the body is the key; the body does not repeat it.** It is what the document is
+> stored, updated, deleted and looked up under, and it is written back into every hit — so `doc`
+> needs no `id` of its own, and leaving one out is the ordinary shape. A `doc` that *does* carry
+> `id` must carry the same value: a disagreement is refused with a `400` naming both, because the
+> body's copy would be read back in preference to the key the document was actually stored under.
+> The same rule applies to a shadow field, which is this key under another name.
+
 #### Bulk Write Documents
 Insert or update multiple documents in a single atomic operation.
 

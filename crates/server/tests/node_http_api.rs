@@ -462,33 +462,484 @@ async fn searching_an_unknown_index_is_empty_and_leaves_the_node_serving() {
         .expect("the node should survive a query for a missing index");
 }
 
-/// The document body must carry its own `id`, even though `write_document` takes one as a
-/// parameter — the outer value addresses and routes the write, the inner one is what the
-/// store indexes. Getting this wrong is easy and the node answers 500 rather than 400,
-/// which is what makes it worth pinning: the behaviour is load-bearing for every caller,
-/// and a future change that starts injecting the id would break this test loudly instead
-/// of silently changing an API contract.
+/// A body does not have to repeat the id it was written under, and may not contradict it.
+///
+/// The key travels beside the body — `{"id": ..., "doc": {...}}`, the shape the API reference
+/// documents and the shape every bulk client sends — and that is the copy the store keeps: the
+/// redb key, the term tantivy indexes, and the value reconstruction writes back into every hit
+/// all come from it, which is why the stored blob deliberately holds no second copy. Validation
+/// demanded `id` inside `doc` anyway, so a caller following the documentation had every document
+/// refused: a 400 on a single write, and — once a bulk write stopped storing what failed
+/// validation — `items_written: 0` with one error per row on a bulk one.
+///
+/// What is refused instead is a body whose `id` disagrees with the key it arrived under. That
+/// document cannot be stored as written: the blob keeps its own `id` and reconstruction prefers
+/// it, so the document would answer to one identifier and report another to whoever found it.
 #[tokio::test]
-async fn a_document_without_an_inner_id_is_refused() {
+async fn a_body_need_not_repeat_its_id_but_may_not_contradict_it() {
     let node = TestNode::start("").await;
     let client = node.client();
 
-    let result = client
+    // A single write in the documented shape: the id beside the body, not in it.
+    client
         .write_document("books", "b3", &json!({"title": "no inner id"}), None)
-        .await;
+        .await
+        .expect("a document whose key travels beside it should be accepted");
 
-    let err = result.expect_err("a document with no inner id should not be accepted");
+    // And a bulk write of the same shape.
+    let bulk = client
+        .bulk_index(
+            "books",
+            &[json!({"id": "b4", "doc": {"title": "bulk, no inner id"}})],
+        )
+        .await
+        .expect("bulk write");
+    assert_eq!(
+        (
+            bulk["items_written"].as_u64(),
+            bulk["errors"].as_array().map(|e| e.len())
+        ),
+        (Some(1), Some(0)),
+        "a bulk write must accept the shape its own documentation shows: {bulk}"
+    );
+
+    // Both are stored under the key they were written with, and read back carrying it.
+    for (id, title) in [("b3", "no inner id"), ("b4", "bulk, no inner id")] {
+        let found = client
+            .search("books", &format!("id:{id}"), Some(10), None, None, None)
+            .await
+            .expect("search");
+        assert_eq!(
+            found["total_hits"].as_u64(),
+            Some(1),
+            "{id} should be retrievable by the key it was written under: {found}"
+        );
+        let hit = &found["hits"][0];
+        assert_eq!(
+            (hit["id"].as_str(), hit["title"].as_str()),
+            (Some(id), Some(title)),
+            "the hit carries the key supplied from the envelope: {hit}"
+        );
+    }
+
+    // A body that names a different identifier is refused, and the refusal names both.
+    let refused = client
+        .write_document(
+            "books",
+            "b5",
+            &json!({"id": "b6", "title": "two identities"}),
+            None,
+        )
+        .await;
+    let err = refused.expect_err("a body contradicting its key should not be accepted");
+    let message = err.to_string();
     assert!(
-        err.to_string().contains("id"),
-        "the error should name the missing field, got: {err}"
+        message.contains("b5") && message.contains("b6"),
+        "the refusal has to name both identifiers, or the caller cannot tell which was wrong: \
+         {message}"
     );
     // A malformed document is the caller's fault. It used to answer 500 Internal server error,
     // which is both wrong about whose fault it is and an instruction to retry a request that
     // cannot succeed.
     assert!(
-        err.to_string().contains("400"),
-        "a refused document should be a 400, got: {err}"
+        message.contains("400"),
+        "a refused document should be a 400, got: {message}"
     );
+
+    // The same document through the bulk path, which validates elsewhere.
+    let bulk = client
+        .bulk_index(
+            "books",
+            &[json!({"id": "b7", "doc": {"id": "b8", "title": "two identities"}})],
+        )
+        .await
+        .expect("a bulk write reports per-document outcomes rather than failing");
+    assert_eq!(
+        bulk["items_written"].as_u64(),
+        Some(0),
+        "a bulk write must be held to the same rule as a single one: {bulk}"
+    );
+    assert!(
+        bulk["errors"].to_string().contains("b8"),
+        "and must say why the document it received was not written: {bulk}"
+    );
+}
+
+/// A batch past the fast validator's size boundary keeps the same contract.
+///
+/// Two validators judge a written document — an inline one for small batches and mature
+/// schemas, and a slower one that also reports fields the schema has yet to learn — and which
+/// one runs is decided by the batch size alone, at 1000 documents. Both refused a body without
+/// `id`, but only the slow one was reachable by a loader sending batches of twelve hundred, so
+/// the break showed up as "every document rejected" on a payload no smaller test sent.
+///
+/// The payload is the shape that found it: a batch across that boundary, the key beside each
+/// body rather than in it, and a shadow field carrying that key under the source's own name.
+#[tokio::test]
+async fn a_batch_past_the_fast_validator_boundary_needs_no_id_in_its_bodies() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "files",
+        &json!({
+            "fields": {
+                "id": {"name": "id", "field_type": "text", "indexed": true},
+                "sha256": {"name": "sha256", "field_type": "text", "indexed": false, "is_shadow": true},
+                "title": {"name": "title", "field_type": "text", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "creating the config should succeed: {body}");
+
+    const DOCS: usize = 1200;
+    let key = |n: usize| format!("f{n:04}");
+    let batch: Vec<serde_json::Value> = (0..DOCS)
+        .map(|n| json!({"id": key(n), "doc": {"sha256": key(n), "title": "a record"}}))
+        .collect();
+
+    let bulk = client
+        .bulk_index("files", &batch)
+        .await
+        .expect("bulk write");
+    assert_eq!(
+        (
+            bulk["items_written"].as_u64(),
+            bulk["errors"].as_array().map(|e| e.len())
+        ),
+        (Some(DOCS as u64), Some(0)),
+        "every document should have been written: {bulk}"
+    );
+
+    client.admin_index_commit("files").await.expect("commit");
+    let found = client
+        .search("files", "title:record", Some(1), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(
+        found["total_hits"].as_u64(),
+        Some(DOCS as u64),
+        "and be searchable by content afterwards: {found}"
+    );
+
+    // And each one is reachable under the name its source uses for the key.
+    let last = key(DOCS - 1);
+    let found = client
+        .search(
+            "files",
+            &format!("sha256:{last}"),
+            Some(1),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("search");
+    assert_eq!(
+        found["hits"][0]["sha256"].as_str(),
+        Some(last.as_str()),
+        "the last document of the batch should be there under its shadow name: {found}"
+    );
+}
+
+/// One document, one verdict — whatever size batch it arrives in.
+///
+/// Two validators used to judge a written document, and which one ran was decided by the batch
+/// size alone: a "fast" one for single writes and anything under a thousand documents, a slower
+/// one above that. They did not agree. The fast one required a value's type to equal the
+/// declared type exactly, while the slow one asked the question that matters — can the engine
+/// store this? A text field takes any value, serializing what is not already a string, so a
+/// number under a text field was refused below a thousand documents and written above it.
+///
+/// For a size-driven loader that is not a corner case: batch size follows traffic, so the same
+/// record is accepted at midday and rejected at midnight. Both directions are pinned here,
+/// because unifying on the strict rule would have been just as wrong: a document the engine can
+/// hold must be accepted at every size, and one it cannot must be refused at every size.
+#[tokio::test]
+async fn a_document_is_judged_the_same_whatever_size_batch_it_arrives_in() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "sized",
+        &json!({
+            "fields": {
+                "id": {"name": "id", "field_type": "text", "indexed": true},
+                "title": {"name": "title", "field_type": "text", "indexed": true},
+                "n": {"name": "n", "field_type": "i64", "indexed": true, "fast": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "creating the config should succeed: {body}");
+
+    // Storable: a text field serializes whatever it is given and indexes that.
+    let storable = |id: String| json!({"id": id, "doc": {"title": 42}});
+    // Not storable: an i64 field has nowhere to put a word, so the write path would skip the
+    // value and leave the document with the field silently unindexed.
+    let refused = |id: String| json!({"id": id, "doc": {"n": "twelve"}});
+
+    for (label, count) in [("one", 1usize), ("many", 1200)] {
+        let batch: Vec<serde_json::Value> = (0..count)
+            .map(|n| storable(format!("ok-{label}-{n}")))
+            .collect();
+        let bulk = client
+            .bulk_index("sized", &batch)
+            .await
+            .expect("bulk write");
+        assert_eq!(
+            (
+                bulk["items_written"].as_u64(),
+                bulk["errors"].as_array().map(|e| e.len())
+            ),
+            (Some(count as u64), Some(0)),
+            "a storable document must be written in a batch of {count}: {bulk}"
+        );
+
+        let batch: Vec<serde_json::Value> = (0..count)
+            .map(|n| refused(format!("bad-{label}-{n}")))
+            .collect();
+        let bulk = client
+            .bulk_index("sized", &batch)
+            .await
+            .expect("bulk write");
+        assert_eq!(
+            (
+                bulk["items_written"].as_u64(),
+                bulk["errors"].as_array().map(|e| e.len())
+            ),
+            (Some(0), Some(count)),
+            "an unstorable document must be refused in a batch of {count}: {bulk}"
+        );
+        assert!(
+            bulk["errors"][0].as_str().unwrap_or_default().contains("n"),
+            "and the reason must name the field: {bulk}"
+        );
+    }
+
+    // The single-write path is the third caller, and it validated as the small batches did.
+    client
+        .write_document("sized", "ok-single", &json!({"title": 42}), None)
+        .await
+        .expect("a storable document should be accepted as a single write too");
+    let err = client
+        .write_document("sized", "bad-single", &json!({"n": "twelve"}), None)
+        .await
+        .expect_err("an unstorable document should be refused as a single write too");
+    assert!(
+        err.to_string().contains("400") && err.to_string().contains('n'),
+        "as a bad request naming the field: {err}"
+    );
+
+    // Storable means what it says: the value is in the index, not merely accepted.
+    client.admin_index_commit("sized").await.expect("commit");
+    let found = client
+        .search("sized", "title:42", Some(1), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(
+        found["total_hits"].as_u64(),
+        Some(1202),
+        "every accepted document should be searchable by the value it carried: {found}"
+    );
+}
+
+/// A list is several values of the field it arrives under, not a value the field cannot hold.
+///
+/// Every tantivy field is multivalued. Two `add_i64` calls under one field store two values of
+/// it, the fast column reports `Cardinality::Multivalued`, and a range or term query matches the
+/// document if any one of its values matches — verified against tantivy 0.26 directly in
+/// `crates/storage/tests/tantivy_multivalue.rs`. So a source reporting two analyses of one
+/// sample belongs in the numeric field the schema declares, and both numbers belong in the
+/// index.
+///
+/// Reading such a value with `as_i64` returned nothing and skipped the field. The write
+/// succeeded, the list was kept in the stored document, and the column was left empty — so the
+/// value read back correctly while no range query over it ever matched, on every document that
+/// carried more than one value. Validation then hardened the same mistake into a refusal.
+///
+/// Null and the empty list are pinned alongside, because they are the same question: both are
+/// the absence of a value, both index nothing, and neither is a reason to refuse a document
+/// that could have omitted the key to identical effect.
+#[tokio::test]
+async fn a_list_is_several_values_of_the_field_it_arrives_under() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "multi",
+        &json!({
+            "fields": {
+                "id": {"name": "id", "field_type": "text", "indexed": true},
+                "n": {"name": "n", "field_type": "i64", "indexed": true, "fast": true},
+                "d": {"name": "d", "field_type": "date", "indexed": true, "fast": true},
+                "b": {"name": "b", "field_type": "boolean", "indexed": true},
+                "title": {"name": "title", "field_type": "text", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "creating the config should succeed: {body}");
+
+    let bulk = client
+        .bulk_index(
+            "multi",
+            &[
+                json!({"id": "m1", "doc": {
+                    "title": "two analyses",
+                    "n": [9, 12],
+                    "d": ["2023-08-19T10:24:56Z", "2023-08-19T10:26:30Z"],
+                    "b": [false, true]
+                }}),
+                // The absences: an explicit null, and a list with nothing in it.
+                json!({"id": "m2", "doc": {"title": "nothing to index", "n": null, "d": null}}),
+                json!({"id": "m3", "doc": {"title": "nothing to index", "n": [], "b": []}}),
+            ],
+        )
+        .await
+        .expect("bulk write");
+    assert_eq!(
+        (
+            bulk["items_written"].as_u64(),
+            bulk["errors"].as_array().map(|e| e.len())
+        ),
+        (Some(3), Some(0)),
+        "every one of the three should be written: {bulk}"
+    );
+
+    client.admin_index_commit("multi").await.expect("commit");
+
+    // Either value of the multivalued document answers, exactly and by range.
+    for query in [
+        "n:9",
+        "n:12",
+        "n:[10 TO 20]",
+        "n:[0 TO 9]",
+        "b:true",
+        "b:false",
+        "d:[2023-08-19T10:24:00Z TO 2023-08-19T10:25:00Z]",
+        "d:[2023-08-19T10:26:00Z TO 2023-08-19T10:27:00Z]",
+    ] {
+        let found = client
+            .search("multi", query, Some(10), None, None, None)
+            .await
+            .expect("search");
+        assert_eq!(
+            found["total_hits"].as_u64(),
+            Some(1),
+            "`{query}` should match the document carrying that value: {found}"
+        );
+        assert_eq!(
+            found["hits"][0]["id"].as_str(),
+            Some("m1"),
+            "and it should be the multivalued one: {found}"
+        );
+    }
+
+    // The stored document is unchanged by any of this: the lists read back as written.
+    let found = client
+        .search("multi", "id:m1", Some(1), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(
+        (
+            found["hits"][0]["n"].clone(),
+            found["hits"][0]["d"].clone(),
+            found["hits"][0]["b"].clone()
+        ),
+        (
+            json!([9, 12]),
+            json!(["2023-08-19T10:24:56Z", "2023-08-19T10:26:30Z"]),
+            json!([false, true])
+        ),
+        "the document reads back exactly as written: {found}"
+    );
+
+    // An absence indexes nothing, which is the whole of what it should do.
+    let found = client
+        .search("multi", "title:nothing", Some(10), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(
+        found["total_hits"].as_u64(),
+        Some(2),
+        "both documents whose fields were absent are stored and searchable: {found}"
+    );
+    let found = client
+        .search("multi", "n:[-1000 TO 1000] limit 0", None, None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(
+        found["total_hits"].as_u64(),
+        Some(1),
+        "and neither is in the numeric column: {found}"
+    );
+}
+
+/// A field the schema has never seen reaches it from a small write, not only a large one.
+///
+/// The other half of the split: the fast validator never reported an unknown field, so
+/// `needs_evolution` was permanently false on the path whose caller reads it to decide whether
+/// the schema has to grow. A batch of twelve hundred taught the index a new field; the same
+/// document written singly, or in a batch of two, did not — the value was stored in the document
+/// body and the field stayed absent from every description of the index.
+///
+/// A field discovered after the index exists is deliberately not searchable: tantivy fixes its
+/// schema at creation, so there is no column to write into. It is recorded so that the two views
+/// of a document agree and so `PATCH /_schema` has something to promote.
+#[tokio::test]
+async fn a_field_the_schema_never_saw_is_recorded_from_a_small_write() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    // Created explicitly, so nothing here is initial-creation sampling.
+    let (status, body) = put_config(
+        &node,
+        "growing",
+        &json!({
+            "fields": {
+                "id": {"name": "id", "field_type": "text", "indexed": true},
+                "title": {"name": "title", "field_type": "text", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "creating the config should succeed: {body}");
+
+    client
+        .write_document(
+            "growing",
+            "g1",
+            &json!({"title": "single", "from_single_write": "v"}),
+            None,
+        )
+        .await
+        .expect("write");
+
+    client
+        .bulk_index(
+            "growing",
+            &[json!({"id": "g2", "doc": {"title": "bulk", "from_small_batch": "v"}})],
+        )
+        .await
+        .expect("bulk write");
+
+    let config = get_json(&node, "/api/growing/_config").await;
+    for name in ["from_single_write", "from_small_batch"] {
+        let field = config["fields"]
+            .as_array()
+            .and_then(|f| f.iter().find(|f| f["name"] == name))
+            .unwrap_or_else(|| panic!("the schema should have learned {name}: {config}"));
+        assert_eq!(
+            (field["type"].as_str(), field["indexed"].as_bool()),
+            (Some("text"), Some(false)),
+            "a late-discovered field is recorded, and not searchable until promoted: {field}"
+        );
+    }
 }
 
 /// A document whose value the declared type cannot hold is refused as a bad request.
@@ -1892,6 +2343,72 @@ async fn a_shadow_field_agreeing_with_the_identifier_is_accepted() {
         );
         assert!(hit.get("id").is_none(), "no hit carries `id`: {hit}");
     }
+}
+
+/// A shadow field is held to the key even when the body never names it.
+///
+/// The check read the identifier out of the body, so on the documented shape — the id beside the
+/// body rather than in it — there was nothing to compare against and every document passed. That
+/// is the shape a bulk loader sends, so the one case the check exists for was the case it did not
+/// cover: the shadow value is stripped from the stored blob and the key is written back under its
+/// name, so a document disagreeing there loses that value with nothing said.
+#[tokio::test]
+async fn a_shadow_field_is_checked_against_the_key_when_the_body_omits_id() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(
+        &node,
+        "files",
+        &json!({
+            "fields": {
+                "id": {"name": "id", "field_type": "text", "indexed": true},
+                "sha1": {"name": "sha1", "field_type": "text", "indexed": false, "is_shadow": true},
+                "title": {"name": "title", "field_type": "text", "indexed": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "creating the config should succeed: {body}");
+
+    // Neither document repeats `id` in its body. The first disagrees with the key under the
+    // shadow name and cannot be stored; the second agrees and can.
+    let bulk = client
+        .bulk_index(
+            "files",
+            &[
+                json!({"id": "AAA", "doc": {"sha1": "BBB", "title": "a record"}}),
+                json!({"id": "CCC", "doc": {"sha1": "CCC", "title": "a record"}}),
+            ],
+        )
+        .await
+        .expect("a bulk write reports per-document outcomes rather than failing");
+    assert_eq!(
+        bulk["items_written"].as_u64(),
+        Some(1),
+        "the disagreeing document should be the only one dropped: {bulk}"
+    );
+    let errors = bulk["errors"].to_string();
+    assert!(
+        errors.contains("sha1") && errors.contains("BBB") && errors.contains("AAA"),
+        "and the reason has to name the field and both values: {bulk}"
+    );
+
+    client.admin_index_commit("files").await.expect("commit");
+    let found = client
+        .search("files", "title:record", Some(10), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(
+        found["total_hits"].as_u64(),
+        Some(1),
+        "only the storable document should be there: {found}"
+    );
+    assert_eq!(
+        found["hits"][0]["sha1"].as_str(),
+        Some("CCC"),
+        "and it comes back with the key under the shadow name: {found}"
+    );
 }
 
 /// One bad document in a batch costs that document, not the batch.

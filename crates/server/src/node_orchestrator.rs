@@ -417,6 +417,63 @@ fn normalize_projection_fields(schema: &IndexSchema, fields: &[String]) -> Vec<S
         .collect()
 }
 
+/// Whether a value written under a name for the document key is that key.
+///
+/// The identifier itself is always a string — `DocPayload.id`, the redb key — while a body may
+/// carry it as a number: a numeric primary key, an id read out of a column that was integral at
+/// the source. So the identifier is read as a number too before those two are called a
+/// disagreement, which is what keeps a body saying `"id": 42` beside an envelope saying `"42"`
+/// from being refused. Any other JSON type is not an identifier and cannot name one.
+fn names_identifier(value: &JsonValue, id: &str) -> bool {
+    match value {
+        JsonValue::String(text) => text == id,
+        JsonValue::Number(number) => id
+            .parse::<serde_json::Number>()
+            .is_ok_and(|written_as| &written_as == number),
+        _ => false,
+    }
+}
+
+/// Why a document cannot be stored under the identifier it arrived with, if it cannot.
+///
+/// The key travels beside the body, not inside it: `DocPayload.id` is the redb key, the term
+/// tantivy indexes, and the value `reconstruct_shadow_fields_owned` writes back into every hit
+/// on the way out. Keeping it in the stored blob as well would hold a second copy of the same
+/// string, which is why the documented bulk shape — `{"id": "...", "doc": {...}}` — leaves it
+/// out of `doc`, and why the read path treats the key as authoritative when the blob has no
+/// `id` of its own. Validation reads the envelope for that reason: demanding `id` inside the
+/// body refused every document written in the shape the API documents.
+///
+/// A body that does carry `id` is the older shape and still valid, but only while it agrees
+/// with the envelope. Disagreement is refused for the same reason a disagreeing shadow field
+/// is: the blob keeps its own `id` and reconstruction prefers it, so the document would answer
+/// to the key it was stored under and report a different one to whoever found it.
+fn unusable_document_identity(id: &str, doc: &JsonValue) -> Option<String> {
+    let obj = match doc.as_object() {
+        Some(obj) => obj,
+        None => return Some("Document body must be a JSON object".to_string()),
+    };
+
+    if id.is_empty() {
+        return Some(
+            "Document must be written with a non-empty 'id' beside its body: the identifier is \
+             the key it is stored, updated and looked up under. The body itself does not have to \
+             repeat it."
+                .to_string(),
+        );
+    }
+
+    let body_id = obj.get("id")?;
+    (!names_identifier(body_id, id)).then(|| {
+        format!(
+            "document is written under id={id} but its body says id={body_id}. The identifier \
+             beside the body is the key the document is stored under, so the two cannot differ: \
+             a later read would find this document as {id} and report {body_id}. Leave 'id' out \
+             of the body — it is supplied from the key — or correct one of the two."
+        )
+    })
+}
+
 /// Why a document's shadow fields cannot be stored as written, if they cannot.
 ///
 /// A shadow field is the document key under the source's own name, and nothing holds a second
@@ -433,12 +490,15 @@ fn normalize_projection_fields(schema: &IndexSchema, fields: &[String]) -> Vec<S
 ///
 /// Absence is not disagreement. A document may omit a shadow field entirely — the ordinary case
 /// for a rewritten document — and reconstruction supplies it on the way out.
-fn disagreeing_shadow_field(doc: &JsonValue, schema: &IndexSchema) -> Option<String> {
+///
+/// `id` is the identifier the write arrived with rather than anything read out of the body,
+/// because a body need not carry `id` at all. Reading it from the body skipped this check
+/// entirely on exactly the documents the documented bulk shape sends.
+fn disagreeing_shadow_field(doc: &JsonValue, schema: &IndexSchema, id: &str) -> Option<String> {
     if schema.shadow_fields.is_empty() {
         return None;
     }
     let obj = doc.as_object()?;
-    let id = obj.get("id")?;
 
     // Sorted, so a document disagreeing under two names names the same one every time.
     let mut names: Vec<&String> = schema.shadow_fields.iter().collect();
@@ -446,7 +506,7 @@ fn disagreeing_shadow_field(doc: &JsonValue, schema: &IndexSchema) -> Option<Str
 
     names.into_iter().find_map(|name| {
         let value = obj.get(name)?;
-        (value != id).then(|| {
+        (!names_identifier(value, id)).then(|| {
             format!(
                 "field '{name}' is a shadow of 'id' and must carry the same value, but this \
                  document has {name}={value} and id={id}. A shadow field is a name for the \
@@ -456,6 +516,124 @@ fn disagreeing_shadow_field(doc: &JsonValue, schema: &IndexSchema) -> Option<Str
             )
         })
     })
+}
+
+/// The field type a value would be given if the schema had never seen the field.
+///
+/// One reading of a JSON value, shared by every write path. It is deliberately not applied to
+/// `id`: the document key is text whatever it looks like, and inferring `i64` from a numeric
+/// identifier is how an index came to declare `id` as a type the key it builds does not use.
+///
+/// A string is examined before it is called text, because the shapes that follow are what the
+/// engine can index as something better: an RFC3339 or naive timestamp is a date, and an
+/// address is an ip. An array reads as text — the write path serializes it into a text field
+/// and tokenizes that — and an object as json. Null reads as text because null is the absence
+/// of a value, and text is the only type that can hold the absence of one.
+fn infer_field_type(value: &JsonValue) -> TantivyFieldType {
+    match value {
+        JsonValue::String(s) => {
+            if chrono::DateTime::parse_from_rfc3339(s).is_ok()
+                || is_naive_datetime(s)
+                || is_naive_date(s)
+            {
+                TantivyFieldType::Date
+            } else if s.parse::<std::net::IpAddr>().is_ok() {
+                TantivyFieldType::Ip
+            } else {
+                TantivyFieldType::Text
+            }
+        }
+        JsonValue::Number(n) => {
+            if n.is_i64() {
+                TantivyFieldType::I64
+            } else if n.is_u64() {
+                TantivyFieldType::U64
+            } else {
+                TantivyFieldType::F64
+            }
+        }
+        JsonValue::Bool(_) => TantivyFieldType::Boolean,
+        JsonValue::Array(_) => TantivyFieldType::Text,
+        JsonValue::Object(_) => TantivyFieldType::Json,
+        JsonValue::Null => TantivyFieldType::Text,
+    }
+}
+
+/// Whether a field declared as one type can hold a single value that reads as another.
+///
+/// `String` is `Text` under an older name, and a numeric field widens to a float, because `4`
+/// and `4.5` in one field is a source being loose about a value rather than a document that
+/// cannot be stored. Everything else has to match: a declared `i64` receiving a word has
+/// nowhere to put it, and the write path would skip the value and leave the document stored
+/// with the field silently unindexed.
+///
+/// Values whose *shape* rather than type decides the answer — a list, a null, a text or json
+/// field that takes anything — are settled by `unstorable_value_type` before this is asked.
+fn scalar_type_is_storable(declared: &TantivyFieldType, inferred: &TantivyFieldType) -> bool {
+    if declared == inferred {
+        return true;
+    }
+    matches!(
+        (declared, inferred),
+        (TantivyFieldType::String, TantivyFieldType::Text)
+            | (
+                TantivyFieldType::I64 | TantivyFieldType::U64,
+                TantivyFieldType::F64
+            )
+    )
+}
+
+/// The reading of a value that the field cannot hold, if there is one.
+///
+/// The question is what the write path can store, which is a wider question than whether two
+/// type names match — see `storage::add_json_value_to_doc`, which is the other half of this
+/// answer and has to agree with it exactly. Where they disagree the cost is silent: a value the
+/// validator waves through and the writer skips leaves a document stored with that field
+/// unindexed, and a query over the field simply never matches it.
+///
+/// **A list is several values of the field.** Every tantivy field is multivalued — two `add_i64`
+/// calls under one field store two values of it, the fast column reports
+/// `Cardinality::Multivalued`, and a range query matches the document if any one value falls
+/// inside. So `{"risk_score": [9, 12]}` belongs in an `i64` field, and each element is checked
+/// on its own. One level is flattened and no more, which is exactly what the writer does with
+/// it: a list inside a list is a value the element type has to accept by itself.
+///
+/// **A text or json field takes anything**, because the writer serializes whatever it is given
+/// into text. A list under one of those is indexed as its own JSON text rather than split, so
+/// it is not looked into here either. **Bytes** wants a list of byte values and nothing else.
+///
+/// **Null is the absence of a value**, and any field may be absent. The writer adds nothing, no
+/// query matches it, and the document reads back exactly as written — so refusing a document
+/// for carrying an explicit null where it could have omitted the key would be a distinction
+/// without a difference to anything downstream.
+fn unstorable_value_type(
+    declared: &TantivyFieldType,
+    value: &JsonValue,
+) -> Option<TantivyFieldType> {
+    if value.is_null() {
+        return None;
+    }
+
+    match declared {
+        // Takes the value whole, whatever shape it has.
+        TantivyFieldType::Text | TantivyFieldType::Json => None,
+        // Takes a list of byte values, and only that.
+        TantivyFieldType::Bytes => value.as_array().is_none().then(|| infer_field_type(value)),
+        _ => match value.as_array() {
+            // Several values of the field, each held to the declared type on its own.
+            Some(items) => items.iter().find_map(|item| {
+                if item.is_null() {
+                    return None;
+                }
+                let inferred = infer_field_type(item);
+                (!scalar_type_is_storable(declared, &inferred)).then_some(inferred)
+            }),
+            None => {
+                let inferred = infer_field_type(value);
+                (!scalar_type_is_storable(declared, &inferred)).then_some(inferred)
+            }
+        },
+    }
 }
 
 /// The sort field a search cannot be answered with, if the caller named one.
@@ -1385,9 +1563,17 @@ impl DeletePayload {
 }
 
 /// Write request message for MicroshardActor.
+///
+/// `id` is the key the document is stored under. It travels beside the body because the body
+/// need not carry it — see `unusable_document_identity` — and it is `#[serde(default)]` because
+/// this is a remote message: a peer running a build that predates the field sends a request
+/// without it, and such a request still means "take the id from the body", which is what
+/// `handle_write` falls back to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteRequest {
     pub index: String,
+    #[serde(default)]
+    pub id: String,
     pub routing_key: String,
     pub doc: JsonValue,
 }
@@ -2650,8 +2836,7 @@ impl OrchestratorEngine {
 
         // Fast path: mature schema — validate inline
         if !schema.fields.is_empty() {
-            let result =
-                NodeOrchestrator::validate_single_document_readonly_fast(&doc, &schema, false);
+            let result = NodeOrchestrator::validate_document(&id, &doc, &schema);
             if let Some(err) = result.validation_error {
                 return Err(OrchestratorError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -2693,6 +2878,7 @@ impl OrchestratorEngine {
                 })?;
                 let req = WriteRequest {
                     index: index.to_string(),
+                    id: id.clone(),
                     routing_key: effective_routing_key.unwrap_or_default(),
                     doc,
                 };
@@ -3792,21 +3978,29 @@ impl MicroshardActor {
     }
 
     /// Handles write requests via the dedicated writer thread.
+    ///
+    /// The key is `request.id` — the one the caller wrote under and the one the response
+    /// reports — rather than anything read out of the body. Reading it from the body meant a
+    /// document written in the documented shape, which leaves `id` out of `doc` because the key
+    /// is already beside it, had no key here at all and was refused. The body is still read as a
+    /// fallback, for a request from a peer whose build predates `WriteRequest::id`.
     pub async fn handle_write(&self, request: WriteRequest) -> Result<u64, OrchestratorError> {
         // OPTIMIZATION: Take ownership of doc from request immediately
         let doc = request.doc;
 
-        // Extract ID (borrowing from doc before move)
-        let id = doc
-            .get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                OrchestratorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Document must contain an 'id' field",
-                ))
-            })?
-            .to_string();
+        let id = if !request.id.is_empty() {
+            request.id
+        } else {
+            doc.get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Document must be written with a non-empty 'id' beside its body",
+                    ))
+                })?
+                .to_string()
+        };
 
         // OPTIMIZATION: Move doc into Option, no clone
         let json_blob = Some(doc);
@@ -5763,7 +5957,7 @@ impl NodeOrchestrator {
 
         // Stage 1: Parallel validation (read-only)
         let validation_results = self
-            .parallel_validate_schema(index, docs, schema_cache, is_initial_creation)
+            .parallel_validate_schema(index, docs, schema_cache)
             .await?;
 
         // Stage 2: Aggregate results and identify evolution needs
@@ -5821,19 +6015,17 @@ impl NodeOrchestrator {
         Ok(summary)
     }
 
-    /// Parallel schema validation (read-only, no mutations)
+    /// Validate a batch, inline or fanned out, according to how big it is.
     ///
-    /// `is_initial_creation` comes from the caller, for the same reason it does in
-    /// `evolve_schema_sequential`: sampling has already filled `schema_cache`, so deriving
-    /// it here from `fields.is_empty()` reads false on exactly the call where it is true.
-    /// That matters because the fast validator does not report new fields — a field that
-    /// first appears past the sampling limit would go unnoticed and never reach the schema.
+    /// Size decides *where* the work runs and nothing else: every document is judged by
+    /// `validate_document`, so a batch of one and a batch of ten thousand reach the same
+    /// verdict about the same document. That was not true while a second validator existed for
+    /// small batches — see `validate_document` for what the two disagreed about.
     async fn parallel_validate_schema(
         &self,
         _index: &str,
         docs: &[DocPayload],
         schema_cache: &IndexSchema,
-        is_initial_creation: bool,
     ) -> Result<Vec<SchemaValidationResult>, OrchestratorError> {
         tracing::debug!(
             "Using parallel Rayon validation for {} documents",
@@ -5846,55 +6038,24 @@ impl NodeOrchestrator {
         // and schema — all to run a handful of cheap per-document checks. Both hops are pure
         // overhead below this size.
         const INLINE_VALIDATION_MAX_DOCS: usize = 64;
-        if !is_initial_creation && docs.len() <= INLINE_VALIDATION_MAX_DOCS {
+        if docs.len() <= INLINE_VALIDATION_MAX_DOCS {
             return Ok(docs
                 .iter()
                 .map(|doc_payload| {
-                    Self::validate_single_document_readonly_fast(
-                        &doc_payload.doc,
-                        schema_cache,
-                        is_initial_creation,
-                    )
+                    Self::validate_document(&doc_payload.id, &doc_payload.doc, schema_cache)
                 })
                 .collect());
         }
-
-        // Fast path: if schema is mature and batch is small, skip expensive clone
-        let use_fast_path = !is_initial_creation && docs.len() < 1000;
 
         // Clone data so it is Send + 'static inside spawn_blocking
         let docs_owned: Vec<DocPayload> = docs.to_vec();
         let schema_clone = schema_cache.clone();
 
-        if use_fast_path {
-            tracing::debug!("Using fast path validation for {} documents", docs.len());
-            let results = tokio::task::spawn_blocking(move || {
-                docs_owned
-                    .par_iter()
-                    .map(|doc_payload| {
-                        Self::validate_single_document_readonly_fast(
-                            &doc_payload.doc,
-                            &schema_clone,
-                            is_initial_creation,
-                        )
-                    })
-                    .collect::<Vec<SchemaValidationResult>>()
-            })
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?;
-
-            return Ok(results);
-        }
-
         let results = tokio::task::spawn_blocking(move || {
             docs_owned
                 .par_iter()
                 .map(|doc_payload| {
-                    Self::validate_single_document_readonly(
-                        &doc_payload.doc,
-                        &schema_clone,
-                        is_initial_creation,
-                    )
+                    Self::validate_document(&doc_payload.id, &doc_payload.doc, &schema_clone)
                 })
                 .collect::<Vec<SchemaValidationResult>>()
         })
@@ -5904,117 +6065,31 @@ impl NodeOrchestrator {
         Ok(results)
     }
 
-    /// Read-only validation for a single document (no mutations) - fast path
-    fn validate_single_document_readonly_fast(
-        doc: &JsonValue,
-        schema_cache: &IndexSchema, // Pass by reference, no clone needed
-        _is_initial_creation: bool,
-    ) -> SchemaValidationResult {
-        // Check 1: Ensure doc["id"] exists
-        if !doc.is_object() || !doc.as_object().unwrap().contains_key("id") {
-            return SchemaValidationResult {
-                needs_evolution: false,
-                new_fields: Vec::new(),
-                validation_error: Some("Document missing required 'id' field".to_string()),
-            };
-        }
-
-        // Check 2: A shadow field is a name for the identifier, so it has to carry it.
-        if let Some(err) = disagreeing_shadow_field(doc, schema_cache) {
-            return SchemaValidationResult {
-                needs_evolution: false,
-                new_fields: Vec::new(),
-                validation_error: Some(err),
-            };
-        }
-
-        // Check 3: Validate against existing schema (no evolution in fast path)
-        if let Some(obj) = doc.as_object() {
-            for (key, value) in obj {
-                if key == "id" {
-                    continue; // Skip ID field
-                }
-
-                // Only check if field exists in schema, don't add new fields
-                if !schema_cache.fields.contains_key(key) {
-                    // In fast path, we don't track new fields for schema evolution
-                    // This is a performance optimization for mature schemas
-                    continue;
-                }
-
-                // Type validation against existing schema
-                if let Some(field_def) = schema_cache.fields.get(key) {
-                    let inferred_type = if key == "id" {
-                        TantivyFieldType::Text
-                    } else {
-                        match value {
-                            JsonValue::String(s) => {
-                                // Try to infer date from string
-                                if chrono::DateTime::parse_from_rfc3339(s).is_ok()
-                                    || is_naive_datetime(s)
-                                    || is_naive_date(s)
-                                {
-                                    TantivyFieldType::Date
-                                } else if s.parse::<std::net::IpAddr>().is_ok() {
-                                    TantivyFieldType::Ip
-                                } else {
-                                    TantivyFieldType::Text
-                                }
-                            }
-                            JsonValue::Number(n) => {
-                                if n.is_i64() {
-                                    TantivyFieldType::I64
-                                } else if n.is_u64() {
-                                    TantivyFieldType::U64
-                                } else {
-                                    TantivyFieldType::F64
-                                }
-                            }
-                            JsonValue::Bool(_) => TantivyFieldType::Boolean,
-                            JsonValue::Array(_) => TantivyFieldType::Text, // Arrays as text
-                            JsonValue::Object(_) => TantivyFieldType::Json, // Objects as JSON
-                            JsonValue::Null => TantivyFieldType::Text,
-                        }
-                    };
-
-                    if inferred_type != field_def.field_type {
-                        return SchemaValidationResult {
-                            needs_evolution: false,
-                            new_fields: Vec::new(),
-                            validation_error: Some(format!(
-                                "Type mismatch for field '{}': expected {:?}, got {:?}",
-                                key, field_def.field_type, inferred_type
-                            )),
-                        };
-                    }
-                }
-            }
-        }
-
-        SchemaValidationResult {
-            needs_evolution: false, // Fast path never needs evolution
-            new_fields: Vec::new(), // No new fields tracked in fast path
-            validation_error: None,
-        }
-    }
-
-    /// Read-only validation for a single document (no mutations)
-    fn validate_single_document_readonly(
+    /// Whether one document can be written, and what the schema would have to learn first.
+    ///
+    /// The only validator, and it was two: a "fast" one for single writes, small batches and
+    /// anything under a thousand documents, and this one past that. They disagreed about the
+    /// same document twice over. The fast one required a value's type to equal the declared
+    /// type exactly, so a number under a text field — a shape the engine stores and indexes
+    /// without complaint — was refused below a thousand documents and written above it; batch
+    /// size decided whether a document was valid. It also never reported a field the schema
+    /// does not have, which left `needs_evolution` permanently false on the path whose caller
+    /// reads it to decide whether the schema has to grow, so a single write carrying a new
+    /// field never grew it while a large batch did.
+    ///
+    /// Nothing about the checks needed to be split. The two hot paths differ in *where* the
+    /// work runs — inline, or fanned out over rayon — which is `parallel_validate_schema`'s
+    /// decision to make, and the per-document work is a handful of hash lookups either way.
+    ///
+    /// `id` is the identifier the write arrived with, beside the body rather than in it — see
+    /// `unusable_document_identity` for why that is the authoritative one.
+    fn validate_document(
+        id: &str,
         doc: &JsonValue,
         schema_cache: &IndexSchema,
-        _is_initial_creation: bool,
     ) -> SchemaValidationResult {
-        // Check 1: Ensure doc["id"] exists
-        if !doc.is_object() || !doc.as_object().unwrap().contains_key("id") {
-            return SchemaValidationResult {
-                needs_evolution: false,
-                new_fields: Vec::new(),
-                validation_error: Some("Document must contain an 'id' field".to_string()),
-            };
-        }
-
-        // Check 2: A shadow field is a name for the identifier, so it has to carry it.
-        if let Some(err) = disagreeing_shadow_field(doc, schema_cache) {
+        // Check 1: the document has a usable identifier, and does not contradict it.
+        if let Some(err) = unusable_document_identity(id, doc) {
             return SchemaValidationResult {
                 needs_evolution: false,
                 new_fields: Vec::new(),
@@ -6022,98 +6097,50 @@ impl NodeOrchestrator {
             };
         }
 
+        // Check 2: A shadow field is a name for the identifier, so it has to carry it.
+        if let Some(err) = disagreeing_shadow_field(doc, schema_cache, id) {
+            return SchemaValidationResult {
+                needs_evolution: false,
+                new_fields: Vec::new(),
+                validation_error: Some(err),
+            };
+        }
+
+        // Check 3: every field either fits what the schema declares, or is one the schema has
+        // yet to hear about.
         let mut needs_evolution = false;
         let mut new_fields = Vec::new();
 
-        // Check 3: Validate fields and identify new ones
         if let Some(obj) = doc.as_object() {
             for (key, value) in obj {
-                let inferred_type = if key == "id" {
-                    TantivyFieldType::Text
-                } else {
-                    match value {
-                        JsonValue::String(s) => {
-                            // Try to infer date from string
-                            if chrono::DateTime::parse_from_rfc3339(s).is_ok()
-                                || is_naive_datetime(s)
-                                || is_naive_date(s)
-                            {
-                                TantivyFieldType::Date
-                            } else if s.parse::<std::net::IpAddr>().is_ok() {
-                                TantivyFieldType::Ip
-                            } else {
-                                TantivyFieldType::Text
-                            }
-                        }
-                        JsonValue::Number(n) => {
-                            if n.is_i64() {
-                                TantivyFieldType::I64
-                            } else if n.is_u64() {
-                                TantivyFieldType::U64
-                            } else {
-                                TantivyFieldType::F64
-                            }
-                        }
-                        JsonValue::Bool(_) => TantivyFieldType::Boolean,
-                        JsonValue::Array(_) => TantivyFieldType::Text, // Arrays as text
-                        JsonValue::Object(_) => TantivyFieldType::Json, // Objects as JSON
-                        JsonValue::Null => TantivyFieldType::Text,
-                    }
-                };
+                // The key is text whatever it looks like, and the index builds it itself.
+                if key == "id" {
+                    continue;
+                }
 
-                if let Some(existing_field) = schema_cache.fields.get(key) {
-                    // Check type compatibility (read-only)
-                    let mut is_compatible = existing_field.field_type == inferred_type;
-
-                    // Allow Text to match String (backward compatibility)
-                    if !is_compatible
-                        && inferred_type == TantivyFieldType::Text
-                        && existing_field.field_type == TantivyFieldType::String
-                    {
-                        is_compatible = true;
-                    }
-
-                    // Allow Text to evolve to more specific types
-                    if !is_compatible && existing_field.field_type == TantivyFieldType::Text {
-                        match inferred_type {
-                            TantivyFieldType::Date
-                            | TantivyFieldType::Ip
-                            | TantivyFieldType::I64
-                            | TantivyFieldType::U64
-                            | TantivyFieldType::F64
-                            | TantivyFieldType::Boolean
-                            | TantivyFieldType::Json => {
-                                is_compatible = true;
-                            }
-                            _ => {}
+                match schema_cache.fields.get(key) {
+                    Some(existing_field) => {
+                        if let Some(unstorable) =
+                            unstorable_value_type(&existing_field.field_type, value)
+                        {
+                            return SchemaValidationResult {
+                                needs_evolution: false,
+                                new_fields: Vec::new(),
+                                validation_error: Some(format!(
+                                    "Type mismatch for field '{}': expected {:?}, got {:?}",
+                                    key, existing_field.field_type, unstorable
+                                )),
+                            };
                         }
                     }
-
-                    // Allow numeric upgrades
-                    if !is_compatible {
-                        match (&existing_field.field_type, inferred_type.clone()) {
-                            (TantivyFieldType::I64, TantivyFieldType::F64)
-                            | (TantivyFieldType::U64, TantivyFieldType::F64) => {
-                                is_compatible = true;
-                            }
-                            _ => {}
-                        }
+                    None => {
+                        // A field the schema has never seen is typed by the value as a whole,
+                        // so a list makes a text field rather than a field of its element type:
+                        // the next document may carry a list of something else, and text is the
+                        // only type that can hold both.
+                        needs_evolution = true;
+                        new_fields.push((key.clone(), infer_field_type(value)));
                     }
-
-                    if !is_compatible {
-                        return SchemaValidationResult {
-                            needs_evolution: false,
-                            new_fields: Vec::new(),
-                            validation_error: Some(format!(
-                                "Type mismatch for field '{}': expected {:?}, got {:?}",
-                                key, existing_field.field_type, inferred_type
-                            )),
-                        };
-                    }
-                } else {
-                    // New field detected
-                    needs_evolution = true;
-                    new_fields.push((key.clone(), inferred_type));
                 }
             }
         }
@@ -7690,7 +7717,7 @@ impl NodeOrchestrator {
 
         // Fast path: mature schema — validate inline without spawn_blocking/Rayon
         if !schema.fields.is_empty() {
-            let result = Self::validate_single_document_readonly_fast(&doc, &schema, false);
+            let result = Self::validate_document(&id, &doc, &schema);
             if let Some(err) = result.validation_error {
                 return Err(OrchestratorError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -7717,6 +7744,7 @@ impl NodeOrchestrator {
                 })?;
                 let req = WriteRequest {
                     index: index.to_string(),
+                    id: id.clone(),
                     routing_key: effective_routing_key.unwrap_or_default(),
                     doc,
                 };
@@ -7775,6 +7803,7 @@ impl NodeOrchestrator {
         })?;
         let req = WriteRequest {
             index: index.to_string(),
+            id: id.clone(),
             routing_key: effective_routing_key.unwrap_or_default(),
             doc,
         };

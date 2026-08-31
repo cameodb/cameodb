@@ -121,9 +121,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unstorable row in an import is no reason to discard the rows around it.
 
   **This changes what an existing pipeline sees.** A caller that was writing documents which fail
-  schema validation — a type mismatch, or a shadow field disagreeing with the identifier — will
-  see `items_written` fall and `errors` appear where neither did before. Those documents were
-  being stored wrong, and the count that called them written was the thing that was false.
+  schema validation — a value the declared type cannot hold, a shadow field disagreeing with the
+  identifier, a body `id` contradicting the key it was written under — will see `items_written`
+  fall and `errors` appear where neither did before. Those documents were being stored wrong, and
+  the count that called them written was the thing that was false.
+
+  Dropping the rows also exposed how much of what failed should never have failed: a body that
+  does not repeat its `id`, a list under a numeric or date field, and an explicit null are all
+  valid. See **Fixed**.
 
 - **A document whose shadow field disagrees with its identifier is refused.** A shadow field is
   the document key under the source's own name and nothing holds a second copy of the value: the
@@ -133,13 +138,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{"id": "AAA", "md5": "BBB"}` came back as `md5: "AAA"`, and `md5:BBB` matched nothing while
   `md5:AAA` matched. Both write paths now refuse it, naming the field and both values.
 
+  The value is held against the identifier the write arrived with rather than one read out of the
+  document body, so the rule applies whether or not the body repeats `id`. Reading it from the
+  body left the check with nothing to compare on every document written in the shape the API
+  documents — which is the one shape a bulk loader sends, so the case the check exists for was
+  the case it did not cover.
+
   The rest of the design already rested on this invariant: `document_key_field` picks any one
   shadow name to read the key back under and reconstruction writes the key under every one, both
   defensible only if all of them mean the key. The bundled importer checks it before promoting a
   column to shadow; this is the same rule for a write arriving by any other route. A document may
   still omit the shadow field entirely, which is the ordinary shape of a rewritten document.
 
+- **A body whose `id` disagrees with the key it was written under is refused.** The identifier
+  travels beside the body — `{"id": "...", "doc": {...}}` — and a body repeating it is the older
+  shape, valid only while the two agree. When they disagreed the stored body kept its own `id` and
+  the read path preferred it, so the document answered to the key it was stored under and reported
+  a different one to whoever found it; on a single write the body's value silently became the key,
+  contradicting the id the response reported. The refusal names both values.
+
 ### Fixed
+
+- **A document written in the shape the API documents was refused for having no `id`.** The write
+  API carries the key beside the body — `{"id": "...", "doc": {...}}`, on both
+  `PUT /api/{index}/document` and `POST /api/{index}/_bulk` — and that is the copy the store
+  keeps: the redb key, the term tantivy indexes, and the value reconstruction writes back into
+  every hit all come from it. The stored body deliberately holds no second copy. Validation
+  demanded `id` inside `doc` anyway, and the single-write path read the key out of the body rather
+  than out of the request that carried it, so a caller following the documentation had every
+  document refused — a `400` on a single write, and, once a bulk write stopped storing what failed
+  validation, `items_written: 0` with one error per row.
+
+  Both the validator and the write path now take the identifier from the request, so a body that
+  omits `id` is accepted on every route and the document is stored, updated and found under the
+  key it was written with. A body that carries `id` is the older shape and still works, as long as
+  it agrees — see **Changed**.
+
+- **A list under a numeric or date field was silently dropped.** Every tantivy field is
+  multivalued: two `add_i64` calls under one field store two values of it, the fast column reports
+  `Cardinality::Multivalued`, and a range or term query matches a document if any one of its
+  values matches. The write path did not use that. It read the value with `as_i64`, `as_bool` or
+  `as_str`, got nothing for a list, and skipped the field — so `{"risk_score": [9, 12]}` was
+  written, kept both numbers in the stored body, and left the column empty. The value read back
+  correctly while no range query over the field ever matched, on every document that carried more
+  than one value, with nothing logged and no error to see.
+
+  A list under a typed field is now indexed value by value, one level deep, and validation accepts
+  it — each element held to the declared type on its own. Text and json fields are deliberately
+  unchanged: they take the whole value serialized, so a list under them is already indexed as its
+  own JSON text and splitting it would change what those fields have always held. Sorting is the
+  one place several values are not simply more: `order_by_fast_field` reads one value per
+  document, and for a multivalued column that is the first one written.
+
+  **An explicit `null` is accepted too**, in a field of any type. It is the absence of a value:
+  the writer stores nothing for it, no query matches it, and the document reads back as written —
+  so refusing a document for spelling out a null where omitting the key would have been identical
+  to everything downstream was a distinction without a difference.
+
+  The three copies of the value-to-document match — both write paths and WAL replay — are now
+  one function. They had already drifted: only replay logged a clamped date, and only replay
+  survived a value that is not a facet path, so a document could index differently on recovery
+  than it did on the write.
+
+- **Batch size decided whether a document was valid.** Two validators judged a written document
+  and the batch size chose between them: a "fast" one for single writes, small batches and
+  anything under a thousand documents, a slower one above that. They disagreed twice over.
+
+  The fast one required a value's type to *equal* the declared type. The slow one asked what the
+  engine can actually store, which is wider: a text field takes any value, since anything that is
+  not already a string is serialized into it and tokenized as text. So a number, a boolean or an
+  object under a text field was refused below a thousand documents and written above it — for a
+  loader whose batch size follows traffic, the same record accepted at midday and rejected at
+  midnight.
+
+  The fast one also never reported a field the schema does not have, which left `needs_evolution`
+  permanently false on the path whose caller reads it to decide whether the schema must grow. A
+  batch of twelve hundred taught the index a new field; the same document written singly, or in a
+  batch of two, did not — the value was stored in the body while the field stayed absent from
+  every description of the index.
+
+  One validator now judges every write, unified on the storability question the larger batches
+  already asked, so nothing that was being written is refused. Type inference and the
+  compatibility rule are each written once, and the writer they have to agree with is the single
+  function above. Batch size still decides *where* validation runs — inline up to 64 documents,
+  fanned out over rayon above that — which was the only difference worth keeping.
 
 - **A shadow field only worked alone.** It is the document key under the source's own name, and
   only the bare `sha256:VALUE` lookup ever resolved: named inside a larger query the clause was
@@ -191,13 +273,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A declared `id` type contradicted the key the index builds.** The index builder skips `id` and
   creates the key itself — raw-tokenized, stored, never fast, whatever the schema declared — but
   enrichment pinned only the indexed, stored and tokenizer flags. The declared type and `fast`
-  survived, and three readers trusted them: `_config` reported the declaration, the slow write
-  validation compared it against the `Text` it infers for a key, and a sort merge built its key
-  from it.
+  survived, and three readers trusted them: `_config` reported the declaration, write validation
+  compared it against the `Text` it infers for a key, and a sort merge built its key from it.
 
-  An index declaring `id` as `i64` therefore refused every document of a batch large enough to
-  take the slow path — 1200 sent, 1200 rejected against a type the index does not use. One
-  declaring it `date` answered an ascending sort with `k20, k30, k10`, because the merge key
+  An index declaring `id` as `i64` therefore refused every document written to it — 1200 sent,
+  1200 rejected against a type the index does not use. One declaring it `date` answered an
+  ascending sort with `k20, k30, k10`, because the merge key
   parsed each identifier as a date, got nothing, and sorted every hit last. Neither reported an
   error. `_config` also showed `fast: true` next to `sortable: false`, the mismatch `can_be_fast`
   already settles for the types that carry no column. Enrichment now pins the type and `fast`
@@ -218,9 +299,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already committed, and failing an index open over one field of one document serves nobody.
 
 - **A malformed document answered `500 Internal server error`.** Every document-validation
-  refusal — a missing inner `id`, a value the declared type cannot hold — is the caller's fault,
-  and `500` is both wrong about that and an instruction to retry a request that cannot succeed.
-  They are now `400`s naming the field.
+  refusal — a value the declared type cannot hold, a body contradicting the key it was written
+  under — is the caller's fault, and `500` is both wrong about that and an instruction to retry a
+  request that cannot succeed. They are now `400`s naming the field.
 
   Two things were in the way. The write handlers classified errors by text rather than through
   `AppError::from_route`, and `io::ErrorKind::InvalidData` — which every one of those refusals
