@@ -37,14 +37,6 @@ impl AppError {
         }
     }
 
-    /// 413 with an explicit, client-safe message.
-    pub fn payload_too_large(msg: impl Into<String>) -> Self {
-        Self {
-            error: anyhow::anyhow!("{}", msg.into()),
-            status: Some(StatusCode::PAYLOAD_TOO_LARGE),
-        }
-    }
-
     /// Classify an error the routing layer returned.
     ///
     /// Some of what routing refuses is the caller's fault rather than the node's — a sort on a

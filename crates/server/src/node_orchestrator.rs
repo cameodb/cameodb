@@ -135,6 +135,49 @@ fn split_document_reason(error: &str) -> Option<(usize, &str)> {
     Some((position.parse().ok()?, reason))
 }
 
+/// Restate reasons numbered against one batch in the numbering its caller used.
+///
+/// Whoever answered a batch numbered its reasons against the batch *it* received, which is not
+/// the numbering the caller counts in: a peer answers about the slice forwarded to it, and a
+/// micro-batch of an NDJSON stream answers about five hundred documents out of a file. A
+/// position from the wrong numbering is worse than none, because it names a real item that is
+/// fine.
+///
+/// Exactly `unwritten` reasons come back, which is what makes the answer addable — written plus
+/// reasons is what was received. Reasons that name no item are attached to items they cost
+/// rather than reported beside them, and a shortfall nobody explained is stated by
+/// `unattributed` rather than left for the caller to find by subtracting.
+pub(crate) fn renumber_reasons(
+    reasons: &[String],
+    positions: &[usize],
+    label: &str,
+    unwritten: usize,
+    attribution: &str,
+    unaccounted: impl Fn() -> String,
+) -> Vec<String> {
+    let mut renumbered = Vec::with_capacity(unwritten);
+
+    for reason in reasons {
+        if renumbered.len() == unwritten {
+            break;
+        }
+        match split_document_reason(reason) {
+            Some((theirs, why)) if theirs < positions.len() => {
+                renumbered.push(format!("{label} {}: {why}", positions[theirs]));
+            }
+            // Not about one item, or numbered against a batch this is not: kept as what was
+            // said, against an item it cost.
+            _ => renumbered.push(format!("{attribution}: {reason}")),
+        }
+    }
+
+    while renumbered.len() < unwritten {
+        renumbered.push(unaccounted());
+    }
+
+    renumbered
+}
+
 /// What a peer's answer means for the documents this node forwarded to it.
 ///
 /// One reason per document the peer did not write, which is what keeps the coordinating node's
@@ -156,33 +199,21 @@ fn remote_rejections(
     written: usize,
     reasons: &[String],
 ) -> Vec<String> {
-    let unwritten = positions.len().saturating_sub(written);
-    let mut rejections = Vec::with_capacity(unwritten);
-
-    for reason in reasons {
-        if rejections.len() == unwritten {
-            break;
-        }
-        match split_document_reason(reason) {
-            Some((theirs, why)) if theirs < positions.len() => {
-                rejections.push(format!("document {}: {why}", positions[theirs]));
-            }
-            // Not about one document, or numbered against a batch this is not: kept as what the
-            // node said, against a document it did not write.
-            _ => rejections.push(format!("node {node_id}: {reason}")),
-        }
-    }
-
-    while rejections.len() < unwritten {
-        rejections.push(format!(
-            "a document forwarded to node {node_id} was neither written nor refused: it reported \
-             {written} written of {} with {} reasons",
-            positions.len(),
-            reasons.len()
-        ));
-    }
-
-    rejections
+    renumber_reasons(
+        reasons,
+        positions,
+        "document",
+        positions.len().saturating_sub(written),
+        &format!("node {node_id}"),
+        || {
+            format!(
+                "a document forwarded to node {node_id} was neither written nor refused: it \
+                 reported {written} written of {} with {} reasons",
+                positions.len(),
+                reasons.len()
+            )
+        },
+    )
 }
 
 /// A document on its way to a shard, still carrying where it sat in the batch that arrived.

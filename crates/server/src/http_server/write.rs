@@ -199,11 +199,20 @@ pub(super) async fn bulk_write_handler(
 
 /// Handler for streaming document write operations (NDJSON input)
 ///
-/// Reads the request body incrementally, splitting on newlines to decode
-/// `DocPayload` items one at a time. Documents are accumulated into
-/// micro-batches of `stream_batch_size` and each batch is dispatched
-/// through the normal routing path as a `BulkWrite`. This keeps peak
-/// memory bounded regardless of total import size.
+/// Reads the request body incrementally, splitting on newlines to decode `DocPayload` items one
+/// at a time. Documents are accumulated into micro-batches of `stream_batch_size` and each batch
+/// is dispatched through the normal routing path as a `BulkWrite`. This keeps peak memory bounded
+/// regardless of total import size.
+///
+/// **A bad line is reported, not fatal.** Micro-batches commit as the body is read, so a request
+/// that aborts partway has already written documents it will not account for — the caller is left
+/// with a `400`, no counts, and no way to know where to resume. So a line that will not parse, or
+/// that is larger than one record may be, is answered like any other refusal: a reason naming the
+/// line, and the rest of the file still loaded. `_bulk` has always answered this way.
+///
+/// Lines are counted as they appear in the file, blanks included, so `line 41` is the line an
+/// operator finds at `sed -n 41p`. Every reason names one, and `items_written` plus the reasons
+/// is the number of documents the body held.
 pub(super) async fn write_stream_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
@@ -212,111 +221,154 @@ pub(super) async fn write_stream_handler(
     info!("Write stream request - index: {}", index);
 
     let batch_size = state.stream_batch_size.max(1);
-
-    // Aggregate counters across all micro-batches
-    let mut total_items_written: u64 = 0;
-    let mut total_errors: Vec<String> = Vec::new();
-    let mut total_line_count: usize = 0;
-    let mut batches_dispatched: usize = 0;
-
-    // Buffer for incomplete trailing line across body chunks
-    let mut buf = BytesMut::new();
-    // Current micro-batch accumulator
-    let mut batch: Vec<DocPayload> = Vec::with_capacity(batch_size);
-
-    let mut body_stream = body.into_data_stream();
     let max_record_size_bytes = state.max_record_size_bytes;
 
-    while let Some(chunk_result) = body_stream.next().await {
-        let chunk = chunk_result.map_err(|e| {
-            AppError::bad_request(format!("Failed to read request body chunk: {}", e))
-        })?;
+    let mut written: u64 = 0;
+    let mut errors: Vec<String> = Vec::new();
+    // Non-blank lines: the documents the body offered, whether or not any of them parsed.
+    let mut documents: usize = 0;
+    let mut unparseable: usize = 0;
+    let mut batches: usize = 0;
+    // Physical lines, so a reason names what the caller can go and look at.
+    let mut line_number: usize = 0;
 
+    let mut buf = BytesMut::new();
+    let mut batch: Vec<(usize, DocPayload)> = Vec::with_capacity(batch_size);
+    // Set when a line has outgrown the record limit: its bytes keep arriving after it has been
+    // refused, and they are dropped until the newline that ends it.
+    let mut discarding = false;
+
+    let mut body_stream = body.into_data_stream();
+
+    while let Some(chunk) = body_stream.next().await {
+        // The body itself failed, so there is no answer to give: what was written cannot be
+        // reported to a caller whose request did not finish arriving.
+        let chunk = chunk.map_err(|e| {
+            AppError::bad_request(format!("Failed to read request body chunk: {e}"))
+        })?;
         buf.extend_from_slice(&chunk);
 
-        // A line only leaves `buf` when its newline arrives, so an unterminated line would
-        // otherwise buffer the entire request allowance before any limit was consulted.
-        // Rejecting here keeps peak memory bounded by the record size, not the body size.
-        if buf.len() > max_record_size_bytes {
-            return Err(AppError::payload_too_large(format!(
-                "document on line {} exceeds the {} MB single-record limit",
-                total_line_count + 1,
-                max_record_size_bytes / (1024 * 1024)
-            )));
-        }
+        loop {
+            let newline = buf.iter().position(|&b| b == b'\n');
 
-        // Process all complete lines in the buffer
-        while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
-            let line = buf.split_to(newline_pos + 1);
-            let line = &line[..line.len() - 1]; // trim trailing newline
+            if discarding {
+                match newline {
+                    Some(at) => {
+                        let _ = buf.split_to(at + 1);
+                        discarding = false;
+                    }
+                    None => {
+                        buf.clear();
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            let Some(at) = newline else {
+                // What is left is one unterminated line. Checked only now, after every complete
+                // line has been taken out: several ordinary lines in the buffer at once are not
+                // one oversized one, and measuring the buffer before draining it called them
+                // that.
+                if buf.len() > max_record_size_bytes {
+                    line_number += 1;
+                    documents += 1;
+                    errors.push(format!(
+                        "line {line_number}: exceeds the {} MB single-record limit",
+                        max_record_size_bytes / (1024 * 1024)
+                    ));
+                    buf.clear();
+                    discarding = true;
+                    continue;
+                }
+                break;
+            };
+
+            let line = buf.split_to(at + 1);
+            let line = &line[..line.len() - 1];
+            line_number += 1;
             if line.is_empty() {
                 continue;
             }
 
-            total_line_count += 1;
-            let doc_payload: DocPayload = serde_json::from_slice(line).map_err(|e| {
-                AppError::bad_request(format!(
-                    "Failed to parse document on line {}: {}",
-                    total_line_count, e
-                ))
-            })?;
-            batch.push(doc_payload);
+            documents += 1;
+            match serde_json::from_slice::<DocPayload>(line) {
+                Ok(doc) => batch.push((line_number, doc)),
+                Err(e) => {
+                    unparseable += 1;
+                    errors.push(format!("line {line_number}: {e}"));
+                }
+            }
 
-            // Flush the micro-batch when it reaches the configured size
             if batch.len() >= batch_size {
-                let flush_result = flush_write_batch(
-                    &state,
-                    &index,
-                    std::mem::replace(&mut batch, Vec::with_capacity(batch_size)),
-                )
-                .await;
-                batches_dispatched += 1;
-                accumulate_batch_result(flush_result, &mut total_items_written, &mut total_errors);
+                let flushed = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
+                let (batch_written, batch_errors) = flush_lines(&state, &index, flushed).await;
+                batches += 1;
+                written += batch_written;
+                errors.extend(batch_errors);
             }
         }
     }
 
-    // Handle any remaining data after the last newline (trailing line without \n)
-    if !buf.is_empty() {
+    // A trailing line with no newline of its own. One that outgrew the limit was already refused
+    // above, when the buffer passed it.
+    if !discarding && !buf.is_empty() {
+        line_number += 1;
+        documents += 1;
         let line = buf.freeze();
-        if !line.is_empty() {
-            total_line_count += 1;
-            let doc_payload: DocPayload = serde_json::from_slice(&line).map_err(|e| {
-                AppError::bad_request(format!(
-                    "Failed to parse document on line {}: {}",
-                    total_line_count, e
-                ))
-            })?;
-            batch.push(doc_payload);
+        match serde_json::from_slice::<DocPayload>(&line) {
+            Ok(doc) => batch.push((line_number, doc)),
+            Err(e) => {
+                unparseable += 1;
+                errors.push(format!("line {line_number}: {e}"));
+            }
         }
     }
 
-    // Flush any remaining documents in the final micro-batch
     if !batch.is_empty() {
-        let flush_result = flush_write_batch(&state, &index, batch).await;
-        batches_dispatched += 1;
-        accumulate_batch_result(flush_result, &mut total_items_written, &mut total_errors);
+        let (batch_written, batch_errors) = flush_lines(&state, &index, batch).await;
+        batches += 1;
+        written += batch_written;
+        errors.extend(batch_errors);
     }
 
-    if total_line_count == 0 {
+    if documents == 0 {
         return Err(AppError::bad_request("No documents found in request body"));
     }
+
+    // Nothing written and nothing that even parsed: this body was not NDJSON. Reporting a line
+    // at a time would answer 200 to a request that was the wrong shape entirely, which is the
+    // one thing a caller cannot tell from a partial success.
+    if written == 0 && unparseable == documents {
+        return Err(AppError::bad_request(format!(
+            "no line of the body parsed as a document; the first was: {}",
+            errors.first().map(String::as_str).unwrap_or("unknown")
+        )));
+    }
+
+    // Every document the body held is written or explained, the same arithmetic `_bulk` answers
+    // with. A path that stops accounting is a test failure here rather than a silent shortfall.
+    debug_assert_eq!(
+        written as usize + errors.len(),
+        documents,
+        "a write stream must account for every document its body held"
+    );
 
     info!(
         "Write stream completed - index: {}, lines: {}, batches: {}, written: {}, errors: {}",
         index,
-        total_line_count,
-        batches_dispatched,
-        total_items_written,
-        total_errors.len()
+        documents,
+        batches,
+        written,
+        errors.len()
     );
 
     let result = serde_json::json!({
-        "status": if total_errors.is_empty() { "ok" } else { "partial" },
-        "items_written": total_items_written,
-        "lines_received": total_line_count,
-        "batches": batches_dispatched,
-        "errors": total_errors,
+        "status": if errors.is_empty() { "ok" } else { "partial" },
+        "items_written": written,
+        "lines_received": documents,
+        "batches": batches,
+        "errors": errors,
     });
 
     let bytes = serde_json::to_vec(&result).map_err(|e| {
@@ -332,6 +384,59 @@ pub(super) async fn write_stream_handler(
         HeaderValue::from_static("application/json"),
     );
     Ok(resp)
+}
+
+/// Dispatch one micro-batch and report its answer in the file's own line numbers.
+///
+/// The engine numbers its reasons against the batch it was handed — `document 3` of five hundred
+/// — which says nothing to someone holding the file. Renumbered here, by the same function the
+/// bulk path uses to renumber a peer's reasons, so `line 1503` is the line to go and fix.
+async fn flush_lines(
+    state: &AppState,
+    index: &str,
+    batch: Vec<(usize, DocPayload)>,
+) -> (u64, Vec<String>) {
+    let lines: Vec<usize> = batch.iter().map(|(line, _)| *line).collect();
+    let docs: Vec<DocPayload> = batch.into_iter().map(|(_, doc)| doc).collect();
+
+    match flush_write_batch(state, index, docs).await {
+        Ok(answer) => {
+            let written = answer
+                .get("items_written")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .min(lines.len() as u64);
+            let reasons: Vec<String> = answer
+                .get("errors")
+                .and_then(|v| v.as_array())
+                .map(|errors| {
+                    errors
+                        .iter()
+                        .filter_map(|e| e.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let unwritten = lines.len() - written as usize;
+            let renumbered = crate::node_orchestrator::renumber_reasons(
+                &reasons,
+                &lines,
+                "line",
+                unwritten,
+                "batch",
+                || "a document in this batch was neither written nor refused".to_string(),
+            );
+            (written, renumbered)
+        }
+        // The batch never got an answer, so none of it was written.
+        Err(e) => (
+            0,
+            lines
+                .into_iter()
+                .map(|line| format!("line {line}: dispatching this batch failed: {e}"))
+                .collect(),
+        ),
+    }
 }
 
 /// Derive a routing hint from the first document in a batch.
@@ -364,29 +469,4 @@ pub(super) async fn flush_write_batch(
         .router
         .route_and_handle(client_op, routing_hint, OperationType::Write)
         .await
-}
-
-/// Accumulate items_written and errors from a micro-batch result into totals.
-fn accumulate_batch_result(
-    result: Result<JsonValue, crate::node_orchestrator::OrchestratorError>,
-    total_items_written: &mut u64,
-    total_errors: &mut Vec<String>,
-) {
-    match result {
-        Ok(val) => {
-            if let Some(written) = val.get("items_written").and_then(|v| v.as_u64()) {
-                *total_items_written += written;
-            }
-            if let Some(errs) = val.get("errors").and_then(|v| v.as_array()) {
-                for err in errs {
-                    if let Some(msg) = err.as_str() {
-                        total_errors.push(msg.to_string());
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            total_errors.push(format!("Batch dispatch failed: {}", e));
-        }
-    }
 }
