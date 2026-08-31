@@ -558,8 +558,10 @@ async fn main() -> Result<()> {
     println!("  POST /api/{{index}}/search - Standard search");
     println!("  POST /api/{{index}}/search/stream - Streaming search");
     println!("  PUT  /api/{{index}}/document - Write document");
+    println!("  DELETE /api/{{index}}/document - Delete document");
     println!("  POST /api/{{index}}/document/stream - Streaming write");
     println!("  POST /api/{{index}}/_bulk - Bulk write documents");
+    println!("  POST /api/{{index}}/_bulk/delete - Bulk delete documents");
     println!("  PUT  /api/{{index}}/_config - Create/update index schema");
     println!("  GET  /api/{{index}}/_config - Retrieve index schema");
     println!("  PATCH /api/{{index}}/_schema - Update index schema");
