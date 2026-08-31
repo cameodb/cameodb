@@ -1931,7 +1931,7 @@ async fn one_query_asked_repeatedly_gives_one_answer() {
 async fn a_response_past_the_byte_ceiling_is_trimmed_and_says_so() {
     let node = TestNode::start_with(
         r#"
-[security.limits]
+[limits]
 max_response_bytes = 900
 "#,
     )

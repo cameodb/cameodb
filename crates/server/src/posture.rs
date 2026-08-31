@@ -447,14 +447,14 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
     // — the defaults land exactly on the external ceiling and pass it while allowing eight
     // times the memory budget. A warning, not a failure: reaching it takes every admitted
     // request carrying a full body at once, so a node sized for it is legitimate.
-    let memory_budget_mb = config.search.total_memory_limit_mb;
+    let memory_budget_mb = config.limits.total_memory_limit_mb;
     push(
         "limits",
         if worst_case_mb > ceiling_mb {
             Outcome::Fail(format!(
                 "max_concurrent_requests ({}) × body limit ({} MB) allows {} MB of in-flight \
                  request data, over the {} MB ceiling for profile '{}'. Lower \
-                 max_concurrent_requests or max_record_size_mb",
+                 network.http.max_concurrent_requests or limits.max_record_size_mb",
                 http.max_concurrent_requests,
                 config.effective_max_body_size_mb(),
                 worst_case_mb,
@@ -464,8 +464,9 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
         } else if profile != Profile::Local && worst_case_mb > memory_budget_mb {
             Outcome::Warn(format!(
                 "max_concurrent_requests ({}) × body limit ({} MB) allows {} MB of in-flight \
-                 request data, over this node's total_memory_limit_mb ({} MB). Lower \
-                 max_concurrent_requests or max_record_size_mb, or raise the memory limit",
+                 request data, over this node's limits.total_memory_limit_mb ({} MB). \
+                 Lower network.http.max_concurrent_requests or limits.max_record_size_mb, or \
+                 raise the memory limit",
                 http.max_concurrent_requests,
                 config.effective_max_body_size_mb(),
                 worst_case_mb,
@@ -793,7 +794,7 @@ mod tests {
         let mut c = config_for(Some(Profile::Internal), "0.0.0.0");
         c.network.http.cors_allowed_origins = vec![];
         // 128 × (512 + 64) MB = 73 728 MB, past the 64 GB internal ceiling.
-        c.max_record_size_mb = 512;
+        c.limits.max_record_size_mb = 512;
         c.network.http.max_concurrent_requests = 128;
         let limits = evaluate(&c)
             .unwrap()
@@ -819,9 +820,9 @@ mod tests {
         let mut c = config_for(Some(Profile::Internal), "0.0.0.0");
         c.network.http.cors_allowed_origins = vec![];
         // 128 × (128 + 64) MB = 24 576 MB: under the 64 GB ceiling, over the memory budget.
-        c.max_record_size_mb = 128;
+        c.limits.max_record_size_mb = 128;
         c.network.http.max_concurrent_requests = 128;
-        c.search.total_memory_limit_mb = 2048;
+        c.limits.total_memory_limit_mb = 2048;
         let internal = limits(&c);
         assert!(matches!(internal, Outcome::Warn(_)), "{:?}", internal);
         assert!(internal.message().contains("2048 MB"), "{:?}", internal);

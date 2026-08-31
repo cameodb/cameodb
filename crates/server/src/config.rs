@@ -114,12 +114,12 @@ const OVERRIDES: &[Override] = &[
     Override {
         flag: "--max-record-size-mb", env: "CAMEODB_MAX_RECORD_SIZE_MB", kind: FlagKind::Value,
         placeholder: "<MB>", help: "Largest accepted record; derives body and message limits",
-        apply: |c, v| { c.max_record_size_mb = v.parse()?; Ok(()) },
+        apply: |c, v| { c.limits.max_record_size_mb = v.parse()?; Ok(()) },
     },
     Override {
         flag: "--max-body-size-mb", env: "CAMEODB_MAX_BODY_SIZE_MB", kind: FlagKind::Value,
         placeholder: "<MB>", help: "HTTP body limit (defaults to derived from record size)",
-        apply: |c, v| { c.network.http.max_body_size_mb = v.parse()?; Ok(()) },
+        apply: |c, v| { c.limits.max_body_size_mb = v.parse()?; Ok(()) },
     },
     Override {
         flag: "--max-concurrent-requests", env: "CAMEODB_MAX_CONCURRENT_REQUESTS", kind: FlagKind::Value,
@@ -154,7 +154,7 @@ const OVERRIDES: &[Override] = &[
     Override {
         flag: "--total-memory-limit-mb", env: "CAMEODB_TOTAL_MEMORY_LIMIT_MB", kind: FlagKind::Value,
         placeholder: "<MB>", help: "Memory budget shared by all indices on this node",
-        apply: |c, v| { c.search.total_memory_limit_mb = v.parse()?; Ok(()) },
+        apply: |c, v| { c.limits.total_memory_limit_mb = v.parse()?; Ok(()) },
     },
     Override {
         flag: "--memory-pressure-threshold-percent", env: "CAMEODB_MEMORY_PRESSURE_THRESHOLD_PERCENT", kind: FlagKind::Value,
@@ -369,6 +369,18 @@ fn unrecognized_keys(content: &str) -> Vec<String> {
     unknown
 }
 
+/// Report where a setting moved to, and whether the value there was taken from it.
+fn moved(file: &str, old: &str, new: &str, applied: bool, value: &dyn std::fmt::Display) {
+    if applied {
+        warn!(
+            "{file}: {old} has moved to limits.{new}; applying {value}. \
+             Move it before 0.4.0, when the old spelling goes."
+        );
+    } else {
+        warn!("{file}: {old} has moved to limits.{new}, which is already set; old key ignored.");
+    }
+}
+
 /// Settings a config file may set that no serialization can contain, and which therefore
 /// cannot appear in the schema above.
 ///
@@ -445,9 +457,9 @@ impl StorageConfig {
 /// Every struct in this module carries a container-level `#[serde(default)]`, so a config
 /// file may contain as much or as little as it wants: name only the settings you are
 /// changing, and everything else — whole sections included — comes from [`Default`]. Each
-/// `Default` impl is built from the same `default_*()` functions the per-field
+/// Every section carries its own `Default`, built from the same `default_*()` functions its
 /// `#[serde(default = "...")]` attributes use, so the two can never disagree about a value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CameoDbConfig {
     /// Node-level configuration (sharding, identity)
@@ -466,20 +478,73 @@ pub struct CameoDbConfig {
     #[serde(default)]
     pub security: crate::auth::SecurityConfig,
 
-    /// Maximum single-record size in MB (default: 64).
+    /// How large a thing may get on this node: `[limits]`.
+    #[serde(default)]
+    pub limits: LimitsConfig,
+
+    /// Moved to `[limits] max_record_size_mb`. Read from here until 0.4.0.
+    #[serde(default)]
+    pub max_record_size_mb: Option<usize>,
+}
+
+/// What this node accepts and holds, as opposed to what a caller may ask for.
+///
+/// The size ceilings live together because they are one chain rather than four settings:
+/// `max_record_size_mb` is the source of truth and the rest derive from it unless an operator
+/// says otherwise.
+///
+/// | Derived limit                     | Formula                                     |
+/// |-----------------------------------|---------------------------------------------|
+/// | HTTP max body size                | `max_record_size_mb + 64` MB (overhead)     |
+/// | Kameo remote request/response max | `max_record_size_mb * 1.25` (25 % headroom) |
+/// | HTTP request timeout              | `max(60, max_record_size_mb / 10)` seconds  |
+/// | Largest MCP search response       | the HTTP max body size — what is accepted in one message is what is sent in one |
+///
+/// `[security.limits]` is the other half of the question and deliberately separate: it bounds
+/// what one caller may ask of the node, where this bounds what the node can do at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Largest single record, in MB (default: 64).
     ///
-    /// This is the **single source of truth** for record size limits across
-    /// the entire system. On startup the following dependent limits are
-    /// derived automatically:
-    ///
-    /// | Derived limit                       | Formula                          |
-    /// |-------------------------------------|----------------------------------|
-    /// | HTTP max body size                   | `max_record_size_mb + 64` MB (overhead) |
-    /// | Kameo remote request/response max    | `max_record_size_mb * 1.25` (25 % headroom) |
-    /// | HTTP request timeout                 | `max(60, max_record_size_mb / 10)` seconds |
-    /// | Largest MCP search response          | the HTTP max body size — what is accepted in one message is what is sent in one |
+    /// The single source of truth for message size: the table above derives from it, so raising
+    /// it for large documents moves every dependent limit with it.
     #[serde(default = "default_max_record_size_mb")]
     pub max_record_size_mb: usize,
+
+    /// HTTP request body ceiling, in MB. `0` derives it from `max_record_size_mb`.
+    #[serde(default)]
+    pub max_body_size_mb: usize,
+
+    /// Largest MCP search response, in bytes. Unset follows the HTTP body ceiling.
+    ///
+    /// A search well inside `security.limits.max_search_limit` can still be more bytes than
+    /// this node carries in one message. Past this the hits that do not fit are left out and the
+    /// response says so, carrying `_truncated`, `_omitted_hits` and advice to narrow the query.
+    /// Set it only to go *below* the message size, which is worth doing when the callers are
+    /// agents whose context is smaller than what the node can send.
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+
+    /// The node's memory budget, in MB (default: 2048).
+    ///
+    /// Sizes the indexer pool and is what `max_body_size_mb × max_concurrent_requests` is
+    /// weighed against at startup: in-flight request bodies are held in memory, so a body
+    /// ceiling and a concurrency limit that multiply past this are a way to run the node out of
+    /// memory from outside.
+    #[serde(default = "default_total_memory_limit_mb")]
+    pub total_memory_limit_mb: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_record_size_mb: default_max_record_size_mb(),
+            max_body_size_mb: 0,
+            max_response_bytes: None,
+            total_memory_limit_mb: default_total_memory_limit_mb(),
+        }
+    }
 }
 
 /// Network configuration wrapper
@@ -510,13 +575,6 @@ pub struct HttpConfig {
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
 
-    /// Maximum request body size in MB.
-    ///
-    /// When omitted (or 0) the effective value is derived from the top-level
-    /// `max_record_size_mb` setting.  Set explicitly only to override.
-    #[serde(default)]
-    pub max_body_size_mb: usize,
-
     /// CORS allowed origins (default: ["*"])
     #[serde(default = "default_cors_allowed_origins")]
     pub cors_allowed_origins: Vec<String>,
@@ -540,6 +598,10 @@ pub struct HttpConfig {
     /// When enabled, server will use HTTPS instead of HTTP
     #[serde(default)]
     pub tls: TlsConfig,
+
+    /// Moved to `[limits] max_body_size_mb`. Read from here until 0.4.0.
+    #[serde(default)]
+    pub max_body_size_mb: Option<usize>,
 }
 
 /// TLS configuration for HTTPS
@@ -765,10 +827,6 @@ pub struct SearchConfig {
     #[serde(default = "default_indexer_memory_max_mb")]
     pub indexer_memory_max_mb: usize,
 
-    /// Total memory limit in MB (default: 2048)
-    #[serde(default = "default_total_memory_limit_mb")]
-    pub total_memory_limit_mb: usize,
-
     /// Memory pressure threshold in percent (0-100, default: 80)
     #[serde(default = "default_memory_pressure_threshold_percent")]
     pub memory_pressure_threshold_percent: u8,
@@ -837,19 +895,23 @@ pub struct SearchConfig {
     /// open, not with shard count. Scale up on nodes with ample RAM and few indices.
     #[serde(default = "default_merge_num_threads")]
     pub merge_num_threads: usize,
+
+    /// Moved to `[limits] total_memory_limit_mb`. Read from here until 0.4.0.
+    #[serde(default)]
+    pub total_memory_limit_mb: Option<usize>,
 }
 
 impl CameoDbConfig {
     /// Effective HTTP max body size in MB.
     ///
-    /// If the user set `network.http.max_body_size_mb` explicitly (non-zero),
+    /// If the user set `limits.max_body_size_mb` explicitly (non-zero),
     /// that value wins.  Otherwise it is derived as `max_record_size_mb + 64`
     /// to leave headroom for JSON framing, bulk-write arrays, etc.
     pub fn effective_max_body_size_mb(&self) -> usize {
-        if self.network.http.max_body_size_mb > 0 {
-            self.network.http.max_body_size_mb
+        if self.limits.max_body_size_mb > 0 {
+            self.limits.max_body_size_mb
         } else {
-            self.max_record_size_mb + 64
+            self.limits.max_record_size_mb + 64
         }
     }
 
@@ -863,8 +925,7 @@ impl CameoDbConfig {
     /// `[security.limits] max_response_bytes` overrides it, and is worth setting when the
     /// callers are agents whose context is smaller than the node's message size.
     pub fn effective_max_response_bytes(&self) -> usize {
-        self.security
-            .limits
+        self.limits
             .max_response_bytes
             .unwrap_or_else(|| self.effective_max_body_size_mb() * 1024 * 1024)
     }
@@ -876,7 +937,7 @@ impl CameoDbConfig {
     /// headroom on top of the configured record size.
     pub fn effective_remote_message_size_bytes(&self) -> usize {
         // max_record_size_mb converted to bytes + 25 % overhead
-        let base = self.max_record_size_mb * 1024 * 1024;
+        let base = self.limits.max_record_size_mb * 1024 * 1024;
         base + base / 4
     }
 
@@ -890,7 +951,7 @@ impl CameoDbConfig {
             // User provided an explicit override – honour it.
             self.network.http.request_timeout_secs
         } else {
-            let scaled = (self.max_record_size_mb as u64) / 10;
+            let scaled = (self.limits.max_record_size_mb as u64) / 10;
             scaled.max(60)
         }
     }
@@ -1015,7 +1076,7 @@ impl CameoDbConfig {
     /// indistinguishable from an omitted one — it silently leaves the default in place. So
     /// every key that survived parsing without landing anywhere is reported.
     fn parse_config_content(content: &str, path: &str) -> Result<Self> {
-        let config: Self = if path.ends_with(".toml") {
+        let mut config: Self = if path.ends_with(".toml") {
             toml::from_str(content).with_context(|| "Failed to parse TOML configuration")?
         } else if path.ends_with(".yaml") || path.ends_with(".yml") {
             serde_saphyr::from_str(content).with_context(|| "Failed to parse YAML configuration")?
@@ -1026,11 +1087,77 @@ impl CameoDbConfig {
                 .with_context(|| "Failed to parse configuration (tried TOML and YAML)")?
         };
 
+        config.adopt_moved_settings(path);
+
         for key in unrecognized_keys(content) {
             warn!("Ignoring unknown setting in {}: {}", path, key);
         }
 
         Ok(config)
+    }
+
+    /// Fold the pre-`[limits]` spellings into `[limits]`, naming where each one went.
+    ///
+    /// The four ceilings were scattered across three tables and the file root before they
+    /// were grouped, and an operator's file outlives a release. Each old key is still read
+    /// and applied, so an upgrade changes nothing until the file is edited, and each one
+    /// warns, so the edit is not deferred forever. They go in 0.4.0.
+    ///
+    /// `[limits]` wins where it says anything: an old key is adopted only when its
+    /// counterpart is still at the default, which is the closest thing to "the operator did
+    /// not set it" that survives both TOML and YAML.
+    fn adopt_moved_settings(&mut self, path: &str) {
+        let defaults = LimitsConfig::default();
+
+        if let Some(mb) = self.max_record_size_mb.take() {
+            let free = self.limits.max_record_size_mb == defaults.max_record_size_mb;
+            if free {
+                self.limits.max_record_size_mb = mb;
+            }
+            moved(path, "max_record_size_mb", "max_record_size_mb", free, &mb);
+        }
+
+        if let Some(mb) = self.network.http.max_body_size_mb.take() {
+            let free = self.limits.max_body_size_mb == defaults.max_body_size_mb;
+            if free {
+                self.limits.max_body_size_mb = mb;
+            }
+            moved(
+                path,
+                "network.http.max_body_size_mb",
+                "max_body_size_mb",
+                free,
+                &mb,
+            );
+        }
+
+        if let Some(mb) = self.search.total_memory_limit_mb.take() {
+            let free = self.limits.total_memory_limit_mb == defaults.total_memory_limit_mb;
+            if free {
+                self.limits.total_memory_limit_mb = mb;
+            }
+            moved(
+                path,
+                "search.total_memory_limit_mb",
+                "total_memory_limit_mb",
+                free,
+                &mb,
+            );
+        }
+
+        if let Some(bytes) = self.security.limits.max_response_bytes.take() {
+            let free = self.limits.max_response_bytes.is_none();
+            if free {
+                self.limits.max_response_bytes = Some(bytes);
+            }
+            moved(
+                path,
+                "security.limits.max_response_bytes",
+                "max_response_bytes",
+                free,
+                &bytes,
+            );
+        }
     }
 
     /// Apply the environment and then the command line over `config`.
@@ -1083,10 +1210,10 @@ impl CameoDbConfig {
 
         // Nothing fits in zero bytes, and one hit always survives the trim — so a ceiling of
         // zero would not refuse a response, it would just describe every response as truncated.
-        if self.security.limits.max_response_bytes == Some(0) {
+        if self.limits.max_response_bytes == Some(0) {
             return Err(ConfigError::SecurityConfig {
-                message: "security.limits.max_response_bytes is 0, which would report every \
-                          response as truncated; set the largest response a search may return"
+                message: "limits.max_response_bytes is 0, which would report every response as \
+                          truncated; set the largest response a search may return"
                     .to_string(),
             }
             .into());
@@ -1159,9 +1286,9 @@ impl CameoDbConfig {
         }
 
         // Validate record size limit
-        if self.max_record_size_mb == 0 {
+        if self.limits.max_record_size_mb == 0 {
             return Err(ConfigError::NetworkConfig {
-                message: "max_record_size_mb must be positive".to_string(),
+                message: "limits.max_record_size_mb must be positive".to_string(),
             }
             .into());
         }
@@ -1282,7 +1409,7 @@ impl CameoDbConfig {
             .into());
         }
 
-        if self.search.total_memory_limit_mb < self.search.indexer_memory_max_mb {
+        if self.limits.total_memory_limit_mb < self.search.indexer_memory_max_mb {
             return Err(ConfigError::MemoryConfig {
                 message: "Total memory limit must be at least as large as max indexer memory"
                     .to_string(),
@@ -1349,30 +1476,17 @@ impl CameoDbConfig {
     }
 }
 
-impl Default for CameoDbConfig {
-    fn default() -> Self {
-        Self {
-            node: NodeConfig::default(),
-            network: NetworkConfig::default(),
-            storage: StorageConfig::default(),
-            search: SearchConfig::default(),
-            security: crate::auth::SecurityConfig::default(),
-            max_record_size_mb: default_max_record_size_mb(),
-        }
-    }
-}
-
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             bind_address: default_http_bind_address(),
             port: default_http_port(),
             request_timeout_secs: default_request_timeout(),
-            max_body_size_mb: 0, // derived from max_record_size_mb
             max_concurrent_requests: default_http_max_concurrent_requests(),
             cors_allowed_origins: default_cors_allowed_origins(),
             admin_enabled: default_admin_enabled(),
             tls: TlsConfig::default(),
+            max_body_size_mb: None,
         }
     }
 }
@@ -1409,7 +1523,6 @@ impl Default for SearchConfig {
         Self {
             indexer_memory_min_mb: default_indexer_memory_min_mb(),
             indexer_memory_max_mb: default_indexer_memory_max_mb(),
-            total_memory_limit_mb: default_total_memory_limit_mb(),
             memory_pressure_threshold_percent: default_memory_pressure_threshold_percent(),
             search_threads: default_search_threads(),
             enable_streaming_search: default_enable_streaming_search(),
@@ -1421,6 +1534,7 @@ impl Default for SearchConfig {
             stream_batch_size: default_stream_batch_size(),
             indexer_num_threads: default_indexer_num_threads(),
             merge_num_threads: default_merge_num_threads(),
+            total_memory_limit_mb: None,
         }
     }
 }
@@ -1877,6 +1991,91 @@ mod tests {
         );
     }
 
+    /// The pre-`[limits]` file every existing deployment still has on disk. It must resolve
+    /// to exactly what the grouped spelling resolves to — an upgrade that quietly reverts a
+    /// 420MB record ceiling to 64 is a node that starts and then refuses the writes it was
+    /// configured for.
+    #[test]
+    fn the_pre_limits_spellings_are_adopted_into_limits() {
+        let old = CameoDbConfig::parse_config_content(
+            r#"
+max_record_size_mb = 420
+
+[network.http]
+max_body_size_mb = 512
+
+[search]
+total_memory_limit_mb = 96000
+
+[security.limits]
+max_response_bytes = 16777216
+"#,
+            "old.toml",
+        )
+        .expect("the old shape still parses");
+
+        assert_eq!(old.limits.max_record_size_mb, 420);
+        assert_eq!(old.limits.max_body_size_mb, 512);
+        assert_eq!(old.limits.total_memory_limit_mb, 96000);
+        assert_eq!(old.limits.max_response_bytes, Some(16777216));
+
+        // Consumed, so nothing downstream reads them and no dump writes them back out.
+        assert_eq!(old.max_record_size_mb, None);
+        assert_eq!(old.network.http.max_body_size_mb, None);
+        assert_eq!(old.search.total_memory_limit_mb, None);
+        assert_eq!(old.security.limits.max_response_bytes, None);
+    }
+
+    #[test]
+    fn limits_wins_where_both_spellings_are_present() {
+        let config = CameoDbConfig::parse_config_content(
+            r#"
+max_record_size_mb = 420
+
+[limits]
+max_record_size_mb = 128
+"#,
+            "both.toml",
+        )
+        .expect("parse");
+
+        assert_eq!(config.limits.max_record_size_mb, 128);
+    }
+
+    /// `[security.limits]` refuses unknown keys, so the moved setting has to be a field there
+    /// rather than something the unknown-key sweep can warn about: without it, an operator
+    /// upgrading with the old spelling gets a node that will not start.
+    #[test]
+    fn the_moved_mcp_response_ceiling_does_not_stop_the_node() {
+        let config = CameoDbConfig::parse_config_content(
+            "[security.limits]\nmax_search_limit = 10000\nmax_response_bytes = 900\n",
+            "old.toml",
+        )
+        .expect("the old shape still parses");
+
+        assert_eq!(config.limits.max_response_bytes, Some(900));
+        assert_eq!(config.security.limits.max_search_limit, 10000);
+    }
+
+    /// A moved setting is a known key, not a typo — the sweep must stay quiet about it, or
+    /// every upgraded deployment reads "Ignoring" next to a value that was in fact applied.
+    #[test]
+    fn the_moved_spellings_are_not_reported_as_unknown() {
+        let content = r#"
+max_record_size_mb = 420
+
+[network.http]
+max_body_size_mb = 512
+
+[search]
+total_memory_limit_mb = 96000
+
+[security.limits]
+max_response_bytes = 16777216
+"#;
+        assert_eq!(unrecognized_keys(content), Vec::<String>::new());
+    }
+
     /// Every config file this repository ships, relative to `crates/server`.
     const SHIPPED_CONFIGS: &[&str] = &[
         "cameodb.toml",
@@ -1959,7 +2158,7 @@ mod tests {
             vec![PathBuf::from("./data/cameodb")]
         );
         assert_eq!(config.search.indexer_memory_min_mb, 64);
-        assert_eq!(config.max_record_size_mb, 64);
+        assert_eq!(config.limits.max_record_size_mb, 64);
         assert!(config.validate().is_ok());
     }
 
@@ -2008,7 +2207,7 @@ mod tests {
         assert_eq!(config.search.indexer_memory_min_mb, 64);
         assert_eq!(config.search.indexer_memory_max_mb, 512);
         assert_eq!(config.storage.default_batch_size, 1000);
-        assert_eq!(config.max_record_size_mb, 64);
+        assert_eq!(config.limits.max_record_size_mb, 64);
         assert!(config.validate().is_ok());
     }
 
@@ -2109,11 +2308,8 @@ mod tests {
     #[test]
     fn a_response_ceiling_of_zero_is_refused() {
         let config = CameoDbConfig {
-            security: crate::auth::SecurityConfig {
-                limits: crate::ratelimit::McpLimitsConfig {
-                    max_response_bytes: Some(0),
-                    ..Default::default()
-                },
+            limits: LimitsConfig {
+                max_response_bytes: Some(0),
                 ..Default::default()
             },
             ..Default::default()
@@ -2157,7 +2353,10 @@ mod tests {
         );
 
         let larger = CameoDbConfig {
-            max_record_size_mb: 512,
+            limits: LimitsConfig {
+                max_record_size_mb: 512,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(
@@ -2172,11 +2371,8 @@ mod tests {
         // And an explicit setting wins, for callers whose context is smaller than the node's
         // message size.
         let capped = CameoDbConfig {
-            security: crate::auth::SecurityConfig {
-                limits: crate::ratelimit::McpLimitsConfig {
-                    max_response_bytes: Some(64 * 1024),
-                    ..Default::default()
-                },
+            limits: LimitsConfig {
+                max_response_bytes: Some(64 * 1024),
                 ..Default::default()
             },
             ..Default::default()
@@ -2217,7 +2413,10 @@ mod tests {
     #[test]
     fn test_derived_limits_large_record() {
         let config = CameoDbConfig {
-            max_record_size_mb: 2048,
+            limits: LimitsConfig {
+                max_record_size_mb: 2048,
+                ..Default::default()
+            },
             ..Default::default()
         };
         // HTTP body: 2048 + 64 = 2112
@@ -2234,7 +2433,7 @@ mod tests {
     #[test]
     fn test_explicit_body_size_override() {
         let mut config = CameoDbConfig::default();
-        config.network.http.max_body_size_mb = 100;
+        config.limits.max_body_size_mb = 100;
         // Explicit override wins
         assert_eq!(config.effective_max_body_size_mb(), 100);
     }
@@ -2250,7 +2449,10 @@ mod tests {
     #[test]
     fn test_zero_record_size_fails_validation() {
         let config = CameoDbConfig {
-            max_record_size_mb: 0,
+            limits: LimitsConfig {
+                max_record_size_mb: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(config.validate().is_err());

@@ -45,17 +45,11 @@ pub struct McpLimitsConfig {
     #[serde(default = "default_max_search_limit")]
     pub max_search_limit: usize,
 
-    /// The largest MCP search response, in bytes. Omitted, it follows the node's message size.
+    /// Moved to `[limits] max_response_bytes`. Read from here until 0.4.0.
     ///
-    /// A limit bounds how many hits come back, not how large they are: a search well inside
-    /// `max_search_limit` can still return far more bytes than the node is configured to carry
-    /// in one message. Past this the hits that do not fit are left out and the response says
-    /// so, carrying `_truncated`, `_omitted_hits` and advice to narrow the query.
-    ///
-    /// Left unset it derives from `max_record_size_mb`, the single source of truth for message
-    /// size — what a node accepts in one message is what it will send in one. Set it only to go
-    /// *below* that, which is worth doing when the callers are agents with small contexts;
-    /// raising the message size is how to go above it, and then every limit moves together.
+    /// Kept as a field rather than left to fall through as an unknown key, because this
+    /// section refuses unknown keys: an operator upgrading with the old spelling would not
+    /// get a warning, they would get a node that will not start.
     #[serde(default)]
     pub max_response_bytes: Option<usize>,
 }
