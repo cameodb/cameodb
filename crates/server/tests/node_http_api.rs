@@ -972,6 +972,9 @@ async fn a_value_the_declared_type_cannot_hold_is_a_bad_request() {
     // whole field, which is what made facets unwritable.
     for (field, value, expected) in [
         ("count", json!("not a number"), "expected I64"),
+        // A float has no place in an integer column: the writer reads `as_i64()` and would
+        // silently skip it, so the validator refuses rather than store an unindexed value.
+        ("count", json!(4.5), "expected I64"),
         ("cat", json!("no-slash"), "is not a facet path"),
         ("cat", json!(7), "expected Facet"),
     ] {

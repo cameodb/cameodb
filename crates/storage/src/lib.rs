@@ -2599,7 +2599,8 @@ impl IndexSchema {
 
     /// Add or evolve a field based on JSON value (schema evolution)
     /// New fields are added as non-indexed to avoid Tantivy schema rebuilds.
-    /// Existing fields can have their types evolved if compatible.
+    /// Existing non-indexed fields can have their types evolved if compatible; an indexed field's
+    /// type is pinned to the column the index built for it and never evolves here.
     pub fn evolve_field(&mut self, name: String, value: &JsonValue) -> bool {
         use std::collections::hash_map::Entry;
 
@@ -2629,6 +2630,15 @@ impl IndexSchema {
             Entry::Occupied(mut entry) => {
                 // Existing field - check if type evolution is needed
                 let current_def = entry.get();
+
+                // An indexed field's type is pinned to the column the index built for it.
+                // Evolving it would write the new type against the old column, and Tantivy
+                // silently skips a value that does not match the column — the document would be
+                // stored in redb and never indexed. A type change goes through a schema edit and
+                // a rebuild instead; the inline path never performs one.
+                if current_def.indexed {
+                    return false;
+                }
 
                 // Only evolve if the inferred type is "more specific" or compatible
                 if Self::should_evolve_field_static(current_def, inferred_type.clone()) {
@@ -4936,185 +4946,191 @@ impl HybridStore {
             WalOp::Delete { id } => id,
         });
 
-        // Evolve schema if new fields are present (declare outside transaction scope)
-        let mut evolved_schema = None;
-        // The id this write changed, moved out of the op by whichever arm ran, so the read cache
-        // can be invalidated once the transaction below has committed.
-        let touched_id: String;
+        match op {
+            WalOp::Put { id, json_blob } => {
+                // Get the schema before the transaction: evolution, shadow filtering and the
+                // Tantivy document all read it, and none of them needs the txn.
+                let schema = if let Some(schema) = self.get_schema_cached(index)? {
+                    schema
+                } else {
+                    tracing::debug!(index = %index, "Loading schema from metadata store");
+                    self.get_schema(index)?
+                        .map(Arc::new)
+                        .unwrap_or_else(|| Arc::new(IndexSchema::default()))
+                };
 
-        let mut write_txn = self.kv.begin_write()?;
-        {
-            // Set durability based on config (wal_sync flag is an intentional configuration decision)
-            let durability = if self.config.wal_sync {
-                Durability::Immediate
-            } else {
-                Durability::None
-            };
-            write_txn.set_durability(durability)?;
-            tracing::trace!(index = %index, durability = ?durability, "Data transaction durability set (user data)");
-
-            let mut wal_table = write_txn.open_table(wal_table_def)?;
-            wal_table.insert(seq_id, wal_data.as_slice())?;
-
-            // Apply to data table
-            match op {
-                WalOp::Put { id, json_blob } => {
-                    // Step 1: Get cached schema for field filtering and evolution
-                    // If not in cache, load from persisted metadata
-                    let schema = if let Some(schema) = self.get_schema_cached(index)? {
-                        schema
-                    } else {
-                        // Load from metadata if not in cache
-                        tracing::debug!(index = %index, "Loading schema from metadata store");
-                        self.get_schema(index)?
-                            .map(Arc::new)
-                            .unwrap_or_else(|| Arc::new(IndexSchema::default()))
-                    };
-
-                    if let Some(json_blob) = &json_blob {
+                // Evolve only when the document carries a field the schema has not seen. Cloning
+                // the whole schema on every write was the hot-path cost this removes; an indexed
+                // field's type is never changed here (see `evolve_field`).
+                let mut evolved_schema = None;
+                if let Some(blob) = &json_blob {
+                    let has_new_field = blob.as_object().is_some_and(|obj| {
+                        obj.keys().any(|name| !schema.fields.contains_key(name))
+                    });
+                    if has_new_field {
                         let mut schema_mut = (*schema).clone();
-                        let evolved_fields = schema_mut.evolve_from_document(json_blob);
+                        let evolved_fields = schema_mut.evolve_from_document(blob);
                         if !evolved_fields.is_empty() {
                             tracing::debug!(
                                 index = %index,
                                 evolved_fields = ?evolved_fields,
                                 "Evolved schema with new non-indexed fields (will persist in separate transaction)"
                             );
-                            // Store evolved schema for persistence after data transaction
                             evolved_schema = Some(schema_mut.clone());
-
-                            // Update cache immediately for subsequent reads
-                            let schema_arc = Arc::new(schema_mut);
-                            self.schema_cache.insert(index.to_string(), schema_arc);
-                            // Note: No need to invalidate fields cache since new fields are non-indexed
-                            // and won't affect Tantivy schema
+                            self.schema_cache
+                                .insert(index.to_string(), Arc::new(schema_mut));
                         }
                     }
+                }
 
-                    // OPTIMIZATION: Skip shadow filtering when no shadow fields exist (common case)
-                    let filtered_json_blob = if schema.has_shadow_fields() {
-                        json_blob
-                            .clone()
-                            .map(|blob| filter_shadow_fields_owned(blob, &schema))
-                    } else {
-                        json_blob.clone()
-                    };
-                    let doc_data = StoredDoc {
-                        json_blob: filtered_json_blob.as_ref(),
-                    };
-                    let doc_bytes = serde_json::to_vec(&doc_data)
-                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-                    let mut data_table = write_txn.open_table(data_table_def)?;
-
-                    // Check if document is new or updated by examining insert return value
-                    let old_value = data_table.insert(id.as_str(), doc_bytes.as_slice())?;
-                    let is_new_document = old_value.is_none();
-
-                    // Step 3: Build tantivy document with ONLY indexed fields
-                    let mut tantivy_doc = doc!(fields.id => id.as_str());
-                    if let Some(seq_field) = fields.seq {
-                        tantivy_doc.add_u64(seq_field, seq_id);
-                    }
-
-                    // Step 4: Single-pass JSON traversal — skip shadows + extract Tantivy fields
-                    if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
-                        for (field_name, field_value) in json_obj {
-                            // O(1) shadow field skip via pre-computed HashSet
-                            if schema.shadow_fields.contains(field_name) {
-                                continue;
-                            }
-
-                            // Look up schema field def + Tantivy field in one go
-                            let field_def = match schema.fields.get(field_name) {
-                                Some(fd) if fd.indexed => fd,
-                                _ => continue,
-                            };
-                            let tantivy_field = match fields.indexed_fields.get(field_name) {
-                                Some(tf) => tf,
-                                None => continue,
-                            };
-
-                            add_json_value_to_doc(
-                                &mut tantivy_doc,
-                                *tantivy_field,
-                                field_name,
-                                &field_def.field_type,
-                                field_value,
-                                BadValue::Refuse,
-                            )?;
+                // Build the Tantivy document outside the redb transaction: it needs the schema
+                // and the field handles, not the txn, and doing it here keeps the transaction —
+                // and therefore the time the writer lock and the data row are held — short.
+                let mut tantivy_doc = doc!(fields.id => id.as_str());
+                if let Some(seq_field) = fields.seq {
+                    tantivy_doc.add_u64(seq_field, seq_id);
+                }
+                if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
+                    for (field_name, field_value) in json_obj {
+                        // O(1) shadow field skip via pre-computed HashSet
+                        if schema.shadow_fields.contains(field_name) {
+                            continue;
                         }
-                    }
 
+                        let field_def = match schema.fields.get(field_name) {
+                            Some(fd) if fd.indexed => fd,
+                            _ => continue,
+                        };
+                        let tantivy_field = match fields.indexed_fields.get(field_name) {
+                            Some(tf) => tf,
+                            None => continue,
+                        };
+
+                        add_json_value_to_doc(
+                            &mut tantivy_doc,
+                            *tantivy_field,
+                            field_name,
+                            &field_def.field_type,
+                            field_value,
+                            BadValue::Refuse,
+                        )?;
+                    }
+                }
+
+                // The stored body, shadow fields stripped. Moved rather than cloned — the clone
+                // on the no-shadow case was the other hot-path cost this removes.
+                let filtered_json_blob = if schema.has_shadow_fields() {
+                    json_blob.map(|blob| filter_shadow_fields_owned(blob, &schema))
+                } else {
+                    json_blob
+                };
+                let doc_bytes = serde_json::to_vec(&StoredDoc {
+                    json_blob: filtered_json_blob.as_ref(),
+                })
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+                // redb commits the WAL entry and the row before Tantivy sees either. A failed
+                // commit can therefore never leave a document buffered in the writer that redb
+                // does not have — the invariant that keeps the search index from running ahead
+                // of the document store.
+                let is_new_document = {
+                    let mut write_txn = self.kv.begin_write()?;
+                    let is_new = {
+                        let durability = if self.config.wal_sync {
+                            Durability::Immediate
+                        } else {
+                            Durability::None
+                        };
+                        write_txn.set_durability(durability)?;
+                        tracing::trace!(index = %index, durability = ?durability, "Data transaction durability set (user data)");
+
+                        let mut wal_table = write_txn.open_table(wal_table_def)?;
+                        wal_table.insert(seq_id, wal_data.as_slice())?;
+
+                        let mut data_table = write_txn.open_table(data_table_def)?;
+                        let old_value = data_table.insert(id.as_str(), doc_bytes.as_slice())?;
+                        old_value.is_none()
+                    };
+                    write_txn.commit()?;
+                    is_new
+                };
+
+                // The cached body for this id is now the previous one. Removing it after the
+                // commit rather than before is what makes the removal stick.
+                self.invalidate_read_cache(index, [id.as_str()]);
+
+                // Tantivy, after redb is durable.
+                {
                     let writer = writer_arc.lock().unwrap_or_else(|poisoned| {
                         tracing::error!(index = %index, "Writer mutex was poisoned, recovering");
                         poisoned.into_inner()
                     });
-
-                    // Optimized Tantivy operations: delete only if document was updated
                     if !is_new_document {
-                        // Document was updated - delete old version first
                         let term = tantivy::Term::from_field_text(fields.id, &id);
                         writer.delete_term(term);
                     }
-                    // Add the document (new or updated)
                     writer.add_document(tantivy_doc)?;
-                    touched_id = id;
                 }
-                WalOp::Delete { id } => {
+
+                if let Some(evolved) = evolved_schema {
+                    match self.persist_schema_evolution(index, &evolved) {
+                        Ok(()) => {
+                            self.schema_cache
+                                .insert(index.to_string(), Arc::new(evolved));
+                            tracing::info!(index = %index, "Schema evolution persisted successfully");
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                index = %index,
+                                error = %e,
+                                "CRITICAL: Schema evolution failed after data commit. Data was saved but schema may be inconsistent."
+                            );
+                            return Err(StoreError::Serialization(format!(
+                                "Schema evolution failed for index {}: {}. Data was committed but schema may be inconsistent.",
+                                index, e
+                            )));
+                        }
+                    }
+                }
+
+                self.increment_operations(index);
+                Ok(seq_id)
+            }
+            WalOp::Delete { id } => {
+                let mut write_txn = self.kv.begin_write()?;
+                {
+                    let durability = if self.config.wal_sync {
+                        Durability::Immediate
+                    } else {
+                        Durability::None
+                    };
+                    write_txn.set_durability(durability)?;
+                    tracing::trace!(index = %index, durability = ?durability, "Data transaction durability set (user data)");
+
+                    let mut wal_table = write_txn.open_table(wal_table_def)?;
+                    wal_table.insert(seq_id, wal_data.as_slice())?;
+
                     let mut data_table = write_txn.open_table(data_table_def)?;
                     data_table.remove(id.as_str())?;
+                }
+                write_txn.commit()?;
 
-                    // Delete from tantivy index
-                    let term = tantivy::Term::from_field_text(fields.id, &id);
+                self.invalidate_read_cache(index, [id.as_str()]);
+
+                // Tantivy delete, after redb committed the removal.
+                {
                     let writer = writer_arc.lock().unwrap_or_else(|poisoned| {
                         tracing::error!(index = %index, "Writer mutex was poisoned, recovering");
                         poisoned.into_inner()
                     });
+                    let term = tantivy::Term::from_field_text(fields.id, &id);
                     writer.delete_term(term);
-                    touched_id = id;
                 }
+
+                self.increment_operations(index);
+                Ok(seq_id)
             }
         }
-
-        write_txn.commit()?;
-
-        // The cached body for this id is now the previous one. Removing it after the commit
-        // rather than before is what makes the removal stick — see `invalidate_read_cache`.
-        self.invalidate_read_cache(index, [touched_id.as_str()]);
-
-        // Persist schema evolution in separate transaction with Immediate durability
-        if let Some(evolved) = evolved_schema {
-            // Note: Schema persistence failure is critical but doesn't affect data consistency
-            // The data has already been committed successfully, but schema evolution failed
-            match self.persist_schema_evolution(index, &evolved) {
-                Ok(()) => {
-                    // Update cache after successful persistence
-                    self.schema_cache
-                        .insert(index.to_string(), Arc::new(evolved));
-                    tracing::info!(index = %index, "Schema evolution persisted successfully");
-                }
-                Err(e) => {
-                    tracing::error!(
-                        index = %index,
-                        error = %e,
-                        "CRITICAL: Schema evolution failed after data commit. Data was saved but schema may be inconsistent."
-                    );
-                    // Return error to signal the issue, but note that data was already committed
-                    return Err(StoreError::Serialization(format!(
-                        "Schema evolution failed for index {}: {}. Data was committed but schema may be inconsistent.",
-                        index, e
-                    )));
-                }
-            }
-        }
-
-        // Increment operation counter for threshold tracking.
-        // The actual commit decision is made by the writer thread loop
-        // after this function returns, via maybe_commit_writer().
-        self.increment_operations(index);
-
-        Ok(seq_id)
     }
 
     /// Delete all data for an index using redb's efficient delete_table() function
@@ -6595,13 +6611,28 @@ impl HybridStore {
 
         // Single transaction for all operations
         let mut write_txn = self.kv.begin_write()?;
-        let mut tantivy_ops = Vec::new();
         let batch_size = ops_len as u64;
+
+        /// The last operation for an id in this batch. A batch may name the same id several
+        /// times, and Tantivy has to end with the document the last one left behind, not one per
+        /// put. redb already keeps the last row (last write wins); this list makes the index
+        /// agree, keeping first-occurrence order so the add order — and therefore the doc ids
+        /// Tantivy assigns, which break score ties — stays deterministic.
+        enum FinalOp {
+            Add(tantivy::TantivyDocument),
+            Delete,
+        }
+        let mut final_ops: Vec<(String, FinalOp)> = Vec::with_capacity(ops_len);
+        // Where in `final_ops` an id's entry lives, so a repeat put or delete overwrites in place
+        // rather than appending a second entry.
+        let mut final_index: HashMap<String, usize> = HashMap::with_capacity(ops_len);
 
         // Collect sequence IDs during processing
         let mut seq_ids = Vec::with_capacity(ops_len);
         let mut new_documents_count = 0usize;
-        let mut updated_document_ids = Vec::new(); // Track updated documents for selective Tantivy deletes
+        // Ids whose prior version must be removed before a replacement is added. A set, so a
+        // duplicate id in the batch is deleted once rather than once per occurrence.
+        let mut updated_document_ids: HashSet<String> = HashSet::new();
 
         {
             // Set durability based on config for bulk operations
@@ -6642,7 +6673,7 @@ impl HybridStore {
                                 new_documents_count += 1;
                             } else {
                                 // Track updated documents for selective Tantivy deletes
-                                updated_document_ids.push(id.clone());
+                                updated_document_ids.insert(id.clone());
                             }
                         }
 
@@ -6681,11 +6712,23 @@ impl HybridStore {
                             }
                         }
 
-                        tantivy_ops.push(("add", tantivy_doc, id));
+                        match final_index.get(&id).copied() {
+                            Some(idx) => final_ops[idx].1 = FinalOp::Add(tantivy_doc),
+                            None => {
+                                final_index.insert(id.clone(), final_ops.len());
+                                final_ops.push((id, FinalOp::Add(tantivy_doc)));
+                            }
+                        }
                     }
                     PreparedKind::Delete => {
                         data_table.remove(id.as_str())?;
-                        tantivy_ops.push(("delete", doc!(), id));
+                        match final_index.get(&id).copied() {
+                            Some(idx) => final_ops[idx].1 = FinalOp::Delete,
+                            None => {
+                                final_index.insert(id.clone(), final_ops.len());
+                                final_ops.push((id, FinalOp::Delete));
+                            }
+                        }
                     }
                 }
             }
@@ -6695,10 +6738,11 @@ impl HybridStore {
 
         // Every id in this batch had its row written or removed, so any cached body for it is
         // the previous one. Done after the commit and before the Tantivy work, with the ids
-        // still borrowed out of `tantivy_ops` rather than collected into a second vector.
-        self.invalidate_read_cache(index, tantivy_ops.iter().map(|(_, _, id)| id.as_str()));
+        // still borrowed out of `final_ops` rather than collected into a second vector.
+        self.invalidate_read_cache(index, final_ops.iter().map(|(id, _)| id.as_str()));
 
-        // Apply all tantivy operations with optimized selective deletes
+        // Apply the final Tantivy operation per id, in the order redb committed: removals for
+        // the ids a replacement displaced, then the last put or delete of each distinct id.
         {
             let writer = writer_arc.lock().unwrap_or_else(|poisoned| {
                 tracing::error!(index = %index, "Writer mutex was poisoned, recovering");
@@ -6717,19 +6761,17 @@ impl HybridStore {
                 }
             }
 
-            // Step 2: Add all documents (new + updated)
-            // Note: Updated documents already deleted in Step 1, new documents don't need deletion
-            for (op_type, tantivy_doc, _id) in tantivy_ops {
-                match op_type {
-                    "add" => {
+            // Step 2: The last operation for each id — an add for a put, a delete for a remove.
+            // A duplicate id in the batch therefore contributes one document, not one per put.
+            for (id, op) in final_ops {
+                match op {
+                    FinalOp::Add(tantivy_doc) => {
                         writer.add_document(tantivy_doc)?;
                     }
-                    "delete" => {
-                        // Handle explicit delete operations (not from updates)
-                        let term = tantivy::Term::from_field_text(fields.id, &_id);
+                    FinalOp::Delete => {
+                        let term = tantivy::Term::from_field_text(fields.id, &id);
                         writer.delete_term(term);
                     }
-                    _ => unreachable!(),
                 }
             }
 
@@ -7708,7 +7750,68 @@ mod tests {
         );
     }
 
-    /// A delete must not bring an index into existence.    /// A delete must not bring an index into existence.
+    /// A batch that names the same id twice keeps the last document, not one per put.
+    ///
+    /// redb already holds the last row; the Tantivy index used to get one document per put, so a
+    /// content query returned the same id twice until the next rewrite or delete. The batch now
+    /// coalesces to the last operation per id.
+    #[test]
+    fn a_batch_keeps_the_last_document_of_a_repeated_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+
+        let mut schema = IndexSchema::default();
+        schema.fields.insert(
+            "title".to_string(),
+            FieldDef::new("title".to_string(), TantivyFieldType::Text),
+        );
+        schema.normalize_after_deserialization();
+        store.store_schema_and_cache("notes", &schema).unwrap();
+
+        store
+            .apply_batch(
+                "notes",
+                vec![
+                    WalOp::Put {
+                        id: "d1".to_string(),
+                        json_blob: Some(serde_json::json!({"title": "hello"})),
+                    },
+                    WalOp::Put {
+                        id: "d1".to_string(),
+                        json_blob: Some(serde_json::json!({"title": "world"})),
+                    },
+                ],
+            )
+            .expect("write");
+        store.commit_index("notes").expect("commit");
+
+        let all = store
+            .search_documents("notes", "*", 10, None)
+            .expect("search");
+        assert_eq!(
+            all.hits.len(),
+            1,
+            "one id written twice is one document, not two: {:?}",
+            all.hits
+        );
+
+        let last = store
+            .search_documents("notes", "title:world", 10, None)
+            .expect("search");
+        assert_eq!(last.hits.len(), 1, "the last put wins: {:?}", last.hits);
+
+        let first = store
+            .search_documents("notes", "title:hello", 10, None)
+            .expect("search");
+        assert_eq!(
+            first.hits.len(),
+            0,
+            "the overwritten put must not linger: {:?}",
+            first.hits
+        );
+    }
+
+    /// A delete must not bring an index into existence.
     ///
     /// The write path opens through `get_or_create_index`, which creates an index when it is
     /// absent — right for a put, which is a caller asking for the index, and wrong for a delete,
@@ -8943,7 +9046,7 @@ mod tests {
             "fields": {
                 "title": {"field_type": "text", "description": "Filing headline"},
                 "year": {"field_type": "i64", "description": "   "},
-                "notes": {"field_type": "text"},
+                "notes": {"field_type": "text", "indexed": false},
             }
         }))
         .expect("schema with descriptions");
@@ -8988,6 +9091,45 @@ mod tests {
             bare.get("description").is_none(),
             "an undescribed index must not pay for the field: {bare}"
         );
+    }
+
+    /// An indexed field's type is pinned to the column the index built for it. Evolving it would
+    /// write the new type against the old column and silently drop values; the inline evolution
+    /// path must never do that.
+    #[test]
+    fn an_indexed_fields_type_is_pinned_to_its_column() {
+        let mut schema = IndexSchema::default();
+        schema.fields.insert(
+            "n".to_string(),
+            FieldDef::new("n".to_string(), TantivyFieldType::I64),
+        );
+        assert!(
+            schema.fields["n"].indexed,
+            "a declared field is indexed by default"
+        );
+
+        // A float cannot retype an indexed i64 field (the value would be silently unindexed).
+        assert!(
+            !schema.evolve_field("n".to_string(), &serde_json::json!(4.5)),
+            "an indexed field must not evolve its type"
+        );
+        assert_eq!(
+            schema.fields["n"].field_type,
+            TantivyFieldType::I64,
+            "the declared type survives"
+        );
+
+        // A non-indexed field still evolves freely, since no column is pinned yet.
+        let mut non_indexed = IndexSchema::default();
+        non_indexed.fields.insert(
+            "n".to_string(),
+            FieldDef::new_non_indexed("n".to_string(), &serde_json::json!(1)),
+        );
+        assert!(
+            non_indexed.evolve_field("n".to_string(), &serde_json::json!(4.5)),
+            "a non-indexed field widens to a float"
+        );
+        assert_eq!(non_indexed.fields["n"].field_type, TantivyFieldType::F64);
     }
 
     /// The limits exist because a catalogue listing carries every index's description at once.

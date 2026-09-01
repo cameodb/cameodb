@@ -599,11 +599,12 @@ fn infer_field_type(value: &JsonValue) -> TantivyFieldType {
 
 /// Whether a field declared as one type can hold a single value that reads as another.
 ///
-/// `String` is `Text` under an older name, and a numeric field widens to a float, because `4`
-/// and `4.5` in one field is a source being loose about a value rather than a document that
-/// cannot be stored. Everything else has to match: a declared `i64` receiving a word has
-/// nowhere to put it, and the write path would skip the value and leave the document stored
-/// with the field silently unindexed.
+/// `String` is `Text` under an older name, and is the only widening the write path performs on
+/// its own. Everything else has to match exactly: a declared `i64` receiving a float or a word
+/// has nowhere to put it — the writer reads `as_i64()`/`as_u64()` and would skip the value,
+/// leaving the document stored with the field silently unindexed. A float is refused here rather
+/// than widened, because widening an already-built column needs a rebuild, which no write path
+/// performs (see `IndexSchema::evolve_field`, which never changes an indexed field's type).
 ///
 /// Values whose *shape* rather than type decides the answer — a list, a null, a text or json
 /// field that takes anything, a facet path — are settled by `unstorable_value` before this is asked.
@@ -614,10 +615,6 @@ fn scalar_type_is_storable(declared: &TantivyFieldType, inferred: &TantivyFieldT
     matches!(
         (declared, inferred),
         (TantivyFieldType::String, TantivyFieldType::Text)
-            | (
-                TantivyFieldType::I64 | TantivyFieldType::U64,
-                TantivyFieldType::F64
-            )
     )
 }
 
@@ -1205,21 +1202,29 @@ fn effective_delete_routing_key(
     id: &str,
     routing_key: Option<String>,
 ) -> Result<String, OrchestratorError> {
-    if let Some(key) = routing_key {
-        return Ok(key);
-    }
-
     let routing_field = schema.get_routing_field();
+
+    // The routing field is the key — `id`, or a shadow field whose value *is* the key — so the
+    // id names the shard the write used, and a caller-supplied `routing_key` cannot retarget it.
+    // Accepting one here let a wrong key route a delete to a shard that holds no such row, where
+    // it removed nothing and still answered "deleted".
     if routing_field == "id" || schema.is_shadow_field(routing_field) {
         return Ok(id.to_string());
     }
 
-    Err(OrchestratorError::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!(
-            "index routes by '{routing_field}', which is not the document key, so a delete must              carry the same routing_key the write used — read it off the document with a search              for id:{id}"
-        ),
-    )))
+    // The routing field is a real field, so the id says nothing about the shard. The caller
+    // must supply the same key the write used; an empty one is as useless as none.
+    match routing_key {
+        Some(key) if !key.is_empty() => Ok(key),
+        _ => Err(OrchestratorError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "index routes by '{routing_field}', which is not the document key, so a delete \
+                 must carry the same routing_key the write used — read it off the document with \
+                 a search for id:{id}"
+            ),
+        ))),
+    }
 }
 
 /// Helper function to detect if an operation is a write operation
@@ -1959,12 +1964,24 @@ pub enum WorkerOutcome {
 /// The engine's verdict on a single write, before it becomes a [`WorkerOutcome`].
 enum WriteOutcome {
     Done(JsonValue),
-    /// The schema has to grow first. Carries back the parts of `ClientOp::Write` that
-    /// `engine_write` consumed, so `execute` can rebuild the op — `index` it still owns.
+    /// The schema has to grow, or the shard the write routes to is on another node. Carries back
+    /// the parts of `ClientOp::Write` that `engine_write` consumed, so `execute` can rebuild the
+    /// op — `index` it still owns.
     NeedsActor {
         id: String,
         routing_key: Option<String>,
         doc: JsonValue,
+    },
+}
+
+/// The engine's verdict on a single delete, before it becomes a [`WorkerOutcome`].
+enum DeleteOutcome {
+    Done(JsonValue),
+    /// The shard the delete routes to is on another node. Carries back the parts of
+    /// `ClientOp::Delete` that `engine_delete` consumed, so `execute` can rebuild the op.
+    NeedsActor {
+        id: String,
+        routing_key: Option<String>,
     },
 }
 
@@ -2826,7 +2843,17 @@ impl OrchestratorEngine {
                 index,
                 id,
                 routing_key,
-            } => WorkerOutcome::Done(self.engine_delete(&index, id, routing_key).await),
+            } => match self.engine_delete(&index, id, routing_key).await {
+                Ok(DeleteOutcome::Done(value)) => WorkerOutcome::Done(Ok(value)),
+                Ok(DeleteOutcome::NeedsActor { id, routing_key }) => {
+                    WorkerOutcome::UseActor(Box::new(ClientOp::Delete {
+                        index,
+                        id,
+                        routing_key,
+                    }))
+                }
+                Err(err) => WorkerOutcome::Done(Err(err)),
+            },
             // Bulk writes need `staged_schema_validation`, parallel routing and remote
             // forwarding; config and metadata ops are lightweight and rare. Both belong on
             // the actor, which owns the state they touch.
@@ -2899,12 +2926,19 @@ impl OrchestratorEngine {
                 // descent, which is not a saving worth a class of divergence in front of a redb
                 // transaction.
                 let target = self.route_write(&effective_routing_key)?;
-                let shard = shards.get(&target).ok_or_else(|| {
-                    OrchestratorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "Shard not found",
-                    ))
-                })?;
+
+                let Some(shard) = shards.get(&target) else {
+                    // The shard is on another node. The engine cannot forward — it holds
+                    // snapshots, not the peer pool — so hand the op back and let the actor
+                    // forward it. The effective key travels in place of the caller's hint: it is
+                    // the value the actor re-derives anyway.
+                    return Ok(WriteOutcome::NeedsActor {
+                        id,
+                        routing_key: effective_routing_key,
+                        doc,
+                    });
+                };
+
                 let req = WriteRequest {
                     index: index.to_string(),
                     id: id.clone(),
@@ -2947,7 +2981,7 @@ impl OrchestratorEngine {
         index: &str,
         id: String,
         routing_key: Option<String>,
-    ) -> Result<JsonValue, OrchestratorError> {
+    ) -> Result<DeleteOutcome, OrchestratorError> {
         let shards = self.shards.load();
         if shards.is_empty() {
             return Err(OrchestratorError::Io(std::io::Error::new(
@@ -2962,25 +2996,25 @@ impl OrchestratorEngine {
             Arc::new(self.load_schema(index).await?)
         };
 
-        let routing_key = effective_delete_routing_key(&schema, &id, routing_key)?;
+        let effective = effective_delete_routing_key(&schema, &id, routing_key.clone())?;
 
         // The ring owns the placement decision here as it does for a write, and a delete cannot
         // disagree with the hint the router dispatched on: both are this same key.
-        let target = self.route_write(&Some(routing_key.clone()))?;
-        let shard = shards.get(&target).ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Shard not found",
-            ))
-        })?;
+        let target = self.route_write(&Some(effective))?;
+
+        let Some(shard) = shards.get(&target) else {
+            // The shard is on another node. The engine cannot forward — it holds snapshots, not
+            // the peer pool — so hand the op back and let the actor forward it.
+            return Ok(DeleteOutcome::NeedsActor { id, routing_key });
+        };
 
         let sequence = shard.handle_delete(index.to_string(), id.clone()).await?;
-        Ok(serde_json::json!({
+        Ok(DeleteOutcome::Done(serde_json::json!({
             "id": id,
             "result": "deleted",
             "version": sequence,
             "shard_id": target.to_string(),
-        }))
+        })))
     }
 
     /// Parallel scatter-gather search across all local shards.
@@ -7768,12 +7802,21 @@ impl NodeOrchestrator {
                 let effective_routing_key = effective_routing_key(&schema, &id, routing_key, &doc);
 
                 let target = self.route_write(&effective_routing_key)?;
-                let shard = self.shards.get(&target).ok_or_else(|| {
-                    OrchestratorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "Shard not found",
-                    ))
-                })?;
+
+                let Some(shard) = self.shards.get(&target) else {
+                    return self
+                        .forward_op_to_owner(
+                            target,
+                            ClientOp::Write {
+                                index: index.to_string(),
+                                id,
+                                routing_key: effective_routing_key,
+                                doc,
+                            },
+                        )
+                        .await;
+                };
+
                 let req = WriteRequest {
                     index: index.to_string(),
                     id: id.clone(),
@@ -7827,12 +7870,21 @@ impl NodeOrchestrator {
         let effective_routing_key = effective_routing_key(&schema_mut, &id, routing_key, &doc);
 
         let target = self.route_write(&effective_routing_key)?;
-        let shard = self.shards.get(&target).ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Shard not found",
-            ))
-        })?;
+
+        let Some(shard) = self.shards.get(&target) else {
+            return self
+                .forward_op_to_owner(
+                    target,
+                    ClientOp::Write {
+                        index: index.to_string(),
+                        id,
+                        routing_key: effective_routing_key,
+                        doc,
+                    },
+                )
+                .await;
+        };
+
         let req = WriteRequest {
             index: index.to_string(),
             id: id.clone(),
@@ -7873,15 +7925,24 @@ impl NodeOrchestrator {
             Arc::new(self.load_schema(index).await?)
         };
 
-        let routing_key = effective_delete_routing_key(&schema, &id, routing_key)?;
+        let effective = effective_delete_routing_key(&schema, &id, routing_key.clone())?;
 
-        let target = self.route_write(&Some(routing_key))?;
-        let shard = self.shards.get(&target).ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Shard not found",
-            ))
-        })?;
+        let target = self.route_write(&Some(effective.clone()))?;
+
+        let Some(shard) = self.shards.get(&target) else {
+            // The ring placed this delete on a peer. Forward it; the peer re-derives the key
+            // from the same schema and routes to the shard it actually hosts.
+            return self
+                .forward_op_to_owner(
+                    target,
+                    ClientOp::Delete {
+                        index: index.to_string(),
+                        id,
+                        routing_key: Some(effective),
+                    },
+                )
+                .await;
+        };
 
         let sequence = shard.handle_delete(index.to_string(), id.clone()).await?;
         Ok(serde_json::json!({
@@ -8109,6 +8170,54 @@ impl NodeOrchestrator {
             .get("items_deleted")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize)
+    }
+
+    /// Forward a single write or delete to the node that owns `target`, and return its answer.
+    ///
+    /// Reached when the ring places a write or delete on a shard this node does not host. The
+    /// remote node re-derives the routing key from its own schema, so the op travels the way the
+    /// caller sent it and routes identically on the other side.
+    async fn forward_op_to_owner(
+        &self,
+        target: Uuid,
+        op: ClientOp,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let node_id = if let Some(coord) = &self.coordinator {
+            coord
+                .ask(GetShardAssignments)
+                .await
+                .unwrap_or_default()
+                .get(&target)
+                .map(|meta| meta.node_id)
+        } else {
+            None
+        };
+
+        let Some(node_id) = node_id else {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("shard {target} is not local and no node owns it"),
+            )));
+        };
+
+        let pool = self.remote_peer_pool.as_ref().ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::other("Remote peer pool not initialized"))
+        })?;
+
+        let remote = pool
+            .get_orchestrator(node_id, ConnectionChannel::Operations)
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+            .ok_or_else(|| {
+                OrchestratorError::Io(std::io::Error::other(format!(
+                    "Remote orchestrator for node {node_id} not found"
+                )))
+            })?;
+
+        remote
+            .ask(&op)
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))
     }
 
     async fn orch_bulk_write(
@@ -9538,16 +9647,31 @@ mod tests {
             "InvalidInput is what `AppError::from_route` turns into a 400 rather than a 500"
         );
 
-        // ...and with the key supplied it routes by that, on any index.
+        // ...and with the key supplied a tenant index routes by it.
         assert_eq!(
             effective_delete_routing_key(&tenanted, "d1", Some("acme".to_string()))
                 .expect("routable"),
             "acme"
         );
+        // On a key-routed index the id still wins, so a stray routing_key cannot retarget the
+        // delete to a shard that holds no such row and answer "deleted" for nothing.
         assert_eq!(
             effective_delete_routing_key(&default_schema, "d1", Some("acme".to_string()))
                 .expect("routable"),
-            "acme"
+            "d1"
+        );
+        assert_eq!(
+            effective_delete_routing_key(&shadow, "abc123", Some("elsewhere".to_string()))
+                .expect("routable"),
+            "abc123"
+        );
+
+        // An empty key on a tenant index is the same as no key: refused, not routed by "".
+        let empty = effective_delete_routing_key(&tenanted, "d1", Some(String::new()))
+            .expect_err("an empty routing_key cannot route");
+        assert!(
+            empty.to_string().contains("tenant_id"),
+            "the refusal names the field: {empty}"
         );
     }
 
