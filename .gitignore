@@ -56,6 +56,14 @@ tramp
 # Devin IDE
 .devinrules
 
+# Claude Code working notes. Plans are a scratchpad for whoever is holding the problem —
+# useful on the machine that wrote them, stale anywhere else — so they stay out of the repo
+# for every contributor, not just the one who made the directory.
+#
+# Scoped to plans/ on purpose: .claude/skills/ is committed and shared, so ignoring .claude
+# wholesale would silently drop it.
+/.claude/plans/
+
 # Other editors
 .project
 .settings/

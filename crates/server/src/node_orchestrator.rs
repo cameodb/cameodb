@@ -8814,6 +8814,17 @@ impl NodeOrchestrator {
         // Normalize schema from external sources (populate field names from map keys, etc.)
         schema.normalize_after_deserialization();
 
+        // The version is assigned here and never taken from the caller. It exists to order
+        // schema changes, so a caller able to set it could name any version at all — `999` on a
+        // first PUT, and every later change made on any node loses to it for good. `version` is
+        // a deserialized field on `IndexSchema`, so a body carrying one arrives with it set;
+        // this overwrites it. A PUT over an index that already has a schema advances the version
+        // that schema holds, which is what makes a re-declaration a newer one rather than a
+        // sibling of the original.
+        schema.version = self
+            .get_cached_schema(index)
+            .map_or(1, |current| current.version.saturating_add(1));
+
         // Ensure 'id' field is explicitly in the schema for visibility
         if !schema.fields.contains_key("id") {
             schema.fields.insert(
