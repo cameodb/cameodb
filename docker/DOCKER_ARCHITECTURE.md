@@ -108,7 +108,7 @@ COPY --chown=nonroot:nonroot docker/cameodb-docker.toml /etc/cameodb/cameodb.tom
 COPY --from=builder --chown=nonroot:nonroot /build-data/cameodb /data/cameodb
 
 ENV CAMEODB_CONFIG=/etc/cameodb/cameodb.toml
-ENV CAMEODB_DATA_DIR=/data/cameodb
+# Data location is [storage] data_paths in the config, or CAMEODB_DATA_PATHS
 
 VOLUME ["/data/cameodb"]
 
@@ -141,8 +141,8 @@ services:
       - CAMEODB_CLUSTER_PORT=9580
       - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
       - CAMEODB_CLUSTER_NODES=cameodb-node1:9580,cameodb-node2:9580,cameodb-node3:9580
-      - CAMEODB_MAX_BODY_SIZE_MB=200
-      - CAMEODB_DEFAULT_BATCH_SIZE=5000
+      - CAMEODB_STORAGE_DEFAULT_BATCH_SIZE=5000
+      - CAMEODB_CLUSTER_PSK=${CAMEODB_CLUSTER_PSK:-…}   # same on every node; see below
     networks:
       cameodb-cluster:
         ipv4_address: 172.20.0.10
@@ -164,8 +164,8 @@ services:
       - CAMEODB_CLUSTER_PORT=9580
       - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
       - CAMEODB_CLUSTER_NODES=cameodb-node1:9580,cameodb-node2:9580,cameodb-node3:9580
-      - CAMEODB_MAX_BODY_SIZE_MB=200
-      - CAMEODB_DEFAULT_BATCH_SIZE=5000
+      - CAMEODB_STORAGE_DEFAULT_BATCH_SIZE=5000
+      - CAMEODB_CLUSTER_PSK=${CAMEODB_CLUSTER_PSK:-…}   # same on every node; see below
     networks:
       cameodb-cluster:
         ipv4_address: 172.20.0.11
@@ -187,8 +187,8 @@ services:
       - CAMEODB_CLUSTER_PORT=9580
       - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
       - CAMEODB_CLUSTER_NODES=cameodb-node1:9580,cameodb-node2:9580,cameodb-node3:9580
-      - CAMEODB_MAX_BODY_SIZE_MB=200
-      - CAMEODB_DEFAULT_BATCH_SIZE=5000
+      - CAMEODB_STORAGE_DEFAULT_BATCH_SIZE=5000
+      - CAMEODB_CLUSTER_PSK=${CAMEODB_CLUSTER_PSK:-…}   # same on every node; see below
     networks:
       cameodb-cluster:
         ipv4_address: 172.20.0.12
@@ -203,8 +203,24 @@ services:
       - cameodb-node2
       - cameodb-node3
     # Inline nginx config proxying to internal node addresses
-    # client_max_body_size: 200M for large batch writes
+    # client_max_body_size: 128M — the node's own ceiling, derived from
+    # limits.max_record_size_mb (64) + 64 MB of framing. A larger value here only
+    # moves the rejection from nginx to the node.
 ```
+
+**The cluster pre-shared key is required, not optional.** The image ships
+`profile = "internal"`, and that profile refuses to start a node with the cluster enabled and
+no PSK — without one, anything that can reach `:9580` can join the swarm. Every node must carry
+the same 64-hex-character key:
+
+```bash
+CAMEODB_CLUSTER_PSK=$(openssl rand -hex 32) \
+  docker compose -f docker/docker-compose-cluster.yml up -d
+```
+
+`docker-compose-cluster.yml` defaults it to a throwaway value so the cluster comes up with no
+setup; generate a real one for anything that outlives the test. `cameodb check-config` reports
+the rule before the container does.
 
 #### **Network Topology**
 ```
@@ -251,7 +267,8 @@ docker-compose -f docker/docker-compose.yml up -d --build
 
 ### **Multi-Node Cluster**
 ```bash
-# From the project root
+# From the project root — CAMEODB_CLUSTER_PSK is optional (a throwaway default ships
+# in the compose file) and must be identical on every node when set
 mkdir -p data/cameodb/node{1,2,3}
 docker-compose -f docker/docker-compose-cluster.yml up -d --build
 ```

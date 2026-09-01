@@ -25,7 +25,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Trust corporate CA certificate (if provided)
+#
+# CORPORATE_CA_ID is in the cache key and the secret is not: BuildKit hashes the RUN command
+# and its ARGs, never the content of a `--mount=type=secret`. So an image built once without a
+# CA kept this layer forever, and a later build that supplied one reused the "No corporate CA"
+# result and failed further down with `invalid peer certificate: UnknownIssuer` — the CA was
+# mounted, and the layer that would have installed it never ran. The compose files pass the CA
+# path here, so pointing CAMEODB_CA_CERT at a different file rebuilds the layer.
+ARG CORPORATE_CA_ID=none
 RUN --mount=type=secret,id=corporate-ca,dst=/usr/local/share/ca-certificates/corporate-ca.crt \
+    echo "corporate CA id: ${CORPORATE_CA_ID}" && \
     if [ -s /usr/local/share/ca-certificates/corporate-ca.crt ]; then \
         echo "Corporate CA certificate detected, adding to CA bundle..." && \
         mkdir -p /etc/ssl/certs && \
@@ -125,7 +134,9 @@ COPY --chown=nonroot:nonroot docker/cameodb-docker.toml /etc/cameodb/cameodb.tom
 COPY --from=builder --chown=nonroot:nonroot /build-data/cameodb /data/cameodb
 
 ENV CAMEODB_CONFIG=/etc/cameodb/cameodb.toml
-ENV CAMEODB_DATA_DIR=/data/cameodb
+# No CAMEODB_DATA_DIR: nothing reads it. The data location is [storage] data_paths in the
+# config above, overridable with CAMEODB_DATA_PATHS (colon-separated). Setting a variable the
+# binary ignores is worse than setting none — it reads as configuration and relocates nothing.
 
 # Set user before VOLUME to ensure proper ownership
 USER nonroot:nonroot
