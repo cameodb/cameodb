@@ -146,6 +146,11 @@ fn split_document_reason(error: &str) -> Option<(usize, &str)> {
 /// reasons is what was received. Reasons that name no item are attached to items they cost
 /// rather than reported beside them, and a shortfall nobody explained is stated by
 /// `unattributed` rather than left for the caller to find by subtracting.
+///
+/// The opposite imbalance — more reasons than items unwritten — cannot come from a peer running
+/// this code, and the surplus is folded into the last reason rather than dropped. The count has
+/// to hold for the answer to add up, but a reason someone took the trouble to send is the only
+/// account of a failure that exists, and silently discarding it is how a real cause disappears.
 pub(crate) fn renumber_reasons(
     reasons: &[String],
     positions: &[usize],
@@ -154,11 +159,13 @@ pub(crate) fn renumber_reasons(
     attribution: &str,
     unaccounted: impl Fn() -> String,
 ) -> Vec<String> {
-    let mut renumbered = Vec::with_capacity(unwritten);
+    let mut renumbered: Vec<String> = Vec::with_capacity(unwritten);
+    let mut surplus: Vec<&str> = Vec::new();
 
     for reason in reasons {
         if renumbered.len() == unwritten {
-            break;
+            surplus.push(reason.as_str());
+            continue;
         }
         match split_document_reason(reason) {
             Some((theirs, why)) if theirs < positions.len() => {
@@ -172,6 +179,17 @@ pub(crate) fn renumber_reasons(
 
     while renumbered.len() < unwritten {
         renumbered.push(unaccounted());
+    }
+
+    // More was said than there are items to say it against. Carried on the last reason so the
+    // count still adds up and nothing said is lost.
+    if !surplus.is_empty()
+        && let Some(last) = renumbered.last_mut()
+    {
+        last.push_str(&format!(
+            " ({attribution} also reported: {})",
+            surplus.join("; ")
+        ));
     }
 
     renumbered
@@ -631,7 +649,8 @@ fn scalar_type_is_storable(declared: &TantivyFieldType, inferred: &TantivyFieldT
 /// `Cardinality::Multivalued`, and a range query matches the document if any one value falls
 /// inside. So `{"risk_score": [9, 12]}` belongs in an `i64` field, and each element is checked
 /// on its own. One level is flattened and no more, which is exactly what the writer does with
-/// it: a list inside a list is a value the element type has to accept by itself.
+/// it: a list or an object *among* those elements is refused, because the writer has no `add_*`
+/// call to make for one and would skip it.
 ///
 /// **A text or json field takes anything**, because the writer serializes whatever it is given
 /// into text. A list under one of those is indexed as its own JSON text rather than split, so
@@ -680,6 +699,12 @@ fn unstorable_value(field: &str, declared: &TantivyFieldType, value: &JsonValue)
 /// `"a/b"` are both strings and only one is a path — so it is asked of the parser the writer
 /// uses, `storage::facet_path_error`, rather than of `infer_field_type`, which reads every
 /// facet path as text and would refuse the whole type.
+///
+/// A list or an object is refused before anything else is asked. `infer_field_type` reads a list
+/// by what it holds — `[1, 2]` is `I64` — which is right for typing a field nobody declared and
+/// wrong here: it made a *nested* list look like a value a numeric field accepts, where the
+/// writer's `as_i64()` returns `None` and skips it, storing the document with the field
+/// unindexed. That is the one outcome this function exists to prevent.
 fn unstorable_scalar(
     field: &str,
     declared: &TantivyFieldType,
@@ -687,6 +712,19 @@ fn unstorable_scalar(
 ) -> Option<String> {
     if value.is_null() {
         return None;
+    }
+
+    let shape = match value {
+        JsonValue::Array(_) => Some("a list"),
+        JsonValue::Object(_) => Some("an object"),
+        _ => None,
+    };
+    if let Some(shape) = shape {
+        return Some(format!(
+            "field '{field}': {shape} is not one value a {declared:?} field can hold. A list \
+             under this field is several values of it, flattened one level — so the elements are \
+             the values, and a list or an object among them is not one"
+        ));
     }
 
     if matches!(declared, TantivyFieldType::Facet) {
@@ -1831,6 +1869,13 @@ pub enum ClientOp {
         id: String,
         routing_key: Option<String>,
         doc: JsonValue,
+        /// Set by the node that forwarded this op to the shard's owner, so the owner does not
+        /// forward it again. See [`NodeOrchestrator::forward_op_to_owner`].
+        ///
+        /// Defaulted, so an older peer that does not send it reads as a first hop — which is
+        /// what every op was before this existed.
+        #[serde(default)]
+        forwarded: bool,
     },
     /// Bulk write operation to insert/update multiple documents
     BulkWrite {
@@ -1860,6 +1905,10 @@ pub enum ClientOp {
         index: String,
         id: String,
         routing_key: Option<String>,
+        /// Set by the node that forwarded this op to the shard's owner, so the owner does not
+        /// forward it again. See [`NodeOrchestrator::forward_op_to_owner`].
+        #[serde(default)]
+        forwarded: bool,
     },
     /// Create or update index configuration/schema
     CreateConfig { index: String, schema: IndexSchema },
@@ -2784,6 +2833,7 @@ impl OrchestratorEngine {
                 id,
                 routing_key,
                 doc,
+                forwarded,
             } => match self.engine_write(&index, id, routing_key, doc).await {
                 Ok(WriteOutcome::Done(value)) => WorkerOutcome::Done(Ok(value)),
                 Ok(WriteOutcome::NeedsActor {
@@ -2795,6 +2845,8 @@ impl OrchestratorEngine {
                     id,
                     routing_key,
                     doc,
+                    // Whichever hop this is, handing the op to the actor is not another one.
+                    forwarded,
                 })),
                 Err(err) => WorkerOutcome::Done(Err(err)),
             },
@@ -2843,6 +2895,7 @@ impl OrchestratorEngine {
                 index,
                 id,
                 routing_key,
+                forwarded,
             } => match self.engine_delete(&index, id, routing_key).await {
                 Ok(DeleteOutcome::Done(value)) => WorkerOutcome::Done(Ok(value)),
                 Ok(DeleteOutcome::NeedsActor { id, routing_key }) => {
@@ -2850,6 +2903,7 @@ impl OrchestratorEngine {
                         index,
                         id,
                         routing_key,
+                        forwarded,
                     }))
                 }
                 Err(err) => WorkerOutcome::Done(Err(err)),
@@ -4086,10 +4140,11 @@ impl MicroshardActor {
     /// Deliberately not its own storage path: the command is a `StorageCommand::Write` carrying a
     /// `WalOp::Delete`, so the delete is coalesced into the same `apply_batch` as the puts that
     /// arrived with it, takes the same single redb transaction, and counts toward the same commit
-    /// threshold. Ordering inside that batch is already correct — Tantivy applies `delete_term` to
-    /// documents added earlier in the same commit, and the redb `insert` then `remove` leaves
-    /// nothing behind — so a put and a delete of one id in the same batch resolve whichever order
-    /// they arrived in.
+    /// threshold. A put and a delete of one id in the same batch resolve whichever order they
+    /// arrived in: redb keeps the last row, and `apply_batch` coalesces to the last operation
+    /// per id and issues the `delete_term` from whether the id had a row *before the batch* —
+    /// not from what each individual `insert` displaced, which a delete earlier in the same
+    /// batch had already emptied.
     ///
     /// The supervisor signal is what bounds visibility. A delete removes the redb row at once, so
     /// an `id:VALUE` lookup stops finding it immediately, but the Tantivy `delete_term` only takes
@@ -5452,8 +5507,13 @@ impl RouterActor {
 
         // Handle search operations with streaming
         match op {
-            // `offset` is ignored rather than bound: this is the streaming path, which hands
-            // the caller the whole result as it is produced, so there is no page to take.
+            // `offset` is ignored rather than bound. True of `Stream`, which hands the caller
+            // the whole result as it is produced, so there is no page to take — and wrong for
+            // `Search`, which reaches this branch whenever routing is `Broadcast` and
+            // `enable_streaming_search` is on, and whose caller does have a page to take. A
+            // paged search there silently answers page 1. Tracked as ROADMAP OB8; the fix is
+            // either to honour the offset here or to refuse a paged `Search` on this path, and
+            // it is a change to the fan-out rather than to this match.
             ClientOp::Search {
                 index,
                 query,
@@ -7653,13 +7713,18 @@ impl NodeOrchestrator {
                 id,
                 routing_key,
                 doc,
-            } => self.orch_write(&index, id, routing_key, doc).await,
+                forwarded,
+            } => {
+                self.orch_write(&index, id, routing_key, doc, forwarded)
+                    .await
+            }
             ClientOp::BulkWrite { index, docs } => self.orch_bulk_write(&index, docs).await,
             ClientOp::Delete {
                 index,
                 id,
                 routing_key,
-            } => self.orch_delete(&index, id, routing_key).await,
+                forwarded,
+            } => self.orch_delete(&index, id, routing_key, forwarded).await,
             ClientOp::BulkDelete { index, docs } => self.orch_bulk_delete(&index, docs).await,
             ClientOp::CreateConfig { index, schema } => {
                 self.orch_create_config(&index, schema).await
@@ -7766,6 +7831,7 @@ impl NodeOrchestrator {
         id: String,
         routing_key: Option<String>,
         doc: JsonValue,
+        forwarded: bool,
     ) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
             return Err(OrchestratorError::Io(std::io::Error::new(
@@ -7807,11 +7873,13 @@ impl NodeOrchestrator {
                     return self
                         .forward_op_to_owner(
                             target,
+                            forwarded,
                             ClientOp::Write {
                                 index: index.to_string(),
                                 id,
                                 routing_key: effective_routing_key,
                                 doc,
+                                forwarded: true,
                             },
                         )
                         .await;
@@ -7875,11 +7943,13 @@ impl NodeOrchestrator {
             return self
                 .forward_op_to_owner(
                     target,
+                    forwarded,
                     ClientOp::Write {
                         index: index.to_string(),
                         id,
                         routing_key: effective_routing_key,
                         doc,
+                        forwarded: true,
                     },
                 )
                 .await;
@@ -7911,6 +7981,7 @@ impl NodeOrchestrator {
         index: &str,
         id: String,
         routing_key: Option<String>,
+        forwarded: bool,
     ) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
             return Err(OrchestratorError::Io(std::io::Error::new(
@@ -7935,10 +8006,12 @@ impl NodeOrchestrator {
             return self
                 .forward_op_to_owner(
                     target,
+                    forwarded,
                     ClientOp::Delete {
                         index: index.to_string(),
                         id,
                         routing_key: Some(effective),
+                        forwarded: true,
                     },
                 )
                 .await;
@@ -8177,11 +8250,28 @@ impl NodeOrchestrator {
     /// Reached when the ring places a write or delete on a shard this node does not host. The
     /// remote node re-derives the routing key from its own schema, so the op travels the way the
     /// caller sent it and routes identically on the other side.
+    ///
+    /// **One hop, and only one.** The op that arrives carries `forwarded`, and `already_forwarded`
+    /// is that flag: a node that was itself forwarded to refuses rather than forwarding on. Both
+    /// ends decide from their own view of the ring and their own copy of the shard assignments,
+    /// and those views disagree while membership is changing — two nodes each certain the other
+    /// owns the shard would otherwise pass one write between them until something timed out,
+    /// once per write. Refusing states the disagreement instead, and the caller's retry lands
+    /// after the views have converged.
     async fn forward_op_to_owner(
         &self,
         target: Uuid,
+        already_forwarded: bool,
         op: ClientOp,
     ) -> Result<JsonValue, OrchestratorError> {
+        if already_forwarded {
+            return Err(OrchestratorError::Io(std::io::Error::other(format!(
+                "shard {target} was forwarded here and is not local either: this node and the \
+                 one that forwarded disagree about who owns it. Retry once the cluster has \
+                 settled"
+            ))));
+        }
+
         let node_id = if let Some(coord) = &self.coordinator {
             coord
                 .ask(GetShardAssignments)
@@ -8475,11 +8565,24 @@ impl NodeOrchestrator {
         // loses, so this is a check on that rather than a repair — a batch that reaches here
         // unbalanced has a path that stopped saying what it dropped, which is the defect this
         // arithmetic exists to catch.
+        //
+        // Asserted in a debug build and logged in a release one. The assertion is what makes an
+        // unaccounting path a test failure; the log is what makes it findable in the build that
+        // actually serves the caller the unbalanced answer.
         debug_assert_eq!(
             written + errors.len(),
             items_received,
             "a bulk write must account for every item it received"
         );
+        if written + errors.len() != items_received {
+            error!(
+                index = %index,
+                items_received = items_received,
+                items_written = written,
+                errors = errors.len(),
+                "BulkWrite did not account for every item it received"
+            );
+        }
 
         let duration = start.elapsed();
         info!(
@@ -9588,7 +9691,56 @@ mod tests {
         );
     }
 
-    /// What a delete is routed by, and when it cannot be routed at all.
+    /// An op from a peer that predates `forwarded` reads as a first hop.
+    ///
+    /// The flag is what stops two nodes disagreeing about a shard from passing one write between
+    /// them, and it is a field added to an op that crosses the wire. kameo encodes a remote
+    /// message with `rmp_serde::to_vec_named`, so fields travel by name and `#[serde(default)]`
+    /// is what makes an older peer's message — which carries no such field — decode as `false`,
+    /// the behaviour every op had before this existed. Asserted through `serde_json`, which has
+    /// the same rule for a missing field; what is pinned here is the `default`, not the codec.
+    #[test]
+    fn an_op_without_the_forwarded_flag_reads_as_a_first_hop() {
+        let write: ClientOp = serde_json::from_str(
+            r#"{"Write":{"index":"i","id":"d1","routing_key":null,"doc":{"t":1}}}"#,
+        )
+        .expect("a Write from a peer that does not send `forwarded`");
+        assert!(
+            matches!(
+                write,
+                ClientOp::Write {
+                    forwarded: false,
+                    ..
+                }
+            ),
+            "an absent flag is a first hop, which is what every op was before it existed"
+        );
+
+        let delete: ClientOp =
+            serde_json::from_str(r#"{"Delete":{"index":"i","id":"d1","routing_key":null}}"#)
+                .expect("a Delete from a peer that does not send `forwarded`");
+        assert!(matches!(
+            delete,
+            ClientOp::Delete {
+                forwarded: false,
+                ..
+            }
+        ));
+
+        // And a hop that was forwarded says so, so the owner can refuse to forward again.
+        let hop: ClientOp = serde_json::from_str(
+            r#"{"Delete":{"index":"i","id":"d1","routing_key":"acme","forwarded":true}}"#,
+        )
+        .expect("a Delete forwarded by a peer running this code");
+        assert!(matches!(
+            hop,
+            ClientOp::Delete {
+                forwarded: true,
+                ..
+            }
+        ));
+    }
+
     /// What a delete is routed by, and when it cannot be routed at all.
     ///
     /// A write reads its key out of the document, which is the authority. A delete has no
@@ -9723,6 +9875,7 @@ mod tests {
             id: "d1".to_string(),
             routing_key: None,
             doc: json!({"title": "Dune"}),
+            forwarded: false,
         })
     }
 

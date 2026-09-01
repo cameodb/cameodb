@@ -5,8 +5,10 @@ Active work is at the front of this file; everything delivered is in
 measurements and the rejected options are what stop a settled question being reopened, and
 several entries exist precisely to say *do not build this again*.
 
-**Last reconciled against the code: 2026-08-26, at 0.3.2.** What that check changed is
-recorded under [Reconciliation](#reconciliation-2026-08-26).
+**Last reconciled against the code: 2026-09-01, at 0.3.3.** The 2026-08-26 pass is recorded
+under [Reconciliation](#reconciliation-2026-08-26); the 2026-09-01 review is filed in place —
+C3–C6, CH8–CH12 and OB3–OB9 — and a re-read on the same day is recorded under
+[Reconciliation](#reconciliation-2026-09-01).
 
 ## How to read this file
 
@@ -44,7 +46,8 @@ on one.
 | 17 — Record deletion | ✅ Done | — |
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
-| Code health — reviewed at 0.3.1, extended 2026-09-01 | 📋 Planned | Twelve items; CH8–CH12 are write-path efficiency |
+| 14 — Security hardening (posture items C3–C7) | ◐ Partial | C3–C6 open; C7 done |
+| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH8 done, CH9 partial, CH10–CH12 are write-path efficiency |
 
 ## Reconciliation, 2026-08-26
 
@@ -75,6 +78,47 @@ Everything else verified as the file described it: no `search_after`, no `sched_
 no per-arena `mallctl`, no reindex path, `should_commit_writer` still counts operations only,
 `cameodb-bench` still closed-loop, and the four code-health duplications all still present.
 
+## Reconciliation, 2026-09-01
+
+A re-read of the 0.3.3 review's own fixes, against the tree rather than against the commits that
+claimed them. Five corrections; the pattern in four of them is the same, and worth naming: a fix
+that closes a defect on the path it was found on, while the *sibling* path — the other arm of a
+match, the other framing of the same input, the second hop of the same forward — keeps the
+behaviour the fix was written to remove.
+
+- **[OB5](#ob5--one-batch-can-index-the-same-id-twice) was ✅ and is only now done.** Coalescing
+  the adds was right; the deletes still read "did this id exist" from each `insert` in turn, which
+  a delete earlier in the same batch had already emptied. Reproduced, then fixed and pinned.
+- **[OB7](#ob7--the-validator-and-the-writer-disagree-about-floats-in-integer-fields) had a
+  sibling.** Element-wise list typing, landed the same day, made a *nested* list read as its
+  inner element type — so the disagreement OB7 closed for floats reopened one level down.
+- **[OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) made an unbounded pattern
+  reachable from every write.** Forwarding had no hop limit before, on the bulk paths only; OB3
+  extended it to single writes and deletes. Bounded now, with the bulk paths named as still open.
+- **Two new items, both from reading the fixes rather than the code they fixed:**
+  [OB10](#ob10--the-record-limit-meant-different-things-depending-on-how-the-wire-split-the-line)
+  and [OB11](#ob11--reasons-and-totals-that-went-missing-on-the-way-out), plus
+  [C7](#c7--a-500-printed-the-nodes-internal-error-text) from the status-classification work.
+- **[CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) is correct, and its
+  documentation was not.** The `has_new_field` guard reads as though it disables type evolution
+  for existing fields. It does not change behaviour: `validate_document` sets `needs_evolution`
+  only for fields the schema has never seen, and a value an existing field cannot hold is
+  *refused* rather than widened — so evolution of an existing field is reachable only from
+  initial schema sampling, which is unaffected. `evolve_field` and `should_evolve_field_static`
+  now say so, because the next reader will ask.
+
+The two file sizes in [CH1](#ch1--one-scatter-gather-written-twice) and
+[CH2](#ch2--the-merge-primitives-deserve-their-own-module) were stale by ~1,300 and ~930 lines and
+are current again. Everything else verified as the file described it: CH9's two remaining pieces,
+CH10, CH11's two duplicates and two hashes, OB8's dropped offset and OB9's discarded peer errors
+are all still exactly as written.
+
+**On the order of work.** The [table](#the-order-of-work) is ordered by what each item costs to
+read, and this batch ignored it: everything done since 0.3.3 is an OB or CH item opened on
+2026-09-01. Defects before features is the right call and not a reason to rewrite the table — but
+the table describes how the *remaining* work should be sequenced, not how work is sequenced when a
+review turns up something wrong.
+
 ---
 
 # Part I — Active work
@@ -99,6 +143,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [C1](#c1--per-index-role-overrides) | Per-index role overrides | 14 | 2026-07-30 | 📋 |
 | [C2](#c2--query-complexity-caps) | Query complexity caps | 14 | 2026-08-10 | 💭 |
 | [C3](#c3--fail-closed-on-unauthenticated-internal) … [C6](#c6--redact-the-cluster-psk-in-debug) | Posture hardening: four items from the 2026-09-01 review | 14 | 2026-09-01 | 📋 |
+| [C7](#c7--a-500-printed-the-nodes-internal-error-text) | A `500` printed the node's internal error text | 14 | 2026-09-01 | ✅ |
 | [D1](#d1--reindex) | Reindex | 15 | 2026-08-15 | 📋 |
 | [D2](#d2--replication) | Replication | 15 | 2026-08-15 | 📋 |
 | [D3](#d3--migration) | Migration | 15 | 2026-08-15 | 📋 |
@@ -116,7 +161,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
 | [J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly) | The flattening lane, and the reference that describes neither | 18 | 2026-08-27 | 📋 |
 | [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to — the evidence behind J1 | 18 | 2026-08-27 | ✅ |
-| [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB9](#ob9--a-bulk-delete-drops-a-peers-per-id-errors) | Correctness, seven items from the 2026-09-01 review — OB3–OB7 done, OB8–OB9 remain | — | 2026-09-01 | ◐ |
+| [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB11](#ob11--reasons-and-totals-that-went-missing-on-the-way-out) | Correctness, nine items from the 2026-09-01 review and the re-read of its own fixes — OB3–OB7 and OB10–OB11 done, OB8–OB9 remain | — | 2026-09-01 | ◐ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
@@ -514,6 +559,15 @@ bound; it is bounded only by the request timeout and the concurrency guard. Cap 
 decompressed bytes on the streaming path — count as the handler drains the body, or make the
 wire-limit apply post-decompression for raw-body handlers.
 
+### C7 — A `500` printed the node's internal error text
+
+✅ **Done** 2026-09-01, found reviewing the `from_route` classification. `AppError::into_response`
+masks a server error's message to `"Internal server error"` — and then returned the unmasked text
+in `details` in the same body, so the mask withheld nothing. A `5xx` now answers with the mask
+alone and the text goes to the `error!` log, which is where an operator reads it and a caller does
+not. A client error still carries its real message in `details`: that one is the caller's to act
+on, and six tests read it.
+
 ### C6 — Redact the cluster PSK in `Debug`
 
 📋 **Planned** (finding H4). `ClusterConfig` derives `Debug` while holding `psk: Option<String>`
@@ -683,6 +737,10 @@ the shard map comes from.
 
 **2026-08-26:** the 0.3.2 sort work is the second change that had to be made twice.
 
+**2026-09-01:** the OB3 forwarding fix is the third. `engine_write` and `orch_write` both had to
+learn to hand a remote shard on, and `engine_delete`/`orch_delete` with them — which is CH10 and
+CH1 charging the same toll on the write side.
+
 ### CH2 — The merge primitives deserve their own module
 
 📋 `SearchWindow`, `order_hit_blocks`, `order_shard_hits`, `compare_hits_by_field`,
@@ -694,6 +752,11 @@ cure — the sorted-collector logic, query preparation and schema description ar
 
 **2026-08-26:** both files grew rather than shrank since the review —
 `node_orchestrator.rs` 9,300 → **9,683** lines, `storage/src/lib.rs` 7,600 → **8,293**.
+
+**2026-09-01:** and again, by more than the previous interval — `node_orchestrator.rs` 9,683 →
+**11,012**, `storage/src/lib.rs` 8,293 → **9,226**. Both grew *while* being actively corrected,
+which is the case for this item rather than against it: every fix in the 0.3.3 review had to be
+made inside one of these two files.
 
 ### CH3 — Cursor paging (`search_after`)
 
@@ -926,6 +989,22 @@ no longer lets a caller-supplied key retarget a key-routed index: on a default o
 id routes whatever was sent, and on a tenant index a missing or empty key is refused. Pinned by the
 updated `a_delete_routes_by_the_id_unless_the_index_routes_by_something_else`.
 
+**And exactly one hop, added 2026-09-01 reviewing the fix.** Forwarding had no bound: the node an
+op is forwarded to runs the same routing decision, from *its* ring view and *its* copy of the
+shard assignments, and those disagree while membership is changing. Two nodes each certain the
+other owns the shard would pass one write between them until something timed out — once per
+write, on every single write and delete, where before this fix the same disagreement was a plain
+error. `ClientOp::Write` and `ClientOp::Delete` now carry `forwarded`, set by the node that
+forwards and refused by the node that receives one already set; the error names the disagreement
+so a retry lands after the views converge. The flag is `#[serde(default)]` and kameo encodes a
+remote message with `rmp_serde::to_vec_named`, so a peer that predates it decodes as a first hop —
+pinned by `an_op_without_the_forwarded_flag_reads_as_a_first_hop`.
+
+Not closed here: the *bulk* forwarding paths have the same unbounded shape, and always did. They
+are one call each and the same flag fits them; left out because a bulk forward carries per-item
+accounting that a refusal has to answer in, which is [OB9](#ob9--a-bulk-delete-drops-a-peers-per-id-errors)'s
+territory rather than this item's.
+
 ### OB4 — The single-write path stages Tantivy before redb commits
 
 ✅ **Done** 2026-09-01.
@@ -957,6 +1036,21 @@ first-occurrence order, with an index map that overwrites an id's entry in place
 each distinct id contributes one Tantivy document and the add order (which breaks score ties)
 stays deterministic. Pinned by `a_batch_keeps_the_last_document_of_a_repeated_id`.
 
+**The other half, found reviewing the fix on 2026-09-01 and now closed with it.** Coalescing the
+*adds* left the *deletes* reading from the wrong place. Whether an id needed its prior version
+removed came from what each `data_table.insert` displaced — and a delete earlier in the same
+batch had already emptied that row, so a re-put of a committed id looked new, no `delete_term`
+was issued, and the document from an earlier batch stayed in the index beside the replacement.
+Two hits for one id, both reading back as the new body, because the read path joins to redb by
+id and redb held one row. Reachable without a hand-built batch: `handle_delete` deliberately
+sends a delete as a `WalOp::Delete` so it coalesces with the writes that arrive with it.
+
+`existed_before` is now decided on an id's first appearance and never revised — the `Delete` arm
+reads `remove`'s return value for exactly this — and the Tantivy pass interleaves the removal and
+the add per id rather than running two passes over two differently-derived lists. Pinned by
+`a_batch_replaces_a_committed_document_it_deletes_and_puts_again` and
+`a_batch_that_puts_then_deletes_an_id_leaves_no_document`.
+
 ### OB6 — Evolving an already-indexed field's type silently unindexes its values
 
 ✅ **Done** 2026-09-01.
@@ -984,6 +1078,15 @@ the field silently unindexed.
 field is now a `400` naming the field, so the validator and the writer agree. Pinned by the new
 case in `a_value_the_declared_type_cannot_hold_is_a_bad_request`.
 
+**A second disagreement of the same kind, found 2026-09-01 and closed with it.** Typing a list by
+its elements — right for a field nobody has declared, and landed the same day — made
+`infer_field_type` answer `I64` for `[1, 2]`, and `unstorable_scalar` asks `infer_field_type`
+about each element of a list. So `[[1, 2]]` under a declared `i64` field passed: the inner list
+"is" an `I64`. The writer flattens exactly one level and reads each element with `as_i64()`,
+which returns `None` for a list, so the value was skipped and the document stored with the field
+unindexed. `unstorable_scalar` now refuses an array or an object before asking what type it
+infers as, which is the only reading under which the writer and the validator agree.
+
 ### OB8 — A paged search loses its page on the streaming fan-out
 
 📋 **Open**, found 2026-09-01.
@@ -1010,6 +1113,38 @@ path should reuse it.
 
 Proposal: return `(items_deleted, errors)` from the forward and merge the peer's reasons,
 renumbered into the caller's batch, exactly as the bulk-write path does.
+
+### OB10 — The record limit meant different things depending on how the wire split the line
+
+✅ **Done** 2026-09-01, reviewing the 35f8fbc stream fix.
+
+Moving the oversize check after the complete lines are drained fixed the false positives it was
+written for, and left the check reachable only for a line *still arriving* — the buffer has
+outgrown the limit and no newline has appeared yet. A line only just over the limit never gets
+there: the chunk carrying the overflowing bytes carries the terminating newline too, the drain
+sees a complete line and takes that path, and nothing measured it. The same file was accepted or
+refused depending on framing, which is the one thing a caller cannot plan around.
+
+**What landed.** The limit is applied to a complete line as well, in one wording shared by both
+paths (`oversized_line`). Pinned by
+`a_write_stream_refuses_an_oversized_line_delivered_whole`, which sets a 1 MB ceiling and sends a
+line a kilobyte over — the delta is what puts the overflow and the newline in one chunk, and
+without the fix that line is parsed and written.
+
+### OB11 — Reasons and totals that went missing on the way out
+
+✅ **Done** 2026-09-01, reviewing the 59dd785/35f8fbc accounting work.
+
+Two small holes in code whose whole subject is not losing track of anything. `renumber_reasons`
+returns exactly one reason per item unwritten, which is what makes a bulk answer add up — and it
+discarded every reason past that count, so a peer that said more than the arithmetic expected had
+the surplus dropped silently. A surplus is now folded onto the last reason: the count still holds
+and nothing said is lost.
+
+The `debug_assert_eq!` accounting invariants in `orch_bulk_write` and the write-stream handler are
+compiled out of the build that actually serves the caller the unbalanced total. Both now log at
+`error!` on the same condition, so the assertion catches an unaccounting path in a test and the
+log catches it in production.
 
 ---
 

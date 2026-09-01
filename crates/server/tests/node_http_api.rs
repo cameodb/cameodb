@@ -975,6 +975,14 @@ async fn a_value_the_declared_type_cannot_hold_is_a_bad_request() {
         // A float has no place in an integer column: the writer reads `as_i64()` and would
         // silently skip it, so the validator refuses rather than store an unindexed value.
         ("count", json!(4.5), "expected I64"),
+        // A list *is* several values of the field, and each is held to the declared type — but
+        // the writer flattens exactly one level, so a list among those elements has no `add_*`
+        // call to make and would be skipped. Typing a list by its elements (which is right for
+        // a field nobody declared) made `[1, 2]` read as an `I64` here, so the nested form got
+        // through and left the field unindexed with nothing said.
+        ("count", json!([[1, 2]]), "is not one value"),
+        ("count", json!([{"n": 1}]), "is not one value"),
+        ("count", json!({"n": 1}), "is not one value"),
         ("cat", json!("no-slash"), "is not a facet path"),
         ("cat", json!(7), "expected Facet"),
     ] {
@@ -3268,6 +3276,52 @@ async fn a_write_stream_skips_an_oversized_line() {
             .as_str()
             .is_some_and(|e| e.starts_with("line 2:") && e.contains("single-record limit")),
         "named by its line and its reason: {body}"
+    );
+}
+
+/// The record limit means the same thing whichever way the wire split the line.
+///
+/// The oversize check the test above exercises fires on a line that is *still arriving*: the
+/// buffer has outgrown the limit and no newline has appeared yet. A line only just past the
+/// limit never reaches that check — the chunk that carries the overflowing bytes carries the
+/// terminating newline too, so the buffer has a complete line in it and the drain takes that
+/// path instead. Without a size check there, the same file was accepted or refused depending on
+/// where the transport happened to split it, and a caller could not tell which answer to expect.
+///
+/// One megabyte, so the line is a kilobyte over rather than six — the delta is what puts the
+/// overflow and the newline in one chunk.
+#[tokio::test]
+async fn a_write_stream_refuses_an_oversized_line_delivered_whole() {
+    let node = TestNode::start("[limits]\nmax_record_size_mb = 1\n").await;
+
+    let big = "x".repeat(1024 * 1024 + 1024);
+    let ndjson = format!(
+        "{{\"id\":\"a\",\"doc\":{{\"t\":\"one\"}}}}\n\
+         {{\"id\":\"big\",\"doc\":{{\"t\":\"{big}\"}}}}\n\
+         {{\"id\":\"c\",\"doc\":{{\"t\":\"three\"}}}}\n"
+    );
+
+    let (status, body) = post_ndjson(&node, "/api/whole/document/stream", &ndjson).await;
+    assert_eq!(
+        status, 200,
+        "an oversized line does not fail the import: {body}"
+    );
+    assert_eq!(
+        body["items_written"], 2,
+        "the two ordinary lines still load: {body}"
+    );
+
+    let errors = body["errors"].as_array().expect("errors array");
+    assert_eq!(
+        errors.len(),
+        1,
+        "the oversized line is refused rather than parsed and written: {body}"
+    );
+    assert!(
+        errors[0]
+            .as_str()
+            .is_some_and(|e| e.starts_with("line 2:") && e.contains("single-record limit")),
+        "and refused for its size, in the same words the other path uses: {body}"
     );
 }
 

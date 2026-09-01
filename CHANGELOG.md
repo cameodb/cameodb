@@ -204,6 +204,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A single write or delete reaches a shard on another node.** Both handlers default their
+  routing hint to the id, and the engine then re-derives the key from the schema's routing
+  field — so on an index that routes by a tenant or a customer the ring could place the write on
+  a shard this node does not host, and `engine_write`/`orch_write` answered `"Shard not found"`
+  instead of forwarding. The bulk paths have always forwarded; this was the single-op divergence.
+  The engine now hands the op back (`NeedsActor`) and the actor forwards it to the owner through
+  the peer pool the bulk paths already use.
+
+  Exactly one hop. Both ends decide from their own view of the ring, and those views disagree
+  while membership is changing, so a forwarded op carries a flag and the node it reaches refuses
+  rather than forwarding it on — two nodes each certain the other owns the shard would otherwise
+  pass one write between them until something timed out. The flag defaults when absent, so a
+  peer that predates it reads as a first hop.
+
+- **A `routing_key` can no longer retarget a delete on a key-routed index.** Where the routing
+  field *is* the key — `id`, or a shadow field whose value is the key — the id routes, and a
+  caller-supplied key that disagreed used to send the delete to a shard holding no such row,
+  which removed nothing and still answered `"deleted"`. On an index that routes by a real field
+  the key is still required, and an empty one is now refused as plainly as a missing one.
+
+- **A failed redb commit can no longer leave a document in the search index.** `apply_write` ran
+  `delete_term`/`add_document` inside the open transaction; if the commit then failed, the
+  document was already buffered in the `IndexWriter` and the next commit flushed a document redb
+  never accepted — with no WAL entry to repair it. It now commits redb first and applies Tantivy
+  after, the shape `apply_batch` already had.
+
+- **A batch that names one id more than once writes one document.** `apply_batch` issued one
+  `delete_term` per *updated* id but an `add_document` for every put, so two puts of one id
+  became two documents under one term while redb kept a single row. The batch now coalesces to
+  the last operation per id, in first-occurrence order so the add order stays deterministic.
+
+  Including the case a delete makes: whether an id needs its prior version removed is decided on
+  the id's **first** appearance in the batch and not revised. Reading it from each `insert` in
+  turn meant a delete earlier in the same batch had already emptied the row, so the re-put looked
+  like a new document, no `delete_term` was issued, and the version committed by an earlier batch
+  stayed in the index beside the replacement. Reachable without a hand-built batch: a single
+  delete travels as a `WalOp::Delete` and coalesces into the same `apply_batch` as the writes
+  that arrive with it.
+
+- **An indexed field's type is pinned to the column the index built for it.** Inline evolution
+  upgraded a declared type with no `indexed` guard and no rebuild, so the writer wrote the new
+  type against the old handle — Tantivy silently skips a non-matching value for a `Str` field
+  and errors on numeric→numeric, and the value was stored in redb and never indexed. A type
+  change goes through a schema edit and a rebuild; a non-indexed field, which has no column yet,
+  still evolves.
+
+- **A float in an integer field is refused rather than silently unindexed.** The validator waved
+  `F64` into an `I64`/`U64` field while the writer read it with `as_i64()`/`as_u64()`, got
+  `None`, and skipped it. `String`→`Text` is the only widening the write path performs on its own.
+
+- **A list inside a list is refused where a numeric field is declared.** Typing a list by its
+  elements is right for a field nobody declared and wrong for judging one value of a declared
+  one: it made `[[1, 2]]` read as `I64`, so the nested form passed validation and the writer's
+  `as_i64()` then skipped it — a document stored with the field unindexed and nothing said. A
+  list under a field is several values of it, flattened exactly one level, so a list or an object
+  among those elements is now refused by name. An object where a scalar is declared is refused in
+  the same words.
+
+- **A line at the record limit means the same thing however the wire split it.** The streaming
+  ingest path checked the size of a line still arriving — the buffer has outgrown the limit and
+  no newline has appeared — which a line only just over the limit never reaches, because the
+  chunk carrying the overflow carries the newline too. Such a line was parsed and written. The
+  limit is now applied to a complete line as well, in the same words.
+
+- **A `500` no longer prints this node's internal error text.** The response masked the message
+  to `"Internal server error"` and then returned the unmasked text in `details` beside it. A
+  server error answers with the mask alone; the text goes to the `error!` log, which is where an
+  operator reads it. A client error still carries its real message in `details`, which is what
+  the caller has to act on.
+
+- **A peer's surplus reasons are carried rather than dropped.** `renumber_reasons` returns exactly
+  one reason per item unwritten, which is what makes a bulk answer add up — but it discarded
+  anything past that count. A reason someone took the trouble to send is the only account of a
+  failure that exists, so a surplus is now folded onto the last reason. The bulk-write and
+  write-stream accounting assertions also log in a release build, where the assertion is compiled
+  out and the caller is served the unbalanced total anyway.
+
+### Performance
+
+- **The single-write path no longer clones the schema and the document body on every write.**
+  The schema is cloned only when the document carries a field the schema has not seen, and the
+  body is moved into shadow filtering rather than copied. The Tantivy document is also built
+  before `begin_write` rather than inside the transaction, so the redb critical section — and the
+  time the writer lock is held — covers the write and nothing else.
+
 - **A field first seen holding a list is typed by what the list holds.** Every tantivy field is
   multivalued, so a list of numbers is a numeric field with several values in it — the reading
   the rest of the write path already takes, since a list is checked element by element and the
