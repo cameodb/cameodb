@@ -110,13 +110,13 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F2](#f2--an-open-loop-load-generator) | An open-loop load generator | — | 2026-08-10 | 📋 |
 | [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator | — | 2026-08-10 | 📋 |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
-| [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items | — | 2026-09-01 | 📋 |
+| [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8 done, CH9 partial | — | 2026-09-01 | ◐ |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
 | [J1](#j1--a-facet-field-cannot-be-written-to) | A facet field cannot be written to | 18 | 2026-08-27 | ✅ |
 | [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
 | [J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly) | The flattening lane, and the reference that describes neither | 18 | 2026-08-27 | 📋 |
 | [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to — the evidence behind J1 | 18 | 2026-08-27 | ✅ |
-| [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB9](#ob9--a-bulk-delete-drops-a-peers-per-id-errors) | Correctness, seven items from the 2026-09-01 review | — | 2026-09-01 | 📋 |
+| [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB9](#ob9--a-bulk-delete-drops-a-peers-per-id-errors) | Correctness, seven items from the 2026-09-01 review — OB3–OB7 done, OB8–OB9 remain | — | 2026-09-01 | ◐ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
@@ -738,22 +738,21 @@ so the next change to how a sorted search counts its total touches one place.
 
 ### CH8 — The single-write path clones the whole schema and document
 
-📋 `apply_write` does `(*schema).clone()` unconditionally and then calls `evolve_from_document`
-on every put, even when the orchestrator already evolved the schema and there are no new fields
-(`storage/src/lib.rs:4975`). It also clones the body in both arms of the shadow filter —
-`json_blob.clone()` whether or not the index has shadow fields (`storage/src/lib.rs:4995-5001`);
-`apply_batch` already moves it. Evolve only when the document carries a field the schema lacks,
-and build the Tantivy doc from the body before moving it into storage.
+✅ **Done** 2026-09-01. `apply_write` now clones the schema only when the document carries a
+field the schema has not seen (the `has_new_field` guard), and moves the body into shadow
+filtering instead of cloning it — the two hot-path clones removed as part of the OB4 reorder.
 
 ### CH9 — Bulk validation clones the batch, and Tantivy docs are built inside the transaction
 
-📋 Two separate costs. `parallel_validate_schema` deep-clones the whole batch (`docs.to_vec()`
-plus a schema clone) to move it into `spawn_blocking` for >64 documents
-(`node_orchestrator.rs:6077-6078`) even though the caller still owns the originals — move them
-in and return them with the verdicts. And both `apply_write` and `apply_batch` build every
-Tantivy document (date parsing, text/json serialization) *inside* the open redb write
-transaction (`storage/src/lib.rs:5015-5047`, `6649-6684`), lengthening the critical section;
-that CPU work needs only the schema and field handles, so stage it before `begin_write`.
+◐ **Partial** 2026-09-01. The `apply_write` half is done: it stages the Tantivy document before
+`begin_write` (as part of the OB4 reorder). Two pieces remain:
+
+- `parallel_validate_schema` still deep-clones the whole batch (`docs.to_vec()` plus a schema
+  clone) to move it into `spawn_blocking` for >64 documents — move them in and return them with
+  the verdicts.
+- `apply_batch` still builds every Tantivy document *inside* the open redb write transaction
+  (the `add_json_value_to_doc` pass), where it shares the critical section with the data row
+  write; the serialisation half already runs outside it.
 
 ### CH10 — `engine_write` and `orch_write` are near-duplicates
 
@@ -911,80 +910,79 @@ decision about the feature, not about safety, and it landed as [J1](#j1--a-facet
 
 ### OB3 — A single write or delete can land on the wrong shard
 
-📋 **Open**, found 2026-09-01 reviewing the write and delete paths after 0.3.3.
+✅ **Done** 2026-09-01.
 
 On an index that routes by a non-key field, the single-write and single-delete handlers default
 their routing hint to `id` (`write.rs:37`, `write.rs:91`). The engine then re-derives the key
-from the schema's routing field (`effective_routing_key`, `node_orchestrator.rs:1175-1185`) and
-routes by the ring — but if that shard is on another node, both `engine_write` and `orch_write`
-answer `"Shard not found"` instead of forwarding, and a keyless delete routes by `id`, appends a
-WAL delete on the wrong shard, removes nothing, and still reports `"deleted"`. The bulk path
-routes every document by the schema field and forwards, so this is a single-path divergence, not
-a routing-model gap.
+from the schema's routing field (`effective_routing_key`, `node_orchestrator.rs`) and routes by
+the ring — but if that shard is on another node, both `engine_write` and `orch_write` answered
+`"Shard not found"` instead of forwarding. The bulk path routes every document by the schema
+field and forwards, so this was a single-path divergence, not a routing-model gap.
 
-Proposal: after `route_write` resolves the target, forward the op to the owning node as the bulk
-path does; and make `effective_delete_routing_key` verify a caller-supplied key against the
-schema routing field rather than trusting it verbatim, so the refusal the handler comment
-promises actually fires.
+**What landed.** `engine_write`/`engine_delete` now return the op back (`NeedsActor`) when the
+ring's target is not a local shard, and `orch_write`/`orch_delete` forward it to the owning node
+through `forward_op_to_owner` (reusing the peer pool the bulk paths use). `effective_delete_routing_key`
+no longer lets a caller-supplied key retarget a key-routed index: on a default or shadow index the
+id routes whatever was sent, and on a tenant index a missing or empty key is refused. Pinned by the
+updated `a_delete_routes_by_the_id_unless_the_index_routes_by_something_else`.
 
 ### OB4 — The single-write path stages Tantivy before redb commits
 
-📋 **Open**, found 2026-09-01.
+✅ **Done** 2026-09-01.
 
-`apply_write` runs `delete_term`/`add_document` *inside* the open redb transaction, before
-`write_txn.commit()` (`storage/src/lib.rs:5049-5078`, commit at 5080). `apply_batch` commits redb
-first (6694) and applies Tantivy after (6701-6734). If the redb commit fails, the single path
-has already buffered the document in the IndexWriter; the next commit flushes a document redb
-never accepted — the "search index ahead of the document store" hazard, with no WAL entry to
-repair it, and exactly the asymmetry the batch ordering exists to prevent. The same function also
-evolves the schema inline where `apply_batch` does not (see OB6), so whether storage-level
-evolution happens depends on writer-thread coalescing.
+`apply_write` ran `delete_term`/`add_document` *inside* the open redb transaction, before
+`write_txn.commit()`. `apply_batch` committed redb first and applied Tantivy after. If the redb
+commit failed, the single path had already buffered the document in the IndexWriter; the next
+commit flushed a document redb never accepted — the "search index ahead of the document store"
+hazard, with no WAL entry to repair it, and exactly the asymmetry the batch ordering exists to
+prevent.
 
-Proposal: order `apply_write` like `apply_batch` — commit redb, then mutate Tantivy — or better,
-unify the two into one `apply_batch`-shaped function so ordering and evolution cannot drift
-again.
+**What landed.** `apply_write` now commits redb first and applies Tantivy after, in the same
+shape as `apply_batch` (the Put arm stages the Tantivy document before `begin_write` and applies
+it after `commit`; the Delete arm removes the row in the transaction and `delete_term`s after).
+The write/delete paths can no longer leave a document buffered in the writer that redb does not
+have.
 
 ### OB5 — One batch can index the same id twice
 
-📋 **Open**, found 2026-09-01.
+✅ **Done** 2026-09-01.
 
-`apply_batch` issues one `delete_term` per *updated* id (tracked by redb `insert`'s return value)
-but `add_document` for *every* put (`storage/src/lib.rs:6638-6733`). Two puts of the same id in
-one batch therefore become one delete plus two adds: two documents under one id term, while redb
-keeps only the last row. Reachable by a bulk write carrying a duplicate id, or by two single
-writes of one id coalesced into one `apply_batch` by the writer thread. The non-coalesced
-`apply_write` path is correct, which hides the divergence.
+`apply_batch` issued one `delete_term` per *updated* id but `add_document` for *every* put. Two
+puts of the same id in one batch therefore became one delete plus two adds: two documents under
+one id term, while redb kept only the last row. Reachable by a bulk write carrying a duplicate id,
+or by two single writes of one id coalesced into one `apply_batch`.
 
-Proposal: coalesce ops by id inside `apply_batch` (last write wins) before building the Tantivy
-ops, so the delete/add pair is emitted once per distinct id.
+**What landed.** `apply_batch` now coalesces to the last operation per id — a Vec kept in
+first-occurrence order, with an index map that overwrites an id's entry in place on a repeat — so
+each distinct id contributes one Tantivy document and the add order (which breaks score ties)
+stays deterministic. Pinned by `a_batch_keeps_the_last_document_of_a_repeated_id`.
 
 ### OB6 — Evolving an already-indexed field's type silently unindexes its values
 
-📋 **Open**, found 2026-09-01.
+✅ **Done** 2026-09-01.
 
-`should_evolve_field_static` upgrades an *indexed* field's declared type (Text→Date/I64/U64/F64/
-Boolean/Ip/Json) with no `indexed` guard and no rebuild (`storage/src/lib.rs:2603-2699`). The
-Tantivy column keeps its old type, so `add_json_value_to_doc` writes the new type against the old
-handle: Tantivy silently skips non-matching values for `Str` fields, and errors on numeric→numeric.
-The orchestrator's fast path treats a date-in-a-Text-field as "no evolution needed", then
-`apply_write` evolves it anyway — so the value is stored in redb and never indexed, the same
-silent loss the 0.3.3 list/null work set out to eliminate.
+`should_evolve_field_static` upgraded an *indexed* field's declared type with no `indexed` guard
+and no rebuild. The Tantivy column kept its old type, so `add_json_value_to_doc` wrote the new
+type against the old handle: Tantivy silently skips non-matching values for `Str` fields, and
+errors on numeric→numeric — the value stored in redb and never indexed.
 
-Proposal: refuse (or defer to a rebuild) type evolution of a field that is already `indexed`, and
-have the validator and `evolve_from_document` share that rule.
+**What landed.** `evolve_field` now refuses to change an indexed field's type: the type is pinned
+to the column the index built for it, and a change goes through a schema edit and a rebuild. A
+non-indexed field still evolves freely (it has no column yet). Pinned by
+`an_indexed_fields_type_is_pinned_to_its_column`.
 
 ### OB7 — The validator and the writer disagree about floats in integer fields
 
-📋 **Open**, found 2026-09-01.
+✅ **Done** 2026-09-01.
 
-`scalar_type_is_storable(I64|U64, F64) => true` (`node_orchestrator.rs:610-622`) waves a float
-into an integer field, but `add_json_value_to_doc` reads it with `as_i64()`/`as_u64()`, gets
-`None`, and skips the value (`storage/src/lib.rs:2088-2101`). The document is stored and the
-field silently unindexed — the validator says "storable", the writer says "no".
+`scalar_type_is_storable(I64|U64, F64) => true` waved a float into an integer field, but the
+writer reads it with `as_i64()`/`as_u64()`, gets `None`, and skips it — the document stored with
+the field silently unindexed.
 
-Proposal: either remove `(I64|U64, F64)` from `scalar_type_is_storable` (refuse floats in int
-fields) or coerce integral floats in the writer, so the two sides agree and a stored document
-always has the indexed values its schema promises.
+**What landed.** `scalar_type_is_storable` no longer accepts `F64` in an `I64`/`U64` field:
+`String`→`Text` is the only widening the write path performs on its own. A float in an integer
+field is now a `400` naming the field, so the validator and the writer agree. Pinned by the new
+case in `a_value_the_declared_type_cannot_hold_is_a_bad_request`.
 
 ### OB8 — A paged search loses its page on the streaming fan-out
 
