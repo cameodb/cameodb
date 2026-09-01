@@ -180,6 +180,14 @@ services:
       - cameodb-node1
       - cameodb-node2
       - cameodb-node3
+    # client_max_body_size below is the node's own ceiling, derived from
+    # limits.max_record_size_mb (64) + 64 MB of framing. A larger value here only moves the
+    # rejection from nginx to the node.
+    #
+    # Keep prose out of the config string itself: it is written by `echo '...'`, so one
+    # apostrophe closes the quote and the remainder of the line becomes shell. That is not a
+    # broken comment but a container that never starts — `sh` reported `unexpected "("` from
+    # the `(64)` above and exited 2, leaving the cluster with no load balancer on :9480.
     command: |
       /bin/sh -c "
       echo 'upstream cameodb_cluster {
@@ -189,8 +197,6 @@ services:
       }
       server {
           listen 80;
-          # The node's own ceiling, derived from limits.max_record_size_mb (64) + 64 MB of
-          # framing. A larger value here only moves the rejection from nginx to the node.
           client_max_body_size 128M;
           client_body_buffer_size 64M;
           location / {
