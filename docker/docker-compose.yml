@@ -7,6 +7,10 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+      args:
+        # Part of the CA layer's cache key; the secret itself is not. Without it a build that
+        # supplies a CA reuses the cached layer from one that did not. See the Dockerfile.
+        CORPORATE_CA_ID: ${CAMEODB_CA_CERT:-none}
       # Injects the CA into the build stage only; see the secrets block below
       secrets:
         - corporate-ca

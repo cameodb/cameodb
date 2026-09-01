@@ -15,6 +15,10 @@ profile = "internal"
 bind_address = "0.0.0.0"
 port = 9480
 request_timeout_secs = 30
+# In-flight bodies are held in memory, so this multiplied by the body ceiling has to fit
+# inside limits.total_memory_limit_mb below. 32 x 128 MB = 4096 MB, which is exactly the
+# budget; `cameodb check-config` warns when the product exceeds it. Raise them together.
+max_concurrent_requests = 32
 # Empty means no browser origin is allowed, which is what a node with no web UI wants.
 # The "internal" and "external" profiles both reject "*". Name the origins that need it:
 #   cors_allowed_origins = ["https://app.example.com"]

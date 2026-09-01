@@ -36,8 +36,20 @@ This setup runs a 3-node cluster and is defined in `docker-compose-cluster.yml`.
 mkdir -p ../data/cameodb/node{1,2,3}
 
 # From the /docker directory, start the cluster
-docker-compose -f docker-compose-cluster.yml up -d
+docker compose -f docker-compose-cluster.yml up -d
 ```
+
+**The cluster pre-shared key.** `profile = "internal"` refuses to start a node with the cluster
+enabled and no PSK: without one, anything that can reach `:9580` can join the swarm. The compose
+file carries a throwaway default so the cluster comes up with no setup. Generate a real one for
+anything that outlives the test — 64 hex characters, identical on every node:
+
+```bash
+CAMEODB_CLUSTER_PSK=$(openssl rand -hex 32) \
+  docker compose -f docker-compose-cluster.yml up -d
+```
+
+There is no rotation path short of stopping every node.
 
 - **Access Points**:
   - **Load Balanced**: `http://localhost:9480` (via NGINX)
@@ -46,6 +58,10 @@ docker-compose -f docker-compose-cluster.yml up -d
   - **Node 3 (Direct)**: `http://localhost:9483`
 - **Data Persistence**: Each node's data is stored in a separate subdirectory within `data/cameodb/`.
 - **Swarm Configuration**: Update the `CAMEODB_CLUSTER_NAME`, `CAMEODB_CLUSTER_PORT`, `CAMEODB_SEED_NODES`, and `CAMEODB_CLUSTER_ENABLED` environment variables to reflect your deployment topology.
+- **Body size**: the nodes accept 128 MB, derived from `limits.max_record_size_mb` (64) plus
+  framing, and NGINX is set to match. Raise `CAMEODB_MAX_RECORD_SIZE_MB` to move both — and
+  `max_concurrent_requests` × the body ceiling has to stay inside `total_memory_limit_mb`, which
+  `check-config` will tell you if it does not.
 
 ## Security
 

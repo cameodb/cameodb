@@ -6,6 +6,10 @@ services:
     build: 
       context: ..
       dockerfile: Dockerfile
+      args:
+        # Part of the CA layer's cache key; the secret itself is not. Without it a build that
+        # supplies a CA reuses the cached layer from one that did not. See the Dockerfile.
+        CORPORATE_CA_ID: ${CAMEODB_CA_CERT:-none}
       secrets:
         - corporate-ca
     image: cameodb:latest
@@ -23,8 +27,12 @@ services:
       - CAMEODB_CLUSTER_PORT=9580
       - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
       - CAMEODB_CLUSTER_NODES=cameodb-node1:9580,cameodb-node2:9580,cameodb-node3:9580
-      - CAMEODB_MAX_BODY_SIZE_MB=200
-      - CAMEODB_DEFAULT_BATCH_SIZE=5000
+      - CAMEODB_STORAGE_DEFAULT_BATCH_SIZE=5000
+      # Every node in a cluster must carry the same key, and the "internal" profile refuses
+      # to start a clustered node without one. The default below is a throwaway for this
+      # compose file and nothing else — generate a real one for anything that outlives it:
+      #   CAMEODB_CLUSTER_PSK=$(openssl rand -hex 32) docker compose -f docker-compose-cluster.yml up
+      - CAMEODB_CLUSTER_PSK=${CAMEODB_CLUSTER_PSK:-deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef}
     
     ports:
       - "9481:9480"
@@ -53,6 +61,10 @@ services:
     build: 
       context: ..
       dockerfile: Dockerfile
+      args:
+        # Part of the CA layer's cache key; the secret itself is not. Without it a build that
+        # supplies a CA reuses the cached layer from one that did not. See the Dockerfile.
+        CORPORATE_CA_ID: ${CAMEODB_CA_CERT:-none}
       secrets:
         - corporate-ca
     image: cameodb:latest
@@ -70,8 +82,12 @@ services:
       - CAMEODB_CLUSTER_PORT=9580
       - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
       - CAMEODB_CLUSTER_NODES=cameodb-node1:9580,cameodb-node2:9580,cameodb-node3:9580
-      - CAMEODB_MAX_BODY_SIZE_MB=200
-      - CAMEODB_DEFAULT_BATCH_SIZE=5000
+      - CAMEODB_STORAGE_DEFAULT_BATCH_SIZE=5000
+      # Every node in a cluster must carry the same key, and the "internal" profile refuses
+      # to start a clustered node without one. The default below is a throwaway for this
+      # compose file and nothing else — generate a real one for anything that outlives it:
+      #   CAMEODB_CLUSTER_PSK=$(openssl rand -hex 32) docker compose -f docker-compose-cluster.yml up
+      - CAMEODB_CLUSTER_PSK=${CAMEODB_CLUSTER_PSK:-deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef}
     
     ports:
       - "9482:9480"
@@ -101,6 +117,10 @@ services:
     build: 
       context: ..
       dockerfile: Dockerfile
+      args:
+        # Part of the CA layer's cache key; the secret itself is not. Without it a build that
+        # supplies a CA reuses the cached layer from one that did not. See the Dockerfile.
+        CORPORATE_CA_ID: ${CAMEODB_CA_CERT:-none}
       secrets:
         - corporate-ca
     image: cameodb:latest
@@ -118,8 +138,12 @@ services:
       - CAMEODB_CLUSTER_PORT=9580
       - CAMEODB_SEED_NODES=cameodb-node1:9580,cameodb-node2:9580
       - CAMEODB_CLUSTER_NODES=cameodb-node1:9580,cameodb-node2:9580,cameodb-node3:9580
-      - CAMEODB_MAX_BODY_SIZE_MB=200
-      - CAMEODB_DEFAULT_BATCH_SIZE=5000
+      - CAMEODB_STORAGE_DEFAULT_BATCH_SIZE=5000
+      # Every node in a cluster must carry the same key, and the "internal" profile refuses
+      # to start a clustered node without one. The default below is a throwaway for this
+      # compose file and nothing else — generate a real one for anything that outlives it:
+      #   CAMEODB_CLUSTER_PSK=$(openssl rand -hex 32) docker compose -f docker-compose-cluster.yml up
+      - CAMEODB_CLUSTER_PSK=${CAMEODB_CLUSTER_PSK:-deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef}
     
     ports:
       - "9483:9480"
@@ -165,8 +189,9 @@ services:
       }
       server {
           listen 80;
-          # Allow larger batch writes (adjust as needed)
-          client_max_body_size 200M;
+          # The node's own ceiling, derived from limits.max_record_size_mb (64) + 64 MB of
+          # framing. A larger value here only moves the rejection from nginx to the node.
+          client_max_body_size 128M;
           client_body_buffer_size 64M;
           location / {
               proxy_pass http://cameodb_cluster;
