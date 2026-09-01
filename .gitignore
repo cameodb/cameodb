@@ -120,9 +120,16 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 
-# Production data directory (created at runtime)
-/data/cameodb/
-/data/examples/
+# Runtime data directories, and any copy of one made by hand.
+#
+# Naming the two subdirectories the server creates (/data/cameodb/, /data/examples/) left a
+# renamed or backed-up copy tracked: moving data/cameodb aside as data/cameodb.bak-<ts> to get
+# a clean test run put a database — redb files, tantivy segments, node_identity.json — into
+# `git status`. So match the directory itself and everything under it, whatever it is called.
+#
+# Anchored to the repository root on purpose, so it never catches a `data` directory nested
+# somewhere in the tree. `examples/data/` is checked in and must stay that way.
+/data*/
 
 # Test artifacts and temporary files
 *.tmp
