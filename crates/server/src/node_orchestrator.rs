@@ -615,23 +615,45 @@ fn infer_field_type(value: &JsonValue) -> TantivyFieldType {
     FieldDef::infer_type_from_value(value)
 }
 
-/// Whether a field declared as one type can hold a single value that reads as another.
+/// Whether a field declared as one type can hold a single value.
 ///
-/// `String` is `Text` under an older name, and is the only widening the write path performs on
-/// its own. Everything else has to match exactly: a declared `i64` receiving a float or a word
-/// has nowhere to put it — the writer reads `as_i64()`/`as_u64()` and would skip the value,
-/// leaving the document stored with the field silently unindexed. A float is refused here rather
-/// than widened, because widening an already-built column needs a rebuild, which no write path
-/// performs (see `IndexSchema::evolve_field`, which never changes an indexed field's type).
+/// **A numeric field is asked the writer's own question**, not whether two type names match.
+/// `add_json_value_to_doc` stores what `as_u64()`/`as_i64()`/`as_f64()` returns and skips the
+/// value when one returns `None`, so that call *is* the definition of what the field can hold.
+/// Comparing inferred names instead disagreed with it in both directions, because
+/// `infer_type_from_value` reads every integer that fits in an `i64` as `I64`:
+///
+/// - a declared `u64` refused `2018` and `0` — every ordinary non-negative integer — and
+///   accepted only what exceeds `i64::MAX`, while the writer's `as_u64()` would have stored
+///   any of them.
+/// - a declared `f64` refused `3`, `0` and `-5` — every whole number — and accepted only a
+///   value written with a fraction, while `as_f64()` widens an integer to a float happily.
+///
+/// Both were refusals of documents the engine can hold, which is the mirror of the silent loss
+/// this function exists to prevent, and both are gone now that the question is the writer's.
+/// The refusals that matter still stand, because `as_*` returns `None` for exactly them: a
+/// negative into a `u64`, a fraction into an integer, an integer past `i64::MAX` into an `i64`.
+///
+/// `String` is `Text` under an older name, and is the only widening left that is about names.
+/// A type is never *changed* to fit a value — widening an already-built column needs a rebuild,
+/// which no write path performs (see `IndexSchema::evolve_field`).
 ///
 /// Values whose *shape* rather than type decides the answer — a list, a null, a text or json
 /// field that takes anything, a facet path — are settled by `unstorable_value` before this is asked.
-fn scalar_type_is_storable(declared: &TantivyFieldType, inferred: &TantivyFieldType) -> bool {
-    if declared == inferred {
+fn scalar_type_is_storable(declared: &TantivyFieldType, value: &JsonValue) -> bool {
+    match declared {
+        TantivyFieldType::U64 => return value.as_u64().is_some(),
+        TantivyFieldType::I64 => return value.as_i64().is_some(),
+        TantivyFieldType::F64 => return value.as_f64().is_some(),
+        _ => {}
+    }
+
+    let inferred = infer_field_type(value);
+    if *declared == inferred {
         return true;
     }
     matches!(
-        (declared, inferred),
+        (declared, &inferred),
         (TantivyFieldType::String, TantivyFieldType::Text)
     )
 }
@@ -743,8 +765,7 @@ fn unstorable_scalar(
         return (!storage::is_date_value(value)).then(|| type_mismatch(field, declared, value));
     }
 
-    let inferred = infer_field_type(value);
-    (!scalar_type_is_storable(declared, &inferred)).then(|| type_mismatch(field, declared, value))
+    (!scalar_type_is_storable(declared, value)).then(|| type_mismatch(field, declared, value))
 }
 
 /// The one wording for a value whose type the field cannot hold.
@@ -10947,6 +10968,54 @@ mod tests {
                  shadow name"
             );
         }
+    }
+
+    /// A numeric field holds what the writer can store, which is not "what the name infers".
+    ///
+    /// `infer_type_from_value` reads every integer that fits in an `i64` as `I64`, so comparing
+    /// inferred names refused a declared `u64` every ordinary integer — `0` and `2018` included —
+    /// and accepted only what exceeds `i64::MAX`. A declared `f64` likewise refused every whole
+    /// number and took only a value written with a fraction. Both refused documents the engine
+    /// holds perfectly well: `add_json_value_to_doc` would have stored each one through
+    /// `as_u64()`/`as_f64()`.
+    #[test]
+    fn a_numeric_field_takes_every_value_the_writer_can_store() {
+        let storable = |declared, value| unstorable_value("n", &declared, &value).is_none();
+
+        // The cases the old name comparison refused.
+        assert!(storable(TantivyFieldType::U64, json!(2018)));
+        assert!(storable(TantivyFieldType::U64, json!(0)));
+        assert!(storable(TantivyFieldType::F64, json!(3)));
+        assert!(storable(TantivyFieldType::F64, json!(0)));
+        assert!(storable(TantivyFieldType::F64, json!(-5)));
+
+        // The ones it already allowed, still allowed.
+        assert!(storable(TantivyFieldType::U64, json!(u64::MAX)));
+        assert!(storable(TantivyFieldType::I64, json!(2018)));
+        assert!(storable(TantivyFieldType::I64, json!(-5)));
+        assert!(storable(TantivyFieldType::F64, json!(3.5)));
+
+        // A list is several values of the field, each judged on its own.
+        assert!(storable(TantivyFieldType::U64, json!([1, 2, 3])));
+        assert!(storable(TantivyFieldType::F64, json!([1, 2.5])));
+    }
+
+    /// The refusals that prevent silent loss are the ones `as_*` returns `None` for, and they
+    /// have to survive the widening above — a value the writer would skip must still be refused
+    /// here, or the document is stored with the field quietly unindexed.
+    #[test]
+    fn a_numeric_field_still_refuses_what_the_writer_would_skip() {
+        let refused = |declared, value| unstorable_value("n", &declared, &value).is_some();
+
+        assert!(refused(TantivyFieldType::U64, json!(-5)));      // as_u64() -> None
+        assert!(refused(TantivyFieldType::U64, json!(3.5)));     // as_u64() -> None
+        assert!(refused(TantivyFieldType::I64, json!(3.5)));     // as_i64() -> None
+        assert!(refused(TantivyFieldType::I64, json!(u64::MAX))); // past i64::MAX
+        assert!(refused(TantivyFieldType::U64, json!("2018")));  // a word, not a number
+        assert!(refused(TantivyFieldType::F64, json!(true)));
+
+        // And an element inside a list is held to the same rule.
+        assert!(refused(TantivyFieldType::U64, json!([1, -2])));
     }
 
     /// A declaration cannot make a column exist, and the refusal says which case it is.
