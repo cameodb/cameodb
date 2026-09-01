@@ -14,10 +14,12 @@
 //! into the config and reintroduce exactly the problem a KDF exists to solve.
 //!
 //! This module is the model. [`crate::authz`] is the enforcement: it holds the route table
-//! and the middleware that consults a [`KeyRing`] in front of the router. What is still
-//! missing is per-tool authorization inside MCP and index filtering on the list endpoints
-//! (ROADMAP Phase 14 Stage B1 steps 3–4); until those land, an index-scoped key is refused
-//! at `/mcp` outright rather than allowed to escape its scope.
+//! and the middleware that consults a [`KeyRing`] in front of the router. Per-tool
+//! authorization inside MCP and index filtering on the list endpoints are part of that
+//! enforcement today — the MCP dispatcher checks each tool's capability and the index it
+//! names, and the catalogue handlers filter what a scoped key may enumerate. What is still
+//! missing is per-index role overrides — a key with one role granted less on a named index —
+//! which is Phase 14 Stage C3 in the roadmap.
 
 use std::fmt;
 use std::path::{Path, PathBuf};

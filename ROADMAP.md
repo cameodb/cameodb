@@ -42,9 +42,9 @@ on one.
 | 15 — HA: reindex, replication, migration | 📋 Planned | All three stages |
 | 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 4.2, Stage 3's deeper warming options, and the measurement on the reporting node |
 | 17 — Record deletion | ✅ Done | — |
-| 18 — Field types: Facet and JSON | ◐ Partial | J1, J2 and J3 — a facet field cannot be written to, a json field behaves exactly like a text one. The prerequisite (OB1, `fast` three-state on the wire) is done. No migration: neither type holds anything today |
+| 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
-| Code health — reviewed at 0.3.1 | 📋 Planned | Seven items, none behavioural |
+| Code health — reviewed at 0.3.1, extended 2026-09-01 | 📋 Planned | Twelve items; CH8–CH12 are write-path efficiency |
 
 ## Reconciliation, 2026-08-26
 
@@ -98,6 +98,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [B2](#b2--2f3--per-arena-jemalloc-stats) | 2f.3 — per-arena jemalloc stats | 13 | 2026-08-08 | 📋 |
 | [C1](#c1--per-index-role-overrides) | Per-index role overrides | 14 | 2026-07-30 | 📋 |
 | [C2](#c2--query-complexity-caps) | Query complexity caps | 14 | 2026-08-10 | 💭 |
+| [C3](#c3--fail-closed-on-unauthenticated-internal) … [C6](#c6--redact-the-cluster-psk-in-debug) | Posture hardening: four items from the 2026-09-01 review | 14 | 2026-09-01 | 📋 |
 | [D1](#d1--reindex) | Reindex | 15 | 2026-08-15 | 📋 |
 | [D2](#d2--replication) | Replication | 15 | 2026-08-15 | 📋 |
 | [D3](#d3--migration) | Migration | 15 | 2026-08-15 | 📋 |
@@ -109,11 +110,13 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F2](#f2--an-open-loop-load-generator) | An open-loop load generator | — | 2026-08-10 | 📋 |
 | [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator | — | 2026-08-10 | 📋 |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
+| [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items | — | 2026-09-01 | 📋 |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
-| [J1](#j1--a-facet-field-cannot-be-written-to) | A facet field cannot be written to | 18 | 2026-08-27 | 📋 |
+| [J1](#j1--a-facet-field-cannot-be-written-to) | A facet field cannot be written to | 18 | 2026-08-27 | ✅ |
 | [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
 | [J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly) | The flattening lane, and the reference that describes neither | 18 | 2026-08-27 | 📋 |
-| [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to — the evidence behind J1 | 18 | 2026-08-27 | 📋 |
+| [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to — the evidence behind J1 | 18 | 2026-08-27 | ✅ |
+| [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB9](#ob9--a-bulk-delete-drops-a-peers-per-id-errors) | Correctness, seven items from the 2026-09-01 review | — | 2026-09-01 | 📋 |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
@@ -477,6 +480,47 @@ and much narrower problem than a loop of ordinary ones. Revisit if a workload ap
 one query — not a stream of them — is the threat; the two `parse_query_lenient` call sites in
 `crates/storage/src/lib.rs` are where a cap would go.
 
+### C3 — Fail closed on unauthenticated `internal`
+
+📋 **Planned**, from the 2026-09-01 review (finding H1). `[security] enabled` defaults to
+`false`, and on the `internal` profile that is an `Outcome::Warn` — the node starts with every
+HTTP and MCP endpoint unauthenticated, and `check-config` exits 0. Only `external` makes it a
+`Fail`. The posture system is correct at what it enforces; this is the one rule whose soft
+gate leaves a network-reachable node open by omission.
+
+Make `enabled = false` on `internal` a `Fail`, with an explicit escape hatch —
+`allow_unauthenticated = true` — for the deployments that genuinely want a trusted-but-open
+node. Have `check-config` exit non-zero on that warning specifically, so "green" and "secure"
+stop meaning different things. `posture.rs` `evaluate`'s `auth` rule (392–434) and `config.rs`
+`check_posture` are the two places.
+
+### C4 — The admin API reachable off-box unauthenticated
+
+📋 **Planned** (finding H2). `admin_enabled` defaults to `true`, and under `internal` a node
+bound off-loopback with no `NodeAdmin` key only *warns* that `/_admin/*` — memory purge,
+forced commit, writer eviction — is reachable unauthenticated (`posture.rs` 317–322). Closing
+C3 closes this too (with auth on, these routes are already gated on `NodeAdmin`), but the two
+are worth keeping apart: an operator can enable auth and still leave the admin API exposed to
+every key rather than to an admin one. Fold the off-box `admin_api` warning into the same gate
+as C3's.
+
+### C5 — A decompression cap on the streaming ingest path
+
+📋 **Planned** (finding H3). `POST /api/{index}/document/stream` takes a raw `Body`, so
+`DefaultBodyLimit` (which measures the *expanded* size for `Json`/`Bytes` extractors) never
+applies to it, and `RequestBodyLimitLayer` counts compressed wire bytes before
+`DecompressionLayer` inflates them. A gzip stream under the wire limit can expand without
+bound; it is bounded only by the request timeout and the concurrency guard. Cap total
+decompressed bytes on the streaming path — count as the handler drains the body, or make the
+wire-limit apply post-decompression for raw-body handlers.
+
+### C6 — Redact the cluster PSK in `Debug`
+
+📋 **Planned** (finding H4). `ClusterConfig` derives `Debug` while holding `psk: Option<String>`
+(`config.rs` 728–731, 767–782). Nothing `Debug`-prints the config today, but any future
+`debug!("{:?}", config)` leaks the PSK. Hand-implement `Debug` for `ClusterConfig` (or wrap the
+field in a redacting type), the way `ClusterPsk` and `ApiKey` already do.
+
 ---
 
 ## D. Phase 15 — High Availability: Reindex, Replication & Migration 📋 Planned
@@ -625,6 +669,9 @@ item was still present. Nothing here changes behaviour; each item is a place the
 one thing twice, or where the next feature will cost more than it should. Ordered by what each
 buys, not by effort.
 
+CH8–CH12 were added by the 2026-09-01 write/read/delete review and are the same kind of item:
+write-path allocations and duplication that cost latency but are not defects.
+
 ### CH1 — One scatter-gather, written twice
 
 📋 `engine_search` and `orch_search` in `node_orchestrator.rs` are ~150-line near-duplicates:
@@ -688,6 +735,57 @@ path being untidy rather than slow — worth doing when the function is next ope
 string-fast branch writes the same `MultiCollector` block out by hand because its key type is
 `String` rather than a copyable numeric. Fold it in by parameterizing the collector expression,
 so the next change to how a sorted search counts its total touches one place.
+
+### CH8 — The single-write path clones the whole schema and document
+
+📋 `apply_write` does `(*schema).clone()` unconditionally and then calls `evolve_from_document`
+on every put, even when the orchestrator already evolved the schema and there are no new fields
+(`storage/src/lib.rs:4975`). It also clones the body in both arms of the shadow filter —
+`json_blob.clone()` whether or not the index has shadow fields (`storage/src/lib.rs:4995-5001`);
+`apply_batch` already moves it. Evolve only when the document carries a field the schema lacks,
+and build the Tantivy doc from the body before moving it into storage.
+
+### CH9 — Bulk validation clones the batch, and Tantivy docs are built inside the transaction
+
+📋 Two separate costs. `parallel_validate_schema` deep-clones the whole batch (`docs.to_vec()`
+plus a schema clone) to move it into `spawn_blocking` for >64 documents
+(`node_orchestrator.rs:6077-6078`) even though the caller still owns the originals — move them
+in and return them with the verdicts. And both `apply_write` and `apply_batch` build every
+Tantivy document (date parsing, text/json serialization) *inside* the open redb write
+transaction (`storage/src/lib.rs:5015-5047`, `6649-6684`), lengthening the critical section;
+that CPU work needs only the schema and field handles, so stage it before `begin_write`.
+
+### CH10 — `engine_write` and `orch_write` are near-duplicates
+
+📋 The single-write counterpart to CH1. The worker path (`engine_write`, 2844–2934) and the
+actor fallback (`orch_write`, 7729–7849) repeat the same validation, effective-key derivation,
+ring routing and shard dispatch, and the two have already drifted on the routing rule this
+review's OB3 names. Extract the shared body; the two callers differ only in where the schema
+comes from.
+
+### CH11 — Routing-key derivation is written four times, with two algorithms
+
+📋 The precedence "document's routing field → caller's routing key → id → hash of the
+document" is spelled out in `write.rs:159-170` and `write.rs:443-455` (identical duplicates),
+`node_orchestrator.rs:1175-1185` (`effective_routing_key`), and the inline bulk-routing closure
+(8207-8210) — and the two "hash the document" fallbacks use *different* hashes
+(`xxh3_64` of full bytes in one, hex-of-prefix in the other). One function, one hash, called
+everywhere; this is exactly the rule the code's own comments insist must agree with itself.
+
+### CH12 — Write-path serialization and round-trip waste
+
+📋 The small ones collected, none of which alone justifies an item:
+
+- The bulk response is serialized twice — once to measure `response_size` for a log line
+  (`write.rs:180-187`), then again by axum. Gate the measurement behind log-enablement.
+- `handle_remote` deep-clones the whole op on every retry attempt, including the
+  single-attempt success path (`node_orchestrator.rs:5698`) — move the owned op on the final
+  attempt, clone only between retries.
+- Bulk writes never use the worker pool, so a large `BulkWrite` serializes on the orchestrator
+  actor mailbox for its full duration, blocking other actor-served operations.
+- The writer thread keeps single `Write`s and `BatchWrite`s in separate maps and applies them
+  as two redb transactions, contradicting the comment at `node_orchestrator.rs:3420-3421` that
+  says they are merged.
 
 ---
 
@@ -771,9 +869,9 @@ failed, the index-level one reporting `{"defaulted", "asked", "declined"}` as th
 
 ### OB2 — A `facet` field cannot be written to
 
-📋 **Open**, found 2026-08-27 while auditing what the MCP syntax reference advertises. Scoped the
-same day as [J1](#j1--a-facet-field-cannot-be-written-to); the evidence stays here, the plan is
-there.
+✅ **Done** 2026-08-31. Found 2026-08-27 while auditing what the MCP syntax reference advertises,
+and scoped the same day as [J1](#j1--a-facet-field-cannot-be-written-to), where the fix landed.
+The evidence stays here; the plan is there.
 
 Every JSON value shape is refused. `staged_schema_validation` infers a type from the value and
 compares it with the declared one: a string infers `Text` (or `Date`, or `Ip`), a number infers a
@@ -808,8 +906,112 @@ defect load-bearing: relaxing the validator without fixing the constructor call 
 an unusable field type into a way to stop a node with one document. Values are now checked where
 they enter the index, on both write paths, and refused by name; the replay path skips and warns
 instead, since the value is already committed and failing an index open over one field serves
-nobody. So this item is now free to be a decision about whether the type earns its place rather
-than a decision about safety. That decision is [J1](#j1--a-facet-field-cannot-be-written-to).
+nobody. With the panic fixed, the remaining question — does the type earn its place — was a
+decision about the feature, not about safety, and it landed as [J1](#j1--a-facet-field-cannot-be-written-to).
+
+### OB3 — A single write or delete can land on the wrong shard
+
+📋 **Open**, found 2026-09-01 reviewing the write and delete paths after 0.3.3.
+
+On an index that routes by a non-key field, the single-write and single-delete handlers default
+their routing hint to `id` (`write.rs:37`, `write.rs:91`). The engine then re-derives the key
+from the schema's routing field (`effective_routing_key`, `node_orchestrator.rs:1175-1185`) and
+routes by the ring — but if that shard is on another node, both `engine_write` and `orch_write`
+answer `"Shard not found"` instead of forwarding, and a keyless delete routes by `id`, appends a
+WAL delete on the wrong shard, removes nothing, and still reports `"deleted"`. The bulk path
+routes every document by the schema field and forwards, so this is a single-path divergence, not
+a routing-model gap.
+
+Proposal: after `route_write` resolves the target, forward the op to the owning node as the bulk
+path does; and make `effective_delete_routing_key` verify a caller-supplied key against the
+schema routing field rather than trusting it verbatim, so the refusal the handler comment
+promises actually fires.
+
+### OB4 — The single-write path stages Tantivy before redb commits
+
+📋 **Open**, found 2026-09-01.
+
+`apply_write` runs `delete_term`/`add_document` *inside* the open redb transaction, before
+`write_txn.commit()` (`storage/src/lib.rs:5049-5078`, commit at 5080). `apply_batch` commits redb
+first (6694) and applies Tantivy after (6701-6734). If the redb commit fails, the single path
+has already buffered the document in the IndexWriter; the next commit flushes a document redb
+never accepted — the "search index ahead of the document store" hazard, with no WAL entry to
+repair it, and exactly the asymmetry the batch ordering exists to prevent. The same function also
+evolves the schema inline where `apply_batch` does not (see OB6), so whether storage-level
+evolution happens depends on writer-thread coalescing.
+
+Proposal: order `apply_write` like `apply_batch` — commit redb, then mutate Tantivy — or better,
+unify the two into one `apply_batch`-shaped function so ordering and evolution cannot drift
+again.
+
+### OB5 — One batch can index the same id twice
+
+📋 **Open**, found 2026-09-01.
+
+`apply_batch` issues one `delete_term` per *updated* id (tracked by redb `insert`'s return value)
+but `add_document` for *every* put (`storage/src/lib.rs:6638-6733`). Two puts of the same id in
+one batch therefore become one delete plus two adds: two documents under one id term, while redb
+keeps only the last row. Reachable by a bulk write carrying a duplicate id, or by two single
+writes of one id coalesced into one `apply_batch` by the writer thread. The non-coalesced
+`apply_write` path is correct, which hides the divergence.
+
+Proposal: coalesce ops by id inside `apply_batch` (last write wins) before building the Tantivy
+ops, so the delete/add pair is emitted once per distinct id.
+
+### OB6 — Evolving an already-indexed field's type silently unindexes its values
+
+📋 **Open**, found 2026-09-01.
+
+`should_evolve_field_static` upgrades an *indexed* field's declared type (Text→Date/I64/U64/F64/
+Boolean/Ip/Json) with no `indexed` guard and no rebuild (`storage/src/lib.rs:2603-2699`). The
+Tantivy column keeps its old type, so `add_json_value_to_doc` writes the new type against the old
+handle: Tantivy silently skips non-matching values for `Str` fields, and errors on numeric→numeric.
+The orchestrator's fast path treats a date-in-a-Text-field as "no evolution needed", then
+`apply_write` evolves it anyway — so the value is stored in redb and never indexed, the same
+silent loss the 0.3.3 list/null work set out to eliminate.
+
+Proposal: refuse (or defer to a rebuild) type evolution of a field that is already `indexed`, and
+have the validator and `evolve_from_document` share that rule.
+
+### OB7 — The validator and the writer disagree about floats in integer fields
+
+📋 **Open**, found 2026-09-01.
+
+`scalar_type_is_storable(I64|U64, F64) => true` (`node_orchestrator.rs:610-622`) waves a float
+into an integer field, but `add_json_value_to_doc` reads it with `as_i64()`/`as_u64()`, gets
+`None`, and skips the value (`storage/src/lib.rs:2088-2101`). The document is stored and the
+field silently unindexed — the validator says "storable", the writer says "no".
+
+Proposal: either remove `(I64|U64, F64)` from `scalar_type_is_storable` (refuse floats in int
+fields) or coerce integral floats in the writer, so the two sides agree and a stored document
+always has the indexed values its schema promises.
+
+### OB8 — A paged search loses its page on the streaming fan-out
+
+📋 **Open**, found 2026-09-01.
+
+`handle_broadcast_streaming` matches `ClientOp::Search` and drops `offset` (`offset: _` →
+`offset: None`, `node_orchestrator.rs:5423-5430`), and `route_and_handle_inner` sends a plain
+`Search` op down that path when routing is `Broadcast` and `enable_streaming_search` is on
+(4688-4691). On a multi-node cluster with streaming enabled, a paged `POST /api/{index}/search`
+with `offset > 0` silently returns page 1. The HTTP stream handler already refuses offset for
+`ClientOp::Stream`; nothing refuses it for a `Search` op reaching this branch.
+
+Proposal: either honour the offset in the streaming path or refuse a paged `Search` there the
+way the stream route already does — never answer a different page than the one asked for.
+
+### OB9 — A bulk delete drops a peer's per-id errors
+
+📋 **Open**, found 2026-09-01.
+
+`forward_bulk_delete_to_remote` logs a peer's `errors` array but returns only `items_deleted`
+(`node_orchestrator.rs:8058-8112`), so per-id failures on a peer surface as a silent shortfall
+that breaks `items_received == items_deleted + errors.len()`. The bulk-write counterpart already
+renumbers and forwards a peer's reasons (`remote_rejections`/`renumber_reasons`); the delete
+path should reuse it.
+
+Proposal: return `(items_deleted, errors)` from the forward and merge the peer's reasons,
+renumbered into the caller's batch, exactly as the bulk-write path does.
 
 ---
 
@@ -817,11 +1019,12 @@ than a decision about safety. That decision is [J1](#j1--a-facet-field-cannot-be
 
 Scoped 2026-08-27, measured against a running engine rather than read off the source.
 
-Two field types exist in the schema, are advertised in the query reference, and do not do what
-their names promise. `facet` cannot be written to at all. `json` can, and behaves exactly like
-`text` — same terms, same matches, no subfield addressing. Both are one write-path change away
-from working, and neither change is only a fix: each alters what an index means, which is why they
-are planned rather than patched.
+Two field types exist in the schema and are advertised in the query reference. `facet` could not
+be written to, and is fixed — [J1](#j1--a-facet-field-cannot-be-written-to) landed 2026-08-31, so a
+declared facet field now takes a path and matches a hierarchy. `json` can be written to, and still
+behaves exactly like `text` — same terms, same matches, no subfield addressing. That is the
+remaining item, and it is not only a fix: it alters what an index means, which is why it is
+planned rather than patched.
 
 **The order is fixed, and one item was a prerequisite rather than a preference.**
 [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) went first and **landed 2026-08-27**: J2
@@ -829,15 +1032,16 @@ defaults a `json` field to `fast` and lets a schema turn it off, and OB1 was the
 exactly that override — an unconditional assignment over a `bool` that cannot express "unset".
 Building J2's default the way the numeric types built theirs would have reproduced it, and the
 promised override would silently not have existed. With `fast` three-state on the wire and
-resolved in one place, J2 declares its default rather than assigning one. Then J1, which is
-independent and small; then J2; then J3, which describes what the first three did.
+resolved in one place, J2 declares its default rather than assigning one. Then J1, which was
+independent and small and is now done; then J2; then J3, which describes what the first three did.
 
-    OB1 ✅ the override holds  →  J1 facet writable  →  J2 json subfields  →  J3 the reference
+    OB1 ✅ the override holds  →  J1 ✅ facet writable  →  J2 json subfields  →  J3 the reference
 
-**Neither needs a migration**, which is what keeps the phase small. Nothing can be written to a
-`facet` field, and a `json` field expresses nothing a `text` field does not, so there is no
-behaviour any existing index depends on — see J2's own section for the measurement and the
-boundary that follows from it. `text` holding JSON is untouched throughout.
+**Neither needs a migration**, which is what keeps the phase small. A `json` field expresses
+nothing a `text` field does not, so there is no behaviour any existing index depends on — see J2's
+own section for the measurement and the boundary that follows from it. `text` holding JSON is
+untouched throughout, and the facet half shipped without one because no index had ever held a
+facet value.
 
 **The shape this phase settles**, and the reason it is worth stating before any of it is built:
 
@@ -853,18 +1057,28 @@ which is which — today it describes only the second, and describes it wrongly.
 
 ### J1 — A facet field cannot be written to
 
-📋 **Planned.** Smallest item here: one arm in the validator, then documentation.
+✅ **Done** 2026-08-31. Smallest item here: one arm in the validator, then documentation.
 
 `staged_schema_validation` infers a type from each JSON value and compares it with the declared
-one. Nothing infers `Facet` — a string infers `Text`, a number a numeric type — so every document
-naming a declared facet field is refused with a type mismatch, whatever it carries. Filed as
-[OB2](#ob2--a-facet-field-cannot-be-written-to).
+one. Nothing inferred `Facet` — a string inferred `Text`, a number a numeric type — so every
+document naming a declared facet field was refused with a type mismatch, whatever it carried.
+Filed as [OB2](#ob2--a-facet-field-cannot-be-written-to).
 
-**Everything else is already built**, which is what makes this small. `create_schema_from_definition`
-declares the column with `add_facet_field`, both write paths call `add_facet`,
-`normalize_facet_query` quotes the path so the grammar accepts it (without which `cat:/a/b` parses
-as a *regex* — see J3), and since 2026-08-27 a value that is not a path is refused by name rather
-than panicking the writer thread.
+**What landed.** The validator now asks the parser the writer uses — `storage::facet_path_error` —
+instead of `infer_field_type`, so a declared `facet` field accepts a string that is a path, and a
+list of them judged element by element, and refuses a non-path by name rather than by type.
+`infer_field_type` still never *infers* a facet: a path-shaped string in a field the schema has not
+seen stays `text`, because a Unix path is not a hierarchy anyone asked for. Judged in the validator
+rather than left to the writer, so a bad path is a per-document rejection in a bulk write rather
+than a failure of the whole shard batch. Pinned end to end by
+`a_facet_field_takes_a_path_and_a_list_of_them` and `one_unparseable_path_refuses_a_list_of_facets`
+in `crates/server/tests/node_http_api.rs`.
+
+**Everything below the validator was already built**, which is what made this small.
+`create_schema_from_definition` declares the column with `add_facet_field`, both write paths call
+`add_facet`, `normalize_facet_query` quotes the path so the grammar accepts it (without which
+`cat:/a/b` parses as a *regex* — see J3), and since 2026-08-27 a value that is not a path is
+refused by name rather than panicking the writer thread.
 
 **What Tantivy's facet gives, measured** on `a=/electronics/phones`, `b=/electronics/phones/cases`,
 `c=/electronics`, `d=/refurb/electronics/phones`, `e=/Electronics/Phones`:
@@ -881,13 +1095,13 @@ property of what was *written*, not of the query. Tantivy's `FacetTokenizer` emi
 every one of its ancestors, so `/electronics/phones/cases` writes four terms and a parent query is
 an ordinary single-term lookup. One term per level per document; no prefix scan, no range.
 
-**No migration, and not merely a small one.** A facet field has never accepted a document, so no
-index holds facet data and there is nothing to reindex, reconcile or read two ways. The type gains
+**No migration, and not merely a small one.** A facet field had never accepted a document, so no
+index held facet data and there was nothing to reindex, reconcile or read two ways. The type gained
 a behaviour where it had none.
 
-**Decisions inside this item.** Whether a facet field should also be `fast` — today a sort naming
-one is refused, and nothing has asked for it. Whether `/` remains the only separator a caller may
-write. Neither blocks the item.
+**Decisions considered but not decided here.** Whether a facet field should also be `fast` — today a
+sort naming one is refused, and nothing has asked for it. Whether `/` remains the only separator a
+caller may write. Neither blocked the item, and both stay open.
 
 **Explicit non-goal: facet counts.** `FacetCollector` is not used anywhere and is not part of
 making the type work. Counting documents per level is an aggregation feature, and CameoDB has no
@@ -1023,12 +1237,13 @@ A query with no path reaches only the empty path; a query with one reaches only 
 overlaps. So J2 does change what an existing query against a `json` field finds, and there is no
 version of it that reads both forms.
 
-**It needs no migration path anyway, and this is the point of the phase.** Neither type holds
-anything worth preserving. A `facet` field cannot be written to at all, so no index anywhere holds
-facet data. And a `json` field is today *indistinguishable from a `text` one* — same terms, same
-matches — so nothing is expressible through it that a `text` field does not already express, and
-nobody choosing bag-of-words search had a reason to reach for it. What the phase changes is what
-the type will mean, not what any existing index relies on.
+**It needs no migration path anyway, and this is the point of the phase.** The remaining type
+holds nothing worth preserving. A `json` field is today *indistinguishable from a `text` one* —
+same terms, same matches — so nothing is expressible through it that a `text` field does not
+already express, and nobody choosing bag-of-words search had a reason to reach for it. (The facet
+half shipped with the same property: it became writable only in J1, so no index holds facet data
+that predates the fix.) What the phase changes is what the type will mean, not what any existing
+index relies on.
 
 So: **a stated boundary, not [reindex](#d1--reindex) first.** An existing `json` field's documents
 keep the terms they were written with and stay findable by the query that finds them today; they
