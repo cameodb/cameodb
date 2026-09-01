@@ -2881,11 +2881,11 @@ fn resolve_index_dir(indices_base: &Path, index: &str) -> Result<PathBuf, StoreE
 /// thread, from a document body, with `panic = "abort"` in the release profile, which takes the
 /// process down rather than the request.
 ///
-/// Nothing reaches it today: the orchestrator's schema validation infers `Text` from every JSON
-/// string and refuses it against a declared `Facet` field, which is why facet fields cannot be
-/// written to at all (ROADMAP OB2). That refusal is load-bearing by accident, and it is the wrong
-/// thing to be relying on — the value is checked here, at the point it enters the index, so that
-/// making facets writable is a change to what is accepted rather than a new way to abort a node.
+/// The validator now accepts a facet path for a declared `Facet` field (ROADMAP OB2 / J1), so the
+/// write path can reach this with a caller-supplied value. That is exactly why the check lives
+/// here rather than relying on the orchestrator to refuse the type: the value is judged at the
+/// point it enters the index, so a bad path is refused by name instead of panicking the writer
+/// thread, whatever the validator accepted.
 ///
 /// Delegates to `from_text` rather than checking the shape by hand: escaping (`\/` for a literal
 /// slash inside a segment) is its rule to define, and a second implementation of it here would be
