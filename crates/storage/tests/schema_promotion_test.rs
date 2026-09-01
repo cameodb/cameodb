@@ -298,7 +298,10 @@ fn updating_a_flag_preserves_every_other_schema_property() {
 
     let after = store.get_schema("docs").unwrap().unwrap();
     assert_eq!(after.get_routing_field(), "title", "routing field erased");
-    assert_eq!(after.version, 7, "version reset");
+    // Advanced by one, not reset to 1. The property this test guards is that an unrelated edit
+    // does not *erase* what the schema carries — and a version that stood still would fail that
+    // in the other direction, since a cluster comparing versions has to see a local edit move it.
+    assert_eq!(after.version, 8, "version did not advance with the edit");
     assert_eq!(after.created_at, 1_600_000_000, "created_at reset");
     assert_eq!(
         after.description.as_deref(),

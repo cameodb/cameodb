@@ -2453,7 +2453,26 @@ impl IndexSchema {
         self.rebuild_shadow_fields_cache();
     }
 
-    /// A hash of this schema's field names, for comparing two schemas cheaply.
+    /// Record that this schema just changed: advance the version and stamp the time.
+    ///
+    /// The two move together because they answer the same question and disagreeing about it is
+    /// the failure mode — `updated_at` was stamped on two paths and `version` on none, so a
+    /// schema could be edited a dozen times and still call itself version 1. A cluster comparing
+    /// `(version, fingerprint)` needs the version to actually advance on a local edit, or a node
+    /// holding newer content cannot say so.
+    ///
+    /// Monotonic, not a count of operations: a change touching three fields may advance it three
+    /// times, and nothing downstream depends on the step size — only on later being greater.
+    ///
+    /// Not called when *applying* a schema that arrived already agreed. That path stores the
+    /// version it was given, because the whole point of an agreed version is that every node
+    /// records the same one.
+    fn mark_modified(&mut self) {
+        self.version = self.version.saturating_add(1);
+        self.updated_at = chrono::Utc::now().timestamp();
+    }
+
+    /// A hash of everything in this schema that decides how the index behaves.
     ///
     /// Computed on demand rather than stored, which is what keeps it honest: a value carried
     /// in the struct has to be recomputed everywhere `fields` changes, and it was not — the
@@ -2461,19 +2480,77 @@ impl IndexSchema {
     /// described a shape it no longer had. At 724ns for a twenty-field schema there is nothing
     /// to save by caching it.
     ///
-    /// This answers "are these the same fields?", never "which schema is this?". An index is
-    /// identified by its name, which every caller already holds; a hash used as a lookup key
-    /// instead collides across indexes of the same shape, and a reverse lookup that did exactly
-    /// that handed one index's schema to another. Names are separated by a byte no field name
-    /// may contain, so `{"ab", "c"}` and `{"a", "bc"}` no longer hash alike.
+    /// This answers "are these the same schema?". It used to hash field *names* alone, which
+    /// answered the much narrower "are these the same fields?" — and that is blind to the one
+    /// disagreement a cluster most needs to see. Two nodes that had independently typed the same
+    /// index, one holding `{amount: f64, label: text}` and the other `{amount: i64, label: i64}`,
+    /// hashed identically, so any check built on this would have polled them and concluded they
+    /// agreed. Types, flags and the routing field are hashed for that reason: a thumbprint that
+    /// cannot see a divergence cannot be used to detect one.
+    ///
+    /// An index is still identified by its *name*, never by this hash. A hash used as a lookup
+    /// key collides across indexes of the same shape — a monthly partition, a per-tenant index —
+    /// and a reverse lookup that did exactly that handed one index's schema to another.
+    ///
+    /// **What is deliberately left out.** `version` is not hashed: the two are compared together
+    /// as a pair, so a node whose content matches at a different version has to be able to
+    /// recognise that, which it cannot do if the version is baked into the hash. `created_at`
+    /// and `updated_at` are not hashed either — they are per-node timestamps, and hashing them
+    /// would report every node as divergent from every other.
+    ///
+    /// **Why lengths rather than a separator.** The previous form separated names with NUL, on
+    /// the grounds that no field name may contain one. Descriptions and tokenizer names are freer
+    /// than field names, so every variable-length part is length-prefixed instead: unambiguous
+    /// whatever bytes it holds, which a separator cannot promise once free text is in the hash.
     pub fn calculate_fingerprint(&self) -> u64 {
+        fn push_str(buf: &mut Vec<u8>, value: &str) {
+            buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            buf.extend_from_slice(value.as_bytes());
+        }
+        fn push_opt(buf: &mut Vec<u8>, value: Option<&str>) {
+            match value {
+                None => buf.push(0),
+                Some(text) => {
+                    buf.push(1);
+                    push_str(buf, text);
+                }
+            }
+        }
+        fn push_bool(buf: &mut Vec<u8>, value: bool) {
+            buf.push(u8::from(value));
+        }
+
         let mut sorted_names: Vec<&String> = self.fields.keys().collect();
         sorted_names.sort();
+
         let mut combined = Vec::new();
         for name in sorted_names {
-            combined.extend_from_slice(name.as_bytes());
-            combined.push(0);
+            let Some(field) = self.fields.get(name) else {
+                continue;
+            };
+            push_str(&mut combined, name);
+            // The canonical lowercase name, not the enum discriminant: this hash is compared
+            // between nodes that may be running different builds, and `to_string` is the spelling
+            // the wire format and the query syntax are both keyed on. A discriminant would shift
+            // under a variant reordering and report a false divergence across a rolling upgrade.
+            push_str(&mut combined, field.field_type.to_string());
+            push_bool(&mut combined, field.indexed);
+            push_bool(&mut combined, field.stored);
+            // The resolved answer, not the three-state declaration. `None` and an explicit
+            // `Some(true)` mean the same thing on a numeric field, and hashing the raw option
+            // would call two nodes divergent for having written the same intent differently.
+            push_bool(&mut combined, field.is_fast());
+            push_bool(&mut combined, field.is_shadow);
+            push_opt(&mut combined, field.description.as_deref());
+            push_opt(&mut combined, field.tokenizer.as_deref());
+            push_opt(&mut combined, field.index_record_option.as_deref());
         }
+
+        // Index-level properties. The routing field earns its place here more than any type
+        // does: two nodes that disagree about it route the same document to different shards.
+        push_str(&mut combined, &self.routing_field_name);
+        push_opt(&mut combined, self.description.as_deref());
+
         xxh3_64(&combined)
     }
 
@@ -2662,7 +2739,7 @@ impl IndexSchema {
         };
 
         if changed {
-            self.updated_at = chrono::Utc::now().timestamp();
+            self.mark_modified();
         }
 
         changed
@@ -2680,6 +2757,7 @@ impl IndexSchema {
         let field_def = FieldDef::new_shadow(name.clone(), field_type);
         self.shadow_fields.insert(name.clone());
         self.fields.insert(name, field_def);
+        self.mark_modified();
         true
     }
 
@@ -2750,6 +2828,7 @@ impl IndexSchema {
                 field_type = ?field_def.field_type,
                 "Promoted field to indexed status - requires Tantivy schema rebuild"
             );
+            self.mark_modified();
             return true;
         }
         false
@@ -5512,7 +5591,7 @@ impl HybridStore {
                 field_def.indexed = updates[field_name];
             }
         }
-        schema.updated_at = chrono::Utc::now().timestamp();
+        schema.mark_modified();
 
         // Persist without re-creating the index. A field in `pending_reindex` deliberately does
         // not get a Tantivy column here: building one would mean recreating the index and
@@ -9209,6 +9288,202 @@ mod tests {
 
     /// A description is the one part of a schema nothing can infer, so it has to survive
     /// everything the schema does on its own.
+    /// The thumbprint has to see every disagreement a cluster would have to reconcile.
+    ///
+    /// The names-only form could not. These two schemas are the divergence reproduced on a live
+    /// three-node cluster — one node had typed the index from a declaration, the others from the
+    /// first document to reach them — and they hashed identically, so a check built on the
+    /// thumbprint would have polled all three and concluded they agreed.
+    #[test]
+    fn the_thumbprint_sees_a_type_divergence() {
+        let build = |amount, label| {
+            let mut schema = IndexSchema::default();
+            schema
+                .fields
+                .insert("amount".into(), FieldDef::new("amount".into(), amount));
+            schema
+                .fields
+                .insert("label".into(), FieldDef::new("label".into(), label));
+            schema
+        };
+
+        let declared = build(TantivyFieldType::F64, TantivyFieldType::Text);
+        let inferred = build(TantivyFieldType::I64, TantivyFieldType::I64);
+
+        assert_ne!(
+            declared.calculate_fingerprint(),
+            inferred.calculate_fingerprint(),
+            "same field names, different types — the thumbprint must not call these equal"
+        );
+    }
+
+    /// Every property that changes how the index behaves moves the thumbprint.
+    ///
+    /// One case per property, because a thumbprint blind to any one of them cannot be used to
+    /// detect a divergence in it. `routing_field_name` matters most: two nodes disagreeing about
+    /// it route the same document to different shards.
+    #[test]
+    fn every_load_bearing_property_moves_the_thumbprint() {
+        let base = || {
+            let mut schema = IndexSchema::default();
+            schema.fields.insert(
+                "f".into(),
+                FieldDef::new("f".into(), TantivyFieldType::I64),
+            );
+            schema
+        };
+        let baseline = base().calculate_fingerprint();
+
+        let mut renamed = base();
+        renamed.fields.insert(
+            "g".into(),
+            FieldDef::new("g".into(), TantivyFieldType::I64),
+        );
+        assert_ne!(baseline, renamed.calculate_fingerprint(), "field set");
+
+        let mut retyped = base();
+        retyped.fields.get_mut("f").unwrap().field_type = TantivyFieldType::U64;
+        assert_ne!(baseline, retyped.calculate_fingerprint(), "field type");
+
+        let mut unindexed = base();
+        unindexed.fields.get_mut("f").unwrap().indexed = false;
+        assert_ne!(baseline, unindexed.calculate_fingerprint(), "indexed");
+
+        let mut stored = base();
+        stored.fields.get_mut("f").unwrap().stored = !stored.fields["f"].stored;
+        assert_ne!(baseline, stored.calculate_fingerprint(), "stored");
+
+        let mut unfast = base();
+        unfast.fields.get_mut("f").unwrap().fast = Some(false);
+        assert_ne!(baseline, unfast.calculate_fingerprint(), "fast");
+
+        let mut described = base();
+        described.fields.get_mut("f").unwrap().description = Some("what it holds".into());
+        assert_ne!(baseline, described.calculate_fingerprint(), "field description");
+
+        let mut tokenized = base();
+        tokenized.fields.get_mut("f").unwrap().tokenizer = Some("raw".into());
+        assert_ne!(baseline, tokenized.calculate_fingerprint(), "tokenizer");
+
+        let mut recorded = base();
+        recorded.fields.get_mut("f").unwrap().index_record_option = Some("Basic".into());
+        assert_ne!(baseline, recorded.calculate_fingerprint(), "record option");
+
+        let mut rerouted = base();
+        rerouted.routing_field_name = "f".into();
+        assert_ne!(baseline, rerouted.calculate_fingerprint(), "routing field");
+
+        let mut titled = base();
+        titled.description = Some("the corpus".into());
+        assert_ne!(baseline, titled.calculate_fingerprint(), "index description");
+    }
+
+    /// What the thumbprint must *not* see, or every node reports every other as divergent.
+    ///
+    /// `version` is excluded because the pair `(version, thumbprint)` is compared as a pair: a
+    /// node holding matching content at a different version has to be able to recognise that.
+    /// The timestamps are excluded because they are per-node and would never agree.
+    #[test]
+    fn the_thumbprint_ignores_version_and_timestamps() {
+        let mut schema = IndexSchema::default();
+        schema
+            .fields
+            .insert("f".into(), FieldDef::new("f".into(), TantivyFieldType::I64));
+        let baseline = schema.calculate_fingerprint();
+
+        schema.version = 47;
+        schema.created_at = 1_600_000_000;
+        schema.updated_at = 1_700_000_000;
+
+        assert_eq!(
+            baseline,
+            schema.calculate_fingerprint(),
+            "version and timestamps are not part of what a schema *is*"
+        );
+    }
+
+    /// An absent description and an empty one are different states, and a length-prefixed hash
+    /// keeps them apart. The previous NUL-separated form was written for field names, which may
+    /// not contain the separator; free text can contain any byte at all.
+    #[test]
+    fn the_thumbprint_distinguishes_absent_from_empty_text() {
+        let build = |description: Option<&str>| {
+            let mut schema = IndexSchema::default();
+            let mut field = FieldDef::new("f".into(), TantivyFieldType::Text);
+            field.description = description.map(str::to_string);
+            schema.fields.insert("f".into(), field);
+            schema.calculate_fingerprint()
+        };
+
+        assert_ne!(build(None), build(Some("")), "absent is not empty");
+
+        // Two field names that concatenate to the same bytes must not collide.
+        let pair = |a: &str, b: &str| {
+            let mut schema = IndexSchema::default();
+            for name in [a, b] {
+                schema.fields.insert(
+                    name.into(),
+                    FieldDef::new(name.into(), TantivyFieldType::Text),
+                );
+            }
+            schema.calculate_fingerprint()
+        };
+        assert_ne!(pair("ab", "c"), pair("a", "bc"), "name boundaries");
+    }
+
+    /// A local edit advances the version, whichever path made it.
+    ///
+    /// `version` shipped as dead metadata — set to 1 at construction and never incremented — so
+    /// a schema could be edited repeatedly and still call itself version 1. A cluster ordering
+    /// changes by version needs each edit to move it.
+    #[test]
+    fn a_local_edit_advances_the_version() {
+        let mut schema = IndexSchema::default();
+        let start = schema.version;
+
+        // A field the schema has never seen — the ordinary write-driven evolution.
+        assert!(schema.evolve_field("discovered".to_string(), &serde_json::json!(7)));
+        let after_discovery = schema.version;
+        assert!(
+            after_discovery > start,
+            "discovering a field left the version at {start}"
+        );
+
+        // Retyping an existing field. Only a non-indexed one can be retyped inline: an indexed
+        // field's type is pinned to the column the index already built for it.
+        let mut pending = FieldDef::new("pending".into(), TantivyFieldType::Text);
+        pending.indexed = false;
+        schema.fields.insert("pending".into(), pending);
+        assert!(schema.evolve_field("pending".to_string(), &serde_json::json!(7)));
+        let after_evolution = schema.version;
+        assert!(
+            after_evolution > after_discovery,
+            "evolving a type left the version at {after_discovery}"
+        );
+
+        assert!(schema.add_shadow_field("shadow".into(), TantivyFieldType::Text));
+        let after_shadow = schema.version;
+        assert!(
+            after_shadow > after_evolution,
+            "adding a shadow field left the version at {after_evolution}"
+        );
+
+        let mut plain = FieldDef::new("later".into(), TantivyFieldType::Text);
+        plain.indexed = false;
+        schema.fields.insert("later".into(), plain);
+        assert!(schema.promote_field_to_indexed("later"));
+        assert!(
+            schema.version > after_shadow,
+            "promoting a field left the version at {after_shadow}"
+        );
+
+        // A no-op is not an edit and must not move it.
+        let settled = schema.version;
+        assert!(!schema.add_shadow_field("shadow".into(), TantivyFieldType::Text));
+        assert!(!schema.promote_field_to_indexed("later"));
+        assert_eq!(settled, schema.version, "a no-op advanced the version");
+    }
+
     #[test]
     fn descriptions_round_trip_and_survive_field_evolution() {
         let mut schema: IndexSchema = serde_json::from_value(serde_json::json!({
@@ -9233,17 +9508,29 @@ mod tests {
         );
         assert_eq!(schema.fields["notes"].description, None);
 
-        // Evolution rewrites a field's type; it must not rewrite what the field means.
-        let before = schema.calculate_fingerprint();
+        // Evolution rewrites a field's type; it must not rewrite what the field means. Asserted
+        // on the descriptions themselves rather than through the fingerprint: the fingerprint
+        // hashes types now, so it moves on any evolution and can no longer stand in for "nothing
+        // else changed" — the thing this test is actually about.
+        let descriptions = |schema: &IndexSchema| {
+            let mut named: Vec<(String, Option<String>)> = schema
+                .fields
+                .iter()
+                .map(|(name, def)| (name.clone(), def.description.clone()))
+                .collect();
+            named.sort();
+            (schema.description.clone(), named)
+        };
+        let before = descriptions(&schema);
         assert!(schema.evolve_field("notes".to_string(), &serde_json::json!(7)));
         assert_eq!(
             schema.fields["title"].description.as_deref(),
             Some("Filing headline")
         );
         assert_eq!(
-            schema.calculate_fingerprint(),
+            descriptions(&schema),
             before,
-            "the fingerprint is over field names, so nothing here should have moved it"
+            "evolution changed a type, so no description may have moved with it"
         );
 
         // And a round trip through the stored form keeps both, while an index that describes
