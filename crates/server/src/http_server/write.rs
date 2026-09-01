@@ -41,6 +41,8 @@ pub(super) async fn write_handler(
         id,
         routing_key: effective_routing_key.clone(),
         doc,
+        // A request off the wire is the first hop by definition.
+        forwarded: false,
     };
 
     let result = state
@@ -94,6 +96,7 @@ pub(super) async fn delete_document_handler(
         index,
         id,
         routing_key,
+        forwarded: false,
     };
 
     let result = state
@@ -266,17 +269,15 @@ pub(super) async fn write_stream_handler(
             }
 
             let Some(at) = newline else {
-                // What is left is one unterminated line. Checked only now, after every complete
+                // What is left is one unterminated line, and it has already outgrown the limit
+                // — the rest of it is still arriving. Checked only now, after every complete
                 // line has been taken out: several ordinary lines in the buffer at once are not
                 // one oversized one, and measuring the buffer before draining it called them
                 // that.
                 if buf.len() > max_record_size_bytes {
                     line_number += 1;
                     documents += 1;
-                    errors.push(format!(
-                        "line {line_number}: exceeds the {} MB single-record limit",
-                        max_record_size_bytes / (1024 * 1024)
-                    ));
+                    errors.push(oversized_line(line_number, max_record_size_bytes));
                     buf.clear();
                     discarding = true;
                     continue;
@@ -292,6 +293,17 @@ pub(super) async fn write_stream_handler(
             }
 
             documents += 1;
+
+            // The same limit, applied to a line that arrived whole. The check above only ever
+            // sees a line still being received, so without this one the verdict on a given file
+            // depended on where the wire happened to split it: an oversized line delivered in
+            // one piece, or with its newline already buffered, was parsed and accepted while the
+            // identical line delivered in two was refused.
+            if line.len() > max_record_size_bytes {
+                errors.push(oversized_line(line_number, max_record_size_bytes));
+                continue;
+            }
+
             match serde_json::from_slice::<DocPayload>(line) {
                 Ok(doc) => batch.push((line_number, doc)),
                 Err(e) => {
@@ -347,12 +359,22 @@ pub(super) async fn write_stream_handler(
     }
 
     // Every document the body held is written or explained, the same arithmetic `_bulk` answers
-    // with. A path that stops accounting is a test failure here rather than a silent shortfall.
+    // with. A path that stops accounting is a test failure here rather than a silent shortfall,
+    // and a log line in the release build that would otherwise just serve the bad total.
     debug_assert_eq!(
         written as usize + errors.len(),
         documents,
         "a write stream must account for every document its body held"
     );
+    if written as usize + errors.len() != documents {
+        tracing::error!(
+            index = %index,
+            lines_received = documents,
+            items_written = written,
+            errors = errors.len(),
+            "Write stream did not account for every document its body held"
+        );
+    }
 
     info!(
         "Write stream completed - index: {}, lines: {}, batches: {}, written: {}, errors: {}",
@@ -384,6 +406,17 @@ pub(super) async fn write_stream_handler(
         HeaderValue::from_static("application/json"),
     );
     Ok(resp)
+}
+
+/// The one wording for a line larger than a single record may be.
+///
+/// Reported from two places — a line still arriving that has already outgrown the limit, and one
+/// that arrived whole — which have to say the same thing about the same line.
+fn oversized_line(line_number: usize, max_record_size_bytes: usize) -> String {
+    format!(
+        "line {line_number}: exceeds the {} MB single-record limit",
+        max_record_size_bytes / (1024 * 1024)
+    )
 }
 
 /// Dispatch one micro-batch and report its answer in the file's own line numbers.

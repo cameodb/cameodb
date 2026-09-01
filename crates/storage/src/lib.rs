@@ -2601,6 +2601,15 @@ impl IndexSchema {
     /// New fields are added as non-indexed to avoid Tantivy schema rebuilds.
     /// Existing non-indexed fields can have their types evolved if compatible; an indexed field's
     /// type is pinned to the column the index built for it and never evolves here.
+    ///
+    /// **Where the evolution half is actually reached.** Adding a field is what every write
+    /// path uses this for. Evolving one is reached only from initial schema sampling
+    /// (`enhanced_schema_sampling`, which walks up to 200 documents into an empty schema, so
+    /// document 2 can widen what document 1 declared). A write to an *existing* field never
+    /// gets here: `unstorable_value` refuses a value the declared type cannot hold before the
+    /// document is accepted, so by the time a write reaches storage every known field already
+    /// fits and there is nothing to widen. That is also why `apply_write` may skip this call
+    /// entirely when the document carries no unknown field.
     pub fn evolve_field(&mut self, name: String, value: &JsonValue) -> bool {
         use std::collections::hash_map::Entry;
 
@@ -2680,6 +2689,11 @@ impl IndexSchema {
     }
 
     /// Determine if a field should evolve to a new type (static version to avoid borrowing issues)
+    /// Whether a field already in the schema should take a wider type.
+    ///
+    /// Consulted during initial schema sampling and, in principle, by any caller evolving a
+    /// schema from a document — not by a write to a field the schema already knows, which
+    /// `unstorable_value` refuses upstream rather than widening. See [`Self::evolve_field`].
     fn should_evolve_field_static(current: &FieldDef, new_type: TantivyFieldType) -> bool {
         // Don't evolve if types are the same
         if current.field_type == new_type {
@@ -6622,17 +6636,51 @@ impl HybridStore {
             Add(tantivy::TantivyDocument),
             Delete,
         }
-        let mut final_ops: Vec<(String, FinalOp)> = Vec::with_capacity(ops_len);
+
+        /// One distinct id, and everything the Tantivy pass needs to know about it.
+        struct FinalEntry {
+            id: String,
+            /// Whether redb held a row for this id *before this batch began*.
+            ///
+            /// Decided on the id's first appearance and never revised, which is the whole point:
+            /// a delete earlier in the same batch removes the row, so a later put's `insert`
+            /// reports nothing displaced for a document the index has had all along. Reading it
+            /// per-operation left that document in Tantivy with no `delete_term` to remove it,
+            /// and the re-put added a second one beside it.
+            existed_before: bool,
+            op: FinalOp,
+        }
+
+        /// Record `op` as this id's latest, keeping the `existed_before` its first appearance
+        /// decided. `touched_existing_row` is what redb just reported, and is consulted only
+        /// when the id is new to this batch.
+        fn record_final(
+            final_ops: &mut Vec<FinalEntry>,
+            final_index: &mut HashMap<String, usize>,
+            id: String,
+            touched_existing_row: bool,
+            op: FinalOp,
+        ) {
+            match final_index.get(&id).copied() {
+                Some(idx) => final_ops[idx].op = op,
+                None => {
+                    final_index.insert(id.clone(), final_ops.len());
+                    final_ops.push(FinalEntry {
+                        id,
+                        existed_before: touched_existing_row,
+                        op,
+                    });
+                }
+            }
+        }
+
+        let mut final_ops: Vec<FinalEntry> = Vec::with_capacity(ops_len);
         // Where in `final_ops` an id's entry lives, so a repeat put or delete overwrites in place
         // rather than appending a second entry.
         let mut final_index: HashMap<String, usize> = HashMap::with_capacity(ops_len);
 
         // Collect sequence IDs during processing
         let mut seq_ids = Vec::with_capacity(ops_len);
-        let mut new_documents_count = 0usize;
-        // Ids whose prior version must be removed before a replacement is added. A set, so a
-        // duplicate id in the batch is deleted once rather than once per occurrence.
-        let mut updated_document_ids: HashSet<String> = HashSet::new();
 
         {
             // Set durability based on config for bulk operations
@@ -6664,18 +6712,15 @@ impl HybridStore {
 
                 match kind {
                     PreparedKind::Put { json_blob } => {
-                        if let Some(doc_bytes) = doc_bytes {
-                            // Check if document is new or updated by examining insert return value
-                            let old_value = data_table.insert(id.as_str(), doc_bytes.as_slice())?;
-                            let is_new_document = old_value.is_none();
-
-                            if is_new_document {
-                                new_documents_count += 1;
-                            } else {
-                                // Track updated documents for selective Tantivy deletes
-                                updated_document_ids.insert(id.clone());
+                        // What `insert` displaced, which says whether the id already had a row —
+                        // but only on this id's first appearance in the batch. `record_final`
+                        // below is what enforces that.
+                        let displaced_a_row = match &doc_bytes {
+                            Some(bytes) => {
+                                data_table.insert(id.as_str(), bytes.as_slice())?.is_some()
                             }
-                        }
+                            None => false,
+                        };
 
                         // Step 3: Build tantivy document with ONLY indexed fields
                         let mut tantivy_doc = doc!(fields.id => id.as_str());
@@ -6712,23 +6757,25 @@ impl HybridStore {
                             }
                         }
 
-                        match final_index.get(&id).copied() {
-                            Some(idx) => final_ops[idx].1 = FinalOp::Add(tantivy_doc),
-                            None => {
-                                final_index.insert(id.clone(), final_ops.len());
-                                final_ops.push((id, FinalOp::Add(tantivy_doc)));
-                            }
-                        }
+                        record_final(
+                            &mut final_ops,
+                            &mut final_index,
+                            id,
+                            displaced_a_row,
+                            FinalOp::Add(tantivy_doc),
+                        );
                     }
                     PreparedKind::Delete => {
-                        data_table.remove(id.as_str())?;
-                        match final_index.get(&id).copied() {
-                            Some(idx) => final_ops[idx].1 = FinalOp::Delete,
-                            None => {
-                                final_index.insert(id.clone(), final_ops.len());
-                                final_ops.push((id, FinalOp::Delete));
-                            }
-                        }
+                        // `remove` answers the same question `insert` does, for the arm that
+                        // would otherwise hide it from a later put of the same id.
+                        let removed_a_row = data_table.remove(id.as_str())?.is_some();
+                        record_final(
+                            &mut final_ops,
+                            &mut final_index,
+                            id,
+                            removed_a_row,
+                            FinalOp::Delete,
+                        );
                     }
                 }
             }
@@ -6739,38 +6786,45 @@ impl HybridStore {
         // Every id in this batch had its row written or removed, so any cached body for it is
         // the previous one. Done after the commit and before the Tantivy work, with the ids
         // still borrowed out of `final_ops` rather than collected into a second vector.
-        self.invalidate_read_cache(index, final_ops.iter().map(|(id, _)| id.as_str()));
+        self.invalidate_read_cache(index, final_ops.iter().map(|entry| entry.id.as_str()));
 
-        // Apply the final Tantivy operation per id, in the order redb committed: removals for
-        // the ids a replacement displaced, then the last put or delete of each distinct id.
+        // Apply the final Tantivy operation per id, in the order redb committed: the prior
+        // version removed where there was one, then the batch's last put or delete for that id.
+        //
+        // Interleaved per id rather than done as a delete pass and an add pass. Tantivy resolves
+        // a `delete_term` against the documents added before it, so `delete_term` immediately
+        // followed by `add_document` under the same id is correct and reads as the one
+        // replacement it is. The two-pass shape said the same thing less clearly, and its delete
+        // list was built from what each `insert` displaced — which a delete of the same id
+        // earlier in the batch had already emptied.
+        let mut new_documents_count = 0usize;
+        let mut replaced_documents = 0usize;
         {
             let writer = writer_arc.lock().unwrap_or_else(|poisoned| {
                 tracing::error!(index = %index, "Writer mutex was poisoned, recovering");
                 poisoned.into_inner()
             });
 
-            // Step 1: Delete only updated documents (selective optimization)
-            if !updated_document_ids.is_empty() {
-                tracing::debug!(
-                    updated_count = updated_document_ids.len(),
-                    "Selective Tantivy deletes for updated documents"
-                );
-                for updated_id in &updated_document_ids {
-                    let term = tantivy::Term::from_field_text(fields.id, updated_id);
+            for FinalEntry {
+                id,
+                existed_before,
+                op,
+            } in final_ops
+            {
+                // A version to remove: one this batch is replacing, or one it is deleting. A
+                // delete always issues the term even where redb held no row, which is what keeps
+                // the batch a repair for an index holding a document the store does not.
+                if existed_before || matches!(op, FinalOp::Delete) {
+                    let term = tantivy::Term::from_field_text(fields.id, &id);
                     writer.delete_term(term);
                 }
-            }
 
-            // Step 2: The last operation for each id — an add for a put, a delete for a remove.
-            // A duplicate id in the batch therefore contributes one document, not one per put.
-            for (id, op) in final_ops {
-                match op {
-                    FinalOp::Add(tantivy_doc) => {
-                        writer.add_document(tantivy_doc)?;
-                    }
-                    FinalOp::Delete => {
-                        let term = tantivy::Term::from_field_text(fields.id, &id);
-                        writer.delete_term(term);
+                if let FinalOp::Add(tantivy_doc) = op {
+                    writer.add_document(tantivy_doc)?;
+                    if existed_before {
+                        replaced_documents += 1;
+                    } else {
+                        new_documents_count += 1;
                     }
                 }
             }
@@ -6788,7 +6842,7 @@ impl HybridStore {
                 index = %index,
                 batch_size = batch_size,
                 new_docs = new_documents_count,
-                updated_docs = updated_document_ids.len(),
+                updated_docs = replaced_documents,
                 "Bulk write completed"
             );
 
@@ -7808,6 +7862,122 @@ mod tests {
             0,
             "the overwritten put must not linger: {:?}",
             first.hits
+        );
+    }
+
+    /// A delete and a re-put of one id in a single batch replace the committed document.
+    ///
+    /// The other half of the same rule, and the one that survived the first fix. A delete
+    /// earlier in the batch removes the redb row, so the re-put's `insert` displaces nothing and
+    /// the id looked new — no `delete_term` was issued, and the document committed by an earlier
+    /// batch stayed in the index beside the replacement. Two hits for one id, both reading back
+    /// as the new body, because the read path joins to redb by id and redb held only one.
+    ///
+    /// Reachable without a hand-built batch: a single delete travels as a `WalOp::Delete` and
+    /// coalesces into the same `apply_batch` as the writes that arrive with it.
+    #[test]
+    fn a_batch_replaces_a_committed_document_it_deletes_and_puts_again() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+
+        let mut schema = IndexSchema::default();
+        schema.fields.insert(
+            "title".to_string(),
+            FieldDef::new("title".to_string(), TantivyFieldType::Text),
+        );
+        schema.normalize_after_deserialization();
+        store.store_schema_and_cache("notes", &schema).unwrap();
+
+        // Committed by an earlier batch, so the index holds it before the one under test starts.
+        store
+            .apply_batch(
+                "notes",
+                vec![WalOp::Put {
+                    id: "d1".to_string(),
+                    json_blob: Some(serde_json::json!({"title": "hello"})),
+                }],
+            )
+            .expect("write the first version");
+        store.commit_index("notes").expect("commit");
+
+        store
+            .apply_batch(
+                "notes",
+                vec![
+                    WalOp::Delete {
+                        id: "d1".to_string(),
+                    },
+                    WalOp::Put {
+                        id: "d1".to_string(),
+                        json_blob: Some(serde_json::json!({"title": "world"})),
+                    },
+                ],
+            )
+            .expect("delete and re-put in one batch");
+        store.commit_index("notes").expect("commit");
+
+        let all = store
+            .search_documents("notes", "*", 10, None)
+            .expect("search");
+        assert_eq!(
+            all.hits.len(),
+            1,
+            "the re-put replaces the committed document rather than joining it: {:?}",
+            all.hits
+        );
+
+        let stale = store
+            .search_documents("notes", "title:hello", 10, None)
+            .expect("search");
+        assert_eq!(
+            stale.hits.len(),
+            0,
+            "the deleted version must be gone from the index: {:?}",
+            stale.hits
+        );
+    }
+
+    /// A batch that deletes an id it never re-puts leaves nothing behind.
+    ///
+    /// The companion to the case above, so the `existed_before` bookkeeping cannot be "satisfied"
+    /// by never removing anything.
+    #[test]
+    fn a_batch_that_puts_then_deletes_an_id_leaves_no_document() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+
+        let mut schema = IndexSchema::default();
+        schema.fields.insert(
+            "title".to_string(),
+            FieldDef::new("title".to_string(), TantivyFieldType::Text),
+        );
+        schema.normalize_after_deserialization();
+        store.store_schema_and_cache("notes", &schema).unwrap();
+
+        store
+            .apply_batch(
+                "notes",
+                vec![
+                    WalOp::Put {
+                        id: "d1".to_string(),
+                        json_blob: Some(serde_json::json!({"title": "hello"})),
+                    },
+                    WalOp::Delete {
+                        id: "d1".to_string(),
+                    },
+                ],
+            )
+            .expect("put then delete in one batch");
+        store.commit_index("notes").expect("commit");
+
+        let all = store
+            .search_documents("notes", "*", 10, None)
+            .expect("search");
+        assert_eq!(
+            all.hits.len(),
+            0,
+            "the delete is the batch's last word on the id: {:?}",
+            all.hits
         );
     }
 

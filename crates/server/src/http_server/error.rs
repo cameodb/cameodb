@@ -120,10 +120,16 @@ impl IntoResponse for AppError {
             }
         }
 
-        let body = serde_json::json!({
-            "error": message,
-            "details": error_msg
-        });
+        // `details` carries the real message for a client error, where the caller is the one who
+        // has to act on it. For a server error it carried this node's internal error text —
+        // precisely what `message` is masked to withhold — so the mask was undone by the field
+        // printed beside it. A 5xx answers with the mask alone now; the text went to the `error!`
+        // above, which is where an operator reads it and a caller does not.
+        let body = if status.is_server_error() {
+            serde_json::json!({ "error": message })
+        } else {
+            serde_json::json!({ "error": message, "details": error_msg })
+        };
 
         (status, Json(body)).into_response()
     }
