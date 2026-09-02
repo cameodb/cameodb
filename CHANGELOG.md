@@ -27,6 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to test with `docker run --rm cameodb:latest`, which never matched the `goranc/cameodb:latest`
   the script tags.
 
+- **The documented streaming-write response named two fields the server does not emit.**
+  `docs/API_REFERENCE.md` gave `POST /api/{index}/document/stream` as `took_ms` and
+  `items_received`, and omitted `status`, `lines_received` and `batches` — so a client written
+  against the page would have broken on fields it never receives and missed the three that carry
+  the result. `_bulk` was documented with `took_ms` for what is `duration_ms`. Both are corrected
+  against a live node, and the stream entry now describes what it means for a bad line to be
+  reported rather than fatal, including the two cases that are still a `400`.
+
+  The posture suite had drifted the same way and in the more confusing direction: its
+  `oversized single record on /document/stream` check still asserted the `413` that path answered
+  before a bad line became a reason instead of a status, so the suite failed against correct
+  behaviour and accused the product. It asserts the response body now — `items_written` and the
+  reason naming the line — which is also what the original check was for, since a `200` that
+  quietly *wrote* an oversized record would satisfy a status check.
+
 ## [0.3.3] - 2026-09-02
 
 ### Added

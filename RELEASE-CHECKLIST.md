@@ -120,6 +120,75 @@ Signed off by:
 
 <!-- Newest first. Append a filled-in template per release. -->
 
+## v0.3.3 — in progress
+
+Commit: 0beddbf. `chore(release): cut 0.3.3` (a406d9b) landed and the changelog was filled in,
+but no tag was cut and no sign-off exists. This is a partial record: one suite was run, and it
+found a defect in itself rather than in the product.
+
+Built targets: macOS arm64, x86_64-unknown-linux-musl (binary + `cameodb_0.3.3_amd64.deb` +
+`cameodb-0.3.3-1.x86_64.rpm`). **Windows outstanding.**
+
+Validation run, host build (macOS arm64), 2026-09-03:
+
+```
+binary: target/release/cameodb (cameodb 0.3.3)
+
+  PASS posture — 44 checks, 0 failed, 0 skipped
+```
+
+That binary is byte-identical to the staged `dist/0.3.3/mac/cameodb`
+(sha256 `b90f335bdf25f925f4a895930a9bafca2c4268f63d2edcde2bc2b7759fdaaa8e`), so the result
+describes the artifact that would ship. **Every other suite: not run.**
+
+Published to DockerHub: `goranc/cameodb:0.3.3` (index `sha256:ff88023d`) and `:latest`
+(`sha256:660a3d77`), both `linux/amd64` + `linux/arm64` with per-platform SLSA provenance.
+Verified by running each tag on each platform — all four report `cameodb 0.3.3`. The two platform
+manifests under `latest`, `sha256:5796dc97` (amd64) and `sha256:9d6aad62` (arm64), are the same
+digests the `--no-push` rehearsal exported locally, so the rehearsal built the bits that shipped.
+Publishing remains manual: no step of this procedure asks for it.
+
+**Recorded error — a posture check had gone stale and failed against correct behaviour.**
+`oversized single record on /document/stream is rejected` asserted `413`; the endpoint answers
+`200` and reports the refusal as a reason on the line. The behaviour is right and the check was
+wrong. The stream handler commits micro-batches as the body arrives, so refusing the whole
+request with a status abandons an import that has already written documents it can no longer
+report — a bare `413`, no counts, nowhere to resume — and it was changed to answer the way
+`_bulk` answers a bad row. The check dates from `fda841e` and was never updated, so it reported a
+defect that did not exist while no longer covering the one it was written for: that an oversized
+record is not *written*. It now asserts the response body — `items_written` and the reason text —
+because a `200` that quietly wrote the record would satisfy a status check. Confirmed against a
+live node before changing it: `items_written` is `0` and the reason reads
+`line 1: exceeds the 1 MB single-record limit`. The two sibling checks still answer `413`
+legitimately, from the wire-level body limit, and `RSS stayed bounded` holds at 35 MB.
+
+The same drift had reached `docs/API_REFERENCE.md`. The streaming-write response was documented
+as `took_ms` and `items_received`, neither of which the server emits, and omitted `status`,
+`lines_received` and `batches`, all three of which it does; `_bulk` was documented with `took_ms`
+for what is `duration_ms`. A client written against that page would have broken on fields it
+never receives. Both corrected against a live 0.3.3 node.
+
+The lesson for the procedure: a check that asserts a status code goes stale silently when the
+contract moves to the body, and it fails *loudly in the wrong direction* — the suite accuses the
+product. Prefer asserting the answer over the envelope.
+
+Advisory exceptions reviewed: not yet.
+
+Skipped checks and why:
+- Every suite but `posture` — not run.
+- `remote-sources` on musl and Windows (procedure step 5) — not run.
+- `check-config` on the two shipped configs (procedure step 7) — not recorded.
+
+Not yet done, release is incomplete:
+- **No Windows artifact.** `dist/0.3.3/windows/cameodb.exe` does not exist.
+- `--stage sbom` and `--stage sign` have not run: `dist/0.3.3/` holds four binaries and
+  packages and no `.bundle`, `.sha256`, `SHA256SUMS` or `MANIFEST.txt`.
+- `publish.sh` has not run, and `cameodb-web` has not been updated.
+- No `v0.3.3` git tag.
+
+Known gaps acknowledged: not yet
+Signed off by:
+
 ## v0.3.2 — 2026-08-20
 
 Commit: 84b5d90 (dirty at build time — the version bump and changelog move were not yet
