@@ -171,10 +171,24 @@ fi
 section "request body limits"
 # One record over the per-record cap, delivered as a single unterminated line. This is the
 # shape that bypassed DefaultBodyLimit entirely and drove RSS to 889 MB in review.
+#
+# The refusal is a reason on the line, not a status on the request. Micro-batches commit as the
+# body is read, so refusing with a status abandons an import that has already written documents
+# it can no longer report — the caller gets a bare 413, no counts, and nowhere to resume. `_bulk`
+# has always answered a bad row with a reason, and the stream path was changed to agree; this
+# check kept asserting the 413 it used to answer.
+#
+# The body is what is asserted, not the 200: a 200 that quietly *wrote* the oversized record
+# would satisfy a status check, and that is the regression actually worth catching here.
 head -c $((3 * 1024 * 1024)) /dev/zero | tr '\0' 'x' > "$WORK/big-line.txt"
 { printf '{"id":"a","doc":{"t":"'; cat "$WORK/big-line.txt"; printf '"}}'; } > "$WORK/oneline.ndjson"
-check_eq "oversized single record on /document/stream is rejected" "413" \
-    "$(status -X POST "$BASE/api/probe/document/stream" -H 'content-type: application/x-ndjson' --data-binary @"$WORK/oneline.ndjson")"
+oversized="$(body -X POST "$BASE/api/probe/document/stream" -H 'content-type: application/x-ndjson' --data-binary @"$WORK/oneline.ndjson")"
+if grep -q '"items_written":0' <<< "$oversized" \
+    && grep -q 'line 1: exceeds the 1 MB single-record limit' <<< "$oversized"; then
+    pass "oversized single record on /document/stream is refused with a reason"
+else
+    fail "oversized single record on /document/stream is refused with a reason" "$oversized"
+fi
 
 # Many small records adding up past the wire limit: caught by the byte counter, not the
 # per-record cap.

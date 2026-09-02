@@ -333,10 +333,10 @@ curl -s -X POST http://localhost:9480/api/books/_bulk \
 **Response:**
 ```json
 {
-  "items_received": 2,
   "items_written": 2,
+  "items_received": 2,
   "errors": [],
-  "took_ms": 45
+  "duration_ms": 7
 }
 ```
 
@@ -360,12 +360,37 @@ EOF
 **Response:**
 ```json
 {
-  "took_ms": 42,
-  "items_received": 2,
+  "status": "ok",
   "items_written": 2,
+  "lines_received": 2,
+  "batches": 1,
   "errors": []
 }
 ```
+
+**A bad line is reported, not fatal.** The body is read in micro-batches that commit as they
+fill, so a line that will not parse — or one larger than `limits.max_record_size_mb` — is
+answered with a reason naming it while the rest of the file still loads. Aborting instead would
+leave the documents already committed unreported, with no count and nowhere to resume.
+
+```json
+{
+  "status": "partial",
+  "items_written": 1,
+  "lines_received": 2,
+  "batches": 1,
+  "errors": ["line 2: key must be a string at line 1 column 2"]
+}
+```
+
+`status` is `partial` whenever `errors` is non-empty and `ok` otherwise. `items_written` plus
+`errors` accounts for every line the body held. Line numbers count physical lines including
+blanks, so `line 2` is what `sed -n 2p` prints — an oversized record reads
+`line 2: exceeds the 1 MB single-record limit`.
+
+The request fails outright with `400` in two cases only: a body holding no documents at all, and
+one where nothing parsed and nothing was written — the shape that means the upload was not NDJSON
+rather than that one row of it was bad.
 
 > **Note:** Streaming write accepts NDJSON (one JSON document per line) for memory-efficient processing of large datasets.
 
