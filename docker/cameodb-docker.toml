@@ -33,6 +33,17 @@ cors_allowed_origins = []
 #   2. Mount the directory read-only (see docker-compose.yml) and uncomment below.
 #   3. Use it:  cameodb client --api-key-file ~/.cameodb/ops.key list indexes
 #
+[security]
+enabled = false
+
+# This node is reachable off-box — profile = "internal" with a non-loopback bind — so with
+# authentication off every route, including /_admin/*, is open to anyone who can reach the
+# port. The node starts and warns; `cameodb check-config` exits non-zero, so a deploy step
+# gates on it. To close it, mint a key:
+#   cameodb keygen --role admin --label ops \
+#     --hash-out /etc/cameodb/keys/ops --key-out ~/.cameodb/ops.key
+# then set enabled = true above and add the matching [[security.api_keys]] entry.
+
 # [security]
 # enabled = true
 #

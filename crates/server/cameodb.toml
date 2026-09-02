@@ -14,7 +14,11 @@ request_timeout_secs = 30
 # Browser origins allowed to call this node. Empty means no cross-origin access, which
 # is what API and MCP clients want; "*" is rejected outside the local profile.
 cors_allowed_origins = []
-max_concurrent_requests = 128
+# In-flight bodies are held in memory, so this multiplied by the body ceiling has to fit inside
+# limits.total_memory_limit_mb below. 32 x 128 MB = 4096 MB, which is exactly the budget; at the
+# 128 this file used to carry, the same arithmetic came to 16 GB against a 4 GB limit and
+# `cameodb check-config` said so. Raise them together.
+max_concurrent_requests = 32
 # Mount the /_admin/* routes. They are unauthenticated unless [security] is enabled, in
 # which case they require a key holding node-admin. Keep them off where the node is
 # reachable off-box and authentication is not on.
@@ -25,6 +29,24 @@ admin_enabled = true
 # inter-node message size, the request timeout and the largest MCP response all derive from it,
 # so raising it for large documents moves them together. `cameodb check-config` prints what each
 # one resolved to.
+# Authentication for the HTTP and MCP surface. Off by default so an upgrade cannot lock
+# an existing deployment out of its own data.
+[security]
+enabled = false
+
+# This node is reachable off-box — profile = "internal" with a non-loopback bind — so with
+# authentication off every route, including /_admin/*, is open to anyone who can reach the
+# port. The node starts and warns; `cameodb check-config` exits non-zero, so a deploy step
+# gates on it. To close it, mint a key:
+#   cameodb keygen --role admin --label ops \
+#     --hash-out /etc/cameodb/keys/ops --key-out ~/.cameodb/ops.key
+# then set enabled = true above and add the matching [[security.api_keys]] entry.
+
+# [[security.api_keys]]
+# key_hash_file = "/etc/cameodb/keys/ops"
+# role = "admin"                         # admin | writer | reader
+# label = "ops"
+
 [limits]
 max_record_size_mb = 64
 # 0 derives it from max_record_size_mb (+64 MB for framing). Set it to pin the body ceiling on
