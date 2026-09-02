@@ -4717,7 +4717,7 @@ pub struct ShardAffineConfig {
 #[derive(Clone, Debug)]
 pub struct StreamingSearchConfig {
     pub enable_streaming_search: bool,
-    pub enable_early_termination: bool,
+
     pub max_concurrent_shard_searches: usize,
     pub max_concurrent_remote_searches: usize,
 }
@@ -4726,7 +4726,7 @@ impl StreamingSearchConfig {
     pub fn from_search_config(sc: &SearchConfig) -> Self {
         Self {
             enable_streaming_search: sc.enable_streaming_search,
-            enable_early_termination: sc.enable_early_termination,
+
             max_concurrent_shard_searches: sc.max_concurrent_shard_searches,
             max_concurrent_remote_searches: sc.max_concurrent_remote_searches,
         }
@@ -5907,9 +5907,6 @@ impl RouterActor {
                 // ahead of its peers, each ordered by id. Streaming means they arrive in
                 // whatever order they finish, and the key is what puts them back.
                 let mut blocks: Vec<((u8, Uuid), Vec<JsonValue>)> = Vec::new();
-                // Counted rather than measured off `blocks`, which the early-termination check
-                // below consults on every iteration.
-                let mut hits_collected = 0usize;
                 let mut total_hits_sum = 0usize;
                 let mut shards_queried = 0usize;
                 let mut nodes_contacted = 0usize;
@@ -5923,14 +5920,25 @@ impl RouterActor {
                         push_remote_future(peer, &mut search_futures);
                     }
 
-                    // Early termination if limit reached and enabled
-                    if self.streaming.enable_early_termination
-                        && hits_collected >= limit
-                        && search_futures.is_empty()
-                        && peer_iter.size_hint().0 == 0
-                    {
-                        break;
-                    }
+                    // No early exit here, and there is nowhere one could go.
+                    //
+                    // A `break` used to sit at exactly this point, guarded by
+                    // `hits_collected >= limit && search_futures.is_empty() && peer_iter is
+                    // empty`. Every part of that guard was satisfied only when there was no work
+                    // left to skip — so it never saved anything — and it fired *after*
+                    // `next().await` had already handed over a result, which the `break` then
+                    // threw away. One whole source, silently, on every search whose limit was
+                    // smaller than the number of matches.
+                    //
+                    // `limit == 0` made `hits_collected >= limit` true from the start, so a
+                    // count-only search dropped a source every time: 29 or 33 reported where the
+                    // answer was 46, and five of nine shards accounted for. Worse than the count,
+                    // the merge lost that source's hits too — a sorted top-5 over three nodes
+                    // returned `[45, 44, 43, 40, 38]` instead of `[46, 45, 44, 43, 42]`,
+                    // depending on which node happened to answer last.
+                    //
+                    // The loop ends on its own: `FuturesUnordered::next` yields `None` once it is
+                    // empty and nothing refills it.
 
                     match search_result {
                         StreamingSearchResult::Local {
@@ -5954,7 +5962,6 @@ impl RouterActor {
                                 }
                                 block.push(hit_doc);
                             }
-                            hits_collected += block.len();
                             // Counted from the result, not from its hits — a shard that matched
                             // nothing still answered, and reading the id back out of each
                             // document missed that as well as costing a copy of it per hit.
@@ -5974,7 +5981,6 @@ impl RouterActor {
                                         val.get_mut("hits").and_then(|h| h.as_array_mut())
                                     {
                                         let block: Vec<JsonValue> = std::mem::take(hits);
-                                        hits_collected += block.len();
                                         blocks.push(((1, node_id), block));
                                     }
                                     if let Some(total) =

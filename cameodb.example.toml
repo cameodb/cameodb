@@ -159,6 +159,10 @@ search_threads = 8
 enable_streaming_search = true
 max_concurrent_shard_searches = 32
 max_concurrent_remote_searches = 8
+# Accepted and inert. It gated one `break` in the streaming merge that could only fire when no
+# work remained to skip, and that discarded a source's results after they had already arrived —
+# so any search whose limit was below the match count lost a whole node from both its count and
+# its merge. Setting it either way changes nothing now.
 enable_early_termination = true
 supervisor_timeout_secs = 5
 default_search_limit = 10
