@@ -564,6 +564,7 @@ async fn main() -> Result<()> {
             enabled: cameodb_config.storage.shard_affine_dispatch,
         },
         shard_placement,
+        cameodb_config.network.cluster.enabled,
     );
 
     // Started before the router, so the writer thread is already draining when the first

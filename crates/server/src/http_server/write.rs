@@ -188,20 +188,41 @@ pub(super) async fn bulk_write_handler(
         .await
         .map_err(AppError::from_route)?;
 
-    // Debug: Log response size to identify potential serialization issues
-    let response_str = serde_json::to_string(&result).unwrap_or_default();
-    let response_size = response_str.len();
+    // The response is measured by what can actually be large in it, rather than by
+    // serialising it.
+    //
+    // This line used to call `serde_json::to_string(&result)` for its length alone — a second
+    // full pass over a response axum is about to serialise itself, into a `String` dropped on
+    // the next line. On a 5 000-document batch that was the largest allocation anywhere on the
+    // write path, spent on a log line, on every bulk write, at `info!`.
+    //
+    // A bulk response is `items_written` and one reason per item that failed, so its size is
+    // its reasons plus a few dozen bytes of framing. Summing the reason lengths costs nothing
+    // and is what the HTTP/2 warning below was reading a whole serialisation to learn.
+    let errors = result.get("errors").and_then(|v| v.as_array());
+    let error_count = errors.map(|e| e.len()).unwrap_or(0);
+    let reason_bytes: usize = errors
+        .map(|e| {
+            e.iter()
+                .map(|r| r.as_str().map(str::len).unwrap_or(0))
+                .sum()
+        })
+        .unwrap_or(0);
     info!(
-        "Bulk write completed - response size: {} bytes, keys: {}",
-        response_size,
-        result.as_object().map(|o| o.keys().count()).unwrap_or(0)
+        "Bulk write completed - items written: {}, errors: {}, reason bytes: {}",
+        result
+            .get("items_written")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        error_count,
+        reason_bytes
     );
 
     // If response is very large, this could cause HTTP/2 issues
-    if response_size > 1_000_000 {
+    if reason_bytes > 1_000_000 {
         warn!(
-            "Large bulk response ({} bytes) may cause HTTP/2 issues",
-            response_size
+            "Large bulk response ({} bytes of failure reasons across {} errors) may cause HTTP/2 issues",
+            reason_bytes, error_count
         );
     }
 
