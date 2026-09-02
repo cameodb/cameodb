@@ -46,8 +46,8 @@ on one.
 | 17 — Record deletion | ✅ Done | — |
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
-| 14 — Security hardening (posture items C3–C7) | ◐ Partial | C3–C6 open; C7 done |
-| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH8 done, CH9 partial, CH10–CH12 are write-path efficiency |
+| 14 — Security hardening (posture items C3–C7) | ◐ Partial | C5 and C6 open; C3, C4 and C7 done |
+| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH8 done, CH9 and CH12 partial, CH10–CH11 are write-path duplication |
 
 ## Reconciliation, 2026-08-26
 
@@ -142,7 +142,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [B2](#b2--2f3--per-arena-jemalloc-stats) | 2f.3 — per-arena jemalloc stats | 13 | 2026-08-08 | 📋 |
 | [C1](#c1--per-index-role-overrides) | Per-index role overrides | 14 | 2026-07-30 | 📋 |
 | [C2](#c2--query-complexity-caps) | Query complexity caps | 14 | 2026-08-10 | 💭 |
-| [C3](#c3--fail-closed-on-unauthenticated-internal) … [C6](#c6--redact-the-cluster-psk-in-debug) | Posture hardening: four items from the 2026-09-01 review | 14 | 2026-09-01 | 📋 |
+| [C3](#c3--fail-closed-on-unauthenticated-internal) … [C6](#c6--redact-the-cluster-psk-in-debug) | Posture hardening: four items from the 2026-09-01 review — C3 and C4 done | 14 | 2026-09-01 | ◐ |
 | [C7](#c7--a-500-printed-the-nodes-internal-error-text) | A `500` printed the node's internal error text | 14 | 2026-09-01 | ✅ |
 | [D1](#d1--reindex) | Reindex | 15 | 2026-08-15 | 📋 |
 | [D2](#d2--replication) | Replication | 15 | 2026-08-15 | 📋 |
@@ -153,15 +153,18 @@ first written down here, so the chronology stays visible under the cost ordering
 | [E4](#e4--two-compatibility-paths-with-no-end-to-end-test) | Two compatibility paths with no end-to-end test | 16 | 2026-08-19 | 📋 |
 | [F1](#f1--the-cost-of-a-durable-commit-under-read-load) | The cost of a durable commit under read load | — | 2026-08-10 | 📋 |
 | [F2](#f2--an-open-loop-load-generator) | An open-loop load generator | — | 2026-08-10 | 📋 |
-| [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator | — | 2026-08-10 | 📋 |
+| [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator — standalone half done | — | 2026-08-10 | ◐ |
+| [F4](#f4--the-bulk-paths-asked-the-coordinator-before-they-knew-they-needed-to) | The bulk paths asked the coordinator before they knew they needed to | — | 2026-09-02 | ✅ |
+| [F5](#f5--concurrency-sweep-measured-2026-09-02) | Concurrency sweep on the release build — the operating point, and bulk's serialization measured | — | 2026-09-02 | ✅ |
+| [F6](#f6--what-fsync-actually-costs-measured-2026-09-02) | What fsync actually costs — and why turning it off is a reallocation, not a speedup | — | 2026-09-02 | ✅ |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
-| [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8 done, CH9 partial | — | 2026-09-01 | ◐ |
+| [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8 done, CH9 and CH12 partial | — | 2026-09-01 | ◐ |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
 | [J1](#j1--a-facet-field-cannot-be-written-to) | A facet field cannot be written to | 18 | 2026-08-27 | ✅ |
 | [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
 | [J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly) | The flattening lane, and the reference that describes neither | 18 | 2026-08-27 | 📋 |
 | [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to — the evidence behind J1 | 18 | 2026-08-27 | ✅ |
-| [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB11](#ob11--reasons-and-totals-that-went-missing-on-the-way-out) | Correctness, nine items from the 2026-09-01 review and the re-read of its own fixes — OB3–OB11 all done | — | 2026-09-01 | ✅ |
+| [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB12](#ob12--the-schema-gate-deadlocked-a-fan-out-against-itself) | Correctness, ten items from the 2026-09-01 review, the re-read of its own fixes, and the 0.3.3 release check — OB3–OB12 all done | — | 2026-09-01 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
@@ -527,27 +530,59 @@ one query — not a stream of them — is the threat; the two `parse_query_lenie
 
 ### C3 — Fail closed on unauthenticated `internal`
 
-📋 **Planned**, from the 2026-09-01 review (finding H1). `[security] enabled` defaults to
-`false`, and on the `internal` profile that is an `Outcome::Warn` — the node starts with every
-HTTP and MCP endpoint unauthenticated, and `check-config` exits 0. Only `external` makes it a
-`Fail`. The posture system is correct at what it enforces; this is the one rule whose soft
-gate leaves a network-reachable node open by omission.
+✅ **Done** 2026-09-02, ahead of the public 0.3.3 — and **not** as this item specified, for two
+reasons that only became visible once it was built that way.
 
-Make `enabled = false` on `internal` a `Fail`, with an explicit escape hatch —
-`allow_unauthenticated = true` — for the deployments that genuinely want a trusted-but-open
-node. Have `check-config` exit non-zero on that warning specifically, so "green" and "secure"
-stop meaning different things. `posture.rs` `evaluate`'s `auth` rule (392–434) and `config.rs`
-`check_posture` are the two places.
+The item asked for `enabled = false` on `internal` to become a `Fail`, with
+`allow_unauthenticated = true` as an escape hatch in `[security]`. Both halves were wrong:
+
+- **A `Fail` breaks an in-place upgrade.** A config with `profile = "internal"`, an off-box bind
+  and no `[security]` section was valid in 0.3.2 and would refuse to boot on 0.3.3. Not a parse
+  error either — `serde(default)` handles a missing field, so the config loads cleanly and *then*
+  the node declines to start. A patch release must not stop a working deployment over a value
+  nobody wrote. `crates/server/cameodb.toml` is exactly that config, and it is what the DEB and
+  RPM install.
+- **The escape hatch says nothing new.** `[node] profile` is already the operator's explicit
+  declaration of reach, and it cannot be inferred for a non-loopback bind — a node with neither
+  refuses to start rather than guess. So `internal` was already stated deliberately, and a second
+  setting re-affirming it is one more thing to get wrong and one more value whose absence can
+  stop a boot.
+
+**So the tool fails and the node warns**, which is what the item's own second sentence actually
+asked for — "have `check-config` exit non-zero on that warning specifically". `Posture` records
+`unauthenticated_off_box` as a fact rather than leaving it to be read out of a message, and
+`cameodb check-config` exits 1 on it; `--allow-unauthenticated` accepts it and exits 0. The
+acceptance lives on the *invocation*, where the operator is, and not in a file that a node has to
+boot from. Whether a node may run and whether a config is fit to deploy are different questions,
+and only the second one is a deploy step's business.
+
+The bind still decides, not the label: `internal` over loopback has overstated its reach rather
+than exposed anything, and neither warns nor fails.
+
+Verified: the three shipped configs fail the plain check with the exposure named and pass with the
+flag, reporting the same three accepted warnings the 0.3.0–0.3.2 records describe; and a node
+started on the config that fails the check serves requests, so nothing that ran on 0.3.2 stops
+running.
 
 ### C4 — The admin API reachable off-box unauthenticated
 
-📋 **Planned** (finding H2). `admin_enabled` defaults to `true`, and under `internal` a node
-bound off-loopback with no `NodeAdmin` key only *warns* that `/_admin/*` — memory purge,
-forced commit, writer eviction — is reachable unauthenticated (`posture.rs` 317–322). Closing
-C3 closes this too (with auth on, these routes are already gated on `NodeAdmin`), but the two
-are worth keeping apart: an operator can enable auth and still leave the admin API exposed to
-every key rather than to an admin one. Fold the off-box `admin_api` warning into the same gate
-as C3's.
+✅ **Done** 2026-09-02, and **half of its premise was wrong**. C3's gate closes the
+unauthenticated case, as the item expected. The other half — "an operator can enable auth and
+still leave the admin API exposed to every key rather than to an admin one" — does not happen:
+`authz.rs` (116–123) requires `Capability::NodeAdmin` on every `/_admin/*` route, so a `reader`
+or `writer` key is refused there regardless of what else it can do.
+
+What was actually wrong was the *message*. With authentication on but no key holding
+`node-admin`, the rule reported `/_admin/*` as "reachable off-box and unauthenticated" — which
+described the opposite configuration. Those endpoints are then reachable by *nobody*, which is
+safe and still worth a line, because an operator who mounted keys expecting to use the admin API
+has to be told which capability is missing. The rule now separates three cases: gated on a
+`node-admin` key (pass), gated on a capability no key holds (warn, naming it), and genuinely
+ungated (warn, naming memory purge, forced commit and writer eviction — reachable only because
+C3's hatch accepted it).
+
+Pinned by `an_admin_api_with_no_admin_key_is_closed_rather_than_open`, which asserts the word
+"unauthenticated" does **not** appear for an authenticated node.
 
 ### C5 — A decompression cap on the streaming ingest path
 
@@ -680,12 +715,153 @@ Nothing else in this phase should be called finished before this runs.
 
 ## F. Engine and performance, not filed under a phase
 
+### F5 — Concurrency sweep, measured 2026-09-02
+
+`cameodb-bench` against a standalone release node on an Apple M5 Pro (5 performance + 10
+efficiency cores, 24 GB), 4 shards, 8 workers, no pinning, `wal_sync` on, 5,000 seed documents,
+5s warmup and 20s measured per point. **Closed-loop, and the harness shares the machine with the
+node**, so the top of the sweep measures the pair and not the server alone.
+
+**Search — saturates at 12, and 16 is worse than free.**
+
+| conc | ok/s | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| 4 | 13,819 | 284µs | 339µs | 394µs | 1.50ms |
+| 8 | 22,388 | 348µs | 423µs | 508µs | 2.07ms |
+| 12 | 26,916 | 437µs | 510µs | 617µs | **15.11ms** |
+| 16 | 26,920 | 586µs | 661µs | 772µs | 10.17ms |
+
+12 → 16 adds **4 ops/s** and 34% to p50. The scaling efficiency is +62%, +20%, then 0%. Note
+`search_threads` defaults to 8 and throughput still improves to 12, so the read pool is not the
+only thing absorbing load — but nothing absorbs anything past it. The `max` at c=12 is the
+figure to explain: 15ms against a 617µs p99.
+
+**Bulk — throughput is invariant under concurrency, and latency scales exactly with it.**
+
+| conc | req/s | docs/s | p50 | p99 | µs per doc |
+|---|---|---|---|---|---|
+| 4 | 20 | 12,580 | 151.5ms | 294.5ms | 303 |
+| 8 | 20 | 12,363 | 311.5ms | 430.0ms | 623 |
+| 12 | 20 | 12,456 | 466.4ms | 671.9ms | 933 |
+| 16 | 21 | 12,264 | 647.4ms | 790.9ms | 1,295 |
+
+**This is [CH12](#ch12--write-path-serialization-and-round-trip-waste)'s fourth bullet, measured.**
+Four times the clients moves the same documents per second and multiplies latency by 4.3 — the
+signature of a hard serialization point, not of a saturated resource. A saturated resource still
+shows *some* gain. The worker-pool report confirms where: `jobs per worker: [0 × 8]` and every
+dispatch counter zero, because a `BulkWrite` never reaches the pool and holds the orchestrator
+mailbox for its whole duration. **Concurrency is not a tuning knob for bulk on this build; 4 is
+as fast as 16 and four times quicker to answer.**
+
+**Single writes — commit-bound, which is [F1](#f1--the-cost-of-a-durable-commit-under-read-load).**
+
+| conc | ok/s | p50 | p99 | max |
+|---|---|---|---|---|
+| 4 | 289 | 13.04ms | 25.90ms | 143.29ms |
+| 8 | 403 | 19.08ms | 33.99ms | 179.02ms |
+| 12 | 502 | 23.03ms | 64.31ms | 271.87ms |
+| 16 | 640 | 24.48ms | **100.45ms** | 205.28ms |
+
+Each write is its own durable commit across 4 shards. Throughput doubles from 4 to 16 while p99
+quadruples. Serially, at concurrency 1, the same write is 4.0ms p50 — so most of what is measured
+here is queueing behind other commits, and the growing `max` is commit and merge stalls.
+
+**Batching is worth 19x.** 640 docs/s as single writes at c=16 against 12,264 docs/s in bulk.
+
+**Mixed — 8 is the operating point; past it reads pay and writes do not gain.**
+
+| conc (= 2N in flight) | search ok/s | search p50 | write ok/s | write p50 |
+|---|---|---|---|---|
+| 4 | 14,299 | 274µs | 261 | 14.90ms |
+| 8 | 21,724 | 360µs | 376 | 20.04ms |
+| 12 | 21,789 | 546µs | 497 | 24.06ms |
+| 16 | 19,895 | 799µs | 622 | 24.96ms |
+
+`--concurrency N` spawns N workers **per workload**, so these rows are 2N requests in flight.
+Reads are barely hurt by concurrent writes at c=8 — 21,724 against 22,388 search-only, a 3% loss
+— and that is the useful result: the read pool and the shard writers are not fighting at that
+level. At c=12 and above search throughput stops improving and then *falls*, while search-only was
+still climbing to 26,916.
+
+**The operating point: 8.** Highest search throughput before the tail opens up, 3% read cost under
+concurrent writes, and the point at which every extra client is queueing rather than working. For
+bulk specifically, lower — concurrency buys nothing there at all.
+
+**Not measured, and it matters:** every figure here is closed-loop service time at a fixed
+concurrency, which is what [F2](#f2--an-open-loop-load-generator) exists to fix. None of it is an
+arrival-rate SLA.
+
+### F6 — What fsync actually costs, measured 2026-09-02
+
+The same sweep as [F5](#f5--concurrency-sweep-measured-2026-09-02) with `[storage] wal_sync =
+false`, which sets redb's durability to `None` (the banner reports `Durability: Eventual`). Same
+node, same binary, same corpus. **Search-only is the control**, because a read never fsyncs:
+22,388 → 22,472 ops/s and p50 348µs → 346µs, so the write arms below are not reading machine
+noise.
+
+**A single durable write is almost entirely fsync.**
+
+| conc | ok/s on | ok/s off | p50 on | p50 off | p99 on | p99 off |
+|---|---|---|---|---|---|---|
+| 4 | 289 | **13,267** | 13.0ms | **140µs** | 25.9ms | 252µs |
+| 8 | 403 | 14,910 | 19.1ms | 218µs | 34.0ms | 370µs |
+| 12 | 502 | 15,926 | 23.0ms | 255µs | 64.3ms | 27.8ms |
+| 16 | 640 | 15,699 | 24.5ms | 277µs | 100.5ms | 38.7ms |
+
+46x the throughput and 93x the latency at c=4. Each single write is its own commit, so this is
+one APFS fsync per operation and it is essentially the whole cost. The tail does *not* go away —
+p99 at c=12/16 is still 28–39ms against a 277µs p50 — and those are Tantivy commit and merge
+stalls, which durability has nothing to do with.
+
+**Bulk is only ~30% fsync. The rest is [CH12](#ch12--write-path-serialization-and-round-trip-waste).**
+
+| conc | docs/s on | docs/s off | gain | p50 on | p50 off |
+|---|---|---|---|---|---|
+| 4 | 12,580 | 16,106 | +28% | 151.5ms | 114.0ms |
+| 8 | 12,363 | 16,236 | +31% | 311.5ms | 238.0ms |
+| 12 | 12,456 | 16,041 | +29% | 466.4ms | 359.9ms |
+| 16 | 12,264 | 16,086 | +31% | 647.4ms | 486.9ms |
+
+**This is the finding worth acting on.** With the disk taken out of the picture bulk is *still*
+flat across concurrency — 16,106 / 16,236 / 16,041 / 16,086 — and its latency still scales
+exactly with the client count. So the ceiling on bulk ingestion is not durability; it is the
+orchestrator mailbox that a `BulkWrite` holds for its whole duration. Fixing that is worth more
+than 30% and costs no safety, where `wal_sync = false` buys 30% and costs the crash-recovery
+guarantee.
+
+**And it is not a free speedup — it moves the cost to readers.**
+
+| conc | search on | search off | write on | write off |
+|---|---|---|---|---|
+| 4 | 14,299 | **4,680** | 261 | 12,143 |
+| 8 | 21,724 | **3,872** | 376 | 14,720 |
+| 12 | 21,789 | 3,599 | 497 | 15,238 |
+| 16 | 19,895 | 3,478 | 622 | 15,589 |
+
+Search throughput in a mixed workload **falls by 82%** and p50 goes 360µs → 1.7ms. Nothing about
+reads got slower; the writes got 40x faster, and 14,720 writes/s of index churn is 40x the
+Tantivy commits and segment merges competing with the searches. The durable configuration is not
+"slow writes" — it is a rate limiter on write-side interference that readers were benefiting
+from.
+
+So the honest summary of the flag: it converts a disk cost into a CPU cost and hands the bill to
+whoever is reading. For a bulk load with nothing else running, that is exactly the trade you
+want, which is what `docs/CONFIGURATION.md` already says. For a node serving queries it is a
+regression dressed as a tuning knob.
+
 ### F1 — The cost of a durable commit under read load
 
 📋 **Planned.** What the rejected linger was meant to paper over, still open: a commit costs
 ~12.5ms with searches running against ~4.6ms without, and `wal_sync = false` recovers +86% of
 write throughput. The lever is **the fsync itself** — WAL device and placement, or a durability
 level between "every commit" and "none" — not how the writer groups writes.
+
+**The +86% is hardware-specific and understates it badly on some machines**, measured
+2026-09-02 — see [F6](#f6--what-fsync-actually-costs-measured-2026-09-02). On an M5 Pro over
+APFS, turning `wal_sync` off took a single write from 13.0ms to **140µs** at p50 and its
+throughput from 289 to 13,267 ops/s: the fsync was ~99% of the operation, not 46% of it. The
+figure to quote is the *shape* — fsync dominates a single durable write — and not the
+percentage, which belongs to the disk it was taken on.
 
 The reasoning is in [Mixed read/write load, measured](#mixed-readwrite-load-measured), which
 also records why the linger cannot be rebuilt from that reasoning alone.
@@ -709,10 +885,70 @@ closed-loop, and each one should say so.
 
 ### F3 — Take unkeyed searches off the coordinator
 
-📋 **Planned.** A keyed write now resolves locally from the published ring and shard placement,
-but a search still pays a mailbox round trip to a single actor because the decision depends on
-cluster size, which the router has no cheap way to know. Needs the node count published
-alongside the ring. Verified still the case 2026-08-26.
+◐ **Partial** 2026-09-02. **The standalone half is done**; the clustered half still needs the node
+count published alongside the ring, which is what the item was originally about.
+
+`resolve_local` opened with `let key = routing_key?`, so every *keyless* operation asked the
+coordinator. Counted on a standalone release build against a 2,000-document index — by grepping
+the coordinator's own `RouteOperation` debug line, so this is asks and not inference:
+
+| operation | coordinator asks before | after |
+|---|---|---|
+| search | **1 per search** | 0 |
+| streaming search | **1 per search** | 0 |
+| `GET /_indexes` | **1 per call** | 0 |
+| single write | 0 | 0 |
+| bulk write / delete | 0 route asks (but see [F4](#f4--the-bulk-paths-asked-the-coordinator-before-they-knew-they-needed-to)) | 0 |
+
+A search has no routing key to resolve, so *every* search took the ask — and the answer could
+only ever be `Local`, because `decide_route` has one node in `expected_nodes`. `NodeConfig`
+already grew `clustered` for 12c3ad9's schema gate, and it answers the same question statically:
+a node with clustering off will never have a peer. `RouterActor` now reads it and takes the local
+arm for keyed and keyless alike. Pinned by `a_lone_node_can_only_ever_be_routed_to_locally`, in
+the coordinator's own tests, because the claim being relied on is `decide_route`'s and not the
+router's.
+
+**What it is worth, measured rather than assumed.** Release build, 2,000-document index,
+five repeats after the change to establish the spread:
+
+| | before | after (5 runs) | outside the spread? |
+|---|---|---|---|
+| search p50, c=1 | 0.358ms | 0.353–0.357ms | marginally |
+| search p99, c=1 | 0.504ms | 0.402–0.476ms | **yes** |
+| search p50, c=16 | 3.276ms | 3.249–3.300ms | no |
+| search p99, c=16 | 5.924ms | 5.806–6.073ms | no |
+| search throughput, c=16 | 4,489 ops/s | 4,439–4,519 ops/s | no |
+
+So: a real improvement to the **single-request tail**, and nothing at concurrency, where the read
+pool's eight search threads are the constraint and a removed mailbox hop disappears into
+queueing. It is not a throughput change and should not be sold as one. What is unambiguous is the
+work removed — 150 coordinator asks over 250 operations, down to **zero** — and that a standalone
+node no longer consults a cluster it does not have, which is now structural rather than
+incidental.
+
+### F4 — The bulk paths asked the coordinator before they knew they needed to
+
+✅ **Done** 2026-09-02, found auditing the single-node path after the cluster work.
+
+`orch_bulk_write` fetched `GetShardAssignments` **and** `GetKnownPeers` at the top of every bulk
+write, and `orch_bulk_delete` fetched `GetShardAssignments` at the top of every bulk delete. All
+three maps are read only in the branch that forwards to a peer: the local/remote split uses
+`self.shards`, which the node already holds. So a single-node deployment paid two coordinator
+mailbox round trips per bulk write and one per bulk delete for maps whose only possible use was
+to discover that everything was local — and a clustered node paid them on every batch that
+happened to land locally, which a routing hint makes common.
+
+They are fetched lazily now, once, only if some document actually routed off this node. The
+delete path already asked for its *peers* lazily (`if !remote_by_node.is_empty()`), which is what
+made the pattern obvious: the same function was doing it right for one map and wrong for the
+other.
+
+**Not a measurable win, and worth saying so.** A bulk write is commit-bound at ~80 ops/s on this
+hardware whatever the concurrency, so two mailbox hops vanish into the fsync: p50 8.03ms before
+and 8.02ms after, p99 within run-to-run spread. The reason to do it anyway is that the work was
+unconditional and unnecessary, and the `ClusterCoordinator` is one actor that also serves gossip,
+shard registration and snapshot persistence — nothing that does not need it should be queuing
+behind it, whatever this hardware happens to show.
 
 ---
 
@@ -836,16 +1072,30 @@ everywhere; this is exactly the rule the code's own comments insist must agree w
 
 ### CH12 — Write-path serialization and round-trip waste
 
-📋 The small ones collected, none of which alone justifies an item:
+◐ **Partial** 2026-09-02. The small ones collected, none of which alone justifies an item. The
+first two landed ahead of the public 0.3.3; both were smaller than described, and neither needed
+the mechanism proposed here:
 
-- The bulk response is serialized twice — once to measure `response_size` for a log line
-  (`write.rs:180-187`), then again by axum. Gate the measurement behind log-enablement.
-- `handle_remote` deep-clones the whole op on every retry attempt, including the
-  single-attempt success path (`node_orchestrator.rs:5698`) — move the owned op on the final
-  attempt, clone only between retries.
-- Bulk writes never use the worker pool, so a large `BulkWrite` serializes on the orchestrator
-  actor mailbox for its full duration, blocking other actor-served operations.
-- The writer thread keeps single `Write`s and `BatchWrite`s in separate maps and applies them
+- ✅ **The bulk response is no longer serialized twice.** Gating the measurement behind
+  log-enablement was the proposal, and it would have bought nothing in the default deployment,
+  where `info` is on. A bulk response is `items_written` plus one reason per failed item, so its
+  size *is* its reasons: summing their lengths costs nothing, needs no gate, and is what the
+  large-response warning was reading a whole serialization to learn. The line reports items
+  written, error count and reason bytes.
+- ✅ **`handle_remote` no longer clones the op per attempt.** "Move the owned op on the final
+  attempt" would have left the first attempt cloning defensively, which is the case that matters
+  because it is the case that normally succeeds. No clone is needed at all: `try_remote` took the
+  op by value and then called `ask(&op)` — the send path serializes from a reference and only ever
+  borrowed it, so taking ownership obliged every caller to hand over a copy it could not get back.
+  It borrows now. The two fan-outs still clone once per peer, which is real: those futures run
+  concurrently and each needs its own.
+- 📋 Bulk writes never use the worker pool, so a large `BulkWrite` serializes on the orchestrator
+  actor mailbox for its full duration, blocking other actor-served operations. **Filed here as
+  efficiency and it was not** — [OB12](#ob12--the-schema-gate-deadlocked-a-fan-out-against-itself)
+  is what that blocking cost once something on the write path needed an answer from a peer that
+  was itself inside a write. OB12 removes the question rather than the blocking, so this bullet
+  stands, and the general fix — metadata reads that do not queue behind a write — belongs with it.
+- 📋 The writer thread keeps single `Write`s and `BatchWrite`s in separate maps and applies them
   as two redb transactions, contradicting the comment at `node_orchestrator.rs:3420-3421` that
   says they are merged.
 
@@ -1220,6 +1470,88 @@ The `debug_assert_eq!` accounting invariants in `orch_bulk_write` and the write-
 compiled out of the build that actually serves the caller the unbalanced total. Both now log at
 `error!` on the same condition, so the assertion catches an unaccounting path in a test and the
 log catches it in production.
+
+### OB12 — The schema gate deadlocked a fan-out against itself
+
+✅ **Done** 2026-09-02, found verifying the 0.3.3 perf work on the compose cluster rather than by
+reading anything. **The most serious defect of this cycle**, and it was in unreleased code:
+[3f6fdb7](#the-order-of-work)'s gate, which had been verified on a path that happened not to fan
+out.
+
+The gate runs inside `NodeOrchestrator`'s message handler. A bulk write holds that mailbox for its
+whole duration — which is [CH12](#ch12--write-path-serialization-and-round-trip-waste)'s fourth
+bullet, filed as an efficiency note — and from inside it the node both forwards shares to its
+peers *and* asks those peers for a schema, through the one `RemoteActorRef<NodeOrchestrator>`
+mailbox now running the forwarded writes, each of which was asking back.
+`ConnectionChannel::{Operations, Replication}` both resolve to that single actor, so there is no
+lane a metadata read can take instead.
+
+| Measured on the 3-node compose cluster, `green 3/3` | before | after |
+|---|---|---|
+| 46 documents, new index, spread across shards | **15 written, 31 refused, 5.02s** | 46 written, 0 refused, 1.72s |
+| the same 46 under one `routing_key` (no fan-out) | 46 written, 0.03s | 46 written, 0.13s |
+| 46 sequential single writes | 46 ok, 0.15s | 46 ok, 0.68s |
+| retrying the failed batch | 18 of 46, then 18 again | n/a |
+
+How many survived was decided by which forwards won the race — 14 to 20 of 46 over six runs —
+and every run paid the full five seconds.
+
+Exactly one `PEER_SCHEMA_LOOKUP_TIMEOUT` window, and the refusal came from the *receiving* node's
+own handler: `Refusing to sample a schema … reason=node 8da172e0 timed out; node 6fa6557d timed
+out`, 5.028s after that same node logged `Attempting remote call` to the first of them.
+
+**A forwarded write now carries what it was validated against**, so the receiver neither asks nor
+samples — `ClientOp::{Write, BulkWrite}::carried_schema`, defaulted so a share from an older peer
+reads as "nothing carried" and takes the lookup as before. This is what the gate was arguing for:
+one schema decision per index, not one per node.
+
+**What travels is one bit, and no schema.** Three cuts, and only the third is right — see
+[3e](#3e-what-a-forwarded-write-carries--reviewed-2026-09-02) for the measurements. The first sent
+the whole `IndexSchema` on every forward: 602 bytes for three fields, 3,478 for twenty, against a
+49-byte document. The second sent a 61-byte stamp, which is nothing on a batch and more than the
+payload on a single write. Neither needed to be sent, because the question was wrong: a forwarded
+write is a *share of a decision another node already made*, so the receiver only needs to know
+that inventing one is not its job — and can then **ask**. `ClientOp::Write` already carried
+`forwarded` for OB3's hop limit, so a single write costs nothing extra; `BulkWrite` gained it.
+
+The receiver *answers* rather than asking, which is what keeps the deadlock closed: it cannot
+canvass peers from inside a write without waiting on the mailbox those peers are using to run the
+writes this fan-out just sent them. Recognised by verdict — a new `RemoteVerdict::SchemaRequired`
+— rather than by reading the message text, which is what bfe5fde's classification work exists to
+avoid.
+
+The sender-side alternative was a cache of "peer P already has index I". Cheaper still, and
+rejected: it is an assumption about another node's disk, which is what ADR 005's "a peer's own
+report is the truth" rules out. Asking costs one round trip per node per index and cannot be
+stale.
+
+Three invariants hold it up:
+
+- **A node that already holds a schema ignores a body it is handed**, because the adopt path is
+  only reached when it holds none. So a stale carried schema cannot overwrite a current one.
+- **An empty schema is never sent** (`schema_to_carry`). The receiver adopts what it is given and
+  then treats the index as already existing, so every field of the arriving document would be
+  recorded unsearchable rather than typed.
+- **A forwarded share is never sampled.** `infer_type_from_value` reads a subset holding no
+  negative values differently from the whole batch, so two nodes sampling their own shares can
+  build two different tantivy indexes from one request, with no bug anywhere. One decision per
+  index, made where the batch was whole.
+
+Divergence detection is *not* on this path, deliberately. The stamp would have bought it, and the
+price was 61 bytes on every forward to notice something that only shows on a node currently being
+written to. Once step 5 lands it is free and better: every node compares its own thumbprint against
+the cluster-agreed one, at boot and on reconcile, for no wire bytes at all.
+
+Verified: identical `version` and `thumbprint` on all three nodes; a content query finds all 46
+and a sorted page returns `[46,45,44,43,42]`, so adoption kept the fields searchable and the fast
+column intact; a declaration on one node is still adopted verbatim by the other two with `n`
+still `u64`; the degraded arm still answers `503` on a new index, now in 0.01s rather than after
+a five-second wait, and the retry once whole writes all of it.
+
+**The class is still open.** This closes the write path by removing the question, not by making
+the answer cheap: any *other* peer metadata read issued while that peer is inside a write still
+queues behind it — `FindSchemaInCluster` behind a `DELETE` is the reachable one. Taking metadata
+reads off the orchestrator mailbox is the general fix, and it is not done.
 
 ---
 
