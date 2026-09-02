@@ -161,7 +161,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
 | [J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly) | The flattening lane, and the reference that describes neither | 18 | 2026-08-27 | 📋 |
 | [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to — the evidence behind J1 | 18 | 2026-08-27 | ✅ |
-| [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB11](#ob11--reasons-and-totals-that-went-missing-on-the-way-out) | Correctness, nine items from the 2026-09-01 review and the re-read of its own fixes — OB3–OB8 and OB10–OB11 done, OB9 remains | — | 2026-09-01 | ◐ |
+| [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB11](#ob11--reasons-and-totals-that-went-missing-on-the-way-out) | Correctness, nine items from the 2026-09-01 review and the re-read of its own fixes — OB3–OB11 all done | — | 2026-09-01 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
@@ -1136,16 +1136,58 @@ covered by a regression test. A single-node test cannot reach the branch at all.
 
 ### OB9 — A bulk delete drops a peer's per-id errors
 
-📋 **Open**, found 2026-09-01.
+✅ **Done** 2026-09-02, found 2026-09-01.
 
-`forward_bulk_delete_to_remote` logs a peer's `errors` array but returns only `items_deleted`
-(`node_orchestrator.rs:8058-8112`), so per-id failures on a peer surface as a silent shortfall
-that breaks `items_received == items_deleted + errors.len()`. The bulk-write counterpart already
-renumbers and forwards a peer's reasons (`remote_rejections`/`renumber_reasons`); the delete
-path should reuse it.
+`forward_bulk_delete_to_remote` read a peer's `errors` array, logged it, and returned only
+`items_deleted` — so per-id failures on a peer arrived as a shortfall in the count with nothing
+to explain it, breaking `items_received == items_deleted + errors.len()`.
 
-Proposal: return `(items_deleted, errors)` from the forward and merge the peer's reasons,
-renumbered into the caller's batch, exactly as the bulk-write path does.
+**Two more paths broke the same invariant**, and fixing only the peer's reasons would have left
+it broken, so all three landed together:
+
+- **A local shard batch that failed** produced one reason for however many ids were in it.
+- **A forward that never reached a node** produced one reason for the whole slice — the case
+  that shows up the moment a node goes down, and the one measured below.
+- **A node with no known address** produced one reason for its whole group.
+
+**What landed.** `forward_bulk_delete_to_remote` returns `(deleted, reasons)` as the bulk-write
+forward already did, and every failure path names each id it lost rather than the group. The
+counting shell of `renumber_reasons` is now `balance_reasons`, shared by both paths: too few
+reasons is padded so a shortfall is stated rather than left to be found by subtracting, too many
+is folded onto the last reason so nothing anyone took the trouble to send is dropped.
+
+The delete side needed no renumbering, which is where this differs from the ROADMAP's own
+proposal. A write's reasons name positions, and a position is only meaningful in the batch it was
+numbered against — hence `remote_rejections`. A delete's reasons name **ids**, and an id means
+the same thing on every node, so `remote_delete_rejections` passes a peer's reason through as the
+peer said it. Only a reason in some other shape — "the shard did not take the batch" — is
+attributed to the node that said it, because there the node is the useful fact. The caller gets
+one flat list keyed by id whichever node handled the id, matching how its own local failures
+already read.
+
+`orch_bulk_delete` now ends with the same `debug_assert_eq!` plus release-mode `error!` the bulk
+write path has, so a path that stops accounting for what it drops becomes a test failure rather
+than an unbalanced answer.
+
+**Verified on the 3-node compose cluster.** With one node stopped, deleting 30 ids:
+
+| | before | after |
+|---|---|---|
+| `items_deleted` | 17 | 17 |
+| `errors` | **1** — "remote forwarding failed", naming no id | **13**, one per id |
+| adds up to 30 | **no — 18** | yes |
+
+Each of the 13 names a distinct id from the batch, so the caller knows exactly what to retry;
+the retry once the cluster was whole deleted all 30 with no errors. Also balanced: a healthy
+delete of all 30, absent ids counted as deleted rather than refused (the delete is idempotent —
+`handle_batch_delete` returns one sequence per id it was given), an entry with an empty id, and
+the degraded batch coordinated from each surviving node in turn.
+
+**Not covered by the cluster test:** a peer that answers with per-id reasons of its own. Both
+nodes split by the same shard map, so a peer never re-forwards a share it was given, and
+provoking it needs fault injection. `remote_delete_rejections` is unit-tested for that branch —
+pass-through, attribution, an id from another batch, padding and surplus — and its counting path
+runs on every healthy cross-node delete above.
 
 ### OB10 — The record limit meant different things depending on how the wire split the line
 

@@ -159,32 +159,59 @@ pub(crate) fn renumber_reasons(
     attribution: &str,
     unaccounted: impl Fn() -> String,
 ) -> Vec<String> {
-    let mut renumbered: Vec<String> = Vec::with_capacity(unwritten);
-    let mut surplus: Vec<&str> = Vec::new();
-
-    for reason in reasons {
-        if renumbered.len() == unwritten {
-            surplus.push(reason.as_str());
-            continue;
-        }
-        match split_document_reason(reason) {
+    balance_reasons(
+        reasons,
+        unwritten,
+        |reason| match split_document_reason(reason) {
             Some((theirs, why)) if theirs < positions.len() => {
-                renumbered.push(format!("{label} {}: {why}", positions[theirs]));
+                format!("{label} {}: {why}", positions[theirs])
             }
             // Not about one item, or numbered against a batch this is not: kept as what was
             // said, against an item it cost.
-            _ => renumbered.push(format!("{attribution}: {reason}")),
+            _ => format!("{attribution}: {reason}"),
+        },
+        attribution,
+        unaccounted,
+    )
+}
+
+/// Exactly one reason per item that was not accounted for, whatever the reasons arrived as.
+///
+/// The counting half of [`renumber_reasons`], separated because there are two ways to name the
+/// item a reason is about and only one way to make the count add up. A bulk write names
+/// positions in the caller's batch; a bulk delete names ids, which mean the same thing on every
+/// node and so need no renumbering at all. `restate` is the difference between them.
+///
+/// Two imbalances, both handled rather than trusted: too few reasons is padded with
+/// `unexplained`, because a shortfall a caller has to find by subtracting is not an answer; too
+/// many is folded onto the last reason, because a reason someone took the trouble to send is the
+/// only account of a failure that exists.
+fn balance_reasons(
+    reasons: &[String],
+    unaccounted: usize,
+    restate: impl Fn(&str) -> String,
+    attribution: &str,
+    unexplained: impl Fn() -> String,
+) -> Vec<String> {
+    let mut balanced: Vec<String> = Vec::with_capacity(unaccounted);
+    let mut surplus: Vec<&str> = Vec::new();
+
+    for reason in reasons {
+        if balanced.len() == unaccounted {
+            surplus.push(reason.as_str());
+            continue;
         }
+        balanced.push(restate(reason));
     }
 
-    while renumbered.len() < unwritten {
-        renumbered.push(unaccounted());
+    while balanced.len() < unaccounted {
+        balanced.push(unexplained());
     }
 
     // More was said than there are items to say it against. Carried on the last reason so the
     // count still adds up and nothing said is lost.
     if !surplus.is_empty()
-        && let Some(last) = renumbered.last_mut()
+        && let Some(last) = balanced.last_mut()
     {
         last.push_str(&format!(
             " ({attribution} also reported: {})",
@@ -192,7 +219,7 @@ pub(crate) fn renumber_reasons(
         ));
     }
 
-    renumbered
+    balanced
 }
 
 /// What a peer's answer means for the documents this node forwarded to it.
@@ -227,6 +254,45 @@ fn remote_rejections(
                 "a document forwarded to node {node_id} was neither written nor refused: it \
                  reported {written} written of {} with {} reasons",
                 positions.len(),
+                reasons.len()
+            )
+        },
+    )
+}
+
+/// What a peer's answer means for the ids this node forwarded to it, on a bulk delete.
+///
+/// The delete counterpart of [`remote_rejections`], and simpler for one reason: a delete's
+/// reasons name ids, and an id means the same thing on every node. A position does not, which is
+/// the whole reason the write path renumbers — so there is nothing to renumber here, and a reason
+/// already about one of the forwarded ids is passed through as the peer said it.
+///
+/// A reason in any other shape is about the request rather than one id — "the shard did not take
+/// the batch", say — so it is attributed to the node that said it and attached to an id it cost.
+/// Which node matters there, and does not for an id-shaped reason: the caller's own local
+/// failures read `{id}: why` too, and one flat list keyed by id is the answer, whichever node
+/// handled the id.
+fn remote_delete_rejections(
+    node_id: Uuid,
+    ids: &[String],
+    deleted: usize,
+    reasons: &[String],
+) -> Vec<String> {
+    let forwarded: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let attribution = format!("node {node_id}");
+    balance_reasons(
+        reasons,
+        ids.len().saturating_sub(deleted),
+        |reason| match reason.split_once(": ") {
+            Some((id, _)) if forwarded.contains(id) => reason.to_string(),
+            _ => format!("{attribution}: {reason}"),
+        },
+        &attribution,
+        || {
+            format!(
+                "an id forwarded to node {node_id} was neither deleted nor refused: it reported \
+                 {deleted} deleted of {} with {} reasons",
+                ids.len(),
                 reasons.len()
             )
         },
@@ -8696,21 +8762,31 @@ impl NodeOrchestrator {
                 let shard = self.shards.get(&shard_id).cloned();
                 let index_name = index.to_string();
                 async move {
-                    let shard = shard.ok_or_else(|| {
-                        OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("Local shard {shard_id} not found"),
-                        ))
-                    })?;
-                    shard.handle_batch_delete(index_name, ids).await
+                    // Kept so a failure can name every id it took down with it, as the bulk
+                    // write path keeps its positions for the same reason. One reason for a whole
+                    // shard batch left the answer short by however many ids were in it.
+                    let attributable = ids.clone();
+                    let outcome = async {
+                        let shard = shard.ok_or_else(|| {
+                            OrchestratorError::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!("Local shard {shard_id} not found"),
+                            ))
+                        })?;
+                        shard.handle_batch_delete(index_name, ids).await
+                    }
+                    .await;
+                    (shard_id, attributable, outcome)
                 }
             })
             .collect();
 
-        for result in futures::future::join_all(local_futures).await {
-            match result {
+        for (shard_id, ids, outcome) in futures::future::join_all(local_futures).await {
+            match outcome {
                 Ok(count) => deleted += count,
-                Err(err) => errors.push(format!("local shard delete failed: {err}")),
+                Err(err) => errors.extend(ids.into_iter().map(|id| {
+                    format!("{id}: shard {shard_id} did not take the batch this id was in: {err}")
+                })),
             }
         }
 
@@ -8734,20 +8810,63 @@ impl NodeOrchestrator {
                     Some(addr) => {
                         let addr = addr.clone();
                         remote_futures.push(async move {
-                            self.forward_bulk_delete_to_remote(node_id, &addr, index, payloads)
-                                .await
+                            // Kept so a call that never reached the node can still name what it
+                            // carried.
+                            let ids: Vec<String> =
+                                payloads.iter().map(|doc| doc.id().to_string()).collect();
+                            let outcome = self
+                                .forward_bulk_delete_to_remote(node_id, &addr, index, payloads)
+                                .await;
+                            (node_id, ids, outcome)
                         });
                     }
-                    None => errors.push(format!("no peer address for node {node_id}")),
+                    // One reason per id rather than one for the group: the group is not what the
+                    // caller sent or counts in.
+                    None => errors.extend(payloads.iter().map(|doc| {
+                        format!(
+                            "{}: no address known for node {node_id}, which owns its shard",
+                            doc.id()
+                        )
+                    })),
                 }
             }
 
-            for result in futures::future::join_all(remote_futures).await {
-                match result {
-                    Ok(count) => deleted += count,
-                    Err(err) => errors.push(format!("remote forwarding failed: {err}")),
+            for (node_id, ids, outcome) in futures::future::join_all(remote_futures).await {
+                match outcome {
+                    Ok((count, reasons)) => {
+                        deleted += count;
+                        errors.extend(reasons);
+                    }
+                    // The batch never got an answer, so none of it was deleted.
+                    Err(err) => errors.extend(
+                        ids.into_iter()
+                            .map(|id| format!("{id}: forwarding to node {node_id} failed: {err}")),
+                    ),
                 }
             }
+        }
+
+        // Every id is either deleted or explained, as on the bulk write path. Each path above
+        // accounts for what it loses, so this is a check on that rather than a repair — a batch
+        // that reaches here unbalanced has a path that stopped saying what it dropped, which is
+        // the defect this arithmetic exists to catch.
+        //
+        // Asserted in a debug build and logged in a release one: the assertion makes an
+        // unaccounting path a test failure, the log makes it findable in the build that actually
+        // serves the caller the unbalanced answer.
+        debug_assert_eq!(
+            deleted + errors.len(),
+            items_received,
+            "a bulk delete must account for every id it received"
+        );
+        if deleted + errors.len() != items_received {
+            error!(
+                index = %index,
+                items_received = items_received,
+                items_deleted = deleted,
+                errors = errors.len(),
+                "BulkDelete did not account for every id it received"
+            );
         }
 
         let duration = start.elapsed();
@@ -8775,7 +8894,7 @@ impl NodeOrchestrator {
         peer_addr: &str,
         index: &str,
         docs: Vec<DeletePayload>,
-    ) -> Result<usize, OrchestratorError> {
+    ) -> Result<(usize, Vec<String>), OrchestratorError> {
         debug!(
             %node_id,
             %peer_addr,
@@ -8797,6 +8916,9 @@ impl NodeOrchestrator {
                 )))
             })?;
 
+        // Kept so the peer's answer can be balanced against what it was actually given.
+        let ids: Vec<String> = docs.iter().map(|doc| doc.id().to_string()).collect();
+
         let op = ClientOp::BulkDelete {
             index: index.to_string(),
             docs,
@@ -8804,22 +8926,39 @@ impl NodeOrchestrator {
 
         let answer: JsonValue = remote_answer(remote.ask(&op).await)?;
 
-        // Its errors are the caller's errors too, so surface them rather than counting only
-        // what succeeded.
-        if let Some(remote_errors) = answer.get("errors").and_then(|e| e.as_array())
-            && !remote_errors.is_empty()
-        {
+        let deleted = (answer
+            .get("items_deleted")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize)
+            .min(ids.len());
+
+        let reasons: Vec<String> = answer
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !reasons.is_empty() {
             warn!(
                 %node_id,
-                error_count = remote_errors.len(),
+                error_count = reasons.len(),
                 "Remote node reported errors deleting its share of the batch"
             );
         }
 
-        Ok(answer
-            .get("items_deleted")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize)
+        // Its reasons are the caller's reasons too. They used to be logged here and dropped,
+        // so a peer that refused half its share was reported as a shortfall in `items_deleted`
+        // with nothing to explain it — the caller could see that fewer ids were deleted than it
+        // sent and could not learn which, or why. ROADMAP OB9.
+        Ok((
+            deleted,
+            remote_delete_rejections(node_id, &ids, deleted, &reasons),
+        ))
     }
 
     /// Forward a single write or delete to the node that owns `target`, and return its answer.
@@ -11994,6 +12133,79 @@ mod tests {
         def.indexed = false;
         def.is_shadow = true;
         def
+    }
+
+    /// A delete's reasons name ids, and an id needs no renumbering to mean the same thing.
+    ///
+    /// The delete counterpart of the write path's renumbering, and the reason it is simpler:
+    /// a position is only meaningful in the batch it was numbered against, an id is meaningful
+    /// everywhere. So a peer's reason about an id this node forwarded is the caller's reason
+    /// already, and passing it through is what makes the answer one flat list keyed by id
+    /// whichever node handled the id.
+    #[test]
+    fn a_peers_delete_reasons_come_back_keyed_by_id() {
+        let node = Uuid::nil();
+        let ids = vec!["d05".to_string(), "d09".to_string()];
+
+        assert_eq!(
+            remote_delete_rejections(node, &ids, 1, &["d09: no shard available".to_string()]),
+            vec!["d09: no shard available".to_string()],
+            "a reason about a forwarded id is passed through as the peer said it"
+        );
+
+        // Not about one id — it cost ids without naming one — so it is attributed to the node
+        // that said it and stands for an id that was not deleted.
+        assert_eq!(
+            remote_delete_rejections(node, &ids, 1, &["index is read-only".to_string()]),
+            vec![format!("node {node}: index is read-only")],
+            "a batch-level reason is attributed rather than dropped"
+        );
+
+        // An id from someone else's batch is not one of ours: naming it would report an id the
+        // caller never sent, so it is kept as what the node said.
+        let foreign = remote_delete_rejections(node, &ids, 1, &["zz1: gone".to_string()]);
+        assert_eq!(foreign, vec![format!("node {node}: zz1: gone")]);
+    }
+
+    /// A bulk delete's answer has to add up: deleted plus reasons is what was sent.
+    ///
+    /// The defect this closes is the shortfall, not the wording. A peer's reasons were logged
+    /// and thrown away, so a peer that refused two of the three ids forwarded to it reported one
+    /// deleted and no reasons — and the caller could see two ids missing without learning which,
+    /// or why. ROADMAP OB9.
+    #[test]
+    fn a_delete_shortfall_is_always_explained() {
+        let node = Uuid::nil();
+        let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+        // Three forwarded, one deleted, and the peer accounted for only one of the other two.
+        let short = remote_delete_rejections(node, &ids, 1, &["b: locked".to_string()]);
+        assert_eq!(short.len(), 2, "one reason per id not deleted: {short:?}");
+        assert_eq!(short[0], "b: locked");
+        assert!(
+            short[1].contains("neither deleted nor refused"),
+            "the one it did not explain says so: {short:?}"
+        );
+
+        // A peer that deleted everything leaves nothing to report, whatever else it said.
+        assert!(
+            remote_delete_rejections(node, &ids, 3, &["b: locked".to_string()]).is_empty(),
+            "nothing was lost, so there is nothing to account for"
+        );
+
+        // More reasons than ids to say them against: folded onto the last, because the count
+        // has to hold and a reason someone sent is the only account of a failure there is.
+        let surplus = remote_delete_rejections(
+            node,
+            &ids,
+            2,
+            &["a: locked".to_string(), "c: vanished".to_string()],
+        );
+        assert_eq!(surplus.len(), 1, "one id was not deleted: {surplus:?}");
+        assert!(
+            surplus[0].contains("a: locked") && surplus[0].contains("c: vanished"),
+            "and neither reason is lost: {surplus:?}"
+        );
     }
 
     /// A peer numbers its reasons against the batch it received, not the one the caller sent.
