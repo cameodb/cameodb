@@ -242,27 +242,52 @@ pub(super) async fn delete_index_handler(
         index, params.delete_schema
     );
 
-    // Require the index to exist before deleting. A name that was never created
-    // cannot have passed `validate_index_name`, so this also rejects traversal
-    // attempts. Distinguish "absent" from "lookup failed" so that an actor
-    // timeout is not reported to the client as a missing index.
-    if let Err(e) = state
+    // Require the index to exist before deleting. A name that was never created cannot have
+    // passed `validate_index_name`, so this also rejects traversal attempts.
+    //
+    // **Asked of the cluster, not of this node.** The check used to be a local `GetConfig`,
+    // which answers only for the schemas this node happens to hold — so deleting through a node
+    // that did not hold the index answered `404` and the cluster-wide delete never ran, leaving
+    // the index alive on every node that did hold it. Deleting it then meant finding those nodes
+    // and asking each one.
+    //
+    // That was always wrong and is now ordinary rather than rare: a node holds a schema only if
+    // a document routed to it or it adopted one from a peer, so "in the cluster, not on this
+    // node" is the normal state of an index whose data landed elsewhere.
+    //
+    // Absent on *some* nodes is not absent: `DeleteIndexCluster` deletes where the index is and
+    // no-ops where it is not, which is success. Only a name no node has is a `404`.
+    let catalogue = state
         .router
-        .handle_client_op(ClientOp::GetConfig {
-            index: index.clone(),
-        })
+        .route_and_handle(
+            ClientOp::ListClusterIndexes {
+                // The names are the question; sizes cost a walk of every shard's data.
+                include_data_size: false,
+            },
+            None,
+            OperationType::Read,
+        )
         .await
-    {
-        let msg = e.to_string();
-        return Err(if msg.contains("NotFound") || msg.contains("not found") {
-            AppError::not_found(format!("index '{}' not found", index))
-        } else {
-            AppError::from(anyhow::anyhow!(
-                "Failed to look up index '{}': {}",
-                index,
-                msg
-            ))
+        // Classified by the error's verdict rather than by reading its text for "not found",
+        // which could not tell a missing index from a shard that failed to answer — and would
+        // have told the caller their index was gone when the lookup itself broke.
+        .map_err(AppError::from_route)?;
+
+    let known = catalogue
+        .get("indexes")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|indexes| {
+            indexes
+                .iter()
+                .filter_map(|entry| entry.get("name").and_then(JsonValue::as_str))
+                .any(|name| name == index)
         });
+
+    if !known {
+        return Err(AppError::not_found(format!(
+            "index '{}' not found on any node in the cluster",
+            index
+        )));
     }
 
     // Use cluster coordinator for proper cluster-wide index deletion
