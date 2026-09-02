@@ -107,11 +107,11 @@ See [Configuration → Security and Posture](../docs/CONFIGURATION.md#security-a
 Use the `docker-push.sh` script for easy building:
 
 ```bash
-# Build and load local image (single platform, for testing)
+# Build both platforms and load a runnable image, publishing nothing
 ../scripts/build/docker-push.sh --no-push
 
 # Test the local build
-docker run --rm cameodb:latest --version
+docker run --rm goranc/cameodb:latest --version
 ```
 
 ### Build and Push to DockerHub (Multi-Platform)

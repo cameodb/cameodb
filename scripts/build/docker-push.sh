@@ -4,7 +4,7 @@
 # Usage:
 #   ./scripts/build/docker-push.sh                   # Build + push latest tag
 #   ./scripts/build/docker-push.sh 0.2.2             # Build + push with version tag
-#   ./scripts/build/docker-push.sh 0.2.2 --no-push   # Build only (no push)
+#   ./scripts/build/docker-push.sh 0.2.2 --no-push   # Build both platforms, no push
 #
 # Can be run from any directory (auto-detects project root)
 #
@@ -73,20 +73,53 @@ if [[ -s "${CORPORATE_CA_CERT}" ]]; then
 fi
 
 if [[ "$NO_PUSH" == true ]]; then
-    # Build only, load into local Docker
-    echo -e "${YELLOW}Building for local platform only (no push)...${NC}"
+    # Build every platform the push would publish. This used to build linux/amd64 alone, which
+    # made the rehearsal worthless for the arch it skipped: an aarch64-only break compiled for
+    # the first time during the real `--push`, after the amd64 manifest was already uploaded.
+    # On an arm64 host it was also the emulated arch that got checked and the native one that
+    # did not.
+    echo -e "${YELLOW}Building ${PLATFORMS} (no push)...${NC}"
+
+    # A manifest list only fits in the local image store when the containerd snapshotter is
+    # enabled; the classic store rejects it with "docker exporter does not currently support
+    # exporting manifest lists". Where it fits, one build both verifies and loads. Where it
+    # does not, verify with cacheonly and load the host arch in a second pass.
+    if docker info --format '{{.DriverStatus}}' 2>/dev/null | grep -q 'io.containerd.snapshotter'; then
+        OUTPUT_ARGS=(--load)
+    else
+        OUTPUT_ARGS=(--output type=cacheonly)
+    fi
+
     docker buildx build \
         --builder "${BUILDER_NAME}" \
-        --platform linux/amd64 \
-        --load \
+        --platform "${PLATFORMS}" \
+        "${OUTPUT_ARGS[@]}" \
         --sbom=true \
         ${BUILD_ARGS[@]:+"${BUILD_ARGS[@]}"} \
         "${TAGS[@]}" \
         -f Dockerfile \
         "$PROJECT_ROOT"
+
+    if [[ "${OUTPUT_ARGS[0]}" == "--output" ]]; then
+        # cacheonly leaves nothing runnable behind, so re-export the host arch for the
+        # `docker run` below. Every layer is already in the build cache, so this is an export,
+        # not a second compile.
+        HOST_PLATFORM="linux/$(docker version --format '{{.Server.Arch}}')"
+        echo ""
+        echo -e "${YELLOW}Loading ${HOST_PLATFORM} into the local image store...${NC}"
+        docker buildx build \
+            --builder "${BUILDER_NAME}" \
+            --platform "${HOST_PLATFORM}" \
+            --load \
+            ${BUILD_ARGS[@]:+"${BUILD_ARGS[@]}"} \
+            "${TAGS[@]}" \
+            -f Dockerfile \
+            "$PROJECT_ROOT"
+    fi
     
     echo ""
     echo -e "${GREEN}Build complete!${NC}"
+    echo -e "  Verified:    ${PLATFORMS}"
     echo -e "  Local image: ${REPO}:latest"
     echo ""
     echo -e "${BLUE}Test with:${NC}"
