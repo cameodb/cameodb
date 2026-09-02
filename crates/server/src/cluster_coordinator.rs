@@ -2636,6 +2636,54 @@ mod tests {
         assert!(matches!(decision, RoutingDecision::Local));
     }
 
+    /// Every routing decision on a lone node is `Local`, whatever it is asked.
+    ///
+    /// This is what lets `RouterActor::resolve_local` answer for a *keyless* operation without a
+    /// mailbox round trip when `[network.cluster] enabled` is off. Measured on a release build
+    /// against a 2,000-document index, that ask was happening once per ordinary search, once per
+    /// streaming search and once per `GET /_indexes` — for an answer that could not have been
+    /// anything else. Keyed writes already resolved locally from the published ring and
+    /// placement; the keyless reads were the gap, and they are the common case.
+    ///
+    /// Asserted here rather than in the router, because the claim is *this function's*: if it
+    /// ever gains an answer other than `Local` for a single-node cluster, the shortcut becomes a
+    /// lie and this test is what says so.
+    #[test]
+    fn a_lone_node_can_only_ever_be_routed_to_locally() {
+        // No shards registered, so the ring is empty — the state a node is in before its first
+        // write, and the one the shortcut has to be right about too.
+        let empty = ClusterCoordinator::new(make_cluster());
+        // And with a shard of its own, which is every later operation.
+        let cluster = make_cluster();
+        let local = cluster.local_node_id;
+        let mut owning = ClusterCoordinator::new(cluster);
+        let shard_id = Uuid::new_v4();
+        owning.shard_assignments.insert(
+            shard_id,
+            ShardMetadata {
+                shard_id,
+                node_id: local,
+                vnode_tokens: vec![1, 2, 3],
+                storage_bytes: 0,
+                document_count: 0,
+            },
+        );
+        owning.rebuild_ring();
+
+        for cc in [&empty, &owning] {
+            for key in [None, Some("any-key".to_string())] {
+                for op in [OperationType::Read, OperationType::Write] {
+                    let decision = cc.decide_route(key.clone(), op.clone());
+                    assert!(
+                        matches!(decision, RoutingDecision::Local),
+                        "a node that is the whole cluster has nowhere else to send \
+                         {key:?}/{op:?}, got {decision:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn decide_route_returns_local_when_owner_is_self() {
         let cluster = make_cluster();

@@ -4906,6 +4906,13 @@ pub struct RouterActor {
     /// This node's shards, published lock-free. Lets a keyed operation be recognised as
     /// local without asking the coordinator — see `route_and_handle`.
     placement: Arc<ArcSwap<ShardPlacement>>,
+    /// Whether `[network.cluster] enabled` is on.
+    ///
+    /// A node with it off is the whole system, so every routing decision is `Local` and the
+    /// coordinator has nothing to add. Static configuration, read here rather than asked,
+    /// because the ask was the cost — measured at one mailbox round trip per *keyless*
+    /// operation, which is every ordinary search, every streaming search and `GET /_indexes`.
+    clustered: bool,
 }
 
 /// Configuration for shard-affine worker dispatch.
@@ -4951,6 +4958,7 @@ impl RouterActor {
         remote_peer_pool: Arc<RemotePeerPool>,
         shard_affine: ShardAffineConfig,
         placement: Arc<ArcSwap<ShardPlacement>>,
+        clustered: bool,
     ) -> Self {
         Self {
             orchestrator,
@@ -4967,6 +4975,7 @@ impl RouterActor {
             remote_peer_pool,
             shard_affine,
             placement,
+            clustered,
         }
     }
 
@@ -5153,6 +5162,13 @@ impl RouterActor {
     /// this node. An unkeyed operation is a scatter-gather whose answer depends on how many
     /// nodes are in the cluster, which is the coordinator's to know, so it is left alone.
     fn resolve_local(&self, routing_key: Option<&str>) -> Option<RoutingDecision> {
+        // A node with clustering off is the whole system: `decide_route` has one node in
+        // `expected_nodes` and can only ever answer `Local`, whether or not a key was given.
+        // Taking that arm here is what keeps a keyless operation off the coordinator — and
+        // keyless is every ordinary search, since a search has no routing key to resolve.
+        if !self.clustered {
+            return Some(RoutingDecision::Local);
+        }
         let key = routing_key?;
         let shard = self.shard_affine.routing_ring.load().get_owner(key)?;
         self.placement
@@ -5472,7 +5488,7 @@ impl RouterActor {
                     async move {
                         let outcome = timeout(
                             remote_timeout,
-                            remote_router.try_remote(op_clone, node_id, &peer_addr),
+                            remote_router.try_remote(&op_clone, node_id, &peer_addr),
                         )
                         .await;
                         (dispatch_ordinal, outcome)
@@ -6089,20 +6105,17 @@ impl RouterActor {
                     let node_id = peer.node_id;
                     let peer_addr = peer.address;
                     search_futures.push(Box::pin(async move {
+                        let op = ClientOp::Search {
+                            index,
+                            query,
+                            limit: Some(fetch_count),
+                            offset: None,
+                            fields,
+                            sort,
+                        };
                         let result = timeout(
                             remote_timeout,
-                            remote_router.try_remote(
-                                ClientOp::Search {
-                                    index,
-                                    query,
-                                    limit: Some(fetch_count),
-                                    offset: None,
-                                    fields,
-                                    sort,
-                                },
-                                node_id,
-                                &peer_addr,
-                            ),
+                            remote_router.try_remote(&op, node_id, &peer_addr),
                         )
                         .await
                         .unwrap_or(Err(OrchestratorError::Io(std::io::Error::new(
@@ -6301,10 +6314,9 @@ impl RouterActor {
         let mut last_err = None;
 
         for attempt in 1..=max_attempts {
-            let op_clone = op.clone();
             match timeout(
                 self.remote_timeout,
-                self.try_remote(op_clone, node_id, &peer_addr),
+                self.try_remote(&op, node_id, &peer_addr),
             )
             .await
             {
@@ -6373,9 +6385,16 @@ impl RouterActor {
 impl RouterActor {
     /// Attempt a remote call to a microshard on another node.
     /// Uses the cached RemotePeerPool to avoid repeated swarm registry lookups.
+    ///
+    /// **Borrows the operation.** `ask` serialises from a reference, so nothing here ever needed
+    /// to own one — and taking it by value obliged every caller to hand over a copy it could not
+    /// get back. The retry loop in [`handle_remote`](Self::handle_remote) paid that on every
+    /// attempt including the first, so an ordinary cross-node write deep-cloned its whole
+    /// document for a call that succeeded. A fan-out still clones once per peer, which is real:
+    /// those futures run concurrently and each needs its own.
     async fn try_remote(
         &self,
-        _op: ClientOp,
+        op: &ClientOp,
         node_id: Uuid,
         peer_addr: &str,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -6400,7 +6419,7 @@ impl RouterActor {
                 )))
             })?;
 
-        remote_answer(remote.ask(&_op).await)
+        remote_answer(remote.ask(op).await)
     }
 }
 
@@ -8887,17 +8906,15 @@ impl NodeOrchestrator {
             Arc::new(self.load_schema(index).await?)
         };
 
-        let shard_assignments = if let Some(coord) = &self.coordinator {
-            coord.ask(GetShardAssignments).await.unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
-
         let mut errors: Vec<String> = Vec::new();
         // Local work is a plain list of ids per shard: the routing key has already done its job
         // by the time a shard is chosen, and the storage layer deletes by key.
         let mut local_by_shard: HashMap<Uuid, Vec<String>> = HashMap::new();
-        let mut remote_by_node: HashMap<Uuid, Vec<DeletePayload>> = HashMap::new();
+        // Ids whose shard this node does not hold, kept with the shard that owns them and
+        // resolved to nodes below — once, and only if there are any. Asking who owns a shard is
+        // a coordinator mailbox round trip, and a single-node deployment never has an answer to
+        // use: every shard it routes to is one it holds.
+        let mut off_node: Vec<(Uuid, DeletePayload)> = Vec::new();
 
         for payload in docs {
             let id = payload.id().to_string();
@@ -8925,15 +8942,29 @@ impl NodeOrchestrator {
 
             if self.shards.contains_key(&target) {
                 local_by_shard.entry(target).or_default().push(id);
-            } else if let Some(shard_meta) = shard_assignments.get(&target) {
-                remote_by_node
-                    .entry(shard_meta.node_id)
-                    .or_default()
-                    .push(payload);
             } else {
-                errors.push(format!(
-                    "{id}: no shard assignment for shard {target}, so it was not deleted"
-                ));
+                off_node.push((target, payload));
+            }
+        }
+
+        let mut remote_by_node: HashMap<Uuid, Vec<DeletePayload>> = HashMap::new();
+        if !off_node.is_empty() {
+            let shard_assignments = if let Some(coord) = &self.coordinator {
+                coord.ask(GetShardAssignments).await.unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
+            for (target, payload) in off_node {
+                match shard_assignments.get(&target) {
+                    Some(shard_meta) => remote_by_node
+                        .entry(shard_meta.node_id)
+                        .or_default()
+                        .push(payload),
+                    None => errors.push(format!(
+                        "{}: no shard assignment for shard {target}, so it was not deleted",
+                        payload.id()
+                    )),
+                }
             }
         }
 
@@ -9313,13 +9344,6 @@ impl NodeOrchestrator {
         let routing_ring = self.routing_ring.clone();
         let first_shard_id = self.first_shard_id();
 
-        // Get shard assignments to determine ownership (used later for remote routing)
-        let shard_assignments = if let Some(coord) = &self.coordinator {
-            coord.ask(GetShardAssignments).await.unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
-
         // Schema-based routing: use routing field from schema instead of per-document routing_key
         let routing_field = schema_cache.get_routing_field().to_string();
 
@@ -9385,17 +9409,29 @@ impl NodeOrchestrator {
             "BulkWrite grouped items by shard"
         );
 
-        // Fetch shard ownership and peer addresses to forward remote batches.
-        let mut peer_addrs = HashMap::new();
-        if let Some(coord) = &self.coordinator {
-            peer_addrs = coord
+        // Who owns a shard, and where that node is — asked only if some document actually
+        // routed off this node.
+        //
+        // Both maps are read in the remote branch below and nowhere else: the local/remote split
+        // above uses `self.shards`, which this node already holds. Fetching them up front cost
+        // two coordinator mailbox round trips on **every** bulk write, including every bulk write
+        // on a single-node deployment, where the answer is always "everything is local". The
+        // delete path next door already asked for its peers lazily; this is the same shape.
+        let (shard_assignments, peer_addrs) = if remote_docs.is_empty() {
+            (HashMap::new(), HashMap::new())
+        } else if let Some(coord) = &self.coordinator {
+            let assignments = coord.ask(GetShardAssignments).await.unwrap_or_default();
+            let addrs: HashMap<Uuid, String> = coord
                 .ask(GetKnownPeers)
                 .await
                 .unwrap_or_default()
                 .into_iter()
                 .map(|p| (p.node_id, p.address))
                 .collect();
-        }
+            (assignments, addrs)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
 
         // Separate local and remote batches for parallel processing
         let mut local_batches = HashMap::new();
