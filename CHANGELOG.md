@@ -7,9 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.3] - 2026-08-31
+## [0.3.3] - 2026-09-02
 
 ### Added
+
+- **A schema carries a version and a thumbprint, and `GET /api/{index}/_config` reports both.**
+  Neither existed as anything an operator could read. `version` was set to 1 at construction and
+  never incremented, so a schema edited a dozen times still called itself version 1; the
+  fingerprint hashed field *names* alone, which is blind to the one disagreement a cluster most
+  needs to see — `{amount: f64, label: text}` and `{amount: i64, label: i64}` hashed identically.
+
+  ```json
+  { "name": "books", "version": 3, "thumbprint": "f69a0b9e2146f661", "field_count": 3, "fields": [...] }
+  ```
+
+  `version` advances on every local edit — a `PUT /_config`, a field a write adds, a flag
+  `PATCH /_schema` flips — through one `mark_modified` that moves it together with `updated_at`.
+  It is monotonic and not a count of requests: one request touching three fields may advance it
+  three times, so compare versions for order and never for how much happened. A `PUT /_config`
+  assigns it server-side rather than taking the caller's, because a caller who could set it could
+  name 999 on a first `PUT` and win every later change on any node.
+
+  `thumbprint` hashes everything that decides how the index behaves — types, `indexed`, `stored`,
+  the resolved `fast`, the shadow flag, tokenizer, record option, both descriptions and
+  `routing_field_name`, which earns its place more than any type does, since two nodes disagreeing
+  about it route the same document to different shards. It hashes the **resolved** schema, so a
+  node holding only a declaration and a node that has built the index agree: an omitted tokenizer
+  and the default it fills in are the same schema, and were previously two permanently different
+  hashes.
+
+  Between them these make divergence answerable from outside the process, which it was not before:
+  compare the two values per node — same/same is agreement, a differing `version` is a change in
+  flight, and one `version` with two thumbprints is a split that needs a reindex.
 
 - **Record deletion.** CameoDB could delete an index and never a document. Two endpoints, both
   needing `write` — a key that can write can already overwrite any document with anything, so
@@ -75,6 +104,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   direction, so an ids file that yields no ids is an error rather than a fall-through.
 
 ### Changed
+
+- **A node asks the cluster before inventing a schema for an index.** Three nodes held three
+  different schemas for one index and nothing reconciled them. Whichever node received
+  `PUT /_config` kept the declaration; every other node typed the same index from the first
+  document that reached it, because a write to an index with no schema builds one by sampling. A
+  tantivy column is built once, so the types then diverged for good. The cost was not theoretical:
+  31 documents valid against the declared schema, written through one node, came back **18
+  accepted and 13 refused**, decided by which node owned the shard.
+
+  "This index is new" now means *no schema exists anywhere I can see*, rather than *none here*,
+  and only that licenses sampling. A peer's declaration is adopted verbatim — version included,
+  since the node is applying an agreed schema rather than making a change. Two candidates are
+  settled by `preferred_schema`: newer version wins, ties to the lower thumbprint, which is pure
+  and symmetric, so every node reaches the same verdict with no communication.
+
+  **A clustered node that is not whole refuses to create an index**, answering `503`. "Nobody
+  holds one" and "I could not ask" are different answers and only the first is a licence to
+  sample, so the check requires every configured member to be connected — a node that boots alone
+  would otherwise satisfy "asked every known peer" by asking nobody, which is the case that
+  produced the divergence. The scope is narrow: an index any node already holds is unaffected,
+  because the schema is read from disk before the question is asked. What it costs is that a bulk
+  import discovering a *new* index during an outage is refused until the cluster is whole, where
+  it previously succeeded and diverged silently. Retrying once every node is connected finishes
+  the job.
+
+  Standalone never asks. `[network.cluster] enabled = false` is static configuration, and it is
+  read before any coordinator hop.
+
+- **`cameodb check-config` fails a network-reachable node with no authentication.** `[security]
+  enabled` defaults to `false`, and on the `internal` profile that was a warning the check exited
+  0 on — so `Result: OK (3 warnings)` was the same answer for a locked-down node and one whose
+  every route, `/_admin/*` included, was open to anyone who could reach the port. Every other
+  warning is a risk an operator may reasonably accept for the profile they declared; this one is
+  reached by *omitting* a setting rather than writing one, so it can be true of a config nobody
+  read.
+
+  **The node still starts, and that is deliberate.** A config in this state was valid in 0.3.2,
+  and refusing to boot would stop a working deployment over a value nobody ever wrote — not
+  something a patch release should do. Whether a config is *fit to deploy* is a different
+  question from whether a node may run, and it is the one a deploy step asks. So the tool fails
+  and the node warns.
+
+  The acceptance lives on the invocation rather than in the file:
+
+  ```bash
+  cameodb check-config -c /etc/cameodb/cameodb.toml --allow-unauthenticated
+  ```
+
+  **No new configuration setting**, on purpose. `[node] profile` is already the operator's
+  explicit statement of reach — it cannot be inferred for a non-loopback bind, so a node with
+  neither refuses to start — and a second setting restating it would be one more thing to get
+  wrong, plus a value whose absence could stop a node booting after an upgrade. The bind decides,
+  not the label: `internal` over a loopback bind has overstated its reach rather than exposed
+  anything, and neither warns nor fails.
+
+  The `/_admin/*` posture line was also wrong in the opposite direction: with authentication on
+  but no key holding `node-admin`, it reported the endpoints as "unauthenticated" when `authz`
+  requires that capability on every one of them, so they were reachable by nobody rather than by
+  everybody. It now names the missing capability.
+
+- **The two shipped configs no longer over-commit memory.** `cameodb.example.toml` and the config
+  the DEB and RPM install to `/etc/cameodb/cameodb.toml` both carried
+  `max_concurrent_requests = 128` against a 128 MB body ceiling and a 4 GB budget — 16 GB of
+  possible in-flight request data, which this release's own `limits` rule reports. Both are 32
+  now, the value the docker config was already corrected to, making the product exactly the
+  budget.
 
 - **The size and memory ceilings live together, under `[limits]`.** `max_record_size_mb` was a
   bare top-level key — it had no section because no subsystem owns it: it is the source of truth
@@ -204,6 +299,166 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A first bulk write into a new index lost most of its documents on a healthy cluster.** The
+  schema gate this release adds runs inside the orchestrator's message handler, and a fan-out
+  asked its peers for a schema *through the very mailbox those peers were using to run the
+  forwarded writes* — each of which was asking back. Three nodes waited on each other until the
+  five-second peer-lookup timeout broke the circle, and every document whose forward fell inside
+  that window was refused.
+
+  | | before | after |
+  |---|---|---|
+  | 46 documents, new index, spread across shards | **15 written, 31 refused, 5.02s** | 46 written, 0 refused, 1.72s |
+  | the same 46 under one `routing_key` | 46 written, 0.03s | unchanged |
+  | retrying the failed batch | 18 of 46, then 18 again — it never converged | n/a |
+
+  How many survived depended on which forwards won the race: 14 to 20 of 46 across six runs,
+  every one of them taking a whole five-second window.
+
+  A forwarded write now **carries what it was validated against**, so the node receiving a share
+  neither asks the cluster nor samples its own. That is what the gate was arguing for in the first
+  place: one schema decision per index, not one per node.
+
+  **What travels is one bit, and no schema.** A forwarded write is a share of a decision another
+  node already made, so the receiver never needs to be *told* what that decision was — it needs to
+  know that inventing one is not its job, and then it can simply ask. `forwarded` already existed
+  on a single write, so **a single write costs nothing extra at all**; a bulk share gained the same
+  bit, about 18 bytes per shard-group. A receiver holding no schema for the index answers, and the
+  forwarding node resends that one write with the schema attached — 5 times across 261 documents
+  into five fresh indexes, in the verification run.
+
+  Nothing speculative goes on the wire, which matters most where it is worst: on a single
+  cross-node write, a schema is 602 bytes for three fields and 3,478 for twenty against a 49-byte
+  document — 12× to 71× the payload, to answer a question the receiver almost always already
+  knows.
+
+  A node that already holds a schema ignores a body it is handed, because the adopt path is only
+  reached when it holds none, and an *empty* schema is never sent, since adopting one would mark
+  the index as already existing and record every field of the arriving document as unsearchable.
+  A receiving node also never samples its own share: a subset of a batch holding no negative
+  values types a field differently from the whole, so two nodes sampling their own shares could
+  build two different indexes from one request with no bug anywhere.
+
+  Only the whole-cluster case is affected. A single-node deployment never asked anyone, and a
+  batch whose documents all route to one node never fanned out — which is why it took a
+  46-document import across three nodes to see it.
+
+  The refusal itself is unchanged: a clustered node that is not whole still answers `503` on a
+  new index, now immediately rather than after a five-second wait, and the retry once every node
+  is connected still finishes the job.
+
+
+- **A paged search returned page 1 at every offset, on a clustered node.** The streaming fan-out
+  matched the search and dropped the offset, and an unkeyed search on a clustered node routes
+  `Broadcast` and lands there whenever `enable_streaming_search` is on — the default, and what the
+  shipped docker config sets. Every offset returned the same ten documents, including offsets past
+  the end of the result set, with a `200` and nothing to tell the caller. Standalone was never
+  affected, which is why it stayed hidden: an unkeyed search there routes `Local` and reaches the
+  real window.
+
+  Two things were missing rather than one. The offset had to survive the match, and every source
+  had to be asked for `offset + limit` rather than `limit` — a merge handed only `limit` per source
+  has too little to page through, and a source that skipped its own offset would drop rows
+  belonging on the page. The skip is still applied once, after the merge. Reading the page off an
+  operation is now one function shared by both fan-outs, which had disagreed twice. The response
+  reports `offset` beside `limit`, as the non-streaming path already did; without it a caller
+  cannot tell a correct page from page 1 returned twice.
+
+  Verified on a three-node cluster over 46 documents with streaming both on and off: five pages of
+  ten tile the full order with no duplicates, `limit=5 offset=41` returns the last five, and an
+  offset past the end returns nothing with `total_hits` still 46. The `offset + limit` ceiling
+  still refuses a page too deep, so the widened fetch adds no exposure.
+
+- **A search whose limit was below the match count could return the wrong documents.** The
+  streaming fan-out's early-exit `break` sat *after* a result had already been handed over, so it
+  threw that result away: one source's hits never entered the merge and its `total_hits` was never
+  added. Measured on a three-node cluster over 46 documents, `total_hits` came back 29, 33 and 29
+  on identical count-only queries, and a sorted top-5 returned `[46,45,44,43,42]` on three runs and
+  `[45,44,43,40,38]` on two — the wrong five documents, silently, with `"failed": 0` in the stats.
+  Every part of the guard was satisfied only when no work remained to skip, so it saved nothing.
+
+  **`[search] enable_early_termination` is now accepted and inert.** That `break` was its only
+  behavioural use in the workspace. There is no replacement: stopping a scatter-gather before every
+  source has answered means a merged top-k that may not hold the top k, and a correct early exit
+  needs a per-source bound on the best value it could still contribute, which nothing here
+  computes.
+
+- **A node just booted told its peers it held no schema for indexes it holds on disk.** The schema
+  cache is filled lazily by the first operation to touch an index, and that cache was what a peer's
+  "do you hold a schema" question read — so the gate above was open again after any restart.
+  Declaring `n: u64` on one node, restarting it, and writing through another had the third node
+  sample `n: i64` against the declaration, with nothing logged, because "nobody holds one" is
+  silent by design. There is now one answer to "does this node hold a schema" — cache, then the
+  store, `None` only when neither has it.
+
+  Two more of the same mistake, found by checking every cached read whose answer escapes the
+  process or gets written down: a cold node stamped `version = 1` over an existing v3, and since
+  version is how the cluster orders two schemas, that node was behind for good rather than merely
+  short an increment; and both search paths took an empty schema, making the shadow-field
+  projection a no-op, so the first search after a boot dropped any field a shadow name refers to.
+
+- **A peer's verdict survives the hop.** `OrchestratorError`'s wire form collapsed every variant to
+  one, so nothing a peer decided survived: a document whose type its schema will never accept came
+  back as `500` with the reason masked, and so did a schema the cluster could not agree on. Four
+  call sites had each hand-written the same conversion, which is why they all had the same bug.
+  Classification now lives in one place and is used twice — by the HTTP surface to pick a status,
+  and by the wire form to carry a verdict home. Mixed versions degrade in both directions.
+
+  A peer that *answered* is no longer retried: the second attempt reaches the same schema and the
+  same verdict, the transport worked, and a malformed document no longer nudges cluster membership
+  by triggering a redial. Every attempt failing to *reach* the owning node was also a `500`, which
+  says this node is broken when this node is fine and a peer is missing — and discourages the one
+  thing that fixes it. It is a `503`. Verified on the cluster: a type mismatch on a remote shard is
+  eight of eight `400` carrying the reason, where every one was a masked `500`; a new index refused
+  while degraded is ten of ten `503`, and all ten succeeded on retry.
+
+- **Deleting an index removed it from whoever was asked, not from the cluster.** The existence check
+  in front of the delete was node-local and bypassed routing, so it saw only the schemas the
+  receiving node happened to hold: deleting through any other node answered `404`, the cluster-wide
+  delete never ran, and the index stayed alive on every node that did hold it. Always wrong, and
+  ordinary rather than rare now that a node holds a schema only if a document routed to it or it
+  adopted one.
+
+  The check asks the cluster, for names only — the old path walked every shard's statistics and
+  every index's schema on every node to look up one name, and could not tell "no node holds this"
+  from "one node did not answer", reading the second as the first. A name no node has is a `404`
+  that says which question it answered; anything else is a delete that no-ops where the index is
+  absent. Verified on the cluster: ten indexes spread across two nodes, every one deleted through a
+  third node that held none of them.
+
+- **A bulk delete now names every id it could not remove.** A peer's per-id reasons were read,
+  logged and dropped, so a peer refusing part of its share arrived as a shortfall in the count with
+  nothing to explain it, and `items_received == items_deleted + errors.len()` did not hold. Two more
+  paths broke the same invariant — a local shard batch that failed, and a forward that never reached
+  a node — each giving one reason for many ids. All three name each id they lose.
+
+  Measured on a three-node cluster with one node stopped, deleting 30 ids: **before, 17 deleted and
+  one error naming no id, adding to 18; after, 17 deleted and 13 errors, one per id, adding to 30**,
+  and the retry once the cluster was whole deleted all 30. A caller could previously see that 13
+  ids were missing with no way to learn which.
+
+  Unlike the bulk *write* path, nothing is renumbered: a write's reasons name positions, meaningful
+  only in the batch they were numbered against, while a delete's name ids, which mean the same thing
+  on every node — so a peer's reason about a forwarded id passes through as the peer said it, and
+  only a reason in some other shape is attributed to the node. The caller gets one flat list keyed
+  by id whichever node handled it.
+
+- **A declared `u64` refused every ordinary integer, and a declared `f64` every whole number.**
+  Numeric validation compared inferred type *names*, and type inference reads any integer fitting
+  in an `i64` as `i64` — so a `u64` field accepted only values exceeding `i64::MAX` and refused `0`
+  and `2018`, while an `f64` field accepted only values written with a fraction. The writer would
+  have stored all of them. Validation now asks the writer's own question instead of comparing
+  names, so the two cannot disagree, and the refusals that prevent silent loss still stand: a
+  negative into a `u64`, a fraction into an integer, an integer past `i64::MAX` into an `i64`.
+
+- **The compose cluster starts, and its load balancer with it.** `profile = "internal"` rejects a
+  clustered node with no pre-shared key and none was set, so the three-node cluster could not boot;
+  every node now carries the same PSK, defaulting to a throwaway so it comes up unattended. An
+  apostrophe in a single-quoted `echo` killed the shell that writes the nginx config, so the cluster
+  had no load balancer on `:9480`. `CAMEODB_DEFAULT_BATCH_SIZE` is not a variable and was silently
+  ignored. And a `--mount=type=secret` is not hashed by BuildKit, so an image built once without a
+  corporate CA kept that layer and every later build failed with `UnknownIssuer`.
+
 - **A single write or delete reaches a shard on another node.** Both handlers default their
   routing hint to the id, and the engine then re-derives the key from the schema's routing
   field — so on an index that routes by a tenant or a customer the ring could place the write on
@@ -282,6 +537,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   out and the caller is served the unbalanced total anyway.
 
 ### Performance
+
+- **A single-node deployment no longer asks a cluster it does not have.** Every *keyless*
+  operation — every ordinary search, every streaming search, every `GET /_indexes` — paid a
+  mailbox round trip to the `ClusterCoordinator` for a routing decision that could only ever come
+  back `Local`, because a node with clustering off has one node in its member list. Keyed writes
+  already resolved locally from the published ring; a search has no routing key to resolve, so it
+  took the ask every time. And the bulk paths asked for the shard-assignment map and the peer
+  address map *before* they knew whether any document had routed off this node — maps read only in
+  the branch that forwards to a peer, so on one node they were fetched to discover that everything
+  was local. Both are now read only when something is actually remote.
+
+  Counted on a release build, from the coordinator's own log: **150 coordinator asks across 250
+  standalone operations, down to zero.**
+
+  Honest about what that buys: a real improvement to the single-request tail (search p99 at
+  concurrency 1 from 0.504ms to a 0.402–0.476ms band over five repeats, outside the run-to-run
+  spread) and **nothing measurable** at concurrency 16 or on the bulk paths, where the read pool's
+  search threads and the redb commit are the constraints. It is not a throughput change. What it
+  removes is unconditional work, and one queue in front of an actor that also serves gossip,
+  shard registration and snapshot persistence.
+
+- **A bulk write no longer serializes its response twice.** The completion log line called
+  `serde_json::to_string` on the whole response for its length alone — a second full pass over
+  something axum was about to serialize itself, into a `String` dropped on the next line, at
+  `info!`, on every bulk write. On a 5,000-document batch that was the largest allocation anywhere
+  on the write path, spent on a log line. A bulk response is `items_written` plus one reason per
+  failed item, so its size is its reasons plus a few dozen bytes of framing; summing the reason
+  lengths costs nothing and is what the large-response warning was reading a whole serialization to
+  learn. The line now reports items written, error count and reason bytes.
+
+- **A cross-node operation is no longer deep-cloned once per attempt.** The remote retry loop cloned
+  the whole operation at the top of every attempt, including the first — so an ordinary cross-node
+  write copied its entire document for a call that then succeeded. The clone was never needed at
+  all: the send path serializes from a reference and only ever borrowed it, so taking the operation
+  by value obliged every caller to hand over a copy it could not get back. A fan-out still clones
+  once per peer, which is real: those futures run concurrently and each needs its own.
 
 - **The single-write path no longer clones the schema and the document body on every write.**
   The schema is cloned only when the document carries a field the schema has not seen, and the

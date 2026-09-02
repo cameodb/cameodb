@@ -531,6 +531,8 @@ curl -s http://localhost:9480/api/books/_config
 ```json
 {
   "name": "books",
+  "version": 3,
+  "thumbprint": "f69a0b9e2146f661",
   "description": "Library catalogue, one document per edition.",
   "field_count": 3,
   "fields": [
@@ -544,6 +546,20 @@ curl -s http://localhost:9480/api/books/_config
 
 Every field carries the same keys, in the same spelling, here and in `GET /_indexes` — one index
 has one description. `fields` is ordered with `id` first, then alphabetically.
+
+`version` and `thumbprint` describe the schema as a whole rather than any field:
+
+| Key | Meaning |
+|-----|---------|
+| `version` | Advances on every change to this schema, starting at 1 — a `PUT /_config`, a field added by a write, a flag flipped by `PATCH /_schema`. **Monotonic, not a count of requests:** one request touching three fields may advance it three times, so compare versions for order and never for how much happened. Adopting a schema that already exists elsewhere keeps the version it came with, which is the point of an agreed version. Two nodes reporting different versions for one index have not converged yet |
+| `thumbprint` | 16 hex digits over the **resolved** schema, so two nodes agree whenever they would build the same index. A declaration and the index built from it therefore match: it hashes what a field resolves to, not what was written, so an omitted tokenizer and the default it fills in are the same schema. Different thumbprints at the same `version` mean the two have genuinely diverged and no retry will settle it |
+
+The pair is what makes divergence answerable from outside the process. Compare
+`GET /api/{index}/_config` on each node: same `version` and same `thumbprint` is agreement,
+different `version` is a change still in flight, and same `version` with different
+thumbprints is a split that needs a reindex.
+
+The per-field keys:
 
 | Key | Meaning |
 |-----|---------|
