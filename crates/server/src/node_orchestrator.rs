@@ -1574,6 +1574,25 @@ pub enum OrchestratorError {
         reasons: String,
         caller_error: bool,
     },
+
+    /// This node cannot establish what the cluster's schema for an index is, so it will not
+    /// invent one.
+    ///
+    /// A write to an index this node has never seen builds the schema by sampling the documents.
+    /// On one node that is the feature that makes semi-structured input work. In a cluster it is
+    /// how three nodes came to hold three different schemas for one index: whichever node
+    /// received `PUT /_config` kept the declaration, and every other node typed the same index
+    /// from the first document that reached it. The types then diverge permanently, because a
+    /// tantivy column is built once.
+    ///
+    /// So sampling is allowed only when this node can be sure no peer already holds a
+    /// declaration — which means being able to ask all of them. When it cannot, refusing is the
+    /// only answer that is not a guess, and it is retryable: the peers are expected back.
+    ///
+    /// Answered as `503`, not `500`. Nothing is wrong with the request and nothing is broken
+    /// here; the cluster is not currently whole enough to agree on a new schema.
+    #[error("cannot establish the cluster schema for '{index}': {reason}")]
+    SchemaUnconfirmed { index: String, reason: String },
 }
 
 // Serialize/Deserialize via display string to satisfy remote message bounds without
@@ -1800,6 +1819,12 @@ impl From<OrchestratorError> for RemoteError {
                     RemoteError::Io(text)
                 }
             }
+            // Not the caller's mistake, so not `InvalidInput`: a requesting node must not turn
+            // this into a 400 telling the caller to fix a request that is already correct. It
+            // travels as `Io`, which is the kind a requesting node reports as retryable.
+            OrchestratorError::SchemaUnconfirmed { index, reason } => RemoteError::Io(format!(
+                "cannot establish the cluster schema for '{index}': {reason}"
+            )),
         }
     }
 }
@@ -1944,6 +1969,16 @@ pub enum ClientOp {
     },
     /// Get index configuration/schema
     GetConfig { index: String },
+    /// This node's stored schema for an index, serialised whole, or `null` if it holds none.
+    ///
+    /// Internal to the cluster: no HTTP route reaches it, and it exists because `GetConfig` —
+    /// the only other way to read a schema — answers with a *response shape*, not a schema.
+    /// Adopting a peer's schema through that shape is the erasure this project already fixed
+    /// once: reading a schema out as JSON and writing it back drops every property the shape
+    /// does not carry, `routing_field_name` among them, which silently changes which shard a
+    /// document routes to. This carries the `IndexSchema` itself so a node can adopt a peer's
+    /// declaration without reconstructing it.
+    GetRawSchema { index: String },
     /// Parse a query against an index without running it.
     ///
     /// Metadata rather than a search: it touches no documents and returns no hits, only what the
@@ -2015,6 +2050,29 @@ pub enum StorageCommand {
         reply: tokio::sync::oneshot::Sender<Result<(), StoreError>>,
     },
     Shutdown,
+}
+
+/// How long to wait for one peer to report its schema for an index.
+///
+/// Bounded because this sits on the write path: a peer that has stopped answering must not hold
+/// a write open indefinitely. It is deliberately not the broadcast timeout — that belongs to the
+/// router and this runs on the orchestrator — and a constant rather than configuration until
+/// there is a reason to tune it, which a metadata read of a few hundred bytes is unlikely to
+/// give. A peer that misses this window counts as unreachable, which refuses the write rather
+/// than letting it invent a schema.
+const PEER_SCHEMA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What the rest of the cluster holds for an index this node has no schema for.
+///
+/// See [`OrchestratorEngine::peer_schema_for`]. `NoneHeld` and `Unreachable` are kept apart
+/// deliberately: only the first licenses this node to build a schema from the documents.
+enum PeerSchemaLookup {
+    /// A peer holds a schema for this index, and this is the one to adopt.
+    Found(Box<IndexSchema>),
+    /// Every peer answered and none holds a schema, so this index is genuinely new.
+    NoneHeld,
+    /// The cluster could not be asked, so nothing can be concluded from the silence.
+    Unreachable { reason: String },
 }
 
 /// What a worker did with an op.
@@ -4746,6 +4804,7 @@ impl RouterActor {
         if matches!(
             op,
             ClientOp::GetConfig { .. }
+                | ClientOp::GetRawSchema { .. }
                 | ClientOp::CreateConfig { .. }
                 | ClientOp::UpdateSchema { .. }
         ) {
@@ -6043,6 +6102,141 @@ impl NodeOrchestrator {
         }
     }
 
+    /// What the cluster already knows about an index this node has no schema for.
+    ///
+    /// Three outcomes, and the difference between the last two is the whole point: "nobody has
+    /// one" licenses this node to build a schema by sampling, while "I could not ask everybody"
+    /// does not, and they are indistinguishable if unreachable peers are counted as silent.
+    async fn peer_schema_for(&self, index: &str) -> PeerSchemaLookup {
+        use crate::cluster_coordinator::{GetKnownPeers, GetStatus, KnownPeer};
+
+        let Some(status) = self.coordinator.as_ref() else {
+            return PeerSchemaLookup::NoneHeld;
+        };
+        let Ok(status): Result<crate::distributed::ClusterStatus, _> =
+            status.ask(GetStatus).await
+        else {
+            return PeerSchemaLookup::Unreachable {
+                reason: "the cluster coordinator did not answer".to_string(),
+            };
+        };
+
+        // Single-node behaviour is unchanged: with no cluster there is nobody to disagree with,
+        // and sampling a schema from the documents is the feature that makes semi-structured
+        // input work.
+        if !status.cluster_enabled {
+            return PeerSchemaLookup::NoneHeld;
+        }
+
+        // Every configured member has to be reachable, not merely every member currently known.
+        // A node that boots alone while its peers are down knows only itself, so "ask all known
+        // peers" would be satisfied by asking nobody — which is exactly the case that produced
+        // three schemas for one index. `total_nodes` is the configured member count, so this
+        // compares against what the operator said the cluster is.
+        if status.connected_nodes < status.total_nodes {
+            return PeerSchemaLookup::Unreachable {
+                reason: format!(
+                    "{} of {} cluster nodes are connected; a schema created now could not be \
+                     agreed with the rest",
+                    status.connected_nodes, status.total_nodes
+                ),
+            };
+        }
+
+        let peers: Vec<KnownPeer> = match self.coordinator.as_ref() {
+            Some(coordinator) => coordinator.ask(GetKnownPeers).await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        if peers.is_empty() {
+            return PeerSchemaLookup::NoneHeld;
+        }
+
+        let Some(pool) = self.remote_peer_pool.clone() else {
+            return PeerSchemaLookup::Unreachable {
+                reason: "no remote peer pool on this node, so no peer can be asked".to_string(),
+            };
+        };
+
+        let op = ClientOp::GetRawSchema {
+            index: index.to_string(),
+        };
+        let answers = futures::future::join_all(peers.into_iter().map(|peer| {
+            let op = op.clone();
+            let pool = pool.clone();
+            async move {
+                let node = peer.node_id;
+                let ask = async {
+                    let remote = pool
+                        .get_orchestrator(node, ConnectionChannel::Operations)
+                        .await
+                        .map_err(|e| format!("node {node} lookup failed: {e}"))?
+                        .ok_or_else(|| format!("node {node} has no reachable orchestrator"))?;
+                    remote
+                        .ask(&op)
+                        .await
+                        .map_err(|e| format!("node {node}: {e}"))
+                };
+                timeout(PEER_SCHEMA_LOOKUP_TIMEOUT, ask)
+                    .await
+                    .unwrap_or_else(|_| Err(format!("node {node} timed out")))
+            }
+        }))
+        .await;
+
+        let mut best: Option<IndexSchema> = None;
+        let mut unreachable = Vec::new();
+        for answer in answers {
+            match answer {
+                Err(why) => unreachable.push(why),
+                Ok(JsonValue::Null) => {}
+                Ok(value) => match serde_json::from_value::<IndexSchema>(value) {
+                    Ok(mut schema) => {
+                        schema.normalize_after_deserialization();
+                        best = Some(match best.take() {
+                            None => schema,
+                            Some(current) => Self::preferred_schema(current, schema),
+                        });
+                    }
+                    // A peer that answered with something unreadable is not a peer that answered
+                    // "no schema". Counted as unreachable so it cannot license sampling.
+                    Err(e) => unreachable.push(format!("unreadable schema from a peer: {e}")),
+                },
+            }
+        }
+
+        // A schema found from any peer settles it even if another peer was unreachable: the
+        // declaration exists, and adopting it is strictly better than inventing a second one.
+        if let Some(schema) = best {
+            return PeerSchemaLookup::Found(Box::new(schema));
+        }
+        if !unreachable.is_empty() {
+            return PeerSchemaLookup::Unreachable {
+                reason: unreachable.join("; "),
+            };
+        }
+        PeerSchemaLookup::NoneHeld
+    }
+
+    /// Which of two schemas for the same index the cluster should settle on.
+    ///
+    /// Newer version wins; a tie goes to the lower thumbprint. The tie-break needs no
+    /// communication and is a pure function of the two candidates, so every node reaches the
+    /// same verdict without anyone deciding it — which is what lets schemas converge with no
+    /// leader and no consensus round.
+    fn preferred_schema(a: IndexSchema, b: IndexSchema) -> IndexSchema {
+        match a.version.cmp(&b.version) {
+            std::cmp::Ordering::Greater => a,
+            std::cmp::Ordering::Less => b,
+            std::cmp::Ordering::Equal => {
+                if b.calculate_fingerprint() < a.calculate_fingerprint() {
+                    b
+                } else {
+                    a
+                }
+            }
+        }
+    }
+
     /// Validates schema for documents in parallel, then evolves schema sequentially.
     ///
     /// This method uses a two-stage approach:
@@ -6064,8 +6258,53 @@ impl NodeOrchestrator {
             });
         }
 
-        // Enhanced sampling for initial schema creation
-        let is_initial_creation = schema_cache.fields.is_empty();
+        // Enhanced sampling for initial schema creation.
+        //
+        // Sampling types an index from its first documents, which is the feature that makes
+        // semi-structured input work — and, in a cluster, the mechanism by which three nodes came
+        // to hold three different schemas for one index. Whichever node received `PUT /_config`
+        // kept the declaration; every other node typed the same index from the first document
+        // that reached it, and a tantivy column is built once, so the types diverged for good.
+        //
+        // So ask before inventing. `is_initial_creation` is what licenses sampling and it now
+        // means "no schema for this index exists anywhere I can see", not merely "none here".
+        let mut is_initial_creation = schema_cache.fields.is_empty();
+        if is_initial_creation {
+            match self.peer_schema_for(index).await {
+                // Nobody holds one, so this index really is new and sampling is the right answer.
+                PeerSchemaLookup::NoneHeld => {}
+                PeerSchemaLookup::Found(declared) => {
+                    // Adopted verbatim, version included: this node is applying a declaration
+                    // that already exists, not making a change, so `mark_modified` must not run
+                    // and advance a version the rest of the cluster has agreed on.
+                    *schema_cache = *declared;
+                    Self::persist_schema_to_stores(index, schema_cache, &self.shards).await?;
+                    tracing::info!(
+                        index = %index,
+                        version = schema_cache.version,
+                        fields = schema_cache.fields.len(),
+                        "Adopted a peer's schema instead of sampling one from the documents"
+                    );
+                    // No longer a creation: the schema came from the cluster, so a field these
+                    // documents add is an addition to an existing schema and takes that path —
+                    // recorded non-indexed, pending a rebuild — rather than being marked
+                    // searchable as a first write's fields are.
+                    is_initial_creation = false;
+                }
+                PeerSchemaLookup::Unreachable { reason } => {
+                    tracing::warn!(
+                        index = %index,
+                        reason = %reason,
+                        "Refusing to sample a schema: the cluster cannot be asked whether one exists"
+                    );
+                    return Err(OrchestratorError::SchemaUnconfirmed {
+                        index: index.to_string(),
+                        reason,
+                    });
+                }
+            }
+        }
+
         if is_initial_creation {
             let sampled_schema = enhanced_schema_sampling(docs, SCHEMA_SAMPLE_LIMIT);
             let sampled_field_count = sampled_schema.fields.len();
@@ -7755,6 +7994,12 @@ impl NodeOrchestrator {
                 field_updates,
             } => self.orch_update_schema(&index, &field_updates).await,
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
+            ClientOp::GetRawSchema { index } => Ok(self
+                .get_cached_schema(&index)
+                .map(|schema| serde_json::to_value(&*schema))
+                .transpose()
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
+                .unwrap_or(JsonValue::Null)),
             ClientOp::ValidateQuery { index, query } => {
                 self.orch_validate_query(&index, &query).await
             }
@@ -10979,6 +11224,68 @@ mod tests {
                  shadow name"
             );
         }
+    }
+
+    /// Two nodes holding different schemas for one index must pick the same winner without
+    /// talking to each other.
+    ///
+    /// That is what lets schemas converge with no leader and no consensus round: the choice is a
+    /// pure function of the two candidates, so every node computes the same answer. The property
+    /// that matters is symmetry — if the verdict depended on which schema was passed first, two
+    /// nodes comparing the same pair would disagree and both would think they had won.
+    #[test]
+    fn the_schema_tie_break_is_deterministic_and_symmetric() {
+        let schema = |version: u64, field: &str, field_type: TantivyFieldType| {
+            let mut s = IndexSchema::default();
+            s.version = version;
+            s.fields
+                .insert(field.into(), FieldDef::new(field.into(), field_type));
+            s
+        };
+
+        // A newer version wins outright, whichever side it is passed on.
+        let older = schema(4, "a", TantivyFieldType::Text);
+        let newer = schema(9, "b", TantivyFieldType::I64);
+        assert_eq!(
+            NodeOrchestrator::preferred_schema(older.clone(), newer.clone()).version,
+            9
+        );
+        assert_eq!(
+            NodeOrchestrator::preferred_schema(newer.clone(), older.clone()).version,
+            9
+        );
+
+        // At the same version the lower thumbprint wins, and the answer does not depend on
+        // argument order. This is the concurrent-creation case: two nodes each declared version 1
+        // for the same index and neither can be called the origin.
+        let left = schema(1, "amount", TantivyFieldType::F64);
+        let right = schema(1, "amount", TantivyFieldType::I64);
+        assert_ne!(
+            left.calculate_fingerprint(),
+            right.calculate_fingerprint(),
+            "the two candidates must be distinguishable or this proves nothing"
+        );
+
+        let from_left = NodeOrchestrator::preferred_schema(left.clone(), right.clone());
+        let from_right = NodeOrchestrator::preferred_schema(right.clone(), left.clone());
+        assert_eq!(
+            from_left.calculate_fingerprint(),
+            from_right.calculate_fingerprint(),
+            "the tie-break disagreed with itself when the arguments were swapped"
+        );
+        assert_eq!(
+            from_left.calculate_fingerprint(),
+            left.calculate_fingerprint()
+                .min(right.calculate_fingerprint()),
+            "the lower thumbprint should have won"
+        );
+
+        // Identical candidates are a no-op rather than a coin flip.
+        let same = schema(3, "x", TantivyFieldType::Text);
+        assert_eq!(
+            NodeOrchestrator::preferred_schema(same.clone(), same.clone()).calculate_fingerprint(),
+            same.calculate_fingerprint()
+        );
     }
 
     /// A numeric field holds what the writer can store, which is not "what the name infers".
