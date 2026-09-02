@@ -394,7 +394,7 @@ profile = "internal"   # local | internal | external
 | CORS `"*"` | allowed (warned) | rejected | rejected |
 | `/_admin/*` | allowed | allowed | **must be disabled** |
 | Cluster PSK | warned | **required** | **required** |
-| Authentication | optional | warned if off | **required** |
+| Authentication | optional | warned if off; fails `check-config` off a loopback bind | **required** |
 
 Choose by who can reach the bind address, not by what the environment is for — a shared test
 box is `internal`, not `local`. Omitting `profile` is valid only for a loopback bind, which
@@ -408,6 +408,25 @@ cameodb check-config -c /etc/cameodb/cameodb.toml
 
 It prints one line per rule (`pass` / `warn` / `fail`) and exits non-zero on any failure, so
 it works as a pre-flight step in a deploy script.
+
+**One warning fails the check even though the node starts on it**: an `internal` node with a
+non-loopback bind and no authentication. Every other warning is a risk you may reasonably accept
+for the profile you declared; this one means every route, `/_admin/*` included, is open to anyone
+who can reach the port — and `[security] enabled` defaults to `false`, so a config reaches that
+state by *omitting* a setting rather than writing one. `Result: OK (3 warnings)` was the same
+answer for a locked-down node and a wide-open one.
+
+Whether the node *boots* stays permissive, deliberately: refusing would stop a deployment that
+had been running this way over a value nobody wrote. Whether a config is *fit to deploy* is a
+different question, and it is the one a deploy step asks. To accept the exposure, say so on the
+command line rather than in the file:
+
+```bash
+cameodb check-config -c /etc/cameodb/cameodb.toml --allow-unauthenticated
+```
+
+The bind decides, not the label: `internal` over a loopback bind has overstated its reach rather
+than exposed anything, and neither warns nor fails the check.
 
 ### Authentication (`[security]`)
 
@@ -436,6 +455,11 @@ key_hash_file = "/etc/cameodb/keys/agent"
 role = "reader"
 label = "agent"
 ```
+
+The configs this repo ships — `cameodb.example.toml`, and the one the DEB and RPM install to
+`/etc/cameodb/cameodb.toml` — bind `0.0.0.0` with authentication off, so a fresh install runs and
+`check-config` tells you it is open. Enable authentication for anything holding data worth
+keeping.
 
 Only digests are stored, so a leaked config file contains nothing that can authenticate. A
 key that is lost is replaced, not recovered.

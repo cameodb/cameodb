@@ -135,7 +135,25 @@ async fn main() -> Result<()> {
             .with_writer(std::io::stderr)
             .init();
 
-        let cli_overrides = config::CliOverrides::parse(args.into_iter().skip(2))?;
+        // Taken off the arguments before the override parser sees them, which rejects a flag
+        // it does not know. The acceptance lives on the *invocation* and not in the config:
+        // whether an operator has decided to run a node open is a property of this deployment,
+        // and putting it in the file would mean a second setting restating what `profile`
+        // already declares — and a node that stops booting when it is absent.
+        let mut allow_unauthenticated = false;
+        let args: Vec<String> = args
+            .into_iter()
+            .skip(2)
+            .filter(|arg| {
+                if arg == "--allow-unauthenticated" {
+                    allow_unauthenticated = true;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let cli_overrides = config::CliOverrides::parse(args)?;
         let cameodb_config = CameoDbConfig::load_unvalidated(&cli_overrides)?;
 
         // The resolved size limits, because most of them are derived rather than written: an
@@ -153,11 +171,14 @@ async fn main() -> Result<()> {
 
         // Render the matrix before deciding, so a failure arrives with the context of
         // everything that passed rather than as a single line.
-        let warnings = match posture::evaluate(&cameodb_config) {
-            Ok(posture) => {
-                print!("{}", posture.render());
-                posture.warnings().count()
-            }
+        let (warnings, unauthenticated_off_box) = match posture::evaluate(&cameodb_config) {
+            Ok(posture) => (
+                {
+                    print!("{}", posture.render());
+                    posture.warnings().count()
+                },
+                posture.unauthenticated_off_box(),
+            ),
             Err(e) => {
                 eprintln!("Result: FAILED\n{}", e);
                 std::process::exit(1);
@@ -166,6 +187,25 @@ async fn main() -> Result<()> {
 
         if let Err(e) = cameodb_config.validate() {
             eprintln!("\nResult: FAILED\n{}", e);
+            std::process::exit(1);
+        }
+
+        // One warning fails the check rather than being counted with the rest, and the node
+        // still starts on it. `[security] enabled` defaults to false, so this state is reached
+        // by omitting a setting rather than by writing one — a config nobody read can be in it,
+        // and "OK, 3 warnings" was the same answer for a locked-down node and a wide-open one.
+        // Refusing the boot instead would stop a deployment that had been running this way for
+        // a value it never wrote, so the gate belongs here, where a deploy step reads it.
+        if unauthenticated_off_box && !allow_unauthenticated {
+            eprintln!(
+                "\nResult: FAILED\nThis node is reachable off this machine and nothing \
+                 authenticates it: every route, including /_admin/*, is open to anyone who can \
+                 reach the port.\n  - set [security] enabled = true and mint a key with \
+                 `cameodb keygen --role admin`, or\n  - declare profile = \"local\" under [node] \
+                 and bind a loopback address, if nothing off-box should reach it.\nThe node \
+                 itself will still start in this state; this check will not pass it. Pass \
+                 --allow-unauthenticated to accept it and exit 0."
+            );
             std::process::exit(1);
         }
         println!(
@@ -192,7 +232,7 @@ async fn main() -> Result<()> {
              Usage:\n  \
              cameodb [OPTIONS]\n  \
              cameodb generate-config\n  \
-             cameodb check-config [-c <PATH>]\n  \
+             cameodb check-config [-c <PATH>] [--allow-unauthenticated]\n  \
              cameodb keygen --role <admin|writer|reader>\n  \
              cameodb client <subcommand>\n\n\
              Options:\n\
@@ -201,7 +241,9 @@ async fn main() -> Result<()> {
              -V, --version                               Show version information\n\n\
              Commands:\n  \
              generate-config  Print a sample configuration file\n  \
-             check-config     Report the security posture of a config and exit non-zero if it fails\n  \
+             check-config     Report the security posture of a config and exit non-zero if it fails.\n  \
+             \u{20}                 Also fails a network-reachable node with no authentication, which\n  \
+             \u{20}                 the node itself only warns about; --allow-unauthenticated accepts it\n  \
              keygen           Mint an API key and print the [[security.api_keys]] stanza for it\n  \
              client           Run the bundled client CLI (health, index, search)\n\n\
              Client examples:\n  \

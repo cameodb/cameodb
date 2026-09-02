@@ -39,9 +39,14 @@ box is a question that has not been answered, not a formality.
    in the repo root, and `crates/server/cameodb.toml`, which is what both the DEB and the RPM
    install to `/etc/cameodb/cameodb.toml`.
    ```bash
-   cameodb check-config -c cameodb.example.toml
-   cameodb check-config -c crates/server/cameodb.toml
+   cameodb check-config -c cameodb.example.toml --allow-unauthenticated
+   cameodb check-config -c crates/server/cameodb.toml --allow-unauthenticated
    ```
+   Both ship `profile = "internal"` on `0.0.0.0` with `[security] enabled = false`, which the
+   check fails without that flag — correctly, since such a node is open to anyone who can reach
+   the port. The flag records that the shipped default is deliberate; drop it and read the
+   failure if you are considering changing that default. Everything else it reports still has to
+   be reviewed.
 8. **Build Windows on the Windows machine** and copy the result into the staging tree, which
    is where the sign stage will look for it.
    ```

@@ -110,9 +110,28 @@ pub struct Posture {
     /// True when the profile was inferred from the bind address rather than declared.
     pub inferred: bool,
     pub checks: Vec<Check>,
+    /// Something off this machine can reach this node and nothing authenticates it.
+    ///
+    /// Kept as a fact rather than derived from a message, because the `auth` rule's outcome is
+    /// a `Warn` either way and reading its text to tell the two apart is exactly what the
+    /// verdict work removed elsewhere. Recorded here so `cameodb check-config` can exit
+    /// non-zero on it while the node itself still starts.
+    unauthenticated_off_box: bool,
 }
 
 impl Posture {
+    /// Whether this configuration leaves a network-reachable node unauthenticated.
+    ///
+    /// **The one warning that fails `check-config`.** Every other warning is a risk an operator
+    /// may reasonably accept for the profile they declared; this one means every route — reads,
+    /// writes, deletes and `/_admin/*` — is open to anyone who can reach the port, and it is
+    /// reached by *omitting* a setting rather than by writing one, so it can be true of a
+    /// config nobody read. Failing the tool and not the boot is what keeps a deploy step
+    /// honest without stopping a node that was already running this way.
+    pub fn unauthenticated_off_box(&self) -> bool {
+        self.unauthenticated_off_box
+    }
+
     pub fn failures(&self) -> impl Iterator<Item = &Check> {
         self.checks.iter().filter(|c| c.outcome.is_fail())
     }
@@ -304,6 +323,7 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
     let admin_key_exists = keyring
         .as_ref()
         .is_ok_and(|ring| ring.enabled() && ring.holds(Capability::NodeAdmin));
+    let auth_enabled = keyring.as_ref().is_ok_and(|ring| ring.enabled());
 
     // --- Admin endpoints --------------------------------------------------------
     push(
@@ -317,9 +337,26 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
             (_, true) if !loopback && admin_key_exists => Outcome::Pass(
                 "/_admin/* reachable off-box, gated on a key holding node-admin".to_string(),
             ),
-            (_, true) if !loopback => {
-                Outcome::Warn("/_admin/* is reachable off-box and unauthenticated".to_string())
-            }
+            // Authentication is on, so these routes are gated — `authz` requires
+            // `node-admin` on every one of them — but no key holds it, which means nobody
+            // can call them rather than everybody. Safe, and still worth a line: an
+            // operator who mounted keys expecting to use the admin API has to be told which
+            // capability is missing, and the message here used to say "unauthenticated",
+            // which described a different configuration entirely.
+            (_, true) if !loopback && auth_enabled => Outcome::Warn(
+                "/_admin/* is reachable off-box and no key holds node-admin, so nothing can \
+                 call it. Mint one with `cameodb keygen --role admin`, or set [network.http] \
+                 admin_enabled = false"
+                    .to_string(),
+            ),
+            // Reachable and ungated. The `auth` rule warns about the same exposure in
+            // general terms, so this line names the specific damage: what these routes do is
+            // the reason an operator would care that they, in particular, are open.
+            (_, true) if !loopback => Outcome::Warn(
+                "/_admin/* is reachable off-box and unauthenticated: memory purge, forced \
+                 commit and writer eviction are open to anyone who can reach the port"
+                    .to_string(),
+            ),
             (_, true) => Outcome::Pass("/_admin/* enabled (loopback only)".to_string()),
             (_, false) => Outcome::Pass("/_admin/* disabled".to_string()),
         },
@@ -395,9 +432,31 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
                      and configure at least one key with `cameodb keygen --role admin`"
                         .to_string(),
                 ),
-                Profile::Internal => Outcome::Warn(
+                // A warning, and **not** a refusal, deliberately. `enabled` defaults to
+                // false, so an existing deployment reaches this state by saying nothing —
+                // and a node that stops booting because of a value it never wrote is a
+                // worse outcome than the exposure, in a release whose other changes are
+                // fixes. `profile` is already the operator's explicit statement of reach
+                // (it cannot be inferred for a non-loopback bind), so there is nothing a
+                // second opt-in flag would establish that the profile does not.
+                //
+                // What was actually wrong is that `check-config` exited 0 on this, so
+                // "green" and "secure" were two questions with one answer. That is fixed
+                // where it was observed: the *tool* exits non-zero — see
+                // [`Posture::unauthenticated_off_box`] — so a deploy step gates on it while
+                // a node upgrading in place still starts.
+                Profile::Internal if !loopback => Outcome::Warn(
                     "all HTTP and MCP endpoints are unauthenticated; anyone who can reach the \
-                     port can read, write, and delete"
+                     port can read, write, and delete. Set [security] enabled = true and mint \
+                     a key with `cameodb keygen --role admin`, or declare profile = \"local\" \
+                     and bind loopback if nothing off-box should reach it"
+                        .to_string(),
+                ),
+                // Loopback: the label overstates the reach rather than exposing anything, and
+                // the `bind` rule above already reports what it really is.
+                Profile::Internal => Outcome::Warn(
+                    "all HTTP and MCP endpoints are unauthenticated; the bind is loopback, so \
+                     only this machine can reach them"
                         .to_string(),
                 ),
                 // Pass, not Warn: this mirrors how `tls` passes plaintext on loopback. A
@@ -486,6 +545,10 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
         profile,
         inferred,
         checks,
+        // `external` refuses this outright above, so it can never reach here true; `local`
+        // requires a loopback bind, so it never can either. In practice it is `internal`
+        // off-box with no keyring, which is the case the tool has to gate on.
+        unauthenticated_off_box: !loopback && !auth_enabled && profile != Profile::External,
     })
 }
 
@@ -633,15 +696,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The `auth` outcome for a config, by rule name.
-    fn auth_outcome(config: &CameoDbConfig) -> Outcome {
+    /// One rule's outcome for a config, by rule name.
+    fn outcome_for(config: &CameoDbConfig, rule: &str) -> Outcome {
         evaluate(config)
             .unwrap()
             .checks
             .into_iter()
-            .find(|c| c.rule == "auth")
-            .unwrap()
+            .find(|c| c.rule == rule)
+            .unwrap_or_else(|| panic!("no rule named {rule}"))
             .outcome
+    }
+
+    /// The `auth` outcome for a config.
+    fn auth_outcome(config: &CameoDbConfig) -> Outcome {
+        outcome_for(config, "auth")
     }
 
     fn with_key(config: &mut CameoDbConfig, role: crate::auth::Role) {
@@ -663,6 +731,10 @@ mod tests {
             Outcome::Pass(_)
         ));
 
+        // A warning, not a refusal: `enabled` defaults to false, so an existing deployment
+        // is in this state without having written anything, and a node that stops booting
+        // over a value it never wrote is worse than the exposure. `check-config` is what
+        // fails on it — see `the_tool_fails_an_open_node_where_the_node_itself_only_warns`.
         let mut internal = config_for(Some(Profile::Internal), "0.0.0.0");
         internal.network.http.cors_allowed_origins = vec![];
         assert!(matches!(auth_outcome(&internal), Outcome::Warn(_)));
@@ -670,6 +742,75 @@ mod tests {
         let mut external = config_for(Some(Profile::External), "0.0.0.0");
         external.network.http.cors_allowed_origins = vec![];
         assert!(auth_outcome(&external).is_fail());
+    }
+
+    /// The one warning `cameodb check-config` refuses to pass, while the node still starts.
+    ///
+    /// Two separate questions that used to have one answer. Whether a node *boots* has to stay
+    /// permissive, because `[security] enabled` defaults to false and a deployment can be in
+    /// this state without having written a line — refusing the boot would break an upgrade over
+    /// a value nobody wrote. Whether a config is *fit to deploy* is the question a deploy step
+    /// asks, and `OK (3 warnings)` was the same answer for a locked-down node and a wide-open
+    /// one.
+    ///
+    /// The bind decides, not the label: `internal` over loopback has overstated its reach
+    /// rather than exposed anything.
+    #[test]
+    fn the_tool_fails_an_open_node_where_the_node_itself_only_warns() {
+        let mut exposed = config_for(Some(Profile::Internal), "0.0.0.0");
+        exposed.network.http.cors_allowed_origins = vec![];
+        assert!(
+            evaluate(&exposed).unwrap().unauthenticated_off_box(),
+            "an off-box bind with no keyring is what the tool has to fail"
+        );
+        assert!(
+            matches!(auth_outcome(&exposed), Outcome::Warn(_)),
+            "and the node still has to start"
+        );
+
+        let mut loopback = config_for(Some(Profile::Internal), "127.0.0.1");
+        loopback.network.http.cors_allowed_origins = vec![];
+        assert!(
+            !evaluate(&loopback).unwrap().unauthenticated_off_box(),
+            "nothing off-box can reach a loopback bind, so there is nothing to fail"
+        );
+
+        // Authentication settles it, which is the point of failing the check at all.
+        let mut keyed = config_for(Some(Profile::Internal), "0.0.0.0");
+        keyed.network.http.cors_allowed_origins = vec![];
+        with_key(&mut keyed, crate::auth::Role::Admin);
+        assert!(!evaluate(&keyed).unwrap().unauthenticated_off_box());
+
+        // `external` refuses unauthenticated outright, so the flag can never be the thing
+        // standing between that config and a green check.
+        let mut external = config_for(Some(Profile::External), "0.0.0.0");
+        external.network.http.cors_allowed_origins = vec![];
+        assert!(auth_outcome(&external).is_fail());
+        assert!(!evaluate(&external).unwrap().unauthenticated_off_box());
+    }
+
+    #[test]
+    fn an_admin_api_with_no_admin_key_is_closed_rather_than_open() {
+        // Auth on, keys mounted, none of them holding node-admin. `authz` needs that
+        // capability on every /_admin/* route, so the endpoints are reachable by nobody —
+        // and this rule used to report them as "unauthenticated", which is the one thing
+        // they are not.
+        let mut c = config_for(Some(Profile::Internal), "0.0.0.0");
+        c.network.http.cors_allowed_origins = vec![];
+        with_key(&mut c, crate::auth::Role::Writer);
+
+        let outcome = outcome_for(&c, "admin_api");
+        assert!(matches!(outcome, Outcome::Warn(_)));
+        assert!(
+            outcome.message().contains("no key holds node-admin"),
+            "expected the missing capability to be named, got: {}",
+            outcome.message()
+        );
+        assert!(
+            !outcome.message().contains("unauthenticated"),
+            "an authenticated node must not be described as unauthenticated: {}",
+            outcome.message()
+        );
     }
 
     #[test]
