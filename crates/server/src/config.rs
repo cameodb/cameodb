@@ -856,7 +856,19 @@ pub struct SearchConfig {
     #[serde(default = "default_max_concurrent_remote_searches")]
     pub max_concurrent_remote_searches: usize,
 
-    /// Enable early termination when result limit is reached
+    /// Accepted and inert. Kept so a config that sets it still loads.
+    ///
+    /// It gated one `break` in the streaming merge, and that `break` was only ever reachable
+    /// when no work remained to skip — so it saved nothing — while discarding a source's results
+    /// that had already arrived. Any search whose limit was below the match count lost a whole
+    /// node from both its count and its merge: `total_hits` came back 29 or 33 where the answer
+    /// was 46, and a sorted top-5 over three nodes returned the wrong five documents depending
+    /// on which node answered last.
+    ///
+    /// There is no safe early exit to put in its place. Stopping a scatter-gather before every
+    /// source has answered means a merged top-k that may not hold the top k, and a `total_hits`
+    /// that under-reports — both silently. A correct one would need a per-source bound on the
+    /// best score or sort value it could still contribute, which nothing here computes.
     #[serde(default = "default_enable_early_termination")]
     pub enable_early_termination: bool,
 
