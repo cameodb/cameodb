@@ -43,6 +43,8 @@ pub(super) async fn write_handler(
         doc,
         // A request off the wire is the first hop by definition.
         forwarded: false,
+        // And decides its own schema: nothing was settled upstream to carry.
+        schema_body: None,
     };
 
     let result = state
@@ -172,7 +174,13 @@ pub(super) async fn bulk_write_handler(
         })
     });
 
-    let client_op = ClientOp::BulkWrite { index, docs };
+    let client_op = ClientOp::BulkWrite {
+        index,
+        docs,
+        // A request off the wire is the first hop, and decides its own schema.
+        forwarded: false,
+        schema_body: None,
+    };
 
     let result = state
         .router
@@ -497,6 +505,8 @@ pub(super) async fn flush_write_batch(
     let client_op = ClientOp::BulkWrite {
         index: index.to_string(),
         docs,
+        forwarded: false,
+        schema_body: None,
     };
     state
         .router

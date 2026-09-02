@@ -65,6 +65,12 @@ impl AppError {
             RemoteVerdict::NotFound => Self::not_found(err.to_string()),
             RemoteVerdict::BadRequest => Self::bad_request(err.to_string()),
             RemoteVerdict::Unavailable => Self::service_unavailable(err.to_string()),
+            // Addressed to the node that forwarded the write, not to a client, and that node
+            // resends with the schema rather than passing this on. Reaching here at all means
+            // the resend was not possible — an older peer, or an op that carries no document —
+            // so it is a `503` for the same reason `Unavailable` is: nothing about the request
+            // is wrong and retrying is the right move.
+            RemoteVerdict::SchemaRequired => Self::service_unavailable(err.to_string()),
             // No explicit status, so `into_response` masks the text and logs it. The caller
             // learns nothing useful from this node's internals; the operator reads them.
             RemoteVerdict::ServerFault => Self::from(err),

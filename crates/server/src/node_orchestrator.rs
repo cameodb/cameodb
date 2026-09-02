@@ -1714,6 +1714,19 @@ pub enum OrchestratorError {
     #[error("cannot establish the cluster schema for '{index}': {reason}")]
     SchemaUnconfirmed { index: String, reason: String },
 
+    /// A forwarded write arrived with a schema *stamp* for an index this node holds no schema
+    /// for, so there is nothing to match the stamp against.
+    ///
+    /// Answered rather than asked, which is the whole point: the receiver cannot canvass its
+    /// peers from inside a write without waiting on mailboxes those peers are using to run the
+    /// forwarded writes. Reporting back costs the sender one retry carrying the body, once per
+    /// node per index, instead of putting the schema on every forward for ever.
+    ///
+    /// Never reaches a client: the forwarding node recognises it by verdict and retries. If it
+    /// somehow does, it is a `503` — nothing is wrong with the request.
+    #[error("no schema for '{index}' on this node; resend the write carrying the schema body")]
+    SchemaBodyRequired { index: String },
+
     /// The node that owns this operation could not be reached.
     ///
     /// Not a fault here and not the caller's mistake: a peer is down or has not finished
@@ -1755,6 +1768,10 @@ pub enum RemoteVerdict {
     /// A fault on the node that answered. The caller learns nothing useful from the detail, so
     /// the HTTP surface withholds it and the operator reads it in the log.
     ServerFault,
+    /// The peer needs the schema body before it can run this write — see
+    /// [`OrchestratorError::SchemaBodyRequired`]. Retryable, and only by a caller that resends
+    /// with the body attached, which is why it is not `Unavailable`.
+    SchemaRequired,
 }
 
 impl RemoteVerdict {
@@ -1765,6 +1782,7 @@ impl RemoteVerdict {
             RemoteVerdict::NotFound => "not-found",
             RemoteVerdict::Unavailable => "unavailable",
             RemoteVerdict::ServerFault => "server-fault",
+            RemoteVerdict::SchemaRequired => "schema-required",
         }
     }
 
@@ -1774,6 +1792,7 @@ impl RemoteVerdict {
             "not-found" => Some(RemoteVerdict::NotFound),
             "unavailable" => Some(RemoteVerdict::Unavailable),
             "server-fault" => Some(RemoteVerdict::ServerFault),
+            "schema-required" => Some(RemoteVerdict::SchemaRequired),
             _ => None,
         }
     }
@@ -1796,6 +1815,11 @@ impl OrchestratorError {
             Self::SchemaUnconfirmed { .. } | Self::PeerUnreachable { .. } => {
                 RemoteVerdict::Unavailable
             }
+
+            // Its own verdict because the forwarding node has to act on it and must not confuse
+            // it with any other "not now": the retry that answers it carries something extra,
+            // and an ordinary `Unavailable` retry would repeat the same insufficient message.
+            Self::SchemaBodyRequired { .. } => RemoteVerdict::SchemaRequired,
 
             Self::UnsortableField { .. } | Self::UnrunnableQuery { .. } => {
                 RemoteVerdict::BadRequest
@@ -2102,6 +2126,12 @@ impl From<OrchestratorError> for RemoteError {
             OrchestratorError::SchemaUnconfirmed { index, reason } => RemoteError::Io(format!(
                 "cannot establish the cluster schema for '{index}': {reason}"
             )),
+            // A microshard never asks for a schema — it is handed one — so this cannot arise on
+            // that path. Carried as `Io` because `RemoteError` has no kind for it and inventing
+            // one would suggest a shard could produce it.
+            OrchestratorError::SchemaBodyRequired { index } => RemoteError::Io(format!(
+                "no schema for '{index}' on this node; resend the write carrying the schema body"
+            )),
             // A verdict from a further hop, mapped onto the kinds this type carries. `RemoteError`
             // is the microshard path and has no retryable kind of its own, so `Unavailable`
             // travels as `Io` here — a shard call does not produce one.
@@ -2109,7 +2139,9 @@ impl From<OrchestratorError> for RemoteError {
             OrchestratorError::Remote { verdict, message } => match verdict {
                 RemoteVerdict::BadRequest => RemoteError::InvalidInput(message),
                 RemoteVerdict::NotFound => RemoteError::NotFound(message),
-                RemoteVerdict::Unavailable | RemoteVerdict::ServerFault => RemoteError::Io(message),
+                RemoteVerdict::Unavailable
+                | RemoteVerdict::ServerFault
+                | RemoteVerdict::SchemaRequired => RemoteError::Io(message),
             },
         }
     }
@@ -2208,11 +2240,47 @@ pub enum ClientOp {
         /// what every op was before this existed.
         #[serde(default)]
         forwarded: bool,
+        /// The schema, sent **only** in answer to [`OrchestratorError::SchemaBodyRequired`].
+        ///
+        /// See [`ClientOp::BulkWrite::schema_body`].
+        #[serde(default)]
+        schema_body: Option<Box<IndexSchema>>,
     },
     /// Bulk write operation to insert/update multiple documents
     BulkWrite {
         index: String,
         docs: Vec<DocPayload>,
+        /// Set by the node that split this batch and forwarded this share, so the owner knows
+        /// it is running someone else's decision rather than making its own.
+        ///
+        /// **A forwarded write must never decide a schema.** The gate runs inside the
+        /// orchestrator's message handler, and a fan-out that asks its peers for a schema asks
+        /// through the very mailbox those peers are using to run the forwarded writes — each of
+        /// which was asking back. Three nodes waited on each other until
+        /// [`PEER_SCHEMA_LOOKUP_TIMEOUT`] broke the circle, and a first bulk write into a new
+        /// index lost most of its documents on a healthy cluster: measured at 15 of 46 written,
+        /// 31 refused, in 5.02s, where the same 46 under one routing key wrote in 0.03s.
+        ///
+        /// This one bit is the whole signal, and it replaces everything an earlier cut carried.
+        /// A share with it set and no local schema does not sample and does not canvass: it
+        /// answers [`OrchestratorError::SchemaBodyRequired`] and the forwarding node resends
+        /// with [`schema_body`](Self::schema_body). So an ordinary forward carries **no schema
+        /// information at all** — where the first cut sent the whole schema (602 bytes for three
+        /// fields, 3,478 for twenty, against a 49-byte document) and the second a 61-byte stamp.
+        /// [`ClientOp::Write`] already carried this bit, so a single write now costs nothing
+        /// extra whatsoever.
+        ///
+        /// Defaulted, so a share from an older peer reads as a first hop and takes the peer
+        /// lookup, which is what every forward did before this existed.
+        #[serde(default)]
+        forwarded: bool,
+        /// The schema, sent **only** in answer to [`OrchestratorError::SchemaBodyRequired`].
+        ///
+        /// Never on a first attempt: the point of `forwarded` is that the receiver can ask, so
+        /// nothing has to be sent speculatively. An empty schema is never sent — see
+        /// [`schema_to_carry`].
+        #[serde(default)]
+        schema_body: Option<Box<IndexSchema>>,
     },
     /// Remove many documents by key, in one request.
     ///
@@ -2360,6 +2428,33 @@ pub enum StorageCommand {
 /// give. A peer that misses this window counts as unreachable, which refuses the write rather
 /// than letting it invent a schema.
 const PEER_SCHEMA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The schema body to send after a receiver asked for it, or `None` if there is none to send.
+///
+/// **An empty schema is never sent.** A receiver adopts what it is handed and then treats the
+/// index as one that already exists, so every field of the document arriving with it would
+/// become an *addition* to a known schema — recorded but not searchable, pending a rebuild.
+fn schema_to_carry(schema: &IndexSchema) -> Option<Box<IndexSchema>> {
+    (!schema.fields.is_empty()).then(|| Box::new(schema.clone()))
+}
+
+/// The same write again, with the schema body attached, for a peer that asked for it.
+///
+/// The clone here is the one place a forward copies a schema, and it is on the cold path only:
+/// a peer asks once per index, the first time a document for it lands there. Every other forward
+/// carries **nothing** — see [`ClientOp::BulkWrite::forwarded`].
+fn with_schema_body(op: &ClientOp, schema: &IndexSchema) -> Option<ClientOp> {
+    let body = schema_to_carry(schema)?;
+    let mut resend = op.clone();
+    match &mut resend {
+        ClientOp::Write { schema_body, .. } | ClientOp::BulkWrite { schema_body, .. } => {
+            *schema_body = Some(body);
+        }
+        // Nothing else validates against a schema, so nothing else can be asked for one.
+        _ => return None,
+    }
+    Some(resend)
+}
 
 /// What the rest of the cluster holds for an index this node has no schema for.
 ///
@@ -3212,6 +3307,7 @@ impl OrchestratorEngine {
                 routing_key,
                 doc,
                 forwarded,
+                schema_body,
             } => match self.engine_write(&index, id, routing_key, doc).await {
                 Ok(WriteOutcome::Done(value)) => WorkerOutcome::Done(Ok(value)),
                 Ok(WriteOutcome::NeedsActor {
@@ -3225,6 +3321,8 @@ impl OrchestratorEngine {
                     doc,
                     // Whichever hop this is, handing the op to the actor is not another one.
                     forwarded,
+                    // Nor does it change what the forwarding node had settled.
+                    schema_body,
                 })),
                 Err(err) => WorkerOutcome::Done(Err(err)),
             },
@@ -6592,11 +6690,17 @@ impl NodeOrchestrator {
     /// This method uses a two-stage approach:
     /// Stage 1: Parallel validation (read-only, CPU-bound)
     /// Stage 2: Sequential schema evolution (write operations only when needed)
+    ///
+    /// `forwarded` says this call is serving a share of a decision another node already made, so
+    /// it must neither sample nor canvass — see [`ClientOp::BulkWrite::forwarded`]. `schema_body`
+    /// is that decision, and arrives only on a resend after this node asked for it.
     async fn staged_schema_validation(
         &self,
         index: &str,
         docs: &[DocPayload],
         schema_cache: &mut IndexSchema,
+        forwarded: bool,
+        schema_body: Option<&IndexSchema>,
     ) -> Result<SchemaValidationSummary, OrchestratorError> {
         if docs.is_empty() {
             return Ok(SchemaValidationSummary {
@@ -6619,7 +6723,40 @@ impl NodeOrchestrator {
         // So ask before inventing. `is_initial_creation` is what licenses sampling and it now
         // means "no schema for this index exists anywhere I can see", not merely "none here".
         let mut is_initial_creation = schema_cache.fields.is_empty();
-        if is_initial_creation {
+
+        if is_initial_creation
+            && let Some(body) = schema_body
+            && !body.fields.is_empty()
+        {
+            // The forwarding node settled this already, so there is nothing to ask and nothing
+            // to invent. Adopted exactly as a peer's answer is below, for the same reason: this
+            // node is applying an agreed schema rather than making a change, so the version
+            // travels with it and `mark_modified` must not advance it.
+            *schema_cache = body.clone();
+            Self::persist_schema_to_stores(index, schema_cache, &self.shards).await?;
+            tracing::info!(
+                index = %index,
+                version = schema_cache.version,
+                fields = schema_cache.fields.len(),
+                "Adopted the schema carried by the forwarded write"
+            );
+            is_initial_creation = false;
+        } else if is_initial_creation && forwarded {
+            // Someone else's decision, and this node has nothing to run it against. Ask the
+            // forwarding node rather than canvassing peers: this runs inside the orchestrator's
+            // message handler, and those peers are using that same mailbox to run the writes
+            // this fan-out just sent them. Answering is the only move that cannot wait on
+            // something waiting on us.
+            //
+            // **This node must not sample either.** A share is a subset of the batch, and
+            // `infer_type_from_value` reads a subset holding no negative values differently from
+            // the whole — so two nodes sampling their own shares can build two different
+            // tantivy indexes from one request, with no bug anywhere. One decision per index,
+            // made where the batch was whole.
+            return Err(OrchestratorError::SchemaBodyRequired {
+                index: index.to_string(),
+            });
+        } else if is_initial_creation {
             match self.peer_schema_for(index).await {
                 // Nobody holds one, so this index really is new and sampling is the right answer.
                 PeerSchemaLookup::NoneHeld => {}
@@ -7139,6 +7276,7 @@ impl NodeOrchestrator {
         peer_addr: &str,
         index: &str,
         batch: Vec<Placed>,
+        established: &IndexSchema,
     ) -> Result<(usize, Vec<String>), OrchestratorError> {
         info!(
             "🔎 Forwarding bulk batch to remote: node_id={}, addr={}, docs={}",
@@ -7175,13 +7313,31 @@ impl NodeOrchestrator {
                 )))
             })?;
 
-        // Send bulk write operation to remote node
+        // One bit, and no schema. `forwarded` tells the owner this share is someone else's
+        // decision, so it neither samples nor canvasses; if it holds nothing to run the share
+        // against it says so, and the resend below carries the body. Nothing about the schema
+        // travels on a forward that does not need it.
         let op = ClientOp::BulkWrite {
             index: index.to_string(),
             docs,
+            forwarded: true,
+            schema_body: None,
         };
 
-        let res: serde_json::Value = remote_answer(remote.ask(&op).await)?;
+        let answer = match remote_answer(remote.ask(&op).await) {
+            Err(err) if matches!(err.verdict(), RemoteVerdict::SchemaRequired) => {
+                let Some(resend) = with_schema_body(&op, established) else {
+                    return Err(err);
+                };
+                debug!(
+                    %node_id,
+                    "Peer holds no schema for this index; resending the batch with the schema"
+                );
+                remote_answer(remote.ask(&resend).await)
+            }
+            other => other,
+        };
+        let res: serde_json::Value = answer?;
 
         let Some(items_written) = res.get("items_written").and_then(|v| v.as_u64()) else {
             return Err(OrchestratorError::Io(std::io::Error::other(
@@ -8331,11 +8487,20 @@ impl NodeOrchestrator {
                 routing_key,
                 doc,
                 forwarded,
+                schema_body,
             } => {
-                self.orch_write(&index, id, routing_key, doc, forwarded)
+                self.orch_write(&index, id, routing_key, doc, forwarded, schema_body)
                     .await
             }
-            ClientOp::BulkWrite { index, docs } => self.orch_bulk_write(&index, docs).await,
+            ClientOp::BulkWrite {
+                index,
+                docs,
+                forwarded,
+                schema_body,
+            } => {
+                self.orch_bulk_write(&index, docs, forwarded, schema_body)
+                    .await
+            }
             ClientOp::Delete {
                 index,
                 id,
@@ -8478,6 +8643,7 @@ impl NodeOrchestrator {
         routing_key: Option<String>,
         doc: JsonValue,
         forwarded: bool,
+        schema_body: Option<Box<IndexSchema>>,
     ) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
             return Err(OrchestratorError::Io(std::io::Error::new(
@@ -8526,7 +8692,14 @@ impl NodeOrchestrator {
                                 routing_key: effective_routing_key,
                                 doc,
                                 forwarded: true,
+                                // This node reached the fast path, which means it holds a
+                                // schema and this document needs nothing added to it. The
+                                // owner may hold none, and `forwarded` above is all it
+                                // needs to know not to invent one: it asks, and the resend
+                                // below carries the body. Nothing speculative on the wire.
+                                schema_body: None,
                             },
+                            Some(&schema),
                         )
                         .await;
                 };
@@ -8560,7 +8733,13 @@ impl NodeOrchestrator {
         let mut schema_mut = (*schema).clone();
 
         let validation_summary = self
-            .staged_schema_validation(index, &docs_slice, &mut schema_mut)
+            .staged_schema_validation(
+                index,
+                &docs_slice,
+                &mut schema_mut,
+                forwarded,
+                schema_body.as_deref(),
+            )
             .await?;
 
         if validation_summary.evolution_needed || self.get_cached_schema(index).is_none() {
@@ -8595,8 +8774,12 @@ impl NodeOrchestrator {
                         id,
                         routing_key: effective_routing_key,
                         doc,
+                        // Nothing speculative: `forwarded` is the signal, and the owner
+                        // asks for the body if it needs one.
+                        schema_body: None,
                         forwarded: true,
                     },
+                    Some(&schema_mut),
                 )
                 .await;
         };
@@ -8659,6 +8842,8 @@ impl NodeOrchestrator {
                         routing_key: Some(effective),
                         forwarded: true,
                     },
+                    // A delete carries no document, so it can never need a schema.
+                    None,
                 )
                 .await;
         };
@@ -8979,6 +9164,7 @@ impl NodeOrchestrator {
         target: Uuid,
         already_forwarded: bool,
         op: ClientOp,
+        established: Option<&IndexSchema>,
     ) -> Result<JsonValue, OrchestratorError> {
         if already_forwarded {
             return Err(OrchestratorError::Io(std::io::Error::other(format!(
@@ -9020,13 +9206,34 @@ impl NodeOrchestrator {
                 )))
             })?;
 
-        remote_answer(remote.ask(&op).await)
+        // One retry, and only for the one answer a retry can change. The peer holds no schema
+        // for this index and said so rather than canvassing anyone, so the resend carries the
+        // body — see [`CarriedSchema`]. Once per node per index; every other forward, and every
+        // other failure, goes through here untouched.
+        match remote_answer(remote.ask(&op).await) {
+            Err(err) if matches!(err.verdict(), RemoteVerdict::SchemaRequired) => {
+                let Some(schema) = established else {
+                    return Err(err);
+                };
+                let Some(resend) = with_schema_body(&op, schema) else {
+                    return Err(err);
+                };
+                debug!(
+                    %node_id,
+                    "Peer holds no schema for this index; resending the write with the schema"
+                );
+                remote_answer(remote.ask(&resend).await)
+            }
+            other => other,
+        }
     }
 
     async fn orch_bulk_write(
         &self,
         index: &str,
         docs: Vec<DocPayload>,
+        forwarded: bool,
+        schema_body: Option<Box<IndexSchema>>,
     ) -> Result<JsonValue, OrchestratorError> {
         let start = std::time::Instant::now();
         if self.shards.is_empty() {
@@ -9041,7 +9248,13 @@ impl NodeOrchestrator {
 
         // Use staged schema validation: parallel validation + sequential evolution
         let validation_summary = self
-            .staged_schema_validation(index, &docs, &mut schema_cache)
+            .staged_schema_validation(
+                index,
+                &docs,
+                &mut schema_cache,
+                forwarded,
+                schema_body.as_deref(),
+            )
             .await?;
 
         if validation_summary.evolution_needed || self.get_cached_schema(index).is_none() {
@@ -9245,6 +9458,9 @@ impl NodeOrchestrator {
         if !remote_batches.is_empty() {
             use futures::future::join_all;
 
+            // Borrowed once, outside: a shared reference is `Copy`, so each `async move`
+            // below takes the reference and not the schema.
+            let established: &IndexSchema = &schema_cache;
             let remote_futures: Vec<_> = remote_batches
                 .into_iter()
                 .map(|(node_id, addr, batch)| async move {
@@ -9252,7 +9468,7 @@ impl NodeOrchestrator {
                     let positions: Vec<usize> =
                         batch.iter().map(|placed| placed.position).collect();
                     let outcome = self
-                        .forward_bulk_to_remote(node_id, &addr, index, batch)
+                        .forward_bulk_to_remote(node_id, &addr, index, batch, established)
                         .await;
                     (node_id, positions, outcome)
                 })
@@ -10590,12 +10806,14 @@ mod tests {
                     routing_key: None,
                     doc: json!({"title": "Dune"}),
                 }],
+                forwarded: false,
+                schema_body: None,
             })
             .await;
 
         match outcome {
             WorkerOutcome::UseActor(op) => match *op {
-                ClientOp::BulkWrite { index, docs } => {
+                ClientOp::BulkWrite { index, docs, .. } => {
                     assert_eq!(index, "books");
                     assert_eq!(
                         docs.len(),
@@ -10623,6 +10841,7 @@ mod tests {
             routing_key: None,
             doc: json!({"title": "Dune"}),
             forwarded: false,
+            schema_body: None,
         })
     }
 
@@ -11138,6 +11357,117 @@ mod tests {
         assert!(
             !NodeConfig::default().clustered,
             "the default configuration must not claim to be part of a cluster"
+        );
+    }
+
+    /// An ordinary forward carries no schema information at all, and the body only on request.
+    ///
+    /// Three cuts of this. The first sent the whole schema on every forward — 602 bytes for
+    /// three fields against a 49-byte document. The second sent a 61-byte stamp. Both were
+    /// answering "does the receiver have a schema", and neither needed to: a forwarded write is
+    /// a share of a decision another node already made, so the receiver can simply *ask* when
+    /// it has nothing to run the share against. `ClientOp::Write` already carried the bit that
+    /// says so, so a single write costs nothing extra; `BulkWrite` gained it.
+    #[test]
+    fn an_ordinary_forward_carries_no_schema_at_all() {
+        let mut settled = IndexSchema::default();
+        for i in 0..3 {
+            settled.fields.insert(
+                format!("f{i}"),
+                FieldDef::new(format!("f{i}"), TantivyFieldType::Text),
+            );
+        }
+
+        let forward = ClientOp::BulkWrite {
+            index: "books".to_string(),
+            docs: vec![DocPayload {
+                id: "b1".to_string(),
+                routing_key: None,
+                doc: json!({"f0": "Dune"}),
+            }],
+            forwarded: true,
+            schema_body: None,
+        };
+        let wire = serde_json::to_string(&forward).unwrap();
+        assert!(
+            !wire.contains("field_type") && !wire.contains("thumbprint"),
+            "no schema and no stamp may appear on an ordinary forward: {wire}"
+        );
+
+        // The body exists, and is what a resend attaches — never a first attempt.
+        let body = schema_to_carry(&settled).expect("a schema with fields can be sent");
+        assert!(body.fields.contains_key("f0"));
+        assert!(
+            schema_to_carry(&IndexSchema::default()).is_none(),
+            "an empty schema must not travel: the receiver would adopt it and index nothing"
+        );
+
+        // What the resend costs, against what it replaces on every forward.
+        let resent = with_schema_body(&forward, &settled).expect("a bulk write can carry one");
+        let resent_len = serde_json::to_string(&resent).unwrap().len();
+        assert!(
+            wire.len() * 3 < resent_len,
+            "the point of asking is that the body is large: forward {} vs resend {}",
+            wire.len(),
+            resent_len
+        );
+    }
+
+    /// A peer that cannot run a share asks for the body, and the resend attaches it.
+    #[test]
+    fn a_resend_attaches_the_body_the_peer_asked_for() {
+        let mut settled = IndexSchema::default();
+        settled.fields.insert(
+            "title".to_string(),
+            FieldDef::new("title".to_string(), TantivyFieldType::Text),
+        );
+
+        let forwarded = ClientOp::Write {
+            index: "books".to_string(),
+            id: "b1".to_string(),
+            routing_key: None,
+            doc: json!({"title": "Dune"}),
+            forwarded: true,
+            schema_body: None,
+        };
+
+        match with_schema_body(&forwarded, &settled).expect("a write can carry a schema") {
+            ClientOp::Write {
+                schema_body: Some(body),
+                id,
+                forwarded: true,
+                ..
+            } => {
+                assert_eq!(id, "b1", "the write itself has to be the same write");
+                assert!(body.fields.contains_key("title"));
+            }
+            other => panic!("expected a body on the resend, got {other:?}"),
+        }
+
+        // The verdict is what the forwarding node matches on, rather than the message text —
+        // reading the text is what the classification work removed.
+        let asked = OrchestratorError::SchemaBodyRequired {
+            index: "books".to_string(),
+        };
+        assert!(matches!(asked.verdict(), RemoteVerdict::SchemaRequired));
+        assert_eq!(
+            RemoteVerdict::from_tag(RemoteVerdict::SchemaRequired.tag()),
+            Some(RemoteVerdict::SchemaRequired),
+            "the verdict has to survive the wire, or the retry never happens"
+        );
+
+        // Nothing without a document can be asked for a schema.
+        assert!(
+            with_schema_body(
+                &ClientOp::Delete {
+                    index: "books".to_string(),
+                    id: "b1".to_string(),
+                    routing_key: None,
+                    forwarded: true,
+                },
+                &settled
+            )
+            .is_none()
         );
     }
 
