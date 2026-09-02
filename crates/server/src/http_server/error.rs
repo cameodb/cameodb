@@ -29,6 +29,18 @@ impl AppError {
         }
     }
 
+    /// 503 with an explicit, client-safe message, for a state the caller should retry.
+    ///
+    /// The status is set explicitly so the message survives: an error that falls through with
+    /// no status answers `500` with the text masked, which is right for an internal fault and
+    /// wrong for a condition the caller is meant to understand and retry.
+    pub fn service_unavailable(msg: impl Into<String>) -> Self {
+        Self {
+            error: anyhow::anyhow!("{}", msg.into()),
+            status: Some(StatusCode::SERVICE_UNAVAILABLE),
+        }
+    }
+
     /// 404 with an explicit, client-safe message.
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self {
@@ -58,6 +70,14 @@ impl AppError {
         // The one thing that is actually absent rather than broken.
         if let OrchestratorError::Storage(storage::StoreError::IndexNotFound(_)) = &err {
             return Self::not_found(err.to_string());
+        }
+
+        // Neither the caller's fault nor a fault at all: the cluster is not whole enough to
+        // agree on a schema for an index nobody here has seen. `503` says retry, which is the
+        // correct instruction — a `500` would mask the reason and invite the caller to treat a
+        // recoverable state as a defect.
+        if let OrchestratorError::SchemaUnconfirmed { .. } = &err {
+            return Self::service_unavailable(err.to_string());
         }
 
         let is_bad_request = match &err {
