@@ -1327,6 +1327,29 @@ pub enum StreamingSearchResult {
 // ============================================================================
 
 /// Generate the remote actor name for a NodeOrchestrator.
+/// A reply from a remote peer, with the verdict of a handler error kept.
+///
+/// The distinction every caller needs and none of them used to make: `HandlerError` means the
+/// peer received the message, ran it, and answered with an error — its answer, already carrying
+/// the verdict that decides the caller's status. Every other variant is the message not getting
+/// there.
+///
+/// Stringifying the whole `SendError` collapsed the two, so a document whose type a peer's schema
+/// will never accept was indistinguishable from a peer that had gone away: retried, wrapped as a
+/// routing failure, answered `500`, and reported to the coordinator as grounds to redial the
+/// cluster. Four call sites each wrote that same `map_err` by hand, which is why they all had the
+/// same bug and why this is one function now.
+fn remote_answer<T>(
+    reply: Result<T, kameo::error::RemoteSendError<OrchestratorError>>,
+) -> Result<T, OrchestratorError> {
+    reply.map_err(|err| match err {
+        kameo::error::RemoteSendError::HandlerError(answered) => answered,
+        never_arrived => {
+            OrchestratorError::Io(std::io::Error::other(never_arrived.to_string()))
+        }
+    })
+}
+
 pub fn orchestrator_remote_name(node_id: &Uuid) -> String {
     format!("orchestrator-{}", node_id)
 }
@@ -1593,16 +1616,156 @@ pub enum OrchestratorError {
     /// here; the cluster is not currently whole enough to agree on a new schema.
     #[error("cannot establish the cluster schema for '{index}': {reason}")]
     SchemaUnconfirmed { index: String, reason: String },
+
+    /// The node that owns this operation could not be reached.
+    ///
+    /// Not a fault here and not the caller's mistake: a peer is down or has not finished
+    /// joining, and it is expected back. Reported as `500` before, which says this node is
+    /// broken — it is not, and the advice a `500` carries is wrong, because the one thing that
+    /// will fix this is the retry a `500` discourages.
+    #[error("{message}")]
+    PeerUnreachable { message: String },
+
+    /// A verdict another node reached, carried across the boundary intact.
+    ///
+    /// See [`RemoteVerdict`]. The variant a peer actually raised cannot be rebuilt here — the
+    /// errors it wraps do not implement serde and there would be nothing to do with them if they
+    /// did — but the verdict is the part that matters, and answering the caller the same way
+    /// whether their request ran here or one hop away is the whole point of keeping it.
+    #[error("{message}")]
+    Remote {
+        verdict: RemoteVerdict,
+        message: String,
+    },
 }
 
-// Serialize/Deserialize via display string to satisfy remote message bounds without
-// requiring downstream error types to implement serde traits.
+/// How an error should be answered, once it is the answer to somebody's request.
+///
+/// One classification, used twice: by the HTTP surface to pick a status, and by
+/// [`OrchestratorError`]'s wire form so a peer's verdict survives the hop. They were two, and
+/// two would drift — the wire form would keep saying "server fault" for a refusal the HTTP layer
+/// had learned to call a bad request, and nobody would notice until a routed write answered
+/// differently from a local one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteVerdict {
+    /// The caller sent something this node will not accept. Nothing to retry.
+    BadRequest,
+    /// What the caller named is not here.
+    NotFound,
+    /// Nothing is wrong with the request and nothing is broken; the node cannot serve it *now*.
+    /// Worth retrying, and the one verdict that says so.
+    Unavailable,
+    /// A fault on the node that answered. The caller learns nothing useful from the detail, so
+    /// the HTTP surface withholds it and the operator reads it in the log.
+    ServerFault,
+}
+
+impl RemoteVerdict {
+    /// The tag this verdict travels under. Short, and stable: it is a wire value.
+    fn tag(self) -> &'static str {
+        match self {
+            RemoteVerdict::BadRequest => "bad-request",
+            RemoteVerdict::NotFound => "not-found",
+            RemoteVerdict::Unavailable => "unavailable",
+            RemoteVerdict::ServerFault => "server-fault",
+        }
+    }
+
+    fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "bad-request" => Some(RemoteVerdict::BadRequest),
+            "not-found" => Some(RemoteVerdict::NotFound),
+            "unavailable" => Some(RemoteVerdict::Unavailable),
+            "server-fault" => Some(RemoteVerdict::ServerFault),
+            _ => None,
+        }
+    }
+}
+
+impl OrchestratorError {
+    /// How this error should be answered, wherever it is answered.
+    ///
+    /// Every judgement is on the error's *type*. Reading the message text is what this replaced,
+    /// and it could not tell a caller's mistake from the node's: any text containing "not found"
+    /// answered 404, so a write that failed because a *shard* was missing told the caller their
+    /// index did not exist.
+    pub fn verdict(&self) -> RemoteVerdict {
+        match self {
+            // The one thing that is actually absent rather than broken.
+            Self::Storage(StoreError::IndexNotFound(_)) => RemoteVerdict::NotFound,
+
+            // Neither the caller's fault nor a fault at all — see `SchemaUnconfirmed` and
+            // `PeerUnreachable`. Both are "not now", and both are worth retrying.
+            Self::SchemaUnconfirmed { .. } | Self::PeerUnreachable { .. } => {
+                RemoteVerdict::Unavailable
+            }
+
+            Self::UnsortableField { .. } | Self::UnrunnableQuery { .. } => {
+                RemoteVerdict::BadRequest
+            }
+
+            // A query no shard could run carries its own verdict: the shards refused what was
+            // asked, or they failed. Only the first is the caller's to fix.
+            Self::NoShardAnswered { caller_error, .. } => {
+                if *caller_error {
+                    RemoteVerdict::BadRequest
+                } else {
+                    RemoteVerdict::ServerFault
+                }
+            }
+
+            // `InvalidData` as well as `InvalidInput`: every producer of the former is a document
+            // the caller sent that the schema refuses — a missing inner `id`, a type that does
+            // not match a declared field.
+            Self::Io(io) => match io.kind() {
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => {
+                    RemoteVerdict::BadRequest
+                }
+                _ => RemoteVerdict::ServerFault,
+            },
+
+            // A value the field's type cannot hold is the document's fault too, as is a query
+            // that will not parse and a name no index may have.
+            Self::Storage(
+                StoreError::InvalidFieldValue { .. }
+                | StoreError::QueryParser(_)
+                | StoreError::InvalidIndexName(_),
+            ) => RemoteVerdict::BadRequest,
+
+            // Already judged, one hop away. Kept rather than re-derived.
+            Self::Remote { verdict, .. } => *verdict,
+
+            _ => RemoteVerdict::ServerFault,
+        }
+    }
+}
+
+/// Separates the verdict tag from the message on the wire.
+///
+/// ASCII unit separator: a control character, so no error message this node produces can contain
+/// one and be mistaken for a tagged form.
+const VERDICT_SEPARATOR: char = '\u{1f}';
+
+// A display string still, because the errors this wraps — `IdentityError`, `StoreError` — do not
+// implement serde and rebuilding them on the far side would serve nothing. What is added is the
+// verdict, prefixed: it decides the status the caller sees, and without it every error a peer
+// raised arrived as an unclassified `Io` and answered `500`. A type mismatch in a document was
+// reported to the caller as this node's fault, and a schema that could not be agreed as a defect
+// rather than as something to retry.
+//
+// Mixed versions degrade to the old behaviour rather than breaking: a node that predates this
+// sends an untagged string, which is read below as a server fault, and reads a tagged one as an
+// opaque message — the same `500` it would have answered anyway.
 impl Serialize for OrchestratorError {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        serializer.serialize_str(&format!(
+            "{}{VERDICT_SEPARATOR}{}",
+            self.verdict().tag(),
+            self
+        ))
     }
 }
 
@@ -1612,7 +1775,25 @@ impl<'de> Deserialize<'de> for OrchestratorError {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        Ok(OrchestratorError::Io(std::io::Error::other(s)))
+        match s.split_once(VERDICT_SEPARATOR) {
+            Some((tag, message)) => match RemoteVerdict::from_tag(tag) {
+                Some(verdict) => Ok(OrchestratorError::Remote {
+                    verdict,
+                    message: message.to_string(),
+                }),
+                // A tag this build does not know is a newer peer naming a verdict that did not
+                // exist here yet. The message is still the answer; only the classification is
+                // unavailable, so it takes the cautious one.
+                None => Ok(OrchestratorError::Remote {
+                    verdict: RemoteVerdict::ServerFault,
+                    message: message.to_string(),
+                }),
+            },
+            None => Ok(OrchestratorError::Remote {
+                verdict: RemoteVerdict::ServerFault,
+                message: s,
+            }),
+        }
     }
 }
 
@@ -1820,11 +2001,21 @@ impl From<OrchestratorError> for RemoteError {
                 }
             }
             // Not the caller's mistake, so not `InvalidInput`: a requesting node must not turn
-            // this into a 400 telling the caller to fix a request that is already correct. It
-            // travels as `Io`, which is the kind a requesting node reports as retryable.
+            // this into a 400 telling the caller to fix a request that is already correct.
             OrchestratorError::SchemaUnconfirmed { index, reason } => RemoteError::Io(format!(
                 "cannot establish the cluster schema for '{index}': {reason}"
             )),
+            // A verdict from a further hop, mapped onto the kinds this type carries. `RemoteError`
+            // is the microshard path and has no retryable kind of its own, so `Unavailable`
+            // travels as `Io` here — a shard call does not produce one.
+            OrchestratorError::PeerUnreachable { message } => RemoteError::Io(message),
+            OrchestratorError::Remote { verdict, message } => match verdict {
+                RemoteVerdict::BadRequest => RemoteError::InvalidInput(message),
+                RemoteVerdict::NotFound => RemoteError::NotFound(message),
+                RemoteVerdict::Unavailable | RemoteVerdict::ServerFault => {
+                    RemoteError::Io(message)
+                }
+            },
         }
     }
 }
@@ -5859,6 +6050,18 @@ impl RouterActor {
         self.handle_broadcast(op).await
     }
 
+    /// Send an operation to the node that owns it, retrying only what is worth retrying.
+    ///
+    /// **A peer that answered is not a peer that failed.** Both used to end up here as an
+    /// unclassified `Io`, so a deterministic refusal — a document whose type the schema will
+    /// never accept — was sent twice more, wrapped in "remote routing failed after N attempts",
+    /// answered `500`, and reported to the coordinator as a reason to redial the cluster. A
+    /// malformed document nudged cluster membership.
+    ///
+    /// So an answer is returned as it arrived: not retried, because the second attempt reaches
+    /// the same schema and the same verdict; not wrapped, because the wrapper described a
+    /// transport that worked perfectly; and not reported as a dial failure, because it says
+    /// nothing about connectivity. Only an attempt that failed to *reach* the peer is retried.
     async fn handle_remote(
         &self,
         op: ClientOp,
@@ -5877,6 +6080,17 @@ impl RouterActor {
             .await
             {
                 Ok(Ok(value)) => return Ok(value),
+                // The peer handled the message and its answer was an error. That is the answer.
+                Ok(Err(err @ OrchestratorError::Remote { .. })) => {
+                    warn!(
+                        %node_id,
+                        %peer_addr,
+                        error = %err,
+                        verdict = ?err.verdict(),
+                        "RouterActor: remote node refused the operation"
+                    );
+                    return Err(err);
+                }
                 Ok(Err(err)) => {
                     warn!(
                         %node_id,
@@ -5921,7 +6135,9 @@ impl RouterActor {
             })
             .await;
 
-        Err(OrchestratorError::Io(std::io::Error::other(reason)))
+        // Every attempt failed to reach the peer. That is a transport problem, so the redial
+        // above is right — but the caller's answer is "not now", not "this node is broken".
+        Err(OrchestratorError::PeerUnreachable { message: reason })
     }
 }
 
@@ -5955,11 +6171,7 @@ impl RouterActor {
                 )))
             })?;
 
-        let res = remote
-            .ask(&_op)
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-        Ok(res)
+        remote_answer(remote.ask(&_op).await)
     }
 }
 
@@ -6831,10 +7043,7 @@ impl NodeOrchestrator {
             docs,
         };
 
-        let res: serde_json::Value = remote
-            .ask(&op)
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+        let res: serde_json::Value = remote_answer(remote.ask(&op).await)?;
 
         let Some(items_written) = res.get("items_written").and_then(|v| v.as_u64()) else {
             return Err(OrchestratorError::Io(std::io::Error::other(
@@ -8488,10 +8697,7 @@ impl NodeOrchestrator {
             docs,
         };
 
-        let answer: JsonValue = remote
-            .ask(&op)
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+        let answer: JsonValue = remote_answer(remote.ask(&op).await)?;
 
         // Its errors are the caller's errors too, so surface them rather than counting only
         // what succeeded.
@@ -8570,10 +8776,7 @@ impl NodeOrchestrator {
                 )))
             })?;
 
-        remote
-            .ask(&op)
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))
+        remote_answer(remote.ask(&op).await)
     }
 
     async fn orch_bulk_write(
@@ -11226,6 +11429,94 @@ mod tests {
         }
     }
 
+    /// A verdict reached on one node has to arrive intact on the next.
+    ///
+    /// Everything a peer raised used to come back as an unclassified `Io` and answer `500`: a
+    /// document whose type the schema refuses was reported as this node's fault, and a schema the
+    /// cluster could not agree on as a defect rather than as something to retry. The classified
+    /// verdict is what crosses now, so a routed request is answered the same way a local one is.
+    #[test]
+    fn a_verdict_survives_the_wire() {
+        let round_trip = |err: &OrchestratorError| -> OrchestratorError {
+            let encoded = serde_json::to_string(err).expect("serialise");
+            serde_json::from_str(&encoded).expect("deserialise")
+        };
+
+        let cases = [
+            (
+                OrchestratorError::SchemaUnconfirmed {
+                    index: "docs".into(),
+                    reason: "2 of 3 nodes connected".into(),
+                },
+                RemoteVerdict::Unavailable,
+            ),
+            (
+                OrchestratorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Type mismatch for field 'n': expected I64, got F64",
+                )),
+                RemoteVerdict::BadRequest,
+            ),
+            (
+                OrchestratorError::UnsortableField {
+                    field: "title".into(),
+                    reason: "no fast column".into(),
+                },
+                RemoteVerdict::BadRequest,
+            ),
+            (
+                OrchestratorError::Storage(StoreError::IndexNotFound("gone".into())),
+                RemoteVerdict::NotFound,
+            ),
+            (
+                OrchestratorError::PeerUnreachable {
+                    message: "remote orchestrator for node 1 not found".into(),
+                },
+                RemoteVerdict::Unavailable,
+            ),
+            (
+                OrchestratorError::Io(std::io::Error::other("a disk gave up")),
+                RemoteVerdict::ServerFault,
+            ),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(err.verdict(), expected, "local verdict for {err}");
+            let arrived = round_trip(&err);
+            assert_eq!(
+                arrived.verdict(),
+                expected,
+                "verdict changed crossing the wire for {err}"
+            );
+            assert_eq!(
+                arrived.to_string(),
+                err.to_string(),
+                "the message must arrive unchanged, and without the tag"
+            );
+        }
+    }
+
+    /// A node that predates the tagged form still gets an answer, and its answers are still read.
+    ///
+    /// Forward and backward: an untagged string is what an older peer sends, and it has to read
+    /// as the cautious verdict rather than as a parse failure. An unknown tag is what a *newer*
+    /// peer sends, naming a verdict this build has not heard of, and takes the same route.
+    #[test]
+    fn an_untagged_or_unknown_verdict_is_read_as_a_server_fault() {
+        let untagged: OrchestratorError =
+            serde_json::from_str("\"something an older node said\"").expect("deserialise");
+        assert_eq!(untagged.verdict(), RemoteVerdict::ServerFault);
+        assert_eq!(untagged.to_string(), "something an older node said");
+
+        // `\u001f` as JSON escapes it, which is how serde_json writes the separator: a raw
+        // control byte is not legal in a JSON string, so the wire form stays valid JSON.
+        let unknown: OrchestratorError =
+            serde_json::from_str(r#""teapot\u001fa verdict from the future""#)
+                .expect("deserialise");
+        assert_eq!(unknown.verdict(), RemoteVerdict::ServerFault);
+        assert_eq!(unknown.to_string(), "a verdict from the future");
+    }
+
     /// Two nodes holding different schemas for one index must pick the same winner without
     /// talking to each other.
     ///
@@ -11236,8 +11527,10 @@ mod tests {
     #[test]
     fn the_schema_tie_break_is_deterministic_and_symmetric() {
         let schema = |version: u64, field: &str, field_type: TantivyFieldType| {
-            let mut s = IndexSchema::default();
-            s.version = version;
+            let mut s = IndexSchema {
+                version,
+                ..Default::default()
+            };
             s.fields
                 .insert(field.into(), FieldDef::new(field.into(), field_type));
             s
