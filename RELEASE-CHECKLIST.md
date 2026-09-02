@@ -120,26 +120,44 @@ Signed off by:
 
 <!-- Newest first. Append a filled-in template per release. -->
 
-## v0.3.3 — in progress
+## v0.3.3 — 2026-09-03
 
-Commit: 0beddbf. `chore(release): cut 0.3.3` (a406d9b) landed and the changelog was filled in,
-but no tag was cut and no sign-off exists. This is a partial record: one suite was run, and it
-found a defect in itself rather than in the product.
+Commit: 673ca55 — `MANIFEST.txt` records `673ca5513524676011a4fa7ef150e03ac270b2fe`, which is the
+tree the validation suite ran against, so for once the recorded commit and the validated one are
+the same. Commits after it are this checklist record and nothing else.
 
 Built targets: macOS arm64, x86_64-unknown-linux-musl (binary + `cameodb_0.3.3_amd64.deb` +
-`cameodb-0.3.3-1.x86_64.rpm`). **Windows outstanding.**
+`cameodb-0.3.3-1.x86_64.rpm`), Windows x86_64 (`cameodb.exe`, 22M). All seven artifacts signed.
 
-Validation run, host build (macOS arm64), 2026-09-03:
+Validation suite, host build (macOS arm64), 2026-09-03 01:02:06 → 01:04:08:
 
 ```
-binary: target/release/cameodb (cameodb 0.3.3)
+binary: target/release/cameodb
 
-  PASS posture — 44 checks, 0 failed, 0 skipped
+  PASS deps
+  PASS unit
+  PASS posture
+  PASS auth
+  PASS tls
+  PASS remote-sources
+  PASS artifact
 ```
 
 That binary is byte-identical to the staged `dist/0.3.3/mac/cameodb`
 (sha256 `b90f335bdf25f925f4a895930a9bafca2c4268f63d2edcde2bc2b7759fdaaa8e`), so the result
-describes the artifact that would ship. **Every other suite: not run.**
+describes the artifact that ships rather than a neighbouring build of it. It also still describes
+the current tree: the last commit to touch `crates/` or `Cargo.*` was fed149a, before this binary
+was built, and everything committed since is docs and scripts.
+
+| Suite | Host build | musl | windows | notes |
+|-------|-----------|------|---------|-------|
+| deps           | PASS | —    | —    | three transitive advisories ignored, all review-by 2026-11-01 |
+| unit           | PASS | —    | —    | |
+| posture        | PASS | —    | —    | 44 checks; one had gone stale and is corrected in 673ca55 — see below |
+| auth           | PASS | —    | —    | |
+| tls            | PASS | —    | —    | |
+| remote-sources | PASS | —    | —    | **outstanding on musl and Windows** — trust store differs per platform, so this result does not transfer (procedure step 5) |
+| artifact       | PASS | —    | —    | host run |
 
 Published to DockerHub: `goranc/cameodb:0.3.3` (index `sha256:ff88023d`) and `:latest`
 (`sha256:660a3d77`), both `linux/amd64` + `linux/arm64` with per-platform SLSA provenance.
@@ -147,6 +165,16 @@ Verified by running each tag on each platform — all four report `cameodb 0.3.3
 manifests under `latest`, `sha256:5796dc97` (amd64) and `sha256:9d6aad62` (arm64), are the same
 digests the `--no-push` rehearsal exported locally, so the rehearsal built the bits that shipped.
 Publishing remains manual: no step of this procedure asks for it.
+
+Signed and staged: `dist/0.3.3/` holds all seven artifacts with a `.bundle` and `.sha256` each,
+plus `SHA256SUMS`, `MANIFEST.txt` and both SBOMs. Signatures spot-checked here against the key
+`dl.cameodb.com` serves rather than taken from the manifest's own "signed" column —
+`cosign verify-blob` returns `Verified OK` for `windows/cameodb.exe`, `mac/cameodb` and
+`linux/cameodb`. The staged `mac/cameodb` is still `b90f335b`, the binary the suite ran against.
+
+`publish.sh` has copied everything into the `cameodb-web` checkout: 17 files replaced and the six
+0.3.3 `.deb`/`.rpm` files added, with `public/downloads/MANIFEST.txt` now reading `CameoDB 0.3.3`
+at the same commit.
 
 **Recorded error — a posture check had gone stale and failed against correct behaviour.**
 `oversized single record on /document/stream is rejected` asserted `413`; the endpoint answers
@@ -172,22 +200,24 @@ The lesson for the procedure: a check that asserts a status code goes stale sile
 contract moves to the body, and it fails *loudly in the wrong direction* — the suite accuses the
 product. Prefer asserting the answer over the envelope.
 
-Advisory exceptions reviewed: not yet.
+Advisory exceptions reviewed: RUSTSEC-2026-0118, RUSTSEC-2026-0119 (hickory-proto 0.25.x,
+transitive via libp2p 0.56.0, needs hickory-proto >=0.26.1), RUSTSEC-2024-0436 (`paste`
+unmaintained, transitive via libp2p → if-watch). All three review-by 2026-11-01, so none was
+renewed for this release; `deps` passing is the gate that says no date has lapsed.
 
 Skipped checks and why:
-- Every suite but `posture` — not run.
 - `remote-sources` on musl and Windows (procedure step 5) — not run.
 - `check-config` on the two shipped configs (procedure step 7) — not recorded.
 
-Not yet done, release is incomplete:
-- **No Windows artifact.** `dist/0.3.3/windows/cameodb.exe` does not exist.
-- `--stage sbom` and `--stage sign` have not run: `dist/0.3.3/` holds four binaries and
-  packages and no `.bundle`, `.sha256`, `SHA256SUMS` or `MANIFEST.txt`.
-- `publish.sh` has not run, and `cameodb-web` has not been updated.
-- No `v0.3.3` git tag.
+Outstanding, and neither blocks the artifacts:
+- **`cameodb-web` is not committed.** `publish.sh` only copies; the checkout is a separate repo
+  and its last commit is still `96c83da` "Publish 0.3.2 binaries". 17 modified and 6 untracked
+  files are sitting there (procedure step 10). Nothing is served until that is committed.
+- **No `v0.3.3` git tag.** `git tag` is empty — as it was for 0.3.0 through 0.3.2, so this is the
+  standing habit rather than a lapse specific to this release.
 
-Known gaps acknowledged: not yet
-Signed off by:
+Known gaps acknowledged: yes
+Signed off by: Goran Cvijanovic
 
 ## v0.3.2 — 2026-08-20
 
