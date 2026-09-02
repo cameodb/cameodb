@@ -62,12 +62,12 @@ debugging; use the pipeline for releases.
   - Multi-platform builds (amd64 + arm64)
   - Automatic buildx builder management
   - Corporate CA certificate support
-  - Local testing with `--no-push` flag
+  - `--no-push` builds both platforms without publishing
 - **Usage**:
   ```bash
   ./scripts/build/docker-push.sh               # Build + push latest
   ./scripts/build/docker-push.sh 0.3.0         # Build + push version tag
-  ./scripts/build/docker-push.sh --no-push     # Local build only
+  ./scripts/build/docker-push.sh --no-push     # Build both platforms, no push
   ```
 - **Audience**: DevOps, release engineers, CI/CD
 

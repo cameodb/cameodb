@@ -4,10 +4,12 @@ CameoDB provides configurations for both single-node and multi-node cluster depl
 
 ### Build Local Docker Image (Development)
 
-Build a single-platform image for local testing:
+`--no-push` builds every platform the push would publish — it is the rehearsal for a release,
+so checking only one architecture would let the other fail for the first time mid-push — and
+leaves a runnable image in the local store:
 
 ```bash
-# Build for current platform (loads into Docker Desktop)
+# Build amd64 + arm64, load locally, publish nothing
 ./scripts/build/docker-push.sh --no-push
 
 # Or build manually

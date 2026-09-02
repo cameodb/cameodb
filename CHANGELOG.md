@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`docker-push.sh --no-push` rehearses the push on both platforms.** It built `linux/amd64`
+  alone, so the rehearsal said nothing about the architecture it skipped: an aarch64-only break
+  would compile for the first time during the real `--push`, after the amd64 manifest had already
+  been uploaded. On an arm64 host it was also the emulated architecture that got checked and the
+  native one that did not. It now builds `${PLATFORMS}` — the same variable the push path reads,
+  so the two cannot drift apart again.
+
+  Keeping a runnable local image took some care, because a manifest list only fits in the local
+  image store when the containerd snapshotter is enabled; the classic store rejects it with
+  `docker exporter does not currently support exporting manifest lists`. Where it fits, one
+  `--load` build both verifies and loads. Where it does not, the verification exports
+  `type=cacheonly` and the host architecture is re-exported in a second pass — an export off warm
+  cache, not a second compile.
+
+  Three documents described this path as single-platform, and `docker/README.md` told the reader
+  to test with `docker run --rm cameodb:latest`, which never matched the `goranc/cameodb:latest`
+  the script tags.
+
 ## [0.3.3] - 2026-09-02
 
 ### Added
