@@ -1215,6 +1215,29 @@ pub(crate) fn order_hit_blocks(
         .collect()
 }
 
+/// The page a fan-out has to compose, read off the operation that asked for it.
+///
+/// One function because there are two fan-outs — [`RouterActor::handle_broadcast`] and
+/// [`RouterActor::handle_broadcast_streaming`] — and they answered this differently. Both had
+/// their own `match &op`, and the streaming one discarded the offset outright, so a paged search
+/// got page 1 whenever `enable_streaming_search` was on (ROADMAP OB8). They also disagreed about
+/// `Stream`: one read its limit, the other fell through to the node default and ignored it.
+///
+/// A `Stream` has no offset to read. It hands the caller the whole result as it is produced, so
+/// there is no page to take, and the HTTP stream route refuses an `offset` rather than accepting
+/// one it would not honour. Its limit is still its own.
+fn search_window_for(op: &ClientOp, default_limit: usize) -> SearchWindow {
+    match op {
+        ClientOp::Search { limit, offset, .. } => SearchWindow {
+            offset: offset.unwrap_or(0),
+            limit: limit.unwrap_or(default_limit),
+        },
+        ClientOp::Stream { limit, .. } => SearchWindow::first(limit.unwrap_or(default_limit)),
+        // Nothing else is paged. The value is unused on those paths rather than wrong on them.
+        _ => SearchWindow::first(default_limit),
+    }
+}
+
 /// The key a write is routed by, in the order of precedence that decides it.
 ///
 /// Written out identically in three places before this existed — the engine fast path and both
@@ -5213,14 +5236,9 @@ impl RouterActor {
         // skipped `offset` of its own hits would drop rows that belong on this page.
         //
         // The window is read off the original op and the copies carry no offset, so this cannot
-        // be applied twice however many levels the request travels through.
-        let window = match &op {
-            ClientOp::Search { limit, offset, .. } => SearchWindow {
-                offset: offset.unwrap_or(0),
-                limit: limit.unwrap_or(self.default_search_limit),
-            },
-            _ => SearchWindow::first(self.default_search_limit),
-        };
+        // be applied twice however many levels the request travels through. Shared with the
+        // streaming fan-out, which had its own reading of the same op and a different answer.
+        let window = search_window_for(&op, self.default_search_limit);
         let op = match op {
             ClientOp::Search {
                 index,
@@ -5798,19 +5816,30 @@ impl RouterActor {
 
         let start_time = std::time::Instant::now();
 
+        // The page, read before the arm below destructures the op — `Search` and `Stream` share
+        // that arm and only one of them can be paged, so the distinction is drawn in
+        // `search_window_for` rather than by the pattern.
+        //
+        // It used to be drawn by discarding the offset for both (`offset: _`), so a paged search
+        // on this path silently answered page 1 — hits and count, at every offset, with a 200,
+        // for every unkeyed search on a clustered node with `enable_streaming_search` on.
+        // Tracked as ROADMAP OB8. Honouring it took three things and only the third was here:
+        // the offset had to survive to this point, every source had to be asked for
+        // `offset + limit` rather than `limit` so the merge has enough to page through, and the
+        // merge had to be handed the real window. `order_hit_blocks` already applies whatever
+        // window it is given; the other two are below.
+        //
+        // It could not have been fixed while this loop still terminated early either: a page
+        // assembled from whichever sources answered first is not the page that was asked for,
+        // wherever the skip is applied. Every source now always answers (2d13f4c).
+        let window = search_window_for(&op, self.default_search_limit);
+
         // Handle search operations with streaming
         match op {
-            // `offset` is ignored rather than bound. True of `Stream`, which hands the caller
-            // the whole result as it is produced, so there is no page to take — and wrong for
-            // `Search`, which reaches this branch whenever routing is `Broadcast` and
-            // `enable_streaming_search` is on, and whose caller does have a page to take. A
-            // paged search there silently answers page 1. Tracked as ROADMAP OB8; the fix is
-            // either to honour the offset here or to refuse a paged `Search` on this path, and
-            // it is a change to the fan-out rather than to this match.
             ClientOp::Search {
                 index,
                 query,
-                limit,
+                limit: _,
                 offset: _,
                 fields,
                 sort,
@@ -5818,11 +5847,14 @@ impl RouterActor {
             | ClientOp::Stream {
                 index,
                 query,
-                limit,
+                limit: _,
                 fields,
                 sort,
             } => {
-                let limit = limit.unwrap_or(self.default_search_limit);
+                // Every source is asked for the whole window from the front of its own order.
+                // A source that skipped `window.offset` of its own hits would drop rows that
+                // belong on this page, so the skip is applied once, after the merge.
+                let fetch_count = window.fetch_count();
 
                 // Create local search stream using improved concurrent approach
                 let local_future = async {
@@ -5836,7 +5868,7 @@ impl RouterActor {
                         .ask(ClientOp::Search {
                             index: index.clone(),
                             query: query.clone(),
-                            limit: Some(limit),
+                            limit: Some(fetch_count),
                             offset: None,
                             fields: fields.clone(),
                             sort: sort.clone(),
@@ -5899,7 +5931,7 @@ impl RouterActor {
                                 ClientOp::Search {
                                     index,
                                     query,
-                                    limit: Some(limit),
+                                    limit: Some(fetch_count),
                                     offset: None,
                                     fields,
                                     sort,
@@ -6032,23 +6064,28 @@ impl RouterActor {
                     }
                 }
 
-                // Ranked by source identity — this node's shards, then each peer — rather
-                // than by which of them streamed in first, so that a tie between two hits is
-                // settled the same way on every run. Early termination can still change *which*
-                // sources contribute to a page; preferring whoever answers first is what this
-                // path is for, and only the ordering of what did arrive is fixed here.
+                // Ranked by source identity — this node's shards, then each peer — rather than
+                // by which of them streamed in first, so that a tie between two hits is settled
+                // the same way on every run, and so that a page is a function of the query
+                // rather than of the network. Every source contributes: the caveat that used to
+                // stand here, that early termination could change *which* of them did, went
+                // with the early exit itself.
                 blocks.sort_by_key(|(source, _)| *source);
                 let all_hits = order_hit_blocks(
                     blocks.into_iter().map(|(_, block)| block).collect(),
                     sort.as_ref(),
-                    SearchWindow::first(limit),
+                    window,
                 );
 
                 let mut response = serde_json::json!({
                     "hits": all_hits,
                     "hits_returned": all_hits.len(),
                     "total_hits": total_hits_sum,
-                    "limit": limit,
+                    "limit": window.limit,
+                    // Reported for the same reason the non-streaming path reports it: a caller
+                    // that cannot see which page it was given cannot tell a correct answer from
+                    // page 1 returned twice, which is how the bug above stayed invisible.
+                    "offset": window.offset,
                     "took_ms": start_time.elapsed().as_millis(),
                     "stats": {
                         "shards": {
@@ -11406,6 +11443,74 @@ mod tests {
             },
         ));
         assert_eq!(page, full[2..4].to_vec());
+    }
+
+    /// Every fan-out reads the same page out of the same operation.
+    ///
+    /// The streaming fan-out used to discard `offset` here, so a paged search answered page 1
+    /// (ROADMAP OB8), and the two fan-outs disagreed about a `Stream`'s limit. This is the one
+    /// reading both of them now use.
+    #[test]
+    fn a_fan_out_reads_the_page_off_the_operation() {
+        let search = |limit: Option<usize>, offset: Option<usize>| ClientOp::Search {
+            index: "books".to_string(),
+            query: "rust".to_string(),
+            limit,
+            offset,
+            fields: None,
+            sort: None,
+        };
+
+        assert_eq!(
+            search_window_for(&search(Some(10), Some(20)), 7),
+            SearchWindow {
+                offset: 20,
+                limit: 10
+            },
+            "a paged search keeps both halves of its page"
+        );
+        assert_eq!(
+            search_window_for(&search(None, Some(20)), 7),
+            SearchWindow {
+                offset: 20,
+                limit: 7
+            },
+            "an absent limit is the node default, and does not take the offset with it"
+        );
+        assert_eq!(
+            search_window_for(&search(Some(10), None), 7),
+            SearchWindow::first(10),
+            "an unpaged search starts at the front"
+        );
+
+        // A stream has no offset to read — the HTTP route refuses one — but its limit is still
+        // its own. The non-streaming fan-out used to fall through to the default here.
+        assert_eq!(
+            search_window_for(
+                &ClientOp::Stream {
+                    index: "books".to_string(),
+                    query: "rust".to_string(),
+                    limit: Some(50),
+                    fields: None,
+                    sort: None,
+                },
+                7
+            ),
+            SearchWindow::first(50),
+            "a stream's limit is its own"
+        );
+
+        // Nothing else is paged, and the value must not read as a page either way.
+        assert_eq!(
+            search_window_for(
+                &ClientOp::GetConfig {
+                    index: "books".to_string()
+                },
+                7
+            ),
+            SearchWindow::first(7),
+            "an unpaged operation starts at the front"
+        );
     }
 
     /// Finding #2: i64 keys beyond f64's exact-integer range must order precisely.

@@ -161,7 +161,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
 | [J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly) | The flattening lane, and the reference that describes neither | 18 | 2026-08-27 | 📋 |
 | [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to — the evidence behind J1 | 18 | 2026-08-27 | ✅ |
-| [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB11](#ob11--reasons-and-totals-that-went-missing-on-the-way-out) | Correctness, nine items from the 2026-09-01 review and the re-read of its own fixes — OB3–OB7 and OB10–OB11 done, OB8–OB9 remain | — | 2026-09-01 | ◐ |
+| [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB11](#ob11--reasons-and-totals-that-went-missing-on-the-way-out) | Correctness, nine items from the 2026-09-01 review and the re-read of its own fixes — OB3–OB8 and OB10–OB11 done, OB9 remains | — | 2026-09-01 | ◐ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
@@ -1089,17 +1089,50 @@ infers as, which is the only reading under which the writer and the validator ag
 
 ### OB8 — A paged search loses its page on the streaming fan-out
 
-📋 **Open**, found 2026-09-01.
+✅ **Done** 2026-09-02, found 2026-09-01.
 
-`handle_broadcast_streaming` matches `ClientOp::Search` and drops `offset` (`offset: _` →
-`offset: None`, `node_orchestrator.rs:5423-5430`), and `route_and_handle_inner` sends a plain
-`Search` op down that path when routing is `Broadcast` and `enable_streaming_search` is on
-(4688-4691). On a multi-node cluster with streaming enabled, a paged `POST /api/{index}/search`
-with `offset > 0` silently returns page 1. The HTTP stream handler already refuses offset for
-`ClientOp::Stream`; nothing refuses it for a `Search` op reaching this branch.
+`handle_broadcast_streaming` matched `ClientOp::Search` and dropped `offset` (`offset: _` →
+`offset: None`), and `route_and_handle_inner` sends a plain `Search` op down that path when
+routing is `Broadcast` and `enable_streaming_search` is on. On a multi-node cluster with
+streaming enabled — the default, and what the shipped docker config sets — a paged
+`POST /api/{index}/search` silently returned page 1 at every offset, including offsets past the
+end of the result set. A standalone node was never affected: an unkeyed search there routes
+`Local` and reaches `orch_search` with the real window, which is why this stayed hidden.
 
-Proposal: either honour the offset in the streaming path or refuse a paged `Search` there the
-way the stream route already does — never answer a different page than the one asked for.
+**What landed.** The offset is honoured rather than refused, because the machinery to honour it
+was already there — `order_hit_blocks` applies whatever `SearchWindow` it is handed, and the
+non-streaming fan-out was already a working reference for the same three steps. Two of the three
+were missing here: the offset had to survive the match, and every source had to be asked for
+`offset + limit` rather than `limit` so the merge has enough to page through. A source that
+skipped its own `offset` would drop rows belonging on the page, so the skip is still applied
+once, after the merge.
+
+The reading of the op is now one function, `search_window_for`, shared by both fan-outs. They
+each had their own `match &op` and disagreed twice: the streaming one discarded the offset, and
+they resolved a `Stream`'s limit differently (its own, versus falling through to the node
+default). A `Stream` has no offset to read — the HTTP route refuses one rather than accepting one
+it would not honour — and that is now the only difference between them. Pinned by
+`a_fan_out_reads_the_page_off_the_operation`.
+
+The response reports `offset` alongside `limit`, as the non-streaming path already did. Without
+it a caller cannot tell a correct page from page 1 returned twice, which is most of why this
+survived.
+
+**Not fixable before `2d13f4c`.** While the early-exit `break` that commit removed could discard
+a source, a page assembled from whichever sources answered first is not the page that was asked
+for, wherever the skip is applied. Every source always answers now.
+
+**Verified on the 3-node compose cluster**, 46 documents over 9 shards, sorted `n desc`. Before:
+every offset in 0/10/20/30/40 returned `[46…37]`, and `limit=10 offset=50` returned ten hits.
+After: the five pages tile the full order exactly with no duplicates, deep pages with a small
+limit are right (`limit=5 offset=41` → `[5,4,3,2,1]`), an offset past the end returns nothing with
+`total_hits` still 46, and a sorted page is identical across five runs. Unsorted paging tiles the
+order too. Both fan-outs pass the same script, with `enable_streaming_search` on and off. The
+`offset + limit` ceiling still applies — `offset=10000, limit=10` is refused with the message
+that says a deep page costs what a large limit costs — so the widened fetch adds no exposure.
+
+Still true, and unchanged by this: no test in the workspace enables clustering, so nothing here is
+covered by a regression test. A single-node test cannot reach the branch at all.
 
 ### OB9 — A bulk delete drops a peer's per-id errors
 
