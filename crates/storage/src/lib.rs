@@ -2503,6 +2503,30 @@ impl IndexSchema {
     /// than field names, so every variable-length part is length-prefixed instead: unambiguous
     /// whatever bytes it holds, which a separator cannot promise once free text is in the hash.
     pub fn calculate_fingerprint(&self) -> u64 {
+        // Hash the *effective* schema, not the declaration as written.
+        //
+        // Two nodes can hold the same schema and write it down differently. A node that has
+        // only the declaration keeps `tokenizer: None` on a field; a node that has built the
+        // Tantivy index reads back the tokenizer the engine actually chose, because
+        // `get_schema_cached` merges the derived schema into the stored one. Same schema, two
+        // spellings — and hashing them raw reported the pair as divergent forever, which is
+        // exactly backwards for a value whose entire job is to answer "are these the same".
+        // Observed between two nodes of a live cluster where one held a declared index with no
+        // documents: `id` was `tokenizer: None` there and `"raw"` on the node that had written
+        // to it.
+        //
+        // `normalize_after_deserialization` is the one definition of what a declaration
+        // resolves to — the same one the index builder honours, `id`'s fixed attributes
+        // included — so the fingerprint borrows it rather than restating the defaults and
+        // drifting from them. This is the same reasoning `is_fast()` already applied to the
+        // three-state `fast`, extended to every property that has a default.
+        let mut effective = self.clone();
+        effective.normalize_after_deserialization();
+        effective.fingerprint_of_effective()
+    }
+
+    /// [`calculate_fingerprint`](Self::calculate_fingerprint) over an already-normalized schema.
+    fn fingerprint_of_effective(&self) -> u64 {
         fn push_str(buf: &mut Vec<u8>, value: &str) {
             buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
             buf.extend_from_slice(value.as_bytes());
@@ -9326,19 +9350,17 @@ mod tests {
     fn every_load_bearing_property_moves_the_thumbprint() {
         let base = || {
             let mut schema = IndexSchema::default();
-            schema.fields.insert(
-                "f".into(),
-                FieldDef::new("f".into(), TantivyFieldType::I64),
-            );
+            schema
+                .fields
+                .insert("f".into(), FieldDef::new("f".into(), TantivyFieldType::I64));
             schema
         };
         let baseline = base().calculate_fingerprint();
 
         let mut renamed = base();
-        renamed.fields.insert(
-            "g".into(),
-            FieldDef::new("g".into(), TantivyFieldType::I64),
-        );
+        renamed
+            .fields
+            .insert("g".into(), FieldDef::new("g".into(), TantivyFieldType::I64));
         assert_ne!(baseline, renamed.calculate_fingerprint(), "field set");
 
         let mut retyped = base();
@@ -9359,7 +9381,11 @@ mod tests {
 
         let mut described = base();
         described.fields.get_mut("f").unwrap().description = Some("what it holds".into());
-        assert_ne!(baseline, described.calculate_fingerprint(), "field description");
+        assert_ne!(
+            baseline,
+            described.calculate_fingerprint(),
+            "field description"
+        );
 
         let mut tokenized = base();
         tokenized.fields.get_mut("f").unwrap().tokenizer = Some("raw".into());
@@ -9375,7 +9401,11 @@ mod tests {
 
         let mut titled = base();
         titled.description = Some("the corpus".into());
-        assert_ne!(baseline, titled.calculate_fingerprint(), "index description");
+        assert_ne!(
+            baseline,
+            titled.calculate_fingerprint(),
+            "index description"
+        );
     }
 
     /// What the thumbprint must *not* see, or every node reports every other as divergent.
@@ -9402,11 +9432,17 @@ mod tests {
         );
     }
 
-    /// An absent description and an empty one are different states, and a length-prefixed hash
-    /// keeps them apart. The previous NUL-separated form was written for field names, which may
-    /// not contain the separator; free text can contain any byte at all.
+    /// Free text is length-prefixed in the hash, so no two schemas collide by concatenation.
+    ///
+    /// The previous NUL-separated form was written for field names, which may not contain the
+    /// separator; descriptions and tokenizer names can contain any byte at all.
+    ///
+    /// An absent description and an empty one hash the *same*, and that is the intended answer
+    /// rather than a limit of the hash: `normalize_description` resolves whitespace-only text to
+    /// absent, so the two are one effective schema and the engine cannot tell them apart either.
+    /// The hash reports what a schema is, and an empty description is not a property.
     #[test]
-    fn the_thumbprint_distinguishes_absent_from_empty_text() {
+    fn the_thumbprint_reads_free_text_unambiguously() {
         let build = |description: Option<&str>| {
             let mut schema = IndexSchema::default();
             let mut field = FieldDef::new("f".into(), TantivyFieldType::Text);
@@ -9415,7 +9451,16 @@ mod tests {
             schema.calculate_fingerprint()
         };
 
-        assert_ne!(build(None), build(Some("")), "absent is not empty");
+        assert_eq!(
+            build(None),
+            build(Some("   ")),
+            "whitespace-only normalizes to absent, so it is the same schema"
+        );
+        assert_ne!(
+            build(None),
+            build(Some("what this field holds")),
+            "a description that survives normalization is part of the schema"
+        );
 
         // Two field names that concatenate to the same bytes must not collide.
         let pair = |a: &str, b: &str| {
@@ -9429,6 +9474,58 @@ mod tests {
             schema.calculate_fingerprint()
         };
         assert_ne!(pair("ab", "c"), pair("a", "bc"), "name boundaries");
+    }
+
+    /// The same schema written two ways has one thumbprint.
+    ///
+    /// This is the property the whole mechanism rests on, and it did not hold. A node holding
+    /// only a declaration leaves `tokenizer` unset; a node that has built the Tantivy index
+    /// reads back the tokenizer the engine chose, because `get_schema_cached` merges the derived
+    /// schema into the stored one. Found on a live cluster: an index declared on one node and
+    /// written to on another reported `id` as `tokenizer: None` and `"raw"` respectively, so two
+    /// nodes holding the same schema disagreed about its thumbprint permanently — the one
+    /// answer a divergence check must never give.
+    #[test]
+    fn a_declaration_and_a_built_index_agree_on_the_thumbprint() {
+        // As declared: nothing said about tokenizers or index options.
+        let mut declared = IndexSchema::default();
+        declared.fields.insert(
+            "id".into(),
+            FieldDef::new("id".into(), TantivyFieldType::Text),
+        );
+        declared.fields.insert(
+            "title".into(),
+            FieldDef::new("title".into(), TantivyFieldType::Text),
+        );
+
+        // As read back from a built index: the engine's choices are now spelled out.
+        let mut built = declared.clone();
+        {
+            let id = built.fields.get_mut("id").unwrap();
+            id.tokenizer = Some("raw".into());
+            id.index_record_option = Some("Basic".into());
+        }
+        {
+            let title = built.fields.get_mut("title").unwrap();
+            title.tokenizer = Some("default".into());
+            title.index_record_option = Some("WithFreqsAndPositions".into());
+        }
+
+        assert_eq!(
+            declared.calculate_fingerprint(),
+            built.calculate_fingerprint(),
+            "a default spelled out is the same schema as a default left unsaid"
+        );
+
+        // And a tokenizer that is *not* the default still moves it — the point is to resolve
+        // defaults, not to stop reading the property.
+        let mut retokenized = declared.clone();
+        retokenized.fields.get_mut("title").unwrap().tokenizer = Some("raw".into());
+        assert_ne!(
+            declared.calculate_fingerprint(),
+            retokenized.calculate_fingerprint(),
+            "a deliberate tokenizer choice is part of the schema"
+        );
     }
 
     /// A local edit advances the version, whichever path made it.

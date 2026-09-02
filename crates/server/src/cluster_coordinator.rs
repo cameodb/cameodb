@@ -1824,7 +1824,13 @@ impl Message<SetLocalOrchestrator> for ClusterCoordinator {
 }
 
 impl Message<DeleteIndexCluster> for ClusterCoordinator {
-    type Reply = Result<JsonValue, String>;
+    /// An `OrchestratorError` rather than a `String`, so the outcome keeps its verdict.
+    ///
+    /// A delete that could not reach one node leaves the index alive there and is worth
+    /// retrying; a delete the local node could not perform at all is not. Collapsed into one
+    /// string both arrived at the HTTP boundary as `500`, which reads as "this failed, and not
+    /// because of you" for the one case where a retry is exactly what the caller should do.
+    type Reply = Result<JsonValue, crate::node_orchestrator::OrchestratorError>;
 
     async fn handle(
         &mut self,
@@ -1845,11 +1851,14 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                     delete_schema: msg.delete_schema,
                 })
                 .await
-                .map_err(|e| {
-                    crate::node_orchestrator::OrchestratorError::Io(std::io::Error::new(
+                // The orchestrator's own error, when it produced one, rather than a description
+                // of it: it already carries the verdict the caller's status is read from.
+                .map_err(|e| match e {
+                    kameo::error::SendError::HandlerError(err) => err,
+                    other => crate::node_orchestrator::OrchestratorError::Io(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
-                        format!("Failed to communicate with local orchestrator: {}", e),
-                    ))
+                        format!("Failed to communicate with local orchestrator: {}", other),
+                    )),
                 })
         } else {
             Err(crate::node_orchestrator::OrchestratorError::Io(
@@ -1903,7 +1912,12 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                                 delete_schema,
                             };
 
-                            match remote_orchestrator.ask(&delete_msg).await {
+                            // `remote_answer` so a peer that ran the delete and refused it
+                            // keeps its own verdict, instead of it being flattened into the
+                            // same string as a peer that never received the message.
+                            match crate::node_orchestrator::remote_answer(
+                                remote_orchestrator.ask(&delete_msg).await,
+                            ) {
                                 Ok(result) => {
                                     info!(
                                         node_id = %peer.node_id,
@@ -1919,7 +1933,7 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                                         error = %e,
                                         "Failed to delete index from remote node"
                                     );
-                                    Err(format!("Remote node {} failed: {}", peer.node_id, e))
+                                    Err(format!("node {}: {}", peer.node_id, e))
                                 }
                             }
                         }
@@ -1958,18 +1972,16 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
         // Combine local and remote results
         let mut all_errors = Vec::new();
 
-        // Check local result
-        match local_result {
-            Ok(_) => {
-                info!("Index deletion succeeded on local node");
-            }
-            Err(e) => {
-                error!(error = %e, "Index deletion failed on local node");
-                all_errors.push(format!("Local node: {}", e));
-            }
+        // The local node's failure is returned as its own error, verdict intact: the caller
+        // asked *this* node to delete an index and it could not, which is not a matter of
+        // reaching anyone else. It is checked first for the same reason — a local fault is the
+        // caller's answer even when every peer succeeded.
+        if let Err(err) = local_result {
+            error!(error = %err, "Index deletion failed on local node");
+            return Err(err);
         }
+        info!("Index deletion succeeded on local node");
 
-        // Check remote results
         for (i, result) in remote_results.into_iter().enumerate() {
             match result {
                 Ok(_) => {
@@ -1977,25 +1989,53 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                 }
                 Err(e) => {
                     warn!(error = %e, "Index deletion failed on remote node {}", i + 1);
-                    all_errors.push(format!("Remote node {}: {}", i + 1, e));
+                    all_errors.push(e);
                 }
             }
         }
 
         // Return overall result
         if all_errors.is_empty() {
-            Ok(serde_json::json!({
+            return Ok(serde_json::json!({
                 "status": "success",
-                "message": "Index deleted successfully across all nodes",
+                // "across all nodes" read as a boast on a standalone node, which has one.
+                // This says the same thing and stays true whatever the node count is.
+                "message": "Index deleted everywhere it was held",
                 "index": msg.index,
                 "delete_schema": msg.delete_schema
-            }))
-        } else {
-            Err(format!(
-                "Index deletion completed with errors: {}",
-                all_errors.join("; ")
-            ))
+            }));
         }
+
+        // Deleted here, and not confirmed on a node that did not answer. Reported as
+        // unavailable rather than as a server fault because the caller's next move is to retry:
+        // the delete is idempotent, the existence check ahead of it looks cluster-wide, and once
+        // the node is back the retry finishes the job. A `500` would have said the opposite.
+        //
+        // Deliberately conservative, and it cannot be otherwise: a node that did not answer
+        // cannot be asked whether it held this index, so "unreachable" and "unreachable and
+        // holding it" are one case here. Announcing success while a possible holder was never
+        // contacted is the worse mistake. The retry then ends in a `404` when nothing is left,
+        // which is why the message says so — being told to retry and then getting a `404` reads
+        // as a failure otherwise, when it is the confirmation.
+        //
+        // A peer that ran the delete and refused it for its own reasons is folded in here too.
+        // Its verdict is not carried through: what the caller needs to know is that the index
+        // may survive somewhere, and that is the same either way. The reason is preserved in the
+        // message and in the warning logged above.
+        Err(
+            crate::node_orchestrator::OrchestratorError::PeerUnreachable {
+                // The reasons go last: each one is already a sentence about a node, so any
+                // phrasing that reads them as a noun ("but <reason> could not be reached")
+                // comes out mangled.
+                message: format!(
+                    "index '{}' was deleted here, but the cluster could not confirm it is gone \
+                     everywhere; retry once the cluster is whole, and a 404 then means nothing \
+                     is left to delete. Unconfirmed: {}",
+                    msg.index,
+                    all_errors.join("; ")
+                ),
+            },
+        )
     }
 }
 
