@@ -1339,14 +1339,12 @@ pub enum StreamingSearchResult {
 /// routing failure, answered `500`, and reported to the coordinator as grounds to redial the
 /// cluster. Four call sites each wrote that same `map_err` by hand, which is why they all had the
 /// same bug and why this is one function now.
-fn remote_answer<T>(
+pub(crate) fn remote_answer<T>(
     reply: Result<T, kameo::error::RemoteSendError<OrchestratorError>>,
 ) -> Result<T, OrchestratorError> {
     reply.map_err(|err| match err {
         kameo::error::RemoteSendError::HandlerError(answered) => answered,
-        never_arrived => {
-            OrchestratorError::Io(std::io::Error::other(never_arrived.to_string()))
-        }
+        never_arrived => OrchestratorError::Io(std::io::Error::other(never_arrived.to_string())),
     })
 }
 
@@ -1516,6 +1514,14 @@ pub struct NodeConfig {
     /// Requires `shard_affine_dispatch` AND `writer_core_affinity` to take effect.
     /// Default: false.
     pub worker_core_affinity: bool,
+
+    /// Whether this node is part of a cluster (`network.cluster.enabled`).
+    ///
+    /// Static for the life of the process, which is the point: it lets the paths that only
+    /// exist to agree with other nodes take a standalone arm without asking the coordinator
+    /// whether there are any. A single node is the whole system, so its own answer is the
+    /// cluster's answer and there is nothing to wait for.
+    pub clustered: bool,
 }
 
 impl Default for NodeConfig {
@@ -1539,6 +1545,8 @@ impl Default for NodeConfig {
             writer_core_affinity: true,
             shard_affine_dispatch: false,
             worker_core_affinity: false,
+            // Standalone by default, matching `network.cluster.enabled`.
+            clustered: false,
         }
     }
 }
@@ -2012,9 +2020,7 @@ impl From<OrchestratorError> for RemoteError {
             OrchestratorError::Remote { verdict, message } => match verdict {
                 RemoteVerdict::BadRequest => RemoteError::InvalidInput(message),
                 RemoteVerdict::NotFound => RemoteError::NotFound(message),
-                RemoteVerdict::Unavailable | RemoteVerdict::ServerFault => {
-                    RemoteError::Io(message)
-                }
+                RemoteVerdict::Unavailable | RemoteVerdict::ServerFault => RemoteError::Io(message),
             },
         }
     }
@@ -2170,6 +2176,19 @@ pub enum ClientOp {
     /// document routes to. This carries the `IndexSchema` itself so a node can adopt a peer's
     /// declaration without reconstructing it.
     GetRawSchema { index: String },
+    /// The schema for an index from anywhere in the cluster, or `null` if no node holds one.
+    ///
+    /// This node's own store first, then its peers — so the common case, a node that holds the
+    /// index, answers from disk and fans out to nobody, and a standalone node never leaves the
+    /// process. It errors rather than answering `null` when the cluster cannot be canvassed in
+    /// full, because "no node has this" and "I could not ask every node" are different facts
+    /// and only the first one means the index does not exist.
+    ///
+    /// The point of asking it this way is that it asks the question directly. The alternative
+    /// on hand was the cluster catalogue, which answers "does this name exist" by collecting
+    /// per-shard statistics for *every* index on every node and reading each of their schemas —
+    /// work proportional to the whole catalogue to look up one name.
+    FindSchemaInCluster { index: String },
     /// Parse a query against an index without running it.
     ///
     /// Metadata rather than a search: it touches no documents and returns no hits, only what the
@@ -3358,11 +3377,11 @@ impl OrchestratorEngine {
             );
         }
 
-        // Get schema for shadow field transformation (lock-free)
-        let schema = self
-            .get_cached_schema(index)
-            .map(|arc| (*arc).clone())
-            .unwrap_or_default();
+        // Get the schema for shadow field transformation. Read through to the store on a miss
+        // rather than treating "not cached yet" as "no schema": with an empty schema the
+        // projection rewrite below is a no-op, so the first search after a boot dropped any
+        // field a shadow name refers to. One disk read per index per process.
+        let schema = self.load_schema(index).await?;
 
         // The identifier travels under the shadow name on the way out, so the projection is
         // rewritten before it is checked or applied.
@@ -4996,6 +5015,9 @@ impl RouterActor {
             op,
             ClientOp::GetConfig { .. }
                 | ClientOp::GetRawSchema { .. }
+                // Local in the sense that matters here: it fans out to peers itself, from the
+                // node that received it, so routing it anywhere would only add a hop.
+                | ClientOp::FindSchemaInCluster { .. }
                 | ClientOp::CreateConfig { .. }
                 | ClientOp::UpdateSchema { .. }
         ) {
@@ -6328,23 +6350,26 @@ impl NodeOrchestrator {
     async fn peer_schema_for(&self, index: &str) -> PeerSchemaLookup {
         use crate::cluster_coordinator::{GetKnownPeers, GetStatus, KnownPeer};
 
-        let Some(status) = self.coordinator.as_ref() else {
+        // The standalone arm, taken before anything is asked of anyone. A node with clustering
+        // off is the whole system: there is nobody to disagree with, and sampling a schema from
+        // the documents is the feature that makes semi-structured input work. `clustered` is
+        // static configuration, so this costs no coordinator round trip — the previous form read
+        // the same fact out of `GetStatus`, which meant a mailbox hop on the first write to
+        // every new index on a node that has no peers by construction.
+        if !self.config.clustered {
+            return PeerSchemaLookup::NoneHeld;
+        }
+
+        let Some(coordinator) = self.coordinator.as_ref() else {
             return PeerSchemaLookup::NoneHeld;
         };
         let Ok(status): Result<crate::distributed::ClusterStatus, _> =
-            status.ask(GetStatus).await
+            coordinator.ask(GetStatus).await
         else {
             return PeerSchemaLookup::Unreachable {
                 reason: "the cluster coordinator did not answer".to_string(),
             };
         };
-
-        // Single-node behaviour is unchanged: with no cluster there is nobody to disagree with,
-        // and sampling a schema from the documents is the feature that makes semi-structured
-        // input work.
-        if !status.cluster_enabled {
-            return PeerSchemaLookup::NoneHeld;
-        }
 
         // Every configured member has to be reachable, not merely every member currently known.
         // A node that boots alone while its peers are down knows only itself, so "ask all known
@@ -6353,9 +6378,13 @@ impl NodeOrchestrator {
         // compares against what the operator said the cluster is.
         if status.connected_nodes < status.total_nodes {
             return PeerSchemaLookup::Unreachable {
+                // States the fact and leaves the consequence to the caller: this answer now
+                // reaches a `DELETE` deciding whether an index exists as well as a write
+                // deciding whether it may invent a schema, and "a schema created now" is
+                // nonsense in the first case.
                 reason: format!(
-                    "{} of {} cluster nodes are connected; a schema created now could not be \
-                     agreed with the rest",
+                    "only {} of {} cluster nodes are connected, so no answer covers the whole \
+                     cluster",
                     status.connected_nodes, status.total_nodes
                 ),
             };
@@ -7222,6 +7251,16 @@ impl NodeOrchestrator {
     ) -> JsonValue {
         let mut map = JsonMap::new();
         map.insert("name".to_string(), JsonValue::String(index.to_string()));
+        // The two values the cluster settles a schema disagreement with, reported here because
+        // this is where an operator reads a schema. `version` orders two schemas for one index
+        // and `thumbprint` says whether they are the same schema at all — so comparing this
+        // response across nodes answers "have these diverged", which otherwise cannot be asked
+        // from outside the process at all. Hex, because a thumbprint is compared by eye.
+        map.insert("version".to_string(), JsonValue::from(schema.version));
+        map.insert(
+            "thumbprint".to_string(),
+            JsonValue::String(format!("{:016x}", schema.calculate_fingerprint())),
+        );
         if let Some(description) = &schema.description {
             map.insert(
                 "description".to_string(),
@@ -8209,12 +8248,35 @@ impl NodeOrchestrator {
                 field_updates,
             } => self.orch_update_schema(&index, &field_updates).await,
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
+            // Read from durable state, not from the lazily-filled cache: this answer is what a
+            // peer uses to decide whether it may invent a schema, so "I have not looked yet"
+            // must not be reported as "there is none". See `durable_schema`.
             ClientOp::GetRawSchema { index } => Ok(self
-                .get_cached_schema(&index)
-                .map(|schema| serde_json::to_value(&*schema))
+                .durable_schema(&index)
+                .await?
+                .map(|schema| serde_json::to_value(&schema))
                 .transpose()
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
                 .unwrap_or(JsonValue::Null)),
+            ClientOp::FindSchemaInCluster { index } => {
+                // This node first. A holder answers from its own store without asking anyone,
+                // which covers every standalone node and the ordinary clustered case.
+                if let Some(schema) = self.durable_schema(&index).await? {
+                    return serde_json::to_value(&schema)
+                        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)));
+                }
+                match self.peer_schema_for(&index).await {
+                    PeerSchemaLookup::Found(schema) => Ok(serde_json::to_value(&*schema)
+                        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?),
+                    PeerSchemaLookup::NoneHeld => Ok(JsonValue::Null),
+                    // Not `null`: nobody said the index is absent, only that the cluster could
+                    // not be canvassed. A caller that reads a partial view as "absent" reports
+                    // a missing index while a node that holds it is merely unreachable.
+                    PeerSchemaLookup::Unreachable { reason } => {
+                        Err(OrchestratorError::SchemaUnconfirmed { index, reason })
+                    }
+                }
+            }
             ClientOp::ValidateQuery { index, query } => {
                 self.orch_validate_query(&index, &query).await
             }
@@ -9111,11 +9173,11 @@ impl NodeOrchestrator {
             );
         }
 
-        // Get schema for shadow field transformation (lock-free)
-        let schema = self
-            .get_cached_schema(index)
-            .map(|arc| (*arc).clone())
-            .unwrap_or_default();
+        // Get the schema for shadow field transformation. Read through to the store on a miss
+        // rather than treating "not cached yet" as "no schema": with an empty schema the
+        // projection rewrite below is a no-op, so the first search after a boot dropped any
+        // field a shadow name refers to. One disk read per index per process.
+        let schema = self.load_schema(index).await?;
 
         // The identifier travels under the shadow name on the way out, so the projection is
         // rewritten before it is checked or applied.
@@ -9275,8 +9337,16 @@ impl NodeOrchestrator {
         // this overwrites it. A PUT over an index that already has a schema advances the version
         // that schema holds, which is what makes a re-declaration a newer one rather than a
         // sibling of the original.
+        //
+        // Read from durable state rather than the cache. The cache is filled lazily, so on a
+        // node that has not touched this index since it booted a re-declaration was stamped
+        // `1` — not "one past what exists" but "the first there has ever been". Version is how
+        // the cluster orders two schemas for the same index (`preferred_schema`), so a v1
+        // stamped over a v3 does not merely lose the increment: the node holding it is behind
+        // for good, and its declaration is the one discarded.
         schema.version = self
-            .get_cached_schema(index)
+            .durable_schema(index)
+            .await?
             .map_or(1, |current| current.version.saturating_add(1));
 
         // Ensure 'id' field is explicitly in the schema for visibility
@@ -9844,10 +9914,23 @@ impl NodeOrchestrator {
         }))
     }
 
-    /// Helper: Load schema from first shard
-    async fn load_schema(&self, index: &str) -> Result<IndexSchema, OrchestratorError> {
+    /// The schema this node holds for `index`, or `None` if it holds none.
+    ///
+    /// **Not the same question as [`get_cached_schema`](Self::get_cached_schema).** That cache is
+    /// filled lazily by the first operation to touch an index, so a node that has just booted
+    /// answers "nothing" for every index it holds on disk until something asks. Where the answer
+    /// only decides whether to re-read, that is a miss. Where it is reported to another node it
+    /// is a lie, and [`peer_schema_for`](Self::peer_schema_for) reads exactly that answer to
+    /// decide whether a schema may be invented: a cold holder saying "none" licenses the
+    /// divergence the gate exists to prevent.
+    ///
+    /// So cache, then disk, and `None` only when the store has neither a Tantivy index nor a
+    /// stored schema for the name. `get_schema_cached` rather than `get_schema` because it is
+    /// what the write path resolves against — a schema derived from Tantivy and merged with the
+    /// stored metadata, so validation and writing agree on the types.
+    async fn durable_schema(&self, index: &str) -> Result<Option<IndexSchema>, OrchestratorError> {
         if let Some(cached) = self.get_cached_schema(index) {
-            return Ok((*cached).clone());
+            return Ok(Some((*cached).clone()));
         }
 
         if let Some(shard) = self.shards.values().next()
@@ -9855,9 +9938,6 @@ impl NodeOrchestrator {
         {
             let sc = Arc::clone(store);
             let idx = index.to_string();
-            // IMPORTANT: Use get_schema_cached() instead of get_schema() to match
-            // what the storage layer uses during writes. This ensures validation
-            // uses the same Tantivy-derived schema as actual write operations.
             let schema = tokio::task::spawn_blocking(move || sc.get_schema_cached(&idx))
                 .await
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
@@ -9865,10 +9945,15 @@ impl NodeOrchestrator {
             if let Some(schema_arc) = schema {
                 let schema = (*schema_arc).clone();
                 self.put_cached_schema(index, &schema);
-                return Ok(schema);
+                return Ok(Some(schema));
             }
         }
-        Ok(IndexSchema::default())
+        Ok(None)
+    }
+
+    /// Helper: Load schema from first shard, empty when this node holds none.
+    async fn load_schema(&self, index: &str) -> Result<IndexSchema, OrchestratorError> {
+        Ok(self.durable_schema(index).await?.unwrap_or_default())
     }
 
     /// Helper: Route write to shard using deterministic key (no round-robin).
@@ -10844,6 +10929,42 @@ mod tests {
         );
     }
 
+    /// The cluster-wide schema lookup has to reach the actor, not a worker.
+    ///
+    /// It answers by canvassing peers, which needs the coordinator and the remote peer pool —
+    /// state the worker pool does not hold. A worker that served it would answer from this
+    /// node's store alone and report `null` for an index a peer holds, which is the same wrong
+    /// answer that made `DELETE` through a non-holding node a 404.
+    #[tokio::test]
+    async fn the_cluster_schema_lookup_defers_to_the_actor() {
+        let engine = bare_engine();
+
+        let outcome = engine
+            .execute(ClientOp::FindSchemaInCluster {
+                index: "books".to_string(),
+            })
+            .await;
+
+        assert!(
+            matches!(outcome, WorkerOutcome::UseActor(op) if matches!(*op, ClientOp::FindSchemaInCluster { .. })),
+            "the cluster schema lookup must be deferred to the actor, carrying its own op"
+        );
+    }
+
+    /// A node is standalone unless its configuration says otherwise.
+    ///
+    /// `peer_schema_for` takes its no-peers arm off this flag before asking the coordinator
+    /// anything, so the default decides what a node with no cluster configuration does on the
+    /// first write to a new index: sample a schema from the documents, in-process, rather than
+    /// wait on a canvass of peers that cannot exist.
+    #[test]
+    fn a_node_is_standalone_until_configured_otherwise() {
+        assert!(
+            !NodeConfig::default().clustered,
+            "the default configuration must not claim to be part of a cluster"
+        );
+    }
+
     #[test]
     fn test_apply_field_projection_single_field() {
         let doc = json!({
@@ -11624,11 +11745,11 @@ mod tests {
     fn a_numeric_field_still_refuses_what_the_writer_would_skip() {
         let refused = |declared, value| unstorable_value("n", &declared, &value).is_some();
 
-        assert!(refused(TantivyFieldType::U64, json!(-5)));      // as_u64() -> None
-        assert!(refused(TantivyFieldType::U64, json!(3.5)));     // as_u64() -> None
-        assert!(refused(TantivyFieldType::I64, json!(3.5)));     // as_i64() -> None
+        assert!(refused(TantivyFieldType::U64, json!(-5))); // as_u64() -> None
+        assert!(refused(TantivyFieldType::U64, json!(3.5))); // as_u64() -> None
+        assert!(refused(TantivyFieldType::I64, json!(3.5))); // as_i64() -> None
         assert!(refused(TantivyFieldType::I64, json!(u64::MAX))); // past i64::MAX
-        assert!(refused(TantivyFieldType::U64, json!("2018")));  // a word, not a number
+        assert!(refused(TantivyFieldType::U64, json!("2018"))); // a word, not a number
         assert!(refused(TantivyFieldType::F64, json!(true)));
 
         // And an element inside a list is held to the same rule.

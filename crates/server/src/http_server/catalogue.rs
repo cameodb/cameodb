@@ -257,12 +257,20 @@ pub(super) async fn delete_index_handler(
     //
     // Absent on *some* nodes is not absent: `DeleteIndexCluster` deletes where the index is and
     // no-ops where it is not, which is success. Only a name no node has is a `404`.
-    let catalogue = state
+    //
+    // `FindSchemaInCluster` asks that and nothing else: this node's store, then its peers only
+    // if this node holds nothing, and no peers at all when clustering is off. The first version
+    // of this check read the cluster catalogue instead, which gathers per-shard statistics and
+    // a schema for every index on every node — the whole catalogue assembled to look up one
+    // name, on a node that usually knew the answer without leaving the process. It also could
+    // not tell "no node holds this" from "one node did not answer", and read the second as the
+    // first: a `404` for an index that exists on a node that was briefly unreachable, followed
+    // by no delete at all. That case now arrives here as an error and leaves as a `503`.
+    let found = state
         .router
         .route_and_handle(
-            ClientOp::ListClusterIndexes {
-                // The names are the question; sizes cost a walk of every shard's data.
-                include_data_size: false,
+            ClientOp::FindSchemaInCluster {
+                index: index.clone(),
             },
             None,
             OperationType::Read,
@@ -273,19 +281,13 @@ pub(super) async fn delete_index_handler(
         // have told the caller their index was gone when the lookup itself broke.
         .map_err(AppError::from_route)?;
 
-    let known = catalogue
-        .get("indexes")
-        .and_then(JsonValue::as_array)
-        .is_some_and(|indexes| {
-            indexes
-                .iter()
-                .filter_map(|entry| entry.get("name").and_then(JsonValue::as_str))
-                .any(|name| name == index)
-        });
-
-    if !known {
+    // Worded for either mode. "not found on any node in the cluster" was accurate on a
+    // clustered node and a puzzle on a standalone one, which has no cluster to have looked in;
+    // and the reassurance it was carrying — that the whole cluster was canvassed, not just this
+    // node — is already given by this not being a 503.
+    if found.is_null() {
         return Err(AppError::not_found(format!(
-            "index '{}' not found on any node in the cluster",
+            "index '{}' does not exist",
             index
         )));
     }
@@ -296,12 +298,21 @@ pub(super) async fn delete_index_handler(
         delete_schema: params.delete_schema.unwrap_or(false),
     };
 
-    let result = state.coordinator.ask(delete_msg).await.map_err(|e| {
-        AppError::from(anyhow::anyhow!(
-            "Failed to delete index across cluster: {}",
-            e
-        ))
-    })?;
+    // The coordinator's own error when it produced one, classified by its verdict — so a
+    // delete that could not reach every node answers `503` and invites the retry that will
+    // finish it, rather than the `500` that says the request was hopeless. Anything else is
+    // the coordinator itself not answering, which is a fault of this node.
+    let result = state
+        .coordinator
+        .ask(delete_msg)
+        .await
+        .map_err(|e| match e {
+            kameo::error::SendError::HandlerError(err) => AppError::from_route(err),
+            other => AppError::from(anyhow::anyhow!(
+                "Failed to delete index across cluster: {}",
+                other
+            )),
+        })?;
 
     Ok(Json(result))
 }
