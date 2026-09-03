@@ -213,8 +213,12 @@ Outstanding, and neither blocks the artifacts:
 - **`cameodb-web` is not committed.** `publish.sh` only copies; the checkout is a separate repo
   and its last commit is still `96c83da` "Publish 0.3.2 binaries". 17 modified and 6 untracked
   files are sitting there (procedure step 10). Nothing is served until that is committed.
-- **No `v0.3.3` git tag.** `git tag` is empty — as it was for 0.3.0 through 0.3.2, so this is the
-  standing habit rather than a lapse specific to this release.
+- **No `v0.3.3` tag, and no GitHub release object.** The release was tagged during the run and
+  pushed to `origin` — annotated tag `01e68ab` over `673ca551`, the tree the artifacts were
+  built from — and both the remote and the local tag were deleted on 2026-09-03. No remote
+  carries it now; `upstream` never did. That leaves 0.3.3 as 0.3.0 through 0.3.2 were, none of
+  which is tagged either. The artifacts do not depend on it: MANIFEST.txt records commit
+  `673ca551`, `dl.cameodb.com` serves the signed binaries and DockerHub serves the images.
 
 Known gaps acknowledged: yes
 Signed off by: Goran Cvijanovic
