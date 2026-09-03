@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The packaged systemd unit stopped the node it was documented to let start.** The unit gates
+  `ExecStart` on `ExecStartPre=cameodb check-config`, and this release made that check fail a
+  network-reachable node with authentication off — deliberately, with "the node itself will
+  still start in this state" in the failure text and in three documents. It did not: the DEB and
+  RPM install a config in exactly that state, so on an existing `internal` deployment the
+  pre-flight exited 1 and systemd never ran `ExecStart`. The upgrade stopped a working node over
+  a value nobody wrote, which is the outcome the split between tool and boot existed to prevent.
+
+  The unit now passes `--allow-unauthenticated` on that line. Everything else the check fails —
+  `external` without TLS, a cluster with no PSK, a config that contradicts its declared
+  `profile` — still stops the start before the port opens, and enabling authentication makes the
+  flag a no-op rather than something to remember to remove. Drop it from a drop-in override
+  (`sudo systemctl edit cameodb`) if you want a host to refuse to run an open node at all.
+
+  Neither file was wrong on its own, which is why review did not catch it, so
+  `scripts/validate/posture.sh` now runs one against the other: it reads the `ExecStartPre` line
+  out of the shipped unit and requires those exact flags to pass the shipped config.
+
+  If a node is already stuck in this state, `systemctl edit cameodb` and override
+  `ExecStartPre` with the flag appended (an empty `ExecStartPre=` first, to clear the packaged
+  one), or enable `[security]` — which is the better answer for a node that is genuinely
+  reachable off-box.
+
 - **`docker-push.sh --no-push` rehearses the push on both platforms.** It built `linux/amd64`
   alone, so the rehearsal said nothing about the architecture it skipped: an aarch64-only break
   would compile for the first time during the real `--push`, after the amd64 manifest had already

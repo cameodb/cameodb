@@ -505,7 +505,7 @@ Type=simple
 MemoryHigh=140G
 MemoryMax=160G
 Environment=MALLOC_CONF=background_thread:true,percpu_arena:percpu,oversize_threshold:0,dirty_decay_ms:1000,muzzy_decay_ms:0
-ExecStartPre=/usr/local/bin/cameodb check-config --config /etc/cameodb/cameodb.toml
+ExecStartPre=/usr/local/bin/cameodb check-config --config /etc/cameodb/cameodb.toml --allow-unauthenticated
 ExecStart=/usr/local/bin/cameodb --config /etc/cameodb/cameodb.toml
 Restart=on-failure
 User=cameodb
@@ -529,6 +529,13 @@ WantedBy=multi-user.target
   2000 ms can retain 10-20 GB across arenas during bulk indexing.
 - `ExecStartPre=... check-config` — refuses to start in a posture the config does not
   satisfy, before the port opens. Do not drop this when editing the unit.
+- `--allow-unauthenticated` on that line — the packaged config has `[security] enabled =
+  false`, which `check-config` fails on purpose so a deploy step catches an open node; the
+  node itself is meant to start in that state. Without the flag the `ExecStartPre` would
+  turn that into a refusal to boot, which is why the packaged unit carries it. Every other
+  failure — `external` without TLS, a cluster with no PSK, a profile the config does not
+  satisfy — still stops the start, and once authentication is on the flag changes nothing.
+  Drop it if you want the unit to hold the line that a node here must never run open.
 
 **Sizing guidance.** `MemoryHigh` should sit above the process's expected steady-state RSS
 but below physical RAM minus OS/page-cache headroom. With 16 shards at

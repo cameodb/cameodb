@@ -219,7 +219,13 @@ cameodb check-config -c /etc/cameodb/cameodb.toml
 One line per rule, non-zero exit on any failure — run it in the deploy step, before the
 service starts. A node whose config contradicts its `[node] profile` refuses to boot rather
 than starting in a posture you did not ask for; `external` will not start without TLS,
-authentication, and `/_admin/*` disabled. See
+authentication, and `/_admin/*` disabled.
+
+The check also fails a node that is reachable off-box with authentication off — a failure the
+node itself only warns about, so a deploy step catches it and an upgrade does not stop a node
+over a value nobody wrote. Add `--allow-unauthenticated` to accept that exposure on the
+invocation; the packaged systemd unit passes it on its own `ExecStartPre` line for that reason.
+See
 [Configuration → Security and Posture](CONFIGURATION.md#security-and-posture).
 
 ### Key material on disk

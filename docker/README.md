@@ -66,8 +66,16 @@ There is no rotation path short of stopping every node.
 ## Security
 
 The containers ship **unauthenticated**, with `profile = "internal"` — honest about a
-published port being reachable from your network, and it is what makes `check-config` pass.
-Every HTTP and MCP endpoint is open to whoever can reach the port, `/_admin/*` included.
+published port being reachable from your network. Every HTTP and MCP endpoint is open to
+whoever can reach the port, `/_admin/*` included, and `check-config` fails that state on
+purpose: the container still starts, but
+
+```bash
+docker compose run --rm cameodb check-config --config /etc/cameodb/cameodb.toml
+```
+
+exits non-zero until you either enable authentication below or add `--allow-unauthenticated`
+to say the exposure is deliberate.
 
 Turning that on is one command and one stanza:
 

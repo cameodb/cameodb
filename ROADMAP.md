@@ -564,6 +564,16 @@ flag, reporting the same three accepted warnings the 0.3.0–0.3.2 records descr
 started on the config that fails the check serves requests, so nothing that ran on 0.3.2 stops
 running.
 
+**Corrected 2026-09-03, from a real upgrade.** That last sentence was verified by starting the
+binary by hand, which is not how the packages start it. The unit installed by the DEB and the
+RPM gates `ExecStart` on `ExecStartPre=cameodb check-config` — added in Phase 15 (see the auth
+record below), when every check failure was also a refusal to boot — so on an existing
+`internal` node the pre-flight exited 1 and systemd never reached `ExecStart`. The split this
+item is built on was undone by a file it never touched: the tool failed *and* the node stopped.
+The unit now passes `--allow-unauthenticated` on that line, and `scripts/validate/posture.sh`
+runs the unit's own `ExecStartPre` flags against the config the packages install, because
+neither file was wrong when read alone.
+
 ### C4 — The admin API reachable off-box unauthenticated
 
 ✅ **Done** 2026-09-02, and **half of its premise was wrong**. C3's gate closes the

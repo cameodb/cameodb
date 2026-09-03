@@ -555,4 +555,31 @@ else
     pass "no key reaches the posture report"
 fi
 
+section "the packaged unit against the config it is packaged with"
+# Neither file is wrong on its own, which is how this shipped: the unit gates ExecStart on
+# check-config, and the config the DEB and RPM install to /etc/cameodb has authentication off —
+# a state check-config fails deliberately, while the node itself is meant to start in it.
+# Together they are a node that stops booting after an upgrade over a value nobody wrote. Only
+# running one against the other says so.
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+UNIT="$REPO_ROOT/crates/server/cameodb.service"
+SHIPPED_CONFIG="$REPO_ROOT/crates/server/cameodb.toml"
+EXEC_PRE="$(grep -m1 '^ExecStartPre=.*check-config' "$UNIT")"
+if [ -z "$EXEC_PRE" ]; then
+    fail "the unit gates the boot on check-config" "no ExecStartPre=... check-config in $UNIT"
+else
+    pass "the unit gates the boot on check-config"
+    # Everything the unit passes to the subcommand, with the installed config path swapped for
+    # the copy in the tree that becomes it.
+    UNIT_FLAGS="${EXEC_PRE#*check-config}"
+    UNIT_FLAGS="${UNIT_FLAGS//--config \/etc\/cameodb\/cameodb.toml/}"
+    # shellcheck disable=SC2086
+    if "$BIN" check-config -c "$SHIPPED_CONFIG" $UNIT_FLAGS > "$WORK/unit.check" 2>&1; then
+        pass "ExecStartPre passes the config the packages install, so the node still boots"
+    else
+        fail "ExecStartPre passes the config the packages install, so the node still boots" \
+            "$(cat "$WORK/unit.check")"
+    fi
+fi
+
 summary
