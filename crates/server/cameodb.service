@@ -10,7 +10,15 @@ Environment=MALLOC_CONF=background_thread:true,percpu_arena:percpu,oversize_thre
 # CAMEODB_API_KEY_ROLE, then uncomment. Keys configured in cameodb.toml need none of this.
 # EnvironmentFile=-/etc/cameodb/cameodb.env
 # Refuse to start in a posture the config does not actually satisfy, before the port opens.
-ExecStartPre=/usr/local/bin/cameodb check-config --config /etc/cameodb/cameodb.toml
+# --allow-unauthenticated because the config installed next to this unit ships with
+# `[security] enabled = false`, which check-config fails deliberately: the tool is what a
+# deploy step reads, and the node itself is meant to start in that state. Without the flag
+# the gate here would turn that failure into the refusal-to-boot that decision rejected, and
+# an upgrade would stop a node that has been running for a value nobody wrote. Everything
+# else the check fails on — a profile the config does not satisfy, `external` without TLS,
+# a cluster with no PSK — still stops the start, and enabling authentication makes the flag
+# a no-op rather than something to remember to remove.
+ExecStartPre=/usr/local/bin/cameodb check-config --config /etc/cameodb/cameodb.toml --allow-unauthenticated
 ExecStart=/usr/local/bin/cameodb --config /etc/cameodb/cameodb.toml
 Restart=on-failure
 User=cameodb

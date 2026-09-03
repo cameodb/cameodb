@@ -428,6 +428,13 @@ cameodb check-config -c /etc/cameodb/cameodb.toml --allow-unauthenticated
 The bind decides, not the label: `internal` over a loopback bind has overstated its reach rather
 than exposed anything, and neither warns nor fails the check.
 
+The packaged systemd unit runs the check as `ExecStartPre`, and passes `--allow-unauthenticated`
+there for the same reason — without it the unit would convert this failure into the refusal to
+boot the design rejected, and the config the packages install to `/etc/cameodb/cameodb.toml` is
+exactly the one it fails on. Every other failure still stops the start before the port opens.
+Drop the flag from the unit (`sudo systemctl edit cameodb`, override `ExecStartPre`) if you want
+this host to refuse to run an unauthenticated node at all.
+
 ### Authentication (`[security]`)
 
 Off by default. When enabled, every route except liveness requires
