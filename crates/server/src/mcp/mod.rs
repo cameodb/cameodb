@@ -84,6 +84,11 @@ impl McpBackend for AppState {
         self.max_search_limit
     }
 
+    /// This node's `[security.limits] max_federated_indexes`.
+    fn max_federated_indexes(&self) -> usize {
+        self.max_federated_indexes
+    }
+
     /// This node's `[search] default_search_limit`, which is what an omitted `limit` becomes.
     ///
     /// The dispatcher bounds `offset + limit` and so needs the number a missing `limit` resolves

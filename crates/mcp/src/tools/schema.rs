@@ -36,12 +36,59 @@ pub const DEFAULT_MAX_SEARCH_LIMIT: usize = 10_000;
 /// overrides when its own default differs.
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 
-/// The most indexes one federated search may name.
+/// The most indexes one federated search may name when the host names no other number.
 ///
 /// Each name is a full scatter-gather across that index's shards, so the argument is a
 /// multiplier on everything the call costs. A caller that wants the whole catalogue is asking
 /// a different question — `list_indexes` answers it in one request.
-pub const MAX_FEDERATED_INDEXES: usize = 20;
+///
+/// How wide a fan-out a deployment can afford is the same kind of question as how many hits it
+/// can afford, so the host owns the number through
+/// [`McpBackend::max_federated_indexes`](crate::McpBackend::max_federated_indexes) and this is
+/// only the answer for a host that does not.
+pub const DEFAULT_MAX_FEDERATED_INDEXES: usize = 20;
+
+/// The bounds the tool schemas advertise and the dispatcher enforces.
+///
+/// Carried as one value rather than two arguments because both are read from the host in the
+/// same breath and both are `usize`. Two positional numbers of the same type can be passed the
+/// wrong way round, and nothing would report it: the catalogue would simply advertise a
+/// federated cap of ten thousand and a search ceiling of twenty, both of them enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolLimits {
+    /// The largest `limit` a search tool may be asked for.
+    pub max_search_limit: usize,
+    /// The most indexes one federated search may name.
+    pub max_federated_indexes: usize,
+}
+
+/// The bounds for a host that configures neither.
+///
+/// Written out rather than derived: a derived `Default` would leave both at zero, which is the
+/// one value each of them refuses.
+impl Default for ToolLimits {
+    fn default() -> Self {
+        Self {
+            max_search_limit: DEFAULT_MAX_SEARCH_LIMIT,
+            max_federated_indexes: DEFAULT_MAX_FEDERATED_INDEXES,
+        }
+    }
+}
+
+impl ToolLimits {
+    /// This host's bounds, asked once and carried together.
+    ///
+    /// A free constructor rather than a trait method with a default body, so that the pair can
+    /// never disagree with the two methods it is built from. A host overriding a composite
+    /// `tool_limits()` while also overriding one of the halves is a contradiction this cannot
+    /// express.
+    pub(crate) fn of<S: crate::backend::McpBackend>(backend: &S) -> Self {
+        Self {
+            max_search_limit: backend.max_search_limit(),
+            max_federated_indexes: backend.max_federated_indexes(),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -134,7 +181,10 @@ fn sort_schema() -> JsonValue {
     })
 }
 
-pub(crate) fn search_index_input_schema(max_search_limit: usize) -> JsonValue {
+pub(crate) fn search_index_input_schema(limits: ToolLimits) -> JsonValue {
+    let ToolLimits {
+        max_search_limit, ..
+    } = limits;
     json!({
         "type": "object",
         "properties": {
@@ -173,16 +223,20 @@ pub(crate) fn search_index_input_schema(max_search_limit: usize) -> JsonValue {
     })
 }
 
-pub(crate) fn search_across_indexes_input_schema(max_search_limit: usize) -> JsonValue {
+pub(crate) fn search_across_indexes_input_schema(limits: ToolLimits) -> JsonValue {
+    let ToolLimits {
+        max_search_limit,
+        max_federated_indexes,
+    } = limits;
     json!({
         "type": "object",
         "properties": {
             "indexes": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": MAX_FEDERATED_INDEXES,
+                "maxItems": max_federated_indexes,
                 "description": format!(
-                    "The indexes to search, at least one and at most {MAX_FEDERATED_INDEXES}. An entry is either a bare index name, or an object naming one with a field projection and a sort of its own. Naming the same index twice is refused rather than searched twice."
+                    "The indexes to search, at least one and at most {max_federated_indexes}. An entry is either a bare index name, or an object naming one with a field projection and a sort of its own. Naming the same index twice is refused rather than searched twice."
                 ),
                 "items": {
                     "oneOf": [
@@ -399,7 +453,7 @@ mod tests {
     /// two nested objects inside the federated search — a client reads those the same way and
     /// they can drift the same way.
     fn contracts() -> Vec<Contract> {
-        let federated = search_across_indexes_input_schema(DEFAULT_MAX_SEARCH_LIMIT);
+        let federated = search_across_indexes_input_schema(ToolLimits::default());
         // The object branch of the entry's `oneOf`. A bare name has no properties to compare;
         // the object form is the half that has to agree with the struct.
         let per_index = federated["properties"]["indexes"]["items"]["oneOf"][1].clone();
@@ -408,7 +462,7 @@ mod tests {
         vec![
             contract::<SearchIndexArgs>(
                 "search_index",
-                search_index_input_schema(DEFAULT_MAX_SEARCH_LIMIT),
+                search_index_input_schema(ToolLimits::default()),
             ),
             contract::<SearchAcrossIndexesArgs>("search_across_indexes", federated),
             contract::<McpIndexSearchRequest>("search_across_indexes.indexes[]", per_index),
@@ -446,29 +500,34 @@ mod tests {
     /// against a value no constant here could supply, since it is the host's to choose.
     #[test]
     fn a_schema_advertises_the_bounds_that_are_enforced() {
-        let hosts_own_ceiling = 4_242;
+        // Neither number is a constant in this crate: both are the host's to choose, so a test
+        // that used the defaults could not tell a bound that follows configuration from one
+        // compiled in here.
+        let hosts_own = ToolLimits {
+            max_search_limit: 4_242,
+            max_federated_indexes: 7,
+        };
         for (label, schema) in [
-            ("search_index", search_index_input_schema(hosts_own_ceiling)),
+            ("search_index", search_index_input_schema(hosts_own)),
             (
                 "search_across_indexes",
-                search_across_indexes_input_schema(hosts_own_ceiling),
+                search_across_indexes_input_schema(hosts_own),
             ),
         ] {
             assert_eq!(
                 schema["properties"]["limit"]["maximum"],
-                json!(hosts_own_ceiling),
+                json!(hosts_own.max_search_limit),
                 "{label} advertises a limit bound that is not the host's"
             );
             assert!(
                 schema["properties"]["limit"]["description"]
                     .as_str()
-                    .is_some_and(|text| text.contains(&hosts_own_ceiling.to_string())),
+                    .is_some_and(|text| text.contains(&hosts_own.max_search_limit.to_string())),
                 "{label} describes a limit bound that is not the host's: {schema}"
             );
         }
 
-        let indexes =
-            &search_across_indexes_input_schema(DEFAULT_MAX_SEARCH_LIMIT)["properties"]["indexes"];
+        let indexes = &search_across_indexes_input_schema(hosts_own)["properties"]["indexes"];
         assert_eq!(
             indexes["minItems"],
             json!(1),
@@ -476,8 +535,14 @@ mod tests {
         );
         assert_eq!(
             indexes["maxItems"],
-            json!(MAX_FEDERATED_INDEXES),
-            "the advertised fan-out bound is not the enforced one"
+            json!(hosts_own.max_federated_indexes),
+            "the advertised fan-out bound is not the host's"
+        );
+        assert!(
+            indexes["description"]
+                .as_str()
+                .is_some_and(|text| text.contains(&hosts_own.max_federated_indexes.to_string())),
+            "the described fan-out bound is not the host's: {indexes}"
         );
     }
 

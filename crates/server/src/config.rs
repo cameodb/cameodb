@@ -48,6 +48,9 @@ pub enum ConfigError {
     #[error("Security configuration error: {message}")]
     SecurityConfig { message: String },
 
+    #[error("MCP configuration error: {message}")]
+    McpConfig { message: String },
+
     #[error("{message}\n\nRun `cameodb --help` for the list of options.")]
     CommandLine { message: String },
 }
@@ -482,9 +485,94 @@ pub struct CameoDbConfig {
     #[serde(default)]
     pub limits: LimitsConfig,
 
+    /// The MCP transport: `[mcp]`.
+    #[serde(default)]
+    pub mcp: McpConfig,
+
     /// Moved to `[limits] max_record_size_mb`. Read from here until 0.4.0.
     #[serde(default)]
     pub max_record_size_mb: Option<usize>,
+}
+
+/// `[mcp]` — the MCP endpoint and how long a conversation with it lives.
+///
+/// Deliberately not `[security.limits]`, which meters what one *key* may spend, and not
+/// `[limits]`, which bounds how large a thing may get. Everything here is about the transport:
+/// which of it is mounted, and how long the server keeps the state a client's session id names.
+/// None of it changes what a client is told — the protocol is the same either way.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct McpConfig {
+    /// Whether `/mcp` is mounted at all (default: true).
+    ///
+    /// Unmounts the routes rather than refusing them, the same way `[network.http]
+    /// admin_enabled` withholds the admin API: a route that is absent has nothing to probe and
+    /// no guard to misconfigure.
+    pub enabled: bool,
+
+    /// How long a session may sit idle before the server forgets it (default: 1800).
+    ///
+    /// Idle means nothing arrived on it *and* no connection is open for it: a client holding
+    /// its listening stream open is never idle, however long it pauses. So this is the gap a
+    /// disconnected client may leave and still find its session — after which its next call is
+    /// answered `404` and it has to `initialize` again.
+    ///
+    /// Thirty minutes rather than the five this used to be fixed at. A session holds no
+    /// conversation state — an id, an activity clock, and the key that owns it — so holding one
+    /// longer costs almost nothing, while losing one costs an agent a re-initialize in the
+    /// middle of a task. `max_sessions` is what bounds the memory, not this.
+    pub session_idle_timeout_secs: u64,
+
+    /// The most sessions the node will hold at once (default: 1024).
+    ///
+    /// `initialize` is reachable before any rate limit and mints a session every time, so
+    /// without a cap the registry's size is chosen by whoever sends requests fastest. At the cap
+    /// the longest-idle session is evicted rather than the new one refused.
+    pub max_sessions: usize,
+
+    /// How often an idle SSE stream is written to (default: 15).
+    ///
+    /// The number that decides whether an intermediary calls the connection dead, so it has to
+    /// be below the shortest idle-read timeout between this node and its clients — which is a
+    /// property of someone else's load balancer, and the reason this is configurable at all.
+    pub sse_keepalive_secs: u64,
+
+    /// Whether the superseded HTTP+SSE transport is mounted (default: true).
+    ///
+    /// `/mcp/sse` and `/mcp/messages`, the 2024-11-05 transport. Current clients negotiate
+    /// Streamable HTTP on `/mcp` and never touch these; turning them off removes the surface.
+    /// On by default because turning it off strands any client still configured for it.
+    pub legacy_sse_enabled: bool,
+}
+
+/// Written out rather than derived, so a config built in code and one parsed from an absent
+/// `[mcp]` are the same config. A derived `Default` would zero every number here, and each of
+/// them means something else at zero.
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_mcp_enabled(),
+            session_idle_timeout_secs: default_session_idle_timeout_secs(),
+            max_sessions: default_max_sessions(),
+            sse_keepalive_secs: default_sse_keepalive_secs(),
+            legacy_sse_enabled: default_legacy_sse_enabled(),
+        }
+    }
+}
+
+impl McpConfig {
+    /// This section as the MCP crate's own transport configuration.
+    ///
+    /// The conversion lives here rather than in that crate so it depends on nothing of the
+    /// server's — and it is the only place the seconds an operator wrote become durations.
+    pub fn transport(&self) -> cameodb_mcp::McpTransportConfig {
+        cameodb_mcp::McpTransportConfig {
+            session_idle_timeout: std::time::Duration::from_secs(self.session_idle_timeout_secs),
+            max_sessions: self.max_sessions,
+            sse_keepalive: std::time::Duration::from_secs(self.sse_keepalive_secs),
+            legacy_sse_enabled: self.legacy_sse_enabled,
+        }
+    }
 }
 
 /// What this node accepts and holds, as opposed to what a caller may ask for.
@@ -1248,6 +1336,66 @@ impl CameoDbConfig {
             .into());
         }
 
+        // A fan-out of zero would refuse every federated search, and there is no reading of
+        // "no bound" that is a number — the same trap as `max_search_limit` above.
+        if self.security.limits.max_federated_indexes == 0 {
+            return Err(ConfigError::SecurityConfig {
+                message: "security.limits.max_federated_indexes is 0, which would refuse every \
+                          federated search; set the most indexes one search may name"
+                    .to_string(),
+            }
+            .into());
+        }
+
+        // A timeout of zero expires a session before its next request can arrive, so every
+        // call after `initialize` would be answered 404. Refused rather than read as "never
+        // expire", which is what an operator wanting a long-lived session should write as a
+        // long number.
+        if self.mcp.session_idle_timeout_secs == 0 {
+            return Err(ConfigError::McpConfig {
+                message: "mcp.session_idle_timeout_secs is 0, which would expire every session \
+                          before its next request; set how long a client may pause"
+                    .to_string(),
+            }
+            .into());
+        }
+
+        // Zero sessions means `initialize` mints one and immediately evicts it.
+        if self.mcp.max_sessions == 0 {
+            return Err(ConfigError::McpConfig {
+                message: "mcp.max_sessions is 0, which would evict every session as it is \
+                          created; set how many concurrent MCP clients this node will hold"
+                    .to_string(),
+            }
+            .into());
+        }
+
+        // A keep-alive of zero writes to every open stream as fast as the runtime will let it.
+        if self.mcp.sse_keepalive_secs == 0 {
+            return Err(ConfigError::McpConfig {
+                message: "mcp.sse_keepalive_secs is 0, which would write to every open stream \
+                          continuously; set how often an idle stream is kept alive"
+                    .to_string(),
+            }
+            .into());
+        }
+
+        // A keep-alive that fires less often than a session expires cannot hold one open: the
+        // stream would be swept between two writes. Refused because the two settings look
+        // independent and are not — an operator who shortened the timeout for a reason should
+        // hear that this is the number that now decides it.
+        if self.mcp.sse_keepalive_secs >= self.mcp.session_idle_timeout_secs {
+            return Err(ConfigError::McpConfig {
+                message: format!(
+                    "mcp.sse_keepalive_secs ({}) is not below mcp.session_idle_timeout_secs \
+                     ({}); a stream written to less often than its session expires cannot keep \
+                     that session open",
+                    self.mcp.sse_keepalive_secs, self.mcp.session_idle_timeout_secs
+                ),
+            }
+            .into());
+        }
+
         // Validate HTTP configuration
         if self.network.http.port == 0 {
             return Err(ConfigError::NetworkConfig {
@@ -1703,6 +1851,29 @@ fn default_http_port() -> u16 {
 
 fn default_request_timeout() -> u64 {
     30
+}
+
+fn default_mcp_enabled() -> bool {
+    true
+}
+
+/// Thirty minutes. See [`McpConfig::session_idle_timeout_secs`] for why it is not five.
+fn default_session_idle_timeout_secs() -> u64 {
+    1800
+}
+
+fn default_max_sessions() -> usize {
+    1024
+}
+
+/// Fifteen seconds, which is under every idle-read timeout common in front of a node: 30 s on
+/// nginx by default, 60 s on an AWS ALB.
+fn default_sse_keepalive_secs() -> u64 {
+    15
+}
+
+fn default_legacy_sse_enabled() -> bool {
+    true
 }
 
 fn default_max_record_size_mb() -> usize {
@@ -2349,6 +2520,150 @@ max_response_bytes = 16777216
             ..Default::default()
         };
         assert!(config.validate().is_err(), "a ceiling of zero was accepted");
+    }
+
+    /// A fan-out bound of zero is a misconfiguration for the same reason a ceiling of zero is.
+    #[test]
+    fn a_fan_out_bound_of_zero_is_refused() {
+        let config = CameoDbConfig {
+            security: crate::auth::SecurityConfig {
+                limits: crate::ratelimit::McpLimitsConfig {
+                    max_federated_indexes: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "a fan-out bound of zero was accepted"
+        );
+    }
+
+    /// `[mcp]` is optional, and the defaults are the ones documented on the section.
+    ///
+    /// The numbers are asserted rather than compared to the `default_*` functions, because
+    /// those would agree with themselves whatever they returned. Two in particular are worth
+    /// pinning: the idle timeout is the thing an operator reaches for after a paused agent was
+    /// handed a 404, and both transports are on by default so an upgrade strands nobody.
+    #[test]
+    fn the_mcp_section_defaults_are_the_documented_ones() {
+        let config = CameoDbConfig::default();
+        assert_eq!(config.mcp, McpConfig::default());
+        assert!(config.mcp.enabled);
+        assert_eq!(config.mcp.session_idle_timeout_secs, 1800);
+        assert_eq!(config.mcp.max_sessions, 1024);
+        assert_eq!(config.mcp.sse_keepalive_secs, 15);
+        assert!(config.mcp.legacy_sse_enabled);
+        assert!(config.validate().is_ok());
+
+        // And a file naming one setting gets the defaults for the rest, rather than zeros.
+        let partial: CameoDbConfig =
+            toml::from_str("[mcp]\nlegacy_sse_enabled = false\n").expect("parse [mcp]");
+        assert!(!partial.mcp.legacy_sse_enabled);
+        assert_eq!(partial.mcp.session_idle_timeout_secs, 1800);
+        assert!(partial.mcp.enabled);
+    }
+
+    /// The seconds an operator wrote are the durations the transport runs with.
+    ///
+    /// The conversion is the only place the two representations meet, and a transposition here
+    /// would be invisible: sessions would expire on the keep-alive interval and streams would
+    /// be written to every half hour, both of which look like the transport merely misbehaving.
+    #[test]
+    fn the_mcp_section_converts_to_the_transport_it_configures() {
+        let config = McpConfig {
+            session_idle_timeout_secs: 900,
+            max_sessions: 64,
+            sse_keepalive_secs: 5,
+            legacy_sse_enabled: false,
+            enabled: true,
+        };
+        let transport = config.transport();
+        assert_eq!(
+            transport.session_idle_timeout,
+            std::time::Duration::from_secs(900)
+        );
+        assert_eq!(transport.max_sessions, 64);
+        assert_eq!(transport.sse_keepalive, std::time::Duration::from_secs(5));
+        assert!(!transport.legacy_sse_enabled);
+    }
+
+    /// Each of these numbers means something else at zero, and none of the meanings is "off".
+    #[test]
+    fn a_zero_in_the_mcp_section_is_refused() {
+        for (label, mcp) in [
+            (
+                "session_idle_timeout_secs",
+                McpConfig {
+                    session_idle_timeout_secs: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_sessions",
+                McpConfig {
+                    max_sessions: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "sse_keepalive_secs",
+                McpConfig {
+                    sse_keepalive_secs: 0,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let config = CameoDbConfig {
+                mcp,
+                ..Default::default()
+            };
+            let err = config
+                .validate()
+                .expect_err(&format!("{label} of zero was accepted"))
+                .to_string();
+            assert!(
+                err.contains(label),
+                "the refusal does not name the setting: {err}"
+            );
+        }
+    }
+
+    /// A keep-alive that fires no more often than a session expires cannot hold one open.
+    ///
+    /// The two settings look independent and are not: the whole point of registering an open
+    /// stream as proof of life is that it is written to inside the window that would otherwise
+    /// sweep the session.
+    #[test]
+    fn a_keepalive_slower_than_the_session_timeout_is_refused() {
+        let config = CameoDbConfig {
+            mcp: McpConfig {
+                session_idle_timeout_secs: 60,
+                sse_keepalive_secs: 60,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("a keep-alive at the timeout was accepted")
+            .to_string();
+        assert!(
+            err.contains("sse_keepalive_secs") && err.contains("session_idle_timeout_secs"),
+            "the refusal does not name both settings: {err}"
+        );
+
+        let workable = CameoDbConfig {
+            mcp: McpConfig {
+                session_idle_timeout_secs: 60,
+                sse_keepalive_secs: 15,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(workable.validate().is_ok());
     }
 
     /// The response ceiling follows the node's message size unless an operator names one.

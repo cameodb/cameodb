@@ -161,6 +161,20 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
         crate::tools::schema::DEFAULT_MAX_SEARCH_LIMIT
     }
 
+    /// The most indexes one federated search may name.
+    ///
+    /// The host's for the same reason [`Self::max_search_limit`] is: each name is a
+    /// scatter-gather across that index's shards, so the number is a multiplier on what one
+    /// request costs the node, and only the node knows what it can afford. Advertised as the
+    /// `maxItems` of the federated schema and enforced by the dispatcher, so the bound a
+    /// caller is shown is the bound it is held to.
+    ///
+    /// The default is
+    /// [`DEFAULT_MAX_FEDERATED_INDEXES`](crate::DEFAULT_MAX_FEDERATED_INDEXES).
+    fn max_federated_indexes(&self) -> usize {
+        crate::tools::schema::DEFAULT_MAX_FEDERATED_INDEXES
+    }
+
     /// The `limit` a search runs with when the call names none.
     ///
     /// Needed here, and not only by the host, because `offset` is bounded against
@@ -249,12 +263,13 @@ pub(crate) mod testing {
     /// The dispatcher tests are about the JSON-RPC envelope — which messages get a reply, what
     /// an error carries — so what a tool *returns* is deliberately uninteresting here.
     ///
-    /// The search ceiling is settable because it is the one thing a host supplies that this
-    /// crate both advertises and enforces: a stub fixed at the default could not tell a bound
-    /// that follows the host from a constant compiled in here.
+    /// The two bounds are settable because they are what a host supplies that this crate both
+    /// advertises and enforces: a stub fixed at the defaults could not tell a bound that
+    /// follows the host from a constant compiled in here.
     #[derive(Clone, Default)]
     pub(crate) struct StubBackend {
         max_search_limit: Option<usize>,
+        max_federated_indexes: Option<usize>,
     }
 
     impl StubBackend {
@@ -262,6 +277,15 @@ pub(crate) mod testing {
         pub(crate) fn capped(max_search_limit: usize) -> Self {
             Self {
                 max_search_limit: Some(max_search_limit),
+                ..Self::default()
+            }
+        }
+
+        /// A host whose fan-out bound is not the default one.
+        pub(crate) fn narrowed(max_federated_indexes: usize) -> Self {
+            Self {
+                max_federated_indexes: Some(max_federated_indexes),
+                ..Self::default()
             }
         }
     }
@@ -271,6 +295,11 @@ pub(crate) mod testing {
     }
 
     impl McpBackend for StubBackend {
+        fn max_federated_indexes(&self) -> usize {
+            self.max_federated_indexes
+                .unwrap_or(crate::tools::schema::DEFAULT_MAX_FEDERATED_INDEXES)
+        }
+
         fn max_search_limit(&self) -> usize {
             self.max_search_limit
                 .unwrap_or(crate::tools::schema::DEFAULT_MAX_SEARCH_LIMIT)

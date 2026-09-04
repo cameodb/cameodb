@@ -200,6 +200,78 @@ search_threads = 8
 default_search_limit = 10
 ```
 
+### The MCP endpoint (`[mcp]`)
+
+```toml
+[mcp]
+enabled = true                     # false unmounts /mcp entirely
+session_idle_timeout_secs = 1800   # how long a disconnected client may pause
+max_sessions = 1024                # concurrent MCP clients held, idlest evicted at the cap
+sse_keepalive_secs = 15            # how often an idle SSE stream is written to
+legacy_sse_enabled = true          # the superseded /mcp/sse + /mcp/messages transport
+```
+
+The transport itself, as opposed to what a caller may spend on it — that is
+[`[security.limits]`](#rate-limiting-mcp-tool-calls-securitylimits), which meters a *key*.
+Nothing here changes what a client is told; the protocol is the same either way.
+
+#### `session_idle_timeout_secs` — how long a paused client keeps its session
+
+The setting to reach for when an agent comes back from a pause to:
+
+```
+transport error: failed to send request: session terminated (404). need to re-initialize
+```
+
+A session id names server-side state, and a request presenting one the node no longer holds is
+answered `404` — which the Streamable HTTP spec requires, and which is the only way a client
+learns to start over. This is how long that state survives.
+
+- **Idle means nothing arrived *and* no connection is open.** A client holding its listening
+  `GET /mcp` stream open is never idle, however long it pauses. So this bounds the
+  disconnected case: the gap a client may leave and still find its session.
+- **Defaults to 1800** (thirty minutes). A session holds no conversation state — an id, an
+  activity clock and the key that owns it — so holding one longer costs almost nothing, while
+  losing one costs an agent a re-initialize mid-task. `max_sessions` is what bounds the memory.
+- **Re-initializing is cheap and needs no cleanup.** An `initialize` carrying a stale session id
+  is allowed through and answers with a new one, so a client recovers in one round trip
+  without clearing anything first.
+- **The sweep interval derives from it** — a tenth of the timeout, between 1 s and 60 s — so a
+  session outlives its timeout by at most 10 %. It is not separately configurable: two knobs
+  admit a config where the sweep is slower than the timeout, and then the sweep interval
+  silently becomes the timeout.
+- **`0` is refused.** It would expire every session before its next request could arrive.
+
+#### `sse_keepalive_secs` — holding a stream open through the middle
+
+How often an idle SSE stream is written to, on both transports. It has to be below the shortest
+idle-read timeout between this node and its clients, and that is a property of someone else's
+load balancer — 30 s on nginx by default, 60 s on an AWS ALB. It defaults to **15**.
+
+It also has to be below `session_idle_timeout_secs`, or a stream written to less often than its
+session expires cannot keep that session open; the node refuses to start rather than leaving
+the contradiction to be discovered as a 404.
+
+#### `legacy_sse_enabled` — the superseded transport
+
+`/mcp/sse` and `/mcp/messages`, the 2024-11-05 HTTP+SSE transport. Current clients negotiate
+Streamable HTTP on `/mcp` and never touch these. `false` **unmounts** them rather than refusing
+them, the same way `admin_enabled` withholds the admin API: a route that is absent has nothing
+to probe and no guard to misconfigure. On by default, because turning it off strands any client
+still configured for it.
+
+Worth knowing if you are considering it as a way to get longer sessions: it does not idle out
+at all — a session with a live push channel is kept regardless of how long the client pauses —
+but it ties that session to one TCP connection, and the session is forgotten the instant the
+connection drops. A laptop sleeping or a proxy recycling the connection ends it with no grace
+period, where a Streamable HTTP session survives the reconnect for
+`session_idle_timeout_secs`. For a client that pauses and reconnects, that is the worse trade.
+
+#### `enabled` — withholding MCP altogether
+
+`false` unmounts `/mcp` and everything under it. For a node whose callers are all using the
+HTTP API, this removes the surface rather than guarding it.
+
 ### Storage Configuration
 
 ```toml
@@ -499,6 +571,7 @@ you only discover on the day you turn authentication on. These all refuse to sta
 tool_calls_per_minute = 120   # 0 (the default) disables limiting entirely
 tool_call_burst = 30          # spendable at once; 0 means one minute's worth
 max_search_limit = 10000      # largest `limit` an MCP search may ask for
+max_federated_indexes = 20    # most indexes one `search_across_indexes` may name
 ```
 
 The companion size ceiling, `max_response_bytes`, lives in [`[limits]`](#size-and-memory-limits)
@@ -554,6 +627,24 @@ each hit is a redb lookup, a merge entry and a serialized document.
   than clamping, so the number an operator wrote is the number that runs.
 - **`0` is refused**, not read as unlimited. A bound whose zero inverts its meaning is a trap;
   an operator who wants a high ceiling writes a high number.
+
+#### `max_federated_indexes` — how wide one search may fan out
+
+The other half of what one call may cost, and always in force for the same reasons
+`max_search_limit` is. It defaults to **20**. Each name in a federated search is a full
+scatter-gather across that index's shards, so the argument is a multiplier on everything the
+call does — which is why the rate limiter charges a federated search per index named rather
+than per call.
+
+- **Advertised as well as enforced**, as the `maxItems` of `search_across_indexes`'s `indexes`
+  array and in its description, so a schema-driven client never builds a call that will be
+  refused.
+- **It also caps what one call may be charged.** A list longer than this is refused when it is
+  decoded, so charging for fan-out that cannot happen would let a malformed call empty a
+  caller's budget.
+- **A caller that wants the whole catalogue is asking a different question.** `list_indexes`
+  answers it in one request.
+- **`0` is refused**, not read as unlimited.
 
 #### `limits.max_response_bytes` — how large one response may be
 

@@ -14,4 +14,4 @@ mod search;
 mod write;
 
 pub(crate) use health::HEALTH_PATH;
-pub(crate) use routes::create_router;
+pub(crate) use routes::{RouterConfig, create_router};

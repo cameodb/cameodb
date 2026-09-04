@@ -45,6 +45,16 @@ pub struct McpLimitsConfig {
     #[serde(default = "default_max_search_limit")]
     pub max_search_limit: usize,
 
+    /// The most indexes one `search_across_indexes` call may name.
+    ///
+    /// The other half of what one call may cost, and always in force for the same reason
+    /// `max_search_limit` is. Each name is a scatter-gather across that index's shards, so this
+    /// is a multiplier on everything the call does — which is why the rate limiter above
+    /// charges a federated search per index named rather than per call. `0` is refused at load
+    /// rather than read as unlimited.
+    #[serde(default = "default_max_federated_indexes")]
+    pub max_federated_indexes: usize,
+
     /// Moved to `[limits] max_response_bytes`. Read from here until 0.4.0.
     ///
     /// Kept as a field rather than left to fall through as an unknown key, because this
@@ -63,15 +73,25 @@ fn default_max_search_limit() -> usize {
     cameodb_mcp::DEFAULT_MAX_SEARCH_LIMIT
 }
 
+/// The fan-out bound when an operator sets none.
+///
+/// Twenty indexes is where one federated call stops being one call: a caller that wants the
+/// whole catalogue is asking a different question, and `list_indexes` answers it in one request.
+fn default_max_federated_indexes() -> usize {
+    cameodb_mcp::DEFAULT_MAX_FEDERATED_INDEXES
+}
+
 /// Written out rather than derived, so that a config built in code and one parsed from an
 /// absent `[security.limits]` are the same config. A derived `Default` would leave
-/// `max_search_limit` at zero, which is the one value this section refuses.
+/// `max_search_limit` and `max_federated_indexes` at zero, which is the one value each of them
+/// refuses.
 impl Default for McpLimitsConfig {
     fn default() -> Self {
         Self {
             tool_calls_per_minute: 0,
             tool_call_burst: 0,
             max_search_limit: default_max_search_limit(),
+            max_federated_indexes: default_max_federated_indexes(),
             max_response_bytes: None,
         }
     }

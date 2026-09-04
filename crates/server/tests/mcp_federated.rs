@@ -1626,7 +1626,7 @@ async fn an_index_list_that_cannot_be_answered_is_refused() {
 async fn the_widest_permitted_fan_out_answers_from_every_index() {
     let node = two_seeded_indexes().await;
 
-    let absent = cameodb_mcp::MAX_FEDERATED_INDEXES - 2;
+    let absent = cameodb_mcp::DEFAULT_MAX_FEDERATED_INDEXES - 2;
     let mut named: Vec<Value> = (0..absent)
         .map(|n| json!({"index": format!("gone{n:02}")}))
         .collect();
@@ -1639,7 +1639,7 @@ async fn the_widest_permitted_fan_out_answers_from_every_index() {
             json!({
                 "indexes": named,
                 "query": "title:record",
-                "limit": cameodb_mcp::MAX_FEDERATED_INDEXES,
+                "limit": cameodb_mcp::DEFAULT_MAX_FEDERATED_INDEXES,
             }),
         )
         .await;

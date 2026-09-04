@@ -94,6 +94,32 @@ enabled = false
 # tool_calls_per_minute = 120           # 0 (default) disables limiting entirely
 # tool_call_burst = 30                  # spendable at once; 0 means one minute's worth
 # max_search_limit = 10000              # largest `limit` an MCP search may ask for
+# max_federated_indexes = 20            # most indexes one search_across_indexes may name
+
+# The MCP endpoint itself: which of it is mounted, and how long a conversation with it lives.
+#
+# Distinct from [security.limits] above, which meters what one key may spend. Nothing here
+# changes what a client is told — the protocol is the same either way.
+#
+# session_idle_timeout_secs is the setting to reach for when a paused agent comes back to
+# "session terminated (404). need to re-initialize". Idle means nothing arrived AND no stream
+# is open: a client holding its listening stream open never expires, however long it pauses,
+# so this is the gap a *disconnected* client may leave and still find its session. A session
+# holds no conversation state — an id, a clock and the key that owns it — so holding one for
+# half an hour costs almost nothing; max_sessions is what bounds the memory.
+[mcp]
+enabled = true
+session_idle_timeout_secs = 1800
+max_sessions = 1024
+# How often an idle SSE stream is written to. Has to be below the shortest idle-read timeout
+# between this node and its clients — 30 s on nginx by default, 60 s on an AWS ALB — and below
+# session_idle_timeout_secs, or a stream cannot hold its own session open.
+sse_keepalive_secs = 15
+# The superseded 2024-11-05 transport, /mcp/sse and /mcp/messages. Current clients negotiate
+# Streamable HTTP on /mcp and never touch these; false unmounts them rather than refusing them.
+# Note that transport ties a session to one TCP connection: it never idles out, but the session
+# dies the moment the connection does, where a Streamable HTTP one survives the reconnect.
+legacy_sse_enabled = true
 
 # Audit trail — who read what. Refusals have always been logged; without this a node cannot
 # say who legitimately read which index, which is the question an incident asks. Reads and
