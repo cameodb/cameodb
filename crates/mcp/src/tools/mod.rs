@@ -9,8 +9,8 @@ use crate::{
     authz::{McpAuthzRef, tool_capability},
     backend::{McpBackend, McpIndexSearchRequest},
     tools::schema::{
-        DescribeIndexArgs, GetCatalogStatsArgs, ListIndexesArgs, MAX_FEDERATED_INDEXES,
-        SearchAcrossIndexesArgs, SearchIndexArgs, ValidateQueryArgs, describe_index_input_schema,
+        DescribeIndexArgs, GetCatalogStatsArgs, ListIndexesArgs, SearchAcrossIndexesArgs,
+        SearchIndexArgs, ToolLimits, ValidateQueryArgs, describe_index_input_schema,
         get_catalog_stats_input_schema, list_indexes_input_schema,
         search_across_indexes_input_schema, search_index_input_schema, validate_query_input_schema,
     },
@@ -89,7 +89,10 @@ fn check_offset_window(
 /// read as a result. An empty list returns no hits and no errors, which is indistinguishable
 /// from a query that matched nothing; a repeated name is searched once per mention and its
 /// documents counted once per mention, so `total_hits` comes back larger than the index.
-fn check_index_list(indexes: &[McpIndexSearchRequest]) -> Result<(), String> {
+fn check_index_list(
+    indexes: &[McpIndexSearchRequest],
+    max_federated_indexes: usize,
+) -> Result<(), String> {
     if indexes.is_empty() {
         return Err(
             "no index was named; `indexes` needs at least one entry, or an empty result would \
@@ -97,9 +100,9 @@ fn check_index_list(indexes: &[McpIndexSearchRequest]) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if indexes.len() > MAX_FEDERATED_INDEXES {
+    if indexes.len() > max_federated_indexes {
         return Err(format!(
-            "{} indexes named; at most {MAX_FEDERATED_INDEXES} may be searched at once, and \
+            "{} indexes named; at most {max_federated_indexes} may be searched at once, and \
              `list_indexes` describes the whole catalogue in one call",
             indexes.len()
         ));
@@ -174,7 +177,7 @@ where
                 backend.default_search_limit(),
                 backend.max_search_limit(),
             )?;
-            check_index_list(&args.indexes)?;
+            check_index_list(&args.indexes, backend.max_federated_indexes())?;
             // Refuse the whole call rather than quietly dropping the indexes this key may
             // not read: partial results that look complete are worse than an error.
             for request in &args.indexes {
@@ -218,8 +221,8 @@ where
 /// Advertising a tool that [`call_tool`] will refuse invites an agent to plan around it and
 /// then fail mid-task. A tool with no row in the capability table is not advertised either —
 /// the deny default applies to the catalogue as much as to the call.
-pub(crate) fn visible_tools(authz: &McpAuthzRef, max_search_limit: usize) -> Vec<JsonValue> {
-    mcp_tools(max_search_limit)
+pub(crate) fn visible_tools(authz: &McpAuthzRef, limits: ToolLimits) -> Vec<JsonValue> {
+    mcp_tools(limits)
         .into_iter()
         .filter(|tool| {
             tool.get("name")
@@ -264,13 +267,13 @@ pub(crate) fn tool_subject(arguments: &JsonValue) -> Option<String> {
 /// so that a rate-limited caller learns nothing from the shape of the refusal about which
 /// tools it would otherwise be allowed.
 ///
-/// Capped at [`MAX_FEDERATED_INDEXES`], because a longer list is refused when it is decoded:
+/// Capped at the host's federated bound, because a longer list is refused when it is decoded:
 /// charging for fan-out that cannot happen would let a malformed call empty a caller's budget.
-pub(crate) fn tool_cost(arguments: &JsonValue) -> u32 {
+pub(crate) fn tool_cost(arguments: &JsonValue, max_federated_indexes: usize) -> u32 {
     let Some(entries) = arguments.get("indexes").and_then(JsonValue::as_array) else {
         return 1;
     };
-    entries.len().clamp(1, MAX_FEDERATED_INDEXES) as u32
+    entries.len().clamp(1, max_federated_indexes) as u32
 }
 
 /// Refuse a tool call that names an index outside the caller's scope.
@@ -362,19 +365,19 @@ fn read_only_tool(
     })
 }
 
-pub(crate) fn mcp_tools(max_search_limit: usize) -> Vec<JsonValue> {
+pub(crate) fn mcp_tools(limits: ToolLimits) -> Vec<JsonValue> {
     vec![
         read_only_tool(
             "search_index",
             "Search Index",
             search_index_description().into(),
-            search_index_input_schema(max_search_limit),
+            search_index_input_schema(limits),
         ),
         read_only_tool(
             "search_across_indexes",
             "Federated Search",
             search_across_indexes_description().into(),
-            search_across_indexes_input_schema(max_search_limit),
+            search_across_indexes_input_schema(limits),
         ),
         read_only_tool(
             "describe_index",
@@ -413,10 +416,10 @@ mod tests {
         testing::{NoCapabilities, Scoped},
     };
     use crate::backend::testing::StubBackend;
-    use crate::tools::schema::DEFAULT_MAX_SEARCH_LIMIT;
+    use crate::tools::schema::{DEFAULT_MAX_FEDERATED_INDEXES, DEFAULT_MAX_SEARCH_LIMIT};
 
     fn advertised_tool_names() -> Vec<String> {
-        mcp_tools(DEFAULT_MAX_SEARCH_LIMIT)
+        mcp_tools(ToolLimits::default())
             .iter()
             .filter_map(|tool| tool.get("name").and_then(|name| name.as_str()))
             .map(str::to_string)
@@ -455,7 +458,7 @@ mod tests {
     /// `title` came later. A client on either finds a name, and neither finds a different one.
     #[test]
     fn a_tool_names_itself_the_same_way_twice() {
-        for tool in mcp_tools(DEFAULT_MAX_SEARCH_LIMIT) {
+        for tool in mcp_tools(ToolLimits::default()) {
             let name = tool["name"].as_str().unwrap_or("?");
             let title = tool["title"].as_str().unwrap_or_default();
             assert!(!title.is_empty(), "{name} has no display name");
@@ -481,7 +484,7 @@ mod tests {
     /// the table indents.
     #[test]
     fn no_description_leaks_the_indentation_of_its_source() {
-        for tool in mcp_tools(DEFAULT_MAX_SEARCH_LIMIT) {
+        for tool in mcp_tools(ToolLimits::default()) {
             let name = tool["name"].as_str().unwrap_or("?").to_string();
             let description = tool["description"].as_str().unwrap_or_default();
 
@@ -511,7 +514,7 @@ mod tests {
     /// it. This is the other half of the deny default in the capability table.
     #[test]
     fn a_tool_that_is_not_a_read_must_say_what_it_does() {
-        for tool in mcp_tools(DEFAULT_MAX_SEARCH_LIMIT) {
+        for tool in mcp_tools(ToolLimits::default()) {
             let name = tool["name"].as_str().unwrap_or("?");
             let annotations = &tool["annotations"];
             // The domain is this node's own indexes, whatever is ingested into them.
@@ -659,7 +662,7 @@ mod tests {
         let authz: McpAuthzRef = Arc::new(Scoped("docs"));
         let backend = StubBackend::capped(25);
 
-        for tool in visible_tools(&authz, backend.max_search_limit()) {
+        for tool in visible_tools(&authz, ToolLimits::of(&backend)) {
             let name = tool["name"].as_str().unwrap_or("?");
             if !name.starts_with("search") {
                 continue;
@@ -701,7 +704,7 @@ mod tests {
     #[tokio::test]
     async fn an_index_list_that_makes_no_sense_is_refused() {
         let authz: McpAuthzRef = Arc::new(Scoped("docs"));
-        let too_many: Vec<JsonValue> = (0..=MAX_FEDERATED_INDEXES)
+        let too_many: Vec<JsonValue> = (0..=DEFAULT_MAX_FEDERATED_INDEXES)
             .map(|n| json!({"index": format!("docs{n}")}))
             .collect();
 
@@ -715,7 +718,7 @@ mod tests {
             (
                 "too many",
                 JsonValue::Array(too_many),
-                &*MAX_FEDERATED_INDEXES.to_string(),
+                &*DEFAULT_MAX_FEDERATED_INDEXES.to_string(),
             ),
         ] {
             let params = ToolCallParams {
@@ -792,22 +795,71 @@ mod tests {
     /// than one call.
     #[test]
     fn a_call_costs_what_it_fans_out_to() {
-        assert_eq!(tool_cost(&json!({"index": "docs", "query": "a"})), 1);
-        assert_eq!(tool_cost(&json!({})), 1);
+        let cost = |arguments| tool_cost(&arguments, DEFAULT_MAX_FEDERATED_INDEXES);
+        assert_eq!(cost(json!({"index": "docs", "query": "a"})), 1);
+        assert_eq!(cost(json!({})), 1);
         assert_eq!(
-            tool_cost(&json!({"indexes": [{"index": "a"}, {"index": "b"}, {"index": "c"}]})),
+            cost(json!({"indexes": [{"index": "a"}, {"index": "b"}, {"index": "c"}]})),
             3
         );
         // A bare name is the same fan-out as an object naming one.
-        assert_eq!(tool_cost(&json!({"indexes": ["a", "b"]})), 2);
+        assert_eq!(cost(json!({"indexes": ["a", "b"]})), 2);
         // An empty list is refused when decoded; it is still one call to refuse.
-        assert_eq!(tool_cost(&json!({"indexes": []})), 1);
+        assert_eq!(cost(json!({"indexes": []})), 1);
         // Charging for fan-out that the dispatcher will refuse would let a malformed call
         // empty a caller's budget.
         let absurd: Vec<JsonValue> = (0..10_000).map(|_| json!({"index": "a"})).collect();
         assert_eq!(
-            tool_cost(&json!({"indexes": absurd})),
-            MAX_FEDERATED_INDEXES as u32
+            cost(json!({"indexes": absurd.clone()})),
+            DEFAULT_MAX_FEDERATED_INDEXES as u32
+        );
+        // And the cap that clamps it is the host's, not this crate's — otherwise a node that
+        // narrowed its fan-out would still charge for twenty.
+        assert_eq!(tool_cost(&json!({"indexes": absurd}), 3), 3);
+    }
+
+    /// A host that narrows the fan-out narrows both halves of it, for the same reason the
+    /// search ceiling has to: the bound a caller reads in `tools/list` is the bound its call is
+    /// measured against.
+    #[tokio::test]
+    async fn a_host_that_narrows_the_fan_out_narrows_what_is_advertised_too() {
+        let authz: McpAuthzRef = Arc::new(Scoped("docs"));
+        let backend = StubBackend::narrowed(3);
+
+        let federated = visible_tools(&authz, ToolLimits::of(&backend))
+            .into_iter()
+            .find(|tool| tool["name"] == json!("search_across_indexes"))
+            .expect("the federated tool is not advertised");
+        assert_eq!(
+            federated["inputSchema"]["properties"]["indexes"]["maxItems"],
+            json!(3),
+            "the advertised fan-out bound is not the host's"
+        );
+
+        let params = ToolCallParams {
+            name: "search_across_indexes".to_string(),
+            arguments: json!({
+                "indexes": ["a", "b", "c", "d"],
+                "query": "x",
+            }),
+        };
+        let err = call_tool(&backend, params, &authz)
+            .await
+            .expect_err("the host's narrowed fan-out was not enforced");
+        assert!(
+            err.contains('3'),
+            "the refusal quotes another number: {err}"
+        );
+
+        // And the crate default is not silently in force underneath it.
+        let within_default: Vec<JsonValue> = (0..5).map(|n| json!(format!("docs{n}"))).collect();
+        let params = ToolCallParams {
+            name: "search_across_indexes".to_string(),
+            arguments: json!({"indexes": within_default, "query": "x"}),
+        };
+        assert!(
+            call_tool(&backend, params, &authz).await.is_err(),
+            "the crate default was applied instead of the host's fan-out bound"
         );
     }
 
@@ -815,14 +867,14 @@ mod tests {
     fn the_catalogue_only_advertises_tools_the_caller_could_call() {
         let reader: McpAuthzRef = Arc::new(Scoped("docs"));
         assert_eq!(
-            visible_tools(&reader, DEFAULT_MAX_SEARCH_LIMIT).len(),
-            mcp_tools(DEFAULT_MAX_SEARCH_LIMIT).len()
+            visible_tools(&reader, ToolLimits::default()).len(),
+            mcp_tools(ToolLimits::default()).len()
         );
 
         // Nothing held, nothing offered. Advertising a tool that the dispatcher will refuse
         // invites an agent to plan around it and fail mid-task.
         let nobody: McpAuthzRef = Arc::new(NoCapabilities);
-        assert!(visible_tools(&nobody, DEFAULT_MAX_SEARCH_LIMIT).is_empty());
+        assert!(visible_tools(&nobody, ToolLimits::default()).is_empty());
     }
 
     #[test]

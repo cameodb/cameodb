@@ -169,6 +169,29 @@ async fn main() -> Result<()> {
             cameodb_config.limits.total_memory_limit_mb,
         );
 
+        // The MCP transport, because two of these are surfaces rather than sizes: whether the
+        // endpoint is mounted at all, and whether the superseded transport is reachable. The
+        // idle timeout is here because it is the number an operator looks for after an agent
+        // was answered `404` on a session it thought it still had, and reading it out of the
+        // file does not say whether `[mcp]` was parsed or defaulted.
+        let mcp = &cameodb_config.mcp;
+        if mcp.enabled {
+            println!(
+                "MCP: enabled, session idle {}s, {} sessions max, SSE keep-alive {}s, \
+                 legacy HTTP+SSE {}",
+                mcp.session_idle_timeout_secs,
+                mcp.max_sessions,
+                mcp.sse_keepalive_secs,
+                if mcp.legacy_sse_enabled {
+                    "mounted"
+                } else {
+                    "not mounted"
+                },
+            );
+        } else {
+            println!("MCP: disabled, /mcp is not mounted");
+        }
+
         // Render the matrix before deciding, so a failure arrives with the context of
         // everything that passed rather than as a single line.
         let (warnings, unauthenticated_off_box) = match posture::evaluate(&cameodb_config) {
@@ -580,6 +603,7 @@ async fn main() -> Result<()> {
             cameodb_config.security.limits.clone(),
         )),
         max_search_limit: cameodb_config.security.limits.max_search_limit,
+        max_federated_indexes: cameodb_config.security.limits.max_federated_indexes,
         max_response_bytes: cameodb_config.effective_max_response_bytes(),
         audit: Arc::clone(&audit_sink),
     };
@@ -587,12 +611,15 @@ async fn main() -> Result<()> {
     // Create the HTTP router with shared state and body limit derived from max_record_size_mb
     let (app, mcp_handle) = create_router(
         app_state,
-        cameodb_config.effective_max_body_size_mb(),
-        &cameodb_config.network.http.cors_allowed_origins,
-        cameodb_config.network.http.max_concurrent_requests,
-        cameodb_config.effective_request_timeout_secs(),
-        cameodb_config.network.http.admin_enabled,
         keyring.clone(),
+        &http_server::RouterConfig {
+            max_body_size_mb: cameodb_config.effective_max_body_size_mb(),
+            cors_allowed_origins: &cameodb_config.network.http.cors_allowed_origins,
+            max_concurrent_requests: cameodb_config.network.http.max_concurrent_requests,
+            request_timeout_secs: cameodb_config.effective_request_timeout_secs(),
+            admin_enabled: cameodb_config.network.http.admin_enabled,
+            mcp: &cameodb_config.mcp,
+        },
     );
 
     // Extract HTTP configuration

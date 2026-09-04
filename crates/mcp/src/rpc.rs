@@ -15,7 +15,9 @@ use crate::{
     backend::{McpBackend, RateLimitVerdict, ToolCall},
     guidance::{INSTRUCTIONS, ORCHESTRATOR_SKILL},
     protocol::negotiate_protocol_version,
-    tools::{ToolCallParams, call_tool, tool_cost, tool_subject, visible_tools},
+    tools::{
+        ToolCallParams, call_tool, schema::ToolLimits, tool_cost, tool_subject, visible_tools,
+    },
 };
 
 #[derive(Debug, Deserialize)]
@@ -192,7 +194,7 @@ where
         // --- Tools ---
         "tools/list" => Some(success_response(
             request.id,
-            json!({ "tools": visible_tools(authz, backend.max_search_limit()) }),
+            json!({ "tools": visible_tools(authz, ToolLimits::of(&backend)) }),
         )),
         "tools/call" => Some(handle_tool_call(&backend, request.id, request.params, authz).await),
 
@@ -233,7 +235,7 @@ where
     let subject = tool_subject(&params.arguments);
     // Read the same way and for the same reason: what the call costs has to be known before
     // the rate check, which precedes decoding.
-    let cost = tool_cost(&params.arguments);
+    let cost = tool_cost(&params.arguments, backend.max_federated_indexes());
     // Owned, because `params` moves into `call_tool` below and the record is written after
     // it returns.
     let query = params

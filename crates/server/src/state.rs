@@ -32,6 +32,11 @@ pub struct AppState {
     /// Both advertised and enforced: the tool schemas render it as their `maximum`, so a
     /// client is shown the same number a call is measured against.
     pub max_search_limit: usize,
+    /// Most indexes one MCP federated search may name, from `[security.limits]`.
+    ///
+    /// Advertised and enforced the same way `max_search_limit` is, and for the same reason: a
+    /// caller must not be refused for exceeding a bound the catalogue did not show it.
+    pub max_federated_indexes: usize,
     /// Largest MCP search response in bytes, from `[security.limits]`.
     ///
     /// Hits past it are left out and the response says so. The limit bounds how many hits are

@@ -29,9 +29,57 @@ use crate::{
     protocol::{MCP_PROTOCOL_VERSION_HEADER, MCP_SESSION_ID_HEADER, SUPPORTED_PROTOCOL_VERSIONS},
     rpc::{error_response, handle_rpc_request, method_of, parse_json_rpc_request},
     session::{
-        McpShutdownHandle, McpTransportState, SessionAccess, SessionClaim, spawn_cleanup_task,
+        McpShutdownHandle, McpTransportState, SessionAccess, SessionClaim, SessionLimits,
+        spawn_cleanup_task,
     },
 };
+
+/// What the host decides about the MCP transport, as opposed to what the protocol decides.
+///
+/// Every field here is a number or a switch an operator can be wrong about in a way only their
+/// deployment can judge: how long a paused agent should keep its session, how many sessions a
+/// node will hold, how often a stream must be written to for the proxies in front of it to
+/// consider it alive, and whether the superseded transport is reachable at all. None of them
+/// changes what the server *says* — a client sees the same protocol either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpTransportConfig {
+    /// How long a session may sit idle before it is swept.
+    ///
+    /// Idle means nothing arrived and no connection is open on it. A client holding its
+    /// listening stream open is never idle, however long it pauses, so this bounds the
+    /// disconnected case: how much of a gap a client may leave and still find its session.
+    pub session_idle_timeout: Duration,
+
+    /// The most sessions the registry will hold, evicting the idlest at the cap.
+    pub max_sessions: usize,
+
+    /// How often an idle SSE stream is written to, on both transports.
+    ///
+    /// The number that decides whether an intermediary calls the connection dead. It has to be
+    /// below the shortest idle-read timeout between this node and its clients, and that is a
+    /// property of someone else's load balancer.
+    pub sse_keepalive: Duration,
+
+    /// Whether the superseded HTTP+SSE transport (`/sse` and `/messages`) is mounted.
+    ///
+    /// Off unmounts the routes rather than refusing them, the same way the admin API is
+    /// withheld: there is nothing left to probe, and nothing a misconfigured guard can
+    /// re-enable. Left on by default because turning it off strands any client still
+    /// configured for it.
+    pub legacy_sse_enabled: bool,
+}
+
+/// The transport a host that configures nothing gets.
+impl Default for McpTransportConfig {
+    fn default() -> Self {
+        Self {
+            session_idle_timeout: Duration::from_secs(1800),
+            max_sessions: 1024,
+            sse_keepalive: Duration::from_secs(15),
+            legacy_sse_enabled: true,
+        }
+    }
+}
 
 /// The caller a request carries, or the unrestricted one if the host inserted none.
 fn caller(authz: Option<Extension<McpAuthzRef>>) -> McpAuthzRef {
@@ -43,16 +91,21 @@ struct MessageQuery {
     session_id: String,
 }
 
-pub fn mcp_router<S>() -> (Router<S>, McpShutdownHandle)
+pub fn mcp_router<S>(config: McpTransportConfig) -> (Router<S>, McpShutdownHandle)
 where
     S: McpBackend,
 {
-    let transport_state = McpTransportState::default();
+    let transport_state = McpTransportState::new(SessionLimits {
+        idle_timeout: config.session_idle_timeout,
+        max_sessions: config.max_sessions,
+    });
 
     // Start global session cleanup task (respects cancellation token)
     spawn_cleanup_task(transport_state.clone());
 
     let handle = McpShutdownHandle::new(transport_state.clone());
+
+    let keepalive = config.sse_keepalive;
 
     let router = Router::new()
         // Streamable HTTP transport (MCP spec 2025-03-26+): a single MCP endpoint
@@ -70,10 +123,10 @@ where
                 },
             )
             .get(
-                |Extension(state): Extension<McpTransportState>,
-                 authz: Option<Extension<McpAuthzRef>>,
-                 headers: HeaderMap| async move {
-                    streamable_listen_handler(state, caller(authz), headers).await
+                move |Extension(state): Extension<McpTransportState>,
+                      authz: Option<Extension<McpAuthzRef>>,
+                      headers: HeaderMap| async move {
+                    streamable_listen_handler(state, caller(authz), headers, keepalive).await
                 },
             )
             .delete(
@@ -83,38 +136,47 @@ where
                     streamable_delete_handler(state, caller(authz), headers).await
                 },
             ),
-        )
-        // Legacy HTTP+SSE transport (MCP spec 2024-11-05): kept for backwards
-        // compatibility with already-configured clients.
-        .route(
-            "/sse",
-            get(
-                |Extension(state): Extension<McpTransportState>,
-                 authz: Option<Extension<McpAuthzRef>>| async move {
-                    mcp_sse_handler(state, caller(authz)).await
-                },
+        );
+
+    // Legacy HTTP+SSE transport (MCP spec 2024-11-05): kept for backwards compatibility with
+    // already-configured clients, and unmounted rather than refused when an operator turns it
+    // off — a route that is absent has no behaviour to get wrong.
+    let router = if config.legacy_sse_enabled {
+        router
+            .route(
+                "/sse",
+                get(
+                    move |Extension(state): Extension<McpTransportState>,
+                          authz: Option<Extension<McpAuthzRef>>| async move {
+                        mcp_sse_handler(state, caller(authz), keepalive).await
+                    },
+                )
+                .post(
+                    |State(app_state): State<S>,
+                     authz: Option<Extension<McpAuthzRef>>,
+                     Json(payload): Json<JsonValue>| async move {
+                        process_mcp_http_message(app_state, caller(authz), payload).await
+                    },
+                ),
             )
-            .post(
-                |State(app_state): State<S>,
-                 authz: Option<Extension<McpAuthzRef>>,
-                 Json(payload): Json<JsonValue>| async move {
-                    process_mcp_http_message(app_state, caller(authz), payload).await
-                },
-            ),
-        )
-        .route(
-            "/messages",
-            post(
-                |State(app_state): State<S>,
-                 Query(query): Query<MessageQuery>,
-                 Extension(state): Extension<McpTransportState>,
-                 authz: Option<Extension<McpAuthzRef>>,
-                 Json(payload): Json<JsonValue>| async move {
-                    process_mcp_message(app_state, query, state, caller(authz), payload).await
-                },
-            ),
-        )
-        .layer(Extension(transport_state));
+            .route(
+                "/messages",
+                post(
+                    |State(app_state): State<S>,
+                     Query(query): Query<MessageQuery>,
+                     Extension(state): Extension<McpTransportState>,
+                     authz: Option<Extension<McpAuthzRef>>,
+                     Json(payload): Json<JsonValue>| async move {
+                        process_mcp_message(app_state, query, state, caller(authz), payload).await
+                    },
+                ),
+            )
+    } else {
+        info!("MCP legacy HTTP+SSE transport disabled: /mcp/sse and /mcp/messages are not mounted");
+        router
+    };
+
+    let router = router.layer(Extension(transport_state));
 
     (router, handle)
 }
@@ -122,6 +184,7 @@ where
 async fn mcp_sse_handler(
     state: McpTransportState,
     authz: McpAuthzRef,
+    keepalive: Duration,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (session_id, rx) = {
         let (session_id, tx, rx) = state.create_sse_session(authz.key_id()).await;
@@ -144,11 +207,7 @@ async fn mcp_sse_handler(
         guard: SessionDropGuard { session_id, state },
     };
 
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    )
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(keepalive).text("keepalive"))
 }
 
 /// Guard that removes the session from the registry when the SSE stream is dropped.
@@ -340,11 +399,21 @@ async fn process_streamable_http<B: McpBackend>(
 /// Opens a server-to-client SSE stream. CameoDB does not currently initiate
 /// server-side requests, so this stream only emits keep-alive comments to hold
 /// the connection open, satisfying clients that establish a listening channel.
+///
+/// While the stream is open the session is registered as connected, which is what keeps the
+/// sweeper from reading a client that is present but quiet as one that has gone. The keep-alives
+/// are the reason that is sound: a client that disappears without closing the connection is
+/// noticed the next time one of them fails to write, and the guard below then releases the
+/// session to the ordinary idle timeout.
 async fn streamable_listen_handler(
     state: McpTransportState,
     authz: McpAuthzRef,
     headers: HeaderMap,
+    keepalive: Duration,
 ) -> Response {
+    // `Some` only for a stream opened on a session, which is what there is to hold open. A
+    // client may open one before `initialize`, and there is nothing to register for that.
+    let mut listening = None;
     if let Some(session_id) = session_id_of(&headers) {
         let key_id = authz.key_id();
         match state.claim_session(session_id, key_id.as_deref()).await {
@@ -352,16 +421,58 @@ async fn streamable_listen_handler(
             SessionClaim::WrongKey => return session_refusal(session_id).into_response(),
             SessionClaim::Unknown => return unknown_session_refusal(session_id).into_response(),
         }
+        if state.open_listener(session_id).await {
+            listening = Some(ListenerGuard {
+                session_id: session_id.to_string(),
+                state: state.clone(),
+            });
+        }
     }
 
-    let stream = futures::stream::pending::<Result<Event, Infallible>>();
+    let stream = ListeningStream {
+        inner: futures::stream::pending::<Result<Event, Infallible>>(),
+        guard: listening,
+    };
     Sse::new(stream)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keepalive"),
-        )
+        .keep_alive(KeepAlive::new().interval(keepalive).text("keepalive"))
         .into_response()
+}
+
+/// Releases a session's listening-stream registration when the stream is dropped.
+///
+/// Unlike [`SessionDropGuard`] this does not forget the session. A Streamable HTTP session
+/// outlives any one connection by design — that is the whole difference between the two
+/// transports — so a closed stream returns the session to the idle timeout rather than ending
+/// it.
+struct ListenerGuard {
+    session_id: String,
+    state: McpTransportState,
+}
+
+impl Drop for ListenerGuard {
+    fn drop(&mut self) {
+        let session_id = std::mem::take(&mut self.session_id);
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            state.close_listener(&session_id).await;
+            debug!(session_id = %session_id, "MCP listening stream closed");
+        });
+    }
+}
+
+/// A listening stream that holds its [`ListenerGuard`] for as long as the client reads it.
+struct ListeningStream<S> {
+    inner: S,
+    #[allow(dead_code)] // Held for its Drop impl
+    guard: Option<ListenerGuard>,
+}
+
+impl<S: Stream + Unpin> Stream for ListeningStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
 }
 
 fn session_id_of(headers: &HeaderMap) -> Option<&str> {

@@ -7,7 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`[mcp]` — the MCP transport's own settings, and a session that outlives a coffee break.**
+  Session lifetime was four constants compiled into the transport, and the shortest of them was
+  the one operators met: five minutes of idle, after which a paused agent's next tool call came
+  back `transport error: failed to send request: session terminated (404). need to
+  re-initialize`. Nothing in a config file could move it.
+
+  ```toml
+  [mcp]
+  enabled = true                     # false unmounts /mcp entirely
+  session_idle_timeout_secs = 1800   # was a fixed 300
+  max_sessions = 1024                # unchanged default
+  sse_keepalive_secs = 15            # unchanged default, previously duplicated in two handlers
+  legacy_sse_enabled = true          # false unmounts /mcp/sse and /mcp/messages
+  ```
+
+  The default idle timeout is now **thirty minutes** rather than five. A Streamable HTTP session
+  holds no conversation state — an id, an activity clock, and the key that owns it — so holding
+  one for half an hour costs a few hundred bytes, while losing one costs an agent a
+  re-initialize in the middle of a task. `max_sessions` is what bounds the memory, and it still
+  evicts the idlest at the cap rather than refusing a new caller.
+
+  The sweep interval is *not* configurable, and is now derived as a tenth of the idle timeout
+  (between 1 s and 60 s). Two independent knobs admit a config where the sweep is slower than
+  the timeout, and then the sweep interval silently becomes the timeout — a session set to
+  expire in five minutes living for an hour, with nothing to read that says why.
+
+  `legacy_sse_enabled = false` and `enabled = false` *unmount* their routes rather than refusing
+  them, the same way `admin_enabled` withholds the admin API: a route that is absent has nothing
+  to probe and no guard to misconfigure. Both are on by default, so an upgrade strands nobody.
+  If you are reaching for the legacy transport to get longer sessions, don't: it never idles
+  out, but it ties the session to one TCP connection and forgets it the instant that connection
+  drops — no grace period at all, where a Streamable HTTP session survives the reconnect. For a
+  client that pauses and comes back, that is the worse trade.
+
+- **`[security.limits] max_federated_indexes`** — the most indexes one `search_across_indexes`
+  may name, previously fixed at 20. It sits beside `max_search_limit` because it is the same
+  kind of bound, metered against the same subject: each name is a full scatter-gather across
+  that index's shards, so the argument is a multiplier on what one call costs, which is why the
+  rate limiter already charges a federated search per index named rather than per call.
+  Advertised as the tool's `maxItems` and enforced by the dispatcher, so a schema-driven client
+  never builds a call that will be refused, and it also caps what one call may be *charged* —
+  otherwise a node that narrowed its fan-out would still bill twenty. `0` is refused at load.
+
 ### Fixed
+
+- **A client holding its MCP listening stream open no longer has its session swept.** The
+  Streamable HTTP `GET /mcp` stream registered nothing with the session registry, so the
+  sweeper could only see the time since the last POST. A client that opened its listening
+  channel and then paused — which is what an agent waiting on a human does — was read as idle
+  and had its session taken while the server was still writing keep-alives to the socket it was
+  reading. Its next tool call was answered `404`.
+
+  The legacy transport never had this problem: a session with a live push channel is kept
+  regardless of how long its client is quiet. That exemption now covers both transports, on the
+  same reasoning — a connection the server is holding open says more about whether the client
+  is there than the time since its last request does. Closing the stream returns the session to
+  the ordinary idle timeout rather than ending it, which is the difference from a legacy SSE
+  session and the reason a client whose stream was cut can still resume on its next POST.
 
 - **The packaged systemd unit stopped the node it was documented to let start.** The unit gates
   `ExecStart` on `ExecStartPre=cameodb check-config`, and this release made that check fail a

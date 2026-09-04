@@ -42,24 +42,50 @@ use crate::http_server::write::{
 };
 use crate::state::AppState;
 
+/// What the surface in front of the handlers is configured with.
+///
+/// Named rather than passed as a run of positional arguments: five of these are numbers or
+/// booleans, two of them are derived from other settings rather than read straight out of the
+/// file, and a transposition among them is the kind that compiles. `max_body_size_mb` next to
+/// `max_concurrent_requests` is the pair that matters most — swapped, the node would accept
+/// enormous bodies four at a time.
+pub struct RouterConfig<'a> {
+    /// Maximum request body size in MB. Derived from `limits.max_record_size_mb` unless pinned.
+    pub max_body_size_mb: usize,
+    /// Allowed CORS origins, from `[network.http]`.
+    pub cors_allowed_origins: &'a [String],
+    /// Maximum concurrent in-flight HTTP requests.
+    pub max_concurrent_requests: usize,
+    /// How long one request may take before it is answered `408`. Also derived.
+    pub request_timeout_secs: u64,
+    /// Whether `/_admin/*` is mounted at all.
+    pub admin_enabled: bool,
+    /// The `[mcp]` section: which of the MCP transport is mounted, and session lifetime.
+    pub mcp: &'a crate::config::McpConfig,
+}
+
 /// Creates the main HTTP router with all endpoints and middleware
 ///
 /// # Arguments
 /// * `state` - Application state with actor references
-/// * `max_body_size_mb` - Maximum request body size in MB (from config)
-/// * `cors_allowed_origins` - List of allowed CORS origins (from config)
-/// * `max_concurrent_requests` - Maximum concurrent in-flight HTTP requests
+/// * `keyring` - The keys the authorization gate decides against
+/// * `config` - See [`RouterConfig`]
 pub fn create_router(
     state: AppState,
-    max_body_size_mb: usize,
-    cors_allowed_origins: &[String],
-    max_concurrent_requests: usize,
-    request_timeout_secs: u64,
-    admin_enabled: bool,
     keyring: Arc<crate::auth::KeyRing>,
+    config: &RouterConfig<'_>,
 ) -> (Router, McpShutdownHandle) {
+    let &RouterConfig {
+        max_body_size_mb,
+        cors_allowed_origins,
+        max_concurrent_requests,
+        request_timeout_secs,
+        admin_enabled,
+        mcp,
+    } = config;
+
     let body_limit_bytes = max_body_size_mb * 1024 * 1024;
-    let (mcp_routes, mcp_handle) = mcp_router::<AppState>();
+    let (mcp_routes, mcp_handle) = mcp_router::<AppState>(mcp.transport());
     // The gate writes to the same sink the handlers do, so a request produces one record
     // whichever layer had the last word about it.
     let audit = Arc::clone(&state.audit);
@@ -130,8 +156,17 @@ pub fn create_router(
             .expose_headers([HeaderName::from_static(MCP_SESSION_ID_HEADER)])
     };
 
-    let router = Router::new()
-        .nest("/mcp", mcp_routes)
+    // `/mcp` is mounted unless an operator turned it off, in which case the routes are absent
+    // rather than refusing — the same reasoning as `admin_enabled` below. The handle is still
+    // returned so shutdown has one code path either way; it drains an empty registry.
+    let router = Router::new();
+    let router = if mcp.enabled {
+        router.nest("/mcp", mcp_routes)
+    } else {
+        info!("MCP disabled: /mcp routes are not mounted");
+        router
+    };
+    let router = router
         // API routes
         .route("/api/{index}/search", post(search_handler))
         .route("/api/{index}/search/stream", post(search_stream_handler))
