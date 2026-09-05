@@ -314,6 +314,33 @@ pub struct StorageConfig {
     pub wal_sync: bool,
 }
 
+/// Replace every whitespace character the query grammar cannot skip with a plain space.
+///
+/// Tantivy's lenient set parser (`IN [ ... ]`) advances over inter-element space with nom's
+/// `multispace`, which is ASCII only — space, tab, CR, LF. A term character is anything that is
+/// not `char::is_whitespace()`. Any character that is whitespace to Rust but not one of those
+/// four ASCII spaces therefore satisfies neither: the parser cannot consume it as space and
+/// will not take it as a term, so an unterminated set such as `IN[\u{a0}` loops forever,
+/// appending an error each turn until the process is out of memory. A single query body reaches
+/// this through `parse_query_lenient`, so it is an unauthenticated way to wedge a search thread.
+///
+/// Folding those characters to an ASCII space closes the gap: the same byte the parser already
+/// knows how to step over, in a position where whitespace is what the character meant. Inside a
+/// quoted phrase it merges two tokens the default tokenizer already splits on, so a search
+/// returns what it did before. Borrow the query unchanged when it holds none of them.
+fn fold_untokenizable_whitespace(query: &str) -> Cow<'_, str> {
+    let is_trap = |c: char| c.is_whitespace() && !matches!(c, ' ' | '\t' | '\n' | '\r');
+    if !query.contains(is_trap) {
+        return Cow::Borrowed(query);
+    }
+    Cow::Owned(
+        query
+            .chars()
+            .map(|c| if is_trap(c) { ' ' } else { c })
+            .collect(),
+    )
+}
+
 /// Convert a date literal into RFC3339 Z string using the same rules as indexing.
 /// Returns None if the literal cannot be parsed as a date.
 fn normalize_date_literal(lit: &str) -> Option<String> {
@@ -636,6 +663,12 @@ fn prepare_query_parser(
     schema: &IndexSchema,
     query: &str,
 ) -> (String, Vec<String>, tantivy::query::QueryParser) {
+    // Fold whitespace the grammar's set parser cannot skip down to an ASCII space first, so no
+    // later pass — and above all `parse_query_lenient` — is handed a character that makes its
+    // element loop spin without consuming input.
+    let query = fold_untokenizable_whitespace(query);
+    let query = query.as_ref();
+
     // Shadow names first, so every later rewriter — and the parser — sees only fields the
     // Tantivy schema actually carries.
     let query = rewrite_shadow_fields(query, schema);
