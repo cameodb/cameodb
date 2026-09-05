@@ -3501,3 +3501,89 @@ async fn a_new_field_holding_a_list_is_typed_by_its_elements() {
         "a range matches the document on its second value: {found}"
     );
 }
+
+/// Dropping an index together with its schema takes the name out of the catalogue.
+///
+/// The schema row outlives the deletion so a write already in flight can read that the index
+/// went away, but nothing that reports what this node holds may see it.
+#[tokio::test]
+async fn dropping_an_index_with_its_schema_takes_it_out_of_the_listing() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    client
+        .write_document("gone", "d1", &json!({"id": "d1", "title": "here"}), None)
+        .await
+        .expect("write");
+    client.admin_index_commit("gone").await.expect("commit");
+
+    let before = client.list_indexes(false).await.expect("listing before");
+    assert!(
+        serde_json::to_string(&before).unwrap().contains("gone"),
+        "the index should be listed before it is dropped: {before:?}"
+    );
+
+    client.delete_index("gone", true).await.expect("drop");
+
+    let after = client.list_indexes(false).await.expect("listing after");
+    assert!(
+        !serde_json::to_string(&after).unwrap().contains("\"gone\""),
+        "a dropped index must not appear in the listing: {after:?}"
+    );
+    let health = client.health().await.expect("health after the drop");
+    assert!(
+        health.node_id.is_some(),
+        "the node should still answer for itself after a drop"
+    );
+}
+
+/// Writing under a name whose schema was dropped types the index afresh.
+///
+/// That is what dropping the schema asks for: the next write is the index's first write, so
+/// its fields are sampled and indexed rather than being recorded as additions to a schema
+/// that no longer exists — which would leave them non-indexed and unsearchable.
+#[tokio::test]
+async fn writing_after_a_drop_types_the_index_afresh() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    client
+        .write_document("reborn", "d1", &json!({"id": "d1", "title": "first life"}), None)
+        .await
+        .expect("write before the drop");
+    client.admin_index_commit("reborn").await.expect("commit");
+
+    client.delete_index("reborn", true).await.expect("drop");
+
+    // A different field, so this cannot pass on anything the old schema left behind.
+    client
+        .write_document(
+            "reborn",
+            "d2",
+            &json!({"id": "d2", "headline": "second life"}),
+            None,
+        )
+        .await
+        .expect("write after the drop");
+    client.admin_index_commit("reborn").await.expect("commit again");
+
+    let hits = client
+        .search("reborn", "headline:second", Some(10), None, None, None)
+        .await
+        .expect("content search on the field the new write introduced");
+    assert_eq!(
+        hits["hits"].as_array().map(|h| h.len()).unwrap_or(0),
+        1,
+        "a field introduced by the first write after a drop should be searchable"
+    );
+
+    let gone = client
+        .search("reborn", "id:d1", Some(10), None, None, None)
+        .await
+        .expect("lookup of the dropped document");
+    assert_eq!(
+        gone["hits"].as_array().map(|h| h.len()).unwrap_or(0),
+        0,
+        "the documents the drop removed must not come back with the name"
+    );
+}
