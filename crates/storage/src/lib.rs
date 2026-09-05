@@ -5346,6 +5346,11 @@ impl HybridStore {
         // Leaving it non-zero makes the next commit_index for this name believe there is
         // unflushed data.
         self.operations_counter.remove(index);
+        // Warmup is invalidated by generation equality, and this name's next reader starts
+        // its generation counter from zero. Dropping both entries is what makes the next
+        // warm actually run, and stops the name reporting warm while it holds no data.
+        self.warmed_generations.remove(index);
+        self.warmup_states.remove(index);
         // Note: index_init_locks is deliberately not cleared. A concurrent
         // get_or_create_index may be holding the lock, and replacing it here would let a
         // later caller initialize the same index in parallel with that holder.
