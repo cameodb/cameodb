@@ -3223,15 +3223,24 @@ impl OrchestratorEngine {
         map.get(index).cloned()
     }
 
-    /// Insert or replace a schema in the cache (copy-on-write).
+    /// Insert a schema in the cache, unless the cache already holds a newer one.
+    ///
+    /// Version decides, not arrival order, so a write that resolved against a schema before it
+    /// was dropped cannot put that schema back over the record of the deletion. Ordering by
+    /// version costs a comparison and needs nothing coordinated between concurrent writers.
     fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
         let schema_arc = Arc::new(schema.clone());
         let index_str = index.to_string();
 
         self.schema_cache.rcu(|old| {
+            if let Some(current) = old.get(&index_str)
+                && current.version > schema_arc.version
+            {
+                return Arc::clone(old);
+            }
             let mut new = (**old).clone();
             new.insert(index_str.clone(), schema_arc.clone());
-            new
+            Arc::new(new)
         });
     }
 
@@ -6797,7 +6806,10 @@ impl NodeOrchestrator {
         //
         // So ask before inventing. `is_initial_creation` is what licenses sampling and it now
         // means "no schema for this index exists anywhere I can see", not merely "none here".
-        let mut is_initial_creation = schema_cache.fields.is_empty();
+        // A record of a deletion counts as no schema: its fields are gone, so there is nothing
+        // to evolve and this write is the one creating the index.
+        let mut is_initial_creation = schema_cache.fields.is_empty()
+            || schema_cache.state == storage::SchemaState::Dropped;
 
         if is_initial_creation
             && let Some(body) = schema_body
@@ -6870,6 +6882,10 @@ impl NodeOrchestrator {
         if is_initial_creation {
             let sampled_schema = enhanced_schema_sampling(docs, SCHEMA_SAMPLE_LIMIT);
             let sampled_field_count = sampled_schema.fields.len();
+
+            // Whatever this settles on describes a live index. Set before the merge so the
+            // schema persisted below never carries a deletion it has just undone.
+            schema_cache.state = storage::SchemaState::Active;
 
             // Merge sampled schema into cache for better type detection
             for (field_name, field_def) in &sampled_schema.fields {
@@ -7444,15 +7460,24 @@ impl NodeOrchestrator {
         map.get(index).cloned()
     }
 
-    /// Insert or replace a schema in the cache (copy-on-write).
+    /// Insert a schema in the cache, unless the cache already holds a newer one.
+    ///
+    /// Version decides, not arrival order, so a write that resolved against a schema before it
+    /// was dropped cannot put that schema back over the record of the deletion. Ordering by
+    /// version costs a comparison and needs nothing coordinated between concurrent writers.
     fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
         let schema_arc = Arc::new(schema.clone());
         let index_str = index.to_string();
 
         self.schema_cache.rcu(|old| {
+            if let Some(current) = old.get(&index_str)
+                && current.version > schema_arc.version
+            {
+                return Arc::clone(old);
+            }
             let mut new = (**old).clone();
             new.insert(index_str.clone(), schema_arc.clone());
-            new
+            Arc::new(new)
         });
     }
 
@@ -8692,7 +8717,12 @@ impl NodeOrchestrator {
             }
         }
 
-        // Clear this index's cached schema (lock-free).
+        // Drop the entry, then cache what the shards now hold in its place.
+        //
+        // An empty entry gives `put_cached_schema` nothing to compare against, so a write that
+        // resolved against the old schema and is only now finishing validation would install
+        // it again. The record of the deletion carries a version above anything a write in
+        // flight holds, which is what makes that comparison refuse.
         {
             let idx = index.to_string();
             self.schema_cache.rcu(|old| {
@@ -8700,6 +8730,18 @@ impl NodeOrchestrator {
                 new.remove(&idx);
                 new
             });
+        }
+        if delete_schema
+            && let Some(shard) = self.shards.values().next()
+            && let Some(store) = &shard.store
+        {
+            let sc = Arc::clone(store);
+            let idx = index.to_string();
+            if let Ok(Ok(Some(dropped))) =
+                tokio::task::spawn_blocking(move || sc.get_schema(&idx)).await
+            {
+                self.put_cached_schema(index, &dropped);
+            }
         }
 
         Ok(serde_json::json!({
