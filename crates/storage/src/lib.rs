@@ -2327,10 +2327,45 @@ impl SchemaFieldUpdate {
     }
 }
 
+/// Whether a stored schema row records a deletion rather than describing a live index.
+///
+/// A row that will not decode counts as live, so an index whose metadata cannot be read stays
+/// in the listings rather than dropping out of them.
+fn schema_records_a_deletion(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<IndexSchema>(bytes)
+        .map(|schema| schema.state == SchemaState::Dropped)
+        .unwrap_or(false)
+}
+
+/// Whether a schema describes a live index or records that one was dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaState {
+    /// The index exists and answers.
+    #[default]
+    Active,
+    /// The index and its schema were dropped.
+    ///
+    /// The row is kept so a write arriving after the drop reads that the index is gone,
+    /// instead of finding nothing and typing the index from its own document — which would
+    /// leave every field it discovers non-indexed, in a Tantivy column only a reindex can
+    /// change.
+    ///
+    /// The fields are cleared, so nothing is left to inherit and the next write samples
+    /// afresh. `version` is above the dropped schema's, so a write still carrying that schema
+    /// cannot install it over this row.
+    Dropped,
+}
+
 /// Index schema definition for validation and evolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSchema {
     pub fields: HashMap<String, FieldDef>,
+    /// Whether this schema describes a live index or records that one was dropped.
+    ///
+    /// Defaulted, so a schema stored before this field existed reads back as `Active`.
+    #[serde(default)]
+    pub state: SchemaState,
     #[serde(default = "default_version")]
     pub version: u64,
     #[serde(default = "default_timestamp")]
@@ -2357,6 +2392,7 @@ impl Default for IndexSchema {
         let now = chrono::Utc::now().timestamp();
         Self {
             fields: HashMap::new(),
+            state: SchemaState::Active,
             version: 1,
             created_at: now,
             updated_at: now,
@@ -4415,6 +4451,8 @@ impl HybridStore {
         let now = chrono::Utc::now().timestamp();
         IndexSchema {
             fields,
+            // Derived from an index on disk, so it describes a live one.
+            state: SchemaState::Active,
             version: 1,
             created_at: now,
             updated_at: now,
@@ -5005,21 +5043,50 @@ impl HybridStore {
         Ok((result, committed))
     }
 
+    /// Whether this name's schema records that its index was dropped.
+    ///
+    /// Answered from the schema cache in the ordinary case, so a write pays a redb read only
+    /// for a name this shard has not touched since it opened.
+    fn index_was_dropped(&self, index: &str) -> bool {
+        if let Some(cached) = self.schema_cache.get(index) {
+            return cached.state == SchemaState::Dropped;
+        }
+        let Ok(read_txn) = self.kv.begin_read() else {
+            return false;
+        };
+        match read_txn.open_table(TABLE_SCHEMA) {
+            Ok(schema_table) => match schema_table.get(index) {
+                Ok(Some(bytes)) => schema_records_a_deletion(bytes.value()),
+                _ => false,
+            },
+            Err(_) => false,
+        }
+    }
+
     /// Whether this shard knows `index` at all, without opening or creating anything.
     ///
     /// The schema table is the registry — `get_index_names` enumerates exactly it — so a row
-    /// there means the index was created, whether or not a document has ever been written to it.
-    /// The writer cache is checked first because an index taking writes is the common case and
-    /// answering from it costs no transaction.
+    /// there means the index was created, whether or not a document has ever been written to
+    /// it, unless that row records a deletion. The schema cache is checked first because it
+    /// answers both questions at once and costs no transaction.
     pub fn index_exists(&self, index: &str) -> bool {
-        if self.writers.contains_key(index) || self.schema_cache.contains_key(index) {
+        if let Some(cached) = self.schema_cache.get(index) {
+            return cached.state == SchemaState::Active;
+        }
+        if self.writers.contains_key(index) {
             return true;
         }
         let Ok(read_txn) = self.kv.begin_read() else {
             return false;
         };
         match read_txn.open_table(TABLE_SCHEMA) {
-            Ok(schema_table) => matches!(schema_table.get(index), Ok(Some(_))),
+            // A row recording a deletion is not an index.
+            Ok(schema_table) => match schema_table.get(index) {
+                Ok(Some(bytes)) => serde_json::from_slice::<IndexSchema>(bytes.value())
+                    .map(|schema| schema.state == SchemaState::Active)
+                    .unwrap_or(true),
+                _ => false,
+            },
             // No schema table yet, so no index has ever been created here.
             Err(_) => false,
         }
@@ -5033,6 +5100,14 @@ impl HybridStore {
         // the trace left by deleting nothing. A put is unaffected: it is the caller that
         // legitimately creates.
         if matches!(op, WalOp::Delete { .. }) && !self.index_exists(index) {
+            return Err(StoreError::IndexNotFound(index.to_string()));
+        }
+
+        // A put creates the index it names, but not one whose schema has been dropped. The
+        // caller settles a schema before dispatching, replacing the record of the deletion, so
+        // a write that still finds that record raced the drop and has no settled schema to be
+        // indexed under.
+        if self.index_was_dropped(index) {
             return Err(StoreError::IndexNotFound(index.to_string()));
         }
 
@@ -5281,6 +5356,10 @@ impl HybridStore {
             size_cache.retain(|key, _| !key.contains(&format!(":{}", index)));
         }
 
+        // Held past the transaction so the cache can take it, which is what lets
+        // `index_was_dropped` answer from memory.
+        let mut tombstone: Option<IndexSchema> = None;
+
         // Delete redb tables completely using delete_table() for efficiency
         let mut write_txn = self.kv.begin_write()?;
         {
@@ -5307,16 +5386,44 @@ impl HybridStore {
                 let _ = meta_table.remove(index)?;
             }
 
-            // Conditionally delete schema metadata if requested
+            // Dropping the schema records the deletion rather than removing the row. The
+            // fields go, so the next write samples afresh; the row stays, so a write already
+            // in flight reads that the index is gone.
             if delete_schema {
-                tracing::debug!(index = %index, "Deleting schema metadata from TABLE_SCHEMA");
                 let mut schema_table = write_txn.open_table(TABLE_SCHEMA)?;
-                let _ = schema_table.remove(index)?;
+                let previous = schema_table
+                    .get(index)?
+                    .and_then(|bytes| serde_json::from_slice::<IndexSchema>(bytes.value()).ok());
+                if let Some(previous) = previous {
+                    let mut new_tombstone = IndexSchema {
+                        state: SchemaState::Dropped,
+                        // Above the dropped schema's, so a write still carrying it cannot
+                        // install it over this row.
+                        version: previous.version.saturating_add(1),
+                        created_at: previous.created_at,
+                        updated_at: chrono::Utc::now().timestamp(),
+                        ..IndexSchema::default()
+                    };
+                    new_tombstone.fields.clear();
+                    let encoded = serde_json::to_vec(&new_tombstone)
+                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                    schema_table.insert(index, encoded.as_slice())?;
+                    tracing::debug!(
+                        index = %index,
+                        version = new_tombstone.version,
+                        "Schema dropped; recorded the deletion in TABLE_SCHEMA"
+                    );
+                    tombstone = Some(new_tombstone);
+                }
             } else {
                 tracing::debug!(index = %index, "Keeping schema metadata in TABLE_SCHEMA");
             }
         }
         write_txn.commit()?;
+
+        if let Some(tombstone) = tombstone {
+            self.schema_cache.insert(index.to_string(), Arc::new(tombstone));
+        }
 
         // Remove tantivy directory
         if index_path.exists() {
@@ -6638,6 +6745,11 @@ impl HybridStore {
             return Err(StoreError::IndexNotFound(index.to_string()));
         }
 
+        // See the second guard in `apply_write`.
+        if self.index_was_dropped(index) {
+            return Err(StoreError::IndexNotFound(index.to_string()));
+        }
+
         // Get or create the index
         let (writer_arc, fields) = self.get_or_create_index(index)?;
 
@@ -7059,7 +7171,10 @@ impl HybridStore {
 
         if let Ok(schema_table) = read_txn.open_table(TABLE_SCHEMA) {
             for result in schema_table.iter()? {
-                let (index_name, _) = result?;
+                let (index_name, bytes) = result?;
+                if schema_records_a_deletion(bytes.value()) {
+                    continue;
+                }
                 index_names.insert(index_name.value().to_string());
             }
         }
@@ -7210,7 +7325,10 @@ impl HybridStore {
         match read_txn.open_table(TABLE_SCHEMA) {
             Ok(schema_table) => {
                 for result in schema_table.iter()? {
-                    let (index_name, _) = result?;
+                    let (index_name, bytes) = result?;
+                    if schema_records_a_deletion(bytes.value()) {
+                        continue;
+                    }
                     index_names.push(index_name.value().to_string());
                 }
             }
