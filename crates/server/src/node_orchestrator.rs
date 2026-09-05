@@ -3808,6 +3808,33 @@ pub struct ShardRuntime {
     pub writer_pin: WriterPin,
 }
 
+/// Run a blocking read on the shared read pool — or tokio's generic blocking pool when a shard
+/// has none — and turn a panic in the closure into an error instead of a process-ending abort.
+///
+/// A search executes tantivy and redb inside `f`, either of which can panic on a shape a
+/// validator did not anticipate. With `panic = "unwind"` in the release profile, tokio unwinds
+/// that panic into the task's `JoinHandle`, which resolves to a `JoinError`; mapping it here
+/// leaves the caller with one failed request while the pool — and every other shard on the node
+/// — keeps serving. This is the seam finding 01 turns on: under the old `panic = "abort"` the
+/// same panic took the whole process down.
+///
+/// Split out from [`MicroshardActor::spawn_on_read_pool`] so the isolation itself is testable
+/// without standing up a shard: it depends on nothing but the pool handle.
+async fn dispatch_read_pool<F, R>(
+    handle: Option<&tokio::runtime::Handle>,
+    f: F,
+) -> Result<R, OrchestratorError>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let joined = match handle {
+        Some(handle) => handle.spawn_blocking(f).await,
+        None => tokio::task::spawn_blocking(f).await,
+    };
+    joined.map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
+}
+
 impl MicroshardActor {
     pub fn new(shard_id: Uuid, storage_config: StorageConfig, runtime: ShardRuntime) -> Self {
         let ShardRuntime {
@@ -4445,16 +4472,7 @@ impl MicroshardActor {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        if let Some(handle) = &self.read_pool_handle {
-            handle
-                .spawn_blocking(f)
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
-        } else {
-            tokio::task::spawn_blocking(f)
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
-        }
+        dispatch_read_pool(self.read_pool_handle.as_ref(), f).await
     }
 
     /// Handles search requests on the dedicated read thread pool.
@@ -10676,6 +10694,53 @@ impl Drop for NodeOrchestrator {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A panic inside a read must cost one request, not the node.
+    ///
+    /// The whole point of `panic = "unwind"` in the release profile is that a panic raised deep
+    /// in tantivy or redb — on a query or document shape a validator missed — unwinds into the
+    /// read task's `JoinHandle` instead of aborting the process. `dispatch_read_pool` is the
+    /// boundary that catches it, and this pins both halves of what that buys: the panicking read
+    /// comes back as an error, and the same pool that ran it serves the next read.
+    ///
+    /// `cargo test` always unwinds, so this exercises the code-level isolation rather than the
+    /// release profile flag; a release-profile smoke test against the built binary is the
+    /// separate half of proving finding 01.
+    #[test]
+    fn a_panicking_read_is_an_error_and_the_read_pool_keeps_serving() {
+        // The pool a shard builds: one worker thread, a bounded blocking pool.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .expect("read runtime");
+        let handle = runtime.handle().clone();
+
+        runtime.block_on(async {
+            // The dedicated-pool path a real search takes.
+            let panicked: Result<(), OrchestratorError> =
+                dispatch_read_pool(Some(&handle), || panic!("tantivy panicked on a document"))
+                    .await;
+            assert!(
+                panicked.is_err(),
+                "a panic in a read must surface as an error, not take the process down"
+            );
+            let after: u32 = dispatch_read_pool(Some(&handle), || 7)
+                .await
+                .expect("the dedicated read pool serves the next read after a panic");
+            assert_eq!(after, 7);
+
+            // And the fallback path, for a shard with no dedicated pool.
+            let panicked: Result<(), OrchestratorError> =
+                dispatch_read_pool(None, || panic!("redb panicked")).await;
+            assert!(panicked.is_err(), "the fallback pool isolates a panic too");
+            let after: u32 = dispatch_read_pool(None, || 9)
+                .await
+                .expect("the fallback pool serves the next read after a panic");
+            assert_eq!(after, 9);
+        });
+    }
 
     /// An engine with no shards and no coordinator. Enough to exercise `execute`'s dispatch
     /// table, which decides what the worker pool will and will not serve before any shard,
