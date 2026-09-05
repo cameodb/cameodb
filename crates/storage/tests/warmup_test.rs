@@ -300,3 +300,64 @@ fn commit_invalidates_warmup_and_rewarm_restores_it() {
     assert_eq!(after_commit.num_docs, 40);
     assert!(store.is_index_warm(index));
 }
+
+/// Deleting an index drops its Tantivy directory and its reader, so the name's next reader
+/// numbers its generations from zero again. Warmup is invalidated by generation equality, so
+/// a leftover entry from the previous life matches the new reader's first generation and the
+/// recreated index is skipped — warm by the map, cold in every segment cache.
+#[test]
+fn an_index_recreated_after_deletion_is_warmed_again() {
+    for delete_schema in [false, true] {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let index = "recycled";
+
+        let store = open_store(temp_dir.path());
+        seed_index(&store, index, 20);
+
+        let first = store.warm_index(index).expect("warm_index").expect("stats");
+        assert!(first.segments_warmed > 0, "first warm must do work");
+
+        store
+            .delete_index_data(index, delete_schema)
+            .expect("delete_index_data");
+
+        seed_index(&store, index, 20);
+
+        let second = store.warm_index(index).expect("warm_index").expect("stats");
+        assert_eq!(second.num_docs, 20, "the recreated index holds its documents");
+        assert!(
+            second.segments_warmed > 0,
+            "delete_schema={delete_schema}: the recreated index must be warmed, \
+             not skipped against the generation its predecessor warmed"
+        );
+    }
+}
+
+/// An index that no longer exists is not warm. Warmup state is keyed by name, so leaving the
+/// entry behind reports the name as warm with no directory and no data underneath it.
+#[test]
+fn deleting_an_index_takes_its_warmup_state_with_it() {
+    for delete_schema in [false, true] {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let index = "discarded";
+
+        let store = open_store(temp_dir.path());
+        seed_index(&store, index, 10);
+        store.warm_index(index).expect("warm_index");
+        assert!(store.is_index_warm(index));
+
+        store
+            .delete_index_data(index, delete_schema)
+            .expect("delete_index_data");
+
+        assert!(
+            !store.is_index_warm(index),
+            "delete_schema={delete_schema}: a deleted index must not report warm"
+        );
+        assert_eq!(
+            store.warmup_states().get(index),
+            None,
+            "delete_schema={delete_schema}: a deleted index must leave no warmup state"
+        );
+    }
+}
