@@ -3851,8 +3851,9 @@ impl MicroshardActor {
         // Startup runs in two phases, both off the async runtime.
         //
         // Phase 1 (recovery) is a correctness requirement: an index whose WAL tail was never
-        // committed answers searches without its most recent writes, so it must be replayed.
-        // Only indices whose persisted checkpoint falls short of their WAL are touched.
+        // committed answers searches without its most recent writes, so it must be replayed
+        // and committed. Only indices whose persisted checkpoint falls short of their WAL
+        // are touched.
         //
         // Phase 2 (warmup) is purely latency: it opens and caches the *reader* for each
         // index and faults in its segment structures, so the first query from an agent or
@@ -3862,7 +3863,14 @@ impl MicroshardActor {
         // Neither phase blocks `start()`. Requests are served throughout via lazy
         // initialization; the phases only determine whether that work has already been done.
         //
-        // After startup the same thread keeps serving re-warm requests: the writer thread
+        // The writer channel is created here rather than beside the writer thread below,
+        // because phase 1 needs a sender: the commit that finishes a replay belongs on the
+        // writer thread like every other commit.
+        let (tx, mut rx) = mpsc::channel::<StorageCommand>(SHARD_WRITER_CHANNEL_CAPACITY);
+        let recovery_writer_tx = tx.clone();
+        self.writer_tx = Some(tx);
+
+        // After startup the warmup thread keeps serving re-warm requests: the writer thread
         // posts an index name here after each commit, so the segment a commit just published
         // gets warmed without doing that work on the write hot path. The channel is bounded
         // and posted to with `try_send`, making re-warming strictly best-effort — a full
@@ -3883,9 +3891,59 @@ impl MicroshardActor {
                 }
             };
 
+            // `get_or_create_index` leaves a replayed tail in the writer's buffer rather
+            // than committing inline: on a large index that is segment merging and an fsync
+            // inside a call that only meant to open the index. Phase 1 commits it here, so
+            // the phase ends in a state that stands on its own — the ordinary flush triggers
+            // are both write-driven, and a recovered index may take no further writes.
+            //
+            // The commits go through the writer thread like every other, serializing against
+            // any write already arriving, and each truncates the WAL range it covers.
+            // Awaiting one before sending the next costs nothing — that thread runs them one
+            // at a time — and surfaces a failure instead of dropping the reply.
+            let mut committed = 0usize;
+            for index in &plan.recovered {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                if recovery_writer_tx
+                    .blocking_send(StorageCommand::Commit {
+                        index: index.clone(),
+                        reply: reply_tx,
+                    })
+                    .is_err()
+                {
+                    warn!(
+                        shard_id = %shard_id,
+                        index = %index,
+                        "Writer thread is gone; the recovered tail stays in the WAL for the next boot"
+                    );
+                    break;
+                }
+                match reply_rx.blocking_recv() {
+                    Ok(Ok(())) => committed += 1,
+                    Ok(Err(e)) => warn!(
+                        shard_id = %shard_id,
+                        index = %index,
+                        error = %e,
+                        "Could not commit the recovered tail; it stays in the WAL for the next boot"
+                    ),
+                    Err(_) => warn!(
+                        shard_id = %shard_id,
+                        index = %index,
+                        "Writer thread dropped the reply to the recovery commit"
+                    ),
+                }
+            }
+
+            // Nothing below sends to the writer thread; releasing the sender keeps this task
+            // out of the set that decides when the channel closes.
+            drop(recovery_writer_tx);
+
+            // Logged after the commits: the shard is queryable for a replayed tail only once
+            // they land.
             info!(
                 shard_id = %shard_id,
                 recovered = plan.recovered.len(),
+                committed = committed,
                 failed = plan.failed.len(),
                 pending_warmup = plan.pending_warmup.len(),
                 "Phase 1 complete - shard is queryable"
@@ -3937,10 +3995,8 @@ impl MicroshardActor {
             }
         });
 
-        // Spawn dedicated writer thread for serialized I/O
-        let (tx, mut rx) = mpsc::channel::<StorageCommand>(SHARD_WRITER_CHANNEL_CAPACITY);
-        self.writer_tx = Some(tx);
-
+        // Spawn dedicated writer thread for serialized I/O. Its channel was created above,
+        // before phase 1, so recovery could post its commits onto it.
         let writer_store = store_arc;
         let shutdown = self.shutdown_notify.clone();
         let writer_shard_id = self.shard_id;
