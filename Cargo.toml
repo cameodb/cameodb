@@ -55,7 +55,12 @@ lto = true              # Full Link Time Optimization for smallest binary
 codegen-units = 1       # Single codegen unit for best optimization
 strip = true            # Strip all symbols for smallest binary
 debug = false           # No debug info
-panic = "abort"         # Smaller panic handling
+panic = "unwind"        # Unwind so a panic can be caught at a boundary instead of taking the
+                        # whole process — every shard on the node — down. A search runs tantivy
+                        # and redb inside a blocking task whose JoinHandle turns an unwinding
+                        # panic into an error, so one malformed request fails rather than the
+                        # node. Costs ~4.5 MB of binary size over "abort"; the blast radius is
+                        # worth more than the bytes.
 
 # Docker-friendly profile: thin LTO avoids OOM in memory-constrained builders
 [profile.release-docker]
