@@ -9,6 +9,12 @@ description = "A high-performance distributed hybrid-search database"
 name = "cameodb"
 path = "src/main.rs"
 
+[features]
+# Compile-time panic seams for the panic-isolation smoke test. Off by default, so a shipped
+# binary carries none of them; the test builds with `--features fault-injection` to drive a real
+# panic into each hardened surface and prove the release profile unwinds rather than aborts.
+fault-injection = []
+
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
