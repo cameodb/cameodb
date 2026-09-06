@@ -3967,6 +3967,22 @@ mod fault_injection {
             "fault-injection: writer thread past its guard"
         );
     }
+
+    /// Hold a crashed writer's monitor before it rebuilds, for the milliseconds named by
+    /// `CAMEODB_FAULT_RESPAWN_DELAY_MS`. The respawn is otherwise immediate, so the window in
+    /// which a shard has no writer — the one `mark_writer_down` exists to make visible — closes
+    /// faster than a health poll can see it. Widening it here lets the smoke test assert the red
+    /// that a dead writer must report, instead of racing it. Unset (the default) holds not at all,
+    /// so every other run keeps the immediate respawn.
+    pub fn hold_before_respawn() {
+        let held = std::env::var("CAMEODB_FAULT_RESPAWN_DELAY_MS")
+            .ok()
+            .and_then(|ms| ms.parse::<u64>().ok())
+            .unwrap_or(0);
+        if held > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(held));
+        }
+    }
 }
 
 fn guard_writer_op<T>(
@@ -4592,6 +4608,11 @@ fn writer_monitor(rt: WriterRuntime, mut handle: std::thread::JoinHandle<WriterE
             debug!(shard_id = %rt.shard_id, "Writer monitor stopping");
             break;
         }
+        // Only ever a no-op outside the fault-injection build: the smoke test uses it to hold the
+        // shard writerless long enough to observe the red that a crash must report.
+        #[cfg(feature = "fault-injection")]
+        fault_injection::hold_before_respawn();
+
         match relaunch_writer(&rt) {
             Ok(new_handle) => {
                 handle = new_handle;
