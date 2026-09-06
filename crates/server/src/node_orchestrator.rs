@@ -4091,27 +4091,48 @@ impl MicroshardActor {
                 .spawn(move || {
                     if !plan.pending_warmup.is_empty() {
                         let requested = plan.pending_warmup.len();
-                        let warmed = warmup_store.warm_indices(&plan.pending_warmup);
-                        info!(
-                            shard_id = %shard_id,
-                            warmed = warmed,
-                            requested = requested,
-                            "Phase 2 complete - index readers warmed"
-                        );
+                        // Warming is a latency optimisation — a query warms its index on demand
+                        // regardless — so a panic here must not take the re-warm loop below down
+                        // with it and leave every later commit unwarmed.
+                        let warmed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            warmup_store.warm_indices(&plan.pending_warmup)
+                        }));
+                        match warmed {
+                            Ok(warmed) => info!(
+                                shard_id = %shard_id,
+                                warmed = warmed,
+                                requested = requested,
+                                "Phase 2 complete - index readers warmed"
+                            ),
+                            Err(_) => warn!(
+                                shard_id = %shard_id,
+                                "startup warmup panicked; indices will warm on demand"
+                            ),
+                        }
                     }
 
                     // Serve re-warm requests until the writer thread drops its sender, which
                     // happens when the shard shuts down. `warm_index` skips a searcher
                     // generation it has already warmed, so bursts of commits on one index
-                    // collapse into a single warm.
+                    // collapse into a single warm. Each warm is caught: a panic warming one
+                    // index costs that index its pre-warming, not every later index its re-warm.
                     while let Ok(index) = warm_rx.recv() {
-                        if let Err(e) = warmup_store.warm_index(&index) {
-                            debug!(
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            warmup_store.warm_index(&index)
+                        }));
+                        match outcome {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => debug!(
                                 shard_id = %shard_id,
                                 index = %index,
                                 error = %e,
                                 "Post-commit warm failed; queries will warm this index on demand"
-                            );
+                            ),
+                            Err(_) => warn!(
+                                shard_id = %shard_id,
+                                index = %index,
+                                "warming panicked; this index will warm on demand"
+                            ),
                         }
                     }
 
