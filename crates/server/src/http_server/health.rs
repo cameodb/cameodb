@@ -76,6 +76,13 @@ pub(super) async fn health_handler(
         .map(|s| s.health.clone())
         .unwrap_or_else(|| "green".to_string());
 
+    // A dead writer thread means at least one shard can take no more writes until the node
+    // restarts. Reads may still be served, but an orchestrator should stop routing to this node
+    // and restart it, so it reports red whatever the cluster view says. This is the only part of
+    // the anonymous response that touches local node state, and it is a single atomic load — it
+    // never reaches the read pool or a shard's writer, so it cannot itself stall.
+    let status = worst_status(status, state.writer_liveness.down_count());
+
     if !identified {
         // Still the *real* status, not a constant: a health check that cannot go yellow is
         // not a health check, and this is what a load balancer reads.
@@ -151,4 +158,36 @@ pub(super) async fn health_handler(
     };
 
     Ok(Json(response).into_response())
+}
+
+/// Fold local writer-thread liveness into the cluster health string.
+///
+/// A shard whose writer thread has died can accept no more writes until the node restarts, which
+/// an orchestrator should treat as a reason to stop routing here and recycle the node — so any
+/// down writer forces `red`, whatever the cluster view reported. With none down the cluster
+/// status stands.
+fn worst_status(cluster_status: String, writers_down: usize) -> String {
+    if writers_down > 0 {
+        "red".to_string()
+    } else {
+        cluster_status
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worst_status;
+
+    #[test]
+    fn a_down_writer_forces_red_over_any_cluster_status() {
+        assert_eq!(worst_status("green".to_string(), 1), "red");
+        assert_eq!(worst_status("yellow".to_string(), 2), "red");
+        assert_eq!(worst_status("red".to_string(), 1), "red");
+    }
+
+    #[test]
+    fn with_every_writer_alive_the_cluster_status_stands() {
+        assert_eq!(worst_status("green".to_string(), 0), "green");
+        assert_eq!(worst_status("yellow".to_string(), 0), "yellow");
+    }
 }

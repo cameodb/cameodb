@@ -3037,6 +3037,13 @@ pub enum StoreError {
     #[error("index not found: {0}")]
     IndexNotFound(String),
 
+    /// A write whose index writer panicked and was reset. The document was not applied and the
+    /// writer has been dropped so the next write rebuilds it, so the operation is safe to retry.
+    /// Its own variant so the writer thread can reply it in place of an unwind that would end the
+    /// thread, and so the HTTP layer can answer a retriable failure rather than a bad request.
+    #[error("index writer for '{0}' panicked and was reset; retry the write")]
+    WriterPanicked(String),
+
     #[error("invalid index name: {0}")]
     InvalidIndexName(String),
 

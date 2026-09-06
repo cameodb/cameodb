@@ -471,6 +471,9 @@ async fn main() -> Result<()> {
     let worker_tx = orchestrator.worker_tx();
     let shared_routing_ring = orchestrator.shared_routing_ring();
     let shard_placement = orchestrator.shard_placement();
+    // Taken before the orchestrator is moved into its actor, so the health endpoint can probe
+    // writer liveness with an atomic load rather than a message the work path could delay.
+    let writer_liveness = orchestrator.writer_liveness();
 
     // NOW spawn the NodeOrchestrator as an actor (after all setup is done)
     let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
@@ -606,6 +609,7 @@ async fn main() -> Result<()> {
         max_federated_indexes: cameodb_config.security.limits.max_federated_indexes,
         max_response_bytes: cameodb_config.effective_max_response_bytes(),
         audit: Arc::clone(&audit_sink),
+        writer_liveness,
     };
 
     // Create the HTTP router with shared state and body limit derived from max_record_size_mb

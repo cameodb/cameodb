@@ -1811,10 +1811,12 @@ impl OrchestratorError {
             Self::Storage(StoreError::IndexNotFound(_)) => RemoteVerdict::NotFound,
 
             // Neither the caller's fault nor a fault at all — see `SchemaUnconfirmed` and
-            // `PeerUnreachable`. Both are "not now", and both are worth retrying.
-            Self::SchemaUnconfirmed { .. } | Self::PeerUnreachable { .. } => {
-                RemoteVerdict::Unavailable
-            }
+            // `PeerUnreachable`. Both are "not now", and both are worth retrying. A writer that
+            // panicked and was reset is the same shape: the document was not applied, the writer
+            // is rebuilt on the next write, and the caller should retry.
+            Self::SchemaUnconfirmed { .. }
+            | Self::PeerUnreachable { .. }
+            | Self::Storage(StoreError::WriterPanicked(_)) => RemoteVerdict::Unavailable,
 
             // Its own verdict because the forwarding node has to act on it and must not confuse
             // it with any other "not now": the retry that answers it carries something extra,
@@ -3774,6 +3776,8 @@ pub struct MicroshardActor {
     /// target upstream is what keeps a writer on the same core as the worker that feeds it:
     /// both come from one ordinal and one layout.
     writer_pin: WriterPin,
+    /// Node-wide writer liveness this shard's writer thread marks if it stops serving.
+    writer_liveness: Arc<WriterLiveness>,
 }
 
 impl std::fmt::Debug for MicroshardActor {
@@ -3806,6 +3810,60 @@ pub struct ShardRuntime {
     pub supervisor_timeout_secs: u64,
     /// Where the writer thread pins, and where it reports what happened.
     pub writer_pin: WriterPin,
+    /// Node-wide writer liveness the writer thread marks if it stops serving.
+    pub writer_liveness: Arc<WriterLiveness>,
+}
+
+/// Node-wide count of writer threads that have stopped serving, read by the health endpoint.
+///
+/// A shard's writer thread is the sole path for every write to that shard. If it exits for any
+/// reason but a requested shutdown — a panic that escaped the per-command guard, or its channel
+/// closing unexpectedly — that shard accepts no more writes until the process restarts, and
+/// nothing else on the node notices. This counter is the notice: the writer thread bumps it as
+/// it stops, and the anonymous health branch reads it with a single atomic load — a bounded,
+/// non-blocking probe that never touches the work path — so a node with a dead writer stops
+/// reporting green.
+#[derive(Debug, Default)]
+pub struct WriterLiveness {
+    down: AtomicUsize,
+}
+
+impl WriterLiveness {
+    /// Record that a writer thread has stopped serving. Called once, as the thread exits.
+    pub fn mark_writer_down(&self) {
+        self.down.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// How many writer threads have stopped. Zero on a healthy node.
+    pub fn down_count(&self) -> usize {
+        self.down.load(AtomicOrdering::Relaxed)
+    }
+}
+
+/// Apply one writer operation, turning a panic inside it into an error for this index's callers
+/// instead of an unwind that ends the writer thread.
+///
+/// A search can be retried as it was; a panicked write cannot trust what it touched. A panic in
+/// tantivy or redb leaves the index's `IndexWriter` in an unknown state and poisons its mutex,
+/// so the only safe response is to drop it — the next write rebuilds it, exactly as an eviction
+/// does — and fail this one operation. The writer thread goes on serving every other index, so a
+/// document that panics the parser costs one request rather than the shard.
+fn guard_writer_op<T>(
+    store: &HybridStore,
+    index: &str,
+    op: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)) {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!(
+                index = %index,
+                "writer operation panicked; resetting the index writer so the next write rebuilds it"
+            );
+            store.force_remove_writer(index);
+            Err(StoreError::WriterPanicked(index.to_string()))
+        }
+    }
 }
 
 /// Run a blocking read on the shared read pool — or tokio's generic blocking pool when a shard
@@ -3844,6 +3902,7 @@ impl MicroshardActor {
             writer_shutdown_timeout_secs,
             supervisor_timeout_secs,
             writer_pin,
+            writer_liveness,
         } = runtime;
 
         Self {
@@ -3860,6 +3919,7 @@ impl MicroshardActor {
             writer_shutdown_timeout_secs,
             supervisor_timeout_secs,
             writer_pin,
+            writer_liveness,
         }
     }
 
@@ -4037,6 +4097,7 @@ impl MicroshardActor {
         let shutdown = self.shutdown_notify.clone();
         let writer_shard_id = self.shard_id;
         let writer_pin = self.writer_pin.clone();
+        let writer_liveness = Arc::clone(&self.writer_liveness);
 
         let handle = std::thread::Builder::new()
             .name(format!("writer-shard-{}", writer_shard_id))
@@ -4050,10 +4111,18 @@ impl MicroshardActor {
 
                 info!(shard_id = %writer_shard_id, "Writer thread started (write coalescing enabled)");
 
-                // Reusable buffers to avoid per-iteration allocations
-                let mut pending_cmds: Vec<StorageCommand> = Vec::with_capacity(256);
+                // Each index's writes go through `guard_writer_op`, so a panic applying one
+                // index becomes an error for that index and rebuilds its writer while the thread
+                // keeps serving. This outer boundary is the last resort: a panic anywhere else in
+                // the loop ends the thread rather than unwinding into the process (which the
+                // release profile now lets unwind), and marks the writer down so health sees a
+                // shard that can no longer take writes. A clean exit — a shutdown command, or the
+                // channel closing as the node tears down — is not a fault and marks nothing.
+                let loop_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Reusable buffers to avoid per-iteration allocations
+                    let mut pending_cmds: Vec<StorageCommand> = Vec::with_capacity(256);
 
-                while let Some(first_cmd) = rx.blocking_recv() {
+                    while let Some(first_cmd) = rx.blocking_recv() {
                     // Phase 1: Drain all pending commands from the channel.
                     // The first command blocks until available; subsequent commands
                     // are non-blocking to coalesce as many writes as possible.
@@ -4116,7 +4185,9 @@ impl MicroshardActor {
                         if writes.len() == 1 {
                             // Single write — no coalescing overhead needed
                             let (op, reply) = writes.pop().unwrap();
-                            let res = writer_store.apply_write_and_maybe_commit(index, op);
+                            let res = guard_writer_op(&writer_store, index, || {
+                                writer_store.apply_write_and_maybe_commit(index, op)
+                            });
                             match &res {
                                 Ok((_, true)) => {
                                     tracing::info!(index = %index, "Writer: threshold commit after write");
@@ -4131,7 +4202,9 @@ impl MicroshardActor {
                             let coalesced_count = writes.len();
                             let (ops, replies): (Vec<WalOp>, Vec<_>) = writes.drain(..).unzip();
 
-                            let res = writer_store.apply_batch_and_maybe_commit(index, ops);
+                            let res = guard_writer_op(&writer_store, index, || {
+                                writer_store.apply_batch_and_maybe_commit(index, ops)
+                            });
                             match res {
                                 Ok(((seq_ids, _new_docs), committed)) => {
                                     if committed {
@@ -4177,7 +4250,9 @@ impl MicroshardActor {
                         if batches.len() == 1 {
                             // Single batch — no coalescing overhead needed
                             let (ops, reply) = batches.into_iter().next().unwrap();
-                            let res = writer_store.apply_batch_and_maybe_commit(&index, ops);
+                            let res = guard_writer_op(&writer_store, &index, || {
+                                writer_store.apply_batch_and_maybe_commit(&index, ops)
+                            });
                             match &res {
                                 Ok((_, true)) => {
                                     tracing::info!(index = %index, "Writer: threshold commit after batch write");
@@ -4200,7 +4275,9 @@ impl MicroshardActor {
                             }
 
                             let total_ops = merged_ops.len();
-                            let res = writer_store.apply_batch_and_maybe_commit(&index, merged_ops);
+                            let res = guard_writer_op(&writer_store, &index, || {
+                                writer_store.apply_batch_and_maybe_commit(&index, merged_ops)
+                            });
                             match res {
                                 Ok(((seq_ids, new_docs), committed)) => {
                                     if committed {
@@ -4263,7 +4340,9 @@ impl MicroshardActor {
 
                     // Phase 5: Process commits after all writes are applied
                     for (index, reply) in commits {
-                        let res = writer_store.commit_index(&index);
+                        let res = guard_writer_op(&writer_store, &index, || {
+                            writer_store.commit_index(&index)
+                        });
                         if res.is_ok() {
                             committed_indices.insert(index.clone());
                         }
@@ -4272,7 +4351,9 @@ impl MicroshardActor {
 
                     // Phase 5b: Process writer evictions (commit then drop from cache)
                     for (index, reply) in evictions {
-                        if let Err(e) = writer_store.commit_index(&index) {
+                        if let Err(e) = guard_writer_op(&writer_store, &index, || {
+                            writer_store.commit_index(&index)
+                        }) {
                             tracing::warn!(index = %index, error = %e, "Evict: commit failed, evicting anyway");
                         }
                         let removed = writer_store.force_remove_writer(&index);
@@ -4283,7 +4364,9 @@ impl MicroshardActor {
                     // Phase 5c: Process index deletions last, so any writes that were
                     // batched alongside the delete are applied before their tables go away.
                     for (index, delete_schema, reply) in deletions {
-                        let res = writer_store.delete_index_data(&index, delete_schema);
+                        let res = guard_writer_op(&writer_store, &index, || {
+                            writer_store.delete_index_data(&index, delete_schema)
+                        });
                         match &res {
                             Ok(()) => info!(index = %index, delete_schema, "Index data deleted"),
                             Err(e) => warn!(index = %index, error = %e, "Index deletion failed"),
@@ -4308,9 +4391,22 @@ impl MicroshardActor {
                         info!(shard_id = %writer_shard_id, "Writer thread shutting down");
                         break;
                     }
+                    }
+                }));
+
+                if loop_outcome.is_err() {
+                    // A panic reached past every per-command guard. The thread is done and this
+                    // shard can take no more writes until the node restarts; record it so the
+                    // health endpoint stops reporting green instead of leaving it silently wedged.
+                    writer_liveness.mark_writer_down();
+                    tracing::error!(
+                        shard_id = %writer_shard_id,
+                        "writer thread panicked and stopped; this shard cannot accept writes until the node restarts"
+                    );
+                } else {
+                    info!(shard_id = %writer_shard_id, "Writer thread stopped");
                 }
                 shutdown.notify_one();
-                info!(shard_id = %writer_shard_id, "Writer thread stopped");
             })
             .map_err(OrchestratorError::Io)?;
 
@@ -6510,6 +6606,9 @@ impl RouterActor {
 pub struct NodeOrchestrator {
     /// Map of shard UUIDs to their microshard actors
     pub(crate) shards: HashMap<Uuid, MicroshardActor>,
+    /// Node-wide writer-thread liveness, shared with every shard's writer thread and read by
+    /// the health endpoint so a dead writer stops the node reporting green.
+    writer_liveness: Arc<WriterLiveness>,
     /// This node's identity (UUID, name, virtual tokens)
     identity: NodeIdentity,
     /// Node configuration  
@@ -7738,6 +7837,7 @@ impl NodeOrchestrator {
 
         let mut orchestrator = Self {
             shards: HashMap::new(),
+            writer_liveness: Arc::new(WriterLiveness::default()),
             identity,
             config,
             routing_ring: ConsistentRing::new(),
@@ -8103,6 +8203,7 @@ impl NodeOrchestrator {
             let default_search_limit = self.default_search_limit;
             let read_handle = self.read_runtime.as_ref().map(|rt| rt.handle().clone());
             let sem = Arc::clone(&semaphore);
+            let writer_liveness = Arc::clone(&self.writer_liveness);
             // Placed here rather than inside the task: hydration runs concurrently, and an
             // ordinal handed out in completion order would not survive a restart.
             let writer_core = self.place_shard(shard_id);
@@ -8123,6 +8224,7 @@ impl NodeOrchestrator {
                         writer_shutdown_timeout_secs,
                         supervisor_timeout_secs,
                         writer_pin: writer_core,
+                        writer_liveness,
                     },
                 );
 
@@ -8321,6 +8423,7 @@ impl NodeOrchestrator {
                 writer_shutdown_timeout_secs: self.config.writer_shutdown_timeout_secs,
                 supervisor_timeout_secs: self.config.supervisor_timeout_secs,
                 writer_pin: writer_core,
+                writer_liveness: Arc::clone(&self.writer_liveness),
             },
         );
         microshard.start().await?;
@@ -8552,6 +8655,12 @@ impl NodeOrchestrator {
     /// Gets the number of active shards.
     pub fn shard_count(&self) -> usize {
         self.shards.len()
+    }
+
+    /// A handle to this node's writer-thread liveness, for the health endpoint to read. Taken
+    /// before the orchestrator is moved into its actor, so health can probe it without a message.
+    pub fn writer_liveness(&self) -> Arc<WriterLiveness> {
+        Arc::clone(&self.writer_liveness)
     }
 
     // ========================================================================
@@ -10740,6 +10849,54 @@ mod tests {
                 .expect("the fallback pool serves the next read after a panic");
             assert_eq!(after, 9);
         });
+    }
+
+    fn writer_test_config(path: std::path::PathBuf) -> StorageConfig {
+        StorageConfig {
+            shard_path: path,
+            indexer_memory_budget: 32 * 1024 * 1024,
+            indexer_memory_min_mb: 16,
+            indexer_memory_max_mb: 256,
+            total_memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+            memory_pressure_threshold_percent: 80,
+            indexer_num_threads: 1,
+            merge_num_threads: 1,
+            default_batch_size: 1000,
+            wal_sync: true,
+        }
+    }
+
+    /// A panic applying a write is caught and reported, not left to unwind the writer thread.
+    ///
+    /// This is the per-command boundary the writer loop wraps every op in: a panic in tantivy or
+    /// redb becomes a `WriterPanicked` error for that index's caller — retriable, because the
+    /// writer is dropped and rebuilt on the next write — while the thread goes on. A normal result
+    /// passes straight through.
+    #[test]
+    fn guard_writer_op_turns_a_panic_into_a_retriable_writer_reset() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store =
+            HybridStore::new(writer_test_config(dir.path().to_path_buf()), 1).expect("store");
+
+        let ok: Result<u32, StoreError> = guard_writer_op(&store, "idx", || Ok(7));
+        assert_eq!(ok.expect("a normal op passes through"), 7);
+
+        let panicked: Result<u32, StoreError> =
+            guard_writer_op(&store, "idx", || panic!("tantivy panicked mid-write"));
+        assert!(
+            matches!(&panicked, Err(StoreError::WriterPanicked(index)) if index == "idx"),
+            "a panicked write is reported as a writer reset, got {panicked:?}"
+        );
+    }
+
+    /// The liveness counter the health endpoint reads reflects each writer that stops.
+    #[test]
+    fn writer_liveness_counts_the_writers_that_have_stopped() {
+        let liveness = WriterLiveness::default();
+        assert_eq!(liveness.down_count(), 0);
+        liveness.mark_writer_down();
+        liveness.mark_writer_down();
+        assert_eq!(liveness.down_count(), 2);
     }
 
     /// An engine with no shards and no coordinator. Enough to exercise `execute`'s dispatch
