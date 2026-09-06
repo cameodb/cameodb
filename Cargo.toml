@@ -35,7 +35,7 @@ tantivy = { version = "0.26.1", features = ["stemmer"] }
 tokio = { version = "1.52.1", features = ["full"] }
 toml = "1.1"
 tower = "0.5.3"
-tower-http = { version = "0.7.0", features = ["trace", "cors", "limit", "timeout", "compression-br", "decompression-br"] }
+tower-http = { version = "0.7.0", features = ["trace", "cors", "limit", "timeout", "compression-br", "decompression-br", "catch-panic"] }
 thiserror = "2.0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

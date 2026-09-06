@@ -20,8 +20,9 @@ use axum::{
 use cameodb_mcp::{MCP_SESSION_ID_HEADER, McpShutdownHandle, mcp_router};
 use tokio::sync::Semaphore;
 use tower_http::{
-    compression::CompressionLayer, cors::CorsLayer, decompression::DecompressionLayer,
-    limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer,
+    catch_panic::CatchPanicLayer, compression::CompressionLayer, cors::CorsLayer,
+    decompression::DecompressionLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
+    trace::TraceLayer,
 };
 use tracing::{info, warn};
 
@@ -243,9 +244,37 @@ pub fn create_router(
             crate::authz::authorize,
         ))
         .layer(cors_layer)
+        // Convert a panic in a handler or any inner layer into a 500 rather than a dropped
+        // connection. Placed just inside the trace layer, so a caught panic is logged as a
+        // normal 500 response and outside every other layer, so a panic in auth, the
+        // concurrency guard or a body limit is caught too. A search panic is already contained
+        // at the read pool; this covers the async handlers that never reach it. It relies on the
+        // release profile unwinding — under the old `panic = "abort"` there was nothing to catch.
+        .layer(CatchPanicLayer::custom(handle_panic))
         .layer(TraceLayer::new_for_http());
 
     (router, mcp_handle)
+}
+
+/// Turn a caught handler panic into the same masked 500 an unclassified error answers with.
+///
+/// The panic payload is logged for an operator and withheld from the caller — a panic message can
+/// carry internals, and the caller can act on none of it. A JSON `{"error":"Internal server
+/// error"}` matches what [`crate::http_server::error::AppError`] returns for a server fault, so a
+/// panicked request is indistinguishable on the wire from any other 500.
+fn handle_panic(panic: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    let detail = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic payload>");
+    tracing::error!(panic = %detail, "request handler panicked; answering 500");
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": "Internal server error" })),
+    )
+        .into_response()
 }
 
 /// Fallback handler for 404/405 to return JSON error shape
@@ -257,4 +286,35 @@ async fn fallback_handler(uri: axum::http::Uri) -> impl IntoResponse {
             "path": uri.to_string()
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_panic;
+    use axum::http::StatusCode;
+
+    /// A caught panic answers the masked 500, and the panic text never reaches the caller.
+    #[tokio::test]
+    async fn a_panic_becomes_a_masked_500() {
+        // The payload a `panic!("...")` produces.
+        let response = handle_panic(Box::new("handler blew up on a document".to_string()));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json, serde_json::json!({ "error": "Internal server error" }));
+        assert!(
+            !String::from_utf8_lossy(&body).contains("blew up"),
+            "the panic message must not reach the caller"
+        );
+    }
+
+    /// A panic whose payload is not a string is still a 500, not a second panic.
+    #[test]
+    fn a_non_string_panic_is_still_a_500() {
+        let response = handle_panic(Box::new(42u32));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
