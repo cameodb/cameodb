@@ -76,12 +76,12 @@ pub(super) async fn health_handler(
         .map(|s| s.health.clone())
         .unwrap_or_else(|| "green".to_string());
 
-    // A dead writer thread means at least one shard can take no more writes until the node
-    // restarts. Reads may still be served, but an orchestrator should stop routing to this node
-    // and restart it, so it reports red whatever the cluster view says. This is the only part of
-    // the anonymous response that touches local node state, and it is a single atomic load — it
-    // never reaches the read pool or a shard's writer, so it cannot itself stall.
-    let status = worst_status(status, state.writer_liveness.down_count());
+    // A writer that has died, or is wedged mid-batch, means at least one shard can take no more
+    // writes. Reads may still be served, but an orchestrator should stop routing to this node and
+    // recycle it, so it reports red whatever the cluster view says. This is the only part of the
+    // anonymous response that touches local node state, and it is a load of a handful of atomics
+    // — it never reaches the read pool or a shard's writer, so it cannot itself stall.
+    let status = worst_status(status, state.writer_liveness.unavailable_writers());
 
     if !identified {
         // Still the *real* status, not a constant: a health check that cannot go yellow is
@@ -162,12 +162,12 @@ pub(super) async fn health_handler(
 
 /// Fold local writer-thread liveness into the cluster health string.
 ///
-/// A shard whose writer thread has died can accept no more writes until the node restarts, which
-/// an orchestrator should treat as a reason to stop routing here and recycle the node — so any
-/// down writer forces `red`, whatever the cluster view reported. With none down the cluster
-/// status stands.
-fn worst_status(cluster_status: String, writers_down: usize) -> String {
-    if writers_down > 0 {
+/// A shard whose writer thread has died or wedged mid-batch can accept no more writes, which an
+/// orchestrator should treat as a reason to stop routing here and recycle the node — so any
+/// unavailable writer forces `red`, whatever the cluster view reported. With every writer serving,
+/// the cluster status stands.
+fn worst_status(cluster_status: String, writers_unavailable: usize) -> String {
+    if writers_unavailable > 0 {
         "red".to_string()
     } else {
         cluster_status
