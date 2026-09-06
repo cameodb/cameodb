@@ -42,11 +42,11 @@ on one.
 | 13 — Thread-per-core & memory operations | ◐ Partial | Stage 2f.2 (CPU arenas) and 2f.3 (per-arena jemalloc stats) — both with the evidence against 2f.2 |
 | 14 — Security hardening | ◐ Partial | Stage C3 only (per-index role overrides); complexity caps deferred |
 | 15 — HA: reindex, replication, migration | 📋 Planned | All three stages |
-| 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 4.2, Stage 3's deeper warming options, and the measurement on the reporting node |
+| 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 4.2, Stage 3's deeper warming options, the measurement on the reporting node, and a cap on open index writers (E5) |
 | 17 — Record deletion | ✅ Done | — |
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
-| 14 — Security hardening (posture items C3–C7) | ◐ Partial | C5 and C6 open; C3, C4 and C7 done |
+| 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH8 done, CH9 and CH12 partial, CH10–CH11 are write-path duplication |
 
 ## Reconciliation, 2026-08-26
@@ -620,6 +620,17 @@ on, and six tests read it.
 `debug!("{:?}", config)` leaks the PSK. Hand-implement `Debug` for `ClusterConfig` (or wrap the
 field in a redacting type), the way `ClusterPsk` and `ApiKey` already do.
 
+### C8 — REST has no rate limit, and anonymous MCP callers share one bucket
+
+📋 **Planned** (0.3.3 stability audit, finding 09). The token-bucket limiter is wired into exactly
+one place — `tool_limiter.check(...)` in `mcp/governance.rs` (23) — so the REST read and write API
+is governed only by `max_concurrent_requests` and body size, which bound instantaneous concurrency
+but place no ceiling on sustained request rate from one caller. Separately, within MCP every
+unidentified caller shares a single bucket (`ratelimit.rs` 141, 182): one anonymous client can
+spend that budget and deny it to the rest, with no per-address dimension to fall back on. Both may
+be intentional for a node expected to sit behind a gateway — if so, that expectation belongs in the
+deployment docs; otherwise meter the REST surface and give anonymous callers a per-address bucket.
+
 ---
 
 ## D. Phase 15 — High Availability: Reindex, Replication & Migration 📋 Planned
@@ -672,7 +683,9 @@ into a closed one.
 
 📋 **Planned.** Documents copied beyond their primary shard placement, so a lost node loses
 availability rather than data. Depends on [D1](#d1--reindex) for catch-up: a rebuilt replica is
-the same operation as a rebuilt index, from a different source.
+the same operation as a rebuilt index, from a different source. This is the durability gap the
+0.3.3 stability audit records as finding 08 — today the Kademlia record puts use `Quorum::One`
+(`swarm/behaviour.rs` 138, 198, 235), so a lost node loses its shards' data outright.
 
 ### D3 — Migration
 
@@ -720,6 +733,19 @@ Nothing else in this phase should be called finished before this runs.
   needs a checked-in fixture index or a build-flag seam.
 - **A legacy WAL tail replaying end to end**, for the same reason. `decode_wal_entry` is unit
   tested against both formats, and the replay body above it is format-agnostic by construction.
+
+### E5 — A cap on open index writers
+
+📋 **Planned** (0.3.3 stability audit, finding 07). `writers` is a `DashMap` that grows with the
+number of distinct indexes written to (`storage/src/lib.rs` 3410), and every entry is a live
+Tantivy `IndexWriter` holding its own indexing arena — `indexer_memory_budget`, default 64 MiB
+(1432), scaled up further by the optimal-budget calculation. Nothing evicts by count or by total
+budget; the only eviction is the admin endpoint. Resident memory is therefore proportional to how
+many index *names* a workload touches, not to how much data it holds — and since writes create
+indexes implicitly, that count is caller-controlled, so a tenant-per-index or date-partitioned
+pattern reaches an uncomfortable footprint quickly. Bound the set: an LRU or total-budget cap that
+commits and drops the coldest writer when a new one would exceed it — the same drop-and-rebuild an
+eviction already does.
 
 ---
 
@@ -959,6 +985,22 @@ and 8.02ms after, p99 within run-to-run spread. The reason to do it anyway is th
 unconditional and unnecessary, and the `ClusterCoordinator` is one actor that also serves gossip,
 shard registration and snapshot persistence — nothing that does not need it should be queuing
 behind it, whatever this hardware happens to show.
+
+### F7 — The request timeout sheds the client, not the work
+
+📋 **Planned** (0.3.3 stability audit, finding 05). Searches run as blocking closures dispatched
+with `spawn_blocking` onto the read pool, bounded by `max_blocking_threads` (`node_orchestrator.rs`
+8232). Tokio never cancels a blocking closure — dropping its `JoinHandle` neither stops work that
+has started nor dequeues work that has not — so when `TimeoutLayer` (`routes.rs` 239) fires it
+drops the request future and releases the concurrency permit while the Tantivy work behind it runs
+to completion. Under sustained overload the permits recycle every `request_timeout_secs` and admit
+more work while the read-pool backlog fills with searches whose clients have left: admission is
+capped (`max_concurrent_requests`, default 128), the backlog behind it is not, and a retrying
+client makes it worse — the shape of a metastable failure. The read-pool health signal added for
+finding 02 now makes a genuinely wedged pool *visible*; what is still missing is a deadline the
+search itself honours, so the work stops when the client is gone. Give the search a cancellation
+token or a deadline checked at segment boundaries, and/or bound the backlog so excess load is
+rejected fast rather than queued.
 
 ---
 
