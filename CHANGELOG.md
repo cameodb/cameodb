@@ -51,8 +51,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Advertised as the tool's `maxItems` and enforced by the dispatcher, so a schema-driven client
   never builds a call that will be refused, and it also caps what one call may be *charged* —
   otherwise a node that narrowed its fan-out would still bill twenty. `0` is refused at load.
+- **Health reports a node whose data path has stopped serving.** `/_cluster/health` reported the
+  cluster's view of itself and nothing about whether this node could still do work, so a shard
+  that had stopped taking writes — or a read pool with every thread stuck — still answered
+  `green` while an orchestrator kept routing to it. Three local conditions now force `red`,
+  whatever the cluster status says:
+
+  - a **writer thread that has exited**, which it records as it stops;
+  - a **writer alive but wedged**, stamped by a per-writer heartbeat and read as stuck once it has
+    been mid-batch for sixty seconds — the case an exit count can never catch, because the thread
+    never returns to report itself;
+  - a **read pool that is wedged**: every thread in flight, and no read having started or finished
+    for sixty seconds.
+
+  The identified body also gains `read_pool_in_flight` and `read_pool_capacity`. Saturation is a
+  gauge and deliberately never colours the status — a pool draining a burst is doing its job, and
+  only a pool that has stopped making progress is a fault. The whole verdict is a handful of
+  atomic loads against a monotonic origin shared by every writer and the reader: it touches no
+  actor and no work path, so the check cannot queue behind the thing it reports on, and a
+  wall-clock step can neither fake a stall nor mask one.
 
 ### Fixed
+
+- **A panic no longer takes the node down.** The release profile built with `panic = "abort"`, so
+  a panic anywhere — one malformed request reaching a corner of tantivy or redb — ended the
+  process and every shard on it. The profile now unwinds, and four boundaries catch what unwinds:
+
+  - **A read** runs as a blocking closure on the read pool, whose join already mapped a failure to
+    an error, so a panicking search fails that one request and the pool serves the next.
+  - **A write, commit or delete** on a writer thread runs through a per-command guard that drops
+    that index's writer — the next write rebuilds it, exactly as an eviction does — and answers
+    `503`, retriable, because a panicked write cannot trust what it touched. The thread goes on
+    serving every other index.
+  - **A handler panic** is caught by a layer just inside the trace layer and outside every other
+    one, so a panic in auth, the concurrency guard or a body limit is answered with the same
+    masked `{"error": "Internal server error"}` any server fault gets, rather than unwinding out
+    of the task and resetting the connection. Nothing from the panic message reaches the wire.
+  - **A warm** is best-effort and now stays that way: a panic warming one index is logged and the
+    re-warm loop continues, instead of ending warming for the whole shard and leaving every later
+    commit unwarmed and every query paying cold-start latency.
+
+  Binary size grows about 4.5 MB, which is what the unwinding tables cost. The blast radius is
+  worth more than the bytes.
+
+  A smoke test drives a real panic over HTTP into the read pool, the request handler, the
+  per-command write guard and the writer thread itself, against the built **release** binary —
+  the only way to prove the shipped profile unwinds, since `cargo test` builds a profile that
+  always does.
+
+- **A crashed writer thread is replaced instead of leaving the shard unable to write.** A panic
+  that escaped the per-command guard ended the thread, and the shard took no further writes until
+  the process restarted. Each writer now has a monitor that owns its handle and parks in `join` at
+  no cost until it exits: a clean exit stops the monitor, a crash rebuilds the writer over the
+  same store and keeps supervising, so the shard heals itself and health returns to green with no
+  restart. The command sender lives in a shared slot the monitor swaps on relaunch, so every clone
+  of the actor sees the replacement at once; a write racing the brief relaunch window fails
+  retriably, as a closed channel always did.
+
+  A writer wedged but alive is out of scope — Rust has no safe way to kill a running thread — and
+  stays surfaced red by the heartbeat above.
+
+- **A query containing untokenizable whitespace no longer grows memory without bound.** The
+  lenient set parser advances over inter-element space with an ASCII-only match and takes anything
+  that is not `char::is_whitespace()` as a term character. A non-breaking space, a form feed or an
+  ideographic space is neither, so an unterminated set such as `IN[\u{a0}` consumed nothing: the
+  element loop spun, appending an error each turn until the process was out of memory — and that
+  reached the parser straight from a request body.
+
+  Every parser is now built through one path that first folds each such character to the plain
+  space it stands for, so search, count and validation are covered by the single fold. Inside a
+  quoted phrase it merges tokens the default tokenizer already splits on, so a search returns what
+  it did before. A generated and a hand-written corpus of these shapes now drive the parsers in
+  `query_panic_safety_test`, which grew memory without bound partway through the generated run
+  before the fold.
+
+- **A replayed WAL tail is committed before recovery reports the shard queryable.** Replay left
+  the recovered entries in the Tantivy writer's buffer and seeded the operation counter for a
+  later flush — but both flush triggers are write-driven, so an index taking no writes after
+  recovery kept its tail buffered and out of content search until unrelated traffic arrived. The
+  log meanwhile reported the shard queryable while those documents were only in the buffer.
+  Recovery now sends a commit for each recovered index and logs phase 1 complete only after they
+  land. The commits run on the writer thread, serialized against writes already queued, and
+  truncate the WAL so the next start has nothing to replay.
+
+- **Deleting an index no longer lets a racing write recreate it untyped.** A write resolves its
+  schema before it reaches the writer thread. With the schema row *removed* on delete, a deletion
+  landing in that gap left the write to type the index from its own document — every discovered
+  field non-indexed, in a column only a reindex can change. A deletion is now recorded rather than
+  removed: the row is rewritten as dropped, its fields cleared and its version raised. Existence
+  checks, listings and stats read a dropped row as absent and a write against one is refused with
+  `IndexNotFound`; the next write to that name samples afresh, and the schema cache orders by
+  version so a write that resolved against the dropped schema cannot install it back over the
+  deletion.
+
+- **Recreating a deleted index warms it again.** Deleting an index left its warmed-generation and
+  warmup-state entries keyed by the deleted name. Warming is invalidated by generation equality,
+  and a deleted name's next reader numbers generations from zero — so the stale entry matched the
+  recreated index's first generation and warming was skipped: `segments_warmed` 0, state `Warm`,
+  and every segment cache cold until a later commit advanced past the stale value. Both entries
+  are now dropped with the rest of the index's caches, and a name that holds no data reads as not
+  warm.
 
 - **A client holding its MCP listening stream open no longer has its session swept.** The
   Streamable HTTP `GET /mcp` stream registered nothing with the session registry, so the

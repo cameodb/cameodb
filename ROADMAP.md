@@ -827,6 +827,39 @@ bulk specifically, lower — concurrency buys nothing there at all.
 concurrency, which is what [F2](#f2--an-open-loop-load-generator) exists to fix. None of it is an
 arrival-rate SLA.
 
+**Re-measured 2026-09-06 on the unwind build, and the figures above stand.** Every number in this
+sweep was taken on a `panic = "abort"` binary, three days before `2c53e97` set the release profile
+to `unwind` — so as written they described a build that no longer ships. Re-running against
+today's tree settles what that change cost.
+
+Both profiles were built from the same commit and run **interleaved** — unwind, abort, unwind,
+abort — so thermal drift and background load fall on both equally; 3 repeats of the four search
+points plus the c=16 write point, same 4 shards, 8 search threads, `wal_sync` on and 5,000 seed
+documents as above. Median of 3, with the observed range:
+
+| search conc | unwind ok/s | abort ok/s | delta | ranges |
+|---|---|---|---|---|
+| 4 | 13,754 [13,562–13,781] | 13,696 [13,546–13,698] | +0.4% | overlapping |
+| 8 | 21,790 [21,180–21,898] | 21,097 [20,772–21,447] | +3.3% | overlapping |
+| 12 | 26,679 [23,628–27,647] | 24,867 [23,159–26,506] | +7.3% | overlapping |
+| 16 | 27,843 [22,972–27,853] | 25,833 [22,019–27,160] | +7.8% | overlapping |
+| write, 16 | 620, p50 24.89ms | 624, p50 24.90ms | −0.6% | overlapping |
+
+**No comparison separates, and the direction is the reading.** Every nominal delta favours unwind,
+which cannot be a real effect — unwinding tables can only cost. A genuine penalty would show as a
+consistent deficit and there is none, so the honest conclusion is *no measurable cost*, not that
+unwind is faster. Trust c=4 and c=8, where the spread is ±1.6%; at c=12 and c=16 it opens to ±10%
+because the harness shares cores with the node, which is the same caveat this sweep opens with.
+
+The cross-check that makes the rest of it credible: **today's abort build reproduces the
+2026-09-02 sweep** — 13,696 against 13,819 at c=4, and the write point at 620–624 ops/s, 24.9ms
+p50 and ~100ms p99 against 640, 24.48ms and 100.45ms. Four days and one profile change later, the
+harness lands in the same place, so the numbers in this section are reproducible rather than a
+single lucky afternoon.
+
+What unwinding actually costs is **4,581,024 bytes** of binary — 24,300,288 against 19,719,264,
+measured on the two binaries this comparison used.
+
 ### F6 — What fsync actually costs, measured 2026-09-02
 
 The same sweep as [F5](#f5--concurrency-sweep-measured-2026-09-02) with `[storage] wal_sync =
