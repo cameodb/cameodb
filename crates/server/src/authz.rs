@@ -90,6 +90,11 @@ const ROUTES: &[RouteRule] = &[
     // the minimal one — see `health_handler`.
     rule("GET",    "/_cluster/health",                  Access::Public),
 
+    // Panic seam for the panic-isolation smoke test. Mounted only under the `fault-injection`
+    // feature, absent from every shipped binary; classified here either way so the route table
+    // stays complete and `every_mounted_route_is_classified` sees a row for it.
+    rule("GET",    "/__fault/panic",                    Access::Public),
+
     // Read
     rule("POST",   "/api/{index}/search",               Access::Needs(Capability::Read)),
     rule("POST",   "/api/{index}/search/stream",        Access::Needs(Capability::Read)),

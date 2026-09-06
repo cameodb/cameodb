@@ -3848,12 +3848,49 @@ impl WriterLiveness {
 /// so the only safe response is to drop it — the next write rebuilds it, exactly as an eviction
 /// does — and fail this one operation. The writer thread goes on serving every other index, so a
 /// document that panics the parser costs one request rather than the shard.
+/// Compile-time panic seams, absent unless the `fault-injection` feature is on — a shipped binary
+/// carries none of them. Each lets the panic-isolation smoke test drive a real panic into one
+/// hardened surface, over HTTP against the built binary, to prove the release profile unwinds and
+/// the boundary holds where in-process tests (which always unwind) cannot reach the profile.
+#[cfg(feature = "fault-injection")]
+mod fault_injection {
+    /// A search whose query is exactly this panics on the read pool.
+    pub const READ_TRAP_QUERY: &str = "__fault_panic_read__";
+    /// A write to this index panics inside the per-command guard: caught, the writer rebuilt.
+    pub const WRITE_OP_TRAP_INDEX: &str = "__fault_panic_write_op__";
+    /// A write to this index panics past the guard, so the writer thread itself dies.
+    pub const WRITER_THREAD_TRAP_INDEX: &str = "__fault_kill_writer__";
+
+    pub fn panic_if_read_trap(query: &str) {
+        assert!(query != READ_TRAP_QUERY, "fault-injection: read on the read pool");
+    }
+
+    pub fn panic_if_write_op_trap(index: &str) {
+        assert!(
+            index != WRITE_OP_TRAP_INDEX,
+            "fault-injection: write inside the per-command guard"
+        );
+    }
+
+    pub fn panic_if_writer_thread_trap(index: &str) {
+        assert!(
+            index != WRITER_THREAD_TRAP_INDEX,
+            "fault-injection: writer thread past its guard"
+        );
+    }
+}
+
 fn guard_writer_op<T>(
     store: &HybridStore,
     index: &str,
     op: impl FnOnce() -> Result<T, StoreError>,
 ) -> Result<T, StoreError> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)) {
+    let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(feature = "fault-injection")]
+        fault_injection::panic_if_write_op_trap(index);
+        op()
+    }));
+    match guarded {
         Ok(result) => result,
         Err(_) => {
             tracing::error!(
@@ -4182,6 +4219,11 @@ impl MicroshardActor {
                     // Multiple single writes to the same index become one apply_batch call
                     // with a single redb transaction instead of N separate transactions.
                     for (index, writes) in &mut write_groups {
+                        // Outside guard_writer_op on purpose: this panic escapes the per-command
+                        // guard, so it reaches the loop's outer catch and takes the writer thread
+                        // down — the path that must mark the writer down and turn health red.
+                        #[cfg(feature = "fault-injection")]
+                        fault_injection::panic_if_writer_thread_trap(index);
                         if writes.len() == 1 {
                             // Single write — no coalescing overhead needed
                             let (op, reply) = writes.pop().unwrap();
@@ -4591,6 +4633,8 @@ impl MicroshardActor {
 
         let outcome = self
             .spawn_on_read_pool(move || {
+                #[cfg(feature = "fault-injection")]
+                fault_injection::panic_if_read_trap(&query);
                 store.search_documents(&index, &query, limit, sort.as_ref())
             })
             .await?

@@ -210,6 +210,11 @@ pub fn create_router(
         router
     };
 
+    // A route that panics on demand, so the panic-isolation smoke test can prove the catch layer
+    // turns a handler panic into a 500 against the built binary. Absent unless the feature is on.
+    #[cfg(feature = "fault-injection")]
+    let router = router.route("/__fault/panic", get(fault_panic_handler));
+
     let router = router
         .with_state(state)
         // Response compression (outermost for responses)
@@ -254,6 +259,13 @@ pub fn create_router(
         .layer(TraceLayer::new_for_http());
 
     (router, mcp_handle)
+}
+
+/// Panic on request, so the smoke test can prove a handler panic is caught. Feature-gated, so a
+/// shipped binary never mounts it.
+#[cfg(feature = "fault-injection")]
+async fn fault_panic_handler() -> axum::response::Response {
+    panic!("fault-injection: handler panic");
 }
 
 /// Turn a caught handler panic into the same masked 500 an unclassified error answers with.
