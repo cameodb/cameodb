@@ -8,7 +8,7 @@ use kameo::actor::ActorRef;
 use std::sync::Arc;
 
 use crate::cluster_coordinator::ClusterCoordinator;
-use crate::node_orchestrator::RouterActor;
+use crate::node_orchestrator::{RouterActor, WriterLiveness};
 use crate::ratelimit::ToolRateLimiter;
 
 /// Application state shared across handlers
@@ -44,4 +44,7 @@ pub struct AppState {
     pub max_response_bytes: usize,
     /// Where the audit trail goes. Inert unless `[security.audit]` turned it on.
     pub audit: Arc<crate::audit::AuditSink>,
+    /// This node's writer-thread liveness. The health endpoint reads it with one atomic load so
+    /// a shard whose writer thread has died stops the node reporting green.
+    pub writer_liveness: Arc<WriterLiveness>,
 }
