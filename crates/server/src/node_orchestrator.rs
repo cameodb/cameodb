@@ -53,12 +53,12 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
 };
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use kameo::actor::ActorRef;
 use kameo::message::{Context, Message};
 use kameo::{Actor, RemoteActor, remote_message};
@@ -3753,10 +3753,15 @@ struct IndexStats {
 pub struct MicroshardActor {
     shard_id: Uuid,
     store: Option<Arc<HybridStore>>,
-    /// Channel sender for dispatching write commands to the writer thread.
-    writer_tx: Option<mpsc::Sender<StorageCommand>>,
-    /// Writer thread handle for forceful termination on shutdown timeout.
-    writer_thread_handle: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    /// Shared slot holding the current writer thread's command sender. A shared slot rather than a
+    /// plain field so a monitor can swap in a replacement writer's channel after a crash and every
+    /// clone of this actor — the engine holds cloned snapshots — sees it at once.
+    writer_tx: Arc<ArcSwapOption<mpsc::Sender<StorageCommand>>>,
+    /// The writer monitor thread's handle. The monitor owns the writer thread's own handle and
+    /// respawns it on a crash; shutdown joins the monitor.
+    writer_monitor_handle: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    /// Set before a requested shutdown so the monitor stops instead of respawning the writer.
+    shutting_down: Arc<AtomicBool>,
     storage_config: StorageConfig,
     default_search_limit: usize,
     /// Active supervision tasks per index (idle-timeout commits).
@@ -3788,7 +3793,7 @@ impl std::fmt::Debug for MicroshardActor {
         f.debug_struct("MicroshardActor")
             .field("shard_id", &self.shard_id)
             .field("store_initialized", &self.store.is_some())
-            .field("writer_initialized", &self.writer_tx.is_some())
+            .field("writer_initialized", &self.writer_tx.load().is_some())
             .field("storage_config", &self.storage_config)
             .finish()
     }
@@ -3882,6 +3887,17 @@ impl WriterLiveness {
     /// Record that a writer thread has stopped serving. Called once, as the thread exits.
     pub fn mark_writer_down(&self) {
         self.down.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Record that a replacement writer thread is serving again, undoing one earlier
+    /// `mark_writer_down`. Called once, after a monitor relaunches a crashed writer. Saturating at
+    /// zero so it can never wrap the count below the number of writers actually down.
+    pub fn mark_writer_up(&self) {
+        let _ = self
+            .down
+            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
     }
 
     /// How many registered writers have been mid-batch longer than `threshold_ms` as of `now_ms`.
@@ -4104,174 +4120,52 @@ where
     joined.map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
 }
 
-impl MicroshardActor {
-    pub fn new(shard_id: Uuid, storage_config: StorageConfig, runtime: ShardRuntime) -> Self {
-        let ShardRuntime {
-            default_search_limit,
-            read_pool_handle,
-            read_pool_health,
-            total_shards,
-            writer_shutdown_timeout_secs,
-            supervisor_timeout_secs,
-            writer_pin,
-            writer_liveness,
-        } = runtime;
+/// Why a writer thread left its loop. The monitor rebuilds the writer on `Crashed` and stops on
+/// `Clean`; a panic that somehow escaped even the writer's own outer catch surfaces as a join
+/// error, which the monitor also treats as `Crashed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterExit {
+    /// A requested shutdown, or the command channel closing at teardown.
+    Clean,
+    /// A panic escaped past every per-command guard and ended the thread.
+    Crashed,
+}
 
-        Self {
-            shard_id,
-            store: None,
-            writer_tx: None,
-            writer_thread_handle: Arc::new(std::sync::Mutex::new(None)),
-            storage_config,
-            default_search_limit,
-            supervisors: Arc::new(AsyncRwLock::new(HashMap::new())),
-            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
-            read_pool_handle,
-            read_pool_health,
-            total_shards,
-            writer_shutdown_timeout_secs,
-            supervisor_timeout_secs,
-            writer_pin,
-            writer_liveness,
-        }
-    }
+/// Everything the writer, warmup and monitor threads share for one shard. Bundled so the monitor
+/// can relaunch the writer without a `&self` it does not hold: every field is an `Arc` or a cheap
+/// clone, and `writer_tx` is the same shared slot the send path reads, so a relaunched writer's
+/// channel becomes visible everywhere at once.
+#[derive(Clone)]
+struct WriterRuntime {
+    shard_id: Uuid,
+    store: Arc<HybridStore>,
+    writer_pin: WriterPin,
+    writer_liveness: Arc<WriterLiveness>,
+    writer_tx: Arc<ArcSwapOption<mpsc::Sender<StorageCommand>>>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    shutting_down: Arc<AtomicBool>,
+}
 
-    pub async fn start(&mut self) -> Result<(), OrchestratorError> {
-        info!(
-            shard_id = %self.shard_id,
-            path = %self.storage_config.shard_path.display(),
-            "MicroshardActor starting"
-        );
-
-        // Initialize HybridStore with spawn_blocking to avoid blocking async runtime
-        let config = self.storage_config.clone();
-        let total_shards = self.total_shards;
-        let store = tokio::task::spawn_blocking(move || HybridStore::new(config, total_shards))
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
-            .map_err(|e: StoreError| match e {
-                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
-                _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
-            })?;
-
-        let store_arc = Arc::new(store);
-        self.store = Some(store_arc.clone());
-
-        // Startup runs in two phases, both off the async runtime.
-        //
-        // Phase 1 (recovery) is a correctness requirement: an index whose WAL tail was never
-        // committed answers searches without its most recent writes, so it must be replayed
-        // and committed. Only indices whose persisted checkpoint falls short of their WAL
-        // are touched.
-        //
-        // Phase 2 (warmup) is purely latency: it opens and caches the *reader* for each
-        // index and faults in its segment structures, so the first query from an agent or
-        // client does not pay for opening the index. It runs on its own thread and never
-        // gates serving — a request arriving first just warms that index on demand.
-        //
-        // Neither phase blocks `start()`. Requests are served throughout via lazy
-        // initialization; the phases only determine whether that work has already been done.
-        //
-        // The writer channel is created here rather than beside the writer thread below,
-        // because phase 1 needs a sender: the commit that finishes a replay belongs on the
-        // writer thread like every other commit.
-        let (tx, mut rx) = mpsc::channel::<StorageCommand>(SHARD_WRITER_CHANNEL_CAPACITY);
-        let recovery_writer_tx = tx.clone();
-        self.writer_tx = Some(tx);
-
-        // After startup the warmup thread keeps serving re-warm requests: the writer thread
-        // posts an index name here after each commit, so the segment a commit just published
-        // gets warmed without doing that work on the write hot path. The channel is bounded
-        // and posted to with `try_send`, making re-warming strictly best-effort — a full
-        // channel drops the request rather than ever stalling a write.
-        let (warm_tx, warm_rx) = std::sync::mpsc::sync_channel::<String>(WARM_REQUEST_CAPACITY);
-        let warmup_store = Arc::clone(&store_arc);
-        let shard_id = self.shard_id;
-        tokio::task::spawn_blocking(move || {
-            let plan = match warmup_store.recover_indices() {
-                Ok(plan) => plan,
-                Err(e) => {
-                    warn!(
-                        shard_id = %shard_id,
-                        error = %e,
-                        "Index recovery failed; indices will recover on first access"
-                    );
-                    return;
-                }
-            };
-
-            // `get_or_create_index` leaves a replayed tail in the writer's buffer rather
-            // than committing inline: on a large index that is segment merging and an fsync
-            // inside a call that only meant to open the index. Phase 1 commits it here, so
-            // the phase ends in a state that stands on its own — the ordinary flush triggers
-            // are both write-driven, and a recovered index may take no further writes.
-            //
-            // The commits go through the writer thread like every other, serializing against
-            // any write already arriving, and each truncates the WAL range it covers.
-            // Awaiting one before sending the next costs nothing — that thread runs them one
-            // at a time — and surfaces a failure instead of dropping the reply.
-            let mut committed = 0usize;
-            for index in &plan.recovered {
-                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                if recovery_writer_tx
-                    .blocking_send(StorageCommand::Commit {
-                        index: index.clone(),
-                        reply: reply_tx,
-                    })
-                    .is_err()
-                {
-                    warn!(
-                        shard_id = %shard_id,
-                        index = %index,
-                        "Writer thread is gone; the recovered tail stays in the WAL for the next boot"
-                    );
-                    break;
-                }
-                match reply_rx.blocking_recv() {
-                    Ok(Ok(())) => committed += 1,
-                    Ok(Err(e)) => warn!(
-                        shard_id = %shard_id,
-                        index = %index,
-                        error = %e,
-                        "Could not commit the recovered tail; it stays in the WAL for the next boot"
-                    ),
-                    Err(_) => warn!(
-                        shard_id = %shard_id,
-                        index = %index,
-                        "Writer thread dropped the reply to the recovery commit"
-                    ),
-                }
-            }
-
-            // Nothing below sends to the writer thread; releasing the sender keeps this task
-            // out of the set that decides when the channel closes.
-            drop(recovery_writer_tx);
-
-            // Logged after the commits: the shard is queryable for a replayed tail only once
-            // they land.
-            info!(
-                shard_id = %shard_id,
-                recovered = plan.recovered.len(),
-                committed = committed,
-                failed = plan.failed.len(),
-                pending_warmup = plan.pending_warmup.len(),
-                "Phase 1 complete - shard is queryable"
-            );
-
-            // One warmup thread per shard, for startup warmup and then for post-commit
-            // re-warms. With N shards that is already N-way parallelism against the same
-            // disk, so warming a shard's indices sequentially keeps the IO pattern sane
-            // instead of turning startup into a seek storm.
-            let spawned = std::thread::Builder::new()
-                .name(format!("warmup-shard-{shard_id}"))
-                .spawn(move || {
-                    if !plan.pending_warmup.is_empty() {
-                        let requested = plan.pending_warmup.len();
+/// Spawn a shard's warmup thread: it warms the indices named in `pending_warmup` once (empty on a
+/// respawn), then serves post-commit re-warm requests until the writer drops its sender. A failure
+/// to spawn is not fatal — every index still warms itself on its first query.
+fn spawn_warmup_thread(
+    rt: &WriterRuntime,
+    warm_rx: std::sync::mpsc::Receiver<String>,
+    pending_warmup: Vec<String>,
+) {
+    let warmup_store = Arc::clone(&rt.store);
+    let shard_id = rt.shard_id;
+    let spawned = std::thread::Builder::new()
+        .name(format!("warmup-shard-{shard_id}"))
+        .spawn(move || {
+                    if !pending_warmup.is_empty() {
+                        let requested = pending_warmup.len();
                         // Warming is a latency optimisation — a query warms its index on demand
                         // regardless — so a panic here must not take the re-warm loop below down
                         // with it and leave every later commit unwarmed.
                         let warmed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            warmup_store.warm_indices(&plan.pending_warmup)
+                            warmup_store.warm_indices(&pending_warmup)
                         }));
                         match warmed {
                             Ok(warmed) => info!(
@@ -4313,29 +4207,34 @@ impl MicroshardActor {
                     }
 
                     debug!(shard_id = %shard_id, "Warmup thread stopped");
-                });
-
-            if let Err(e) = spawned {
-                // Not fatal: every index still warms itself on its first query.
-                warn!(
-                    shard_id = %shard_id,
-                    error = %e,
-                    "Could not spawn warmup thread; indices will warm on first query"
-                );
-            }
         });
 
-        // Spawn dedicated writer thread for serialized I/O. Its channel was created above,
-        // before phase 1, so recovery could post its commits onto it.
-        let writer_store = store_arc;
-        let shutdown = self.shutdown_notify.clone();
-        let writer_shard_id = self.shard_id;
-        let writer_pin = self.writer_pin.clone();
-        let writer_liveness = Arc::clone(&self.writer_liveness);
+    if let Err(e) = spawned {
+        warn!(
+            shard_id = %shard_id,
+            error = %e,
+            "Could not spawn warmup thread; indices will warm on first query"
+        );
+    }
+}
 
-        let handle = std::thread::Builder::new()
-            .name(format!("writer-shard-{}", writer_shard_id))
-            .spawn(move || {
+/// Spawn a shard's writer thread — the sole serialized path for its writes. It returns a
+/// [`WriterExit`] so the monitor can tell a clean shutdown from a crash. Extracted from
+/// `start` so the monitor can spawn a replacement over the same store.
+fn spawn_writer_thread(
+    rt: &WriterRuntime,
+    mut rx: mpsc::Receiver<StorageCommand>,
+    warm_tx: std::sync::mpsc::SyncSender<String>,
+) -> std::io::Result<std::thread::JoinHandle<WriterExit>> {
+    let writer_store = Arc::clone(&rt.store);
+    let writer_shard_id = rt.shard_id;
+    let writer_pin = rt.writer_pin.clone();
+    let writer_liveness = Arc::clone(&rt.writer_liveness);
+    let shutdown = Arc::clone(&rt.shutdown_notify);
+
+    std::thread::Builder::new()
+        .name(format!("writer-shard-{}", writer_shard_id))
+        .spawn(move || -> WriterExit {
                 // Pin to the core the orchestrator picked from this shard's ordinal — the
                 // same ordinal that chooses the worker feeding this thread, so the two land
                 // together. Improves cache locality for the redb and tantivy structures this
@@ -4646,43 +4545,281 @@ impl MicroshardActor {
 
                 // The thread is exiting, cleanly or by panic; a panic leaves the heartbeat frozen
                 // at its last batch stamp, so clear it here to keep a dead writer from also being
-                // read as stalled — `mark_writer_down` below is the one signal it needs.
+                // read as stalled.
                 writer_heartbeat.store(0, AtomicOrdering::Relaxed);
 
-                if loop_outcome.is_err() {
-                    // A panic reached past every per-command guard. The thread is done and this
-                    // shard can take no more writes until the node restarts; record it so the
-                    // health endpoint stops reporting green instead of leaving it silently wedged.
+                let exit = if loop_outcome.is_err() {
+                    // A panic reached past every per-command guard, so the thread is done. Mark it
+                    // down so health goes red, and report `Crashed` so the monitor rebuilds it over
+                    // this same store — only the thread died, the data is intact.
                     writer_liveness.mark_writer_down();
                     tracing::error!(
                         shard_id = %writer_shard_id,
-                        "writer thread panicked and stopped; this shard cannot accept writes until the node restarts"
+                        "writer thread crashed; the monitor will respawn it"
                     );
+                    WriterExit::Crashed
                 } else {
                     info!(shard_id = %writer_shard_id, "Writer thread stopped");
-                }
+                    WriterExit::Clean
+                };
                 shutdown.notify_one();
-            })
-            .map_err(OrchestratorError::Io)?;
+                exit
+        })
+}
 
-        // Store the thread handle for forceful termination if needed during shutdown
-        *self.writer_thread_handle.lock().unwrap() = Some(handle);
+/// Rebuild a shard's writer after a crash: a fresh command channel and warm channel over the same
+/// store, the new sender published into the shared slot before the writer starts draining so a
+/// racing write finds the live channel. No recovery and no startup warmup — see [`relaunch_writer`]
+/// callers and `WriterExit::Crashed`.
+fn relaunch_writer(rt: &WriterRuntime) -> std::io::Result<std::thread::JoinHandle<WriterExit>> {
+    let (tx, rx) = mpsc::channel::<StorageCommand>(SHARD_WRITER_CHANNEL_CAPACITY);
+    let (warm_tx, warm_rx) = std::sync::mpsc::sync_channel::<String>(WARM_REQUEST_CAPACITY);
+    rt.writer_tx.store(Some(Arc::new(tx)));
+    spawn_warmup_thread(rt, warm_rx, Vec::new());
+    spawn_writer_thread(rt, rx, warm_tx)
+}
+
+/// Supervise one shard's writer thread, replacing it if it dies. Runs on its own thread, parked in
+/// `join` at no cost until the writer exits: a clean exit (shutdown) stops the monitor, a crash
+/// makes it relaunch the writer over the same store and keep supervising. It owns the writer's
+/// handle, so a genuinely wedged writer that never exits simply keeps the monitor parked rather
+/// than being force-killed — Rust has no safe way to terminate a running thread, and that case is
+/// already surfaced red by the stall heartbeat.
+fn writer_monitor(rt: WriterRuntime, mut handle: std::thread::JoinHandle<WriterExit>) {
+    loop {
+        let exit = handle.join().unwrap_or(WriterExit::Crashed);
+        if rt.shutting_down.load(AtomicOrdering::Relaxed) || exit == WriterExit::Clean {
+            debug!(shard_id = %rt.shard_id, "Writer monitor stopping");
+            break;
+        }
+        match relaunch_writer(&rt) {
+            Ok(new_handle) => {
+                handle = new_handle;
+                rt.writer_liveness.mark_writer_up();
+                info!(
+                    shard_id = %rt.shard_id,
+                    "Writer thread respawned; the shard is accepting writes again"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    shard_id = %rt.shard_id,
+                    error = %e,
+                    "Could not respawn the writer thread; the shard stays down until restart"
+                );
+                break;
+            }
+        }
+    }
+}
+
+impl MicroshardActor {
+    pub fn new(shard_id: Uuid, storage_config: StorageConfig, runtime: ShardRuntime) -> Self {
+        let ShardRuntime {
+            default_search_limit,
+            read_pool_handle,
+            read_pool_health,
+            total_shards,
+            writer_shutdown_timeout_secs,
+            supervisor_timeout_secs,
+            writer_pin,
+            writer_liveness,
+        } = runtime;
+
+        Self {
+            shard_id,
+            store: None,
+            writer_tx: Arc::new(ArcSwapOption::empty()),
+            writer_monitor_handle: Arc::new(std::sync::Mutex::new(None)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            storage_config,
+            default_search_limit,
+            supervisors: Arc::new(AsyncRwLock::new(HashMap::new())),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            read_pool_handle,
+            read_pool_health,
+            total_shards,
+            writer_shutdown_timeout_secs,
+            supervisor_timeout_secs,
+            writer_pin,
+            writer_liveness,
+        }
+    }
+
+    pub async fn start(&mut self) -> Result<(), OrchestratorError> {
+        info!(
+            shard_id = %self.shard_id,
+            path = %self.storage_config.shard_path.display(),
+            "MicroshardActor starting"
+        );
+
+        // Initialize HybridStore with spawn_blocking to avoid blocking async runtime
+        let config = self.storage_config.clone();
+        let total_shards = self.total_shards;
+        let store = tokio::task::spawn_blocking(move || HybridStore::new(config, total_shards))
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
+            .map_err(|e: StoreError| match e {
+                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
+                _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
+            })?;
+
+        let store_arc = Arc::new(store);
+        self.store = Some(store_arc.clone());
+
+        // Startup runs in two phases, both off the async runtime.
+        //
+        // Phase 1 (recovery) is a correctness requirement: an index whose WAL tail was never
+        // committed answers searches without its most recent writes, so it must be replayed
+        // and committed. Only indices whose persisted checkpoint falls short of their WAL
+        // are touched.
+        //
+        // Phase 2 (warmup) is purely latency: it opens and caches the *reader* for each
+        // index and faults in its segment structures, so the first query from an agent or
+        // client does not pay for opening the index. It runs on its own thread and never
+        // gates serving — a request arriving first just warms that index on demand.
+        //
+        // Neither phase blocks `start()`. Requests are served throughout via lazy
+        // initialization; the phases only determine whether that work has already been done.
+        //
+        // The writer channel is created here rather than beside the writer thread below,
+        // because phase 1 needs a sender: the commit that finishes a replay belongs on the
+        // writer thread like every other commit.
+        // The runtime the writer, warmup and monitor threads all share. Cloned into the monitor
+        // so it can relaunch the writer over this same store — the durable state a crash leaves
+        // intact — without a `&self` it cannot hold.
+        let rt = WriterRuntime {
+            shard_id: self.shard_id,
+            store: Arc::clone(&store_arc),
+            writer_pin: self.writer_pin.clone(),
+            writer_liveness: Arc::clone(&self.writer_liveness),
+            writer_tx: Arc::clone(&self.writer_tx),
+            shutdown_notify: Arc::clone(&self.shutdown_notify),
+            shutting_down: Arc::clone(&self.shutting_down),
+        };
+
+        let (tx, rx) = mpsc::channel::<StorageCommand>(SHARD_WRITER_CHANNEL_CAPACITY);
+        let recovery_writer_tx = tx.clone();
+        // Published into the shared slot the send path reads, so a write reaches the writer as
+        // soon as the channel exists — and reaches its replacement after a respawn.
+        rt.writer_tx.store(Some(Arc::new(tx)));
+
+        // After startup the warmup thread keeps serving re-warm requests: the writer thread
+        // posts an index name here after each commit, so the segment a commit just published
+        // gets warmed without doing that work on the write hot path. The channel is bounded
+        // and posted to with `try_send`, making re-warming strictly best-effort — a full
+        // channel drops the request rather than ever stalling a write.
+        let (warm_tx, warm_rx) = std::sync::mpsc::sync_channel::<String>(WARM_REQUEST_CAPACITY);
+        let warmup_store = Arc::clone(&store_arc);
+        let shard_id = self.shard_id;
+        let rt_recovery = rt.clone();
+        tokio::task::spawn_blocking(move || {
+            let plan = match warmup_store.recover_indices() {
+                Ok(plan) => plan,
+                Err(e) => {
+                    warn!(
+                        shard_id = %shard_id,
+                        error = %e,
+                        "Index recovery failed; indices will recover on first access"
+                    );
+                    return;
+                }
+            };
+
+            // `get_or_create_index` leaves a replayed tail in the writer's buffer rather
+            // than committing inline: on a large index that is segment merging and an fsync
+            // inside a call that only meant to open the index. Phase 1 commits it here, so
+            // the phase ends in a state that stands on its own — the ordinary flush triggers
+            // are both write-driven, and a recovered index may take no further writes.
+            //
+            // The commits go through the writer thread like every other, serializing against
+            // any write already arriving, and each truncates the WAL range it covers.
+            // Awaiting one before sending the next costs nothing — that thread runs them one
+            // at a time — and surfaces a failure instead of dropping the reply.
+            let mut committed = 0usize;
+            for index in &plan.recovered {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                if recovery_writer_tx
+                    .blocking_send(StorageCommand::Commit {
+                        index: index.clone(),
+                        reply: reply_tx,
+                    })
+                    .is_err()
+                {
+                    warn!(
+                        shard_id = %shard_id,
+                        index = %index,
+                        "Writer thread is gone; the recovered tail stays in the WAL for the next boot"
+                    );
+                    break;
+                }
+                match reply_rx.blocking_recv() {
+                    Ok(Ok(())) => committed += 1,
+                    Ok(Err(e)) => warn!(
+                        shard_id = %shard_id,
+                        index = %index,
+                        error = %e,
+                        "Could not commit the recovered tail; it stays in the WAL for the next boot"
+                    ),
+                    Err(_) => warn!(
+                        shard_id = %shard_id,
+                        index = %index,
+                        "Writer thread dropped the reply to the recovery commit"
+                    ),
+                }
+            }
+
+            // Nothing below sends to the writer thread; releasing the sender keeps this task
+            // out of the set that decides when the channel closes.
+            drop(recovery_writer_tx);
+
+            // Logged after the commits: the shard is queryable for a replayed tail only once
+            // they land.
+            info!(
+                shard_id = %shard_id,
+                recovered = plan.recovered.len(),
+                committed = committed,
+                failed = plan.failed.len(),
+                pending_warmup = plan.pending_warmup.len(),
+                "Phase 1 complete - shard is queryable"
+            );
+
+            // One warmup thread per shard: startup warmup for the tail recovery just replayed,
+            // then post-commit re-warms. Spawned through the shared helper so a respawn gets the
+            // same warmup thread back, with nothing to warm at startup.
+            spawn_warmup_thread(&rt_recovery, warm_rx, plan.pending_warmup);
+        });
+
+        // Spawn the dedicated writer thread and the monitor that will relaunch it if it crashes.
+        // The writer's channel was created above, before phase 1, so recovery could post its
+        // commits onto it.
+        let writer_handle = spawn_writer_thread(&rt, rx, warm_tx).map_err(OrchestratorError::Io)?;
+
+        // The monitor owns the writer's handle and joins it: a clean exit stops the monitor, a
+        // crash makes it rebuild the writer over the same store and keep supervising. Shutdown
+        // joins the monitor, not the writer.
+        let monitor = std::thread::Builder::new()
+            .name(format!("writer-monitor-shard-{}", self.shard_id))
+            .spawn(move || writer_monitor(rt, writer_handle))
+            .map_err(OrchestratorError::Io)?;
+        *self.writer_monitor_handle.lock().unwrap() = Some(monitor);
 
         info!(shard_id = %self.shard_id, "MicroshardActor initialized with dedicated writer thread");
         Ok(())
     }
 
-    /// Send a command to the dedicated writer thread.
+    /// Send a command to the dedicated writer thread. Loads the current sender from the shared
+    /// slot, so a command sent just after a crash reaches the monitor's replacement writer once it
+    /// has published its channel. A send that lands in the brief window before the replacement is
+    /// up fails as "Writer thread closed" and is retriable, exactly as it was before this slot.
     async fn send_write_command(&self, cmd: StorageCommand) -> Result<(), OrchestratorError> {
-        self.writer_tx
-            .as_ref()
-            .ok_or_else(|| {
-                OrchestratorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Writer channel not initialized",
-                ))
-            })?
-            .send(cmd)
+        let tx = self.writer_tx.load_full().ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Writer channel not initialized",
+            ))
+        })?;
+        tx.send(cmd)
             .await
             .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer thread closed")))
     }
@@ -4780,8 +4917,14 @@ impl MicroshardActor {
             }
         }
 
-        // Send shutdown signal and wait for thread exit
-        if let Some(tx) = self.writer_tx.take() {
+        // Tell the monitor this is a requested stop, so it treats the coming exit as clean and
+        // does not respawn the writer. Set before the Shutdown command so it is visible however
+        // the writer races to exit.
+        self.shutting_down.store(true, AtomicOrdering::Relaxed);
+
+        // Send shutdown signal and wait for thread exit. Taking the sender out of the shared slot
+        // also closes the channel to any lingering supervisor clone.
+        if let Some(tx) = self.writer_tx.swap(None) {
             if tx.send(StorageCommand::Shutdown).await.is_ok() {
                 let timeout_secs = self.writer_shutdown_timeout_secs;
                 match timeout(
@@ -4792,11 +4935,12 @@ impl MicroshardActor {
                 {
                     Ok(()) => {
                         tracing::info!(shard_id = %self.shard_id, "Writer thread shutdown complete");
-                        // Join thread cleanly
-                        if let Some(handle) = self.writer_thread_handle.lock().unwrap().take()
+                        // Join the monitor; it has seen the clean exit and stopped, and it owns
+                        // the writer thread's handle, so this joins the whole writer stack.
+                        if let Some(handle) = self.writer_monitor_handle.lock().unwrap().take()
                             && let Err(e) = handle.join()
                         {
-                            tracing::warn!(shard_id = %self.shard_id, error = ?e, "Writer thread panicked");
+                            tracing::warn!(shard_id = %self.shard_id, error = ?e, "Writer monitor panicked");
                         }
                     }
                     Err(_) => {
@@ -4806,8 +4950,8 @@ impl MicroshardActor {
                             "Writer thread shutdown timed out after {}s - abandoning",
                             timeout_secs
                         );
-                        // Abandon thread - OS will clean up on process exit
-                        *self.writer_thread_handle.lock().unwrap() = None;
+                        // Abandon the monitor thread - OS will clean up on process exit
+                        *self.writer_monitor_handle.lock().unwrap() = None;
                     }
                 }
             } else {
@@ -4908,8 +5052,11 @@ impl MicroshardActor {
     /// The supervisor's role is idle-timeout commit: if no writes arrive for N seconds,
     /// it sends a Commit to the writer thread to flush any remaining uncommitted data.
     async fn signal_supervisor(&self, index: String) {
-        let writer_tx = match self.writer_tx.as_ref() {
-            Some(tx) => tx.clone(),
+        // Snapshot the current sender for this supervisor's idle commits. If the writer is later
+        // replaced, this snapshot's channel closes; the supervisor's send then fails and it exits,
+        // and the next write re-arms a fresh supervisor with the new sender.
+        let writer_tx = match self.writer_tx.load_full() {
+            Some(tx) => tx,
             None => return,
         };
 
@@ -11257,6 +11404,22 @@ mod tests {
         liveness.mark_writer_down();
         liveness.mark_writer_down();
         assert_eq!(liveness.unavailable_writers(), 2);
+    }
+
+    /// Respawning a dead writer clears its down-count, so a shard that self-heals reports green
+    /// again — and the clear can never drive the count below the writers actually down.
+    #[test]
+    fn respawning_a_writer_clears_its_down_count() {
+        let liveness = WriterLiveness::default();
+        liveness.mark_writer_down();
+        assert_eq!(liveness.unavailable_writers(), 1, "a dead writer counts");
+
+        liveness.mark_writer_up();
+        assert_eq!(liveness.unavailable_writers(), 0, "its replacement clears the count");
+
+        // Saturating: an extra up with nothing down cannot wrap the count back up.
+        liveness.mark_writer_up();
+        assert_eq!(liveness.unavailable_writers(), 0);
     }
 
     /// An engine with no shards and no coordinator. Enough to exercise `execute`'s dispatch

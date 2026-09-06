@@ -177,11 +177,11 @@ async fn health_status(client: &reqwest::Client, node: &Node) -> String {
     body["status"].as_str().expect("status field").to_string()
 }
 
-/// Every panic surface is contained: the process survives each trigger, and only a genuinely
-/// dead writer turns health red.
+/// Every panic surface is contained: the process survives each trigger, a dead writer turns
+/// health red, and its monitor respawns it so the shard heals back to green without a restart.
 #[tokio::test]
 #[ignore = "builds a second binary; run explicitly with --ignored"]
-async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_shows_in_health() {
+async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_is_respawned() {
     install_crypto_provider();
     let binary = build_fault_binary();
     let mut node = Node::start(&binary).await;
@@ -235,26 +235,19 @@ async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_shows_in_health
         "a contained panic must not turn health red"
     );
 
-    // Now kill the writer thread outright — a panic past its guard. The write's reply is lost,
-    // the shard can take no more writes, and this must show: health goes red while the process
-    // stays up and still answers reads.
+    // Now kill the writer thread outright — a panic past its guard ends the thread. The write's
+    // reply is lost, but the thread's monitor must notice the crash and respawn a replacement over
+    // the same store, so the shard heals on its own: health returns to green and writes land again,
+    // with no process restart.
     let _ = client
         .put(node.url(&format!("/api/{WRITER_THREAD_TRAP_INDEX}/document")))
         .json(&serde_json::json!({ "id": "x", "doc": { "title": "kill" } }))
         .send()
         .await;
 
-    // Give the writer thread a moment to unwind and mark itself down.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     assert!(node.is_running(), "a dead writer must not take the process down");
-    assert_eq!(
-        health_status(&client, &node).await,
-        "red",
-        "a dead writer thread must show as red in health"
-    );
 
-    // Reads are unaffected by the writer's death.
+    // Reads are never affected by the writer's death.
     let status = client
         .post(node.url("/api/healthy/search"))
         .json(&serde_json::json!({ "query": "fine", "limit": 5 }))
@@ -263,4 +256,28 @@ async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_shows_in_health
         .expect("read after writer death")
         .status();
     assert_eq!(status, 200, "reads must still be served after a writer dies");
+
+    // The monitor respawns the writer, so health returns to green on its own. (It may pass through
+    // red first; we assert the recovery, which is the contract, rather than race the window.)
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if health_status(&client, &node).await == "green" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a respawned writer must return health to green without a restart"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // And the replacement writer serves: a fresh write to a healthy index on the same shard lands.
+    let status = client
+        .put(node.url("/api/healthy/document"))
+        .json(&serde_json::json!({ "id": "ok2", "doc": { "title": "back" } }))
+        .send()
+        .await
+        .expect("write after respawn")
+        .status();
+    assert_eq!(status, 200, "the respawned writer must accept writes again");
 }
