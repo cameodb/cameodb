@@ -24,6 +24,13 @@ const WRITE_OP_TRAP_INDEX: &str = "__fault_panic_write_op__";
 const WRITER_THREAD_TRAP_INDEX: &str = "__fault_kill_writer__";
 const HANDLER_TRAP_PATH: &str = "/__fault/panic";
 
+/// How long the node's writer monitor is held before it rebuilds a crashed writer. The respawn is
+/// immediate in a normal build, which leaves the writerless window far too short to poll over
+/// HTTP; holding it open is what lets this test assert the red a dead writer must report, and then
+/// the green its replacement restores. Long enough to poll comfortably, short enough not to drag
+/// the run out.
+const RESPAWN_HOLD: Duration = Duration::from_secs(3);
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -116,6 +123,10 @@ max_shards_per_node = 1
             .arg("-c")
             .arg(&config_path)
             .env("RUST_LOG", "error")
+            .env(
+                "CAMEODB_FAULT_RESPAWN_DELAY_MS",
+                RESPAWN_HOLD.as_millis().to_string(),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -236,9 +247,10 @@ async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_is_respawned() 
     );
 
     // Now kill the writer thread outright — a panic past its guard ends the thread. The write's
-    // reply is lost, but the thread's monitor must notice the crash and respawn a replacement over
-    // the same store, so the shard heals on its own: health returns to green and writes land again,
-    // with no process restart.
+    // reply is lost, and the shard can take no more writes until its monitor rebuilds one. Both
+    // halves of that must show: health goes red while the writer is gone, and back to green once
+    // the replacement is serving, with no process restart. The monitor is held off for
+    // `RESPAWN_HOLD`, so the red window is wide enough to observe rather than race.
     let _ = client
         .put(node.url(&format!("/api/{WRITER_THREAD_TRAP_INDEX}/document")))
         .json(&serde_json::json!({ "id": "x", "doc": { "title": "kill" } }))
@@ -246,6 +258,19 @@ async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_is_respawned() 
         .await;
 
     assert!(node.is_running(), "a dead writer must not take the process down");
+
+    // Health was green one assertion ago, so a red here is the writer's death and nothing else.
+    let deadline = Instant::now() + RESPAWN_HOLD;
+    loop {
+        if health_status(&client, &node).await == "red" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a dead writer thread must show as red in health"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Reads are never affected by the writer's death.
     let status = client
@@ -257,9 +282,9 @@ async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_is_respawned() 
         .status();
     assert_eq!(status, 200, "reads must still be served after a writer dies");
 
-    // The monitor respawns the writer, so health returns to green on its own. (It may pass through
-    // red first; we assert the recovery, which is the contract, rather than race the window.)
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Once the hold expires the monitor respawns the writer, and health returns to green on its
+    // own — the recovery the down-count exists to be cleared by.
+    let deadline = Instant::now() + RESPAWN_HOLD + Duration::from_secs(10);
     loop {
         if health_status(&client, &node).await == "green" {
             break;
