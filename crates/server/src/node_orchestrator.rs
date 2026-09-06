@@ -3765,6 +3765,9 @@ pub struct MicroshardActor {
     shutdown_notify: Arc<tokio::sync::Notify>,
     /// Read thread pool handle for isolated search/stats operations.
     read_pool_handle: Option<tokio::runtime::Handle>,
+    /// Node-wide read-pool health each read on this shard brackets, so health sees saturation and
+    /// a wedge. `None` when there is no dedicated pool (tests, and the generic-pool fallback).
+    read_pool_health: Option<Arc<ReadPoolHealth>>,
     /// Total shards on this node (for per-shard memory budgeting).
     total_shards: usize,
     /// Writer thread shutdown timeout in seconds.
@@ -3802,6 +3805,9 @@ pub struct ShardRuntime {
     pub default_search_limit: usize,
     /// The shared read pool. `None` falls back to tokio's generic blocking pool.
     pub read_pool_handle: Option<tokio::runtime::Handle>,
+    /// Node-wide read-pool health each read brackets. Paired with `read_pool_handle`: `Some` for
+    /// the dedicated pool, `None` for the generic-pool fallback.
+    pub read_pool_health: Option<Arc<ReadPoolHealth>>,
     /// Shards on this node, for per-shard memory budgeting.
     pub total_shards: usize,
     /// How long to let the writer thread drain on shutdown.
@@ -3970,6 +3976,97 @@ fn guard_writer_op<T>(
     }
 }
 
+/// A read pool that has filled every blocking thread and completed nothing for longer than this
+/// is treated as wedged — threads stuck in a tantivy or redb call that will not return, which no
+/// per-read panic guard can catch because the threads never unwind. The bound sits well past any
+/// healthy search, so a pool merely busy-but-draining — completions still landing — never trips
+/// it; only a pool that has stopped making progress does.
+const READ_POOL_WEDGE_THRESHOLD: Duration = Duration::from_secs(60);
+
+/// Node-wide read-pool health, read by the health endpoint the same bounded, non-blocking way as
+/// [`WriterLiveness`].
+///
+/// Every read runs a blocking closure on the shared pool through [`dispatch_read_pool`], which
+/// brackets it: `in_flight` counts closures currently executing — bounded by the pool's blocking
+/// width — and `last_progress` is the tick of the most recent bracket edge, a read starting or
+/// finishing. Health reads the pair. Two shapes it distinguishes:
+///
+/// - *Saturation* — `in_flight` at `capacity` — is load, not a fault: reported as a gauge, it
+///   never colours the status, because a pool draining a burst is doing its job.
+/// - *Wedge* — saturation whose `last_progress` has not advanced for [`READ_POOL_WEDGE_THRESHOLD`]
+///   — is every thread stuck with no read starting or ending, and turns the node red because it
+///   can no longer answer reads. Stamping progress on the *start* edge too is what keeps a fresh
+///   burst after a long idle from reading as a wedge: the reads that just began are progress.
+#[derive(Debug)]
+pub struct ReadPoolHealth {
+    in_flight: AtomicUsize,
+    last_progress: AtomicU64,
+    capacity: usize,
+    origin: Instant,
+}
+
+impl ReadPoolHealth {
+    fn new(capacity: usize) -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+            last_progress: AtomicU64::new(0),
+            capacity: capacity.max(1),
+            origin: Instant::now(),
+        }
+    }
+
+    fn now_ticks(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
+    }
+
+    /// Mark a read as it begins executing on a pool thread; the returned guard marks it done when
+    /// dropped — including as a panicking read unwinds — so both bracket edges always land.
+    fn track(self: &Arc<Self>) -> ReadInFlight {
+        self.in_flight.fetch_add(1, AtomicOrdering::Relaxed);
+        self.last_progress.store(self.now_ticks().max(1), AtomicOrdering::Relaxed);
+        ReadInFlight {
+            pool: Arc::clone(self),
+        }
+    }
+
+    /// In-flight reads and the pool's blocking width — the saturation gauge for the health body.
+    pub fn gauge(&self) -> (usize, usize) {
+        (
+            self.in_flight.load(AtomicOrdering::Relaxed),
+            self.capacity,
+        )
+    }
+
+    /// Whether every pool thread is busy and none has started or finished a read for longer than
+    /// [`READ_POOL_WEDGE_THRESHOLD`] — a stuck pool, not merely a loaded one.
+    pub fn is_wedged(&self) -> bool {
+        self.is_wedged_at(self.now_ticks())
+    }
+
+    fn is_wedged_at(&self, now_ms: u64) -> bool {
+        if self.in_flight.load(AtomicOrdering::Relaxed) < self.capacity {
+            return false;
+        }
+        let last = self.last_progress.load(AtomicOrdering::Relaxed);
+        now_ms.saturating_sub(last) >= READ_POOL_WEDGE_THRESHOLD.as_millis() as u64
+    }
+}
+
+/// Drop guard bracketing one read: decrements the in-flight count and stamps the progress tick as
+/// the read leaves the pool, whether it returned or unwound.
+struct ReadInFlight {
+    pool: Arc<ReadPoolHealth>,
+}
+
+impl Drop for ReadInFlight {
+    fn drop(&mut self) {
+        self.pool
+            .last_progress
+            .store(self.pool.now_ticks().max(1), AtomicOrdering::Relaxed);
+        self.pool.in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+}
+
 /// Run a blocking read on the shared read pool — or tokio's generic blocking pool when a shard
 /// has none — and turn a panic in the closure into an error instead of a process-ending abort.
 ///
@@ -3980,19 +4077,29 @@ fn guard_writer_op<T>(
 /// — keeps serving. This is the seam finding 01 turns on: under the old `panic = "abort"` the
 /// same panic took the whole process down.
 ///
+/// When a [`ReadPoolHealth`] is supplied, the closure is bracketed on the pool thread so health
+/// can see saturation and, past a threshold of no progress, a wedge.
+///
 /// Split out from [`MicroshardActor::spawn_on_read_pool`] so the isolation itself is testable
 /// without standing up a shard: it depends on nothing but the pool handle.
 async fn dispatch_read_pool<F, R>(
     handle: Option<&tokio::runtime::Handle>,
+    health: Option<Arc<ReadPoolHealth>>,
     f: F,
 ) -> Result<R, OrchestratorError>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    let tracked = move || {
+        // Held across `f` on the pool thread, so in-flight reflects work actually running and the
+        // guard's drop records completion even if `f` unwinds.
+        let _in_flight = health.as_ref().map(|h| h.track());
+        f()
+    };
     let joined = match handle {
-        Some(handle) => handle.spawn_blocking(f).await,
-        None => tokio::task::spawn_blocking(f).await,
+        Some(handle) => handle.spawn_blocking(tracked).await,
+        None => tokio::task::spawn_blocking(tracked).await,
     };
     joined.map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
 }
@@ -4002,6 +4109,7 @@ impl MicroshardActor {
         let ShardRuntime {
             default_search_limit,
             read_pool_handle,
+            read_pool_health,
             total_shards,
             writer_shutdown_timeout_secs,
             supervisor_timeout_secs,
@@ -4019,6 +4127,7 @@ impl MicroshardActor {
             supervisors: Arc::new(AsyncRwLock::new(HashMap::new())),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             read_pool_handle,
+            read_pool_health,
             total_shards,
             writer_shutdown_timeout_secs,
             supervisor_timeout_secs,
@@ -4714,7 +4823,7 @@ impl MicroshardActor {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        dispatch_read_pool(self.read_pool_handle.as_ref(), f).await
+        dispatch_read_pool(self.read_pool_handle.as_ref(), self.read_pool_health.clone(), f).await
     }
 
     /// Handles search requests on the dedicated read thread pool.
@@ -6798,6 +6907,10 @@ pub struct NodeOrchestrator {
     /// Isolates read I/O from the writer threads and tokio's generic blocking pool.
     /// Arc-wrapped so the runtime outlives shard clones that hold its Handle.
     read_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    /// Node-wide read-pool health, its capacity the read runtime's blocking width. Handed to every
+    /// shard so each read brackets it, and to the health endpoint so it can see the pool saturate
+    /// or wedge.
+    read_pool_health: Arc<ReadPoolHealth>,
     /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups.
     remote_peer_pool: Option<Arc<RemotePeerPool>>,
 }
@@ -8001,6 +8114,7 @@ impl NodeOrchestrator {
             worker_count: 0,
             worker_threads: Vec::new(),
             read_runtime: Some(read_runtime),
+            read_pool_health: Arc::new(ReadPoolHealth::new(read_threads)),
             remote_peer_pool: None,
         };
 
@@ -8350,6 +8464,7 @@ impl NodeOrchestrator {
             let storage_config = self.create_shard_storage_config(shard_id, shard_path);
             let default_search_limit = self.default_search_limit;
             let read_handle = self.read_runtime.as_ref().map(|rt| rt.handle().clone());
+            let read_pool_health = Some(Arc::clone(&self.read_pool_health));
             let sem = Arc::clone(&semaphore);
             let writer_liveness = Arc::clone(&self.writer_liveness);
             // Placed here rather than inside the task: hydration runs concurrently, and an
@@ -8368,6 +8483,7 @@ impl NodeOrchestrator {
                     ShardRuntime {
                         default_search_limit,
                         read_pool_handle: read_handle,
+                        read_pool_health,
                         total_shards,
                         writer_shutdown_timeout_secs,
                         supervisor_timeout_secs,
@@ -8567,6 +8683,7 @@ impl NodeOrchestrator {
             ShardRuntime {
                 default_search_limit: self.default_search_limit,
                 read_pool_handle: read_handle,
+                read_pool_health: Some(Arc::clone(&self.read_pool_health)),
                 total_shards,
                 writer_shutdown_timeout_secs: self.config.writer_shutdown_timeout_secs,
                 supervisor_timeout_secs: self.config.supervisor_timeout_secs,
@@ -8809,6 +8926,13 @@ impl NodeOrchestrator {
     /// before the orchestrator is moved into its actor, so health can probe it without a message.
     pub fn writer_liveness(&self) -> Arc<WriterLiveness> {
         Arc::clone(&self.writer_liveness)
+    }
+
+    /// A handle to this node's read-pool health, for the health endpoint to read its saturation
+    /// gauge and wedge state. Taken before the orchestrator is moved into its actor, like
+    /// [`writer_liveness`](Self::writer_liveness), so health can probe it without a message.
+    pub fn read_pool_health(&self) -> Arc<ReadPoolHealth> {
+        Arc::clone(&self.read_pool_health)
     }
 
     // ========================================================================
@@ -10974,29 +11098,66 @@ mod tests {
             .expect("read runtime");
         let handle = runtime.handle().clone();
 
+        let health = Arc::new(ReadPoolHealth::new(2));
+
         runtime.block_on(async {
-            // The dedicated-pool path a real search takes.
-            let panicked: Result<(), OrchestratorError> =
-                dispatch_read_pool(Some(&handle), || panic!("tantivy panicked on a document"))
-                    .await;
+            // The dedicated-pool path a real search takes, tracked so the in-flight bracket is
+            // exercised across the panic too.
+            let panicked: Result<(), OrchestratorError> = dispatch_read_pool(
+                Some(&handle),
+                Some(Arc::clone(&health)),
+                || panic!("tantivy panicked on a document"),
+            )
+            .await;
             assert!(
                 panicked.is_err(),
                 "a panic in a read must surface as an error, not take the process down"
             );
-            let after: u32 = dispatch_read_pool(Some(&handle), || 7)
+            let after: u32 = dispatch_read_pool(Some(&handle), Some(Arc::clone(&health)), || 7)
                 .await
                 .expect("the dedicated read pool serves the next read after a panic");
             assert_eq!(after, 7);
+            // The guard drops on both the panicking and the clean read, so nothing stays counted.
+            assert_eq!(health.gauge().0, 0, "a read that panicked still left the in-flight count");
 
             // And the fallback path, for a shard with no dedicated pool.
             let panicked: Result<(), OrchestratorError> =
-                dispatch_read_pool(None, || panic!("redb panicked")).await;
+                dispatch_read_pool(None, None, || panic!("redb panicked")).await;
             assert!(panicked.is_err(), "the fallback pool isolates a panic too");
-            let after: u32 = dispatch_read_pool(None, || 9)
+            let after: u32 = dispatch_read_pool(None, None, || 9)
                 .await
                 .expect("the fallback pool serves the next read after a panic");
             assert_eq!(after, 9);
         });
+    }
+
+    /// A saturated read pool is load, not a fault; a saturated pool that has stopped making
+    /// progress is a wedge and turns the node red. Driven against a supplied clock (`is_wedged_at`)
+    /// so the stall lands without a 60-second wait.
+    #[test]
+    fn a_stuck_read_pool_reads_as_wedged_and_a_busy_one_does_not() {
+        let pool = Arc::new(ReadPoolHealth::new(2));
+        let threshold = READ_POOL_WEDGE_THRESHOLD.as_millis() as u64;
+
+        // Idle: never wedged, however stale the progress tick.
+        assert!(!pool.is_wedged_at(10 * threshold));
+
+        // Two reads start (capacity full) and stamp progress at tick 1_000.
+        let g1 = pool.track();
+        let g2 = pool.track();
+        pool.last_progress.store(1_000, AtomicOrdering::Relaxed);
+        assert_eq!(pool.gauge(), (2, 2), "both reads are in flight against a width of two");
+
+        // At capacity but progressing recently: saturated, not wedged.
+        assert!(!pool.is_wedged_at(1_000 + threshold - 1));
+        // At capacity with no progress past the threshold: wedged.
+        assert!(pool.is_wedged_at(1_000 + threshold));
+
+        // One read finishes: below capacity, so not wedged even long after.
+        drop(g1);
+        assert!(!pool.is_wedged_at(u64::MAX));
+        drop(g2);
+        assert_eq!(pool.gauge().0, 0);
     }
 
     /// A writer wedged mid-batch is as unavailable as a dead one, and an idle writer is not.

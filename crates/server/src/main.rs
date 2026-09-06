@@ -474,6 +474,7 @@ async fn main() -> Result<()> {
     // Taken before the orchestrator is moved into its actor, so the health endpoint can probe
     // writer liveness with an atomic load rather than a message the work path could delay.
     let writer_liveness = orchestrator.writer_liveness();
+    let read_pool_health = orchestrator.read_pool_health();
 
     // NOW spawn the NodeOrchestrator as an actor (after all setup is done)
     let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
@@ -610,6 +611,7 @@ async fn main() -> Result<()> {
         max_response_bytes: cameodb_config.effective_max_response_bytes(),
         audit: Arc::clone(&audit_sink),
         writer_liveness,
+        read_pool_health,
     };
 
     // Create the HTTP router with shared state and body limit derived from max_record_size_mb

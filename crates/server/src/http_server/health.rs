@@ -37,6 +37,11 @@ pub struct HealthResponse {
     pub total_indexes: usize,
     pub indexes_with_data: usize,
 
+    // Read-pool saturation gauge: reads executing now, and the pool's blocking width. A read
+    // approaching the second is a node shedding read load; equal and stuck is what turns it red.
+    pub read_pool_in_flight: usize,
+    pub read_pool_capacity: usize,
+
     // Performance/Debug metrics
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dial_failures: Option<u64>,
@@ -76,18 +81,25 @@ pub(super) async fn health_handler(
         .map(|s| s.health.clone())
         .unwrap_or_else(|| "green".to_string());
 
-    // A writer that has died, or is wedged mid-batch, means at least one shard can take no more
-    // writes. Reads may still be served, but an orchestrator should stop routing to this node and
-    // recycle it, so it reports red whatever the cluster view says. This is the only part of the
-    // anonymous response that touches local node state, and it is a load of a handful of atomics
-    // — it never reaches the read pool or a shard's writer, so it cannot itself stall.
-    let status = worst_status(status, state.writer_liveness.unavailable_writers());
+    // The two ways a shard's data path stops serving while the request path stays up: a writer
+    // that has died or wedged mid-batch (no more writes), and a read pool with every thread stuck
+    // and no progress (no more reads). Either should make an orchestrator stop routing here and
+    // recycle the node, so either forces red whatever the cluster view says. This is the only part
+    // of the anonymous response that touches local node state, and it is a load of a handful of
+    // atomics — it never reaches the read pool or a shard's writer, so it cannot itself stall.
+    let status = worst_status(
+        status,
+        state.writer_liveness.unavailable_writers(),
+        state.read_pool_health.is_wedged(),
+    );
 
     if !identified {
         // Still the *real* status, not a constant: a health check that cannot go yellow is
         // not a health check, and this is what a load balancer reads.
         return Ok(Json(serde_json::json!({ "status": status })).into_response());
     }
+
+    let (read_pool_in_flight, read_pool_capacity) = state.read_pool_health.gauge();
 
     // Get basic shard count and node info from orchestrator
     let shard_count = state.router.shard_count().await;
@@ -152,6 +164,8 @@ pub(super) async fn health_handler(
         active_shards: shard_count,
         total_indexes,
         indexes_with_data,
+        read_pool_in_flight,
+        read_pool_capacity,
         dial_failures: cluster_status.as_ref().map(|s| s.dial_failures),
         bootstrap_successes: cluster_status.as_ref().map(|s| s.bootstrap_successes),
         routing_updates: cluster_status.as_ref().map(|s| s.routing_updates),
@@ -160,14 +174,15 @@ pub(super) async fn health_handler(
     Ok(Json(response).into_response())
 }
 
-/// Fold local writer-thread liveness into the cluster health string.
+/// Fold local data-path liveness into the cluster health string.
 ///
-/// A shard whose writer thread has died or wedged mid-batch can accept no more writes, which an
-/// orchestrator should treat as a reason to stop routing here and recycle the node — so any
-/// unavailable writer forces `red`, whatever the cluster view reported. With every writer serving,
-/// the cluster status stands.
-fn worst_status(cluster_status: String, writers_unavailable: usize) -> String {
-    if writers_unavailable > 0 {
+/// A shard whose writer thread has died or wedged mid-batch can accept no more writes, and a read
+/// pool with every thread stuck can answer no more reads — either is a reason for an orchestrator
+/// to stop routing here and recycle the node, so either forces `red` whatever the cluster view
+/// reported. With every writer serving and the read pool making progress, the cluster status
+/// stands. Saturation alone is not folded in: a busy-but-draining pool is doing its job.
+fn worst_status(cluster_status: String, writers_unavailable: usize, read_pool_wedged: bool) -> String {
+    if writers_unavailable > 0 || read_pool_wedged {
         "red".to_string()
     } else {
         cluster_status
@@ -179,15 +194,21 @@ mod tests {
     use super::worst_status;
 
     #[test]
-    fn a_down_writer_forces_red_over_any_cluster_status() {
-        assert_eq!(worst_status("green".to_string(), 1), "red");
-        assert_eq!(worst_status("yellow".to_string(), 2), "red");
-        assert_eq!(worst_status("red".to_string(), 1), "red");
+    fn an_unavailable_writer_forces_red_over_any_cluster_status() {
+        assert_eq!(worst_status("green".to_string(), 1, false), "red");
+        assert_eq!(worst_status("yellow".to_string(), 2, false), "red");
+        assert_eq!(worst_status("red".to_string(), 1, false), "red");
     }
 
     #[test]
-    fn with_every_writer_alive_the_cluster_status_stands() {
-        assert_eq!(worst_status("green".to_string(), 0), "green");
-        assert_eq!(worst_status("yellow".to_string(), 0), "yellow");
+    fn a_wedged_read_pool_forces_red_over_any_cluster_status() {
+        assert_eq!(worst_status("green".to_string(), 0, true), "red");
+        assert_eq!(worst_status("yellow".to_string(), 0, true), "red");
+    }
+
+    #[test]
+    fn a_healthy_data_path_lets_the_cluster_status_stand() {
+        assert_eq!(worst_status("green".to_string(), 0, false), "green");
+        assert_eq!(worst_status("yellow".to_string(), 0, false), "yellow");
     }
 }

@@ -8,7 +8,7 @@ use kameo::actor::ActorRef;
 use std::sync::Arc;
 
 use crate::cluster_coordinator::ClusterCoordinator;
-use crate::node_orchestrator::{RouterActor, WriterLiveness};
+use crate::node_orchestrator::{ReadPoolHealth, RouterActor, WriterLiveness};
 use crate::ratelimit::ToolRateLimiter;
 
 /// Application state shared across handlers
@@ -47,4 +47,7 @@ pub struct AppState {
     /// This node's writer-thread liveness. The health endpoint reads it with one atomic load so
     /// a shard whose writer thread has died stops the node reporting green.
     pub writer_liveness: Arc<WriterLiveness>,
+    /// This node's read-pool health. The health endpoint reads it the same non-blocking way for
+    /// the saturation gauge and to turn the node red when the pool has wedged.
+    pub read_pool_health: Arc<ReadPoolHealth>,
 }
