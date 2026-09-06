@@ -3814,29 +3814,96 @@ pub struct ShardRuntime {
     pub writer_liveness: Arc<WriterLiveness>,
 }
 
-/// Node-wide count of writer threads that have stopped serving, read by the health endpoint.
+/// A writer that has been mid-batch longer than this is treated as wedged. A single coalesced
+/// write batch that genuinely runs this long is already pathological, so the bound is loose
+/// enough that a busy-but-progressing writer never trips it, and tight enough that a truly stuck
+/// shard surfaces within a health check or two rather than never.
+const WRITER_STALL_THRESHOLD: Duration = Duration::from_secs(60);
+
+/// Node-wide writer health, read by the anonymous health branch as a bounded, non-blocking probe.
 ///
-/// A shard's writer thread is the sole path for every write to that shard. If it exits for any
-/// reason but a requested shutdown — a panic that escaped the per-command guard, or its channel
-/// closing unexpectedly — that shard accepts no more writes until the process restarts, and
-/// nothing else on the node notices. This counter is the notice: the writer thread bumps it as
-/// it stops, and the anonymous health branch reads it with a single atomic load — a bounded,
-/// non-blocking probe that never touches the work path — so a node with a dead writer stops
-/// reporting green.
-#[derive(Debug, Default)]
+/// A shard's writer thread is the sole path for every write to that shard, and two failure shapes
+/// leave it unable to serve writes while nothing on the request path notices:
+///
+/// - It *exits* abnormally — a panic past the per-command guard, or its channel closing
+///   unexpectedly. `down` is the notice: the thread bumps it once as it stops.
+/// - It is *alive but wedged* — blocked inside a redb or tantivy call and no longer draining its
+///   channel. `down` can never catch this, because the thread never returns. Each writer instead
+///   publishes a heartbeat: the tick at which it began its current batch, or 0 while it idles on
+///   `blocking_recv`. A heartbeat non-zero for longer than [`WRITER_STALL_THRESHOLD`] is a writer
+///   stuck mid-op.
+///
+/// Health folds both into one count via [`unavailable_writers`](Self::unavailable_writers): a
+/// single atomic load plus a scan of a handful more, off the work path, so a node whose data path
+/// has stalled or died stops reporting green. Ticks are milliseconds from a monotonic origin
+/// shared by every writer and the reader, so an NTP step cannot fake or mask a stall.
+#[derive(Debug)]
 pub struct WriterLiveness {
     down: AtomicUsize,
+    heartbeats: std::sync::Mutex<Vec<Arc<AtomicU64>>>,
+    origin: Instant,
+}
+
+impl Default for WriterLiveness {
+    fn default() -> Self {
+        Self {
+            down: AtomicUsize::new(0),
+            heartbeats: std::sync::Mutex::new(Vec::new()),
+            origin: Instant::now(),
+        }
+    }
 }
 
 impl WriterLiveness {
+    /// Milliseconds since this liveness was created. The clock every heartbeat is stamped with and
+    /// compared against — monotonic, so it never runs backwards under a wall-clock adjustment.
+    pub fn now_ticks(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
+    }
+
+    /// Register a writer thread and hand back its heartbeat. The thread stamps it with
+    /// [`now_ticks`](Self::now_ticks) as it starts a batch and resets it to 0 when it goes back to
+    /// waiting; a stalled writer is one whose stamp stops advancing while non-zero.
+    pub fn register_writer(&self) -> Arc<AtomicU64> {
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        self.heartbeats
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(Arc::clone(&heartbeat));
+        heartbeat
+    }
+
     /// Record that a writer thread has stopped serving. Called once, as the thread exits.
     pub fn mark_writer_down(&self) {
         self.down.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
-    /// How many writer threads have stopped. Zero on a healthy node.
-    pub fn down_count(&self) -> usize {
+    /// How many registered writers have been mid-batch longer than `threshold_ms` as of `now_ms`.
+    /// A writer that idles on `blocking_recv` holds a 0 stamp and is never counted.
+    fn stalled_count(&self, now_ms: u64, threshold_ms: u64) -> usize {
+        self.heartbeats
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|heartbeat| {
+                let since = heartbeat.load(AtomicOrdering::Relaxed);
+                since != 0 && now_ms.saturating_sub(since) >= threshold_ms
+            })
+            .count()
+    }
+
+    /// Writers that cannot currently take writes: exited abnormally, or wedged mid-batch past
+    /// [`WRITER_STALL_THRESHOLD`]. Self-contained — reads its own clock and threshold — so the
+    /// health branch folds the whole data-path verdict from one call.
+    pub fn unavailable_writers(&self) -> usize {
+        self.unavailable_at(self.now_ticks())
+    }
+
+    /// The verdict [`unavailable_writers`](Self::unavailable_writers) computes, against a supplied
+    /// clock so a test can place a stall without waiting out the real threshold.
+    fn unavailable_at(&self, now_ms: u64) -> usize {
         self.down.load(AtomicOrdering::Relaxed)
+            + self.stalled_count(now_ms, WRITER_STALL_THRESHOLD.as_millis() as u64)
     }
 }
 
@@ -4176,11 +4243,18 @@ impl MicroshardActor {
                 // release profile now lets unwind), and marks the writer down so health sees a
                 // shard that can no longer take writes. A clean exit — a shutdown command, or the
                 // channel closing as the node tears down — is not a fault and marks nothing.
+                // Published so health can tell a writer wedged mid-batch from one idle on the
+                // channel: stamped as each batch starts, cleared to 0 once it drains.
+                let writer_heartbeat = writer_liveness.register_writer();
+
                 let loop_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // Reusable buffers to avoid per-iteration allocations
                     let mut pending_cmds: Vec<StorageCommand> = Vec::with_capacity(256);
 
                     while let Some(first_cmd) = rx.blocking_recv() {
+                    // Mark the writer busy for the whole batch it is about to drain and apply;
+                    // `max(1)` keeps the stamp distinct from the 0 that means idle.
+                    writer_heartbeat.store(writer_liveness.now_ticks().max(1), AtomicOrdering::Relaxed);
                     // Phase 1: Drain all pending commands from the channel.
                     // The first command blocks until available; subsequent commands
                     // are non-blocking to coalesce as many writes as possible.
@@ -4449,6 +4523,10 @@ impl MicroshardActor {
                         }
                     }
 
+                    // Batch drained and applied; the thread is about to wait again, so it is no
+                    // longer mid-op and must not read as stalled while it idles.
+                    writer_heartbeat.store(0, AtomicOrdering::Relaxed);
+
                     // Phase 6: Handle shutdown after draining all pending work
                     if should_shutdown {
                         info!(shard_id = %writer_shard_id, "Writer thread shutting down");
@@ -4456,6 +4534,11 @@ impl MicroshardActor {
                     }
                     }
                 }));
+
+                // The thread is exiting, cleanly or by panic; a panic leaves the heartbeat frozen
+                // at its last batch stamp, so clear it here to keep a dead writer from also being
+                // read as stalled — `mark_writer_down` below is the one signal it needs.
+                writer_heartbeat.store(0, AtomicOrdering::Relaxed);
 
                 if loop_outcome.is_err() {
                     // A panic reached past every per-command guard. The thread is done and this
@@ -10916,6 +10999,57 @@ mod tests {
         });
     }
 
+    /// A writer wedged mid-batch is as unavailable as a dead one, and an idle writer is not.
+    ///
+    /// `down` catches a writer that *exited*; it can never catch one blocked inside a redb or
+    /// tantivy call, because that thread never returns to bump it. The heartbeat closes that gap:
+    /// a stamp that stops advancing while non-zero is a stuck writer, a 0 stamp is one idle on its
+    /// channel. This drives the stamps by hand — no writer thread — to pin the fold health reads.
+    #[test]
+    fn a_wedged_writer_counts_as_unavailable_and_an_idle_one_does_not() {
+        let liveness = WriterLiveness::default();
+        let heartbeat = liveness.register_writer();
+        let threshold = WRITER_STALL_THRESHOLD.as_millis() as u64;
+
+        // Idle on the channel (stamp 0): never stalled, however much time passes.
+        assert_eq!(liveness.stalled_count(threshold * 10, threshold), 0);
+
+        // Mid-batch since tick 1_000, but not yet past the threshold: still healthy.
+        heartbeat.store(1_000, AtomicOrdering::Relaxed);
+        assert_eq!(liveness.stalled_count(1_000 + threshold - 1, threshold), 0);
+
+        // Mid-batch past the threshold: wedged.
+        assert_eq!(liveness.stalled_count(1_000 + threshold, threshold), 1);
+
+        // The writer finished its batch and went back to waiting: healthy again.
+        heartbeat.store(0, AtomicOrdering::Relaxed);
+        assert_eq!(liveness.stalled_count(u64::MAX, threshold), 0);
+    }
+
+    /// `unavailable_writers` is the single number the health branch folds: dead writers plus
+    /// wedged ones, from the same struct, so one call decides the whole data-path verdict. Driven
+    /// against a supplied clock (`unavailable_at`) so the stall lands without a 60-second wait.
+    #[test]
+    fn unavailable_writers_sums_dead_and_wedged() {
+        let liveness = WriterLiveness::default();
+        let threshold = WRITER_STALL_THRESHOLD.as_millis() as u64;
+        let now = 10 * threshold; // well past any stamp we place below
+        assert_eq!(liveness.unavailable_at(now), 0);
+
+        // One writer exits abnormally.
+        liveness.mark_writer_down();
+        assert_eq!(liveness.unavailable_at(now), 1);
+
+        // A second writer is registered and wedges mid-batch a full threshold ago.
+        let heartbeat = liveness.register_writer();
+        heartbeat.store(now - threshold, AtomicOrdering::Relaxed);
+        assert_eq!(liveness.unavailable_at(now), 2, "dead and wedged both count");
+
+        // That writer unblocks and returns to waiting: only the dead one remains.
+        heartbeat.store(0, AtomicOrdering::Relaxed);
+        assert_eq!(liveness.unavailable_at(now), 1);
+    }
+
     fn writer_test_config(path: std::path::PathBuf) -> StorageConfig {
         StorageConfig {
             shard_path: path,
@@ -10954,14 +11088,14 @@ mod tests {
         );
     }
 
-    /// The liveness counter the health endpoint reads reflects each writer that stops.
+    /// Each writer that stops raises the count the health endpoint reads.
     #[test]
     fn writer_liveness_counts_the_writers_that_have_stopped() {
         let liveness = WriterLiveness::default();
-        assert_eq!(liveness.down_count(), 0);
+        assert_eq!(liveness.unavailable_writers(), 0);
         liveness.mark_writer_down();
         liveness.mark_writer_down();
-        assert_eq!(liveness.down_count(), 2);
+        assert_eq!(liveness.unavailable_writers(), 2);
     }
 
     /// An engine with no shards and no coordinator. Enough to exercise `execute`'s dispatch
