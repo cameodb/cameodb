@@ -7,9 +7,8 @@
 //! would take the process down and the very next request would fail.
 //!
 //! The `fault-injection` feature is off in every shipped build, so the panic seams these probes
-//! reach exist only here. The test is `#[ignore]` because it compiles a second binary; run it
-//! with `cargo test -p server --test panic_isolation -- --ignored`, and set
-//! `PANIC_SMOKE_PROFILE=dev` to trade the release proof for a faster build while iterating.
+//! reach exist only here. It compiles a second binary, so set `PANIC_SMOKE_PROFILE=dev` while
+//! iterating to trade the release proof for a faster build.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -196,7 +195,6 @@ async fn health_status(client: &reqwest::Client, node: &Node) -> String {
 /// Every panic surface is contained: the process survives each trigger, a dead writer turns
 /// health red, and its monitor respawns it so the shard heals back to green without a restart.
 #[tokio::test]
-#[ignore = "builds a second binary; run explicitly with --ignored"]
 async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_is_respawned() {
     install_crypto_provider();
     let binary = build_fault_binary();
