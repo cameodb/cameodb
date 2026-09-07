@@ -814,7 +814,7 @@ pub struct StorageConfig {
 }
 
 /// Cluster configuration for distributed actor system
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClusterConfig {
     /// Enable distributed cluster mode (default: false)
@@ -872,6 +872,24 @@ pub struct ClusterConfig {
     /// Messaging configuration
     #[serde(default)]
     pub messaging: MessagingConfig,
+}
+
+impl fmt::Debug for ClusterConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClusterConfig")
+            .field("enabled", &self.enabled)
+            .field("bind_address", &self.bind_address)
+            .field("cluster_port", &self.cluster_port)
+            .field("seed_nodes", &self.seed_nodes)
+            .field("cluster_nodes", &self.cluster_nodes)
+            .field("cluster_name", &self.cluster_name)
+            .field("listen_addrs", &self.listen_addrs)
+            .field("bootstrap_peers", &self.bootstrap_peers)
+            .field("psk", &self.psk.as_ref().map(|_| "<redacted>"))
+            .field("psk_file", &self.psk_file)
+            .field("messaging", &self.messaging)
+            .finish()
+    }
 }
 
 /// Messaging configuration for Kameo remote actors
@@ -2854,6 +2872,21 @@ max_response_bytes = 16777216
         let debug = format!("{:?}", psk);
         assert!(!debug.contains(&secret), "psk leaked via Debug: {}", debug);
         assert!(debug.contains("redacted"), "{}", debug);
+
+        let cluster_debug = format!("{:?}", config.network.cluster);
+        assert!(
+            !cluster_debug.contains(&secret),
+            "psk leaked via ClusterConfig Debug: {}",
+            cluster_debug
+        );
+        assert!(cluster_debug.contains("redacted"), "{}", cluster_debug);
+
+        let config_debug = format!("{:?}", config);
+        assert!(
+            !config_debug.contains(&secret),
+            "psk leaked via CameoDbConfig Debug: {}",
+            config_debug
+        );
     }
 
     /// pnet disables QUIC, so a QUIC address alongside a PSK can never connect. Catching
