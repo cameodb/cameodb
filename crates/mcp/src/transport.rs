@@ -276,11 +276,7 @@ async fn process_mcp_message<B: McpBackend>(
             let join_handle = tokio::spawn(async move {
                 let maybe_response = match parse_json_rpc_request(payload) {
                     Ok(request) => handle_rpc_request(app_state, request, &authz).await,
-                    Err(err) => Some(error_response(
-                        None,
-                        -32600,
-                        format!("Invalid JSON-RPC request: {err}"),
-                    )),
+                    Err(err_response) => Some(err_response),
                 };
 
                 if let Some(envelope) = maybe_response {
