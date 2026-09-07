@@ -755,15 +755,31 @@ mod tests {
 
             // `post(handler)` and the chained `.get(handler)` of a method router both count,
             // which is how the MCP transport's three verbs on one path are seen. The boundary
-            // check is what keeps a handler named `set_budget(` from reading as a `get`.
+            // check is what keeps a handler named `set_budget(` from reading as a `get`, and the
+            // string-literal skip keeps a path like `"/post("` from being read as a `POST`.
             let mentions_method = |method: &str| {
                 let needle = format!("{method}(");
-                call.match_indices(&needle).any(|(at, _)| {
-                    call[..at]
-                        .chars()
-                        .next_back()
-                        .is_none_or(|before| !before.is_alphanumeric() && before != '_')
-                })
+                let mut in_string = false;
+                for (at, ch) in call.char_indices() {
+                    if ch == '"' {
+                        in_string = !in_string;
+                        continue;
+                    }
+                    if in_string {
+                        continue;
+                    }
+                    if !call[at..].starts_with(&needle) {
+                        continue;
+                    }
+                    if at == 0 {
+                        return true;
+                    }
+                    let before = call[..at].chars().next_back().unwrap();
+                    if !before.is_alphanumeric() && before != '_' {
+                        return true;
+                    }
+                }
+                false
             };
 
             let methods = METHODS
@@ -854,6 +870,50 @@ mod tests {
         assert!(!is_classified("TRACE", "/api/{index}/_config"));
         assert!(is_classified("PUT", "/api/{index}/document"));
         assert!(!is_classified("TRACE", "/api/{index}/document"));
+    }
+
+    /// A path literal or handler name that happens to contain a method-like substring must not
+    /// create a phantom HTTP method. The previous boundary check already excluded identifiers, but
+    /// strings such as `"/post("` and handler names such as `my_get(...)` could still misread.
+    #[test]
+    fn parser_does_not_misread_method_names_inside_paths_or_handlers() {
+        let source = r#"
+            Router::new()
+                .route("/get(api", get(handler))
+                .route("/post(it", post(my_get(post)))
+                .route("/mixed", get(handler_one).post(handler_two))
+        "#;
+        let mounted = mounted_routes(source);
+        let methods_for = |path: &str| -> std::collections::HashSet<&str> {
+            mounted
+                .iter()
+                .find(|route| route.path == path)
+                .map(|route| route.methods.iter().map(|m| m.as_str()).collect())
+                .unwrap_or_default()
+        };
+
+        assert!(
+            methods_for("/get(api").contains("GET"),
+            "the real GET method on /get(api should be detected"
+        );
+        assert!(
+            !methods_for("/get(api").contains("POST"),
+            "'post' inside a path string should not add POST"
+        );
+
+        assert!(
+            methods_for("/post(it").contains("POST"),
+            "the real POST method on /post(it should be detected"
+        );
+        assert!(
+            !methods_for("/post(it").contains("GET"),
+            "'my_get' inside a handler name should not add GET"
+        );
+
+        assert!(
+            methods_for("/mixed").contains("GET") && methods_for("/mixed").contains("POST"),
+            "chained method routers should still be detected"
+        );
     }
 
     /// The check above reads one file, so it is only a check while one file mounts everything.

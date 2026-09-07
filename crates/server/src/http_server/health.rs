@@ -6,7 +6,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::error;
+
+/// How long the health endpoint will wait on actor queries that can queue behind real work.
+/// These only affect the expanded body; the liveness status is always fast.
+const HEALTH_ACTOR_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::authz::Authz;
 use crate::cluster_coordinator::GetStatus;
@@ -101,10 +106,24 @@ pub(super) async fn health_handler(
 
     let (read_pool_in_flight, read_pool_capacity) = state.read_pool_health.gauge();
 
-    // Get basic shard count and node info from orchestrator
-    let shard_count = state.router.shard_count().await;
-    let (node_id, node_name) = match state.router.handle_client_op(ClientOp::GetIdentity).await {
-        Ok(result) => {
+    // Get basic shard count and node info from orchestrator. These can queue behind real work,
+    // so the expanded body uses bounded waits; on timeout we fall back to defaults rather than
+    // let a slow node fail its own health probe.
+    let shard_count =
+        match tokio::time::timeout(HEALTH_ACTOR_TIMEOUT, state.router.shard_count()).await {
+            Ok(count) => count,
+            Err(_) => {
+                error!("health actor timeout: shard_count");
+                0
+            }
+        };
+    let (node_id, node_name) = match tokio::time::timeout(
+        HEALTH_ACTOR_TIMEOUT,
+        state.router.handle_client_op(ClientOp::GetIdentity),
+    )
+    .await
+    {
+        Ok(Ok(result)) => {
             let node_id = result
                 .get("node_id")
                 .and_then(|v| v.as_str())
@@ -117,18 +136,22 @@ pub(super) async fn health_handler(
                 .to_string();
             (node_id, node_name)
         }
-        Err(_) => ("local".to_string(), "unknown".to_string()),
+        Ok(Err(_)) | Err(_) => {
+            error!("health actor timeout or error: GetIdentity");
+            ("local".to_string(), "unknown".to_string())
+        }
     };
 
     // Get index statistics for health check
-    let (total_indexes, indexes_with_data) = match state
-        .router
-        .handle_client_op(ClientOp::ListIndexes {
+    let (total_indexes, indexes_with_data) = match tokio::time::timeout(
+        HEALTH_ACTOR_TIMEOUT,
+        state.router.handle_client_op(ClientOp::ListIndexes {
             include_data_size: false,
-        })
-        .await
+        }),
+    )
+    .await
     {
-        Ok(result) => {
+        Ok(Ok(result)) => {
             let total = result
                 .get("total_indexes")
                 .and_then(|v| v.as_u64())
@@ -149,7 +172,10 @@ pub(super) async fn health_handler(
                 .count();
             (total, with_data)
         }
-        Err(_) => (0, 0), // Fallback to 0 if index listing fails
+        Ok(Err(_)) | Err(_) => {
+            error!("health actor timeout or error: ListIndexes");
+            (0, 0) // Fallback to 0 if index listing fails
+        }
     };
 
     let response = HealthResponse {
@@ -181,7 +207,11 @@ pub(super) async fn health_handler(
 /// to stop routing here and recycle the node, so either forces `red` whatever the cluster view
 /// reported. With every writer serving and the read pool making progress, the cluster status
 /// stands. Saturation alone is not folded in: a busy-but-draining pool is doing its job.
-fn worst_status(cluster_status: String, writers_unavailable: usize, read_pool_wedged: bool) -> String {
+fn worst_status(
+    cluster_status: String,
+    writers_unavailable: usize,
+    read_pool_wedged: bool,
+) -> String {
     if writers_unavailable > 0 || read_pool_wedged {
         "red".to_string()
     } else {

@@ -100,7 +100,9 @@ pub fn create_router(
     let concurrency_guard = from_fn(move |req: axum::extract::Request, next: Next| {
         let sem = semaphore.clone();
         async move {
-            if req.uri().path() == HEALTH_PATH {
+            // Health checks may arrive with or without a trailing slash; exempt them all so a
+            // load balancer's probe is never starved out by ordinary traffic.
+            if req.uri().path().trim_end_matches('/') == HEALTH_PATH {
                 return next.run(req).await;
             }
             match sem.try_acquire() {
@@ -316,7 +318,10 @@ mod tests {
             .await
             .expect("read body");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
-        assert_eq!(json, serde_json::json!({ "error": "Internal server error" }));
+        assert_eq!(
+            json,
+            serde_json::json!({ "error": "Internal server error" })
+        );
         assert!(
             !String::from_utf8_lossy(&body).contains("blew up"),
             "the panic message must not reach the caller"
