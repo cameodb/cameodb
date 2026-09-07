@@ -12,10 +12,11 @@
 //! `PANIC_SMOKE_PROFILE=dev` to trade the release proof for a faster build while iterating.
 
 use std::io::Write as _;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+mod common;
 
 /// Trap inputs — the same literals the feature-gated seams in `node_orchestrator` and `routes`
 /// match. Kept in step by hand because the binary crate exposes no library to import them from.
@@ -45,13 +46,21 @@ fn build_fault_binary() -> PathBuf {
     let release = std::env::var("PANIC_SMOKE_PROFILE").as_deref() != Ok("dev");
 
     let mut cmd = Command::new(env!("CARGO"));
-    cmd.current_dir(workspace_root())
-        .args(["build", "--bin", "cameodb", "--features", "fault-injection"]);
+    cmd.current_dir(workspace_root()).args([
+        "build",
+        "--bin",
+        "cameodb",
+        "--features",
+        "fault-injection",
+    ]);
     if release {
         cmd.arg("--release");
     }
     let status = cmd.status().expect("run cargo build");
-    assert!(status.success(), "building the fault-injection binary failed");
+    assert!(
+        status.success(),
+        "building the fault-injection binary failed"
+    );
 
     let target = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -59,7 +68,11 @@ fn build_fault_binary() -> PathBuf {
     let binary = target
         .join(if release { "release" } else { "debug" })
         .join("cameodb");
-    assert!(binary.exists(), "built binary not found at {}", binary.display());
+    assert!(
+        binary.exists(),
+        "built binary not found at {}",
+        binary.display()
+    );
     binary
 }
 
@@ -72,14 +85,6 @@ fn install_crypto_provider() {
     });
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
-
 /// The built fault-injection binary, running against a temporary data directory.
 struct Node {
     child: Option<Child>,
@@ -90,7 +95,7 @@ struct Node {
 impl Node {
     async fn start(binary: &Path) -> Node {
         let dir = tempfile::tempdir().expect("temp dir");
-        let port = free_port();
+        let port = common::reserve_port();
         let data = dir.path().join("data");
         std::fs::create_dir_all(&data).expect("data dir");
 
@@ -161,8 +166,8 @@ max_shards_per_node = 1
 
     fn is_running(&mut self) -> bool {
         match self.child.as_mut().map(|c| c.try_wait()) {
-            Some(Ok(None)) => true,      // still running
-            _ => false,                  // exited, errored, or already taken
+            Some(Ok(None)) => true, // still running
+            _ => false,             // exited, errored, or already taken
         }
     }
 }
@@ -217,7 +222,10 @@ async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_is_respawned() 
         .expect("handler trap request")
         .status();
     assert_eq!(status, 500, "a panicking handler must answer 500");
-    assert!(node.is_running(), "the node must survive a panicking handler");
+    assert!(
+        node.is_running(),
+        "the node must survive a panicking handler"
+    );
 
     // A write whose per-command guard catches the panic is retriable (503), the writer is
     // rebuilt, and a following write to another index still lands — the thread kept serving.
@@ -228,7 +236,10 @@ async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_is_respawned() 
         .await
         .expect("guarded write trap request")
         .status();
-    assert_eq!(status, 503, "a guarded write panic must be retriable, not fatal");
+    assert_eq!(
+        status, 503,
+        "a guarded write panic must be retriable, not fatal"
+    );
 
     let status = client
         .put(node.url("/api/healthy/document"))
@@ -237,7 +248,10 @@ async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_is_respawned() 
         .await
         .expect("normal write request")
         .status();
-    assert_eq!(status, 200, "the writer thread must still serve after a guarded panic");
+    assert_eq!(
+        status, 200,
+        "the writer thread must still serve after a guarded panic"
+    );
 
     // Health is still green: nothing has actually died yet.
     assert_eq!(
@@ -257,7 +271,10 @@ async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_is_respawned() 
         .send()
         .await;
 
-    assert!(node.is_running(), "a dead writer must not take the process down");
+    assert!(
+        node.is_running(),
+        "a dead writer must not take the process down"
+    );
 
     // Health was green one assertion ago, so a red here is the writer's death and nothing else.
     let deadline = Instant::now() + RESPAWN_HOLD;
@@ -280,7 +297,10 @@ async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_is_respawned() 
         .await
         .expect("read after writer death")
         .status();
-    assert_eq!(status, 200, "reads must still be served after a writer dies");
+    assert_eq!(
+        status, 200,
+        "reads must still be served after a writer dies"
+    );
 
     // Once the hold expires the monitor respawns the writer, and health returns to green on its
     // own — the recovery the down-count exists to be cleared by.

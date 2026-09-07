@@ -324,7 +324,10 @@ fn an_index_recreated_after_deletion_is_warmed_again() {
         seed_index(&store, index, 20);
 
         let second = store.warm_index(index).expect("warm_index").expect("stats");
-        assert_eq!(second.num_docs, 20, "the recreated index holds its documents");
+        assert_eq!(
+            second.num_docs, 20,
+            "the recreated index holds its documents"
+        );
         assert!(
             second.segments_warmed > 0,
             "delete_schema={delete_schema}: the recreated index must be warmed, \

@@ -15,12 +15,13 @@
 //! concurrently and leave nothing behind.
 
 use std::io::Write as _;
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use client::CameoClient;
 use serde_json::json;
+
+mod common;
 
 /// A node running in its own process, killed when the test drops it.
 struct TestNode {
@@ -37,7 +38,7 @@ impl TestNode {
     /// say) without this helper growing a parameter for every setting.
     async fn start(extra: &str) -> TestNode {
         let dir = tempfile::tempdir().expect("temp dir");
-        let port = free_port();
+        let port = common::reserve_port();
         let data = dir.path().join("data");
         std::fs::create_dir_all(&data).expect("data dir");
 
@@ -77,7 +78,7 @@ supervisor_timeout_secs = 5
             .arg(&config_path)
             .env("RUST_LOG", "warn")
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn cameodb");
 
@@ -127,16 +128,6 @@ fn with_tls_provider() {
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
-}
-
-/// Ask the OS for an unused port and immediately give it back.
-///
-/// Racy in principle — something could take it before the node binds — but the window is
-/// microseconds and the alternative is a fixed port, which makes concurrent tests collide
-/// every time rather than almost never.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("local addr").port()
 }
 
 /// The cheapest possible end-to-end assertion, and the one everything else depends on: the
@@ -3548,7 +3539,12 @@ async fn writing_after_a_drop_types_the_index_afresh() {
     let client = node.client();
 
     client
-        .write_document("reborn", "d1", &json!({"id": "d1", "title": "first life"}), None)
+        .write_document(
+            "reborn",
+            "d1",
+            &json!({"id": "d1", "title": "first life"}),
+            None,
+        )
         .await
         .expect("write before the drop");
     client.admin_index_commit("reborn").await.expect("commit");
@@ -3565,7 +3561,10 @@ async fn writing_after_a_drop_types_the_index_afresh() {
         )
         .await
         .expect("write after the drop");
-    client.admin_index_commit("reborn").await.expect("commit again");
+    client
+        .admin_index_commit("reborn")
+        .await
+        .expect("commit again");
 
     let hits = client
         .search("reborn", "headline:second", Some(10), None, None, None)

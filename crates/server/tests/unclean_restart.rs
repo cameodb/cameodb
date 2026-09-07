@@ -5,12 +5,13 @@
 //! acknowledged without waiting for further writes to trigger a flush.
 
 use std::io::Write as _;
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use client::CameoClient;
 use serde_json::json;
+
+mod common;
 
 /// A node that can be killed and restarted against the same data directory.
 struct Node {
@@ -23,7 +24,7 @@ struct Node {
 impl Node {
     async fn start() -> Node {
         let dir = tempfile::tempdir().expect("temp dir");
-        let port = free_port();
+        let port = common::reserve_port();
         let data = dir.path().join("data");
         std::fs::create_dir_all(&data).expect("data dir");
 
@@ -76,7 +77,7 @@ supervisor_timeout_secs = 3600
             .arg(&self.config_path)
             .env("RUST_LOG", "warn")
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn cameodb");
         self.child = Some(child);
@@ -127,9 +128,37 @@ fn with_tls_provider() {
     });
 }
 
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("local addr").port()
+/// Poll a content search until it returns the expected number of hits or the deadline expires.
+///
+/// Startup recovery timing depends on the writer channel and Tantivy commit, so a fixed sleep is
+/// both slow and flaky. This waits only as long as necessary while still failing decisively if
+/// the index never reaches the expected state.
+async fn wait_for_hits(
+    client: &client::CameoClient,
+    index: &str,
+    query: &str,
+    limit: usize,
+    expected: usize,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let hits = client
+            .search(index, query, Some(limit), None, None, None)
+            .await
+            .expect("search")["hits"]
+            .as_array()
+            .map(|h| h.len())
+            .unwrap_or(0);
+        if hits == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected} hits, found {hits}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Documents written before a crash are searchable after the restart that replays them.
@@ -173,20 +202,17 @@ async fn documents_written_before_a_crash_are_searchable_after_the_restart() {
         "the document store should still hold doc-7 after the crash"
     );
 
-    // Give startup recovery room to finish before judging the search index.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let by_content = client
-        .search("archive", "title:archived", Some(100), None, None, None)
-        .await
-        .expect("content search after restart");
-    let hits = by_content["hits"].as_array().map(|h| h.len()).unwrap_or(0);
-
-    assert_eq!(
-        hits, 25,
-        "every document recovered from the WAL should be searchable by content after a \
-         restart, got {hits} of 25"
-    );
+    // Wait for startup recovery to commit the replayed tail; polling is both faster and less
+    // flaky than a fixed sleep on slow CI runners.
+    wait_for_hits(
+        &client,
+        "archive",
+        "title:archived",
+        100,
+        25,
+        Duration::from_secs(5),
+    )
+    .await;
 }
 
 /// The recovery commit truncates the WAL, so a second restart has nothing left to replay and
@@ -211,26 +237,32 @@ async fn a_second_restart_finds_the_documents_without_replaying_them_again() {
         }
     }
 
-    // Crash, restart, let phase 1 and its commit finish.
+    // Crash, restart, and wait for phase 1 and its commit to finish.
     node.kill_hard().await;
     node.spawn().await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Restart again — this time cleanly, and with no writes in between.
-    node.kill_hard().await;
-    node.spawn().await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let hits = node
-        .client()
-        .search("archive", "title:archived", Some(100), None, None, None)
-        .await
-        .expect("content search after the second restart");
-    assert_eq!(
-        hits["hits"].as_array().map(|h| h.len()).unwrap_or(0),
+    wait_for_hits(
+        &node.client(),
+        "archive",
+        "title:archived",
+        100,
         15,
-        "the documents should survive a second restart on their own committed segments"
-    );
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Restart again — this time cleanly, and with no writes in between. The first restart already
+    // truncated the WAL, so the second one should answer from committed segments.
+    node.kill_hard().await;
+    node.spawn().await;
+    wait_for_hits(
+        &node.client(),
+        "archive",
+        "title:archived",
+        100,
+        15,
+        Duration::from_secs(5),
+    )
+    .await;
 }
 
 /// The recovered tail and writes that arrive after the restart both end up searchable.
@@ -278,15 +310,14 @@ async fn writes_after_a_crash_join_the_recovered_tail() {
         .admin_index_commit("archive")
         .await
         .expect("commit the new writes");
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let hits = client
-        .search("archive", "title:archived", Some(100), None, None, None)
-        .await
-        .expect("content search");
-    assert_eq!(
-        hits["hits"].as_array().map(|h| h.len()).unwrap_or(0),
+    wait_for_hits(
+        &client,
+        "archive",
+        "title:archived",
+        100,
         20,
-        "both the recovered tail and the writes that followed it should be searchable"
-    );
+        Duration::from_secs(5),
+    )
+    .await;
 }

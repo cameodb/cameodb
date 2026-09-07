@@ -46,9 +46,11 @@ mod tests {
 
         assert!(test_dir.exists());
         assert!(test_dir.is_dir());
-        assert!(test_dir
-            .to_string_lossy()
-            .contains("cameodb_tests/storage/test_utils_test"));
+        assert!(
+            test_dir
+                .to_string_lossy()
+                .contains("cameodb_tests/storage/test_utils_test")
+        );
 
         // Cleanup
         cleanup_test_data_dir(&test_dir);

@@ -10,11 +10,12 @@
 //! parentheses balance and which still does not parse.
 
 use std::io::Write as _;
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+
+mod common;
 
 struct TestNode {
     child: Child,
@@ -25,7 +26,7 @@ struct TestNode {
 impl TestNode {
     async fn start() -> TestNode {
         let dir = tempfile::tempdir().expect("temp dir");
-        let port = free_port();
+        let port = common::reserve_port();
         let data = dir.path().join("data");
         std::fs::create_dir_all(&data).expect("data dir");
 
@@ -60,7 +61,7 @@ max_shards_per_node = 1
             .arg(&config_path)
             .env("RUST_LOG", "warn")
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn cameodb");
 
@@ -173,14 +174,6 @@ fn http() -> reqwest::Client {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
     reqwest::Client::new()
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral")
-        .local_addr()
-        .expect("local addr")
-        .port()
 }
 
 /// A dropped clause reaches the MCP caller as an error rather than as hits.
