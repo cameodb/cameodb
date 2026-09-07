@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-09-07
+
 ### Changed
 
 - **Default HTTP bind address is now loopback (`127.0.0.1`) and default CORS origins are empty.**
