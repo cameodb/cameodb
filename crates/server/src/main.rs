@@ -110,7 +110,19 @@ async fn main() -> Result<()> {
         .skip(1)
         .any(|arg| arg == "--version" || arg == "-V")
     {
-        println!("cameodb {}", env!("CARGO_PKG_VERSION"));
+        // A fault-injection build says so, here and nowhere else it could be missed. It carries
+        // panic seams a shipped binary does not — an unauthenticated `/__fault/panic` among them
+        // — so anything that validates or ships a binary has to be able to tell the two apart,
+        // and the compiled-in strings cannot be relied on for it: the trap constants are only
+        // ever compared against, and at `opt-level = 3` the comparison becomes immediates with
+        // no literal left in the binary to find. This marker is a declaration rather than a
+        // side effect, and `a_fault_injection_build_says_so_in_its_version` in
+        // `panic_isolation.rs` fails if it ever stops being printed.
+        print!("cameodb {}", env!("CARGO_PKG_VERSION"));
+        if cfg!(feature = "fault-injection") {
+            print!(" +fault-injection");
+        }
+        println!();
         return Ok(());
     }
 

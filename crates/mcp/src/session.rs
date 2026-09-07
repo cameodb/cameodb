@@ -9,7 +9,6 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use axum::response::sse::Event;
 use serde_json::Value as JsonValue;
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -331,9 +330,62 @@ pub(crate) struct McpSession {
     key_id: Option<String>,
     /// In-flight requests on this session, keyed by JSON-RPC request id. Only legacy SSE
     /// requests are registered here, because they are processed asynchronously after the
-    /// server returns 202 Accepted. A `notifications/cancelled` message can abort one of
-    /// these tasks; dropping the session aborts them all.
-    in_flight: Arc<std::sync::Mutex<HashMap<JsonValue, AbortHandle>>>,
+    /// server returns 202 Accepted. A `notifications/cancelled` message can cancel one of
+    /// these tasks; the last handle to the session going away cancels them all.
+    in_flight: Arc<InFlight>,
+}
+
+/// The in-flight registry for one session, shared by every clone of it.
+///
+/// Cancelling on drop is what ties an asynchronous request's lifetime to its session, and it is
+/// the only correct place for that: a legacy SSE response is pushed down the *stream*, not
+/// returned on the POST that started the work, so the POST's own response is dropped — by
+/// hyper, the moment the 202 is written — long before the work is done. Hanging the cancel
+/// there stopped every request before it could answer. When the session is swept, terminated,
+/// or evicted and the last clone goes, nobody is left who could receive the answer, and only
+/// then is stopping the work right.
+///
+/// A [`CancellationToken`] rather than a task's `AbortHandle`, because a token can be minted
+/// *before* the work it cancels exists. That is what lets a request be registered before its
+/// task is spawned, which is the only ordering in which the guard below cannot run before the
+/// insertion it is meant to undo.
+#[derive(Debug, Default)]
+struct InFlight(std::sync::Mutex<HashMap<JsonValue, CancellationToken>>);
+
+impl InFlight {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<JsonValue, CancellationToken>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        for token in self.lock().values() {
+            token.cancel();
+        }
+    }
+}
+
+/// Removes a request from its session's in-flight map when its task finishes or is cancelled, so
+/// a request that has answered does not leave an entry behind.
+///
+/// Holds a `Weak`, deliberately. The task that owns this guard must not keep the registry
+/// alive, or [`InFlight::drop`] could never run while anything was in flight — the request
+/// would be holding open the very thing whose disappearance is meant to stop it, and "cancelled
+/// if the session goes away" would be true only of a session with nothing to cancel.
+pub(crate) struct RequestGuard {
+    in_flight: std::sync::Weak<InFlight>,
+    id: JsonValue,
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        if let Some(in_flight) = self.in_flight.upgrade() {
+            in_flight.lock().remove(&self.id);
+        }
+    }
 }
 
 impl McpSession {
@@ -343,38 +395,41 @@ impl McpSession {
             listeners: 0,
             last_activity: std::time::Instant::now(),
             key_id,
-            in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            in_flight: Arc::new(InFlight::default()),
         }
     }
 
-    /// Register a request that is being processed asynchronously so it can be cancelled.
-    pub(crate) fn start_request(&self, request_id: JsonValue, handle: AbortHandle) {
+    /// Register a request that will be processed asynchronously, returning the token its task
+    /// should stop on and the guard that un-registers it once it has.
+    ///
+    /// Called *before* the task is spawned, and both halves come back from the one call so that
+    /// ordering is not something a caller can get wrong. It is the only safe order: registering
+    /// after the spawn leaves a window in which the task finishes first, its guard removes an
+    /// entry that does not exist yet, and the insertion that follows is one nothing will ever
+    /// take out. An `AbortHandle` cannot be registered this early — it does not exist until the
+    /// task does — which is why the map holds a token instead.
+    pub(crate) fn start_request(&self, request_id: JsonValue) -> (CancellationToken, RequestGuard) {
+        let token = CancellationToken::new();
         self.in_flight
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(request_id, handle);
+            .insert(request_id.clone(), token.clone());
+        (
+            token,
+            RequestGuard {
+                in_flight: Arc::downgrade(&self.in_flight),
+                id: request_id,
+            },
+        )
     }
 
     /// Cancel an in-flight request by its JSON-RPC id. Returns true if the id was known.
     pub(crate) fn cancel_request(&self, request_id: &JsonValue) -> bool {
-        let mut map = self
-            .in_flight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(handle) = map.remove(request_id) {
-            handle.abort();
+        if let Some(token) = self.in_flight.lock().remove(request_id) {
+            token.cancel();
             true
         } else {
             false
         }
-    }
-
-    /// Remove a request from the in-flight map when it completes or is dropped.
-    pub(crate) fn finish_request(&self, request_id: &JsonValue) {
-        self.in_flight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(request_id);
     }
 
     /// Is the server still holding a connection open for this session?
@@ -415,45 +470,115 @@ mod tests {
         McpTransportState::new(TEST_LIMITS)
     }
 
+    /// Spawn a request task the way the legacy SSE transport spawns one: registered before it
+    /// exists, stopping on the token that registration handed back, and holding the guard that
+    /// un-registers it. Resolves to whether the work ran to completion rather than being
+    /// cancelled, which is the only thing these tests need to see.
+    ///
+    /// Built here rather than inline so a test cannot accidentally assert against an ordering
+    /// the transport does not use — the ordering is the property under test.
+    fn spawn_request(
+        session: &McpSession,
+        request_id: JsonValue,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::JoinHandle<bool> {
+        let (token, guard) = session.start_request(request_id);
+        tokio::spawn(async move {
+            let _guard = guard;
+            tokio::select! {
+                biased;
+                () = token.cancelled() => false,
+                () = work => true,
+            }
+        })
+    }
+
     #[tokio::test]
-    async fn cancelling_a_registered_request_aborts_its_task() {
+    async fn cancelling_a_registered_request_stops_its_task() {
         let state = state();
         let session_id = state.create_session(None).await;
         let SessionClaim::Granted(session) = state.claim_session(&session_id, None).await else {
             panic!("session should be claimable");
         };
 
-        // A task that would run forever if not cancelled.
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-        });
-
+        // Work that would never finish on its own, so completing can only mean it was not
+        // cancelled.
         let request_id = JsonValue::from(7);
-        session.start_request(request_id.clone(), task.abort_handle());
+        let task = spawn_request(&session, request_id.clone(), std::future::pending());
+
         assert!(session.cancel_request(&request_id));
-        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            !task.await.expect("the request task ran"),
+            "the work carried on after its request was cancelled"
+        );
 
         // A second cancellation no longer finds the request.
         assert!(!session.cancel_request(&request_id));
     }
 
+    /// The session is what an asynchronous request's lifetime hangs on, so ending the session
+    /// ends the work — and nothing before that does. Both halves matter: the POST's own response
+    /// is dropped the moment the 202 is written, and hanging the cancel there is what stopped
+    /// every legacy-SSE request before it could answer.
     #[tokio::test]
-    async fn finishing_a_request_removes_it_from_the_in_flight_map() {
+    async fn a_request_outlives_its_post_and_dies_with_its_session() {
         let state = state();
         let session_id = state.create_session(None).await;
         let SessionClaim::Granted(session) = state.claim_session(&session_id, None).await else {
             panic!("session should be claimable");
         };
 
-        let task = tokio::spawn(async {});
-        let request_id = JsonValue::from(9);
-        session.start_request(request_id.clone(), task.abort_handle());
-        session.finish_request(&request_id);
+        let request_id = JsonValue::from(11);
+        let task = spawn_request(&session, request_id, std::future::pending());
 
-        assert!(!session.cancel_request(&request_id));
-        let _ = task.await;
+        // Dropping the handle the POST held is not the end of the request: the answer goes to
+        // the stream, so the work has to survive the request that started it.
+        drop(session);
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "the request was cancelled when its POST was done with it"
+        );
+
+        // Ending the session is the end of it: nobody is left who could receive the answer.
+        assert!(state.forget_session(&session_id).await);
+        assert!(
+            !task.await.expect("the request task ran"),
+            "the request outlived the session it belonged to"
+        );
+    }
+
+    /// A request that has answered leaves no entry behind, however fast it answers.
+    ///
+    /// The map is keyed by request id and only emptied by the guard, so an entry nothing removes
+    /// is one the session carries until it ends. That is what the old ordering could leave:
+    /// registering *after* the spawn let a task finish first, its guard remove an entry that did
+    /// not exist yet, and the insertion that followed be one nothing would ever take out. Work
+    /// that completes immediately is the shape that used to hit it, so that is what this runs —
+    /// and it asserts the map is empty rather than merely that cancelling finds nothing, because
+    /// the leak is the entry, not what cancelling makes of it.
+    #[tokio::test]
+    async fn a_finished_request_leaves_no_entry_however_fast_it_finishes() {
+        let state = state();
+        let session_id = state.create_session(None).await;
+        let SessionClaim::Granted(session) = state.claim_session(&session_id, None).await else {
+            panic!("session should be claimable");
+        };
+
+        for id in 0..8 {
+            let request_id = JsonValue::from(id);
+            let task = spawn_request(&session, request_id, std::future::ready(()));
+            assert!(
+                task.await.expect("the request task ran"),
+                "work that cannot block was reported cancelled"
+            );
+        }
+
+        let left_behind = session.in_flight.lock().len();
+        assert_eq!(
+            left_behind, 0,
+            "{left_behind} finished requests are still registered as in flight"
+        );
     }
 
     #[tokio::test]

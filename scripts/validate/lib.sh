@@ -94,6 +94,47 @@ cameodb_bin() {
     return 1
 }
 
+# Refuse a binary built with the `fault-injection` feature.
+#
+# Those builds carry panic seams a shipped one does not, including an unauthenticated
+# /__fault/panic route, so validating one proves nothing about the product — and every suite
+# here would pass against it and record the pass. The panic smoke test builds into its own
+# target directory precisely so this cannot happen by accident; this is the check that says so
+# out loud if it ever does, whether the binary arrived from that test, a hand-run
+# `cargo build --release --features fault-injection`, or a CAMEODB_BIN pointing at one.
+#
+# Asks the binary, rather than grepping it. `--version` prints `+fault-injection` under the
+# feature and nothing under an ordinary build, which is a declaration the binary makes about
+# itself; the smoke test asserts it is still printed, so this cannot quietly stop working.
+#
+# Grepping for compiled-in strings was tried and does not work, which is worth recording so it
+# is not attempted again. The `/__fault/panic` route path is present in *every* binary, because
+# `ROUTES` in authz.rs classifies the route whether or not it is mounted. The trap constants —
+# `__fault_panic_read__` and friends — are in *neither*: they are only ever compared against,
+# and at `opt-level = 3` with LTO the comparison is inlined to immediates with no literal left
+# in `.rodata`. A grep for those matched nothing in the fault build itself, so it would have
+# been a check that never fired.
+refuse_fault_injection_binary() {
+    local bin="$1" version
+    version="$("$bin" --version 2>/dev/null)" || {
+        printf '%sWarning:%s %s would not report --version; cannot confirm it is a clean build.\n' \
+            "$_c_yellow" "$_c_off" "$bin" >&2
+        return 0
+    }
+    case "$version" in
+        *+fault-injection*)
+            printf '%sRefusing:%s %s was built with the `fault-injection` feature.\n' \
+                "$_c_red" "$_c_off" "$bin" >&2
+            printf '          It reports: %s\n' "$version" >&2
+            printf '          It carries panic seams no shipped binary has, including an\n' >&2
+            printf '          unauthenticated /__fault/panic route, so validating it proves nothing.\n' >&2
+            printf '          Rebuild with `cargo build --release` and run this again.\n' >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+
 # require_free_port <port> — refuse to run when something already holds the port.
 #
 # `wait_for_http` only proves that *something* answers. A node left behind by an aborted run

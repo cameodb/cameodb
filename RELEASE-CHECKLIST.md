@@ -10,7 +10,8 @@ box is a question that has not been answered, not a formality.
    internal path dependencies pin it too — a bump touches both in each manifest, then
    `cargo check --workspace` to refresh `Cargo.lock`. Confirm with
    `cargo run --bin cameodb -- --version`, which reads `CARGO_PKG_VERSION` and is the only
-   place the number is observable at runtime.
+   place the number is observable at runtime. It also appends `+fault-injection` on a build
+   carrying the panic-test seams, which is not something to ship — see step 4.
    ```bash
    grep -rn '^version = ' crates/*/Cargo.toml     # all six must agree
    ```
@@ -28,6 +29,10 @@ box is a question that has not been answered, not a formality.
    ```bash
    scripts/validate/all.sh
    ```
+   It reads `target/release/cameodb` and does not rebuild it, so what gets validated is whatever
+   was last built there — which is why the order of steps 3 and 4 matters. It now refuses a
+   binary reporting `+fault-injection` before any suite runs, rather than validating one and
+   recording the pass; if that fires, `cargo build --release` and run it again.
 5. **Run `remote-sources` on every other target.** It is the only suite whose result does
    not transfer between platforms — the trust store differs (macOS Keychain, Linux
    `/etc/ssl/certs`, musl containers need `ca-certificates`). See
