@@ -20,8 +20,19 @@ use axum::{
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info};
+
+/// Drops its [`AbortHandle`] on drop so a background task is cancelled when the HTTP response
+/// that owns it is dropped — e.g., because the client disconnected after receiving the 202.
+#[derive(Clone)]
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 use crate::{
     authz::{McpAuthzRef, unrestricted},
@@ -193,13 +204,13 @@ async fn mcp_sse_handler(
         let endpoint_url = format!("/mcp/messages?session_id={}", session_id);
         let endpoint_event = Event::default().event("endpoint").data(endpoint_url);
 
-        let _ = tx.send(endpoint_event);
+        let _ = tx.try_send(endpoint_event);
         (session_id, rx)
     };
 
     info!(session_id = %session_id, "MCP SSE session opened");
 
-    let inner_stream = UnboundedReceiverStream::new(rx).map(Ok);
+    let inner_stream = ReceiverStream::new(rx).map(Ok);
 
     // Wrap stream with a guard that removes the session when SSE connection drops
     let stream = SessionStream {
@@ -259,8 +270,10 @@ async fn process_mcp_message<B: McpBackend>(
             let sender = mcp_session.sender.clone();
             let session_id = query.session_id.clone();
 
-            // Spawn background task to process message asynchronously
-            tokio::spawn(async move {
+            // Spawn background task to process message asynchronously. Tying the task's lifetime
+            // to the HTTP response means a client disconnect aborts wasted work: if the 202 is
+            // dropped before the body is sent, the join handle is dropped and the task is cancelled.
+            let join_handle = tokio::spawn(async move {
                 let maybe_response = match parse_json_rpc_request(payload) {
                     Ok(request) => handle_rpc_request(app_state, request, &authz).await,
                     Err(err) => Some(error_response(
@@ -273,9 +286,9 @@ async fn process_mcp_message<B: McpBackend>(
                 if let Some(envelope) = maybe_response {
                     let event = Event::default().event("message").data(envelope.to_string());
                     match sender {
-                        Some(sender) if sender.send(event).is_ok() => {}
+                        Some(sender) if sender.try_send(event).is_ok() => {}
                         Some(_) => {
-                            debug!(session_id = %session_id, "MCP session receiver dropped during async processing");
+                            debug!(session_id = %session_id, "MCP session receiver dropped or fell behind during async processing");
                         }
                         None => {
                             debug!(session_id = %session_id, "MCP session has no SSE push channel; response dropped");
@@ -284,8 +297,12 @@ async fn process_mcp_message<B: McpBackend>(
                 }
             });
 
-            // Return 202 Accepted immediately per MCP spec
-            StatusCode::ACCEPTED.into_response()
+            // Return 202 Accepted immediately per MCP spec. Keep an abort handle with the response
+            // so the spawned task is cancelled if the client goes away before it finishes.
+            let guard = AbortOnDrop(join_handle.abort_handle());
+            let mut response = StatusCode::ACCEPTED.into_response();
+            response.extensions_mut().insert(guard);
+            response
         }
         SessionClaim::WrongKey => session_refusal(&query.session_id).into_response(),
         SessionClaim::Unknown => unknown_session_refusal(&query.session_id).into_response(),
@@ -426,6 +443,10 @@ async fn streamable_listen_handler(
                 session_id: session_id.to_string(),
                 state: state.clone(),
             });
+        } else {
+            // The session was reclaimed/swept between claim and open; a keep-alive stream without
+            // a listener guard would let the client hold a connection to a dead session.
+            return unknown_session_refusal(session_id).into_response();
         }
     }
 

@@ -101,16 +101,16 @@ impl McpTransportState {
     /// The id is a random UUID for the same reason the Streamable HTTP one is: a session
     /// created with authorization off is bound to nobody, so a guessable id would be enough to
     /// post into someone else's conversation.
+    ///
+    /// The channel is bounded so a slow or absent reader cannot grow the server's memory without
+    /// bound. Filling the buffer is treated the same as a closed receiver: the event is dropped
+    /// rather than stalling the caller.
     pub(crate) async fn create_sse_session(
         &self,
         key_id: Option<String>,
-    ) -> (
-        String,
-        mpsc::UnboundedSender<Event>,
-        mpsc::UnboundedReceiver<Event>,
-    ) {
+    ) -> (String, mpsc::Sender<Event>, mpsc::Receiver<Event>) {
         let session_id = Uuid::new_v4().to_string();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel::<Event>(128);
 
         let session = McpSession::new(Some(tx.clone()), key_id);
 
@@ -312,7 +312,7 @@ pub(crate) struct McpSession {
     /// SSE push channel. `Some` for legacy SSE sessions (server pushes responses
     /// over the stream); `None` for Streamable HTTP sessions where responses are
     /// returned inline on the POST request.
-    pub(crate) sender: Option<mpsc::UnboundedSender<Event>>,
+    pub(crate) sender: Option<mpsc::Sender<Event>>,
     /// How many listening streams are open on this session.
     ///
     /// The Streamable HTTP equivalent of `sender` being live. That transport's `GET` stream
@@ -330,7 +330,7 @@ pub(crate) struct McpSession {
 }
 
 impl McpSession {
-    fn new(sender: Option<mpsc::UnboundedSender<Event>>, key_id: Option<String>) -> Self {
+    fn new(sender: Option<mpsc::Sender<Event>>, key_id: Option<String>) -> Self {
         Self {
             sender,
             listeners: 0,
