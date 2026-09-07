@@ -6825,25 +6825,36 @@ impl HybridStore {
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
         let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
 
-        #[derive(Debug)]
         enum PreparedKind {
-            Put { json_blob: Option<JsonValue> },
+            /// The Tantivy document this put will add, built before the transaction opens.
+            Put { tantivy_doc: tantivy::TantivyDocument },
             Delete,
         }
 
-        #[derive(Debug)]
         struct PreparedOp {
             wal_bytes: Vec<u8>,
             doc_bytes: Option<Vec<u8>>,
             id: String,
+            seq_id: u64,
             kind: PreparedKind,
         }
 
         let has_shadow_fields = schema.has_shadow_fields();
 
-        // Step 1: Serialize outside of lock (CPU work)
+        // Step 1: everything that is CPU and not redb, done before the write transaction opens.
+        //
+        // Shadow filtering, the stored-body serialisation *and* the Tantivy document build all
+        // read the batch and the schema and touch no table, so none of them needs to be inside
+        // the transaction — and while they were, every document's field traversal held the redb
+        // write lock against every other writer of this store. The transaction below is now the
+        // two `insert`s and the bookkeeping that depends on what they displaced, which is the
+        // only part that genuinely needs to be there.
+        //
+        // A refused value still aborts the whole batch and writes nothing; it now does so
+        // before any table is opened rather than by dropping a transaction that had already
+        // staged three hundred rows.
         let mut prepared_ops = Vec::with_capacity(ops_len);
-        for op in ops {
+        for (op, seq_id) in ops.into_iter().zip(seq_ids_iter) {
             match op {
                 WalOp::Put { id, json_blob } => {
                     let filtered_json_blob = if has_shadow_fields {
@@ -6861,13 +6872,47 @@ impl HybridStore {
                     })
                     .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
+                    // Build the Tantivy document with ONLY indexed fields: a single-pass JSON
+                    // traversal that skips shadows and extracts the fields the schema indexes.
+                    let mut tantivy_doc = doc!(fields.id => id.as_str());
+                    if let Some(seq_field) = fields.seq {
+                        tantivy_doc.add_u64(seq_field, seq_id);
+                    }
+                    if let Some(json_obj) = filtered_json_blob.as_ref().and_then(|v| v.as_object())
+                    {
+                        for (field_name, field_value) in json_obj {
+                            // O(1) shadow field skip via pre-computed HashSet
+                            if has_shadow_fields && schema.shadow_fields.contains(field_name) {
+                                continue;
+                            }
+
+                            // Look up schema field def + Tantivy field in one go
+                            let field_def = match schema.fields.get(field_name) {
+                                Some(fd) if fd.indexed => fd,
+                                _ => continue,
+                            };
+                            let tantivy_field = match fields.indexed_fields.get(field_name) {
+                                Some(tf) => tf,
+                                None => continue,
+                            };
+
+                            add_json_value_to_doc(
+                                &mut tantivy_doc,
+                                *tantivy_field,
+                                field_name,
+                                &field_def.field_type,
+                                field_value,
+                                BadValue::Refuse,
+                            )?;
+                        }
+                    }
+
                     prepared_ops.push(PreparedOp {
                         wal_bytes,
                         doc_bytes: Some(doc_bytes),
                         id,
-                        kind: PreparedKind::Put {
-                            json_blob: filtered_json_blob,
-                        },
+                        seq_id,
+                        kind: PreparedKind::Put { tantivy_doc },
                     });
                 }
                 WalOp::Delete { id } => {
@@ -6877,6 +6922,7 @@ impl HybridStore {
                         wal_bytes,
                         doc_bytes: None,
                         id,
+                        seq_id,
                         kind: PreparedKind::Delete,
                     });
                 }
@@ -6955,12 +7001,14 @@ impl HybridStore {
             let mut wal_table = write_txn.open_table(wal_table_def)?;
             let mut data_table = write_txn.open_table(data_table_def)?;
 
-            // Process operations and collect sequence IDs
-            for (prepared, seq_id) in prepared_ops.into_iter().zip(seq_ids_iter) {
+            // Step 2: the transaction itself — the two table writes, and the bookkeeping that
+            // depends on what they displaced. Every document was built above.
+            for prepared in prepared_ops {
                 let PreparedOp {
                     wal_bytes,
                     doc_bytes,
                     id,
+                    seq_id,
                     kind,
                 } = prepared;
 
@@ -6971,7 +7019,7 @@ impl HybridStore {
                 seq_ids.push(seq_id);
 
                 match kind {
-                    PreparedKind::Put { json_blob } => {
+                    PreparedKind::Put { tantivy_doc } => {
                         // What `insert` displaced, which says whether the id already had a row —
                         // but only on this id's first appearance in the batch. `record_final`
                         // below is what enforces that.
@@ -6981,41 +7029,6 @@ impl HybridStore {
                             }
                             None => false,
                         };
-
-                        // Step 3: Build tantivy document with ONLY indexed fields
-                        let mut tantivy_doc = doc!(fields.id => id.as_str());
-                        if let Some(seq_field) = fields.seq {
-                            tantivy_doc.add_u64(seq_field, seq_id);
-                        }
-
-                        // Step 4: Single-pass JSON traversal — skip shadows + extract Tantivy fields
-                        if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
-                            for (field_name, field_value) in json_obj {
-                                // O(1) shadow field skip via pre-computed HashSet
-                                if has_shadow_fields && schema.shadow_fields.contains(field_name) {
-                                    continue;
-                                }
-
-                                // Look up schema field def + Tantivy field in one go
-                                let field_def = match schema.fields.get(field_name) {
-                                    Some(fd) if fd.indexed => fd,
-                                    _ => continue,
-                                };
-                                let tantivy_field = match fields.indexed_fields.get(field_name) {
-                                    Some(tf) => tf,
-                                    None => continue,
-                                };
-
-                                add_json_value_to_doc(
-                                    &mut tantivy_doc,
-                                    *tantivy_field,
-                                    field_name,
-                                    &field_def.field_type,
-                                    field_value,
-                                    BadValue::Refuse,
-                                )?;
-                            }
-                        }
 
                         record_final(
                             &mut final_ops,

@@ -47,7 +47,7 @@ on one.
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
-| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH8 done, CH9 and CH12 partial, CH10–CH11 are write-path duplication |
+| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH8 and CH9 done, CH12 partial, CH10–CH11 are write-path duplication |
 
 ## Reconciliation, 2026-08-26
 
@@ -158,7 +158,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F5](#f5--concurrency-sweep-measured-2026-09-02) | Concurrency sweep on the release build — the operating point, and bulk's serialization measured | — | 2026-09-02 | ✅ |
 | [F6](#f6--what-fsync-actually-costs-measured-2026-09-02) | What fsync actually costs — and why turning it off is a reallocation, not a speedup | — | 2026-09-02 | ✅ |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
-| [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8 done, CH9 and CH12 partial | — | 2026-09-01 | ◐ |
+| [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8 and CH9 done, CH12 partial | — | 2026-09-01 | ◐ |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
 | [J1](#j1--a-facet-field-cannot-be-written-to) | A facet field cannot be written to | 18 | 2026-08-27 | ✅ |
 | [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
@@ -1128,15 +1128,58 @@ filtering instead of cloning it — the two hot-path clones removed as part of t
 
 ### CH9 — Bulk validation clones the batch, and Tantivy docs are built inside the transaction
 
-◐ **Partial** 2026-09-01. The `apply_write` half is done: it stages the Tantivy document before
-`begin_write` (as part of the OB4 reorder). Two pieces remain:
+✅ **Done** 2026-09-07. The `apply_write` half landed 2026-09-01 with the OB4 reorder; the two
+remaining pieces are now done too.
 
-- `parallel_validate_schema` still deep-clones the whole batch (`docs.to_vec()` plus a schema
-  clone) to move it into `spawn_blocking` for >64 documents — move them in and return them with
-  the verdicts.
-- `apply_batch` still builds every Tantivy document *inside* the open redb write transaction
-  (the `add_json_value_to_doc` pass), where it shares the critical section with the data row
-  write; the serialisation half already runs outside it.
+- **`parallel_validate_schema` no longer clones the batch.** It took `&[DocPayload]` and called
+  `docs.to_vec()` to get the `'static` that `spawn_blocking` needs — a second copy of the whole
+  request body, allocated and dropped per bulk write, to run read-only checks over it. The batch
+  is taken by value and handed back beside the verdicts, which costs a `Vec` of pointers and
+  copies nothing. `staged_schema_validation` threads the ownership through. The schema clone
+  stays and should: it is one field map, bounded by declared fields rather than by batch size.
+  `block_in_place` would have removed the clone *and* a thread hop, and was rejected — every
+  `#[tokio::test]` in the crate is current-thread flavoured, so it would panic for the next test
+  that bulk-writes past the inline threshold.
+- **`apply_batch` builds its Tantivy documents before it opens the transaction.** Shadow
+  filtering, the stored-body serialisation and the `add_json_value_to_doc` pass all read the
+  batch and the schema and touch no table, so none of them needed to hold the redb write lock.
+  The transaction is now the two `insert`s and the bookkeeping that depends on what they
+  displaced. OB5's semantics are untouched: `existed_before` still comes from what redb reported
+  inside the transaction, and `record_final` still keeps first-occurrence order.
+
+**Neither is a measurable throughput win, and that was predicted rather than discovered.** Three
+binaries — neither half, the first, both — built from the same tree and run interleaved, 3
+repeats of a 500-document bulk load at each durability setting:
+
+| | both halves | first half | neither |
+|---|---|---|---|
+| `wal_sync = true` | 12,147 docs/s | 12,134 | 12,255 |
+| `wal_sync = false` | 15,304 | 15,470 | 15,162 |
+
+Everything inside 1–2%, with overlapping ranges. The clone is why: measured directly, copying a
+400-document, 1.77 MB batch costs **133 µs** against ~47 ms of batch service time — 0.3%, under
+the noise floor of any harness in this document.
+
+**Why the second half measures as nothing here, which is not the same as being nothing.** The
+bench settles the schema during seeding and then writes steady-state, so nothing else opens a
+write transaction on the store while it runs. The contention that does exist is narrower than the
+whole write path and absent from this workload: `persist_schema_to_stores` writes each shard's
+schema from `spawn_blocking` (`node_orchestrator.rs` 7767), off the writer thread, so a schema
+write can block behind an open batch transaction — during evolution and initial creation, which
+is exactly what a steady-state bench does not exercise.
+
+So the reasons to have done it are the ones [F4](#f4--the-bulk-paths-asked-the-coordinator-before-they-knew-they-needed-to)
+gives: the work was unconditional and unnecessary. What is left after the null result is real
+enough to name — a second copy of the request body no longer held live across validation, the
+filtered body dropped once its bytes and its document exist rather than surviving the
+transaction, and a refused value that fails before any table is opened instead of by dropping a
+transaction that had already staged rows.
+
+That last one is a behaviour change in *when*, not in *what*, and nothing pinned it:
+`batch_refusal_test.rs` now does, asserting that one bad value writes none of its batch and
+leaves the index usable. It passes against the pre-change code as well, which is what makes it
+evidence that the restructure preserved the guarantee rather than merely evidence that the new
+code agrees with itself.
 
 ### CH10 — `engine_write` and `orch_write` are near-duplicates
 

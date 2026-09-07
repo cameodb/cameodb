@@ -7324,22 +7324,28 @@ impl NodeOrchestrator {
     /// `forwarded` says this call is serving a share of a decision another node already made, so
     /// it must neither sample nor canvass — see [`ClientOp::BulkWrite::forwarded`]. `schema_body`
     /// is that decision, and arrives only on a resend after this node asked for it.
+    /// Validate a batch against the index's schema, growing the schema first where the batch
+    /// needs it. The batch travels in and back out again — see `parallel_validate_schema` for
+    /// why owning it is what lets the fan-out avoid copying it.
     async fn staged_schema_validation(
         &self,
         index: &str,
-        docs: &[DocPayload],
+        docs: Vec<DocPayload>,
         schema_cache: &mut IndexSchema,
         forwarded: bool,
         schema_body: Option<&IndexSchema>,
-    ) -> Result<SchemaValidationSummary, OrchestratorError> {
+    ) -> Result<(SchemaValidationSummary, Vec<DocPayload>), OrchestratorError> {
         if docs.is_empty() {
-            return Ok(SchemaValidationSummary {
-                total_docs: 0,
-                valid_docs: 0,
-                evolution_needed: false,
-                all_new_fields: std::collections::HashSet::new(),
-                errors: Vec::new(),
-            });
+            return Ok((
+                SchemaValidationSummary {
+                    total_docs: 0,
+                    valid_docs: 0,
+                    evolution_needed: false,
+                    all_new_fields: std::collections::HashSet::new(),
+                    errors: Vec::new(),
+                },
+                docs,
+            ));
         }
 
         // Enhanced sampling for initial schema creation.
@@ -7426,7 +7432,7 @@ impl NodeOrchestrator {
         }
 
         if is_initial_creation {
-            let sampled_schema = enhanced_schema_sampling(docs, SCHEMA_SAMPLE_LIMIT);
+            let sampled_schema = enhanced_schema_sampling(&docs, SCHEMA_SAMPLE_LIMIT);
             let sampled_field_count = sampled_schema.fields.len();
 
             // Whatever this settles on describes a live index. Set before the merge so the
@@ -7459,14 +7465,14 @@ impl NodeOrchestrator {
             );
         }
 
-        // Stage 1: Parallel validation (read-only)
-        let validation_results = self
-            .parallel_validate_schema(index, docs, schema_cache)
-            .await?;
+        // Stage 1: Parallel validation (read-only). The batch goes in by value and comes back
+        // beside the verdicts; nothing downstream reads it in between.
+        let total_docs = docs.len();
+        let (validation_results, docs) = self.parallel_validate_schema(docs, schema_cache).await?;
 
         // Stage 2: Aggregate results and identify evolution needs
         let mut summary = SchemaValidationSummary {
-            total_docs: docs.len(),
+            total_docs,
             valid_docs: 0,
             evolution_needed: false,
             all_new_fields: std::collections::HashSet::new(),
@@ -7516,7 +7522,7 @@ impl NodeOrchestrator {
             "Staged schema validation completed"
         );
 
-        Ok(summary)
+        Ok((summary, docs))
     }
 
     /// Validate a batch, inline or fanned out, according to how big it is.
@@ -7525,12 +7531,17 @@ impl NodeOrchestrator {
     /// `validate_document`, so a batch of one and a batch of ten thousand reach the same
     /// verdict about the same document. That was not true while a second validator existed for
     /// small batches — see `validate_document` for what the two disagreed about.
+    ///
+    /// The batch is taken by value and handed back with the verdicts. `spawn_blocking` needs
+    /// `'static`, and the only way to give it that while borrowing was to deep-clone every
+    /// document — a second copy of the whole request body, allocated and dropped per bulk
+    /// write, to run read-only checks over it. Moving it in and out costs a `Vec` of pointers
+    /// either way and copies nothing.
     async fn parallel_validate_schema(
         &self,
-        _index: &str,
-        docs: &[DocPayload],
+        docs: Vec<DocPayload>,
         schema_cache: &IndexSchema,
-    ) -> Result<Vec<SchemaValidationResult>, OrchestratorError> {
+    ) -> Result<(Vec<SchemaValidationResult>, Vec<DocPayload>), OrchestratorError> {
         tracing::debug!(
             "Using parallel Rayon validation for {} documents",
             docs.len()
@@ -7538,35 +7549,37 @@ impl NodeOrchestrator {
 
         // Small batches validate inline. Offloading them costs two thread hops (onto this
         // worker's blocking pool, then a rayon fan-out onto the global rayon pool, which is
-        // unpinned and competes with the writer threads) plus a full clone of the documents
-        // and schema — all to run a handful of cheap per-document checks. Both hops are pure
-        // overhead below this size.
+        // unpinned and competes with the writer threads) — all to run a handful of cheap
+        // per-document checks. Both hops are pure overhead below this size.
         const INLINE_VALIDATION_MAX_DOCS: usize = 64;
         if docs.len() <= INLINE_VALIDATION_MAX_DOCS {
-            return Ok(docs
+            let results = docs
                 .iter()
                 .map(|doc_payload| {
                     Self::validate_document(&doc_payload.id, &doc_payload.doc, schema_cache)
                 })
-                .collect());
+                .collect();
+            return Ok((results, docs));
         }
 
-        // Clone data so it is Send + 'static inside spawn_blocking
-        let docs_owned: Vec<DocPayload> = docs.to_vec();
+        // The schema is still cloned, and stays cloned: it is one field map, bounded by how
+        // many fields the index declares rather than by how many documents the batch carries,
+        // so it does not grow with the thing being optimised here.
         let schema_clone = schema_cache.clone();
 
-        let results = tokio::task::spawn_blocking(move || {
-            docs_owned
+        let (results, docs) = tokio::task::spawn_blocking(move || {
+            let results = docs
                 .par_iter()
                 .map(|doc_payload| {
                     Self::validate_document(&doc_payload.id, &doc_payload.doc, &schema_clone)
                 })
-                .collect::<Vec<SchemaValidationResult>>()
+                .collect::<Vec<SchemaValidationResult>>();
+            (results, docs)
         })
         .await
         .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?;
 
-        Ok(results)
+        Ok((results, docs))
     }
 
     /// Whether one document can be written, and what the schema would have to learn first.
@@ -9412,14 +9425,12 @@ impl NodeOrchestrator {
             routing_key: routing_key.clone(),
             doc: doc.clone(),
         };
-        let docs_slice = [doc_payload];
-
         let mut schema_mut = (*schema).clone();
 
-        let validation_summary = self
+        let (validation_summary, _docs) = self
             .staged_schema_validation(
                 index,
-                &docs_slice,
+                vec![doc_payload],
                 &mut schema_mut,
                 forwarded,
                 schema_body.as_deref(),
@@ -9942,11 +9953,12 @@ impl NodeOrchestrator {
         // `load_schema` answers from the cache when it can, and reads a shard when it cannot.
         let mut schema_cache = self.load_schema(index).await?;
 
-        // Use staged schema validation: parallel validation + sequential evolution
-        let validation_summary = self
+        // Use staged schema validation: parallel validation + sequential evolution. The batch
+        // is handed over and handed back so the fan-out never has to copy it.
+        let (validation_summary, docs) = self
             .staged_schema_validation(
                 index,
-                &docs,
+                docs,
                 &mut schema_cache,
                 forwarded,
                 schema_body.as_deref(),
