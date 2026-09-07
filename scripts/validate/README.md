@@ -13,6 +13,13 @@ scripts/validate/all.sh posture tls
 Each suite exits non-zero on failure and prints a `PASS`/`FAIL` line per check, so the
 output of a run is the evidence. Paste the summary into `RELEASE-CHECKLIST.md`.
 
+Before any suite runs, `all.sh` refuses a binary whose `--version` reports
+`+fault-injection` — a build carrying the panic-test seams, including an unauthenticated
+`/__fault/panic` route. Every suite here would pass against one and the run would be
+recorded as a validation of the product. The panic smoke test builds into
+`target/panic-smoke/` so it cannot land on `target/release/cameodb` by accident; this is
+the check for when one arrives some other way.
+
 | Suite | What it proves | Why it cannot be a unit test |
 |-------|----------------|------------------------------|
 | `deps` | fmt, clippy (`-D warnings`), `cargo audit`, `cargo deny`, advisory exceptions still in date | Needs the real dependency graph and the current advisory database |

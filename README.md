@@ -22,6 +22,7 @@ By leveraging the **Kameo** actor framework and **Tokio**'s async runtime, Cameo
 * **Intelligent Data Loader:** Robust, zero-copy ingestion pipeline that transparently handles multiple formats (`CSV`, `TSV`, `JSON`, `JSONL`) and on-the-fly decompression (`Gzip`, `Bzip2`, `Zstd`, `XZ`, `LZ4`, `Deflate`). It supports loading from local disk, distributed network files, and directly streaming from HTTP(S) endpoints.
 * **Consistent Hybrid Recovery:** Guarantees data consistency during startup by automatically recovering and syncing uncommitted records from the ACID datastore (KV) into the search index.
 * **Graceful Shutdowns:** Multi-phase process ensuring zero WAL replay on clean reboots.
+* **Contained Faults:** A panic fails one request rather than the process — caught at the read pool, the per-index write guard, the request handler and index warming. A writer thread that dies is respawned over the same store, and `/_cluster/health` turns red for a node whose data path has stopped serving (a dead or wedged writer, a wedged read pool) even while the cluster still calls itself green.
 * **Production Memory Management:** Jemalloc allocator with per-CPU arenas, background purge threads, and runtime admin endpoints for memory diagnostics and manual intervention.
 * **Writer Core Pinning:** Optional CPU core affinity for shard writer threads to improve cache locality and reduce scheduling jitter on the write hot path.
 * **TLS/HTTPS Support:** Native HTTPS support via rustls for encrypted client connections and secure API access.
@@ -69,7 +70,7 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -node
 2. **Configure TLS in cameodb.toml**:
 ```toml
 [network.http]
-bind_address = "0.0.0.0"
+bind_address = "127.0.0.1"
 port = 9480
 
 [network.http.tls]
@@ -77,6 +78,12 @@ enabled = true
 cert_file = "/path/to/cert.pem"
 key_file = "/path/to/key.pem"
 ```
+
+Loopback, so this infers `profile = "local"` and needs nothing further. Serving TLS to
+other hosts means a non-loopback `bind_address`, which requires a declared `profile` and
+the posture that goes with it — authentication included. See
+[Security profiles](#security-profiles) below, and check any config before starting the
+node with `cameodb check-config -c cameodb.toml`.
 
 3. **Start the server**:
 ```bash
