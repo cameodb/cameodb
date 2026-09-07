@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Default HTTP bind address is now loopback (`127.0.0.1`) and default CORS origins are empty.**
+  New configs that omit `bind_address` now start on loopback, which infers `profile = "local"`
+  and permits `cors_allowed_origins = ["*"]`. A non-loopback bind must explicitly set a
+  `profile` and declare CORS origins. This closes the previous example default of `0.0.0.0`
+  with a wildcard origin.
+
 ### Added
 
 - **`[mcp]` — the MCP transport's own settings, and a session that outlives a coffee break.**
