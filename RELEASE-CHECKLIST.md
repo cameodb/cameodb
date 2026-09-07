@@ -130,6 +130,69 @@ Signed off by:
 
 <!-- Newest first. Append a filled-in template per release. -->
 
+## v0.3.4 — 2026-09-07
+
+Commit: 433f8b9 — `MANIFEST.txt` records `433f8b94b6067ef2005b9ad4bdacb4f7add468ed`, and that is
+also the last commit to touch `crates/` or `Cargo.*`, so the recorded commit, the validated tree
+and the current one are the same.
+
+Built targets: macOS arm64 (23M), x86_64-unknown-linux-musl (31M binary + `cameodb_0.3.4_amd64.deb`
+9.1M + `cameodb-0.3.4-1.x86_64.rpm` 9.8M), Windows x86_64 (`cameodb.exe`, 33M). All seven artifacts
+signed.
+
+Validation suite, 2026-09-07 22:43:06 → 22:52:19:
+
+```
+binary: /Users/gc/Code/cameodb/target/release/cameodb
+
+  PASS deps
+  PASS unit
+  PASS posture
+  PASS auth
+  PASS tls
+  PASS remote-sources
+  PASS artifact
+```
+
+That binary is byte-identical to the staged `dist/0.3.4/mac/cameodb`
+(sha256 `2746e44abae16f3a9b4afd6db92ba39528e3f676af763d77fa003cda2821e8f0`), so the result describes
+the artifact that ships rather than a neighbouring build of it. It reports `cameodb 0.3.4` with no
+`+fault-injection` marker, and neither do the staged linux or Windows binaries — the marker and the
+build-stage refusal are new this release.
+
+| Suite | Host build | musl | windows | notes |
+|-------|-----------|------|---------|-------|
+| deps           | PASS | —    | —    | three transitive advisories ignored, all review-by 2026-11-01 — not yet due, none renewed |
+| unit           | PASS | —    | —    | `cargo test --workspace`, which for the first time includes the panic-isolation smoke test — it builds its own release binary, so the run is slower than 0.3.3's |
+| posture        | PASS | —    | —    | now also checks the shipped systemd unit's `ExecStartPre` flags against the shipped config |
+| auth           | PASS | —    | —    | |
+| tls            | PASS | —    | —    | |
+| remote-sources | PASS | —    | —    | **outstanding on musl and Windows** — trust store differs per platform, so this result does not transfer (procedure step 5) |
+| artifact       | —    | PASS | —    | run with no argument, so it read the musl binary through a container probe rather than the host build named above |
+
+Signed and staged: `dist/0.3.4/` holds all seven artifacts with a `.bundle` and `.sha256` each, plus
+`SHA256SUMS`, `MANIFEST.txt` and both SBOMs. `shasum -c SHA256SUMS` verifies all seven. Signatures
+spot-checked against the key `dl.cameodb.com` serves rather than taken from the manifest's own
+"signed" column — `cosign verify-blob` returns `Verified OK` for `mac/cameodb`, `linux/cameodb` and
+`windows/cameodb.exe`.
+
+`publish.sh --commit` has copied everything into the `cameodb-web` checkout: 17 files replaced and
+the six 0.3.4 `.deb`/`.rpm` files added, with `public/downloads/MANIFEST.txt` now reading
+`CameoDB 0.3.4` at the same commit.
+
+Advisory exceptions reviewed: RUSTSEC-2026-0118, RUSTSEC-2026-0119 (hickory-proto 0.25.x, needs
+>=0.26.1 which libp2p 0.56.0 has not adopted) and RUSTSEC-2024-0436 (unmaintained `paste`, via
+libp2p → if-watch). All three review-by 2026-11-01, so none came due for this release and none was
+renewed.
+
+Skipped checks and why: `remote-sources` on musl and Windows — see the table. Docker Hub publishing
+was not part of this release; no step of the procedure asks for it.
+
+Known gaps acknowledged: yes — the standing list above is unchanged, except that the systemd/DEB/RPM
+interaction it warned about is now fixed and covered by `posture`.
+
+Signed off by: g.c.
+
 ## v0.3.3 — 2026-09-03
 
 Commit: 673ca55 — `MANIFEST.txt` records `673ca5513524676011a4fa7ef150e03ac270b2fe`, which is the
