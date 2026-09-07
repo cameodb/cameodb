@@ -33,10 +33,21 @@ struct ReadResourceArgs {
     uri: String,
 }
 
-pub(crate) fn parse_json_rpc_request(
-    payload: JsonValue,
-) -> Result<JsonRpcRequest, serde_json::Error> {
+pub(crate) fn parse_json_rpc_request(payload: JsonValue) -> Result<JsonRpcRequest, JsonValue> {
+    let id = payload.get("id").cloned();
+    let version = payload.get("jsonrpc").and_then(|v| v.as_str());
+    if version != Some("2.0") {
+        return Err(error_response(
+            id,
+            -32600,
+            format!(
+                "Invalid JSON-RPC request: jsonrpc must be \"2.0\", got {}",
+                version.map_or_else(|| "null".to_string(), |v| format!("{v:?}"))
+            ),
+        ));
+    }
     serde_json::from_value::<JsonRpcRequest>(payload)
+        .map_err(|e| error_response(id, -32600, format!("Invalid JSON-RPC request: {e}")))
 }
 
 pub(crate) fn method_of(payload: &JsonValue) -> Option<&str> {
@@ -448,5 +459,22 @@ mod tests {
             "a result carried structuredContent for a server that advertises no outputSchema: \
              {result}"
         );
+    }
+
+    #[test]
+    fn a_request_without_jsonrpc_is_invalid() {
+        let err = parse_json_rpc_request(json!({ "id": 1, "method": "initialize" }))
+            .expect_err("missing jsonrpc must be rejected");
+        assert_eq!(err["error"]["code"], json!(-32600));
+        assert_eq!(err["id"], json!(1));
+    }
+
+    #[test]
+    fn a_request_with_the_wrong_jsonrpc_version_is_invalid() {
+        let err =
+            parse_json_rpc_request(json!({ "jsonrpc": "1.0", "id": 2, "method": "initialize" }))
+                .expect_err("wrong jsonrpc version must be rejected");
+        assert_eq!(err["error"]["code"], json!(-32600));
+        assert_eq!(err["id"], json!(2));
     }
 }
