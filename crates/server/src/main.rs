@@ -644,6 +644,10 @@ async fn main() -> Result<()> {
         protocol,
         bind_address
     );
+    let admin_enabled = cameodb_config.network.http.admin_enabled;
+    let mcp_enabled = cameodb_config.mcp.enabled;
+    let legacy_sse_enabled = mcp_enabled && cameodb_config.mcp.legacy_sse_enabled;
+
     println!("🎯 API endpoints:");
     println!("  POST /api/{{index}}/search - Standard search");
     println!("  POST /api/{{index}}/search/stream - Streaming search");
@@ -659,24 +663,39 @@ async fn main() -> Result<()> {
     println!("  GET  /_indexes - List all indexes with statistics");
     println!("  GET  /_cluster/_indexes - List cluster indexes");
     println!("  GET  /_cluster/health - Health check");
-    println!("  GET  /_admin/memory - Memory statistics (jemalloc + process)");
-    println!(
-        "  POST /_admin/memory/purge - Trigger jemalloc memory purge (?force=true for aggressive)"
-    );
-    println!("  POST /_admin/index/{{index}}/commit - Force index writer commit");
-    println!("  GET  /_admin/workers - Worker pool statistics");
-    println!("  POST /_admin/index/{{index}}/evict-writer - Evict index writer from cache");
-    println!(
-        "  POST /mcp - MCP Streamable HTTP endpoint (JSON-RPC, returns MCP-Session-Id on initialize)"
-    );
-    println!("  GET  /mcp - MCP Streamable HTTP listening stream (SSE)");
-    println!("  DELETE /mcp - MCP Streamable HTTP session termination (MCP-Session-Id header)");
-    println!("  GET  /mcp/sse - MCP legacy SSE transport endpoint");
-    println!("  POST /mcp/sse - MCP legacy compatibility HTTP endpoint");
-    println!("  POST /mcp/messages?session_id=... - MCP legacy JSON-RPC message endpoint");
-    println!(
-        "  MCP protocol: 2025-06-18 (negotiated), capabilities: tools (6), resources (4), prompts (1)"
-    );
+
+    if admin_enabled {
+        println!("  GET  /_admin/memory - Memory statistics (jemalloc + process)");
+        println!(
+            "  POST /_admin/memory/purge - Trigger jemalloc memory purge (?force=true for aggressive)"
+        );
+        println!("  POST /_admin/index/{{index}}/commit - Force index writer commit");
+        println!("  GET  /_admin/workers - Worker pool statistics");
+        println!("  POST /_admin/index/{{index}}/evict-writer - Evict index writer from cache");
+    } else {
+        println!("  (Admin endpoints are disabled)");
+    }
+
+    if mcp_enabled {
+        println!(
+            "  POST /mcp - MCP Streamable HTTP endpoint (JSON-RPC, returns MCP-Session-Id on initialize)"
+        );
+        println!("  GET  /mcp - MCP Streamable HTTP listening stream (SSE)");
+        println!("  DELETE /mcp - MCP Streamable HTTP session termination (MCP-Session-Id header)");
+        if legacy_sse_enabled {
+            println!("  GET  /mcp/sse - MCP legacy SSE transport endpoint");
+            println!("  POST /mcp/sse - MCP legacy compatibility HTTP endpoint");
+            println!("  POST /mcp/messages?session_id=... - MCP legacy JSON-RPC message endpoint");
+        } else {
+            println!("  (MCP legacy SSE transport is not mounted)");
+        }
+        println!(
+            "  MCP protocol: 2025-06-18 (negotiated), capabilities: tools (6), resources (4), prompts (1)"
+        );
+    } else {
+        println!("  (MCP is disabled, /mcp is not mounted)");
+    }
+
     println!();
     println!("⚙️  Configuration:");
     println!("  Data Paths: {:?}", cameodb_config.storage.data_paths);
