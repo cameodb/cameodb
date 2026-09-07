@@ -20,6 +20,9 @@
 //! characters against `IN` and `[`, and the hand-written cases pin the shape down by name.
 
 use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use storage::{
     FieldDef, HybridStore, IndexSchema, StorageConfig, TantivyFieldType, WalOp, field_references,
 };
@@ -59,7 +62,9 @@ fn store(dir: &TempDir) -> HybridStore {
             .insert(name.to_string(), FieldDef::new(name.to_string(), ty));
     }
     schema.normalize_after_deserialization();
-    store.store_schema_and_cache(INDEX, &schema).expect("schema");
+    store
+        .store_schema_and_cache(INDEX, &schema)
+        .expect("schema");
 
     store
         .apply_batch(
@@ -79,21 +84,92 @@ fn store(dir: &TempDir) -> HybridStore {
     store
 }
 
+/// Run `work` in a background thread watched by a watchdog that panics if it stops making progress.
+///
+/// The fuzz tests deliberately exercise paths that have previously hung the parser. A hung parser
+/// would make `cargo test` sit forever, so the watchdog reports the iteration count where progress
+/// stopped and aborts the test instead.
+fn run_with_watchdog<F>(expected_iterations: usize, work: F)
+where
+    F: FnOnce(Arc<AtomicUsize>) + Send + 'static,
+{
+    let progress = Arc::new(AtomicUsize::new(0));
+    let progress_watch = progress.clone();
+
+    let worker = std::thread::spawn(move || work(progress));
+
+    let mut last = 0;
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let current = progress_watch.load(Ordering::Relaxed);
+        if current >= expected_iterations {
+            break;
+        }
+        if current == last {
+            panic!("query parser appears hung at iteration {current} of {expected_iterations}");
+        }
+        last = current;
+    }
+
+    worker.join().expect("worker thread");
+}
+
 /// Pieces chosen for where they can land rather than for looking like a query: every grammar
 /// delimiter, the field names the normalizers key off, and characters of one to four bytes
 /// including two that `split_whitespace` treats as separators and one that it does not.
 const PIECES: &[&str] = &[
     // Delimiters the parsers scan for.
-    ":", "[", "]", "{", "}", "\"", "(", ")", "\\", "*", "?", "^", "~", "+", "-", ">", "<", "=",
-    "/", ",", "|", "!", ".", // Keywords the passes split on.
-    " TO ", "TO", " IN ", "IN", "AND", "OR", "NOT", // Names in and out of the schema.
-    "created", "title", "id", "count", "missing", // Date-shaped fragments.
-    "2024-06-15", "2024", "T12:00:00Z", "12:00:00", "now",
+    ":",
+    "[",
+    "]",
+    "{",
+    "}",
+    "\"",
+    "(",
+    ")",
+    "\\",
+    "*",
+    "?",
+    "^",
+    "~",
+    "+",
+    "-",
+    ">",
+    "<",
+    "=",
+    "/",
+    ",",
+    "|",
+    "!",
+    ".", // Keywords the passes split on.
+    " TO ",
+    "TO",
+    " IN ",
+    "IN",
+    "AND",
+    "OR",
+    "NOT", // Names in and out of the schema.
+    "created",
+    "title",
+    "id",
+    "count",
+    "missing", // Date-shaped fragments.
+    "2024-06-15",
+    "2024",
+    "T12:00:00Z",
+    "12:00:00",
+    "now",
     // Multi-byte characters, 2 to 4 bytes.
-    "é", "日", "🎉", "\u{301}", // Whitespace that is not a space: NBSP and ideographic space.
-    "\u{a0}", "\u{3000}", // Zero-width space: three bytes, and not whitespace.
+    "é",
+    "日",
+    "🎉",
+    "\u{301}", // Whitespace that is not a space: NBSP and ideographic space.
+    "\u{a0}",
+    "\u{3000}", // Zero-width space: three bytes, and not whitespace.
     "\u{200b}", // Ordinary separators.
-    " ", "\t", "\n",
+    " ",
+    "\t",
+    "\n",
 ];
 
 /// xorshift64*, so the corpus is the same on every run and a failure is reproducible from the
@@ -129,23 +205,25 @@ fn spans_are_sliceable(query: &str) {
 fn no_generated_query_panics_any_parser() {
     let dir = TempDir::new().expect("temp dir");
     let store = store(&dir);
-
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
 
-    for i in 0..20_000 {
-        let query: String = (0..rng.below(16))
-            .map(|_| PIECES[rng.below(PIECES.len())])
-            .collect();
+    run_with_watchdog(20_000, move |progress| {
+        for i in 0..20_000 {
+            let query: String = (0..rng.below(16))
+                .map(|_| PIECES[rng.below(PIECES.len())])
+                .collect();
 
-        spans_are_sliceable(&query);
-        // `validate_query` runs the date normalizers over every generated query — that is the
-        // pass that rewrites by byte offset. Executing the parsed query adds nothing to the
-        // question and costs a searcher per call, so a slice of the corpus carries that half.
-        let _ = store.validate_query(INDEX, &query);
-        if i % 40 == 0 {
-            let _ = store.search_documents(INDEX, &query, 10, None);
+            spans_are_sliceable(&query);
+            // `validate_query` runs the date normalizers over every generated query — that is the
+            // pass that rewrites by byte offset. Executing the parsed query adds nothing to the
+            // question and costs a searcher per call, so a slice of the corpus carries that half.
+            let _ = store.validate_query(INDEX, &query);
+            if i % 40 == 0 {
+                let _ = store.search_documents(INDEX, &query, 10, None);
+            }
+            progress.fetch_add(1, Ordering::Relaxed);
         }
-    }
+    });
 }
 
 /// The shapes worth writing down: an incomplete range, a delimiter with a multi-byte character
@@ -206,16 +284,21 @@ fn no_hand_written_edge_case_panics_any_parser() {
         "title:\u{a0}IN[\u{3000}",
     ];
 
-    for query in cases {
-        spans_are_sliceable(query);
-        let _ = store.validate_query(INDEX, query);
-        let _ = store.search_documents(INDEX, query, 10, None);
-    }
+    let total_iterations = cases.len() + 1;
+    run_with_watchdog(total_iterations, move |progress| {
+        for query in cases {
+            spans_are_sliceable(query);
+            let _ = store.validate_query(INDEX, query);
+            let _ = store.search_documents(INDEX, query, 10, None);
+            progress.fetch_add(1, Ordering::Relaxed);
+        }
 
-    // Length is its own axis: the normalizers walk the string with a cursor, and a long run of
-    // the same shape is what would expose an offset that drifts.
-    let long = "created:[é TO 日] ".repeat(4_000);
-    spans_are_sliceable(&long);
-    let _ = store.validate_query(INDEX, &long);
-    let _ = store.search_documents(INDEX, &long, 10, None);
+        // Length is its own axis: the normalizers walk the string with a cursor, and a long run of
+        // the same shape is what would expose an offset that drifts.
+        let long = "created:[é TO 日] ".repeat(4_000);
+        spans_are_sliceable(&long);
+        let _ = store.validate_query(INDEX, &long);
+        let _ = store.search_documents(INDEX, &long, 10, None);
+        progress.fetch_add(1, Ordering::Relaxed);
+    });
 }

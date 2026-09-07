@@ -8,13 +8,14 @@
 //! answers is consistent with what it accepted.
 
 use std::io::Write as _;
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use client::CameoClient;
 use serde_json::json;
+
+mod common;
 
 struct TestNode {
     child: Child,
@@ -25,7 +26,7 @@ struct TestNode {
 impl TestNode {
     async fn start(extra: &str) -> TestNode {
         let dir = tempfile::tempdir().expect("temp dir");
-        let port = free_port();
+        let port = common::reserve_port();
         let data = dir.path().join("data");
         std::fs::create_dir_all(&data).expect("data dir");
 
@@ -62,7 +63,7 @@ supervisor_timeout_secs = 2
             .arg(&config_path)
             .env("RUST_LOG", "warn")
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn cameodb");
 
@@ -112,11 +113,6 @@ fn with_tls_provider() {
     });
 }
 
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("local addr").port()
-}
-
 /// Writes, searches, commits and schema evolution all at once, against one index.
 ///
 /// Every write is accounted for: a document the node answered 2xx for must be retrievable
@@ -158,7 +154,9 @@ async fn a_mixed_concurrent_workload_loses_no_acknowledged_write() {
         let c = Arc::clone(&client);
         tasks.push(tokio::spawn(async move {
             for _ in 0..40 {
-                let _ = c.search("chaos", "title:document", Some(10), None, None, None).await;
+                let _ = c
+                    .search("chaos", "title:document", Some(10), None, None, None)
+                    .await;
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Vec::new()
@@ -239,7 +237,9 @@ async fn deleting_an_index_under_load_leaves_the_node_serving() {
                 let _ = c
                     .write_document("racy", &id, &json!({"id": id, "title": "racing"}), None)
                     .await;
-                let _ = c.search("racy", "title:racing", Some(5), None, None, None).await;
+                let _ = c
+                    .search("racy", "title:racing", Some(5), None, None, None)
+                    .await;
             }
         }));
     }
@@ -260,12 +260,18 @@ async fn deleting_an_index_under_load_leaves_the_node_serving() {
         t.await.expect("task did not panic");
     }
 
-    assert!(node.still_running(), "node died deleting an index under load");
+    assert!(
+        node.still_running(),
+        "node died deleting an index under load"
+    );
 
     // The node must still answer, and the index must be coherent: whatever it says it
     // holds, it must be able to search.
     client.health().await.expect("health after the race");
-    let listing = client.list_indexes(false).await.expect("listing after the race");
+    let listing = client
+        .list_indexes(false)
+        .await
+        .expect("listing after the race");
     let _ = serde_json::to_string(&listing).expect("listing serializes");
     // Answered, or refused with a reason the caller can act on — never a 5xx and never a
     // hang. Success is deliberately not asserted: a write that recreates an index
@@ -287,7 +293,12 @@ async fn deleting_an_index_under_load_leaves_the_node_serving() {
 
     // And it must still accept new writes under that name.
     client
-        .write_document("racy", "after", &json!({"id": "after", "title": "after"}), None)
+        .write_document(
+            "racy",
+            "after",
+            &json!({"id": "after", "title": "after"}),
+            None,
+        )
         .await
         .expect("write after the race");
 }
@@ -307,7 +318,12 @@ async fn evicting_a_writer_mid_flight_does_not_lose_acknowledged_documents() {
     for i in 0..30 {
         let id = format!("pre-{i}");
         if client
-            .write_document("evict", &id, &json!({"id": id, "title": "before evict"}), None)
+            .write_document(
+                "evict",
+                &id,
+                &json!({"id": id, "title": "before evict"}),
+                None,
+            )
             .await
             .is_ok()
         {
@@ -317,14 +333,23 @@ async fn evicting_a_writer_mid_flight_does_not_lose_acknowledged_documents() {
 
     // Evict with documents still buffered (no explicit commit yet).
     let report = client.admin_index_evict_writer("evict").await;
-    assert!(report.is_ok(), "eviction should be answered: {:?}", report.err());
+    assert!(
+        report.is_ok(),
+        "eviction should be answered: {:?}",
+        report.err()
+    );
 
     // Keep writing under the same name: this is what moves the sequence counter past the
     // evicted documents and triggers the truncation if the checkpoint is wrong.
     for i in 0..30 {
         let id = format!("post-{i}");
         if client
-            .write_document("evict", &id, &json!({"id": id, "title": "after evict"}), None)
+            .write_document(
+                "evict",
+                &id,
+                &json!({"id": id, "title": "after evict"}),
+                None,
+            )
             .await
             .is_ok()
         {
@@ -370,7 +395,10 @@ async fn a_burst_of_searches_does_not_starve_the_health_endpoint() {
         .map(|i| json!({"id": format!("d{i}"), "doc": {"id": format!("d{i}"), "title": format!("lorem ipsum dolor {i} sit amet"), "body": format!("the quick brown fox {i} jumps over the lazy dog repeatedly")}}))
         .collect();
     client.bulk_index("load", &batch).await.expect("bulk seed");
-    client.admin_index_commit("load").await.expect("commit seed");
+    client
+        .admin_index_commit("load")
+        .await
+        .expect("commit seed");
 
     let mut searches = Vec::new();
     for _ in 0..64 {
@@ -378,7 +406,14 @@ async fn a_burst_of_searches_does_not_starve_the_health_endpoint() {
         searches.push(tokio::spawn(async move {
             for _ in 0..5 {
                 let _ = c
-                    .search("load", "title:lorem OR body:quick OR title:ipsum", Some(100), None, None, None)
+                    .search(
+                        "load",
+                        "title:lorem OR body:quick OR title:ipsum",
+                        Some(100),
+                        None,
+                        None,
+                        None,
+                    )
                     .await;
             }
         }));

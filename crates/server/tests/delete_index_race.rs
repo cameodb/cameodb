@@ -8,13 +8,14 @@
 //! refusing every content query against them.
 
 use std::io::Write as _;
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use client::CameoClient;
 use serde_json::json;
+
+mod common;
 
 struct TestNode {
     child: Child,
@@ -27,7 +28,7 @@ impl TestNode {
     /// between the writer thread and the deletion routed onto it.
     async fn start() -> TestNode {
         let dir = tempfile::tempdir().expect("temp dir");
-        let port = free_port();
+        let port = common::reserve_port();
         let data = dir.path().join("data");
         std::fs::create_dir_all(&data).expect("data dir");
 
@@ -63,7 +64,7 @@ supervisor_timeout_secs = 3600
             .arg(&config_path)
             .env("RUST_LOG", "warn")
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn cameodb");
 
@@ -106,11 +107,6 @@ fn with_tls_provider() {
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
-}
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("local addr").port()
 }
 
 /// Seed an index so its schema exists with `title` indexed, then delete it part way through a
