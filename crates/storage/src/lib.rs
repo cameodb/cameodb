@@ -4972,8 +4972,6 @@ impl HybridStore {
         drop(writer_arc);
 
         // All post-commit operations happen WITHOUT holding the writer lock
-        self.reset_operations_counter(index);
-
         tracing::debug!(index = %index, ops_committed = ops_pending, "commit_index: committed");
 
         // CRITICAL: Smart refresh reader cache after commit to ensure search sees latest data
@@ -4986,10 +4984,14 @@ impl HybridStore {
 
         // AFTER the Tantivy commit succeeds: record the durable sequence and drop the WAL
         // entries it covers. Both happen in one redb transaction so a crash can never leave
-        // the checkpoint ahead of the WAL.
+        // the checkpoint ahead of the WAL. Only reset the operations counter once the
+        // checkpoint is durable; otherwise a later failure would make the next commit see
+        // zero pending operations and skip the WAL truncation, leaving the replay tail until
+        // the next restart.
         if let Some(seq) = committed_seq {
             self.checkpoint_committed(index, seq)?;
         }
+        self.reset_operations_counter(index);
 
         Ok(())
     }
@@ -5467,7 +5469,8 @@ impl HybridStore {
         write_txn.commit()?;
 
         if let Some(tombstone) = tombstone {
-            self.schema_cache.insert(index.to_string(), Arc::new(tombstone));
+            self.schema_cache
+                .insert(index.to_string(), Arc::new(tombstone));
         }
 
         // Remove tantivy directory
@@ -6827,7 +6830,9 @@ impl HybridStore {
 
         enum PreparedKind {
             /// The Tantivy document this put will add, built before the transaction opens.
-            Put { tantivy_doc: tantivy::TantivyDocument },
+            Put {
+                tantivy_doc: tantivy::TantivyDocument,
+            },
             Delete,
         }
 
