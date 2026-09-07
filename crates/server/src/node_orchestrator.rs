@@ -3851,15 +3851,43 @@ const WRITER_STALL_THRESHOLD: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 pub struct WriterLiveness {
     down: AtomicUsize,
-    heartbeats: std::sync::Mutex<Vec<Arc<AtomicU64>>>,
+    heartbeats: Arc<std::sync::Mutex<Vec<Option<Arc<AtomicU64>>>>>,
     origin: Instant,
+}
+
+/// A heartbeat entry returned by [`WriterLiveness::register_writer`]. The guard derefs to the
+/// underlying [`AtomicU64`] so the writer thread can stamp it, and removes the entry from the
+/// registry when it is dropped — so a crashed or cleanly exited writer does not leave a dead
+/// heartbeat behind for future health scans.
+#[derive(Debug)]
+pub struct WriterHeartbeat {
+    index: usize,
+    registry: Arc<std::sync::Mutex<Vec<Option<Arc<AtomicU64>>>>>,
+    heartbeat: Arc<AtomicU64>,
+}
+
+impl std::ops::Deref for WriterHeartbeat {
+    type Target = AtomicU64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.heartbeat
+    }
+}
+
+impl Drop for WriterHeartbeat {
+    fn drop(&mut self) {
+        let mut guard = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+        if self.index < guard.len() {
+            guard[self.index] = None;
+        }
+    }
 }
 
 impl Default for WriterLiveness {
     fn default() -> Self {
         Self {
             down: AtomicUsize::new(0),
-            heartbeats: std::sync::Mutex::new(Vec::new()),
+            heartbeats: Arc::new(std::sync::Mutex::new(Vec::new())),
             origin: Instant::now(),
         }
     }
@@ -3875,13 +3903,16 @@ impl WriterLiveness {
     /// Register a writer thread and hand back its heartbeat. The thread stamps it with
     /// [`now_ticks`](Self::now_ticks) as it starts a batch and resets it to 0 when it goes back to
     /// waiting; a stalled writer is one whose stamp stops advancing while non-zero.
-    pub fn register_writer(&self) -> Arc<AtomicU64> {
+    pub fn register_writer(&self) -> WriterHeartbeat {
         let heartbeat = Arc::new(AtomicU64::new(0));
-        self.heartbeats
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(Arc::clone(&heartbeat));
-        heartbeat
+        let mut guard = self.heartbeats.lock().unwrap_or_else(|p| p.into_inner());
+        let index = guard.len();
+        guard.push(Some(Arc::clone(&heartbeat)));
+        WriterHeartbeat {
+            index,
+            registry: Arc::clone(&self.heartbeats),
+            heartbeat,
+        }
     }
 
     /// Record that a writer thread has stopped serving. Called once, as the thread exits.
@@ -3907,6 +3938,7 @@ impl WriterLiveness {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
+            .flatten()
             .filter(|heartbeat| {
                 let since = heartbeat.load(AtomicOrdering::Relaxed);
                 since != 0 && now_ms.saturating_sub(since) >= threshold_ms
@@ -3951,7 +3983,10 @@ mod fault_injection {
     pub const WRITER_THREAD_TRAP_INDEX: &str = "__fault_kill_writer__";
 
     pub fn panic_if_read_trap(query: &str) {
-        assert!(query != READ_TRAP_QUERY, "fault-injection: read on the read pool");
+        assert!(
+            query != READ_TRAP_QUERY,
+            "fault-injection: read on the read pool"
+        );
     }
 
     pub fn panic_if_write_op_trap(index: &str) {
@@ -4020,19 +4055,18 @@ const READ_POOL_WEDGE_THRESHOLD: Duration = Duration::from_secs(60);
 ///
 /// Every read runs a blocking closure on the shared pool through [`dispatch_read_pool`], which
 /// brackets it: `in_flight` counts closures currently executing — bounded by the pool's blocking
-/// width — and `last_progress` is the tick of the most recent bracket edge, a read starting or
-/// finishing. Health reads the pair. Two shapes it distinguishes:
+/// width — and `last_completion` is the tick of the most recent bracket edge where a read
+/// finished or unwound. Health reads the pair. Two shapes it distinguishes:
 ///
 /// - *Saturation* — `in_flight` at `capacity` — is load, not a fault: reported as a gauge, it
 ///   never colours the status, because a pool draining a burst is doing its job.
-/// - *Wedge* — saturation whose `last_progress` has not advanced for [`READ_POOL_WEDGE_THRESHOLD`]
-///   — is every thread stuck with no read starting or ending, and turns the node red because it
-///   can no longer answer reads. Stamping progress on the *start* edge too is what keeps a fresh
-///   burst after a long idle from reading as a wedge: the reads that just began are progress.
+/// - *Wedge* — saturation whose `last_completion` has not advanced for
+///   [`READ_POOL_WEDGE_THRESHOLD`] — is every thread stuck with no read finishing, and turns the
+///   node red because it can no longer answer reads.
 #[derive(Debug)]
 pub struct ReadPoolHealth {
     in_flight: AtomicUsize,
-    last_progress: AtomicU64,
+    last_completion: AtomicU64,
     capacity: usize,
     origin: Instant,
 }
@@ -4041,7 +4075,7 @@ impl ReadPoolHealth {
     fn new(capacity: usize) -> Self {
         Self {
             in_flight: AtomicUsize::new(0),
-            last_progress: AtomicU64::new(0),
+            last_completion: AtomicU64::new(0),
             capacity: capacity.max(1),
             origin: Instant::now(),
         }
@@ -4055,7 +4089,6 @@ impl ReadPoolHealth {
     /// dropped — including as a panicking read unwinds — so both bracket edges always land.
     fn track(self: &Arc<Self>) -> ReadInFlight {
         self.in_flight.fetch_add(1, AtomicOrdering::Relaxed);
-        self.last_progress.store(self.now_ticks().max(1), AtomicOrdering::Relaxed);
         ReadInFlight {
             pool: Arc::clone(self),
         }
@@ -4063,13 +4096,10 @@ impl ReadPoolHealth {
 
     /// In-flight reads and the pool's blocking width — the saturation gauge for the health body.
     pub fn gauge(&self) -> (usize, usize) {
-        (
-            self.in_flight.load(AtomicOrdering::Relaxed),
-            self.capacity,
-        )
+        (self.in_flight.load(AtomicOrdering::Relaxed), self.capacity)
     }
 
-    /// Whether every pool thread is busy and none has started or finished a read for longer than
+    /// Whether every pool thread is busy and no read has finished or unwound for longer than
     /// [`READ_POOL_WEDGE_THRESHOLD`] — a stuck pool, not merely a loaded one.
     pub fn is_wedged(&self) -> bool {
         self.is_wedged_at(self.now_ticks())
@@ -4079,12 +4109,12 @@ impl ReadPoolHealth {
         if self.in_flight.load(AtomicOrdering::Relaxed) < self.capacity {
             return false;
         }
-        let last = self.last_progress.load(AtomicOrdering::Relaxed);
+        let last = self.last_completion.load(AtomicOrdering::Relaxed);
         now_ms.saturating_sub(last) >= READ_POOL_WEDGE_THRESHOLD.as_millis() as u64
     }
 }
 
-/// Drop guard bracketing one read: decrements the in-flight count and stamps the progress tick as
+/// Drop guard bracketing one read: decrements the in-flight count and stamps the completion tick as
 /// the read leaves the pool, whether it returned or unwound.
 struct ReadInFlight {
     pool: Arc<ReadPoolHealth>,
@@ -4093,7 +4123,7 @@ struct ReadInFlight {
 impl Drop for ReadInFlight {
     fn drop(&mut self) {
         self.pool
-            .last_progress
+            .last_completion
             .store(self.pool.now_ticks().max(1), AtomicOrdering::Relaxed);
         self.pool.in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
     }
@@ -4175,54 +4205,54 @@ fn spawn_warmup_thread(
     let spawned = std::thread::Builder::new()
         .name(format!("warmup-shard-{shard_id}"))
         .spawn(move || {
-                    if !pending_warmup.is_empty() {
-                        let requested = pending_warmup.len();
-                        // Warming is a latency optimisation — a query warms its index on demand
-                        // regardless — so a panic here must not take the re-warm loop below down
-                        // with it and leave every later commit unwarmed.
-                        let warmed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            warmup_store.warm_indices(&pending_warmup)
-                        }));
-                        match warmed {
-                            Ok(warmed) => info!(
-                                shard_id = %shard_id,
-                                warmed = warmed,
-                                requested = requested,
-                                "Phase 2 complete - index readers warmed"
-                            ),
-                            Err(_) => warn!(
-                                shard_id = %shard_id,
-                                "startup warmup panicked; indices will warm on demand"
-                            ),
-                        }
-                    }
+            if !pending_warmup.is_empty() {
+                let requested = pending_warmup.len();
+                // Warming is a latency optimisation — a query warms its index on demand
+                // regardless — so a panic here must not take the re-warm loop below down
+                // with it and leave every later commit unwarmed.
+                let warmed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    warmup_store.warm_indices(&pending_warmup)
+                }));
+                match warmed {
+                    Ok(warmed) => info!(
+                        shard_id = %shard_id,
+                        warmed = warmed,
+                        requested = requested,
+                        "Phase 2 complete - index readers warmed"
+                    ),
+                    Err(_) => warn!(
+                        shard_id = %shard_id,
+                        "startup warmup panicked; indices will warm on demand"
+                    ),
+                }
+            }
 
-                    // Serve re-warm requests until the writer thread drops its sender, which
-                    // happens when the shard shuts down. `warm_index` skips a searcher
-                    // generation it has already warmed, so bursts of commits on one index
-                    // collapse into a single warm. Each warm is caught: a panic warming one
-                    // index costs that index its pre-warming, not every later index its re-warm.
-                    while let Ok(index) = warm_rx.recv() {
-                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            warmup_store.warm_index(&index)
-                        }));
-                        match outcome {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(e)) => debug!(
-                                shard_id = %shard_id,
-                                index = %index,
-                                error = %e,
-                                "Post-commit warm failed; queries will warm this index on demand"
-                            ),
-                            Err(_) => warn!(
-                                shard_id = %shard_id,
-                                index = %index,
-                                "warming panicked; this index will warm on demand"
-                            ),
-                        }
-                    }
+            // Serve re-warm requests until the writer thread drops its sender, which
+            // happens when the shard shuts down. `warm_index` skips a searcher
+            // generation it has already warmed, so bursts of commits on one index
+            // collapse into a single warm. Each warm is caught: a panic warming one
+            // index costs that index its pre-warming, not every later index its re-warm.
+            while let Ok(index) = warm_rx.recv() {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    warmup_store.warm_index(&index)
+                }));
+                match outcome {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => debug!(
+                        shard_id = %shard_id,
+                        index = %index,
+                        error = %e,
+                        "Post-commit warm failed; queries will warm this index on demand"
+                    ),
+                    Err(_) => warn!(
+                        shard_id = %shard_id,
+                        index = %index,
+                        "warming panicked; this index will warm on demand"
+                    ),
+                }
+            }
 
-                    debug!(shard_id = %shard_id, "Warmup thread stopped");
+            debug!(shard_id = %shard_id, "Warmup thread stopped");
         });
 
     if let Err(e) = spawned {
@@ -4603,7 +4633,22 @@ fn relaunch_writer(rt: &WriterRuntime) -> std::io::Result<std::thread::JoinHandl
 /// already surfaced red by the stall heartbeat.
 fn writer_monitor(rt: WriterRuntime, mut handle: std::thread::JoinHandle<WriterExit>) {
     loop {
-        let exit = handle.join().unwrap_or(WriterExit::Crashed);
+        let exit = match handle.join() {
+            Ok(exit) => exit,
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("panic payload is not a string");
+                tracing::error!(
+                    shard_id = %rt.shard_id,
+                    panic = %message,
+                    "writer thread panicked; the monitor will respawn it"
+                );
+                WriterExit::Crashed
+            }
+        };
         if rt.shutting_down.load(AtomicOrdering::Relaxed) || exit == WriterExit::Clean {
             debug!(shard_id = %rt.shard_id, "Writer monitor stopping");
             break;
@@ -4988,7 +5033,12 @@ impl MicroshardActor {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        dispatch_read_pool(self.read_pool_handle.as_ref(), self.read_pool_health.clone(), f).await
+        dispatch_read_pool(
+            self.read_pool_handle.as_ref(),
+            self.read_pool_health.clone(),
+            f,
+        )
+        .await
     }
 
     /// Handles search requests on the dedicated read thread pool.
@@ -7360,8 +7410,8 @@ impl NodeOrchestrator {
         // means "no schema for this index exists anywhere I can see", not merely "none here".
         // A record of a deletion counts as no schema: its fields are gone, so there is nothing
         // to evolve and this write is the one creating the index.
-        let mut is_initial_creation = schema_cache.fields.is_empty()
-            || schema_cache.state == storage::SchemaState::Dropped;
+        let mut is_initial_creation =
+            schema_cache.fields.is_empty() || schema_cache.state == storage::SchemaState::Dropped;
 
         if is_initial_creation
             && let Some(body) = schema_body
@@ -11283,12 +11333,11 @@ mod tests {
         runtime.block_on(async {
             // The dedicated-pool path a real search takes, tracked so the in-flight bracket is
             // exercised across the panic too.
-            let panicked: Result<(), OrchestratorError> = dispatch_read_pool(
-                Some(&handle),
-                Some(Arc::clone(&health)),
-                || panic!("tantivy panicked on a document"),
-            )
-            .await;
+            let panicked: Result<(), OrchestratorError> =
+                dispatch_read_pool(Some(&handle), Some(Arc::clone(&health)), || {
+                    panic!("tantivy panicked on a document")
+                })
+                .await;
             assert!(
                 panicked.is_err(),
                 "a panic in a read must surface as an error, not take the process down"
@@ -11298,7 +11347,11 @@ mod tests {
                 .expect("the dedicated read pool serves the next read after a panic");
             assert_eq!(after, 7);
             // The guard drops on both the panicking and the clean read, so nothing stays counted.
-            assert_eq!(health.gauge().0, 0, "a read that panicked still left the in-flight count");
+            assert_eq!(
+                health.gauge().0,
+                0,
+                "a read that panicked still left the in-flight count"
+            );
 
             // And the fallback path, for a shard with no dedicated pool.
             let panicked: Result<(), OrchestratorError> =
@@ -11319,18 +11372,22 @@ mod tests {
         let pool = Arc::new(ReadPoolHealth::new(2));
         let threshold = READ_POOL_WEDGE_THRESHOLD.as_millis() as u64;
 
-        // Idle: never wedged, however stale the progress tick.
+        // Idle: never wedged, however stale the completion tick.
         assert!(!pool.is_wedged_at(10 * threshold));
 
-        // Two reads start (capacity full) and stamp progress at tick 1_000.
+        // Two reads start (capacity full) and complete at tick 1_000.
         let g1 = pool.track();
         let g2 = pool.track();
-        pool.last_progress.store(1_000, AtomicOrdering::Relaxed);
-        assert_eq!(pool.gauge(), (2, 2), "both reads are in flight against a width of two");
+        pool.last_completion.store(1_000, AtomicOrdering::Relaxed);
+        assert_eq!(
+            pool.gauge(),
+            (2, 2),
+            "both reads are in flight against a width of two"
+        );
 
-        // At capacity but progressing recently: saturated, not wedged.
+        // At capacity but a completion happened recently: saturated, not wedged.
         assert!(!pool.is_wedged_at(1_000 + threshold - 1));
-        // At capacity with no progress past the threshold: wedged.
+        // At capacity with no completion past the threshold: wedged.
         assert!(pool.is_wedged_at(1_000 + threshold));
 
         // One read finishes: below capacity, so not wedged even long after.
@@ -11384,7 +11441,11 @@ mod tests {
         // A second writer is registered and wedges mid-batch a full threshold ago.
         let heartbeat = liveness.register_writer();
         heartbeat.store(now - threshold, AtomicOrdering::Relaxed);
-        assert_eq!(liveness.unavailable_at(now), 2, "dead and wedged both count");
+        assert_eq!(
+            liveness.unavailable_at(now),
+            2,
+            "dead and wedged both count"
+        );
 
         // That writer unblocks and returns to waiting: only the dead one remains.
         heartbeat.store(0, AtomicOrdering::Relaxed);
@@ -11448,7 +11509,11 @@ mod tests {
         assert_eq!(liveness.unavailable_writers(), 1, "a dead writer counts");
 
         liveness.mark_writer_up();
-        assert_eq!(liveness.unavailable_writers(), 0, "its replacement clears the count");
+        assert_eq!(
+            liveness.unavailable_writers(),
+            0,
+            "its replacement clears the count"
+        );
 
         // Saturating: an extra up with nothing down cannot wrap the count back up.
         liveness.mark_writer_up();
