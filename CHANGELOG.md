@@ -257,6 +257,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the fault build included. A test asserts the version marker in both directions, present under
   the feature and absent without it, so neither failure can return silently.
 
+  `scripts/release/build.sh` refuses one too, which closes a hole the marker made visible. It
+  validated the hand-copied `windows/cameodb.exe` by checking that its reported version
+  *contains* the release version — and `cameodb 0.3.4 +fault-injection` contains `0.3.4`, so such
+  a build would have been accepted, signed and published. Windows is the one artifact that
+  arrives pre-built from another machine, and therefore the only one a stray `cargo test` over
+  there could have replaced; the mac and linux binaries are built by that script with the feature
+  off, and the mac one is now checked anyway, for the edit that changes how it is built. Nothing
+  after the build stage is affected: `sign.sh`, `sbom.sh` and `publish.sh` read `dist/` rather
+  than `target/`, and take the version from the manifests rather than from a binary.
+
 - **A crashed writer thread is replaced instead of leaving the shard unable to write.** A panic
   that escaped the per-command guard ended the thread, and the shard took no further writes until
   the process restarted. Each writer now has a monitor that owns its handle and parks in `join` at

@@ -33,9 +33,12 @@ Edit `cameodb.toml`:
 ```toml
 [node]
 label = "cameo-node-01"
+# Omitted only for a loopback bind, which infers "local". Anything reachable from
+# another host must state its posture — see Security profiles.
+profile = "local"
 
 [network.http]
-bind_address = "0.0.0.0"
+bind_address = "127.0.0.1"
 port = 9480
 
 [storage]
@@ -85,15 +88,19 @@ Both TOML and YAML formats are supported.
 # Port for HTTP (default: 9480)
 port = 9480
 
-# Bind address for HTTP (default: "0.0.0.0")
-bind_address = "0.0.0.0"
+# Bind address for HTTP (default: "127.0.0.1" — loopback only).
+# A non-loopback address is reachable from other hosts, so it requires an explicit
+# `profile` under [node]; see Security profiles.
+bind_address = "127.0.0.1"
 
 # Request timeout in seconds (default: 30). Left at the default it is derived from
 # limits.max_record_size_mb instead; see Size and memory limits below.
 request_timeout_secs = 30
 
-# CORS allowed origins (default: ["*"])
-cors_allowed_origins = ["*"]
+# CORS allowed origins (default: [] — no cross-origin browser access).
+# `["*"]` is permitted only on a `local` profile, and warned about there.
+# CORS governs browsers only: no API or MCP client is affected by an empty list.
+cors_allowed_origins = []
 ```
 
 ### Size and memory limits
@@ -860,7 +867,11 @@ label = "cameodb-multi-disk"
 
 [network.http]
 port = 9480
-bind_address = "0.0.0.0"
+# Loopback, so this example needs no `profile` — it is about `data_paths` below.
+# For a node reachable from other hosts, see the production example at the end of
+# this document: a non-loopback bind needs a declared profile, and the posture
+# that goes with it.
+bind_address = "127.0.0.1"
 
 [storage]
 data_paths = [

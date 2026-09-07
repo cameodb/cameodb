@@ -73,8 +73,19 @@ mac_arch="$(lipo -archs "$MAC_BIN" 2>/dev/null || echo unknown)"
 [ "$mac_arch" = "arm64" ] || die "mac binary is '$mac_arch', expected arm64 — downloads/mac/ is published as Apple Silicon only"
 ok "arm64 Mach-O"
 
-"$MAC_BIN" --version > /dev/null || die "mac binary does not run"
-ok "runs: $("$MAC_BIN" --version | head -1)"
+mac_reported="$("$MAC_BIN" --version | head -1)" || die "mac binary does not run"
+
+# `cargo build --release` above rebuilds without the feature, so this should be unreachable —
+# it is here for the edit that changes how this binary gets built. `--version` appends
+# `+fault-injection` to a build carrying the panic-test seams, which include an unauthenticated
+# /__fault/panic route: not something to sign, and not something to publish.
+case "$mac_reported" in
+    *+fault-injection*)
+        die "$MAC_BIN reports '$mac_reported' — a fault-injection build is not publishable.
+     Rebuild with \`cargo build --release\` (the panic smoke test stages its own binary
+     under target/panic-smoke/ and should never have written this one)" ;;
+esac
+ok "runs: $mac_reported"
 
 cp "$MAC_BIN" "$DIST/mac/cameodb"
 
@@ -164,6 +175,17 @@ if [ -f "$WIN_EXE" ]; then
         # "Illegal byte sequence" rather than stripping the NULs.
         win_reported="$(LC_ALL=C tr -d '\r\000\357\273\277\377\376' < "$WIN_EXE.version" | head -1)"
         case "$win_reported" in
+            # Ordered before the version match, which this would otherwise satisfy: a
+            # fault-injection build reports `cameodb <version> +fault-injection`, so it carries
+            # the right version and would have been accepted, signed and published. This is the
+            # only artifact arriving pre-built from another machine, and therefore the only one
+            # a stray `cargo test` on that machine could have left in target\release\ — the mac
+            # and linux binaries are built by this script with the feature off.
+            *+fault-injection*)
+                die "windows/cameodb.exe reports '$win_reported' — a fault-injection build is
+     not publishable: it carries panic seams a shipped binary does not, including an
+     unauthenticated /__fault/panic route. Rebuild it on the Windows machine with
+     \`cargo build --release\` and copy it over again, sidecar included" ;;
             *"$VERSION"*) ok "reports '$win_reported' (recorded on the Windows machine)" ;;
             *)            die "windows/cameodb.exe reports '$win_reported', but this release is $VERSION" ;;
         esac

@@ -57,6 +57,11 @@ box is a question that has not been answered, not a formality.
    ```
    dist/<version>/windows/cameodb.exe
    ```
+   Copy the version sidecar with it — `cameodb.exe --version > cameodb.exe.version` — and re-run
+   `--stage build` to have it checked. Nothing on macOS can otherwise tell which build that .exe
+   is, and it is the one artifact this pipeline does not produce itself: a stale exe, or one left
+   by a `cargo test` in `target\release\` on that machine, is caught only here. Without the
+   sidecar the build stage says so and carries on.
 9. **Sign, checksum and publish.** Signing verifies each signature against the published
    public key as it goes; publishing is a dry run until `--commit`.
    ```bash

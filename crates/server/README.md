@@ -9,10 +9,11 @@ This document focuses on the *node-side* architecture and the distributed workfl
 ## 1. Core Responsibilities
 
 - **HTTP API surface**
-  - Routes: `/api/{index}/search` (JSON), `/api/{index}/search/stream` (NDJSON, JSON fallback), `/api/{index}/document` (PUT), `/api/{index}/document/stream` (NDJSON), `/api/{index}/_bulk` (POST), `/api/{index}/_config` (GET/PUT), `/api/{index}/_schema` (PATCH), `/api/{index}` (DELETE), `/_indexes`, `/_cluster/_indexes`, `/_cluster/health`.
-  - MCP Routes: `/mcp` (POST - direct HTTP JSON-RPC), `/mcp/sse` (GET - SSE transport, POST - compatibility), `/mcp/messages?session_id=...` (POST - SSE message endpoint).
+  - Routes: `/api/{index}/search` (JSON), `/api/{index}/search/stream` (NDJSON, JSON fallback), `/api/{index}/document` (PUT, DELETE), `/api/{index}/document/stream` (NDJSON), `/api/{index}/_bulk` (POST), `/api/{index}/_bulk/delete` (POST), `/api/{index}/_config` (GET/PUT), `/api/{index}/_schema` (PATCH), `/api/{index}` (DELETE), `/_indexes`, `/_cluster/_indexes`, `/_cluster/health`.
+  - Admin routes, mounted only when `admin_enabled` is on and required off by the `external` profile: `/_admin/memory` (GET), `/_admin/memory/purge` (POST), `/_admin/workers` (GET), `/_admin/audit` (GET), `/_admin/index/{index}/commit` (POST), `/_admin/index/{index}/evict-writer` (POST).
+  - MCP routes, mounted unless `[mcp] enabled = false`: `/mcp` (POST — JSON-RPC; GET — Streamable HTTP listening stream; DELETE — session termination), and unless `legacy_sse_enabled = false`: `/mcp/sse` (GET — legacy SSE transport, POST — compatibility), `/mcp/messages?session_id=...` (POST — legacy message endpoint).
   - Translates requests into strongly-typed operations (`ClientOp`) and hands them to `RouterActor`.
-  - Middleware: compression/decompression, trace, permissive CORS, request body limit; ConnectInfo enabled at serve for client addr extraction.
+  - Middleware, outermost first: trace, catch-panic (a panicking handler becomes a masked `500` rather than a dropped connection), CORS, authentication, request timeout, concurrency guard (sheds `503`, exempting `/_cluster/health`), body limit, decompression, compression. CORS is deny-all by default and permissive only when `cors_allowed_origins` contains `"*"`, which the `internal` and `external` profiles reject. ConnectInfo is enabled at serve for client-address extraction.
 - **Local orchestration**
   - Manages microshards (`MicroshardActor`) and their storage configuration.
   - Ensures all redb/tantivy I/O is executed via `tokio::task::spawn_blocking`.
@@ -585,7 +586,7 @@ Add TLS configuration to your `cameodb.toml`:
 
 ```toml
 [network.http]
-bind_address = "0.0.0.0"
+bind_address = "127.0.0.1"
 port = 9480
 
 [network.http.tls]
@@ -593,6 +594,12 @@ enabled = true
 cert_file = "/path/to/cert.pem"
 key_file = "/path/to/key.pem"
 ```
+
+A loopback bind infers `profile = "local"`. Serving TLS off-box means a non-loopback
+`bind_address`, and that requires a declared `profile` under `[node]` plus the posture it
+enforces — `external` requires authentication and refuses to start without it. See
+[docs/CONFIGURATION.md](../../docs/CONFIGURATION.md) for the profiles and a complete
+reachable-node example.
 
 ### Quick Start with TLS
 

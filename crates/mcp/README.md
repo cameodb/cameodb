@@ -12,7 +12,7 @@ The `cameodb_mcp` crate provides a standards-compliant MCP server that exposes C
 - **No Separate Process**: Runs in the same binary as CameoDB, sharing the same `AppState` and actor system
 - **Transport**: Streamable HTTP (2025-03-26+) on `/mcp`, plus legacy HTTP+SSE (2024-11-05) for already-configured clients
 - **Protocol**: JSON-RPC 2.0, negotiated at `initialize` — `2025-06-18`, `2025-03-26`, or `2024-11-05`
-- **Session Management**: Automatic session registry with 5-minute timeout cleanup
+- **Session Management**: Automatic session registry; idle timeout, cap and keep-alive are set under `[mcp]` (defaults: 30 minutes, 1024 sessions, 15 seconds)
 - **Asynchronous Processing**: Non-blocking POST requests with background task execution
 
 ### Key Features
@@ -26,7 +26,7 @@ The `cameodb_mcp` crate provides a standards-compliant MCP server that exposes C
 - ✅ **Read-Only Operations** (all tools are annotated as `readOnlyHint: true`)
 - ✅ **MCP Spec Compliant** (2025-06-18, negotiable down to 2024-11-05) with proper SSE event handling
 - ✅ **Asynchronous Processing** - non-blocking POST with 202 Accepted response
-- ✅ **Automatic Session Cleanup** with configurable timeout (5 minutes)
+- ✅ **Automatic Session Cleanup**, idle timeout configurable under `[mcp]` (default 30 minutes)
 - ✅ **Self-Contained Schema Discovery** — every index response includes per-field query hints
 
 ### Self-Contained Discovery
@@ -671,11 +671,12 @@ For compatibility with some MCP client integrations, `POST /mcp/sse` is also acc
 - Session IDs are cryptographically random UUIDs on both transports, so an id cannot be guessed even when authorization is off and sessions are bound to nobody
 - A request naming a session the server no longer holds is answered `404 Not Found`, per the Streamable HTTP spec — the signal telling the client to start over with `initialize` (an `initialize` carrying a stale id already is that fresh start, so it proceeds)
 - A session created by an identified key can only be continued or terminated by that key; another key is refused with `403 Forbidden`
-- The registry holds at most 1024 sessions; at the cap the longest-idle one is evicted rather than the new one refused
+- The registry holds at most `max_sessions` sessions (default 1024); at the cap the longest-idle one is evicted rather than the new one refused
 - Server emits structured `Event` objects (not raw strings) for proper MCP compliance
-- Sessions are kept alive while the SSE connection remains open
-- Sessions are cleaned up after SSE disconnect + 5 minutes of POST inactivity
-- Keepalive messages sent every 15 seconds to maintain connection
+- A session is never idle while the server is holding a connection open for it — a legacy SSE stream whose push channel is live, or a Streamable HTTP `GET /mcp` listening stream. A connection the server is writing keep-alives to says more about whether the client is there than the time since its last POST does
+- Once no connection is open, a session is swept after `session_idle_timeout_secs` of inactivity (default 1800 — thirty minutes). Closing a listening stream returns the session to that ordinary timeout rather than ending it, so a client whose stream was cut can still resume on its next POST
+- Keepalives are written every `sse_keepalive_secs` (default 15) on both transports
+- All four are set under `[mcp]` — see [docs/CONFIGURATION.md](../../docs/CONFIGURATION.md#the-mcp-endpoint-mcp). The sweep interval is deliberately not configurable: it is derived as a tenth of the idle timeout, because two independent knobs admit a config whose sweep is slower than its timeout
 
 ### JSON-RPC Methods
 
@@ -684,7 +685,10 @@ The server implements these JSON-RPC methods:
 - `initialize` — Capability negotiation (advertises `tools`, `resources`, `prompts`)
 - `ping` — Health check
 - `notifications/initialized` — Client initialization complete (no response)
-- `notifications/cancelled` — Task cancellation (no response)
+- `notifications/cancelled` — Task cancellation (no response). Honoured on the legacy HTTP+SSE
+  transport, where a request is processed after its POST has been answered `202`: the named
+  `requestId` is looked up and its work stopped. Accepted on Streamable HTTP too, though a
+  request there is answered inline on its own POST, so the connection already bounds it
 - `tools/list` — List available tools
 - `tools/call` — Invoke a tool
 - `resources/list` — List available resources
@@ -696,7 +700,10 @@ The server implements these JSON-RPC methods:
 
 All errors are mapped to JSON-RPC error codes:
 
-- `-32600`: Invalid JSON-RPC request
+- `-32600`: Invalid JSON-RPC request — including a message whose `jsonrpc` field is missing or is
+  not exactly `"2.0"`. The field is required by JSON-RPC 2.0 and is now checked, so a hand-rolled
+  client that omitted it is refused rather than served; the request's `id` is echoed back when it
+  carried one, as the spec requires of an error response
 - `-32601`: Method not found
 - `-32602`: Invalid params
 - `-32603`: Internal error (backend failures)
