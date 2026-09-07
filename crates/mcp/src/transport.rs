@@ -34,14 +34,27 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Removes a request from its session's in-flight map when the spawned task finishes or is
+/// aborted, so a cancelled request does not leak an entry.
+struct RequestGuard {
+    session: McpSession,
+    id: JsonValue,
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.session.finish_request(&self.id);
+    }
+}
+
 use crate::{
     authz::{McpAuthzRef, unrestricted},
     backend::McpBackend,
     protocol::{MCP_PROTOCOL_VERSION_HEADER, MCP_SESSION_ID_HEADER, SUPPORTED_PROTOCOL_VERSIONS},
     rpc::{error_response, handle_rpc_request, method_of, parse_json_rpc_request},
     session::{
-        McpShutdownHandle, McpTransportState, SessionAccess, SessionClaim, SessionLimits,
-        spawn_cleanup_task,
+        McpSession, McpShutdownHandle, McpTransportState, SessionAccess, SessionClaim,
+        SessionLimits, spawn_cleanup_task,
     },
 };
 
@@ -267,38 +280,80 @@ async fn process_mcp_message<B: McpBackend>(
         .await
     {
         SessionClaim::Granted(mcp_session) => {
-            let sender = mcp_session.sender.clone();
             let session_id = query.session_id.clone();
-
-            // Spawn background task to process message asynchronously. Tying the task's lifetime
-            // to the HTTP response means a client disconnect aborts wasted work: if the 202 is
-            // dropped before the body is sent, the join handle is dropped and the task is cancelled.
-            let join_handle = tokio::spawn(async move {
-                let maybe_response = match parse_json_rpc_request(payload) {
-                    Ok(request) => handle_rpc_request(app_state, request, &authz).await,
-                    Err(err_response) => Some(err_response),
-                };
-
-                if let Some(envelope) = maybe_response {
-                    let event = Event::default().event("message").data(envelope.to_string());
-                    match sender {
-                        Some(sender) if sender.try_send(event).is_ok() => {}
-                        Some(_) => {
-                            debug!(session_id = %session_id, "MCP session receiver dropped or fell behind during async processing");
+            match parse_json_rpc_request(payload) {
+                Ok(request) => {
+                    // `notifications/cancelled` is itself a notification, so it gets no reply.
+                    // Handle it synchronously: look up the in-flight request and abort it.
+                    if request.method == "notifications/cancelled" {
+                        if let Some(request_id) = request.params.get("requestId").cloned() {
+                            let cancelled = mcp_session.cancel_request(&request_id);
+                            debug!(
+                                session_id = %session_id,
+                                request_id = %request_id,
+                                cancelled = cancelled,
+                                "MCP cancellation received for legacy SSE request"
+                            );
                         }
-                        None => {
-                            debug!(session_id = %session_id, "MCP session has no SSE push channel; response dropped");
-                        }
+                        return StatusCode::ACCEPTED.into_response();
                     }
-                }
-            });
 
-            // Return 202 Accepted immediately per MCP spec. Keep an abort handle with the response
-            // so the spawned task is cancelled if the client goes away before it finishes.
-            let guard = AbortOnDrop(join_handle.abort_handle());
-            let mut response = StatusCode::ACCEPTED.into_response();
-            response.extensions_mut().insert(guard);
-            response
+                    let sender = mcp_session.sender.clone();
+                    let request_id = request.id.clone();
+                    let session_for_guard = mcp_session.clone();
+                    let request_id_for_guard = request_id.clone();
+
+                    // Spawn background task to process message asynchronously. Tying the task's
+                    // lifetime to the HTTP response means a client disconnect aborts wasted work:
+                    // if the 202 is dropped before the body is sent, the join handle is dropped
+                    // and the task is cancelled.
+                    let join_handle = tokio::spawn(async move {
+                        let _guard = request_id_for_guard.clone().map(|id| RequestGuard {
+                            session: session_for_guard,
+                            id,
+                        });
+
+                        let maybe_response = handle_rpc_request(app_state, request, &authz).await;
+                        if let Some(envelope) = maybe_response {
+                            let event =
+                                Event::default().event("message").data(envelope.to_string());
+                            match sender {
+                                Some(sender) if sender.try_send(event).is_ok() => {}
+                                Some(_) => {
+                                    debug!(session_id = %session_id, "MCP session receiver dropped or fell behind during async processing");
+                                }
+                                None => {
+                                    debug!(session_id = %session_id, "MCP session has no SSE push channel; response dropped");
+                                }
+                            }
+                        }
+                    });
+
+                    let abort_handle = join_handle.abort_handle();
+                    if let Some(id) = request_id {
+                        mcp_session.start_request(id, abort_handle.clone());
+                    }
+
+                    // Return 202 Accepted immediately per MCP spec. Keep an abort handle with the
+                    // response so the spawned task is cancelled if the client goes away before it
+                    // finishes.
+                    let guard = AbortOnDrop(abort_handle);
+                    let mut response = StatusCode::ACCEPTED.into_response();
+                    response.extensions_mut().insert(guard);
+                    response
+                }
+                Err(err_response) => {
+                    // Parse errors have no request id, so they cannot be cancelled. Push the
+                    // error response synchronously if a legacy SSE channel exists.
+                    if let Some(sender) = mcp_session.sender {
+                        let event = Event::default()
+                            .event("message")
+                            .data(err_response.to_string());
+                        let _ = sender.try_send(event);
+                    }
+                    StatusCode::ACCEPTED.into_response()
+                }
+            }
         }
         SessionClaim::WrongKey => session_refusal(&query.session_id).into_response(),
         SessionClaim::Unknown => unknown_session_refusal(&query.session_id).into_response(),
@@ -350,9 +405,10 @@ async fn process_streamable_http<B: McpBackend>(
     // with 404, which is what tells a client to start over with `initialize`. An `initialize`
     // carrying a stale id is already that fresh start, so it proceeds.
     let key_id = authz.key_id();
+    let mut session = None;
     if let Some(session_id) = session_id_of(&headers) {
         match state.claim_session(session_id, key_id.as_deref()).await {
-            SessionClaim::Granted(_) => {}
+            SessionClaim::Granted(claimed) => session = Some(claimed),
             SessionClaim::WrongKey => return session_refusal(session_id).into_response(),
             SessionClaim::Unknown if is_initialize => {}
             SessionClaim::Unknown => return unknown_session_refusal(session_id).into_response(),
@@ -377,24 +433,45 @@ async fn process_streamable_http<B: McpBackend>(
     }
 
     match parse_json_rpc_request(payload) {
-        Ok(request) => match handle_rpc_request(app_state, request, &authz).await {
-            Some(response) => {
-                if is_initialize {
-                    // Establish a session and advertise it via the MCP-Session-Id header.
-                    let session_id = state.create_session(key_id).await;
-                    let mut response_headers = HeaderMap::new();
-                    if let Ok(value) = HeaderValue::from_str(&session_id) {
-                        response_headers
-                            .insert(HeaderName::from_static(MCP_SESSION_ID_HEADER), value);
-                    }
-                    (StatusCode::OK, response_headers, Json(response)).into_response()
-                } else {
-                    (StatusCode::OK, Json(response)).into_response()
+        Ok(request) => {
+            // `notifications/cancelled` is itself a notification, so it gets no inline reply.
+            // Streamable HTTP requests are processed synchronously, so there is nothing on this
+            // transport to abort here; a future session may share the same in-flight map with
+            // legacy SSE tasks. We still accept the cancellation so compliant clients do not get
+            // an unexpected error.
+            if request.method == "notifications/cancelled" {
+                if let (Some(request_id), Some(session)) =
+                    (request.params.get("requestId").cloned(), session.as_ref())
+                {
+                    let cancelled = session.cancel_request(&request_id);
+                    debug!(
+                        request_id = %request_id,
+                        cancelled = cancelled,
+                        "MCP cancellation received for streamable HTTP request"
+                    );
                 }
+                return StatusCode::ACCEPTED.into_response();
             }
-            // No response body => JSON-RPC notification or response: 202 Accepted.
-            None => StatusCode::ACCEPTED.into_response(),
-        },
+
+            match handle_rpc_request(app_state, request, &authz).await {
+                Some(response) => {
+                    if is_initialize {
+                        // Establish a session and advertise it via the MCP-Session-Id header.
+                        let session_id = state.create_session(key_id).await;
+                        let mut response_headers = HeaderMap::new();
+                        if let Ok(value) = HeaderValue::from_str(&session_id) {
+                            response_headers
+                                .insert(HeaderName::from_static(MCP_SESSION_ID_HEADER), value);
+                        }
+                        (StatusCode::OK, response_headers, Json(response)).into_response()
+                    } else {
+                        (StatusCode::OK, Json(response)).into_response()
+                    }
+                }
+                // No response body => JSON-RPC notification or response: 202 Accepted.
+                None => StatusCode::ACCEPTED.into_response(),
+            }
+        }
         Err(err) => (
             StatusCode::BAD_REQUEST,
             Json(error_response(

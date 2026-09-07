@@ -22,10 +22,10 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JsonRpcRequest {
-    id: Option<JsonValue>,
-    method: String,
+    pub(crate) id: Option<JsonValue>,
+    pub(crate) method: String,
     #[serde(default)]
-    params: JsonValue,
+    pub(crate) params: JsonValue,
 }
 
 #[derive(Debug, Deserialize)]

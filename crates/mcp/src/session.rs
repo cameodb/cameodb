@@ -7,7 +7,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::response::sse::Event;
+use serde_json::Value as JsonValue;
 use tokio::sync::{Mutex, mpsc};
+use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -327,6 +329,11 @@ pub(crate) struct McpSession {
     /// for. Without this, learning someone else's session id would be enough to continue
     /// their conversation.
     key_id: Option<String>,
+    /// In-flight requests on this session, keyed by JSON-RPC request id. Only legacy SSE
+    /// requests are registered here, because they are processed asynchronously after the
+    /// server returns 202 Accepted. A `notifications/cancelled` message can abort one of
+    /// these tasks; dropping the session aborts them all.
+    in_flight: Arc<std::sync::Mutex<HashMap<JsonValue, AbortHandle>>>,
 }
 
 impl McpSession {
@@ -336,7 +343,38 @@ impl McpSession {
             listeners: 0,
             last_activity: std::time::Instant::now(),
             key_id,
+            in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Register a request that is being processed asynchronously so it can be cancelled.
+    pub(crate) fn start_request(&self, request_id: JsonValue, handle: AbortHandle) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(request_id, handle);
+    }
+
+    /// Cancel an in-flight request by its JSON-RPC id. Returns true if the id was known.
+    pub(crate) fn cancel_request(&self, request_id: &JsonValue) -> bool {
+        let mut map = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(handle) = map.remove(request_id) {
+            handle.abort();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a request from the in-flight map when it completes or is dropped.
+    pub(crate) fn finish_request(&self, request_id: &JsonValue) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(request_id);
     }
 
     /// Is the server still holding a connection open for this session?
@@ -375,6 +413,47 @@ mod tests {
 
     fn state() -> McpTransportState {
         McpTransportState::new(TEST_LIMITS)
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_registered_request_aborts_its_task() {
+        let state = state();
+        let session_id = state.create_session(None).await;
+        let SessionClaim::Granted(session) = state.claim_session(&session_id, None).await else {
+            panic!("session should be claimable");
+        };
+
+        // A task that would run forever if not cancelled.
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+
+        let request_id = JsonValue::from(7);
+        session.start_request(request_id.clone(), task.abort_handle());
+        assert!(session.cancel_request(&request_id));
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        // A second cancellation no longer finds the request.
+        assert!(!session.cancel_request(&request_id));
+    }
+
+    #[tokio::test]
+    async fn finishing_a_request_removes_it_from_the_in_flight_map() {
+        let state = state();
+        let session_id = state.create_session(None).await;
+        let SessionClaim::Granted(session) = state.claim_session(&session_id, None).await else {
+            panic!("session should be claimable");
+        };
+
+        let task = tokio::spawn(async {});
+        let request_id = JsonValue::from(9);
+        session.start_request(request_id.clone(), task.abort_handle());
+        session.finish_request(&request_id);
+
+        assert!(!session.cancel_request(&request_id));
+        let _ = task.await;
     }
 
     #[tokio::test]
