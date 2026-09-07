@@ -15,6 +15,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `profile` and declare CORS origins. This closes the previous example default of `0.0.0.0`
   with a wildcard origin.
 
+- **An MCP request must declare `"jsonrpc": "2.0"`.** The field was never checked, so a message
+  that omitted it — or named another version — was dispatched as if it had asked correctly.
+  Missing or wrong is now `-32600 Invalid Request`, with the request's `id` echoed when it
+  carried one, as the JSON-RPC 2.0 spec requires of an error response.
+
+  **This can refuse a client that worked before.** Anything hand-rolled against the endpoint that
+  left the field out will now be refused rather than served; adding one key to the request body
+  fixes it. Every conforming MCP client already sends it, so nothing that speaks the protocol
+  properly is affected.
+
+- **A slow legacy-SSE reader loses events instead of growing the server.** The push channel behind
+  `/mcp/sse` was unbounded, so a client that opened the stream and then stopped reading it — a
+  paused agent, a stalled proxy, a connection the kernel has given up on — had its queue grow with
+  every response the server pushed, on the server's heap, with nothing bounding it but the client's
+  eventual return. It holds 128 events now, and a full buffer is treated exactly as a closed one:
+  the event is dropped and logged, and the caller is never stalled. A client that cannot keep up
+  with 128 queued responses has stopped reading, not fallen behind.
+
+- **A Streamable HTTP listening stream is refused rather than opened onto a dead session.** `GET
+  /mcp` checked the session, then registered the listener as a second step, and served a
+  keep-alive stream regardless of whether that registration took. A session swept or terminated
+  in the gap left the client holding an open connection to a session the server no longer had —
+  reading keep-alives from something that would answer its next POST with `404`. It now answers
+  the unknown-session refusal, which is what tells a client to re-`initialize`.
+
 ### Added
 
 - **`[mcp]` — the MCP transport's own settings, and a session that outlives a coffee break.**
@@ -51,6 +76,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drops — no grace period at all, where a Streamable HTTP session survives the reconnect. For a
   client that pauses and comes back, that is the worse trade.
 
+- **`notifications/cancelled` stops work an agent has abandoned.** The notification was listed as
+  a supported method and did nothing with it: an agent that gave up on a tool call — a human
+  cancelling mid-task, a client tearing down a turn — had its search run to completion anyway,
+  spending a read-pool thread on an answer nobody would read. A session now tracks its in-flight
+  requests by JSON-RPC id, and the notification stops the one it names.
+
+  Accepted on both transports, though only the legacy HTTP+SSE one has anything to stop: a
+  Streamable HTTP request is answered inline on its own POST, so its work is already tied to the
+  connection and a client that goes away drops it. The notification is acknowledged there rather
+  than refused, because a compliant client should not get an error for following the spec.
+
+  A request without an id is a notification, which nothing can refer to and so nothing can
+  cancel; those run to completion as they always did.
+
 - **`[security.limits] max_federated_indexes`** — the most indexes one `search_across_indexes`
   may name, previously fixed at 20. It sits beside `max_search_limit` because it is the same
   kind of bound, metered against the same subject: each name is a full scatter-gather across
@@ -69,8 +108,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - a **writer alive but wedged**, stamped by a per-writer heartbeat and read as stuck once it has
     been mid-batch for sixty seconds — the case an exit count can never catch, because the thread
     never returns to report itself;
-  - a **read pool that is wedged**: every thread in flight, and no read having started or finished
-    for sixty seconds.
+  - a **read pool that is wedged**: every thread in flight, and no read having *finished* for
+    sixty seconds. Completion is the edge that gets stamped, and only completion: a pool with
+    every thread stuck starts nothing, so a start edge cannot distinguish a wedge from a burst
+    it is working through.
 
   The identified body also gains `read_pool_in_flight` and `read_pool_capacity`. Saturation is a
   gauge and deliberately never colours the status — a pool draining a burst is doing its job, and
@@ -80,6 +121,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wall-clock step can neither fake a stall nor mask one.
 
 ### Fixed
+
+- **A burst of reads after a quiet spell no longer reports the node as wedged.** The read-pool
+  wedge check stamped its progress tick on completions only, so on a node that had served no read
+  for a minute that tick was however old the last one was — and the next burst to fill every
+  blocking thread was read as a stall on the spot, forcing `/_cluster/health` to `red` until the
+  first read landed. That is the status a load balancer reads and an orchestrator drains a node
+  on, and `read_threads` defaults to `max(2, cores / 2)`, so on a small node a single fanned-out
+  search is enough to saturate the pool and trip it.
+
+  A read *beginning* counts as progress again. That cannot hide a real wedge, which is what makes
+  it safe rather than merely lenient: the bracket is taken inside the closure, on the pool thread,
+  once the closure has begun executing, and the capacity it is compared against is the pool's
+  `max_blocking_threads` — so a start edge can only land while a thread is free, and a pool whose
+  every thread is stuck starts nothing. The reasoning is now recorded on the type, because it is
+  the step that was got wrong. A test drives a burst arriving after an hour of quiet and asserts
+  both halves: not wedged when the work has just started, still wedged once that same work has
+  been stuck for the threshold.
+
+- **A WAL tail is no longer stranded by a failure after the commit.** `commit_index` reset the
+  operations counter as its first post-commit step, before the checkpoint that records the durable
+  sequence and drops the WAL entries it covers. Anything failing in between — the reader refresh,
+  the budget recalculation, the checkpoint's own redb transaction — left the counter at zero with
+  the WAL untruncated, and zero pending operations is exactly what makes the *next* commit skip
+  truncation. The entries then sat in the log until the process restarted and replayed them: not a
+  correctness loss, since replay is what the log is for, but an unbounded log and a slower start,
+  arrived at by a path that reported success. The reset now happens only once the checkpoint is
+  durable, so a post-commit failure leaves the counter high and the next commit retries the
+  checkpoint.
+
+- **The cluster PSK no longer leaks through `Debug`.** `ClusterPsk` and `ApiKey` redact themselves,
+  but `ClusterConfig` derived `Debug` and printed the field it holds — so any `debug!("{:?}",
+  config)` on the config, or on the `CameoDbConfig` containing it, wrote the shared secret to the
+  log. `ClusterConfig` now hand-implements `Debug` and prints `<redacted>` for a PSK that is set,
+  leaving `Serialize` untouched so nothing that legitimately round-trips the config is affected. A
+  test asserts the secret appears in neither struct's `Debug` output.
+
+- **A busy node no longer fails its own health probe.** The identified `/_cluster/health` body asks
+  the orchestrator for its shard count, identity and index list, and those asks queue behind real
+  work — so on a node under load the health request could wait on the very saturation it exists to
+  report, and a probe with a timeout of its own would record a node as *down* that was merely busy.
+  Each ask is now bounded at five seconds and falls back to a safe default. The concurrency-limit
+  exemption that keeps a node at `max_concurrent_requests` answering its own health probe also
+  stopped mattering the moment a probe was configured with a trailing slash — it matched the path
+  exactly — so `/_cluster/health/` was queued with ordinary traffic and starved out by exactly the
+  load it needed to report. It is matched with any number of trailing slashes now. The anonymous
+  status was always a handful of atomic loads and is unchanged; this is the expanded body catching
+  up to it.
+
+- **The startup banner lists the endpoints the node actually mounted.** It printed the full route
+  table unconditionally, so a node with `admin_enabled = false`, `[mcp] enabled = false` or
+  `legacy_sse_enabled = false` advertised `/_admin/*`, `/mcp` and `/mcp/sse` on the operator's
+  first screen of output — routes that answer `404`. Each group is now printed only when it is
+  mounted, with a line naming what is disabled instead, so the banner and the router agree.
+
+- **The legacy MCP SSE transport answers again.** Every `POST /mcp/messages` was accepted with a
+  202 and then never answered: the client's stream carried keep-alives and nothing else, until it
+  gave up. The transport processes a message on a spawned task because it has to answer 202 before
+  the work is done and push the result down the SSE stream afterwards — and that task had been
+  given an abort guard living in the POST's response extensions, on the reasoning that a client
+  disconnecting before the 202 lands should not leave work running. But hyper drops that response
+  as soon as it has *written* the 202, success included, so the guard cancelled the work a few
+  microseconds after it started. Never on the error path, always on the happy one.
+
+  A request's lifetime belongs to its **session**, which is where the answer is going, and it now
+  hangs there: the in-flight registry cancels what it still holds when the session is swept,
+  terminated or evicted, and the task holds only a weak reference back, so a running request no
+  longer keeps alive the registry whose disappearance is meant to stop it. A POST being done with
+  a request means nothing about whether anyone is still waiting for it.
+
+  Registration also moved to *before* the task is spawned, which closed a leak the old order
+  carried: a request that finished first had its guard remove an entry that did not exist yet,
+  and the insertion that followed was one nothing would ever take out — a stale entry per such
+  request, held until the session ended. The registry keys a `CancellationToken` rather than a
+  task's `AbortHandle` precisely because a token can be minted before the work it cancels exists,
+  which is what makes that order possible; `start_request` hands back the token and the guard
+  together, so the two cannot be sequenced wrongly by a caller.
+
+  Three tests asserted the legacy endpoint was mounted and returned `text/event-stream`, which is
+  why a full green suite reported a transport that answered nothing — *mounted* and *working* are
+  two claims and only the first was being made. `a_legacy_sse_request_is_answered_on_the_stream`
+  now makes the second, by reading the reply off the stream; it fails against the broken code.
 
 - **A panic no longer takes the node down.** The release profile built with `panic = "abort"`, so
   a panic anywhere — one malformed request reaching a corner of tantivy or redb — ended the
@@ -105,7 +227,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A smoke test drives a real panic over HTTP into the read pool, the request handler, the
   per-command write guard and the writer thread itself, against the built **release** binary —
   the only way to prove the shipped profile unwinds, since `cargo test` builds a profile that
-  always does.
+  always does. It runs with the rest of the suite rather than behind `#[ignore]`, because a proof
+  nobody runs is not one: the cost is that `cargo test` now compiles a release binary once, and
+  `PANIC_SMOKE_PROFILE=dev` trades that proof for a faster build while iterating.
+
+  That binary is built into **`target/panic-smoke/`** rather than the ordinary target directory,
+  which matters for the release process rather than for the test. The default location is
+  `target/release/cameodb` — the exact path `scripts/validate/lib.sh` picks up with no rebuild of
+  its own, and the one `scripts/release/build.sh` copies into `dist/`. Running `cargo test`
+  between the build and the validation steps therefore replaced the release artifact with a
+  fault-injection build, and the whole suite would have passed against it and recorded the pass:
+  a validation of a binary carrying an unauthenticated `/__fault/panic` route that nobody was
+  going to ship. Separate directories also stop the two invalidating each other's cache, since
+  they differ by a feature flag.
+
+  `scripts/validate/all.sh` now refuses such a binary before any suite runs, so the guarantee
+  does not rest on the test's build flags staying correct: it catches a hand-run
+  `cargo build --release --features fault-injection` and a `CAMEODB_BIN` pointed at one just the
+  same. **`cameodb --version` reports `+fault-injection` under the feature**, and the check reads
+  that — a declaration the binary makes about itself rather than something inferred from it. It is
+  also the answer to "what am I actually holding?" for anyone who ends up with a stray build.
+
+  Grepping the binary for its compiled-in seams was the obvious approach and does not work, which
+  is recorded where the check lives so it is not tried again. The `/__fault/panic` route path is
+  in *every* binary, because `ROUTES` in `authz.rs` classifies the route whether or not it is
+  mounted — a check on that refuses every release build. The trap constants are in *neither*:
+  they are only ever compared against, so at `opt-level = 3` with LTO the comparison is inlined
+  to immediates and no literal survives in `.rodata` — a check on those never fires at all, in
+  the fault build included. A test asserts the version marker in both directions, present under
+  the feature and absent without it, so neither failure can return silently.
 
 - **A crashed writer thread is replaced instead of leaving the shard unable to write.** A panic
   that escaped the per-command guard ended the thread, and the shard took no further writes until
@@ -229,6 +379,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour and accused the product. It asserts the response body now — `items_written` and the
   reason naming the line — which is also what the original check was for, since a `200` that
   quietly *wrote* an oversized record would satisfy a status check.
+
+### Performance
+
+- **A bulk write no longer copies its batch to validate it.** `parallel_validate_schema` took the
+  batch by reference and called `docs.to_vec()` to get the `'static` that `spawn_blocking` needs —
+  a second copy of the whole request body, allocated and dropped per bulk write, to run read-only
+  checks over it. It takes the batch by value now and hands it back beside the verdicts, which
+  costs a `Vec` of pointers and copies nothing. `apply_batch` likewise builds its Tantivy
+  documents *before* it opens the redb write transaction: shadow filtering, the stored-body
+  serialisation and the `add_json_value_to_doc` pass all read the batch and the schema and touch
+  no table, so none of them needed to hold the write lock. The transaction is now the two inserts
+  and the bookkeeping that depends on what they displaced.
+
+  **Honest about what that buys: nothing measurable, and that was predicted rather than
+  discovered.** Three binaries built from the same tree — neither half, the first, both — run
+  interleaved, 3 repeats of a 500-document bulk load at each durability setting:
+
+  | | both halves | first half | neither |
+  |---|---|---|---|
+  | `wal_sync = true` | 12,147 docs/s | 12,134 | 12,255 |
+  | `wal_sync = false` | 15,304 | 15,470 | 15,162 |
+
+  Everything inside 1–2%, with overlapping ranges. The clone is why: copying a 400-document,
+  1.77 MB batch measures **133 µs** against ~47 ms of batch service time — 0.3%, under the noise
+  floor. The transaction half measures as nothing *here* for a narrower reason — the bench settles
+  its schema during seeding, so nothing else opens a write transaction while it runs, and the
+  contention that exists is `persist_schema_to_stores` during evolution and creation, which a
+  steady-state bench does not exercise.
+
+  So the reason to have done it is that the work was unconditional and unnecessary. What is left
+  after the null result is worth naming: a second copy of the request body no longer held live
+  across validation, the filtered body dropped once its bytes and its document exist rather than
+  surviving the transaction, and a refused value that fails before any table is opened instead of
+  by dropping a transaction that had already staged rows. That last is a change in *when*, not in
+  *what*, and nothing pinned it — `batch_refusal_test` now does, asserting that one bad value
+  writes none of its batch and leaves the index usable. It passes against the pre-change code too,
+  which is what makes it evidence the restructure preserved the guarantee rather than evidence the
+  new code agrees with itself.
 
 ## [0.3.3] - 2026-09-02
 

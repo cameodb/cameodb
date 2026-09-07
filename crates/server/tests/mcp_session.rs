@@ -166,6 +166,40 @@ max_shards_per_node = 1
             while let Ok(Some(_)) = resp.chunk().await {}
         })
     }
+
+    /// Open the legacy `GET /mcp/sse` stream and read up to the `endpoint` event it opens with,
+    /// returning the session id it names alongside the still-open response to read replies from.
+    async fn open_legacy_sse(&self) -> (String, reqwest::Response) {
+        let mut resp = http()
+            .get(format!("{}/mcp/sse", self.url))
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .expect("legacy sse get");
+        assert_eq!(resp.status(), 200, "the legacy SSE stream was refused");
+
+        let mut seen = String::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let chunk = resp
+                .chunk()
+                .await
+                .expect("read the endpoint event")
+                .expect("the stream closed before the endpoint event");
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+            if let Some(at) = seen.find("session_id=") {
+                let id: String = seen[at + "session_id=".len()..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '-')
+                    .collect();
+                // Only once the line has ended is the id whole rather than merely non-empty.
+                if !id.is_empty() && seen[at..].contains('\n') {
+                    return (id, resp);
+                }
+            }
+        }
+        panic!("the legacy SSE stream never named a session; saw {seen:?}");
+    }
 }
 
 impl Drop for TestNode {
@@ -311,6 +345,61 @@ legacy_sse_enabled = false
     // And the current transport is untouched by turning the old one off.
     let session = off.initialize().await;
     assert_eq!(off.tools_list_status(&session).await, 200);
+}
+
+/// A legacy-SSE request is answered — on the stream, which is the only place its answer goes.
+///
+/// The transport returns 202 to the POST and pushes the JSON-RPC response down the SSE stream
+/// afterwards, so *mounted* and *working* are two different claims, and the tests above only made
+/// the first. This one makes the second, and it is the property that broke: the spawned task was
+/// given an abort guard living in the POST's response extensions, so hyper cancelled the work as
+/// soon as it had written the 202 — every request accepted, none ever answered. Nothing short of
+/// reading the reply off the stream can see that, which is why this asserts the round trip rather
+/// than the status.
+#[tokio::test]
+async fn a_legacy_sse_request_is_answered_on_the_stream() {
+    let node = TestNode::start("").await;
+    let (session_id, mut stream) = node.open_legacy_sse().await;
+
+    let status = http()
+        .post(format!("{}/mcp/messages?session_id={session_id}", node.url))
+        .header("content-type", "application/json")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "legacy-sse-test", "version": "0"},
+            },
+        }))
+        .send()
+        .await
+        .expect("legacy message post")
+        .status();
+    assert_eq!(status.as_u16(), 202, "the legacy POST was not accepted");
+
+    // Well inside the 15-second keep-alive, so a reply that arrives here arrived because the
+    // work ran — not because something eventually flushed the stream.
+    let mut seen = String::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let chunk = tokio::time::timeout(Duration::from_secs(10), stream.chunk())
+            .await
+            .expect("timed out waiting for the response event")
+            .expect("read the response event")
+            .expect("the stream closed before the response arrived");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+        if seen.contains("\"id\":1") {
+            assert!(
+                seen.contains("protocolVersion"),
+                "the reply on the stream is not an initialize result: {seen:?}"
+            );
+            return;
+        }
+    }
+    panic!("the JSON-RPC response never arrived on the legacy SSE stream; saw {seen:?}");
 }
 
 /// `enabled = false` withholds the whole endpoint, and nothing else.

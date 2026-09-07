@@ -19,6 +19,13 @@ declare -a RESULTS
 started="$(date '+%Y-%m-%d %H:%M:%S')"
 overall=0
 
+# Before anything runs, not per-suite: every suite would pass against a fault-injection build
+# and the run would be recorded as a validation of the product. `deps` needs no binary, so a
+# missing one is left to the suites that do need it to report.
+if _bin="$(cameodb_bin)"; then
+    refuse_fault_injection_binary "$_bin" || exit 2
+fi
+
 for suite in "${SUITES[@]}"; do
     script="$SCRIPT_DIR/$suite.sh"
     if [ ! -x "$script" ]; then

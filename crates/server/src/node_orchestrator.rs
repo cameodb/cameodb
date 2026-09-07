@@ -4055,18 +4055,36 @@ const READ_POOL_WEDGE_THRESHOLD: Duration = Duration::from_secs(60);
 ///
 /// Every read runs a blocking closure on the shared pool through [`dispatch_read_pool`], which
 /// brackets it: `in_flight` counts closures currently executing — bounded by the pool's blocking
-/// width — and `last_completion` is the tick of the most recent bracket edge where a read
-/// finished or unwound. Health reads the pair. Two shapes it distinguishes:
+/// width — and `last_progress` is the tick of the most recent bracket edge, a read starting or
+/// finishing. Health reads the pair. Two shapes it distinguishes:
 ///
 /// - *Saturation* — `in_flight` at `capacity` — is load, not a fault: reported as a gauge, it
 ///   never colours the status, because a pool draining a burst is doing its job.
-/// - *Wedge* — saturation whose `last_completion` has not advanced for
-///   [`READ_POOL_WEDGE_THRESHOLD`] — is every thread stuck with no read finishing, and turns the
-///   node red because it can no longer answer reads.
+/// - *Wedge* — saturation whose `last_progress` has not advanced for
+///   [`READ_POOL_WEDGE_THRESHOLD`] — is every thread stuck with nothing starting or ending, and
+///   turns the node red because it can no longer answer reads.
+///
+/// **Both edges are stamped, and the start edge is load-bearing.** Stamping only completions
+/// looks stricter and is in fact wrong: `last_progress` would then be the age of the last
+/// *finished* read, which on a quiet node is however long ago that was. A burst arriving after a
+/// minute of no reads would saturate the pool and be read as wedged on the spot — a healthy node
+/// turned red by its first traffic in a while, for as long as it took the first read to land.
+/// `read_threads` is `max(2, cores / 2)`, so on a small node one federated search fanning out is
+/// enough to saturate it.
+///
+/// The start edge cannot hide a real wedge, which is the reason it is safe to trust. [`track`]
+/// runs *inside* the closure, on the pool thread, once the closure has begun executing — and
+/// `capacity` is the pool's `max_blocking_threads`. So a start edge can only land while a thread
+/// is free, and a pool whose every thread is stuck starts nothing: no edge, `last_progress`
+/// frozen, red at the threshold. Away from that, a start edge also implies an earlier completion,
+/// since a thread only becomes free by finishing — which is why this matters at exactly one point
+/// in a pool's life, the first reads after it has been idle.
+///
+/// [`track`]: ReadPoolHealth::track
 #[derive(Debug)]
 pub struct ReadPoolHealth {
     in_flight: AtomicUsize,
-    last_completion: AtomicU64,
+    last_progress: AtomicU64,
     capacity: usize,
     origin: Instant,
 }
@@ -4075,7 +4093,7 @@ impl ReadPoolHealth {
     fn new(capacity: usize) -> Self {
         Self {
             in_flight: AtomicUsize::new(0),
-            last_completion: AtomicU64::new(0),
+            last_progress: AtomicU64::new(0),
             capacity: capacity.max(1),
             origin: Instant::now(),
         }
@@ -4088,7 +4106,18 @@ impl ReadPoolHealth {
     /// Mark a read as it begins executing on a pool thread; the returned guard marks it done when
     /// dropped — including as a panicking read unwinds — so both bracket edges always land.
     fn track(self: &Arc<Self>) -> ReadInFlight {
+        self.track_at(self.now_ticks())
+    }
+
+    /// [`track`](Self::track) against a supplied clock, so a test can place a read's start
+    /// somewhere other than a few microseconds after the pool was built — the same split as
+    /// [`is_wedged`](Self::is_wedged) and `is_wedged_at`, and for the same reason.
+    fn track_at(self: &Arc<Self>, now_ms: u64) -> ReadInFlight {
         self.in_flight.fetch_add(1, AtomicOrdering::Relaxed);
+        // A read beginning is progress. See the type's docs for why this edge is safe: it can
+        // only land while a pool thread is free, so a wedged pool never produces one.
+        self.last_progress
+            .store(now_ms.max(1), AtomicOrdering::Relaxed);
         ReadInFlight {
             pool: Arc::clone(self),
         }
@@ -4099,8 +4128,8 @@ impl ReadPoolHealth {
         (self.in_flight.load(AtomicOrdering::Relaxed), self.capacity)
     }
 
-    /// Whether every pool thread is busy and no read has finished or unwound for longer than
-    /// [`READ_POOL_WEDGE_THRESHOLD`] — a stuck pool, not merely a loaded one.
+    /// Whether every pool thread is busy and no read has started, finished or unwound for longer
+    /// than [`READ_POOL_WEDGE_THRESHOLD`] — a stuck pool, not merely a loaded one.
     pub fn is_wedged(&self) -> bool {
         self.is_wedged_at(self.now_ticks())
     }
@@ -4109,12 +4138,12 @@ impl ReadPoolHealth {
         if self.in_flight.load(AtomicOrdering::Relaxed) < self.capacity {
             return false;
         }
-        let last = self.last_completion.load(AtomicOrdering::Relaxed);
+        let last = self.last_progress.load(AtomicOrdering::Relaxed);
         now_ms.saturating_sub(last) >= READ_POOL_WEDGE_THRESHOLD.as_millis() as u64
     }
 }
 
-/// Drop guard bracketing one read: decrements the in-flight count and stamps the completion tick as
+/// Drop guard bracketing one read: decrements the in-flight count and stamps the progress tick as
 /// the read leaves the pool, whether it returned or unwound.
 struct ReadInFlight {
     pool: Arc<ReadPoolHealth>,
@@ -4123,7 +4152,7 @@ struct ReadInFlight {
 impl Drop for ReadInFlight {
     fn drop(&mut self) {
         self.pool
-            .last_completion
+            .last_progress
             .store(self.pool.now_ticks().max(1), AtomicOrdering::Relaxed);
         self.pool.in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
     }
@@ -11372,22 +11401,22 @@ mod tests {
         let pool = Arc::new(ReadPoolHealth::new(2));
         let threshold = READ_POOL_WEDGE_THRESHOLD.as_millis() as u64;
 
-        // Idle: never wedged, however stale the completion tick.
+        // Idle: never wedged, however stale the progress tick.
         assert!(!pool.is_wedged_at(10 * threshold));
 
-        // Two reads start (capacity full) and complete at tick 1_000.
+        // Two reads start (capacity full) and make progress at tick 1_000.
         let g1 = pool.track();
         let g2 = pool.track();
-        pool.last_completion.store(1_000, AtomicOrdering::Relaxed);
+        pool.last_progress.store(1_000, AtomicOrdering::Relaxed);
         assert_eq!(
             pool.gauge(),
             (2, 2),
             "both reads are in flight against a width of two"
         );
 
-        // At capacity but a completion happened recently: saturated, not wedged.
+        // At capacity but progress happened recently: saturated, not wedged.
         assert!(!pool.is_wedged_at(1_000 + threshold - 1));
-        // At capacity with no completion past the threshold: wedged.
+        // At capacity with no progress past the threshold: wedged.
         assert!(pool.is_wedged_at(1_000 + threshold));
 
         // One read finishes: below capacity, so not wedged even long after.
@@ -11395,6 +11424,50 @@ mod tests {
         assert!(!pool.is_wedged_at(u64::MAX));
         drop(g2);
         assert_eq!(pool.gauge().0, 0);
+    }
+
+    /// A burst that saturates a pool which has been idle a long while is *not* a wedge.
+    ///
+    /// This is the case that makes the start edge load-bearing. Track only completions and
+    /// `last_progress` is the age of the last read to finish, which on a quiet node is however
+    /// long ago that was — so the first traffic in a minute would saturate the pool and read as
+    /// wedged immediately, turning a healthy node red until the first read landed. A node idle
+    /// long enough to hit this is exactly a small one, where `max(2, cores / 2)` threads are
+    /// saturated by one fanned-out search.
+    ///
+    /// Both halves are asserted against the same pool, because a check that cannot still catch
+    /// the genuine stall afterwards has bought the false negative rather than fixed anything.
+    #[test]
+    fn a_burst_after_a_long_idle_is_not_a_wedge_but_a_stall_in_it_still_is() {
+        let pool = Arc::new(ReadPoolHealth::new(2));
+        let threshold = READ_POOL_WEDGE_THRESHOLD.as_millis() as u64;
+
+        // The pool served reads an hour ago and has been quiet since.
+        let last_completion = 60 * threshold;
+        pool.last_progress
+            .store(last_completion, AtomicOrdering::Relaxed);
+
+        // Five minutes later a burst arrives and fills every thread. `track` stamps the start,
+        // so the reads that just began count as progress rather than as an hour of silence.
+        let started = last_completion + 5 * threshold;
+        let _g1 = pool.track_at(started);
+        let _g2 = pool.track_at(started);
+        assert_eq!(pool.gauge(), (2, 2), "the burst saturated the pool");
+
+        assert!(
+            !pool.is_wedged_at(started),
+            "a pool saturated by work that just started reads as wedged"
+        );
+        assert!(
+            !pool.is_wedged_at(started + threshold - 1),
+            "a saturated pool is a fault before its work has had the threshold to finish"
+        );
+
+        // And the stall is still caught: those same reads, now stuck past the threshold.
+        assert!(
+            pool.is_wedged_at(started + threshold),
+            "a pool whose reads have been stuck for the threshold is not reported wedged"
+        );
     }
 
     /// A writer wedged mid-batch is as unavailable as a dead one, and an idle writer is not.

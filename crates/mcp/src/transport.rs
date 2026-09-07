@@ -23,38 +23,14 @@ use serde_json::{Value as JsonValue, json};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info};
 
-/// Drops its [`AbortHandle`] on drop so a background task is cancelled when the HTTP response
-/// that owns it is dropped — e.g., because the client disconnected after receiving the 202.
-#[derive(Clone)]
-struct AbortOnDrop(tokio::task::AbortHandle);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// Removes a request from its session's in-flight map when the spawned task finishes or is
-/// aborted, so a cancelled request does not leak an entry.
-struct RequestGuard {
-    session: McpSession,
-    id: JsonValue,
-}
-
-impl Drop for RequestGuard {
-    fn drop(&mut self) {
-        self.session.finish_request(&self.id);
-    }
-}
-
 use crate::{
     authz::{McpAuthzRef, unrestricted},
     backend::McpBackend,
     protocol::{MCP_PROTOCOL_VERSION_HEADER, MCP_SESSION_ID_HEADER, SUPPORTED_PROTOCOL_VERSIONS},
     rpc::{error_response, handle_rpc_request, method_of, parse_json_rpc_request},
     session::{
-        McpSession, McpShutdownHandle, McpTransportState, SessionAccess, SessionClaim,
-        SessionLimits, spawn_cleanup_task,
+        McpShutdownHandle, McpTransportState, SessionAccess, SessionClaim, SessionLimits,
+        spawn_cleanup_task,
     },
 };
 
@@ -299,21 +275,38 @@ async fn process_mcp_message<B: McpBackend>(
                     }
 
                     let sender = mcp_session.sender.clone();
-                    let request_id = request.id.clone();
-                    let session_for_guard = mcp_session.clone();
-                    let request_id_for_guard = request_id.clone();
 
-                    // Spawn background task to process message asynchronously. Tying the task's
-                    // lifetime to the HTTP response means a client disconnect aborts wasted work:
-                    // if the 202 is dropped before the body is sent, the join handle is dropped
-                    // and the task is cancelled.
-                    let join_handle = tokio::spawn(async move {
-                        let _guard = request_id_for_guard.clone().map(|id| RequestGuard {
-                            session: session_for_guard,
-                            id,
-                        });
+                    // Register before spawning. A request carrying an id can be cancelled — by
+                    // `notifications/cancelled`, or by its session ending — and registering it
+                    // first is what keeps the bookkeeping honest: the task cannot finish and
+                    // un-register itself before it has been registered. One without an id is a
+                    // notification, which nothing can refer to and so nothing can cancel.
+                    let (token, guard) = request
+                        .id
+                        .clone()
+                        .map(|id| mcp_session.start_request(id))
+                        .unzip();
 
-                        let maybe_response = handle_rpc_request(app_state, request, &authz).await;
+                    // Process the message on a spawned task: this transport answers 202 first
+                    // and pushes the result down the SSE stream afterwards, so the work has to
+                    // outlive the POST that carried it. Its lifetime belongs to the *session*
+                    // — cancelled if the session goes away — and deliberately not to this
+                    // response, which hyper drops as soon as the 202 is written.
+                    tokio::spawn(async move {
+                        let _guard = guard;
+
+                        let maybe_response = match token {
+                            // Cancelling drops the work where it stands and answers nothing:
+                            // the client that would have read the reply is the one that asked
+                            // for it to stop, or is no longer there to read it.
+                            Some(token) => tokio::select! {
+                                biased;
+                                () = token.cancelled() => None,
+                                response = handle_rpc_request(app_state, request, &authz) => response,
+                            },
+                            None => handle_rpc_request(app_state, request, &authz).await,
+                        };
+
                         if let Some(envelope) = maybe_response {
                             let event =
                                 Event::default().event("message").data(envelope.to_string());
@@ -329,18 +322,8 @@ async fn process_mcp_message<B: McpBackend>(
                         }
                     });
 
-                    let abort_handle = join_handle.abort_handle();
-                    if let Some(id) = request_id {
-                        mcp_session.start_request(id, abort_handle.clone());
-                    }
-
-                    // Return 202 Accepted immediately per MCP spec. Keep an abort handle with the
-                    // response so the spawned task is cancelled if the client goes away before it
-                    // finishes.
-                    let guard = AbortOnDrop(abort_handle);
-                    let mut response = StatusCode::ACCEPTED.into_response();
-                    response.extensions_mut().insert(guard);
-                    response
+                    // Return 202 Accepted immediately per MCP spec.
+                    StatusCode::ACCEPTED.into_response()
                 }
                 Err(err_response) => {
                     // Parse errors have no request id, so they cannot be cancelled. Push the

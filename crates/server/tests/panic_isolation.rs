@@ -7,8 +7,9 @@
 //! would take the process down and the very next request would fail.
 //!
 //! The `fault-injection` feature is off in every shipped build, so the panic seams these probes
-//! reach exist only here. It compiles a second binary, so set `PANIC_SMOKE_PROFILE=dev` while
-//! iterating to trade the release proof for a faster build.
+//! reach exist only here. It compiles a second binary — into `target/panic-smoke/`, never over
+//! the release artifact the validation and release scripts read; see [`build_fault_binary`]. Set
+//! `PANIC_SMOKE_PROFILE=dev` while iterating to trade the release proof for a faster build.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -41,17 +42,35 @@ fn workspace_root() -> PathBuf {
 
 /// Build `cameodb` with the fault-injection seams and return the binary path. Release by default
 /// — the profile whose `panic = "unwind"` this test exists to exercise.
+///
+/// Built into its **own target directory**, which is not a detail. The ordinary one would put
+/// this binary at `target/release/cameodb` — the exact path `scripts/validate/lib.sh` picks up
+/// with no rebuild of its own, and the one `scripts/release/build.sh` copies into `dist/`. A
+/// `cargo test` between the release build and the validation run would then leave the suite
+/// probing a binary with an unauthenticated `/__fault/panic` route compiled in, reporting a pass
+/// for something nobody was going to ship. Isolating the two also stops them invalidating each
+/// other's cache: the feature flag differs, so sharing a directory means every alternation
+/// between `cargo test` and `cargo build --release` rebuilds the server crate.
 fn build_fault_binary() -> PathBuf {
     let release = std::env::var("PANIC_SMOKE_PROFILE").as_deref() != Ok("dev");
 
+    // Under whichever target root is in force, so `CARGO_TARGET_DIR` is still respected.
+    let target = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root().join("target"))
+        .join("panic-smoke");
+
     let mut cmd = Command::new(env!("CARGO"));
-    cmd.current_dir(workspace_root()).args([
-        "build",
-        "--bin",
-        "cameodb",
-        "--features",
-        "fault-injection",
-    ]);
+    cmd.current_dir(workspace_root())
+        .args([
+            "build",
+            "--bin",
+            "cameodb",
+            "--features",
+            "fault-injection",
+            "--target-dir",
+        ])
+        .arg(&target);
     if release {
         cmd.arg("--release");
     }
@@ -61,9 +80,6 @@ fn build_fault_binary() -> PathBuf {
         "building the fault-injection binary failed"
     );
 
-    let target = std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_root().join("target"));
     let binary = target
         .join(if release { "release" } else { "debug" })
         .join("cameodb");
@@ -190,6 +206,52 @@ async fn health_status(client: &reqwest::Client, node: &Node) -> String {
         .await
         .expect("health json");
     body["status"].as_str().expect("status field").to_string()
+}
+
+/// A fault-injection build declares itself in `--version`, and an ordinary one does not.
+///
+/// `scripts/validate/all.sh` refuses a binary carrying these seams by reading exactly this, so
+/// that refusal is only as good as the marker still being printed. Asserting it here is what
+/// keeps the two in step: drop the marker and this fails, rather than the release process quietly
+/// losing a guard it is relying on. Both directions, because a marker that is always present
+/// would block every release just as surely as an absent one lets a fault build through.
+#[tokio::test]
+async fn a_fault_injection_build_says_so_in_its_version() {
+    let fault = build_fault_binary();
+    let reported = String::from_utf8(
+        Command::new(&fault)
+            .arg("--version")
+            .output()
+            .expect("run --version on the fault-injection binary")
+            .stdout,
+    )
+    .expect("--version output is text");
+    assert!(
+        reported.contains("+fault-injection"),
+        "a fault-injection build must say so in --version, or the validation suite cannot \
+         refuse it; it reported {reported:?}"
+    );
+
+    // The ordinary build of this very workspace, which is what ships. Skipped rather than
+    // failed when it has not been built: `cargo test` alone does not produce one, and this test
+    // exists to pin the marker, not to require a release build.
+    let ordinary = workspace_root().join("target/release/cameodb");
+    if ordinary.exists() {
+        let reported = String::from_utf8(
+            Command::new(&ordinary)
+                .arg("--version")
+                .output()
+                .expect("run --version on the release binary")
+                .stdout,
+        )
+        .expect("--version output is text");
+        assert!(
+            !reported.contains("fault-injection"),
+            "an ordinary build must not claim the fault-injection marker, or every release is \
+             refused; {} reported {reported:?}",
+            ordinary.display()
+        );
+    }
 }
 
 /// Every panic surface is contained: the process survives each trigger, a dead writer turns
