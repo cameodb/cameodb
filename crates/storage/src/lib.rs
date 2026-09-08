@@ -3432,8 +3432,12 @@ pub struct HybridStore {
     warmed_generations: Arc<DashMap<String, u64>>,
     /// Per-index warmup lifecycle state, for observability.
     warmup_states: Arc<DashMap<String, IndexWarmupState>>,
-    /// Unified cache for index sizes (Tantivy + Redb) with expiration to avoid repeated expensive calculations
-    index_size_cache: Arc<Mutex<HashMap<String, IndexSizeCache>>>,
+    /// Unified cache for index sizes (Tantivy + Redb) with expiration to avoid repeated
+    /// expensive calculations. Keyed by `(include_data_size, index)` rather than a formatted
+    /// string: this cache lives per shard, so the shard path in the old string key was
+    /// redundant, and the string form made invalidation a substring match — evicting index
+    /// `"a"` also evicted `"ab"` and `"aa"`. The tuple key makes invalidation exact.
+    index_size_cache: Arc<Mutex<HashMap<(bool, String), IndexSizeCache>>>,
     /// Cache expiration duration for index sizes (1 hour)
     index_cache_expiry: Duration,
     /// Storage configuration
@@ -5398,10 +5402,7 @@ impl HybridStore {
         // later caller initialize the same index in parallel with that holder.
 
         // Invalidate size cache entries for this index
-        {
-            let mut size_cache = self.index_size_cache.lock().unwrap();
-            size_cache.retain(|key, _| !key.contains(&format!(":{}", index)));
-        }
+        self.invalidate_size_cache(index);
 
         // Held past the transaction so the cache can take it, which is what lets
         // `index_was_dropped` answer from memory.
@@ -7133,10 +7134,7 @@ impl HybridStore {
         // Unconditional, where this used to ask for a new or updated document first: a batch of
         // pure deletes satisfies neither test and still changes every figure in there. An empty
         // batch cannot reach this point — `ops.is_empty()` returned at the top.
-        {
-            let mut size_cache = self.index_size_cache.lock().unwrap();
-            size_cache.retain(|key, _| !key.contains(&format!(":{}", index)));
-        }
+        self.invalidate_size_cache(index);
 
         tracing::debug!(
             index = %index,
@@ -7687,6 +7685,20 @@ impl HybridStore {
         }
     }
 
+    /// Drop both cached size entries (`fast` and `full`) for `index`.
+    ///
+    /// The tuple key is what makes this exact: the cache's keys used to be the formatted
+    /// string `{shard}:{fast|full}:{index}`, and invalidation was a `contains(":{index}")`
+    /// match — evicting `"a"` also evicted `"ab"`, `"aa"` and every other index name holding
+    /// the substring, silently. Deleting or committing one index costing its neighbours their
+    /// cached sizes is invisible to tests because an over-eager cache is still correct, only
+    /// slower. Exact keys mean only this index's entries go.
+    fn invalidate_size_cache(&self, index: &str) {
+        let mut size_cache = self.index_size_cache.lock().unwrap();
+        size_cache.remove(&(false, index.to_string()));
+        size_cache.remove(&(true, index.to_string()));
+    }
+
     /// Batch measure all indexes in a single pass with shared transaction.
     /// This eliminates the N² complexity of the old approach where get_index_sizes_cached
     /// was called once per index, and each call measured ALL indexes.
@@ -7701,14 +7713,10 @@ impl HybridStore {
         let mut results = HashMap::new();
 
         // Check cache first for all indexes
-        let cache_suffix = if include_data_size { "full" } else { "fast" };
-        let cache_key_prefix = format!("{}:{}:", self.config.shard_path.display(), cache_suffix);
-
         {
             let cache = self.index_size_cache.lock().unwrap();
             for index_name in index_names {
-                let cache_key = format!("{}{}", cache_key_prefix, index_name);
-                if let Some(entry) = cache.get(&cache_key)
+                if let Some(entry) = cache.get(&(include_data_size, index_name.clone()))
                     && entry.timestamp.elapsed() < self.index_cache_expiry
                 {
                     results.insert(
@@ -7786,7 +7794,6 @@ impl HybridStore {
         // OPTIMIZATION: Populate BOTH fast and full cache entries to enable cache sharing
         {
             let mut cache = self.index_size_cache.lock().unwrap();
-            let shard_path = self.config.shard_path.display().to_string();
 
             for (idx_name, tantivy_bytes, doc_count, raw_redb_bytes) in per_index_stats {
                 let corrected_redb_bytes = if include_data_size {
@@ -7796,9 +7803,8 @@ impl HybridStore {
                 };
 
                 // Always cache the "fast" entry (tantivy bytes + doc count, no redb size)
-                let fast_key = format!("{}:fast:{}", shard_path, idx_name);
                 cache.insert(
-                    fast_key,
+                    (false, idx_name.clone()),
                     IndexSizeCache {
                         tantivy_bytes,
                         redb_bytes: 0,
@@ -7809,9 +7815,8 @@ impl HybridStore {
 
                 // When we have redb data, also cache the "full" entry
                 if include_data_size {
-                    let full_key = format!("{}:full:{}", shard_path, idx_name);
                     cache.insert(
-                        full_key,
+                        (true, idx_name.clone()),
                         IndexSizeCache {
                             tantivy_bytes,
                             redb_bytes: corrected_redb_bytes,
@@ -8526,6 +8531,41 @@ mod tests {
             default_batch_size: 100_000,
             wal_sync: true,
         }
+    }
+
+    /// Invalidating one index's cached sizes leaves its neighbours' entries alone.
+    ///
+    /// The cache keys used to be formatted strings and invalidation was a substring match, so
+    /// evicting `"a"` also evicted `"ab"`. The fix is only pinned by asserting the neighbour
+    /// survives, because an over-evicting cache still answers correctly — it just measures
+    /// again, which no caller can see.
+    #[test]
+    fn invalidating_one_indexs_cached_sizes_leaves_its_neighbours_alone() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(read_cache_config(&temp_dir), 1).expect("store");
+
+        let entry = IndexSizeCache {
+            tantivy_bytes: 1,
+            redb_bytes: 2,
+            document_count: 3,
+            timestamp: Instant::now(),
+        };
+        {
+            let mut cache = store.index_size_cache.lock().unwrap();
+            for index in ["a", "ab"] {
+                cache.insert((false, index.to_string()), entry.clone());
+                cache.insert((true, index.to_string()), entry.clone());
+            }
+        }
+
+        store.invalidate_size_cache("a");
+
+        let cache = store.index_size_cache.lock().unwrap();
+        assert_eq!(cache.len(), 2, "only 'a' should have been evicted");
+        assert!(cache.contains_key(&(false, "ab".to_string())));
+        assert!(cache.contains_key(&(true, "ab".to_string())));
+        assert!(!cache.contains_key(&(false, "a".to_string())));
+        assert!(!cache.contains_key(&(true, "a".to_string())));
     }
 
     /// A WAL entry written by the previous build still decodes.
