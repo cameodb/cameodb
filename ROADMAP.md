@@ -2150,7 +2150,18 @@ replay window from a number nobody can trust.
 
 ### L3 — Poison panics, nine sites, inconsistent with the unwind posture
 
-**Defect.** 📋 **Planned.** The release chose `panic = "unwind"` so a contained panic costs one
+**Defect.** ✅ **Done** 2026-09-08. Every remaining `.lock().unwrap()` on the three mutexes now
+recovers with `unwrap_or_else(|poisoned| poisoned.into_inner())` — four on `index_size_cache`
+(`storage/lib.rs` `shutdown`, `invalidate_size_cache`, both ends of `batch_measure_all_indexes`;
+the fifth and sixth cache sites were already absorbed by L1's re-keying), three on
+`writer_monitor_handle` (spawn and both ends of `shutdown_writer` in `node_orchestrator.rs`) and
+one on `runtime_join_handle` (`swarm/mod.rs` `wait_for_shutdown`). Covered by the regression
+tests `a_poisoned_size_cache_does_not_poison_the_calls_that_follow` (storage) and
+`a_poisoned_join_handle_slot_does_not_poison_shutdown` (server), both of which poison the mutex
+through a real panic before the call; full `cargo test -p storage`, `cargo test -p server` and
+`cargo check --workspace --all-targets` green.
+
+**Original entry.** The release chose `panic = "unwind"` so a contained panic costs one
 request — but nine `.lock().unwrap()` sites panic again on a poisoned mutex: five on
 `index_size_cache` (`storage/lib.rs` ~3705, 5402, 7137, 7708, 7788), three on
 `writer_monitor_handle` (`node_orchestrator.rs` ~4900, 5035, 5049) and one on

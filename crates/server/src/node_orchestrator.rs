@@ -4897,7 +4897,10 @@ impl MicroshardActor {
             .name(format!("writer-monitor-shard-{}", self.shard_id))
             .spawn(move || writer_monitor(rt, writer_handle))
             .map_err(OrchestratorError::Io)?;
-        *self.writer_monitor_handle.lock().unwrap() = Some(monitor);
+        *self
+            .writer_monitor_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(monitor);
 
         info!(shard_id = %self.shard_id, "MicroshardActor initialized with dedicated writer thread");
         Ok(())
@@ -5032,7 +5035,11 @@ impl MicroshardActor {
                         tracing::info!(shard_id = %self.shard_id, "Writer thread shutdown complete");
                         // Join the monitor; it has seen the clean exit and stopped, and it owns
                         // the writer thread's handle, so this joins the whole writer stack.
-                        if let Some(handle) = self.writer_monitor_handle.lock().unwrap().take()
+                        if let Some(handle) = self
+                            .writer_monitor_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take()
                             && let Err(e) = handle.join()
                         {
                             tracing::warn!(shard_id = %self.shard_id, error = ?e, "Writer monitor panicked");
@@ -5046,7 +5053,10 @@ impl MicroshardActor {
                             timeout_secs
                         );
                         // Abandon the monitor thread - OS will clean up on process exit
-                        *self.writer_monitor_handle.lock().unwrap() = None;
+                        *self
+                            .writer_monitor_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                     }
                 }
             } else {
