@@ -130,7 +130,10 @@ impl SwarmRuntimeHandle {
     /// Wait for the swarm runtime task to finish, with timeout.
     pub async fn wait_for_shutdown(&self, timeout: std::time::Duration) -> Result<()> {
         let handle = {
-            let mut lock = self.runtime_join_handle.lock().unwrap();
+            let mut lock = self
+                .runtime_join_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             lock.take()
         };
         if let Some(handle) = handle {
@@ -1289,5 +1292,31 @@ mod tests {
 
         let results = convert_seed_nodes_to_multiaddrs(&inputs);
         assert_eq!(results.len(), 0);
+    }
+
+    /// A poisoned join-handle slot must not panic the shutdown that follows.
+    ///
+    /// `wait_for_shutdown` takes the runtime's join handle out of its mutex; a
+    /// `.lock().unwrap()` there would turn one contained panic into a panic on every later
+    /// shutdown, contradicting the `panic = "unwind"` posture the release chose. The slot
+    /// holds only ownership of a handle, so recovering the guard is safe and matches what the
+    /// rest of the process does.
+    #[tokio::test]
+    async fn a_poisoned_join_handle_slot_does_not_poison_shutdown() {
+        let handle = SwarmRuntimeHandle::inert();
+        let slot = Arc::clone(&handle.runtime_join_handle);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = slot.lock().unwrap();
+            panic!("the contained panic the slot is expected to survive");
+        }));
+        assert!(
+            slot.is_poisoned(),
+            "the fixture must leave the slot poisoned"
+        );
+
+        handle
+            .wait_for_shutdown(std::time::Duration::from_millis(10))
+            .await
+            .expect("shutdown recovers the guard rather than panicking");
     }
 }

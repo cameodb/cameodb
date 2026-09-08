@@ -3714,7 +3714,10 @@ impl HybridStore {
         self.budget_cache.clear();
         self.operations_counter.clear();
         self.current_seq.clear();
-        self.index_size_cache.lock().unwrap().clear();
+        self.index_size_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
 
         // Force a final redb fsync/flush to reduce WAL replay on startup
         let redb_start = std::time::Instant::now();
@@ -7702,7 +7705,10 @@ impl HybridStore {
     /// cached sizes is invisible to tests because an over-eager cache is still correct, only
     /// slower. Exact keys mean only this index's entries go.
     fn invalidate_size_cache(&self, index: &str) {
-        let mut size_cache = self.index_size_cache.lock().unwrap();
+        let mut size_cache = self
+            .index_size_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         size_cache.remove(&(false, index.to_string()));
         size_cache.remove(&(true, index.to_string()));
     }
@@ -7722,7 +7728,10 @@ impl HybridStore {
 
         // Check cache first for all indexes
         {
-            let cache = self.index_size_cache.lock().unwrap();
+            let cache = self
+                .index_size_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for index_name in index_names {
                 if let Some(entry) = cache.get(&(include_data_size, index_name.clone()))
                     && entry.timestamp.elapsed() < self.index_cache_expiry
@@ -7801,7 +7810,10 @@ impl HybridStore {
         // Cache and build results for uncached indexes
         // OPTIMIZATION: Populate BOTH fast and full cache entries to enable cache sharing
         {
-            let mut cache = self.index_size_cache.lock().unwrap();
+            let mut cache = self
+                .index_size_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
             for (idx_name, tantivy_bytes, doc_count, raw_redb_bytes) in per_index_stats {
                 let corrected_redb_bytes = if include_data_size {
@@ -8034,6 +8046,37 @@ mod tests {
             "a checkpoint the index cannot prove must fail the scan, not seed a replay window \
              from an untrusted number"
         );
+    }
+
+    /// A poisoned size-cache mutex must not panic every stats or shutdown call that follows.
+    ///
+    /// The release chose `panic = "unwind"` so a contained panic costs one request — a
+    /// `.lock().unwrap()` on a poisoned mutex turns that one contained panic into a panic on
+    /// every later call, which is the failure this test is named after. The cache holds only
+    /// derived figures, so recovering the guard is safe, and is what every other mutex in the
+    /// process already does (`audit.rs`, `session.rs`, the rate limiter).
+    #[test]
+    fn a_poisoned_size_cache_does_not_poison_the_calls_that_follow() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+
+        let cache = Arc::clone(&store.index_size_cache);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.lock().unwrap();
+            panic!("the contained panic the cache is expected to survive");
+        }));
+        assert!(
+            cache.is_poisoned(),
+            "the fixture must leave the cache poisoned"
+        );
+
+        store
+            .gather_index_stats(false)
+            .expect("stats recover the guard rather than panicking");
+        store.invalidate_size_cache("anything");
+        store
+            .shutdown()
+            .expect("shutdown recovers the guard rather than panicking");
     }
 
     /// A value that is not a facet path is refused, not handed to a constructor that panics.
