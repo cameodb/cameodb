@@ -82,8 +82,24 @@ impl Default for McpTransportConfig {
 }
 
 /// The caller a request carries, or the unrestricted one if the host inserted none.
+///
+/// A missing extension is the intended state when security is off — no identity to enforce —
+/// and a misconfiguration when it is on, and this function cannot tell the two apart. What it
+/// can do is refuse to be silent about it: the warning is the load-bearing part, because a
+/// trust boundary that fails open without a log line is one an operator never learns about.
 fn caller(authz: Option<Extension<McpAuthzRef>>) -> McpAuthzRef {
-    authz.map_or_else(unrestricted, |Extension(authz)| authz)
+    match authz {
+        Some(Extension(authz)) => authz,
+        None => {
+            tracing::warn!(
+                "MCP request reached the transport with no authz extension; serving as \
+                 unrestricted. This is expected when security is off and a misconfiguration \
+                 when it is on — check that the authorize middleware is in the stack and \
+                 classifies MCP routes"
+            );
+            unrestricted()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

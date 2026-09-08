@@ -21,8 +21,8 @@ mod common;
 /// Trap inputs — the same literals the feature-gated seams in `node_orchestrator` and `routes`
 /// match. Kept in step by hand because the binary crate exposes no library to import them from.
 const READ_TRAP_QUERY: &str = "__fault_panic_read__";
-const WRITE_OP_TRAP_INDEX: &str = "__fault_panic_write_op__";
-const WRITER_THREAD_TRAP_INDEX: &str = "__fault_kill_writer__";
+const WRITE_OP_TRAP_INDEX: &str = "fault_panic_write_op__";
+const WRITER_THREAD_TRAP_INDEX: &str = "fault_kill_writer__";
 const HANDLER_TRAP_PATH: &str = "/__fault/panic";
 
 /// How long the node's writer monitor is held before it rebuilds a crashed writer. The respawn is

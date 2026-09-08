@@ -292,12 +292,16 @@ fn handle_panic(panic: Box<dyn std::any::Any + Send + 'static>) -> axum::respons
 }
 
 /// Fallback handler for 404/405 to return JSON error shape
+///
+/// Echoes the path only, not the query string: the audit layer strips the query from its
+/// records, and the trace layer logs this body in full — so echoing the raw URI here would
+/// put the query string (which may carry tokens or other secrets) into both.
 async fn fallback_handler(uri: axum::http::Uri) -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({
             "error": "Not Found",
-            "path": uri.to_string()
+            "path": uri.path()
         })),
     )
 }
