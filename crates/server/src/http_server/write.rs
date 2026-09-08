@@ -18,6 +18,46 @@ use crate::http_server::error::AppError;
 use crate::node_orchestrator::{ClientOp, DeletePayload, DocPayload};
 use crate::state::AppState;
 
+/// The most reasons a streaming-ingest response will list before it counts the rest.
+///
+/// The wire body limit caps the input, not the amplification: 2-byte garbage lines become one
+/// serde error string each, all held at once and then serialized whole. An operator gets the
+/// same shape of answer from the first N reasons plus a count of the rest, and the node does
+/// not allocate a string per line of a hostile body.
+const MAX_LISTED_STREAM_ERRORS: usize = 100;
+
+/// The reasons a streaming ingest reports, bounded to the first N plus a count of the rest.
+///
+/// Pushing past the cap drops the reason and increments the suppressed count, so the final
+/// tally (`listed.len() + suppressed`) is still every bad line — the accounting the
+/// `debug_assert!` at the end of `write_stream_handler` checks against `documents`.
+#[derive(Default)]
+struct BoundedErrors {
+    listed: Vec<String>,
+    suppressed: u64,
+}
+
+impl BoundedErrors {
+    fn push(&mut self, reason: String) {
+        if self.listed.len() < MAX_LISTED_STREAM_ERRORS {
+            self.listed.push(reason);
+        } else {
+            self.suppressed += 1;
+        }
+    }
+
+    fn extend(&mut self, reasons: Vec<String>) {
+        for reason in reasons {
+            self.push(reason);
+        }
+    }
+
+    /// The number of reasons held, listed or suppressed — every bad line the body held.
+    fn total(&self) -> u64 {
+        self.listed.len() as u64 + self.suppressed
+    }
+}
+
 /// Handler for document write operations
 pub(super) async fn write_handler(
     Path(index): Path<String>,
@@ -256,7 +296,7 @@ pub(super) async fn write_stream_handler(
     let max_record_size_bytes = state.max_record_size_bytes;
 
     let mut written: u64 = 0;
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors = BoundedErrors::default();
     // Non-blank lines: the documents the body offered, whether or not any of them parsed.
     let mut documents: usize = 0;
     let mut unparseable: usize = 0;
@@ -383,7 +423,11 @@ pub(super) async fn write_stream_handler(
     if written == 0 && unparseable == documents {
         return Err(AppError::bad_request(format!(
             "no line of the body parsed as a document; the first was: {}",
-            errors.first().map(String::as_str).unwrap_or("unknown")
+            errors
+                .listed
+                .first()
+                .map(String::as_str)
+                .unwrap_or("unknown")
         )));
     }
 
@@ -391,16 +435,16 @@ pub(super) async fn write_stream_handler(
     // with. A path that stops accounting is a test failure here rather than a silent shortfall,
     // and a log line in the release build that would otherwise just serve the bad total.
     debug_assert_eq!(
-        written as usize + errors.len(),
+        written as usize + errors.total() as usize,
         documents,
         "a write stream must account for every document its body held"
     );
-    if written as usize + errors.len() != documents {
+    if written as usize + errors.total() as usize != documents {
         tracing::error!(
             index = %index,
             lines_received = documents,
             items_written = written,
-            errors = errors.len(),
+            errors = errors.total(),
             "Write stream did not account for every document its body held"
         );
     }
@@ -411,15 +455,16 @@ pub(super) async fn write_stream_handler(
         documents,
         batches,
         written,
-        errors.len()
+        errors.total()
     );
 
     let result = serde_json::json!({
-        "status": if errors.is_empty() { "ok" } else { "partial" },
+        "status": if errors.total() == 0 { "ok" } else { "partial" },
         "items_written": written,
         "lines_received": documents,
         "batches": batches,
-        "errors": errors,
+        "errors": errors.listed,
+        "suppressed_errors": errors.suppressed,
     });
 
     let bytes = serde_json::to_vec(&result).map_err(|e| {

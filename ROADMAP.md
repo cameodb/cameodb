@@ -2210,13 +2210,23 @@ faults become a generic string.
 
 ### L8 — The streaming-ingest error vector grows one string per bad line
 
-**Security, medium.** 📋 **Planned.** `write_stream_handler` (`http_server/write.rs` ~259–341)
-pushes one formatted error per oversized or unparseable line into a `Vec<String>` unbounded
-within the request. The wire body limit (~128 MB) caps the input, not the amplification: 2-byte
-garbage lines become tens of millions of serde error strings, all held at once and then
-serialized whole into the response. Keep the first N reasons plus a count of the rest — the
-NDJSON error-reporting contract survives that. Sits beside [C5](#c5--a-decompression-cap-on-the-streaming-ingest-path),
-which bounds the same path's *input* amplification.
+**Security, medium.** ✅ **Done** 2026-09-08. `write_stream_handler` now collects its reasons
+through a `BoundedErrors` helper that keeps the first `MAX_LISTED_STREAM_ERRORS` (100) and
+counts the rest, and the response carries `errors` (the listed) plus a `suppressed_errors`
+count. The accounting arithmetic (`written + listed + suppressed == documents`) is unchanged,
+so the `debug_assert!` and the partial-vs-ok status still hold. Covered by the regression test
+`a_stream_of_bad_lines_reports_a_bounded_number_of_reasons` in `node_http_api` (5 000 garbage
+lines → ≤100 listed reasons + a 4 900 suppressed count), the existing stream tests still green,
+full `cargo test -p server` and `cargo check --workspace --all-targets` clean.
+
+**Original entry.** `write_stream_handler` (`http_server/write.rs` ~259–341) pushed one
+formatted error per oversized or unparseable line into a `Vec<String>` unbounded within the
+request. The wire body limit (~128 MB) caps the input, not the amplification: 2-byte garbage
+lines become tens of millions of serde error strings, all held at once and then serialized
+whole into the response. Keep the first N reasons plus a count of the rest — the NDJSON
+error-reporting contract survives that. Sits beside
+[C5](#c5--a-decompression-cap-on-the-streaming-ingest-path), which bounds the same path's
+*input* amplification.
 
 ### L9 — A `Writer` key can mint indexes
 

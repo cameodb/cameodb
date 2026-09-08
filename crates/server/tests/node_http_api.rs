@@ -3333,6 +3333,45 @@ async fn a_body_that_is_not_ndjson_is_refused_outright() {
     );
 }
 
+/// A stream of nothing but bad lines reports a bounded number of reasons, not one per line.
+///
+/// The wire body limit caps the input, not the amplification: 2-byte garbage lines become
+/// tens of millions of serde error strings, all held at once and then serialized whole into
+/// the response. The contract that survives is "the first N reasons plus a count of the rest"
+/// — an operator gets the same shape of answer, and the node does not allocate a string per
+/// line of a hostile body.
+#[tokio::test]
+async fn a_stream_of_bad_lines_reports_a_bounded_number_of_reasons() {
+    let node = TestNode::start("stream_batch_size = 4").await;
+
+    // One good line so the body is NDJSON-shaped and the request reaches the partial path
+    // rather than the "nothing parsed" refusal. Then many unparseable lines.
+    let mut ndjson = String::from("{\"id\":\"ok\",\"doc\":{\"n\":1}}\n");
+    for i in 0..5_000 {
+        ndjson.push_str(&format!("{{garbage line {i}}}\n"));
+    }
+
+    let (status, body) = post_ndjson(&node, "/api/spam/document/stream", &ndjson).await;
+    assert_eq!(status, 200, "a bad line does not fail the import: {body}");
+    assert_eq!(body["status"], "partial", "and it is reported: {body}");
+    assert_eq!(body["items_written"], 1, "the one good line loaded: {body}");
+
+    let errors = body["errors"].as_array().expect("errors array");
+    assert!(
+        errors.len() <= 100,
+        "the response carries at most the first 100 reasons, not one per bad line: {body}"
+    );
+
+    // The rest are counted, not listed — the contract an operator reads is "first N + a count",
+    // and the count has to add up to the number of bad lines the body held.
+    let suppressed = body["suppressed_errors"].as_u64().unwrap_or(0);
+    assert_eq!(
+        errors.len() as u64 + suppressed,
+        5_000,
+        "the listed reasons plus the suppressed count is every bad line: {body}"
+    );
+}
+
 /// POST a raw NDJSON body, returning the status and the decoded response.
 async fn post_ndjson(node: &TestNode, path: &str, body: &str) -> (u16, serde_json::Value) {
     with_tls_provider();
