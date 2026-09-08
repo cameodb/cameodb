@@ -16,12 +16,14 @@ use crate::node_orchestrator::ClientOp;
 use crate::state::AppState;
 use storage::IndexSchema;
 
-/// Validate an index name for creation.
+/// Validate an index name.
 ///
 /// Rejects names that could escape the `shard_path/indices/` directory via path
 /// traversal (`..`, `/`, `\`), empty names, names exceeding 255 bytes, and names
-/// that don't start with an alphanumeric character.
-fn validate_index_name(index: &str) -> Result<(), AppError> {
+/// that don't start with an alphanumeric character. Called from the authorize
+/// middleware on every route that carries an `{index}` segment, so the strict
+/// check that `PUT /_config` always had is now the one every path gets.
+pub(crate) fn validate_index_name(index: &str) -> Result<(), AppError> {
     if index.is_empty() {
         return Err(AppError::bad_request("index name must not be empty"));
     }

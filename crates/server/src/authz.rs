@@ -32,6 +32,7 @@ use cameodb_mcp::{McpAuthz, McpAuthzRef, McpCapability};
 
 use crate::audit::{AuditRecord, AuditSink};
 use crate::auth::{Capability, KeyEntry, KeyRing};
+use crate::http_server::validate_index_name;
 
 /// What the gate needs: the keys it checks against, and the trail it writes to.
 ///
@@ -603,6 +604,30 @@ pub async fn authorize(State(gate): State<GateState>, mut req: Request, next: Ne
                 .and_then(|c| c.index)
                 .map(str::to_string);
             let access = classified.map(|c| c.access);
+
+            // One shared validator on every path that carries an `{index}` segment.
+            // `PUT /_config` always had this check; now so does every write, search, and
+            // admin route — a name with a space or a semicolon used to pass the auth layer
+            // and reach the engine, which only blocked traversal.
+            if let Some(ref name) = index
+                && let Err(err) = validate_index_name(name)
+            {
+                let response = err.into_response();
+                if gate.audit.is_enabled() {
+                    let identified = identity.key_id.is_some();
+                    let record = AuditRecord::http(&method, &path)
+                        .with_identity(identity.key_id, identity.label, identity.role)
+                        .with_peer(peer.flatten())
+                        .with_index(index.clone())
+                        .allowed(response.status().as_u16());
+                    match rollup_name(access, true, identified) {
+                        Some(event) => gate.audit.record_rolled(record.with_event(event)),
+                        None => gate.audit.record(record),
+                    }
+                }
+                return response;
+            }
+
             req.extensions_mut().insert(authz);
 
             let response = next.run(req).await;

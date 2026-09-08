@@ -3978,9 +3978,9 @@ mod fault_injection {
     /// A search whose query is exactly this panics on the read pool.
     pub const READ_TRAP_QUERY: &str = "__fault_panic_read__";
     /// A write to this index panics inside the per-command guard: caught, the writer rebuilt.
-    pub const WRITE_OP_TRAP_INDEX: &str = "__fault_panic_write_op__";
+    pub const WRITE_OP_TRAP_INDEX: &str = "fault_panic_write_op__";
     /// A write to this index panics past the guard, so the writer thread itself dies.
-    pub const WRITER_THREAD_TRAP_INDEX: &str = "__fault_kill_writer__";
+    pub const WRITER_THREAD_TRAP_INDEX: &str = "fault_kill_writer__";
 
     pub fn panic_if_read_trap(query: &str) {
         assert!(

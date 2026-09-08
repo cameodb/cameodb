@@ -2239,7 +2239,37 @@ creation or write down, in the capability reference, that minting indexes is an 
 
 ### L10 — The low findings, in one place
 
-**Security, low.** 📋 **Planned.** Six items, each a few lines to fix:
+**Security, low.** ✅ **Done** 2026-09-08. Five of six items fixed; the sixth is a
+documentation finding:
+
+- `mcp/transport.rs` `caller()`: now warns on every request that arrives with no authz
+  extension, so a trust boundary that fails open is no longer silent. The permissive default
+  is kept (security-off is the intended state it represents), but the `warn!` is load-bearing.
+- `http_server/health.rs`: the anonymous health check now returns from local liveness atomics
+  only — the coordinator actor round-trip moved below the `!identified` early return, so a
+  health flood no longer becomes mailbox pressure.
+- `routes.rs` `fallback_handler`: echoes `uri.path()` only, not `uri.to_string()` — the query
+  string (which may carry tokens) no longer reaches the response body the trace layer logs.
+- Index-name validation: `validate_index_name` is now `pub(crate)` and called in the `authorize`
+  middleware on every request whose classified route carries an `{index}` segment, so the strict
+  check `PUT /_config` always had is the one every write, search, and admin route gets. The
+  fault-injection trap index names were renamed to pass it (`__fault_panic_write_op__` →
+  `fault_panic_write_op`, `__fault_kill_writer__` → `fault_kill_writer`).
+- `serde-saphyr` / `hickory-proto`: **confirmed — there is no CI.** The project has no
+  `.github/workflows/` directory; `cargo deny check` and `cargo audit` run only via the manual
+  `scripts/validate/deps.sh` gate, which skips both tools when absent and still passes. The
+  `review-by 2026-11-01` exceptions in `deny.toml` are not checked automatically. This is a
+  decision item for the retrospective in [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle),
+  not a code fix.
+- HTTP search routes: `search_handler` and `search_stream_handler` now call
+  `state.tool_limiter.check(key_id, 1)` — the same per-key token bucket the MCP surface uses,
+  keyed by the same `key_id`, off by the same default (`tool_calls_per_minute: 0` →
+  `Verdict::Allow`). A refused caller gets a 429 with a retry-after.
+
+Full `cargo test -p server` (275 unit + 56 node_http_api + all integration suites including
+panic isolation), `cargo test -p cameodb_mcp`, and `cargo check --workspace --all-targets` green.
+
+**Original entry.** Six items, each a few lines to fix:
 
 - `mcp/transport.rs` ~85–87: `caller()` fails open to `McpUnrestricted` when the authz extension
   is absent — unreachable today, wrong default at a trust boundary. Warn loudly or refuse.

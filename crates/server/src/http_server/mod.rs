@@ -13,5 +13,6 @@ mod routes;
 mod search;
 mod write;
 
+pub(crate) use catalogue::validate_index_name;
 pub(crate) use health::HEALTH_PATH;
 pub(crate) use routes::{RouterConfig, create_router};

@@ -72,7 +72,28 @@ pub(super) async fn health_handler(
 ) -> Result<Response, AppError> {
     let identified = authz.is_some_and(|Extension(authz)| authz.is_identified());
 
-    // Query cluster status from coordinator
+    // The two ways a shard's data path stops serving while the request path stays up: a writer
+    // that has died or wedged mid-batch (no more writes), and a read pool with every thread stuck
+    // and no progress (no more reads). Either should make an orchestrator stop routing here and
+    // recycle the node, so either forces red whatever the cluster view says. This is the only part
+    // of the anonymous response that touches local node state, and it is a load of a handful of
+    // atomics — it never reaches the read pool or a shard's writer, so it cannot itself stall.
+    let local_status = worst_status(
+        "green".to_string(),
+        state.writer_liveness.unavailable_writers(),
+        state.read_pool_health.is_wedged(),
+    );
+
+    if !identified {
+        // Still the *real* status, not a constant: a health check that cannot go yellow is
+        // not a health check, and this is what a load balancer reads. Anonymous callers need
+        // only the local liveness atomics — the coordinator round-trip is for the expanded
+        // body below, and a health flood must not become mailbox pressure on it.
+        return Ok(Json(serde_json::json!({ "status": local_status })).into_response());
+    }
+
+    // Query cluster status from coordinator — only for the expanded body an identified caller
+    // receives, so an anonymous health flood never reaches the actor.
     let cluster_status = match state.coordinator.ask(GetStatus).await {
         Ok(status) => Some(status),
         Err(err) => {
@@ -86,23 +107,11 @@ pub(super) async fn health_handler(
         .map(|s| s.health.clone())
         .unwrap_or_else(|| "green".to_string());
 
-    // The two ways a shard's data path stops serving while the request path stays up: a writer
-    // that has died or wedged mid-batch (no more writes), and a read pool with every thread stuck
-    // and no progress (no more reads). Either should make an orchestrator stop routing here and
-    // recycle the node, so either forces red whatever the cluster view says. This is the only part
-    // of the anonymous response that touches local node state, and it is a load of a handful of
-    // atomics — it never reaches the read pool or a shard's writer, so it cannot itself stall.
     let status = worst_status(
         status,
         state.writer_liveness.unavailable_writers(),
         state.read_pool_health.is_wedged(),
     );
-
-    if !identified {
-        // Still the *real* status, not a constant: a health check that cannot go yellow is
-        // not a health check, and this is what a load balancer reads.
-        return Ok(Json(serde_json::json!({ "status": status })).into_response());
-    }
 
     let (read_pool_in_flight, read_pool_capacity) = state.read_pool_health.gauge();
 

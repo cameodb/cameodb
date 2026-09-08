@@ -49,6 +49,14 @@ impl AppError {
         }
     }
 
+    /// 429 with an explicit, client-safe message, for a caller that has spent its rate budget.
+    pub fn too_many_requests(msg: impl Into<String>) -> Self {
+        Self {
+            error: anyhow::anyhow!("{}", msg.into()),
+            status: Some(StatusCode::TOO_MANY_REQUESTS),
+        }
+    }
+
     /// Answer an error the routing layer returned, according to its verdict.
     ///
     /// The classification itself lives on [`OrchestratorError::verdict`], not here, because it is
