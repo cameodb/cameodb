@@ -3022,6 +3022,14 @@ pub enum StoreError {
     #[error("tantivy error: {0}")]
     Tantivy(#[from] tantivy::TantivyError),
 
+    /// An index whose contents contradict the engine's own bookkeeping — e.g. a document the
+    /// `_seq` fast field orders but whose stored fields cannot read the value. Not the
+    /// caller's fault and not fixable by retrying: a checkpoint reconstructed from nothing
+    /// seeds a replay window from a number nobody can trust, so the read that finds this
+    /// fails rather than inventing one.
+    #[error("corrupt index state: {0}")]
+    CorruptIndex(String),
+
     #[error("serialization error: {0}")]
     Serialization(String),
 
@@ -3807,14 +3815,14 @@ impl HybridStore {
                 );
                 return Ok(seq);
             } else {
-                tracing::error!(
-                    inverted_sort_key = ?inverted_sort_key,
-                    doc_address = ?doc_address,
-                    "_seq field not found in stored document - this should never happen! Returning inverted_sort_key which is WRONG"
-                );
-                // CRITICAL BUG: We should NOT return the inverted sort key here
-                // Return u64::MAX - inverted_sort_key to get the actual value
-                return Ok(u64::MAX - inverted_sort_key.unwrap_or(0));
+                // The fast field orders this document as the highest `_seq`, and the stored
+                // fields cannot read a value on it. Nothing here can reconstruct one the
+                // caller could trust, and a wrong checkpoint seeds a replay window — so the
+                // scan fails, and with it the index open that asked.
+                return Err(StoreError::CorruptIndex(format!(
+                    "the top document by _seq ({inverted_sort_key:?} at {doc_address:?}) \
+                     carries no stored _seq value to read"
+                )));
             }
         } else {
             tracing::debug!("get_highest_indexed_seq: No documents found in index");
@@ -7993,6 +8001,39 @@ mod tests {
                 "id must survive the round trip"
             );
         }
+    }
+
+    /// A checkpoint scan that finds a sortable `_seq` but cannot read its stored value fails,
+    /// rather than inventing a number.
+    ///
+    /// `get_highest_indexed_seq` orders on the `_seq` fast field but reads the answer from the
+    /// document's stored fields, because the sort key is `u64::MAX` minus it. A document that is
+    /// fast-only has a sort key and no stored value, and the scan used to log an error and hand
+    /// back the inverted sort key as if it were the checkpoint — a value its own comment called
+    /// wrong, which every caller then trusted as the start of the replay window. The branch now
+    /// fails the scan, and with it the index open, rather than seeding recovery from a number
+    /// nobody can trust.
+    #[test]
+    fn a_checkpoint_scan_it_cannot_read_fails_instead_of_lying() {
+        // Fast but not stored: ordering on the column finds the document, and the stored-field
+        // read on it finds nothing.
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_u64_field("_seq", FAST);
+        let tantivy_index = Index::create_in_ram(schema_builder.build());
+
+        let seq_field = tantivy_index.schema().get_field("_seq").unwrap();
+        let mut writer = tantivy_index.writer(50_000_000).unwrap();
+        writer.add_document(doc!(seq_field => 42_u64)).unwrap();
+        writer.commit().unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+
+        assert!(
+            store.get_highest_indexed_seq(&tantivy_index).is_err(),
+            "a checkpoint the index cannot prove must fail the scan, not seed a replay window \
+             from an untrusted number"
+        );
     }
 
     /// A value that is not a facet path is refused, not handed to a constructor that panics.
