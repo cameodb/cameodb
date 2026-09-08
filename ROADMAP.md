@@ -2171,7 +2171,12 @@ every later one panic. Make the nine match the rest.
 
 ### L4 — The `unsafe impl Send/Sync` on `HybridStore` is redundant-or-unsound
 
-**Defect.** 📋 **Planned.** `storage/lib.rs` ~7906–7908 hand-implements `Send`/`Sync` with a
+**Defect.** ✅ **Done** 2026-09-08. The two `unsafe impl` lines were deleted, and the compiler
+proves `Send + Sync` for `HybridStore` on its own — `cargo check --workspace --all-targets`,
+full `cargo test -p storage` and `cargo test -p server` all green, so the impls were dead weight
+and not load-bearing for any thread-safety claim.
+
+**Original entry.** `storage/lib.rs` ~7906–7908 hand-implements `Send`/`Sync` with a
 comment claiming every component is already `Send + Sync`. If the comment is true the impls are
 dead weight and the compiler will prove it when they are deleted; if it is false the impls are
 unsound. Either way, remove them.

@@ -7928,10 +7928,6 @@ impl HybridStore {
     }
 }
 
-// Safe because all components are Send+Sync
-unsafe impl Send for HybridStore {}
-unsafe impl Sync for HybridStore {}
-
 #[cfg(test)]
 mod index_dir_tests {
     use super::{StoreError, resolve_index_dir};
