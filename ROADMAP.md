@@ -8,7 +8,10 @@ several entries exist precisely to say *do not build this again*.
 **Last reconciled against the code: 2026-09-01, at 0.3.3.** The 2026-08-26 pass is recorded
 under [Reconciliation](#reconciliation-2026-08-26); the 2026-09-01 review is filed in place —
 C3–C6, CH8–CH12 and OB3–OB9 — and a re-read on the same day is recorded under
-[Reconciliation](#reconciliation-2026-09-01).
+[Reconciliation](#reconciliation-2026-09-01). The 2026-09-08 review of the 0.3.3 and 0.3.4
+changesets is filed as its own activity group under
+[L. Post-0.3.4 review](#l-post-034-review--preparing-the-next-cycle--planned), held until the
+release has settled.
 
 ## How to read this file
 
@@ -48,6 +51,7 @@ on one.
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH8 and CH9 done, CH12 partial, CH10–CH11 are write-path duplication |
+| L — Post-0.3.4 review: the refactor cycle | 📋 Planned | Twenty items in five groups — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
 
@@ -168,6 +172,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
+| [L1](#l1--size-cache-invalidation-by-substring-evicts-neighbouring-indexes) … [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | Post-0.3.4 review group — defects first, then the mechanical splits, then the structural corrections; sequenced inside [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | — | 2026-09-08 | 📋 |
 
 ---
 
@@ -2075,6 +2080,309 @@ they ignore the query and they ignore deleted documents, whose rows are removed 
 and from the index at the next commit. They answer "what did this column ever hold", not "what does
 this query match" — a different question, and one that gets more wrong the longer an index has been
 written to.
+
+---
+
+## L. Post-0.3.4 review — preparing the next cycle 📋 Planned
+
+Reviewed 2026-09-08 against the 0.3.4 cut: the 37 commits since v0.3.3 (~6,980 insertions, of
+which ~3,430 are non-test) read end to end, plus a workspace-wide posture audit. The verdict on
+the release is that it stands — the panic containment is layered and each layer is tested,
+including against the built binary; the correctness fixes (checkpoint ordering, the schema
+tombstone, the parser whitespace fold, the bounded SSE channel) are root-cause fixes rather than
+symptom patches. Nothing below is a defect in what 0.3.4 changed.
+
+What the review found instead is what surrounds the changes: four small defects adjacent to
+them, the remainder of the security surface the hardening did not reach, and a structural fact
+that has been true for three releases and gets more expensive each one — every 0.3.3 and 0.3.4
+fix had to be made inside one of five files, four of which are above 2,800 lines.
+
+**The splitting rule for L11–L13, agreed 2026-09-08:** few files, grouped by feature and
+architectural meaning — related changes should land in one file, occasionally split across two
+or three. No per-function-family fragmentation: a module split that leaves you hunting twenty
+files for one call chain has traded one readability problem for another. Where a file legitimately
+stays large (the orchestrator's dispatch core), that size is a statement about what the code is,
+and is kept together deliberately.
+
+**Why this is one group and not scattered across C, G and H.** The items come from one review,
+answer one question — *what does the next development cycle inherit* — and are sequenced
+together ([L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle)). They are held
+here, untouched, until 0.3.4 has settled and been delivered. What happens then is also part of
+the group: a retrospective over the 0.3.3/0.3.4 stability-and-security cycle, whose output is
+the goal set for the cycle after it — which of these items becomes the next phase, in which
+order, and which are deliberately not taken up.
+
+Fidelity note: the line numbers were read on 2026-09-08 and will drift; the named functions and
+the shapes are the durable part.
+
+### L1 — Size-cache invalidation by substring evicts neighbouring indexes
+
+**Defect.** ✅ **Done** 2026-09-08. Cache re-keyed from the formatted
+`{shard}:{fast|full}:{index}` string to a `(include_data_size, index)` tuple, with one
+`invalidate_size_cache` helper removing both flavours exactly at the two (identical) old
+`retain` sites — the helper also absorbed two of L3's nine poison-unwraps. Covered by the
+regression test `invalidating_one_indexs_cached_sizes_leaves_its_neighbours_alone` in storage,
+and `cargo check --workspace` green.
+
+**Original entry.** `index_size_cache` was keyed by the formatted string
+`{shard}:{fast|full}:{index}`, and both invalidation sites (`storage/src/lib.rs` ~5402 and
+~7138) evict with `key.contains(&format!(":{}", index))`. Committing or deleting index `a`
+therefore also evicts the cached sizes of `ab`, `aa`, `ba` and anything else containing the
+substring — silent cross-index eviction, invisible to every test because a cache that misses too
+often still answers correctly. Key the cache by a `(mode, index)` tuple instead of a formatted
+string; the lock-poison unwraps on the same lines belong to L3.
+
+### L2 — `get_highest_indexed_seq` returns a value its own comment calls wrong
+
+**Defect.** 📋 **Planned.** The unreadable-checkpoint branch in `storage/src/lib.rs` (~3805–3813)
+logs an error and returns an `Ok` carrying what the comment itself calls a *wrong* value
+(`u64::MAX - inverted_sort_key`-style reconstruction). Every caller treats the answer as truth —
+the right shape for "this should never happen" is `Err`, so the path cannot silently seed a
+replay window from a number nobody can trust.
+
+### L3 — Poison panics, nine sites, inconsistent with the unwind posture
+
+**Defect.** 📋 **Planned.** The release chose `panic = "unwind"` so a contained panic costs one
+request — but nine `.lock().unwrap()` sites panic again on a poisoned mutex: five on
+`index_size_cache` (`storage/lib.rs` ~3705, 5402, 7137, 7708, 7788), three on
+`writer_monitor_handle` (`node_orchestrator.rs` ~4900, 5035, 5049) and one on
+`runtime_join_handle` (`swarm/mod.rs` ~133). Everywhere else the codebase recovers with
+`into_inner()` (`audit.rs`, `session.rs`). One poisoned stats or shutdown call currently makes
+every later one panic. Make the nine match the rest.
+
+### L4 — The `unsafe impl Send/Sync` on `HybridStore` is redundant-or-unsound
+
+**Defect.** 📋 **Planned.** `storage/lib.rs` ~7906–7908 hand-implements `Send`/`Sync` with a
+comment claiming every component is already `Send + Sync`. If the comment is true the impls are
+dead weight and the compiler will prove it when they are deleted; if it is false the impls are
+unsound. Either way, remove them.
+
+### L5 — Legacy-SSE work outlives its request and bypasses the guards
+
+**Security, medium.** 📋 **Planned.** Every `POST /mcp/messages` `tokio::spawn`s the full
+`handle_rpc_request` and answers 202 (`mcp/transport.rs` ~295–326). The concurrency semaphore
+(`routes.rs` ~100–119) releases its permit at the 202, the timeout never applies to the work,
+and the MCP rate limiter is inert by default — so one session can hold an unbounded number of
+concurrent searches and the per-session in-flight map grows with them. Bound per-session
+in-flight requests, and consider a small non-zero default for `tool_calls_per_minute`: the
+threat model in `ratelimit.rs` already names the runaway-agent-loop scenario this is open to.
+
+### L6 — A `GET /mcp` listening stream without a session is unbounded
+
+**Security, medium.** 📋 **Planned.** A `GET /mcp` with no `MCP-Session-Id` is answered with an
+infinite keep-alive stream (`mcp/transport.rs` ~481–516). It creates no session (so
+`max_sessions` never bounds it), holds no semaphore permit and no timeout (both end when the
+headers stream), and repeats per connection. Refuse pre-`initialize` listeners, or cap a global
+anonymous-listener count.
+
+### L7 — MCP tool errors leak what HTTP deliberately masks
+
+**Security, medium.** 📋 **Planned.** `rpc.rs` ~329–338 puts any tool error verbatim into the
+response text, and `server/mcp/search.rs` forwards `OrchestratorError::to_string()` — shard and
+storage diagnostics, forwarded peer fault text — while the HTTP layer masks exactly this class
+on 5xx ([C7](#c7--a-500-printed-the-nodes-internal-error-text) closed this on HTTP; MCP has no
+equivalent). Classify tool errors the same way: client-fault verdicts pass through, server
+faults become a generic string.
+
+### L8 — The streaming-ingest error vector grows one string per bad line
+
+**Security, medium.** 📋 **Planned.** `write_stream_handler` (`http_server/write.rs` ~259–341)
+pushes one formatted error per oversized or unparseable line into a `Vec<String>` unbounded
+within the request. The wire body limit (~128 MB) caps the input, not the amplification: 2-byte
+garbage lines become tens of millions of serde error strings, all held at once and then
+serialized whole into the response. Keep the first N reasons plus a count of the rest — the
+NDJSON error-reporting contract survives that. Sits beside [C5](#c5--a-decompression-cap-on-the-streaming-ingest-path),
+which bounds the same path's *input* amplification.
+
+### L9 — A `Writer` key can mint indexes
+
+**Security, medium.** 📋 **Planned.** A write to an unknown index triggers schema sampling and
+creates the index (`node_orchestrator.rs` ~7442–7514), requiring only `Capability::Write` — so a
+writer key (or anyone, in the default posture) can grow the node's disk with arbitrarily many
+indexes, which is the resource decision `IndexAdmin` exists to own. Either config-gate implicit
+creation or write down, in the capability reference, that minting indexes is an intended part of
+`Writer`.
+
+### L10 — The low findings, in one place
+
+**Security, low.** 📋 **Planned.** Six items, each a few lines to fix:
+
+- `mcp/transport.rs` ~85–87: `caller()` fails open to `McpUnrestricted` when the authz extension
+  is absent — unreachable today, wrong default at a trust boundary. Warn loudly or refuse.
+- `http_server/health.rs` ~76–82: an anonymous health check still pays a coordinator actor
+  round-trip while being deliberately semaphore-exempt — a health flood becomes mailbox
+  pressure. Anonymous callers need only the local liveness atomics.
+- `routes.rs` ~295–303: the fallback 404 echoes the raw URI, query string included, into a body
+  the trace layer logs in full — while the audit layer takes care to strip it. Echo the path
+  only.
+- Index-name validation is two-tier: strict on `PUT /api/{index}/_config`
+  (`catalogue.rs`), lax on write/search (`resolve_index_dir` blocks traversal, nothing
+  else). One shared validator on every path.
+- `serde-saphyr 0.0.28` is a very young parsing crate in the operator-config path; the
+  hickory-proto advisories ride a `review-by` of 2026-11-01. Both are fine *if* `cargo deny
+  check` runs in CI on every PR — confirm it does.
+- HTTP search routes have no rate limiter while the MCP surface does
+  ([C8](#c8--rest-has-no-rate-limit-and-anonymous-mcp-callers-share-one-bucket) is the same
+  item, recorded earlier). Reuse the token bucket keyed per key — off by default, as with MCP.
+
+### L11 — `node_orchestrator.rs` is 13,669 lines and holds four actors
+
+**Decomposition.** 📋 **Planned.** One module containing four actors, a worker pool, an engine,
+~60 free helpers, ~25 wire types and ~90 tests. [CH2](#ch2--the-merge-primitives-deserve-their-own-module)
+has tracked the growth since 0.3.1 (9,300 → 9,683 → 11,012 → 13,669).
+
+**Deliberately coarse: a handful of files grouped by architectural role, not one file per
+function family.** The point of the split is that a change to one actor, or to the read-side
+machinery, happens in one place — not that no file ever exceeds a line budget. Convert to a
+directory module — the crate already does this for `http_server/`, `swarm/`, `admin/` — with
+`mod.rs` re-exporting so every `use crate::node_orchestrator::…` site compiles untouched:
+
+```
+node_orchestrator/
+├── mod.rs           (~1,000) module doc (keep the thread-topology essay), shared consts,
+│                              every wire/message type, and the error types
+├── search.rs        (~1,700) the read-side machinery: merge primitives (this is what CH2
+│                              always wanted), validation, sort keys, reason accounting
+├── shard.rs         (~1,900) MicroshardActor, the writer thread and its monitor, warmup,
+│                              WriterLiveness and ReadPoolHealth
+├── router.rs        (~1,600) RouterActor, whole
+├── orchestrator.rs  (~5,200) NodeOrchestrator, the engine and the worker pool — the dispatch
+│                              core, and deliberately still the big file
+└── tests.rs         (~2,300) the unit tests, moved out as one
+```
+
+`orchestrator.rs` staying large is the design, not a failure: it is the one place "how a client
+operation flows" is read, and grouping beats fragmenting it across per-file quotas. If it keeps
+growing *after* the L15/L16 dedup shrinks it, the engine and the worker pool are the natural
+next extraction — not a first move. Longest functions to break while there: `handle_broadcast`
+(568 lines), `spawn_writer_thread` (350), `orch_bulk_write` (318). Move only, first — the dedup
+passes are L15 and L16.
+
+### L12 — `storage/src/lib.rs` is 9,961 lines, of which one impl block is 4,460
+
+**Decomposition.** 📋 **Planned.** Same coarse rule as L11: five files grouped by what the code
+*is*, so a write-path change happens in `store.rs`, a query-syntax change in `query.rs`, a field
+or document shape change in `schema.rs`. The pure sections (query normalization, schema model,
+document building) lift out first, verbatim and at zero risk; the `impl HybridStore` block then
+splits along the two boundaries it already draws — writes and reads:
+
+```
+storage/src/
+├── lib.rs      (~700)   docs, re-exports, StorageConfig, StoreError, stats types
+├── query.rs    (~1,700) the pure query machinery: whitespace/date/prefix/shadow passes,
+│                        field-reference scanning, parser preparation, discarded-clause reports
+├── schema.rs   (~2,300) the data model: FieldDef, IndexSchema, SchemaState, date typing,
+│                        document building, WAL/StoredDoc types, tokenizers
+├── store.rs    (~2,900) HybridStore + the write path and everything that guards it: lifecycle,
+│                        get_or_create_index, apply_write/apply_batch, commit and checkpoint,
+│                        recovery and warmup
+├── search.rs   (~1,200) reader pool, search_documents, validate_query, stats gathering
+└── (tests move to tests/ alongside, or stay with the file they test)
+```
+
+Keep `lib.rs` re-exports so the ~12 consuming files and every integration test compile
+unchanged. Longest functions: `search_documents` (560 lines), `apply_batch` (376),
+`get_or_create_index` (278) — breaking those is part of the move, not a follow-up.
+
+### L13 — `cli.rs`, `config.rs` and `cluster_coordinator.rs` (5,387 / 2,955 / 2,840 lines)
+
+**Decomposition.** 📋 **Planned.** Three files, one item, same coarse rule — a few files each,
+grouped by feature, tests moved out first (config.rs carries 909 lines of tests, cli.rs 374 —
+the largest single-file reductions at near-zero risk).
+
+- `cli.rs` → four files. `mod.rs`: the clap definitions, top-level dispatch, the list/output
+  helpers (~1,200). `ingest.rs`: the whole ingest pipeline — source and compression detection,
+  the JSON stream parsers, schema detection, the loaders (~2,600, shrinking toward ~2,400 when
+  L18 folds its duplicates). `shell.rs`: the interactive session, completer and help (~1,900).
+  `tests.rs`. The interactive help text is a hand-written restatement of the clap grammar and
+  will drift forever — generate one from the other while the file is open.
+- `config.rs` → keep the config model in one file; move only the CLI-override machinery and the
+  ~50 one-line `default_*` functions: `config.rs` (~2,000, incl. loading and validation),
+  `overrides.rs` (~700, incl. `cli_help` and the defaults table), tests out. Note the stale
+  module-doc TOML example (lines 9–23) that matches no current struct, and the
+  `impl StorageConfig` that precedes its struct — both fixed in passing.
+- `cluster_coordinator.rs` → `coordinator.rs` (the actor and every handler, ~2,300),
+  `messages.rs` (~250 — the 26 message types are already a contiguous block at the top), tests
+  out. If a second cut is ever wanted, the swarm-event forwarder inside `InitSwarm` is the piece
+  to lift — not half the handlers.
+
+### L14 — `OrchestratorError::Io` is the wire's catch-all, and semantics round-trip through strings
+
+**Simplification.** 📋 **Planned.** 93 sites construct `OrchestratorError::Io(io::Error::…)` for
+conditions that are not IO ("No shards", "Missing routing key", validation failures), and the
+two `From` impls on `RemoteError` then re-derive the lost semantics by matching `ErrorKind` one
+way and flattening four kinds into `Io` the other. Dedicated variants (`NotFound`,
+`InvalidInput`, `Validation`) delete most of both impls and dozens of constructions. The largest
+risk item in the group — take it after the split (L11) and only with the per-module tests
+running.
+
+### L15 — The schema-cache machinery exists three times
+
+**Simplification.** 📋 **Planned.** `get/put_cached_schema` are byte-identical in
+`OrchestratorEngine` and `NodeOrchestrator`; "load schema from the first shard's store" appears
+three times with the same double `map_err`; `route_write` twice; the load-from-cache-or-shard
+preamble opens every write handler. One `SchemaCache` newtype plus one `schema_for(index)`
+helper removes all of it — and gives the version-ordering rule added in 0.3.4 a single home.
+
+### L16 — `handle_broadcast` and `handle_broadcast_streaming` are one fan-out written twice
+
+**Simplification.** 📋 **Planned.** 568 and 313 lines sharing preamble (peer ask, counters,
+window widening) and postamble (merge, discard and approximate-sort bookkeeping); the file's own
+comment says the two "answered this differently", and [CH1](#ch1--one-scatter-gather-written-twice)
+records what written-twice costs. Extract the shared phases; the local future and the merge
+strategy are all that genuinely differ. Do beside CH1, not separately.
+
+### L17 — Dead code and stale suppressions
+
+**Simplification.** 📋 **Planned.** A sweep, each item small: `StreamingSearchResult::Local.
+{shard_id, took_ms}` (constructed, never read, `shard_id` always `Uuid::nil()`); blanket
+`#[cfg_attr(not(test), allow(dead_code))]` on live public types, which masks real signal;
+`OrchestratorEngine`'s bulk-write fields held under `#[allow(dead_code)]` for a move that never
+happened — finish the move or drop the fields; the dead `_extension` parameter in cli's
+`detect_source_format_from_hint`; the dead `_inactive_nodes` computation in the coordinator;
+per-request `info!` with a per-peer loop on the broadcast hot path should be `debug!`.
+
+### L18 — `cli.rs` says the same thing three ways
+
+**Simplification.** 📋 **Planned.** The two JSON single-pass loaders (HTTP and reader variants)
+run one ingest protocol written out twice; id-field detection exists in three flavours
+re-implementing one priority ranking; the CSV schema finalization block at ~2298–2319 is copied
+verbatim at ~4257–4278 behind a comment that says "CRITICAL: apply the same logic" — the
+comment is the bug report. One pipeline struct with a pluggable source, one ranking function,
+one finalizer.
+
+### L19 — `config.rs` validates by repetition
+
+**Simplification.** 📋 **Planned.** `CameoDbConfig::validate` is ~296 lines of one repeated
+shape (split per section, or drive the zero-checks from a table); `adopt_moved_settings` writes
+the same take/adopt/warn protocol four times (and goes away at 0.4.0 regardless); the ~50
+one-line `default_*` functions (~185 lines) collapse into a macro or consistent derive; and
+`merge_configs` ignores its `base` argument entirely — implement per-key merging or delete the
+abstraction, because the current layering story is false.
+
+### L20 — The retrospective, and the sequence into the next cycle
+
+📋 **Planned, and the gate on everything above.** Once 0.3.4 is delivered and settled, run the
+retrospective over the 0.3.3/0.3.4 cycle — what the stability-and-security posture bought, what
+it cost in review surface (every fix inside one of five files), and what the fault-injection
+feature should become (kept test-only, promoted, or removed — a decision, not a default). Its
+output is this group's sequencing and the next cycle's goals:
+
+1. **L1–L4 now**, small and independent — they are defects on today's code.
+2. **L8 and the L10 bundle next**, same shape: small, bounded, security-adjacent.
+3. **The moves in L11–L13** (tests and standalone types first, then the coarse feature groups
+   each item names) *before* the next feature phase starts, so the next review does not read a
+   13k-line diff context again.
+4. **L14–L19 after the splits**, each with the per-module tests that the split creates.
+5. **L5, L6, L7, L9 are posture changes, not fixes** — each needs an explicit decision in the
+   retrospective (bound, gate, classify, document) before it is coded.
+
+Measures of success for the group: the five tracked files each become a small set of
+feature-grouped files (four to six production files apiece, not fifteen); a change of one
+architectural concern touches one file; CH2's two tracked sizes stop growing between releases;
+and the 0.4.0 cleanup list
+(`adopt_moved_settings`, the `max_response_bytes` migration, `RouteShard`'s stub, the
+coordinator's shard-query TODO at ~1794) is either done or re-dated.
 
 ---
 

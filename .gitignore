@@ -56,6 +56,11 @@ tramp
 # Devin IDE
 .devinrules
 
+# Devin session logs. Same scratchpad reasoning as .claude/plans/ above: scoped on
+# purpose, because .devin/skills/ and .devin/workflows/ are committed and shared —
+# ignoring .devin/ wholesale would silently drop anything new added under them.
+/.devin/session-*.md
+
 # Claude Code working notes. Plans are a scratchpad for whoever is holding the problem —
 # useful on the machine that wrote them, stale anywhere else — so they stay out of the repo
 # for every contributor, not just the one who made the directory.
