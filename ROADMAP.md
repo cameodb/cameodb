@@ -2134,8 +2134,16 @@ string; the lock-poison unwraps on the same lines belong to L3.
 
 ### L2 — `get_highest_indexed_seq` returns a value its own comment calls wrong
 
-**Defect.** 📋 **Planned.** The unreadable-checkpoint branch in `storage/src/lib.rs` (~3805–3813)
-logs an error and returns an `Ok` carrying what the comment itself calls a *wrong* value
+**Defect.** ✅ **Done** 2026-09-08. The unreadable-checkpoint branch now returns a new
+`StoreError::CorruptIndex` (the scan orders on the `_seq` fast field but the top document carries
+no stored `_seq` value to trust), which `checkpoint_seq` propagates and `recover_index` turns
+into a failed index open — the posture its own comment already stated. Covered by the regression
+test `a_checkpoint_scan_it_cannot_read_fails_instead_of_lying` in storage (a fast-but-not-stored
+`_seq` drives exactly that branch: the sort key exists, the stored read finds nothing), full
+`cargo test -p storage` and `cargo check --workspace --all-targets` green.
+
+**Original entry.** The unreadable-checkpoint branch in `storage/src/lib.rs` (~3805–3813)
+logged an error and returned an `Ok` carrying what the comment itself called a *wrong* value
 (`u64::MAX - inverted_sort_key`-style reconstruction). Every caller treats the answer as truth —
 the right shape for "this should never happen" is `Err`, so the path cannot silently seed a
 replay window from a number nobody can trust.
