@@ -2,7 +2,12 @@
 name = "server"
 version = "0.3.4"
 edition = "2024"
-license = "Apache-2.0"
+# FSL-1.1-ALv2 (the SPDX id for FSL-1.1-Apache-2.0): the protected product surface — see
+# the root LICENSE. Converts to Apache-2.0 two years after each release.
+license = "FSL-1.1-ALv2"
+# Never uploaded to a registry: this is the product binary, and an accidental
+# `cargo publish --workspace` would put the FSL-licensed source on crates.io irrevocably.
+publish = false
 description = "A high-performance distributed hybrid-search database"
 
 [[bin]]

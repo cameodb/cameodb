@@ -3,6 +3,11 @@ name = "client"
 version = "0.3.4"
 edition = "2024"
 license = "MIT"
+# Not published: the SDK is consumed by the `cameodb` binary (in crates/server) via a path
+# dependency, and the path dep on `storage` would block a crates.io upload anyway. The MIT
+# license stays — this is a declaration of intent to keep it out of the registry, not a
+# license change.
+publish = false
 
 [dependencies]
 anyhow.workspace = true

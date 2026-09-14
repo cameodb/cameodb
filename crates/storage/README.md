@@ -78,12 +78,14 @@ All write operations follow a strict sequence to ensure atomicity across both st
    ├─ Optional fsync() based on wal_sync config
    └─ Durability checkpoint
 
-7. Increment Operations & Signal Supervisor
+7. Increment Operations
    ├─ increment_operations(index) - Track operation count
-   ├─ Signal supervisor task to reset 5-second timer
    └─ Tantivy commit deferred via Supervised Smart Commits:
-      ├─ Smart Commit: When operation count reaches adaptive threshold (500-8000 ops)
-      └─ Supervised Commit: After 5 seconds of write inactivity (durability guarantee)
+      ├─ Smart Commit: when the operation count reaches the adaptive threshold
+      │   (1×–20× default_batch_size, scaled by the index's memory budget; ×1.5 more
+      │   during a sustained bulk burst)
+      └─ Supervised Commit: after supervisor_timeout_secs of write inactivity
+          (5 s by default), enforced by the idle-commit supervisor in the server crate
 ```
 
 ### Storage Optimization: Index-Only Tantivy Strategy
@@ -568,13 +570,16 @@ The system combines two complementary commit mechanisms:
 - **Trigger**: Operation count threshold reached (adaptive based on memory budget)
 - **Behavior**: Immediate Tantivy commit during write operations
 - **Purpose**: Memory management and performance optimization
-- **Adaptive Threshold**: 500-8000 operations based on index memory budget (32MB-512MB)
+- **Adaptive Threshold**: 1×–20× `default_batch_size`, scaling with the index's memory
+  budget — with the default batch size of 1000 that is 1000 operations at the minimum
+  budget up to 20000 at the maximum. A sustained burst past 5× `default_batch_size`
+  stretches the threshold by a further ×1.5.
 
 #### 2. Supervised Eventual Commits (Durability Guarantee)
-- **Trigger**: 5 seconds of inactivity after last write
-- **Behavior**: Background commit via async supervisor tasks
+- **Trigger**: `supervisor_timeout_secs` of inactivity after the last write
+  (`[search] supervisor_timeout_secs`, 5 s by default)
+- **Behavior**: The per-shard writer thread in the server crate commits the idle index
 - **Purpose**: Data durability guarantee for low-volume write patterns
-- **Self-cleanup**: Supervisors automatically remove themselves after successful commits
 
 ### Implementation Details
 
@@ -582,43 +587,29 @@ The system combines two complementary commit mechanisms:
 ```rust
 // Adaptive threshold calculation:
 let budget_ratio = (budget - min_budget) as f64 / (max_budget - min_budget) as f64;
-let base_ops = (default_batch_size * (0.5 + budget_ratio * 7.5)) as u64;
-// Result: 500 ops (32MB) -> 8000 ops (512MB)
+let base_ops = (default_batch_size * (1.0 + budget_ratio * 19.0)) as u64;
+// Result with default_batch_size = 1000: 1000 ops (min budget) -> 20000 ops (max budget)
+// A burst already 5x default_batch_size deep stretches the threshold by x1.5.
 ```
 
-#### Supervisor Mechanism
-```rust
-// Per-index async supervisor:
-tokio::spawn(async move {
-    loop {
-        tokio::select! {
-            Some(()) = rx.recv() => continue;  // Write activity - reset timer
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                // Timeout - eventual commit
-                store_inner.commit_index(&index_inner);
-                break; // Self-cleanup
-            }
-        }
-    }
-});
-```
+The idle-timeout half lives in the server crate rather than here: each shard's dedicated
+writer thread (`crates/server/src/node_orchestrator.rs`) watches its own command channel and
+commits an index that has seen no writes for `supervisor_timeout_secs`.
 
 ### Behavior Scenarios
 
 #### High-Volume Workloads
 ```
-Write 1 → Signal supervisor (timer: 5s)
-Write 2 → Signal supervisor (timer: 5s)
-... (smart commit triggers at default_batch_size ops)
-Commit → Supervisor self-cleanup
+Write 1 → operation counter incremented
+Write 2 → operation counter incremented
+... (smart commit fires once the adaptive threshold — 1×–20× default_batch_size — is crossed)
 ```
 
 #### Low-Volume Workloads
 ```
-Write 1 → Signal supervisor (timer: 5s)
+Write 1
 ... (no more writes)
-5s pass → Timeout → Eventual commit
-Commit → Supervisor self-cleanup
+supervisor_timeout_secs pass → the shard writer's idle timeout fires → commit
 ```
 
 ### Benefits
@@ -630,25 +621,29 @@ Commit → Supervisor self-cleanup
 - **Multi-Tenant**: Per-index supervision and commit strategies
 
 #### Durability Guarantees
-- **Maximum 5-second window**: Data loss window bounded by supervisor timeout
-- **Large Batches (≥ default_batch_size)**: **Immediate commit** regardless of threshold
+- **Bounded invisibility window**: an uncommitted write becomes searchable at the latest
+  `supervisor_timeout_secs` (5 s by default) after it landed
+- **Large batches commit promptly**: a batch counts its full size against the threshold, so
+  one large enough batch crosses it and commits as soon as it returns
 - **Consistency**: All writes eventually become searchable
-- **Crash Safety**: Supervisor state is lightweight, easily recreated
+- **Crash Safety**: uncommitted writes are replayed from the WAL on startup
 
 #### Operational Simplicity
 - **Zero Configuration**: Works out of the box with sensible defaults
-- **Self-Healing**: Automatic retry and cleanup mechanisms
-- **Resource Efficient**: Supervisors only exist for active indices
-- **Async/Sync Safe**: Proper isolation between async supervision and sync storage operations
+- **Resource Efficient**: idle supervision carries no background task per index — the shard's
+  own writer thread notices the lull
+- **Async/Sync Safe**: Proper isolation between async actors and sync storage operations
 
 ### Configuration
 
 ```toml
 [search]
 indexer_memory_min_mb = 64      # Minimum memory budget
-indexer_memory_max_mb = 512     # Maximum memory budget  
+indexer_memory_max_mb = 512     # Maximum memory budget
+supervisor_timeout_secs = 5     # Idle timeout before the supervised commit fires
+
+[storage]
 default_batch_size = 1000       # Base smart commit threshold
-# Supervisor timeout is fixed at 5 seconds (configurable in future versions)
 ```
 
 ### Environment Variables
@@ -669,48 +664,39 @@ This supervised strategy ensures optimal performance across all write patterns w
 
 ## Tiered Cache Sizing for redb
 
-CameoDB implements intelligent cache sizing for the redb storage engine that optimizes both startup recovery time and steady-state memory usage.
-
-### Two-Phase Initialization
-
-For existing databases, redb is initialized in two phases:
-
-1. **Phase 1 - Init Boost**: Opens with a larger cache size calculated from database file size
-   - Enables faster WAL recovery and index metadata loading
-   - Cache size determined by database tier (see table below)
-
-2. **Phase 2 - Normal Operation**: Reopens with optimized standard cache
-   - Drops init cache to release memory for steady-state operations
-   - Balances performance with multi-shard deployments
+CameoDB implements intelligent cache sizing for the redb storage engine that optimizes
+steady-state memory usage across many shards on one node. A single cache size is chosen at
+open time; the earlier two-phase "init boost" scheme was removed once recovery switched to
+the persisted committed sequence, which needs no large startup cache.
 
 ### Database Size Tiers
 
-| Database Size | Tier  | Standard Cache | Init Boost Cache    | Multiplier |
-|---------------|-------|----------------|---------------------|------------|
-| < 1MB         | New   | 32MB           | 32MB                | 1×         |
-| < 100MB       | Small | 64MB           | 128MB               | 2×         |
-| 100MB - 1GB   | Medium| 128MB          | 512MB               | 4×         |
-| > 1GB         | Large | 256MB          | per_shard_available | 8×         |
+| Database Size | Standard Cache |
+|---------------|----------------|
+| < 1MB         | 32MB           |
+| < 100MB       | 64MB           |
+| 100MB - 1GB   | 128MB          |
+| > 1GB         | 256MB          |
 
 ### Per-Shard Memory Budgeting
 
 When multiple shards run on a single node, memory is automatically divided to prevent overallocation:
 
 - **Configured Limit**: Uses `total_memory_limit_bytes` when configured (> 0), otherwise falls back to system memory stats
-- **Available Memory Pool**: 25% of the configured/ detected available memory
-- **Per-Shard Budget**: Divided equally among all active shards
-- **Safety Caps**: Standard cache capped at 12.5% available, init boost capped at `per_shard_available` (prevents OOM with many large shards)
+- **Available Memory Pool**: 25% of the configured/detected available memory
+- **Per-Shard Budget**: Divided equally among all shards
+- **Safety Caps**: the tier figure is capped at the per-shard share of both the available
+  pool (25% of available memory) and the total pool (50% of total memory), with a 32MB floor
+  per shard (prevents OOM with many large shards)
 - **Cross-Platform**: Uses system memory detection with macOS fallback (25% of total if unavailable)
 
 ### Example Log Output
 
 ```
-HybridStore: calculated tiered cache sizes (per-shard) \
+HybridStore: calculated cache size (per-shard) \
   file_size_mb=2078 available_memory_mb=4096 total_memory_mb=16384 \
-  max_shards=4 per_shard_available_mb=256 \
-  standard_cache_mb=256 init_cache_mb=512
-HybridStore: Phase 1/2 - Opening with init boost cache
-HybridStore: Phase 2/2 - Reopening with normal cache elapsed_ms=16
+  max_shards=4 per_shard_available_mb=256 standard_cache_mb=256
+HybridStore: Opening existing database normal_cache_mb=256
 ```
 
 ## Performance Characteristics
@@ -1031,17 +1017,20 @@ CameoDB supports a rich set of field types for indexing and storage. These types
 | Type | Description | Tantivy Mapping |
 |------|-------------|-----------------|
 | **`text`** | Standard full-text search field. Tokenized and indexed. | `TEXT` |
-| **`exact`** / **`string`** | Exact match field. Not tokenized; punctuation preserved. Case-sensitive. | `STRING` |
-| **`boolean`** | Boolean value. Stored as true/false. | `bool` |
-| **`i64`** | 64-bit signed integer. Supports range queries and sorting. | `i64` (FAST) |
-| **`u64`** | 64-bit unsigned integer. Supports range queries and sorting. | `u64` (FAST) |
-| **`f64`** / **`number`** | 64-bit floating point. Supports range queries and sorting. | `f64` (FAST) |
-| **`date`** | DateTime field. Supports RFC3339, naive datetime, date-only, year-month, and year-only formats. | `date` (FAST) |
-| **`bytes`** | Binary data field. Stored as byte arrays. | `bytes` |
+| **`string`** | Exact match field. Not tokenized; punctuation preserved. Case-sensitive. | `STRING` |
+| **`boolean`** | Boolean value. Stored as true/false. Alias: `bool`. | `bool` |
+| **`i64`** | 64-bit signed integer. Supports range queries and sorting. Aliases: `integer`, `int`, `number`, `signed`. | `i64` (FAST) |
+| **`u64`** | 64-bit unsigned integer. Supports range queries and sorting. Aliases: `unsigned`, `uint`. | `u64` (FAST) |
+| **`f64`** | 64-bit floating point. Supports range queries and sorting. Aliases: `float`, `double`, `decimal`. | `f64` (FAST) |
+| **`date`** | DateTime field. Supports RFC3339, naive datetime, date-only, year-month, and year-only formats. Aliases: `datetime`, `timestamp`. | `date` (FAST) |
+| **`bytes`** | Binary data field. Stored as byte arrays. Aliases: `binary`, `blob`. | `bytes` |
 | **`ip`** | IP address field (IPv4/IPv6). IPv4 addresses are mapped to IPv6. | `ip` (IPv6) |
-| **`json`** | Nested JSON object field. Stored as serialized JSON string. | `TEXT` (JSON string) |
-| **`facet`** | Categorical/hierarchical facet field for faceted search. | `facet` |
-| **`array`** | Multi-valued text field. Each element is tokenized. | `TEXT` (multi-valued) |
+| **`json`** | Nested JSON object field. Searchable as unstructured text. Aliases: `object`, `document`. | JsonObject |
+| **`facet`** | Categorical/hierarchical facet field for faceted search. Aliases: `category`, `tag`. | `facet` |
+
+There is no separate `array` field type: every Tantivy field is multivalued, so a JSON array
+takes the type its elements infer to (`{"risk_score": [9, 12]}` is an `i64` field holding two
+values, `{"tags": ["a", "b"]}` a `text` field holding two terms).
 
 > **Note:** The `id` field is always indexed as an untokenized `STRING` (exact match) and stored for document retrieval.
 

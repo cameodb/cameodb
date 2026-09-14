@@ -254,14 +254,20 @@ This implements a distributed search/read path suitable for fan-out queries acro
 
 ### Graceful Shutdown
 
-CameoDB implements a 4-phase graceful shutdown process with configurable timeouts:
+CameoDB implements a 5-phase graceful shutdown process, with an emergency timeout of 120s
+that forces process exit if the whole sequence overruns:
 
 | Phase | Operation | Timeout | Critical |
 |-------|-----------|---------|----------|
 | 1 | Close MCP sessions | 5s | No |
 | 2 | Drain HTTP connections | 10s | No |
 | 3 | Shutdown all shards | 60s | **Yes** |
-| 4 | Shutdown coordinator | 10s | No |
+| 4 | Shutdown the read thread pool | 10s | No |
+| 5 | Shutdown coordinator | 10s | No |
+
+Phase 4 runs after the shards because their shutdown is what the last reads execute against.
+The audit sink is flushed last of all, after every other subsystem, so its final rollups land
+in the trail rather than being lost with the process.
 
 **Phase 3 (Shard Shutdown) includes:**
 - Commit any pending Tantivy writes with data durability
@@ -470,11 +476,11 @@ Planned future work includes:
 
 ---
 
-## 8. Distributed Flows (Sequence Diagrams)
+## 9. Distributed Flows (Sequence Diagrams)
 
 This section illustrates the main distributed workflows implemented by the `server` crate.
 
-### 8.1 Local Read/Write
+### 9.1 Local Read/Write
 
 ```mermaid
 sequenceDiagram
@@ -500,7 +506,7 @@ sequenceDiagram
     HTTP-->>Client: HTTP response
 ```
 
-### 8.2 Remote Read/Write
+### 9.2 Remote Read/Write
 
 ```mermaid
 sequenceDiagram
@@ -530,7 +536,7 @@ sequenceDiagram
     HTTP-->>Client: HTTP response
 ```
 
-### 8.3 Broadcast Search (Scatter–Gather)
+### 9.3 Broadcast Search (Scatter–Gather)
 
 ```mermaid
 sequenceDiagram
@@ -682,13 +688,14 @@ cameodb client --interactive --connect https://localhost:9480
 cameodb client --interactive --connect https://localhost:9480 --insecure
 ```
 
-**Per-command `--insecure` for remote sources:**
+**`--insecure-source` for remote data sources** (deliberately separate from `--insecure`,
+which concerns the connection to the CameoDB server):
 ```bash
-# Load schema from external HTTPS URL with self-signed cert
-cameodb client schema detect https://external.com/schema.csv --insecure
+# Load schema from an external HTTPS URL whose certificate does not validate
+cameodb client schema detect https://external.com/schema.csv --insecure-source
 
-# Load data from external HTTPS URL with self-signed cert
-cameodb client data load myindex https://external.com/data.csv --insecure
+# Same for a data load
+cameodb client data load myindex https://external.com/data.csv --insecure-source
 ```
 
 ### TLS Configuration Options

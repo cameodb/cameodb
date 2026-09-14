@@ -1,8 +1,9 @@
 # Distributed Hybrid-Search Database: Architecture Design Document
 
-**Version:** 0.3.0
+**Version:** 0.3.4
 **Stack:** Rust, Kameo (Actors), Tokio, Redb, Tantivy, Axum, Libp2p
-**Crates:** `server`, `storage`, `cluster`, `client`, `mcp`
+**Crates:** `server`, `storage`, `cluster`, `client`, `mcp` (+ `bench`, a latency harness that
+doubles as a worked SDK example; not shipped)
 
 ---
 
@@ -157,7 +158,12 @@ let json_doc: JsonValue = serde_json::from_str(&json_string)?;
 
 ## 5. Replication & Consistency
 
-We utilize a **Unified Replication Model**. There is no distinct "Migration" code; migration is simply replication followed by a role switch.
+> **Planned — not yet implemented.** Cluster nodes today each own their shards outright; there
+> is no follower replication, `Promote`, or `Forwarding` role in the code. This section is the
+> intended design, kept here because surrounding routing and WAL choices were made with it in
+> mind.
+
+The design is a **Unified Replication Model**. There is no distinct "Migration" code; migration is simply replication followed by a role switch.
 
 ### 5.1. The Protocol
 1.  **Handshake:** Follower sends `CurrentSeqID`.
@@ -199,7 +205,7 @@ The system exposes a RESTful API built on **Axum**. It rejects the complexity of
     "took_ms": 12
   }
   ```
-* **Query Capabilities:** Full Tantivy query language including Boolean operators (`AND`, `OR`, `-`), Phrase queries (`"foo bar"`), Range queries (`[10 TO 20]`), and Fuzzy matching (`word~1`).
+* **Query Capabilities:** The supported query syntax — Boolean operators (`AND`, `OR`, `NOT`, `+`/`-`), phrase queries with optional slop (`"foo bar"~2`), prefix queries (`field:pre*`), range queries (`[10 TO 20]`, `{10 TO 20}`), comparisons (`field:>=4`), and `IN` sets — is defined in one place (`crates/mcp/src/syntax.rs`) and rendered identically into the MCP tools' reference. Fuzzy matching is **not** supported: a trailing `~N` on a bare term is only phrase slop.
 
 ### 6.2. Ingestion Endpoint
 * **Method:** `PUT /api/{index}/document`
@@ -286,7 +292,7 @@ flowchart TB
     subgraph Application["Application Layer"]
         Server["CameoDB Node<br/>Actor System<br/>HTTP API<br/>Request Routing<br/>Orchestration"]
         Client["client crate<br/>SDK / Client Libraries"]
-        Mcp["mcp crate<br/>MCP Server<br/>AI Agent Tools<br/>SSE Transport"]
+        Mcp["mcp crate<br/>MCP Server<br/>AI Agent Tools<br/>Streamable HTTP + SSE Transport"]
     end
 
     subgraph Core["Core Infrastructure"]
@@ -306,7 +312,7 @@ flowchart TB
 - **`storage`:** Hybrid storage engine (redb + tantivy), WAL, search functionality, schema evolution
 - **`cluster`:** Consistent hashing (XXH3), node identity, topology management
 - **`client`:** SDK for application integration (HTTP client, CLI REPL)
-- **`mcp`:** Model Context Protocol server for AI agents (SSE transport, JSON-RPC, tool definitions)
+- **`mcp`:** Model Context Protocol server for AI agents (Streamable HTTP plus the legacy SSE transport, JSON-RPC, tool definitions)
 
 ## 9. Resilience & Recovery
 
@@ -354,12 +360,16 @@ Around that, at the cluster level:
 
 1.  **Orchestrator** starts; shards recover as above and become routable.
 2.  **Network Join:** Connects to DHT.
-3.  **Reconciliation:**
-    * Checks if it is still the owner of its shards in the Ring.
-    * If yes, opens gates for writes.
-    * If no (Cluster rebalanced while dead), enters `Forwarding` mode or deletes data (based on policy).
+3.  **Reconciliation:** the node loads its persisted topology snapshot as *expectations* and
+    converges on what peers actually report (matched / changed / added / missing are logged;
+    the remote report wins). What it does **not** do yet is re-own shards: the
+    ownership-check-and-`Forwarding` step listed in earlier drafts is part of the planned
+    follower design in §5, and no shard migration happens today.
 
 ### 9.2. Zero-Downtime Migration (Soft Handoff)
+
+> **Planned — not yet implemented**, like the follower protocol in §5 it depends on.
+
 1.  **Candidate** joins as Follower.
 2.  **Sync** completes.
 3.  **Orchestrator** issues `Promote`.

@@ -375,7 +375,7 @@ To override per-deployment, use `systemctl edit cameodb` rather than editing the
 sudo systemctl edit cameodb
 # Add:
 [Service]
-Environment=MALLOC_CONF=background_thread:true,percpu_arena:percpu,oversize_threshold:0,dirty_decay_ms:1000,muzzy_decay_ms=0
+Environment=MALLOC_CONF=background_thread:true,percpu_arena:percpu,oversize_threshold:0,dirty_decay_ms:1000,muzzy_decay_ms:0
 ```
 
 ### Admin Memory Operations

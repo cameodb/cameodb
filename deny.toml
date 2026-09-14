@@ -35,6 +35,10 @@ allow = [
     "BSL-1.0",
     "MPL-2.0",
     "EPL-2.0",
+    # Own product crate (crates/server): Functional Source License 1.1 with the Apache-2.0
+    # future grant. No dependency is under it — this entry covers the workspace member
+    # itself.
+    "FSL-1.1-ALv2",
     "bzip2-1.0.6",
     # Mozilla's CA certificate bundle, shipped by webpki-root-certs via
     # rustls-platform-verifier. CDLA-Permissive-2.0 is a permissive *data* licence with no
