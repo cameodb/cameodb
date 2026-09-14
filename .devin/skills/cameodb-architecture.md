@@ -4,13 +4,13 @@ This document outlines the highly specific architectural rules, dependencies, an
 
 ## 1. Core Dependencies & Versions
 *Do not hallucinate versions. Use these strictly:*
-- **Actor Framework**: `kameo` (0.19) with features ["remote", "macros"]
-- **Web Server**: `axum` (0.8.9), `axum-extra` (0.10.3)
+- **Actor Framework**: `kameo` (0.22) with features ["remote", "macros"]
+- **Web Server**: `axum` (0.8.9), `axum-server` (0.8, `tls-rustls-no-provider`) for TLS
 - **P2P Networking**: `libp2p` (0.56.0)
-- **KV Store**: `redb` (3.1.3)
+- **KV Store**: `redb` (4.1.0)
 - **Search**: `tantivy` (0.26.1) with features ["stemmer"]
 - **Async Runtime**: `tokio` (1.52.1) with features ["full"]
-- **HTTP Client**: `reqwest` (0.12.28)
+- **HTTP Client**: `reqwest` (0.13, `rustls-no-provider` — ring provider, no OpenSSL)
 - **Hashing**: `xxhash-rust` (0.8) with features ["xxh3"]
 - **Error Handling**: `thiserror` (2.0.18), `anyhow` (1.0.102)
 
@@ -63,4 +63,6 @@ When implementing an Actor using `kameo`, strictly follow this pattern:
 - **Routing**:
   - `routing_key` present -> Unicast (Hash Ring Lookup).
   - `routing_key` missing -> Scatter-Gather (Broadcast to all shards).
-- **Storage Boundary**: `redb` stores raw bytes (Bincode/JSON); `tantivy` stores indexed fields.
+- **Storage Boundary**: `redb` stores documents as serialized JSON (`{"json_blob": …}`);
+  `tantivy` stores indexed fields. Per-index tables `data_<index>` / `wal_<index>`, one
+  `store.redb` file per shard.

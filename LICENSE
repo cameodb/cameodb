@@ -15,8 +15,9 @@ and a protected FSL-covered product surface that eventually becomes Apache-2.0.
   - **Notes**: Maximizes compatibility (including GPL)
 
 - **Product / server application** (`crates/server`)
-  - **License**: FSL-1.1-Apache-2.0
-  - **Notes**: Functional Source License that converts to Apache-2.0 two years after release
+  - **License**: Functional Source License 1.1 with the Apache-2.0 future license —
+    SPDX id `FSL-1.1-ALv2`, also written `FSL-1.1-Apache-2.0`
+  - **Notes**: Converts to Apache-2.0 two years after release; the manifest uses the SPDX id
 
 All license texts are available under `licenses/`:
 

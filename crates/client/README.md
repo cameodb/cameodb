@@ -33,7 +33,11 @@ cargo run --bin cameodb -- client -i
 Flags:
 - `--connect http://host:port` – default `http://localhost:9480`
 - `--interactive` / `-i` – launch the REPL
-- `--insecure` – accept invalid TLS certificates (for self-signed certs in development)
+- `--insecure` – accept an unverified TLS certificate on the **server connection** (for a self-signed cert you issued yourself, on a node you control)
+- `--insecure-source` – skip certificate validation for **remote schema/data sources** only
+
+The two flags are deliberately separate and neither implies the other: accepting an
+untrusted data source must not also stop verifying the connection carrying your writes.
 
 ### TLS/HTTPS Support
 
@@ -47,16 +51,14 @@ cameodb client -i --connect https://cameodb.example.com
 cameodb client -i --connect https://localhost:9480 --insecure
 ```
 
-**Per-command `--insecure` for remote sources:**
+**`--insecure-source` for remote sources:**
 ```bash
-# Load schema from external HTTPS URL with self-signed cert
-cameodb client schema detect https://external.com/schema.csv --insecure
+# Fetch a schema from an external HTTPS URL whose certificate does not validate
+cameodb client schema detect https://external.com/schema.csv --insecure-source
 
-# Load data from external HTTPS URL with self-signed cert
-cameodb client data load myindex https://external.com/data.csv --insecure
+# Same for a data load
+cameodb client data load myindex https://external.com/data.csv --insecure-source
 ```
-
-The global `--insecure` flag applies to the entire session (server connection + all commands). Per-command `--insecure` applies only to specific remote schema/data loading operations.
 
 ## 🧭 Available Commands
 
@@ -69,7 +71,12 @@ The global `--insecure` flag applies to the entire session (server connection + 
 | `schema detect <file> [--delimiter ...]` | Detect schema from CSV/TSV/JSON/JSONL/NDJSON (auto or forced delimiter, supports compression & HTTP(S)) |
 | `schema load <index> <file> [--delimiter ...]` | Detect schema from CSV/TSV/JSON/JSONL/NDJSON and apply to an index (supports compression & HTTP(S)) |
 | `data load <index> <file> [--delimiter ...] [--batch-size N]` | Ingest CSV/TSV/JSON/JSONL/NDJSON data in batches (supports compression & HTTP(S)) |
+| `delete <index> --id <ID[,ID…]> [--routing-key K]` | Delete documents by id (comma-separated, or `--ids-file <PATH>` for one id per line) |
 | `delete <index> [--delete-schema]` | Delete an index; prompts `Delete index "<name>"? [yes/NO]:` and only proceeds on `yes` |
+| `admin memory stats` / `admin memory purge [--force]` | Read memory statistics / trigger a jemalloc purge |
+| `admin index <name> commit` / `evict-writer` | Force a commit across the index's shards / evict its writers from cache |
+| `admin workers` | Worker pool: jobs per worker, core placement, dispatch counters |
+| `key file <path>` / `key show` / `key clear` | Change, inspect, or drop the API key mid-session (bound to the origin it was given for) |
 | `connect <host[:port]>` | Switch target server and refresh cache |
 | `help` | Display built-in command reference |
 | `exit` / `quit` / `\q` | Leave the REPL |

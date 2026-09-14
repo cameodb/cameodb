@@ -3,6 +3,8 @@ name = "storage"
 version = "0.3.4"
 edition = "2024"
 license = "Apache-2.0"
+# Not published: consumed via path dependencies only.
+publish = false
 
 [dependencies]
 anyhow = { workspace = true }

@@ -3,7 +3,7 @@
   <p><strong>A high-performance, distributed hybrid-search database built in Rust.</strong></p>
   
   [![Rust](https://img.shields.io/badge/rust-1.85%2B-blue.svg)](https://www.rust-lang.org)
-  [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
+  [![License](https://img.shields.io/badge/license-Apache--2.0_%2F_MIT_%2F_FSL--1.1-green.svg)](LICENSE)
 </div>
 
 ## ✨ What is CameoDB?
@@ -19,7 +19,7 @@ By leveraging the **Kameo** actor framework and **Tokio**'s async runtime, Cameo
 * **Supervised Smart Commits:** Intelligently batches writes with micro-second precision to optimize throughput while maintaining strict crash durability.
 * **Tiered Cache Sizing:** Dynamically budgets memory across active shards based on system RAM to ensure steady-state operational safety.
 * **Sophisticated Schema Detection:** Automatically infers and maps indices from raw data payloads via versatile columnar structural testing and verifiable format detections.
-* **Intelligent Data Loader:** Robust, zero-copy ingestion pipeline that transparently handles multiple formats (`CSV`, `TSV`, `JSON`, `JSONL`) and on-the-fly decompression (`Gzip`, `Bzip2`, `Zstd`, `XZ`, `LZ4`, `Deflate`). It supports loading from local disk, distributed network files, and directly streaming from HTTP(S) endpoints.
+* **Intelligent Data Loader:** Robust ingestion pipeline that transparently handles multiple formats (`CSV`, `TSV`, `JSON`, `JSONL`/`NDJSON`) and on-the-fly decompression (`Gzip`, `Zip`). It supports loading from local disk, mounted network paths, and directly streaming from HTTP(S) endpoints.
 * **Consistent Hybrid Recovery:** Guarantees data consistency during startup by automatically recovering and syncing uncommitted records from the ACID datastore (KV) into the search index.
 * **Graceful Shutdowns:** Multi-phase process ensuring zero WAL replay on clean reboots.
 * **Contained Faults:** A panic fails one request rather than the process — caught at the read pool, the per-index write guard, the request handler and index warming. A writer thread that dies is respawned over the same store, and `/_cluster/health` turns red for a node whose data path has stopped serving (a dead or wedged writer, a wedged read pool) even while the cluster still calls itself green.
@@ -250,20 +250,20 @@ The easiest way to explore CameoDB is through its interactive REPL, which provid
 cameodb client --interactive
 
 # Inside the REPL, try:
-cameodb@localhost:9480 ▶ health
-cameodb@localhost:9480 ▶ schema detect ./examples/data/booksummaries.tsv
-cameodb@localhost:9480 ▶ data load books ./examples/data/booksummaries.tsv
-cameodb@localhost:9480 ▶ search books "title:Hitchhiker" limit 10
-cameodb@localhost:9480 ▶ delete books --id 12345
-cameodb@localhost:9480 ▶ delete books --id 12345,12346,12347
-cameodb@localhost:9480 ▶ admin memory stats
-cameodb@localhost:9480 ▶ admin memory purge --force
+cameodb@localhost ▶ health
+cameodb@localhost ▶ schema detect ./examples/data/booksummaries.tsv
+cameodb@localhost ▶ data load books ./examples/data/booksummaries.tsv
+cameodb@localhost ▶ search books "title:Hitchhiker" limit 10
+cameodb@localhost ▶ delete books --id 12345
+cameodb@localhost ▶ delete books --id 12345,12346,12347
+cameodb@localhost ▶ admin memory stats
+cameodb@localhost ▶ admin memory purge --force
 ```
 
 ### 🗜️ Supported Ingestion Formats
-The CLI client features a robust, zero-copy ingestion pipeline that transparently handles:
+The CLI client features a robust ingestion pipeline that transparently handles:
 - **Formats:** `CSV`, `TSV`, `JSON` (Documents/Arrays), and `JSONL/NDJSON`.
-- **Compression:** Automatically detects and decompresses `Gzip (.gz)`, `Bzip2 (.bz2)`, `Zstd (.zst)`, `XZ (.xz)`, `LZ4 (.lz4)`, and `Deflate` formats on the fly.
+- **Compression:** Automatically detects and decompresses `Gzip (.gz/.gzip)` and `Zip (.zip)` archives on the fly.
 - **Sources:** Ingest data from local disk files, mounted network paths, or by streaming directly from public `HTTP/HTTPS` URLs.
 
 ## 🔒 Security
@@ -383,4 +383,4 @@ Please review our [Code of Conduct](.github/CODE_OF_CONDUCT.md) before participa
 
 ## 📄 License
 
-This project is licensed under the [Apache License 2.0](LICENSE) - see the LICENSE file for details.
+CameoDB uses a multi-license model — see [LICENSE](LICENSE) for details. In short: the core crates are Apache-2.0, the client SDK and bench harness are MIT, and the server is FSL-1.1-ALv2 (a.k.a. FSL-1.1-Apache-2.0 — converting to Apache-2.0 two years after release). License texts live in [licenses/](licenses/).

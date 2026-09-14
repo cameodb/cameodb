@@ -146,7 +146,7 @@ Execute full-text search on a single CameoDB index.
 
 **Returns:** JSON array of matching documents with relevance scores.
 
-A response larger than the largest single message the node is configured to carry — its HTTP body size, 128 MB by default, overridable as `[security.limits] max_response_bytes` — is trimmed to fit and carries `_truncated: true`, `_omitted_hits: N` and a `_warning` naming the figure it hit. The hits returned are the highest ranked, in order; `total_hits` still reports everything that matched. Treat the flag as instruction to narrow the query rather than reading the trimmed set as the whole result.
+A response larger than the largest single message the node is configured to carry — its HTTP body size, 128 MB by default, overridable as `[limits] max_response_bytes` — is trimmed to fit and carries `_truncated: true`, `_omitted_hits: N` and a `_warning` naming the figure it hit. The hits returned are the highest ranked, in order; `total_hits` still reports everything that matched. Treat the flag as instruction to narrow the query rather than reading the trimmed set as the whole result.
 
 **Example:**
 ```json
@@ -823,7 +823,7 @@ cargo clippy -p cameodb_mcp -- -D warnings
 
 ### Integration with Main Server
 
-The MCP router is nested into the main HTTP server in `crates/server/src/http_server.rs`:
+The MCP router is nested into the main HTTP server in `crates/server/src/http_server/routes.rs`:
 
 ```rust
 Router::new()
@@ -833,7 +833,9 @@ Router::new()
 
 ## License
 
-FSL-1.1-Apache-2.0 (same as CameoDB)
+Apache-2.0, per this crate's manifest. CameoDB as a whole is multi-licensed — the server
+crate is FSL-1.1-ALv2 (the Functional Source License 1.1 with the Apache-2.0 future grant),
+the client SDK is MIT; see the root `LICENSE` file.
 
 ## References
 

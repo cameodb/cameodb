@@ -63,21 +63,21 @@ cargo run --release --bin cameodb
 
 CameoDB loads configuration from multiple sources with the following precedence (highest to lowest):
 
-1. **Environment Variables** (highest priority)
-2. **Configuration Files**
-3. **Default Values** (lowest priority)
+1. **Command-line flags** (e.g. `--http-port 9999`)
+2. **Environment Variables**
+3. **Configuration Files**
+4. **Default Values** (lowest priority)
 
 ### Configuration File Locations
 
 CameoDB searches for configuration files in this order:
 
-1. `cameodb.toml` (current directory)
-2. `cameodb.yaml` (current directory)
-3. `config/cameodb.toml`
-4. `config/cameodb.yaml`
-5. `/etc/cameodb/config.toml`
+1. `cameodb.toml`, `cameodb.yaml`, `cameodb.yml` (current directory)
+2. `config/cameodb.toml`, `config/cameodb.yaml`
+3. `/etc/cameodb/cameodb.toml`, `/etc/cameodb/config.toml`
 
-Both TOML and YAML formats are supported.
+Both TOML and YAML formats are supported. An explicit `--config <path>` (or
+`CAMEODB_CONFIG`) bypasses the search entirely.
 
 ## Configuration Reference
 
@@ -297,8 +297,9 @@ wal_sync = true
 # WAL segment size in MB (default: 64)
 wal_segment_size_mb = 64
 
-# Default batch size for bulk ingestion (default: 5000)
-default_batch_size = 5000
+# Default batch size for bulk ingestion; also the base of the smart-commit threshold
+# (default: 1000)
+default_batch_size = 1000
 
 # Initial number of shards per index (default: 4)
 num_shards_init = 4

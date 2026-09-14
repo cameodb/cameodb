@@ -4,8 +4,8 @@ This directory contains runnable examples for ingesting data into CameoDB using 
 
 ## 📊 Available Datasets
 
-| Dataset | Script | Records | Format | Batch Size | Memory Limit | Description |
-|---------|--------|---------|--------|------------|-------------|-------------|
+| Dataset | Script | Records | Format | Batch Size | Description |
+|---------|--------|---------|--------|------------|-------------|
 | **TED Talks** | `ingest_ted.py` | ~4,600 | CSV (semicolon) | **4000 docs / 16MB** | YouTube TED talks metadata with descriptions |
 | **Book Summaries** | `ingest_books.py` | 16,559 | TSV (tab) | **2000 docs / 16MB** | CMU Book Summaries with plot synopses |
 
@@ -28,10 +28,6 @@ python3 examples/ingest_books.py --dry-run
 # Custom data files
 python3 examples/ingest_ted.py --data /path/to/custom/ted.csv
 python3 examples/ingest_books.py --data /path/to/custom/books.txt
-
-# Size analysis (check memory usage and safety)
-python3 examples/size_analysis.py
-python3 examples/size_analysis.py 1500 books  # Test custom batch size
 ```
 
 ---
@@ -59,7 +55,7 @@ python examples/ingest_ted.py --dry-run | head
 python examples/ingest_ted.py
 
 # Specify a different index or CSV
-python examples/ingest_ted.py --index talks --csv path/to/file.csv
+python examples/ingest_ted.py --index talks --data path/to/file.csv
 
 # Target a remote CameoDB node
 python examples/ingest_ted.py --base-url http://node1:9480
@@ -162,24 +158,27 @@ Each book is indexed with the following fields:
 ```
 
 ### Performance Optimizations
-- **Batch Processing**: Optimized batch sizes (2000 books, 4000 TED, 10000 URLs)
-- **Memory Management**: 32MB limit (50% safety margin under 64MB Kameo limit)
+- **Batch Processing**: Optimized batch sizes (2000 books, 4000 TED)
+- **Memory Management**: 16MB cap per batch
 - **Smart Batching**: Automatic batch size adjustment based on document size
-- **Error Handling**: Detailed error reporting with failed operation counts/sec with optimized batching (Rust 2024 performance improvements)
-- **Supervised Smart Commits**: Dynamic commit thresholds based on memory budgets (32MB-512MB) with eventual durability guarantees via async supervision
+- **Error Handling**: Detailed error reporting with failed operation counts
+- **Supervised Smart Commits** (server side): the adaptive commit threshold (1×–20×
+  `default_batch_size`, scaled by the index's memory budget) plus the idle-commit timeout
+  (`[search] supervisor_timeout_secs`, 5 s default) — batches sized below the threshold mean
+  rows become searchable at the latest a few seconds after ingestion finishes
 - **Parallel Sharding**: Automatic document distribution across multiple shards
 - **Cluster-Aware**: Real-time cluster health monitoring and accurate shard reporting
 
 ### Command Line Options
 
-| Option | Books Default | TED Default | URLs Default | Description |
-|--------|--------------|------------|--------------|-------------|
-| `--base-url` | `http://localhost:9480` | `http://localhost:9480` | `http://localhost:9480` | CameoDB HTTP base URL |
-| `--index` | `books` | `ted` | `urls` | Target index name |
-| `--data` | `examples/data/booksummaries.tsv` | `examples/data/youtube_ted_2024.csv` | `examples/data/urls.csv` | Path to data file |
-| `--dry-run` | `false` | `false` | `false` | Print sample documents instead of sending |
-| `--batch-size` | **2000** | 4000 | 10000 | Maximum documents per batch |
-| `--max-batch-mb` | **16** | 16 | 16 | Maximum batch size in MB (50% safety margin under 64MB Kameo limit) |
+| Option | Books Default | TED Default | Description |
+|--------|--------------|------------|-------------|
+| `--base-url` | `http://localhost:9480` | `http://localhost:9480` | CameoDB HTTP base URL |
+| `--index` | `books` | `ted` | Target index name |
+| `--data` | `examples/data/booksummaries.tsv` | `examples/data/youtube_ted_2024.csv` | Path to data file |
+| `--dry-run` | `false` | `false` | Print sample documents instead of sending |
+| `--batch-size` | **2000** | 4000 | Maximum documents per batch |
+| `--max-batch-mb` | **16** | 16 | Maximum batch size in MB |
 
 ### Example Output
 

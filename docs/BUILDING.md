@@ -83,10 +83,13 @@ vendored OpenSSL is involved either way.
 
 ### On `--no-default-features`
 
-The build commands carry it and it currently does nothing: no crate in this workspace
-declares a `[features]` section, and the flag applies to workspace members rather than to
-their dependencies. It is kept so that adding an opt-in feature later does not silently
-change what release builds contain.
+The build commands carry it as a guard rail: the one opt-in feature in the workspace,
+`server`'s `fault-injection` (compile-time panic seams for the panic-isolation smoke test),
+is not a default feature, so a release build never contains it — and this keeps a release
+build from silently changing any *future* feature that does become a default. The flag
+applies to workspace members rather than to their dependencies. Releases are also checked
+after the fact: `scripts/validate/all.sh` refuses a binary whose `--version` reports
+`+fault-injection`.
 
 TLS is not a feature either. It is rustls with the `ring` provider, unconditionally, with
 outbound HTTPS verified against the system trust store through `rustls-platform-verifier` —
@@ -501,7 +504,7 @@ ld.lld: error: undefined symbol: mallocx
 ld.lld: error: undefined symbol: mallctl
 ```
 
-You ran `cargo zigbuild` directly without exporting `AR`/`RANLIB` first (see the warning in [Building for x86_64-unknown-linux-musl](#building-for-x86_64-unknown-linux-musl) above). Either use `./scripts/build/build-musl.sh`, or export `AR="zig ar"` and `RANLIB="zig ranlib"` before your `cargo zigbuild` invocation. As a quick diagnostic, check whether `libjemalloc.a` in the build output is suspiciously small (a healthy archive is several MB; an empty one built with the wrong `ranlib` is under 100 bytes):
+You ran `cargo zigbuild` directly without exporting `AR`/`RANLIB` first (see the warning in [Building static Linux binaries (musl)](#building-static-linux-binaries-musl) above). Either use `./scripts/build/build-musl.sh`, or export `AR="zig ar"` and `RANLIB="zig ranlib"` before your `cargo zigbuild` invocation. As a quick diagnostic, check whether `libjemalloc.a` in the build output is suspiciously small (a healthy archive is several MB; an empty one built with the wrong `ranlib` is under 100 bytes):
 ```bash
 find target -name "libjemalloc.a" -exec ls -la {} \;
 ```
@@ -553,7 +556,7 @@ cargo generate-rpm -p crates/server --target x86_64-unknown-linux-musl --auto-re
 
 **Option 2: Cross-compilation with cargo-zigbuild (supports hardening)**
 
-`cargo generate-rpm` needs its own `--target` invocation, so this option can't go through `./scripts/build/build-musl.sh` directly — `AR`/`RANLIB` must be exported manually (see the warning in [Building for x86_64-unknown-linux-musl](#building-for-x86_64-unknown-linux-musl)):
+`cargo generate-rpm` needs its own `--target` invocation, so this option can't go through `./scripts/build/build-musl.sh` directly — `AR`/`RANLIB` must be exported manually (see the warning in [Building static Linux binaries (musl)](#building-static-linux-binaries-musl)):
 ```bash
 export AR="zig ar"
 export RANLIB="zig ranlib"
@@ -605,7 +608,7 @@ docker run --rm --platform linux/amd64 \
 # Generate DEB package (run on host after Docker build)
 # Use --no-build to package the existing binary without rebuilding
 # Use --no-strip on macOS (macOS strip/objcopy don't support Linux binaries)
-# Note: Binary is automatically stripped by Cargo's [profile.release] strip = "symbols"
+# Note: Binary is automatically stripped by Cargo's [profile.release] strip = true
 # The debug symbols warning from cargo-deb is cosmetic and can be ignored.
 cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl -p server
 

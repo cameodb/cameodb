@@ -106,8 +106,9 @@ cargo run --release --bin cameodb -- -c path/to.toml   # explicit config
 
 Config resolution, highest precedence first: command-line options, `CAMEODB_*` environment
 variables, the config file, then defaults. The file itself is found via `-c`, then
-`CAMEODB_CONFIG`, then `./cameodb.toml`, `./config/cameodb.toml`,
-`/etc/cameodb/cameodb.toml`, `/etc/cameodb/config.toml`.
+`CAMEODB_CONFIG`, then `./cameodb.toml`, `./cameodb.yaml`, `./cameodb.yml`,
+`./config/cameodb.toml`, `./config/cameodb.yaml`, `/etc/cameodb/cameodb.toml`,
+`/etc/cameodb/config.toml`.
 
 Then, in another shell:
 

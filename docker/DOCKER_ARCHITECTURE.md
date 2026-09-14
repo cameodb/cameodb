@@ -38,16 +38,18 @@ cameodb/
 
 #### **Builder Stage Features**
 ```dockerfile
-# Rust 1.94 with musl/gnu static linking
-ARG RUST_VERSION=1.94
+# Rust 1.95 with musl/gnu static linking
+ARG RUST_VERSION=1.95
 ARG TARGET_ABI=musl
 FROM rust:${RUST_VERSION}-slim AS builder
 
 RUN rustup default ${RUST_VERSION}
 
-# Cross-compilation support and SSL dependencies
+# Cross-compilation toolchain bits (TLS is pure rustls — nothing links OpenSSL)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
+    xz-utils \
     libssl-dev \
     musl-tools \
     gcc-aarch64-linux-gnu \
