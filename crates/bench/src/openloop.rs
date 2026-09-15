@@ -29,7 +29,7 @@
 //! ceiling, the run measured this harness.
 
 use crate::args::{Args, Arrival, OpenLoop, Step, Workload};
-use crate::stats::{Samples, ms};
+use crate::stats::{Samples, SecondBucket, ms};
 use crate::workload::{WORDS, document};
 use anyhow::Result;
 use client::{CameoClient, failure_status};
@@ -682,7 +682,9 @@ async fn collect(
                 }
             }
             Answer::Failed { status, message } => {
-                bucket.samples.record_failure(status, message);
+                bucket
+                    .samples
+                    .record_failure_open(completion.intended, status, message);
             }
         }
     };
@@ -826,6 +828,37 @@ pub fn print(reports: Vec<StepReport>, open: &OpenLoop) {
     }
 }
 
+/// How to fit a run's per-second series onto one readable line.
+///
+/// Long runs are grouped rather than truncated. Truncation hides the end of the run, which on
+/// an overload run is the only part that matters — a collapse shows up late by definition.
+fn series_grouping(seconds: usize) -> (usize, &'static str) {
+    const TARGET: usize = 50;
+    if seconds <= TARGET {
+        (1, "/s")
+    } else {
+        (seconds.div_ceil(TARGET), "/s avg")
+    }
+}
+
+/// Group `window` into buckets of `group` seconds and report each as a per-second rate, so
+/// every number on the line means the same thing whatever the grouping.
+fn downsample(
+    window: &[SecondBucket],
+    group: usize,
+    field: impl Fn(&SecondBucket) -> u64,
+) -> Vec<u64> {
+    window
+        .chunks(group)
+        .map(|chunk| chunk.iter().map(&field).sum::<u64>() / chunk.len() as u64)
+        .collect()
+}
+
+fn print_series(label: &str, unit: &str, values: &[u64]) {
+    let rendered: Vec<String> = values.iter().map(u64::to_string).collect();
+    println!("  {:>11}{}  {}", label, unit, rendered.join(" "));
+}
+
 fn print_workload(workload: WorkloadReport, wall: Duration) {
     if workload.samples.is_empty() {
         return;
@@ -847,12 +880,26 @@ fn print_workload(workload: WorkloadReport, wall: Duration) {
         } else {
             1
         };
-        let series: Vec<String> = per_second[..keep]
-            .iter()
-            .take(60)
-            .map(u64::to_string)
-            .collect();
-        println!("  {:>10}  {}", "ok per sec", series.join(" "));
+        let window = &per_second[..keep];
+        let (group, unit) = series_grouping(window.len());
+
+        // Successes and refusals on the same axis, so the crossover is visible rather than
+        // inferred: at a fixed offered rate, `ok` falling while `408` climbs is work
+        // continuing after the client that asked for it was abandoned.
+        print_series("ok", unit, &downsample(window, group, |b| b.ok));
+        if window.iter().any(|b| b.shed > 0) {
+            print_series("503 shed", unit, &downsample(window, group, |b| b.shed));
+        }
+        if window.iter().any(|b| b.timed_out > 0) {
+            print_series(
+                "408 timeout",
+                unit,
+                &downsample(window, group, |b| b.timed_out),
+            );
+        }
+        if window.iter().any(|b| b.other > 0) {
+            print_series("other fail", unit, &downsample(window, group, |b| b.other));
+        }
     }
 
     if is_bulk {

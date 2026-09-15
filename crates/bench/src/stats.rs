@@ -100,10 +100,10 @@ pub struct Samples {
     total: Vec<u64>,
     /// Intended send → actually sent: how far behind its own schedule the generator was.
     lag: Vec<u64>,
-    /// Successful completions in each whole second since the run began, so the report can
-    /// show whether the achieved rate held or decayed. A node that sustains a rate and one
-    /// that collapses into it halfway through produce the same average.
-    per_second: Vec<u64>,
+    /// What happened in each whole second since the run began, so the report can show
+    /// whether the achieved rate held or decayed. A node that sustains a rate and one that
+    /// collapses into it halfway through produce the same average.
+    per_second: Vec<SecondBucket>,
     pub outcomes: Outcomes,
     /// First error seen, kept so a failed run says *why* rather than just how often.
     pub first_error: Option<String>,
@@ -130,12 +130,20 @@ impl Samples {
         self.lag
             .push(sent.saturating_sub(intended).as_micros() as u64);
         self.outcomes.ok += 1;
+        self.bucket(intended).ok += 1;
+    }
 
+    /// The bucket for the second an arrival was *offered* in, grown as needed.
+    ///
+    /// Keyed on the intended time rather than on completion: a request the node answers late,
+    /// or refuses late, still belongs to the second it was asked for. Bucketing by completion
+    /// would make a collapse look like load moving into the future rather than being lost.
+    fn bucket(&mut self, intended: Duration) -> &mut SecondBucket {
         let second = intended.as_secs() as usize;
         if self.per_second.len() <= second {
-            self.per_second.resize(second + 1, 0);
+            self.per_second.resize(second + 1, SecondBucket::default());
         }
-        self.per_second[second] += 1;
+        &mut self.per_second[second]
     }
 
     /// Record a failure, classified by the status the node answered with.
@@ -143,6 +151,32 @@ impl Samples {
     /// `status` is `None` for anything that never became a response. See [`Outcomes`] for why
     /// the distinction is kept rather than counted as one number.
     pub fn record_failure(&mut self, status: Option<u16>, error: impl Display) {
+        self.classify(status, error);
+    }
+
+    /// [`record_failure`](Self::record_failure) for an open-loop run, which also knows *when*
+    /// the request was offered.
+    ///
+    /// The per-second series has to carry failures as well as successes or it shows half the
+    /// picture. The case this exists for is the crossover: successes falling while timeouts
+    /// climb, at a fixed offered rate, is the signature of work continuing after the client
+    /// that asked for it has been abandoned — and an average over the run hides it completely.
+    pub fn record_failure_open(
+        &mut self,
+        intended: Duration,
+        status: Option<u16>,
+        error: impl Display,
+    ) {
+        self.classify(status, error);
+        let bucket = self.bucket(intended);
+        match status {
+            Some(503) => bucket.shed += 1,
+            Some(408) => bucket.timed_out += 1,
+            _ => bucket.other += 1,
+        }
+    }
+
+    fn classify(&mut self, status: Option<u16>, error: impl Display) {
         match status {
             Some(503) => self.outcomes.shed += 1,
             Some(408) => self.outcomes.timed_out += 1,
@@ -162,10 +196,14 @@ impl Samples {
         self.outcomes.merge(other.outcomes);
 
         if self.per_second.len() < other.per_second.len() {
-            self.per_second.resize(other.per_second.len(), 0);
+            self.per_second
+                .resize(other.per_second.len(), SecondBucket::default());
         }
-        for (slot, count) in self.per_second.iter_mut().zip(other.per_second.iter()) {
-            *slot += count;
+        for (slot, bucket) in self.per_second.iter_mut().zip(other.per_second.iter()) {
+            slot.ok += bucket.ok;
+            slot.shed += bucket.shed;
+            slot.timed_out += bucket.timed_out;
+            slot.other += bucket.other;
         }
 
         if self.first_error.is_none() {
@@ -201,7 +239,7 @@ impl Samples {
     ///
     /// The last bucket is usually short and is dropped by the reader rather than here, since
     /// only the caller knows the measured duration.
-    pub fn per_second(&self) -> &[u64] {
+    pub fn per_second(&self) -> &[SecondBucket] {
         &self.per_second
     }
 
@@ -222,6 +260,15 @@ impl Samples {
             lag: (!self.lag.is_empty()).then(|| Percentiles::of(&self.lag)),
         }
     }
+}
+
+/// What one second of a run contained, by outcome.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SecondBucket {
+    pub ok: u64,
+    pub shed: u64,
+    pub timed_out: u64,
+    pub other: u64,
 }
 
 /// One latency distribution, in microseconds.
@@ -535,7 +582,40 @@ mod tests {
             Duration::from_millis(2_600),
         );
 
-        assert_eq!(samples.per_second(), &[2, 0, 1]);
+        let seconds: Vec<u64> = samples.per_second().iter().map(|b| b.ok).collect();
+        assert_eq!(seconds, vec![2, 0, 1]);
+    }
+
+    /// Failures are bucketed by class as well as by second. The crossover this exists to
+    /// show — successes falling while timeouts climb at a fixed offered rate — is invisible in
+    /// a series that counts only what succeeded.
+    #[test]
+    fn failures_bucket_by_second_and_class() {
+        let mut samples = Samples::default();
+        samples.record_open(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(150),
+        );
+        samples.record_failure_open(Duration::from_millis(200), Some(408), "timeout");
+        samples.record_failure_open(Duration::from_millis(300), Some(503), "shed");
+        samples.record_failure_open(Duration::from_millis(1_400), Some(408), "timeout");
+        samples.record_failure_open(Duration::from_millis(1_500), Some(500), "server");
+
+        let buckets = samples.per_second();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(
+            (buckets[0].ok, buckets[0].timed_out, buckets[0].shed),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            (buckets[1].ok, buckets[1].timed_out, buckets[1].other),
+            (0, 1, 1)
+        );
+        // The totals still agree with the classification the outcome counts made.
+        assert_eq!(samples.outcomes.timed_out, 2);
+        assert_eq!(samples.outcomes.shed, 1);
+        assert_eq!(samples.outcomes.other_status, 1);
     }
 
     /// Per-second series have to survive the merge too — they are collected per workload and
@@ -562,6 +642,7 @@ mod tests {
         );
 
         a.merge(b);
-        assert_eq!(a.per_second(), &[2, 0, 0, 1]);
+        let seconds: Vec<u64> = a.per_second().iter().map(|b| b.ok).collect();
+        assert_eq!(seconds, vec![2, 0, 0, 1]);
     }
 }

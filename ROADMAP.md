@@ -163,6 +163,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F4](#f4--the-bulk-paths-asked-the-coordinator-before-they-knew-they-needed-to) | The bulk paths asked the coordinator before they knew they needed to | — | 2026-09-02 | ✅ |
 | [F5](#f5--concurrency-sweep-measured-2026-09-02) | Concurrency sweep on the release build — the operating point, and bulk's serialization measured | — | 2026-09-02 | ✅ |
 | [F6](#f6--what-fsync-actually-costs-measured-2026-09-02) | What fsync actually costs — and why turning it off is a reallocation, not a speedup | — | 2026-09-02 | ✅ |
+| [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) | The request timeout sheds the client, not the work — measured: goodput goes to zero, not down | — | 2026-09-15 | ⚠️ |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
 | [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8 and CH9 done, CH12 partial | — | 2026-09-01 | ◐ |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
@@ -1005,9 +1006,11 @@ produce.
 - [F1](#f1--the-cost-of-a-durable-commit-under-read-load), and the bounded linger, which was
   rejected on arithmetic computed from a closed-loop rate — 0.046 writes arriving at a shard per
   200µs window at c16. Poisson arrivals are the condition it needed and never had.
-- [F7](#f7--the-request-timeout-sheds-the-client-not-the-work). Sustained overload plus the
-  `408` count plus the per-second series is the instrument for the metastable failure: a rate
-  that decays through a fixed-λ run is the signature.
+- ✅ [F7](#f7--the-request-timeout-sheds-the-client-not-the-work), **done the same day**. The
+  `408` count broken out from the other outcomes, the per-second series and the co-located-harness
+  verdict were between them exactly the instrument it needed: the failure is confirmed, it is
+  larger than the audit described, and it surfaced [OB13](#ob13--the-health-endpoints-exemption-from-the-concurrency-guard-does-not-protect-it)
+  alongside. This is the item that paid for F2.
 - The audit trail's **read path**, and the trail **under a queue-overrunning workload**, which
   is the case the `gap` record exists for.
 - [A3](#a3--protocol-compliance-tests-and-agent-query-benchmarks)'s agent-query latency figures.
@@ -1084,23 +1087,77 @@ behind it, whatever this hardware happens to show.
 
 ### F7 — The request timeout sheds the client, not the work
 
-📋 **Planned** (0.3.3 stability audit, finding 05). Searches run as blocking closures dispatched
-with `spawn_blocking` onto the read pool, bounded by `max_blocking_threads` (`node_orchestrator.rs`
-8232). Tokio never cancels a blocking closure — dropping its `JoinHandle` neither stops work that
-has started nor dequeues work that has not — so when `TimeoutLayer` (`routes.rs` 239) fires it
-drops the request future and releases the concurrency permit while the Tantivy work behind it runs
-to completion. Under sustained overload the permits recycle every `request_timeout_secs` and admit
-more work while the read-pool backlog fills with searches whose clients have left: admission is
-capped (`max_concurrent_requests`, default 128), the backlog behind it is not, and a retrying
-client makes it worse — the shape of a metastable failure. The read-pool health signal added for
-finding 02 now makes a genuinely wedged pool *visible*, and
-[F2](#f2--an-open-loop-load-generator) (2026-09-15) supplies the instrument that would show the
-failure rather than infer it: sustained overload at a fixed arrival rate, the `408` count broken
-out from the other outcomes, and the per-second achieved-rate series — a rate that decays through
-a fixed-rate run is the metastable signature. Not yet run. What is still missing in the node is a
-deadline the search itself honours, so the work stops when the client is gone. Give the search a cancellation
-token or a deadline checked at segment boundaries, and/or bound the backlog so excess load is
-rejected fast rather than queued.
+⚠️ **Confirmed by measurement** 2026-09-15 (0.3.3 stability audit, finding 05), and worse than
+it was described. The mechanism was reasoned about correctly; what the reasoning understated is
+the size of the effect. **Goodput does not degrade under this failure. It goes to zero.**
+
+The mechanism, unchanged: searches run as blocking closures dispatched with `spawn_blocking` onto
+the read pool, bounded by `max_blocking_threads` (`node_orchestrator.rs` 8341). Tokio never
+cancels a blocking closure — dropping its `JoinHandle` neither stops work that has started nor
+dequeues work that has not — so when `TimeoutLayer` (`routes.rs` 241) fires it drops the request
+future and releases the concurrency permit while the Tantivy work behind it runs to completion.
+Admission is capped (`max_concurrent_requests`); the backlog behind it is not.
+
+**Measured**, with [F2](#f2--an-open-loop-load-generator)'s open-loop generator. Apple M1 (4+4
+cores, 16 GB), release node and release harness co-located, a 200,000-document index, 4 shards,
+`search_threads = 2`, `max_concurrent_requests = 3000`. Harness lag p99 stayed at or below 1.1ms
+on every arm, so these are node measurements and not the generator. The two columns are the same
+node, the same index and the same offered load; the only thing that differs is the timeout:
+
+| offered | `request_timeout_secs = 1` | `request_timeout_secs = 300` |
+|---|---|---|
+| 1,000/s | **1 ok/s**, 14,949 × 408 | **735 ok/s**, 3,930 × 503 |
+| 2,000/s | ~0 ok/s, 29,872 × 408 | 733 ok/s, 18,885 × 503 |
+| 3,000/s | ~0 ok/s, 44,466 × 408 | 729 ok/s, 34,232 × 503 |
+| 4,000/s | ~0 ok/s, 45,000 × 408 | 729 ok/s, 49,277 × 503 |
+
+Real capacity is ~730 searches/s, and the control column delivers it at every level of overload
+— flat, with the excess refused cleanly as 503. That is textbook graceful degradation. The left
+column is the same machine doing the same ~730 searches/s of work and delivering **none of it**,
+because every search it completes belongs to a client the timeout abandoned while it queued. The
+node is not slow and it is not idle. It is fully busy producing answers nobody is left to receive.
+
+**It recovers, but not promptly.** Dropping from 3,000/s to 300/s — 41% of capacity — left
+goodput at zero for a further **12 seconds**, with 408s continuing at the full offered rate,
+before it returned:
+
+```
+ok/s       0 0 0 0 0 0 0 0 0 0 0 0 51 303 287 314 251 277 292
+```
+
+So it is not permanently metastable: the backlog drains at `capacity − offered`, and the dead
+period scales with how deep admission lets the backlog get.
+
+**What decides whether a node is exposed.** The regime is entered when
+`max_concurrent_requests / service_rate > request_timeout_secs`. At the 128 default against
+~730/s that is 175ms versus 30s — three orders of magnitude of headroom, which is why no
+default deployment has ever seen this and why the audit could only reason about it. The same
+machine with a 5,000-document index and 8 read threads (capacity ~9,300/s) produced **zero 408s
+across 1.7M requests** at up to 16,000/s offered, peaking at 9,697 ok/s and still serving 8,852
+ok/s under 60% overload. The danger is reached by *raising* `max_concurrent_requests`, which is
+exactly what an operator does when they start seeing 503s.
+
+**What to fix, in the order the measurement argues for.**
+
+1. **Check the deadline at dequeue, not at segment boundaries.** The pathology is not work that
+   runs too long, it is work that *starts* after its client is already gone — in the left column
+   above, essentially all of it. Stamping each request with a deadline and having the closure
+   return immediately when it is already past costs one comparison and converts the entire
+   wasted-work regime into instant rejection. A cancellation token checked mid-search is strictly
+   more work for strictly less of the win.
+2. **Bound the read-pool backlog** so excess load is refused at admission rather than queued
+   behind a semaphore that only counts requests, not the work they imply.
+3. **Warn on the ratio.** `cameodb check-config` already reasons about
+   `max_concurrent_requests × body limit` against the memory budget; the same place can say that
+   admission divided by a plausible service rate exceeds the request timeout.
+
+Fix 1 also closes [OB13](#ob13--the-health-endpoint-fails-under-overload-but-not-for-the-reason-it-looked-like):
+the health endpoint's 408s under this failure are not a layering problem but this same timeout
+churn starving the request runtime, and rejecting at dequeue removes the churn along with the
+wasted work. Measured there, and the reason no separate change is warranted.
+
+Not yet measured: whether a retrying client deepens it (each arm here used a fixed arrival rate
+and no retries), and the write path, which has its own queue.
 
 ---
 
@@ -1747,6 +1804,54 @@ a five-second wait, and the retry once whole writes all of it.
 the answer cheap: any *other* peer metadata read issued while that peer is inside a write still
 queues behind it — `FindSchemaInCluster` behind a `DELETE` is the reachable one. Taking metadata
 reads off the orchestrator mailbox is the general fix, and it is not done.
+
+### OB13 — The health endpoint fails under overload, but not for the reason it looked like
+
+✅ **Investigated and closed into [F7](#f7--the-request-timeout-sheds-the-client-not-the-work)**
+2026-09-15. Opened the same day on the observation that `/_cluster/health` returned 408 during
+the F7 collapse. It does — but the layering explanation was wrong, and the fix it implied would
+not have worked.
+
+**The original reading.** `HEALTH_PATH` is exempt from the concurrency guard (`routes.rs` 105) so
+that "a load balancer would [not] evict a node that was merely busy". `TimeoutLayer` is applied
+*after* the guard (`routes.rs` 241 against 112) and a later `Router::layer` is the **outer** one,
+so a health request skips the semaphore and is still wrapped by the timeout. That much is
+factually true. The inference — that reordering the layers would fix it — is not.
+
+**Measured.** Health probed every 0.2–1s while the node was driven open-loop, M1, release
+binaries co-located, 5,000- and 200,000-document indices:
+
+| admission | timeout | index | offered | health p50 | max | codes |
+|---|---|---|---|---|---|---|
+| — | — | 5k | idle | 1.6ms | 1.8ms | all 200 |
+| **128 (default)** | 30s | 5k | 4,000/s | 0.9ms | 1.8ms | all 200 |
+| **128 (default)** | 30s | 5k | 9,000/s | 3.1ms | 13.6ms | all 200 |
+| **128 (default)** | 30s | 5k | 14,000/s | 11.3ms | 21.0ms | all 200 |
+| 3000 | 300s | 5k | 14,000/s | 12.4ms | 373.8ms | all 200 |
+| 3000 | 300s | 200k | 3,000/s | 117.6ms | 119.4ms | all 200 |
+| 3000 | **1s** | 200k | 3,000/s | **1001.8ms** | 1002.5ms | **all 408** |
+
+**It does not reproduce at defaults.** 21ms worst case at 50% past the knee, every probe 200. No
+load balancer evicts on that, and the exemption is doing its job.
+
+**The last two rows are the finding.** They are the same node, the same index, the same offered
+rate and the same admission depth. The only difference is `request_timeout_secs`, and it moves
+health from a comfortable 118ms to a hard 408. So the queue is not what health is waiting behind
+— the anonymous body is built from atomics and never reaches the read pool (`health.rs` 78-81),
+which the 118ms row confirms directly. What starves it is the **churn**: at a 1s timeout the node
+fires ~3,000 timeouts a second, and each one drops a future, builds a 408, releases a permit and
+admits a replacement. That recycling saturates the request runtime, and the health task cannot
+get a worker slot.
+
+Which is [F7](#f7--the-request-timeout-sheds-the-client-not-the-work)'s own mechanism, seen from
+the side. **Reordering the layers would not have helped**: it would convert a 408 into a >1s 200,
+which a load-balancer probe treats identically. Fixing F7 — rejecting at dequeue so a request
+whose deadline has passed never runs, which removes the recycling as well as the wasted work —
+removes this too. No separate change is warranted, and the layer ordering should be left alone
+until something demonstrates a problem it actually causes.
+
+**Kept as an entry** because the wrong fix was one commit away, and because the default-config
+row is worth having on record: it is the evidence that the exemption works where it matters.
 
 ---
 
