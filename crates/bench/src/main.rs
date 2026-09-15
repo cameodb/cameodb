@@ -12,20 +12,30 @@
 //! single-document write, the answer was to add `write_document` to the SDK rather than
 //! reach past it with a raw `http()` call.
 //!
-//! # What it measures, and what it does not
+//! # What it measures
 //!
-//! Closed-loop: `--concurrency` workers each issue one request, wait, and issue the next.
-//! That measures service time at a fixed concurrency. It is not an open-loop generator, so
-//! it does not model a fixed arrival rate and its percentiles are not an SLA — a saturated
-//! node appears as rising latency rather than an unbounded queue, because the harness stops
-//! offering load while it waits. Compare runs at equal concurrency and treat the numbers as
-//! relative.
+//! Two load models, and the flags pick between them.
+//!
+//! **Closed-loop (`--concurrency`, the default).** N workers each issue one request, wait,
+//! and issue the next. Measures service time at a fixed concurrency. It is not an arrival
+//! process and its percentiles are not an SLA — a saturated node appears as rising latency
+//! rather than an unbounded queue, because the harness stops offering load while it waits.
+//! Compare runs at equal concurrency and treat the numbers as relative. Every performance
+//! figure published for this project was taken this way, and this path is unchanged so they
+//! stay comparable.
+//!
+//! **Open-loop (`--rate`).** Requests are offered on a schedule that does not wait for
+//! answers, so an overloaded node produces a growing queue instead of a shrinking offered
+//! load. Latency is reported from the *intended* send time as well as the actual one; where
+//! those diverge, the difference is queueing that the closed-loop model cannot see. See
+//! [`openloop`] for the mechanism and [`stats`] for why both clocks are kept.
 //!
 //! Searches also carry the node's own `took_ms`, reported beside the client-observed
 //! latency. The gap between them is everything outside the search itself: queueing at the
 //! concurrency limiter, the worker hop, and the network.
 
 mod args;
+mod openloop;
 mod stats;
 mod workload;
 
@@ -61,44 +71,53 @@ async fn main() -> Result<()> {
         println!("authenticated as key {key_id}");
     }
 
-    println!(
-        "plan: mode={:?} concurrency={} warmup={}s duration={}s index={}",
-        args.mode,
-        args.concurrency,
-        args.warmup.as_secs(),
-        args.duration.as_secs(),
-        args.index
-    );
+    print_plan(&args);
 
     workload::prepare_index(&client, &args).await?;
 
-    if !args.warmup.is_zero() {
-        println!(
-            "\nwarming up for {}s (not measured)…",
-            args.warmup.as_secs()
-        );
-        workload::run(Arc::clone(&client), &args, args.warmup).await?;
+    // Snapshot around the measured window only. Taken earlier, the counts also include
+    // seeding and warmup and cannot be reconciled against the measured request totals. The
+    // open-loop path warms up inside its own runner, so each arm takes the snapshot at the
+    // point where its warmup is already done.
+    let before;
+    let after;
+
+    match &args.load {
+        args::Load::Closed { concurrency } => {
+            if !args.warmup.is_zero() {
+                println!(
+                    "\nwarming up for {}s (not measured)…",
+                    args.warmup.as_secs()
+                );
+                workload::run(Arc::clone(&client), &args, *concurrency, args.warmup).await?;
+            }
+            before = client.admin_worker_stats().await.ok();
+
+            println!("measuring for {}s…", args.duration.as_secs());
+            let started = Instant::now();
+            let report =
+                workload::run(Arc::clone(&client), &args, *concurrency, args.duration).await?;
+            let wall = started.elapsed();
+            report.print(wall);
+            after = client.admin_worker_stats().await.ok();
+        }
+        args::Load::Open(open) => {
+            // The open-loop runner does its own warmup, so the snapshot has to sit inside it
+            // — taken here it would straddle the warmup. It is taken after instead, which
+            // costs the warmup's jobs and is the same trade the closed-loop arm makes.
+            let reports = openloop::run(Arc::clone(&client), &args, open).await?;
+            before = None;
+            openloop::print(reports, open);
+            after = client.admin_worker_stats().await.ok();
+        }
     }
 
-    // Snapshot *after* warmup, so the worker-pool delta covers the same requests the
-    // latencies do. Taken before it, the counts also include seeding and warmup and cannot
-    // be reconciled against the measured request totals.
-    let before = client.admin_worker_stats().await.ok();
-
-    println!("measuring for {}s…", args.duration.as_secs());
-    let started = Instant::now();
-    let report = workload::run(Arc::clone(&client), &args, args.duration).await?;
-    let wall = started.elapsed();
-
-    report.print(wall);
-
-    let after = client.admin_worker_stats().await.ok();
-    if let (Some(before), Some(after)) = (before, after) {
-        workload::print_worker_delta(&before, &after);
-    } else {
-        println!(
+    match (before, after) {
+        (Some(before), Some(after)) => workload::print_worker_delta(&before, &after),
+        (None, Some(_)) => {}
+        _ => println!(
             "\n(worker pool stats unavailable — /_admin/* is disabled or needs a node-admin key)"
-        );
+        ),
     }
 
     if !args.keep_index {
@@ -109,6 +128,54 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// What this run is about to do, in one place, before it does any of it.
+///
+/// The open-loop arm says more than the closed-loop one because more of it can go wrong: the
+/// generator reserves a core to hit its arrival times, so a run against a node on the same
+/// machine is a run where the two compete. That is worth saying before twenty seconds of
+/// measurement rather than after.
+fn print_plan(args: &args::Args) {
+    match &args.load {
+        args::Load::Closed { concurrency } => println!(
+            "plan: closed-loop mode={:?} concurrency={} warmup={}s duration={}s index={}",
+            args.mode,
+            concurrency,
+            args.warmup.as_secs(),
+            args.duration.as_secs(),
+            args.index
+        ),
+        args::Load::Open(open) => {
+            let rates: Vec<String> = open
+                .steps
+                .iter()
+                .map(|step| format!("{:.0}/s", step.search.max(step.write)))
+                .collect();
+            println!(
+                "plan: open-loop mode={:?} arrival={} rate={} warmup={}s duration={}s \
+                 max-in-flight={} seed={} index={}",
+                args.mode,
+                open.arrival.name(),
+                rates.join(" → "),
+                args.warmup.as_secs(),
+                open.total_duration().as_secs(),
+                open.max_in_flight,
+                open.seed,
+                args.index
+            );
+            if client::sdk::origin_of(&args.url).contains("localhost")
+                || args.url.contains("127.0.0.1")
+                || args.url.contains("[::1]")
+            {
+                println!(
+                    "note: the node is on this machine. The generator spins to hit its arrival \
+                     times, so the two compete for cores — read the reported harness lag before \
+                     believing any number here."
+                );
+            }
+        }
+    }
 }
 
 /// Build the client. This is the whole of what an SDK consumer has to do.

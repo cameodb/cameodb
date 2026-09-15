@@ -167,7 +167,7 @@ in [BUILDING.md](BUILDING.md).
 | `crates/storage` | The redb + tantivy hybrid store |
 | `crates/cluster` | Consistent-hash ring, identity, membership |
 | `crates/mcp` | The MCP protocol layer. Deliberately holds no deployment policy — the server crate supplies authorization, rate limiting and audit through trait hooks |
-| `crates/bench` | `cameodb-bench`, the latency harness. Not shipped |
+| `crates/bench` | `cameodb-bench`, the load harness — closed-loop and open-loop. Not shipped |
 
 ## Common tasks
 
@@ -180,8 +180,34 @@ in [BUILDING.md](BUILDING.md).
 | Integration suite only | `cargo test -p server --test audit_trail` |
 | Log level | `RUST_LOG=debug cargo run --bin cameodb` |
 | Audit trail only | `RUST_LOG=warn,cameodb::audit=info` |
-| Benchmark | `cargo run --release -p bench -- --mode write --concurrency 64` |
+| Benchmark, closed loop | `cargo run --release -p bench -- --mode write --concurrency 64` |
+| Benchmark, open loop | `cargo run --release -p bench -- --mode search --rate 5000` |
+| Find the capacity knee | `cargo run --release -p bench -- --mode search --rate-steps 2000,4000,8000,16000` |
 | What scripts exist | `./scripts/setup/dev-info.sh` |
+
+## Benchmarking
+
+Two load models, and they answer different questions.
+
+`--concurrency N` is **closed-loop**: N workers each hold one request open and issue the next
+only when the last is answered. It measures service time at a fixed concurrency. Every
+performance figure in `ROADMAP.md` was taken this way, so runs are comparable to those only at
+equal concurrency. A saturated node shows up as rising latency, never as a queue, because the
+harness stops offering load exactly when the node stops keeping up.
+
+`--rate N` is **open-loop**: requests are offered on a schedule that does not wait for answers,
+so the queue is allowed to grow and that growth is the measurement. Use it for anything phrased
+as an arrival rate — "can this node take 8,000 searches a second", overload and shedding
+behaviour, or any change whose benefit depends on several requests being in flight at once.
+
+Read the verdict line before the numbers. The harness spins to hit sub-millisecond arrival
+times, so it reserves a core, and a run against a node on the same machine is a run where the
+two compete — which the tool detects and says. A step that reports `INVALID as a statement about
+the node` measured this harness, not CameoDB: lower the rate, or move the generator off-box.
+
+Latency is reported twice in open-loop mode. `service` is sent-to-answered; `total` is
+intended-send-to-answered and is the one an SLA is written against. Where they diverge, the gap
+is queueing — including any the harness itself introduced, which is what `harness lag` isolates.
 
 ## Troubleshooting
 
