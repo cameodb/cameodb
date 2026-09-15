@@ -1009,7 +1009,7 @@ produce.
 - ✅ [F7](#f7--the-request-timeout-sheds-the-client-not-the-work), **done the same day**. The
   `408` count broken out from the other outcomes, the per-second series and the co-located-harness
   verdict were between them exactly the instrument it needed: the failure is confirmed, it is
-  larger than the audit described, and it surfaced [OB13](#ob13--the-health-endpoints-exemption-from-the-concurrency-guard-does-not-protect-it)
+  larger than the audit described, and it surfaced [OB13](#ob13--the-health-endpoint-fails-under-overload-but-not-for-the-reason-it-looked-like)
   alongside. This is the item that paid for F2.
 - The audit trail's **read path**, and the trail **under a queue-overrunning workload**, which
   is the case the `gap` record exists for.
@@ -1098,11 +1098,14 @@ dequeues work that has not — so when `TimeoutLayer` (`routes.rs` 241) fires it
 future and releases the concurrency permit while the Tantivy work behind it runs to completion.
 Admission is capped (`max_concurrent_requests`); the backlog behind it is not.
 
-**Measured**, with [F2](#f2--an-open-loop-load-generator)'s open-loop generator. Apple M1 (4+4
-cores, 16 GB), release node and release harness co-located, a 200,000-document index, 4 shards,
+**Measured**, with [F2](#f2--an-open-loop-load-generator)'s open-loop generator, on two machines.
+Release node and release harness co-located in both, a 200,000-document index, 4 shards,
 `search_threads = 2`, `max_concurrent_requests = 3000`. Harness lag p99 stayed at or below 1.1ms
-on every arm, so these are node measurements and not the generator. The two columns are the same
-node, the same index and the same offered load; the only thing that differs is the timeout:
+on every M1 arm and 608µs on every M5 arm, and no arm dropped an arrival or returned an INVALID
+verdict, so these are node measurements and not the generator. The two columns are the same node,
+the same index and the same offered load; the only thing that differs is the timeout.
+
+**Apple M1** (4+4 cores, 16 GB):
 
 | offered | `request_timeout_secs = 1` | `request_timeout_secs = 300` |
 |---|---|---|
@@ -1111,13 +1114,39 @@ node, the same index and the same offered load; the only thing that differs is t
 | 3,000/s | ~0 ok/s, 44,466 × 408 | 729 ok/s, 34,232 × 503 |
 | 4,000/s | ~0 ok/s, 45,000 × 408 | 729 ok/s, 49,277 × 503 |
 
-Real capacity is ~730 searches/s, and the control column delivers it at every level of overload
-— flat, with the excess refused cleanly as 503. That is textbook graceful degradation. The left
-column is the same machine doing the same ~730 searches/s of work and delivering **none of it**,
-because every search it completes belongs to a client the timeout abandoned while it queued. The
-node is not slow and it is not idle. It is fully busy producing answers nobody is left to receive.
+**Apple M5 Pro** (5 performance + 10 efficiency cores, 24 GB) — the machine
+[F5](#f5--concurrency-sweep-measured-2026-09-02)'s sweep was taken on — same protocol, re-run
+2026-09-15:
 
-**It recovers, but not promptly.** Dropping from 3,000/s to 300/s — 41% of capacity — left
+| offered | `request_timeout_secs = 1` | `request_timeout_secs = 300` |
+|---|---|---|
+| 1,000/s | **233 ok/s**, 15,304 × 408 | **995 ok/s**, 73 × 503 |
+| 2,000/s | 1 ok/s, 39,990 × 408 | 993 ok/s, 20,137 × 503 |
+| 3,000/s | ~0 ok/s, 59,191 × 408, 1,018 × 503 | 990 ok/s, 40,400 × 503 |
+| 4,000/s | ~0 ok/s, 60,000 × 408, 20,210 × 503 | 988 ok/s, 60,452 × 503 |
+
+Real capacity is ~730 searches/s on the M1 and ~990/s on the M5, and each control column delivers
+its own capacity at every level of overload — flat, with the excess refused cleanly as 503. That
+is textbook graceful degradation. The left column is the same machine doing the same work and
+delivering **none of it**, because every search it completes belongs to a client the timeout
+abandoned while it queued. The node is not slow and it is not idle. It is fully busy producing
+answers nobody is left to receive.
+
+**A third more capacity buys no resistance to it.** The M5 reaches the same zero, one step
+later: its 1,000/s arm still clears 233 ok/s where the M1's was already at 1, and by 2,000/s the
+two are indistinguishable. What the extra capacity moves is the offered rate at which the collapse
+completes, not whether it completes — which follows from the regime condition below being a ratio,
+not a rate.
+
+The per-second series added for this measurement shows the crossover directly, on the M5 arm at
+1,000/s offered with a 1s timeout. Successes fall as timeouts climb, at a fixed offered rate:
+
+```
+         ok/s  1045 1005 1008 1012  589    0    0    0    0    0 …
+408 timeout/s     0    0    0    0  397  933 1006 1000 1031  977 …
+```
+
+**It recovers, but not promptly.** Dropping from 3,000/s to 300/s — 41% of M1 capacity — left
 goodput at zero for a further **12 seconds**, with 408s continuing at the full offered rate,
 before it returned:
 
@@ -1128,14 +1157,44 @@ ok/s       0 0 0 0 0 0 0 0 0 0 0 0 51 303 287 314 251 277 292
 So it is not permanently metastable: the backlog drains at `capacity − offered`, and the dead
 period scales with how deep admission lets the backlog get.
 
+**The M5 shortens the dead period in the direction that reading predicts.** The same 3,000/s →
+300/s drop left goodput at zero for **4 seconds**, not 12:
+
+```
+         ok/s    0    0    0    0  149  284  308  277  317  307 …
+408 timeout/s  310  303  337  293  173    0    0    0    0    0 …
+```
+
+Admission caps the backlog at 3,000 requests on both machines, so the drain is
+`3000 / (capacity − offered)`: 3000/(730−300) ≈ 7s against 3000/(990−300) ≈ 4.3s. The M1 took
+longer than its own arithmetic predicts and the M5 landed on it, which puts the dead period in the
+region the model describes without making the model exact. The operational point is unchanged
+and now has a second data point: recovery time is set by admission depth, so the same knob that
+creates the exposure also decides how long a node stays dark after the load relents.
+
 **What decides whether a node is exposed.** The regime is entered when
 `max_concurrent_requests / service_rate > request_timeout_secs`. At the 128 default against
-~730/s that is 175ms versus 30s — three orders of magnitude of headroom, which is why no
-default deployment has ever seen this and why the audit could only reason about it. The same
-machine with a 5,000-document index and 8 read threads (capacity ~9,300/s) produced **zero 408s
-across 1.7M requests** at up to 16,000/s offered, peaking at 9,697 ok/s and still serving 8,852
-ok/s under 60% overload. The danger is reached by *raising* `max_concurrent_requests`, which is
-exactly what an operator does when they start seeing 503s.
+~730/s that is 175ms versus an effective **60s** — three orders of magnitude of headroom, which
+is why no default deployment has ever seen this and why the audit could only reason about it.
+
+*The timeout a default node actually runs is 60s, not the 30s this document said.*
+`effective_request_timeout_secs` (`config.rs` 1067) honours `request_timeout_secs` only when it
+**differs** from the default of 30, and otherwise derives `max(60, max_record_size_mb / 10)`. So
+the literal value 30 is indistinguishable from leaving the key unset, and both resolve to 60 for
+any `max_record_size_mb` below 600 — so, in practice, always. `cameodb check-config` prints the
+resolved figure and was the tell. This widens the headroom rather than narrowing it, but the condition above is written in
+terms of a number the configuration file cannot currently express, which is worth knowing before
+anyone tunes against it.
+
+Both machines confirm the headroom, and the M5 widens it. The M1 with a 5,000-document index and
+8 read threads (capacity ~9,300/s) produced **zero 408s across 1.7M requests** at up to 16,000/s
+offered, peaking at 9,697 ok/s and still serving 8,852 ok/s under 60% overload. The M5 at the same
+settings has a knee at **~26,500/s** — 16,000/s is not yet overload for it, sustained with 16
+requests in flight against the admission ceiling of 128 — and produced **zero 408s across
+3,658,940 requests** offered up to 50,000/s, holding 24,385 ok/s while refusing 51% as 503.
+
+The danger is reached by *raising* `max_concurrent_requests`, which is exactly what an operator
+does when they start seeing 503s.
 
 **What to fix, in the order the measurement argues for.**
 
@@ -1818,8 +1877,13 @@ that "a load balancer would [not] evict a node that was merely busy". `TimeoutLa
 so a health request skips the semaphore and is still wrapped by the timeout. That much is
 factually true. The inference — that reordering the layers would fix it — is not.
 
-**Measured.** Health probed every 0.2–1s while the node was driven open-loop, M1, release
-binaries co-located, 5,000- and 200,000-document indices:
+**Measured.** Health probed every 0.2–1s from a process separate from the load generator, while
+the node was driven open-loop with release binaries co-located, 5,000- and 200,000-document
+indices. The `timeout` column is the configured value; at the 128-admission rows the value the
+node resolved is 60s either way — see the derivation noted in
+[F7](#f7--the-request-timeout-sheds-the-client-not-the-work), which `check-config` prints.
+
+**Apple M1** (4+4 cores, capacity ~9,300/s at 5k and 8 read threads):
 
 | admission | timeout | index | offered | health p50 | max | codes |
 |---|---|---|---|---|---|---|
@@ -1831,17 +1895,41 @@ binaries co-located, 5,000- and 200,000-document indices:
 | 3000 | 300s | 200k | 3,000/s | 117.6ms | 119.4ms | all 200 |
 | 3000 | **1s** | 200k | 3,000/s | **1001.8ms** | 1002.5ms | **all 408** |
 
-**It does not reproduce at defaults.** 21ms worst case at 50% past the knee, every probe 200. No
-load balancer evicts on that, and the exemption is doing its job.
+**Apple M5 Pro** (5+10 cores, capacity ~26,500/s at 5k and 8 read threads), 2026-09-15. The
+overload rows are placed at this machine's own knee rather than at the M1's absolute rate, since
+14,000/s is comfortably *below* it here and would not be an overload row at all:
 
-**The last two rows are the finding.** They are the same node, the same index, the same offered
-rate and the same admission depth. The only difference is `request_timeout_secs`, and it moves
-health from a comfortable 118ms to a hard 408. So the queue is not what health is waiting behind
-— the anonymous body is built from atomics and never reaches the read pool (`health.rs` 78-81),
-which the 118ms row confirms directly. What starves it is the **churn**: at a 1s timeout the node
-fires ~3,000 timeouts a second, and each one drops a future, builds a 408, releases a permit and
-admits a replacement. That recycling saturates the request runtime, and the health task cannot
-get a worker slot.
+| admission | timeout | index | offered | health p50 | max | codes |
+|---|---|---|---|---|---|---|
+| — | — | 5k | idle | 1.9ms | 28.1ms | all 200 |
+| **128 (default)** | 30s | 5k | 4,000/s | 0.6ms | 4.4ms | all 200 |
+| **128 (default)** | 30s | 5k | 9,000/s | 0.7ms | 4.5ms | all 200 |
+| **128 (default)** | 30s | 5k | 14,000/s | 0.8ms | 5.1ms | all 200 |
+| **128 (default)** | 30s | 5k | 40,000/s *(50% past knee)* | 3.1ms | 7.8ms | all 200 |
+| 3000 | 300s | 5k | 40,000/s | 3.3ms | 7.0ms | all 200 |
+| 3000 | 300s | 200k | 3,000/s | 76.2ms | 80.8ms | all 200 |
+| 3000 | **1s** | 200k | 3,000/s | **1001.5ms** | 1012.9ms | **all 408** |
+
+**It does not reproduce at defaults, on either machine.** 21ms worst case on the M1 and 7.8ms on
+the M5, both at 50% past their own knee, every probe 200. No load balancer evicts on that, and the
+exemption is doing its job. The M5's 28.1ms idle maximum is its first probe against a cold
+process and is the largest number in its column — which is the sense of scale to keep when reading
+the overload rows beneath it.
+
+**The last two rows of each table are the finding**, and they reproduce across a hardware
+generation. They are the same node, the same index, the same offered rate and the same admission
+depth. The only difference is `request_timeout_secs`, and it moves health from a comfortable
+118ms (M1) or 76ms (M5) to a hard 408 at ~1001ms on both. So the queue is not what health is
+waiting behind — the anonymous body is built from atomics and never reaches the read pool
+(`health.rs` 78-81), which those 118ms and 76ms rows confirm directly. What starves it is the
+**churn**: at a 1s timeout the node fires ~3,000 timeouts a second, and each one drops a future,
+builds a 408, releases a permit and admits a replacement. That recycling saturates the request
+runtime, and the health task cannot get a worker slot.
+
+**That the 408 latency is ~1001ms on both machines, while the healthy latency differs by 1.5×, is
+itself the evidence.** Health is not being made slow and then timing out; it is waiting out the
+timeout exactly, because it never runs at all until the deadline fires. Hardware moves the 76ms
+against 118ms and leaves the 1001ms where it is.
 
 Which is [F7](#f7--the-request-timeout-sheds-the-client-not-the-work)'s own mechanism, seen from
 the side. **Reordering the layers would not have helped**: it would convert a 408 into a >1s 200,
