@@ -41,7 +41,7 @@ use crate::http_server::write::{
     bulk_delete_handler, bulk_write_handler, delete_document_handler, write_handler,
     write_stream_handler,
 };
-use crate::node_orchestrator::REQUEST_STARTED_AT;
+use crate::node_orchestrator::{OpClass, REQUEST_STARTED_AT};
 use crate::state::AppState;
 
 /// What the surface in front of the handlers is configured with.
@@ -97,14 +97,48 @@ pub fn create_router(
     // The liveness endpoint is exempt. Sharing the semaphore with it meant a node under
     // load answered its own health check with 503, so a load balancer would evict a node
     // that was merely busy — turning local overload into a cluster-wide outage.
+    //
+    // Beside it, and tighter: a permit count is a bound on requests, not on the work they
+    // imply. At 3,000 permits against a node that serves ~730 searches/s, a full house is
+    // about four seconds of backlog against a one-second budget, so most of what the
+    // semaphore admits is already doomed — it just takes a body read, a parse and a trip to a
+    // worker to find out. `QueueLoad` is the pool's own estimate of that backlog, and asking
+    // it here refuses the same request for the price of a few atomic loads. See ROADMAP F7.
     let semaphore = Arc::new(Semaphore::new(max_concurrent_requests));
+    let queue_load = state.queue_load.clone();
     let concurrency_guard = from_fn(move |req: axum::extract::Request, next: Next| {
         let sem = semaphore.clone();
+        let queue_load = queue_load.clone();
         async move {
             // Health checks may arrive with or without a trailing slash; exempt them all so a
             // load balancer's probe is never starved out by ordinary traffic.
-            if req.uri().path().trim_end_matches('/') == HEALTH_PATH {
+            let path = req.uri().path().trim_end_matches('/');
+            if path == HEALTH_PATH {
                 return next.run(req).await;
+            }
+            // `/_admin/*` is exempt from the backlog gate, though not from the semaphore. It
+            // is how an operator reads `refused_at_admission` and the queue depth, and a node
+            // that stops answering the endpoint explaining why it is refusing is a node that
+            // cannot be diagnosed at the one moment it needs to be — the same mistake OB13
+            // was, arrived at from the other direction.
+            if !path.starts_with("/_admin/")
+                && let Some(load) = queue_load.as_ref()
+                && let Some(predicted) = load.would_refuse(OpClass::Any)
+            {
+                // `refuse` counts it and builds the one refusal text — the dispatch path
+                // answers with the same error, so the two layers cannot drift.
+                let err = load.refuse(predicted);
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    // When the predicted backlog clears, not a fixed delay — a client retrying
+                    // sooner than this is coming back into the overload it was shed from.
+                    [(
+                        header::RETRY_AFTER,
+                        load.retry_after_secs(predicted).to_string(),
+                    )],
+                    err.to_string(),
+                )
+                    .into_response();
             }
             match sem.try_acquire() {
                 Ok(_permit) => next.run(req).await,
@@ -112,7 +146,7 @@ pub fn create_router(
                     StatusCode::SERVICE_UNAVAILABLE,
                     // Without this, clients retry immediately and deepen the overload.
                     [(header::RETRY_AFTER, "1")],
-                    "Too many concurrent requests",
+                    "Too many concurrent requests".to_string(),
                 )
                     .into_response(),
             }
@@ -236,11 +270,11 @@ pub fn create_router(
         .layer(RequestBodyLimitLayer::new(body_limit_bytes))
         // Concurrency guard — reject excess requests with 503
         .layer(concurrency_guard)
-        // Stamp request arrival for the deadline checks downstream — the dispatch path and
-        // the worker dequeue check both measure spent budget against this instant. Just
-        // inside the timeout layer, so the stamp and the client's deadline start together —
-        // a request that spent its budget being received (a max-size record at the derived
-        // timeout) is refused as stale work rather than given a fresh budget.
+        // Stamp request arrival for the deadline checks downstream: the admission gate above,
+        // the dispatch path, and the worker dequeue check all measure spent budget against
+        // this instant. Just inside the timeout layer, so the stamp and the client's deadline
+        // start together — a request that spent its budget being received (a max-size record
+        // at the derived timeout) is refused as stale work rather than given a fresh budget.
         .layer(from_fn(
             |req: axum::extract::Request, next: Next| async move {
                 REQUEST_STARTED_AT

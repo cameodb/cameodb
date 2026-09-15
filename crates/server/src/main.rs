@@ -499,6 +499,9 @@ async fn main() -> Result<()> {
     // writer liveness with an atomic load rather than a message the work path could delay.
     let writer_liveness = orchestrator.writer_liveness();
     let read_pool_health = orchestrator.read_pool_health();
+    // Same reason, and the admission guard needs it on every request: the backlog estimate the
+    // front door refuses against, so an overloaded node says no before reading a body.
+    let queue_load = orchestrator.queue_load();
 
     // NOW spawn the NodeOrchestrator as an actor (after all setup is done)
     let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
@@ -637,6 +640,7 @@ async fn main() -> Result<()> {
         audit: Arc::clone(&audit_sink),
         writer_liveness,
         read_pool_health,
+        queue_load,
     };
 
     // Create the HTTP router with shared state and body limit derived from max_record_size_mb

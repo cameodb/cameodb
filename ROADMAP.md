@@ -1243,9 +1243,85 @@ at the more conservative uncapped reserve. Both are the same dial. Whether the f
 tuned further, or replaced by a percentile of the service distribution rather than twice its
 mean, is open and is the obvious next measurement.
 
-2. **Bound the read-pool backlog** so excess load is refused at admission rather than queued
-   behind a semaphore that only counts requests, not the work they imply. Still open, and now
-   the thing standing between ~555/s and ~730/s.
+**Fix 2 — bound the backlog at admission. ✅ Done 2026-09-15**, and like fix 1 it corrected
+the entry that asked for it — this time about why it was worth doing.
+
+Admission counts requests, not the work they imply: `max_concurrent_requests` at 3,000 against
+~500 searches/s is seconds of backlog against a one-second budget. `QueueLoad` turns the
+accounting the pool already keeps — a single pool-wide `outstanding` counter, maintained where
+jobs are handed to and leave the workers, and fix 1's service estimates — into Little's law,
+and both the HTTP admission guard (`routes.rs`) and the dispatch path refuse against it before
+a body is read. The door does not know the routed class, so it judges on the blended estimate;
+the worker rechecks against its own. The estimate is the pool's own; nothing new is measured.
+
+*The premise was wrong.* This entry said fix 2 was "the thing standing between ~555/s and
+~730/s". It is not, and the ~730/s control it was measured against does not reproduce. Re-run
+2026-09-15 on the same M1, same 200k index, same settings, the 300s-timeout control now serves
+**417/s** in steady state where fix 1 alone serves **553/s** — fix 1 is *faster* than the
+control, so the gap fix 2 was supposed to close is not there in the form described. What the
+earlier column measured was a less-loaded machine, and the two sessions' absolute numbers are
+not comparable. Only same-session comparisons below.
+
+*And the difference it does make to throughput is below this machine's noise floor.* The same
+binary run back to back at 1,000/s offered gave 533/s and 494/s in steady state — an 8% spread,
+which is wider than every difference between fix 1 and fix 2 measured here. Anything at the
+few-percent level on this box is not a result.
+
+**Measured, M1, 200k index, `request_timeout_secs = 1`, `max_concurrent_requests = 3000`,
+`search_threads = 2`. Steady-state ok/s, not the run mean — the mean is dominated by the
+opening second, where an unbounded queue absorbs a burst it will answer far too late.**
+
+| offered | control (300s timeout) | fix 1 | fix 2 |
+|---|---|---|---|
+| 300/s | — | 301 ok/s, p99 10.4ms, 0 shed | 299 ok/s, p99 14.4ms, **0 shed** |
+| 1,000/s | 417/s, p50 **7,106ms** | 553/s, p50 880ms | 521/s (494–536), p50 836ms |
+| 3,000/s | 410/s, p50 **7,314ms** | 425/s, p50 850ms | 410/s, p50 782ms |
+
+So on throughput and latency fix 2 changes nothing measurable. What it changes is categorical:
+
+- **Where the refusal happens.** Under fix 1 at 3,000/s the node refused 133,039 jobs at a
+  worker and none at the door; under fix 2, 19,112 at the door against 144 at the worker. The
+  dequeue check has become the backstop it was meant to be, and a refused request no longer
+  pays for its body, its parse, a permit and a channel hop first. On this workload — searches
+  with tiny bodies — that saving is not visible. On a write it is the body.
+- **What the client is told.** `503 Overloaded: a 832ms backlog against a 1000ms request`
+  instead of `read abandoned`, and every `503` this node raises now carries `Retry-After`. The
+  admission guard always did; a refusal arriving through `AppError` did not, so the same
+  condition advised the caller differently depending on which layer noticed it. Where the
+  refusal is made on a predicted wait the header carries that wait, so a retry lands after the
+  backlog rather than back inside it; where it is not, a second stands in.
+- **A queue with no deadline check, closed.** A full worker queue used to divert to the actor
+  mailbox: capacity 64, `ask` *waits* rather than failing, serialised through one task, and
+  nothing on that path checks a budget — F7's mechanism intact in the overflow lane. It is
+  refused instead. Worth knowing that it was never reached in any arm measured here, before or
+  after: `actor_mailbox_fallbacks` stayed at 0 even at 4,000/s against 8,192 permits, because
+  fix 1's dequeue refusal drains the worker queues faster than admission can fill them. This is
+  a hole closed on the code, not on evidence of it being entered.
+- **The node reports the number it is refusing on.** `queue_depth` and `predicted_wait_ms` in
+  health, `dispatch.refused_at_admission` in `/_admin/workers`.
+
+*A shallower queue is a slower one, which is why the target is the deadline and not a fixed
+lookahead.* Bounding the backlog to one service round served 417/s, two rounds 443/s, and the
+depth the deadline rule settles on ~521/s; the 3,000-deep control, 417/s. Throughput is not
+monotonic in queue depth — too shallow starves the pool, too deep thrashes — and the deadline
+rule lands near the optimum without a tuning constant. A door *weaker* than the worker was also
+tried, refusing only at `predicted > budget` and leaving anything marginal to the worker: 424/s,
+20% down and well outside the noise band, because letting the queue grow past what the worker
+will accept only means refusing the same requests later.
+
+**Recovery was already fixed by fix 1, not by this.** The 3,000/s → 300/s drop that once left
+goodput at zero for 12 seconds now returns 310 ok/s in the first second at p50 7ms, and does so
+identically with and without fix 2.
+
+**[OB13](#ob13--the-health-endpoint-fails-under-overload-but-not-for-the-reason-it-looked-like)
+re-verified**: 14 of 14 probes `200` under 3,000/s, p50 52.8ms. `/_admin/*` is exempt from the
+backlog gate for the same reason health is exempt from the semaphore — a node that stops
+answering the endpoint that explains why it is refusing cannot be diagnosed at the one moment it
+matters.
+
+Not measured: whether the earlier refusal pays for itself on a large-body write workload, which
+is the case it was built for and the one arm here does not cover.
+
 3. **Warn on the ratio.** `cameodb check-config` already reasons about
    `max_concurrent_requests × body limit` against the memory budget; the same place can say that
    admission divided by a plausible service rate exceeds the request timeout.

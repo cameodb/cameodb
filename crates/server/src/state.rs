@@ -8,7 +8,7 @@ use kameo::actor::ActorRef;
 use std::sync::Arc;
 
 use crate::cluster_coordinator::ClusterCoordinator;
-use crate::node_orchestrator::{ReadPoolHealth, RouterActor, WriterLiveness};
+use crate::node_orchestrator::{QueueLoad, ReadPoolHealth, RouterActor, WriterLiveness};
 use crate::ratelimit::ToolRateLimiter;
 
 /// Application state shared across handlers
@@ -50,4 +50,11 @@ pub struct AppState {
     /// This node's read-pool health. The health endpoint reads it the same non-blocking way for
     /// the saturation gauge and to turn the node red when the pool has wedged.
     pub read_pool_health: Arc<ReadPoolHealth>,
+    /// This node's estimate of how long a request arriving now would wait before a worker
+    /// started it. The admission guard refuses against it before reading a body, and health
+    /// reports it so an operator sees the number the refusals are being made on.
+    ///
+    /// `None` when there is no worker pool to predict — nothing to estimate, and the guard
+    /// stays out of the way.
+    pub queue_load: Option<Arc<QueueLoad>>,
 }
