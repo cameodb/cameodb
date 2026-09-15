@@ -541,6 +541,48 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
         },
     );
 
+    // --- Overload regime --------------------------------------------------------
+    // ROADMAP F7's condition, which the two fixes to it mitigate but do not remove: when
+    // `max_concurrent_requests / service_rate > request_timeout_secs`, admission lets in more
+    // work than the budget can cover, and the request timeout rather than the admission guard
+    // becomes what decides which requests are shed.
+    //
+    // The tool cannot know a node's service rate, and a constant standing in for it would be
+    // wrong for somebody. So the condition is inverted: divide admission by the timeout and
+    // report the rate *at which the configuration enters the regime*. That is arithmetic with
+    // no assumption in it, and it hands the operator a number to check against a node they can
+    // measure — `jobs_completed` on `/_admin/workers`, or a benchmark.
+    //
+    // The one judgement left is where to warn, and F7's own arms set it: the slowest steady
+    // state measured there was ~410 searches/s, on an M1 with a 200k-document index and
+    // `search_threads = 2` under 3x overload. A node asked to beat 500/s to stay out of the
+    // regime is therefore being asked for more than this project has measured on its slowest
+    // arm, which is the point at which saying so is worth an operator's attention.
+    const MEASURED_SLOWEST_SEARCH_RATE: u64 = 500;
+    let timeout_secs = config.effective_request_timeout_secs().max(1);
+    // Round up: the rate the node has to *beat*, not merely reach.
+    let regime_rate = (http.max_concurrent_requests as u64).div_ceil(timeout_secs);
+    push(
+        "overload",
+        if regime_rate > MEASURED_SLOWEST_SEARCH_RATE {
+            Outcome::Warn(format!(
+                "max_concurrent_requests ({}) against a {}s request timeout admits more work \
+                 than the budget covers unless this node serves over {} requests/s. Below \
+                 that, the timeout rather than admission decides what is shed, and goodput \
+                 falls well under capacity while clients wait the full budget to be refused. \
+                 Lower network.http.max_concurrent_requests, or raise \
+                 network.http.request_timeout_secs. Measure the node's real rate from \
+                 jobs_completed on /_admin/workers",
+                http.max_concurrent_requests, timeout_secs, regime_rate
+            ))
+        } else {
+            Outcome::Pass(format!(
+                "{} concurrent / {}s timeout = safe above {} requests/s",
+                http.max_concurrent_requests, timeout_secs, regime_rate
+            ))
+        },
+    );
+
     Ok(Posture {
         profile,
         inferred,
@@ -705,6 +747,75 @@ mod tests {
             .find(|c| c.rule == rule)
             .unwrap_or_else(|| panic!("no rule named {rule}"))
             .outcome
+    }
+
+    /// ROADMAP F7's regime condition, as `check-config` can see it.
+    ///
+    /// A default node is three orders of magnitude clear of it, which is why the failure was
+    /// only ever reached deliberately and why this rule must stay quiet by default.
+    #[test]
+    fn a_default_node_is_nowhere_near_the_overload_regime() {
+        let config = config_for(None, "127.0.0.1");
+        match outcome_for(&config, "overload") {
+            Outcome::Pass(message) => assert!(
+                message.contains("safe above 3 requests/s"),
+                "128 permits over a 60s timeout is 3/s: {message}"
+            ),
+            other => panic!("a default node must not warn: {other:?}"),
+        }
+    }
+
+    /// The configuration F7 was measured on: 3,000 permits against a 1s timeout asks the node
+    /// for 3,000 requests/s, where the machine it was measured on served ~410.
+    #[test]
+    fn the_configuration_f7_was_measured_on_is_called_out() {
+        let mut config = config_for(None, "127.0.0.1");
+        config.network.http.max_concurrent_requests = 3000;
+        config.network.http.request_timeout_secs = Some(1);
+        match outcome_for(&config, "overload") {
+            Outcome::Warn(message) => {
+                assert!(message.contains("3000 requests/s"), "{message}");
+                assert!(
+                    message.contains("max_concurrent_requests")
+                        && message.contains("request_timeout_secs"),
+                    "the warning must name both knobs that settle it: {message}"
+                );
+            }
+            other => panic!("expected a warning: {other:?}"),
+        }
+    }
+
+    /// The way an operator actually arrives here, named in F7: raising admission because the
+    /// node is answering 503. Nothing else about the configuration changes.
+    #[test]
+    fn raising_admission_alone_walks_a_safe_node_into_the_regime() {
+        let mut config = config_for(None, "127.0.0.1");
+        assert!(matches!(outcome_for(&config, "overload"), Outcome::Pass(_)));
+
+        config.network.http.max_concurrent_requests = 60_000;
+        assert!(
+            matches!(outcome_for(&config, "overload"), Outcome::Warn(_)),
+            "60,000 permits over a 60s timeout asks for 1,000/s and should be called out"
+        );
+
+        // And the other knob settles it, which is what makes the advice actionable rather
+        // than a complaint: the same admission against a longer budget is fine.
+        config.network.http.request_timeout_secs = Some(600);
+        assert!(matches!(outcome_for(&config, "overload"), Outcome::Pass(_)));
+    }
+
+    /// The threshold is a rate the node must *beat*, so the arithmetic rounds up rather than
+    /// truncating a fractional rate down into a pass.
+    #[test]
+    fn the_regime_rate_rounds_up_rather_than_flattering_the_configuration() {
+        let mut config = config_for(None, "127.0.0.1");
+        config.network.http.request_timeout_secs = Some(2);
+        config.network.http.max_concurrent_requests = 1001;
+        // 1001/2 = 500.5, which must not truncate to exactly the 500 that passes.
+        match outcome_for(&config, "overload") {
+            Outcome::Warn(message) => assert!(message.contains("501 requests/s"), "{message}"),
+            other => panic!("expected a warning: {other:?}"),
+        }
     }
 
     /// The `auth` outcome for a config.

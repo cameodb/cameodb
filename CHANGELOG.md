@@ -53,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queue used to divert to the actor mailbox, which waits for a slot rather than failing and
   checks no budget on the way through.
 
+- **`cameodb check-config` now says when admission is set wider than the request timeout can
+  cover.** The new `overload` rule divides `max_concurrent_requests` by the timeout to give the
+  rate the node has to beat to stay out of the regime where the timeout, rather than the
+  admission guard, decides what gets shed. No service rate is assumed — the tool cannot know
+  one, so it reports the threshold and names both knobs that move it. A default node sits three
+  orders of magnitude clear and the rule stays quiet; it speaks up on the configuration an
+  operator reaches by raising `max_concurrent_requests` because the node is answering 503,
+  which is exactly the way into the problem.
+
 - **Every `503` this node raises now carries `Retry-After`, and where the refusal knows its
   backlog the header says when it clears.** The admission guard always did; a refusal arriving
   through the error path — an overloaded pool, an unreachable peer, an unconfirmed schema — did

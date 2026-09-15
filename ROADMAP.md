@@ -163,7 +163,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F4](#f4--the-bulk-paths-asked-the-coordinator-before-they-knew-they-needed-to) | The bulk paths asked the coordinator before they knew they needed to | — | 2026-09-02 | ✅ |
 | [F5](#f5--concurrency-sweep-measured-2026-09-02) | Concurrency sweep on the release build — the operating point, and bulk's serialization measured | — | 2026-09-02 | ✅ |
 | [F6](#f6--what-fsync-actually-costs-measured-2026-09-02) | What fsync actually costs — and why turning it off is a reallocation, not a speedup | — | 2026-09-02 | ✅ |
-| [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) | The request timeout sheds the client, not the work — measured: goodput goes to zero, not down | — | 2026-09-15 | ⚠️ |
+| [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) | The request timeout sheds the client, not the work — measured: goodput goes to zero, not down | — | 2026-09-15 | ✅ |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
 | [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8 and CH9 done, CH12 partial | — | 2026-09-01 | ◐ |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
@@ -1322,9 +1322,38 @@ matters.
 Not measured: whether the earlier refusal pays for itself on a large-body write workload, which
 is the case it was built for and the one arm here does not cover.
 
-3. **Warn on the ratio.** `cameodb check-config` already reasons about
-   `max_concurrent_requests × body limit` against the memory budget; the same place can say that
-   admission divided by a plausible service rate exceeds the request timeout.
+**Fix 3 — warn on the ratio. ✅ Done 2026-09-15.** `cameodb check-config` gained an `overload`
+rule, beside the `limits` rule that already weighs `max_concurrent_requests × body limit`
+against the memory budget.
+
+*The ratio could not be checked the way this entry asked for it.* It wanted admission divided
+by "a plausible service rate" compared against the timeout, but the tool cannot know a node's
+service rate, and any constant standing in for one is wrong for somebody — the measurements in
+this entry alone span 410/s and 26,500/s on the same code. So the condition is inverted:
+`max_concurrent_requests / request_timeout_secs` is the rate *at which the configuration enters
+the regime*, which is arithmetic with no assumption in it, and the operator is handed that
+number to check against a node they can measure.
+
+The one judgement left is where to warn, and F7's own arms set it: 500/s, just above the ~410/s
+slowest steady state measured here (M1, 200k documents, `search_threads = 2`, 3x overload). A
+configuration asking the node to beat that is asking for more than this project has measured on
+its slowest arm.
+
+```
+[PASS] overload    128 concurrent / 30s timeout = safe above 5 requests/s
+[WARN] overload    max_concurrent_requests (3000) against a 1s request timeout admits more
+                   work than the budget covers unless this node serves over 3000 requests/s...
+```
+
+A default node is three orders of magnitude clear of it, which is why the failure was only ever
+reached deliberately and why the rule stays quiet by default. The warning names both knobs that
+settle it, and a test pins the route an operator actually takes into the regime — raising
+`max_concurrent_requests` because the node is answering 503, with nothing else changed.
+
+**F7 is now closed.** All three fixes are in, and what each was for is worth keeping distinct:
+fix 1 is the one that recovered goodput and recovery time, fix 2 moved the refusal to the door
+and closed a queue that checked no deadline, and fix 3 is what tells an operator they are
+walking into it. Two of the three entries were wrong about their own premise until measured.
 
 A second guard remains in `dispatch_read_pool` against the full budget, for a configuration
 where the read pool rather than the worker channel is the deep queue. It did not fire in any
