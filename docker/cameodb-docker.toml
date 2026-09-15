@@ -14,7 +14,10 @@ profile = "internal"
 [network.http]
 bind_address = "0.0.0.0"
 port = 9480
-request_timeout_secs = 30
+# Request timeout. Unset, it is derived from limits.max_record_size_mb as
+# max(60, max_record_size_mb / 10) — 60s at the default record size. Write it only to
+# override that; `cameodb check-config` reports which of the two is in force.
+# request_timeout_secs = 60
 # In-flight bodies are held in memory, so this multiplied by the body ceiling has to fit
 # inside limits.total_memory_limit_mb below. 32 x 128 MB = 4096 MB, which is exactly the
 # budget; `cameodb check-config` warns when the product exceeds it. Raise them together.

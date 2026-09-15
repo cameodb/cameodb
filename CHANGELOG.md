@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`request_timeout_secs = 30` now means 30 seconds.** The setting was read as a `u64`
+  defaulting to 30, and "differs from the default" stood in for "the operator set it" — so 30,
+  the one value the file could not express, resolved to the derived `max(60,
+  max_record_size_mb / 10)` instead. It is `Option<u64>` now: written is honoured, absent is
+  derived, and no value is reserved.
+
+  **This changes what a node runs.** All three shipped example configs wrote exactly `30`, so
+  anyone who started from one has been running 60s and will now run 30s. At the default 64 MB
+  record size a record needs ~6s on the wire, so 30s remains ample; the setting is worth
+  re-reading on a node whose `max_record_size_mb` is above 300 MB, where 30s is below what a
+  maximum-size record needs. The examples no longer write the key, `cameodb check-config`
+  reports `timeout 60s (derived)` or `(set)`, and a written timeout under
+  `max_record_size_mb / 10` is warned about at startup — warned, not refused, since a node that
+  serves searches and accepts no large writes is entitled to a short timeout.
+
+  `network.cluster.messaging.request_timeout_secs` had the same defect and the same fix. It
+  also had a consumer that bypassed the resolution entirely: `RouterActor` read the raw field,
+  so a default node forwarded between nodes with a 30s deadline underneath a 60s HTTP timeout,
+  abandoning forwarded work while the client that asked for it was still waiting. Unset, the
+  remote deadline now follows the HTTP one as it was always documented to.
+
+### Added
+
+- **`--request-timeout-secs` / `CAMEODB_REQUEST_TIMEOUT_SECS`.** The timeout was reachable only
+  by editing a config file, while the limit it interacts with most —
+  `--max-concurrent-requests` — already had both.
+
 ## [0.3.4] - 2026-09-07
 
 ### Changed
