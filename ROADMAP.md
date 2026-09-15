@@ -80,7 +80,9 @@ item by item against the tree; six corrections, all of them recorded in place be
 
 Everything else verified as the file described it: no `search_after`, no `sched_setaffinity`,
 no per-arena `mallctl`, no reindex path, `should_commit_writer` still counts operations only,
-`cameodb-bench` still closed-loop, and the four code-health duplications all still present.
+`cameodb-bench` still closed-loop (it grew an open-loop mode later — see
+[F2](#f2--an-open-loop-load-generator), 2026-09-15), and the four code-health duplications all
+still present.
 
 ## Reconciliation, 2026-09-01
 
@@ -156,7 +158,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [E3](#e3--measure-recovery-on-the-reporting-node) | Measure recovery on the reporting node | 16 | 2026-08-19 | 📋 |
 | [E4](#e4--two-compatibility-paths-with-no-end-to-end-test) | Two compatibility paths with no end-to-end test | 16 | 2026-08-19 | 📋 |
 | [F1](#f1--the-cost-of-a-durable-commit-under-read-load) | The cost of a durable commit under read load | — | 2026-08-10 | 📋 |
-| [F2](#f2--an-open-loop-load-generator) | An open-loop load generator | — | 2026-08-10 | 📋 |
+| [F2](#f2--an-open-loop-load-generator) | An open-loop load generator | — | 2026-09-15 | ✅ |
 | [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator — standalone half done | — | 2026-08-10 | ◐ |
 | [F4](#f4--the-bulk-paths-asked-the-coordinator-before-they-knew-they-needed-to) | The bulk paths asked the coordinator before they knew they needed to | — | 2026-09-02 | ✅ |
 | [F5](#f5--concurrency-sweep-measured-2026-09-02) | Concurrency sweep on the release build — the operating point, and bulk's serialization measured | — | 2026-09-02 | ✅ |
@@ -829,8 +831,9 @@ concurrent writes, and the point at which every extra client is queueing rather 
 bulk specifically, lower — concurrency buys nothing there at all.
 
 **Not measured, and it matters:** every figure here is closed-loop service time at a fixed
-concurrency, which is what [F2](#f2--an-open-loop-load-generator) exists to fix. None of it is an
-arrival-rate SLA.
+concurrency. None of it is an arrival-rate SLA.
+[F2](#f2--an-open-loop-load-generator) landed on 2026-09-15 and can produce one; this sweep has
+not been re-run against it, and the numbers above stay as they were taken.
 
 **Re-measured 2026-09-06 on the unwind build, and the figures above stand.** Every number in this
 sweep was taken on a `panic = "abort"` binary, three days before `2c53e97` set the release profile
@@ -942,20 +945,75 @@ also records why the linger cannot be rebuilt from that reasoning alone.
 
 ### F2 — An open-loop load generator
 
-📋 **Planned**, and a prerequisite for three other items. `cameodb-bench` is closed-loop by
-construction and says so in its own help text — verified 2026-08-26 — which means it measures
-service time at a fixed concurrency and cannot produce an independent arrival process.
+✅ **Done** 2026-09-15. `cameodb-bench --rate` offers requests on a schedule that does not
+wait for answers. The closed-loop path is untouched and still the default, because every figure
+in this section was taken with it and they stay comparable only if a bare invocation keeps
+meaning what it meant.
 
-Blocking:
+**What it produces that the closed-loop mode could not.**
 
-- [F1](#f1--the-cost-of-a-durable-commit-under-read-load), and any revisit of the bounded
-  linger, which is *provably* untestable against a closed-loop client
-- The audit trail's **read path**, where a record really is serialized per request, and the
-  trail **under a queue-overrunning workload**, which is the case the `gap` record exists for
-- [A3](#a3--protocol-compliance-tests-and-agent-query-benchmarks)'s agent-query latency figures
+- **An arrival process.** Exponential inter-arrival gaps (`--arrival poisson`, the default) or
+  exact spacing (`uniform`), seeded so two runs offer the same load. A saturated node now shows
+  as a growing queue rather than as a shrinking offered rate — closed-loop, a node that slows
+  down simply receives less work, which is why the overload never appeared.
+- **Latency from the intended send time.** Reported as `total`, beside `service` (sent →
+  answered) and the `harness lag` between them. Where they diverge the difference is queueing,
+  and reporting only the first is the coordinated omission the mode exists to remove.
+- **Outcomes told apart.** `503` (the concurrency guard refusing admission), `408` (the request
+  timeout abandoning a client), `429`, any other status, and transport failures are counted
+  separately. They were one `errors` number, which is exactly the number an overload run needs
+  broken down. The status comes from `client::HttpFailure` rather than from parsing the message.
+- **A verdict per step**, which refuses to present a number as an SLA point when it is not one.
+  The harness is judged first and hardest: any arrival dropped at the `--max-in-flight` ceiling,
+  or a p99 lag over 5ms, reports `INVALID as a statement about the node`. A generator that
+  cannot keep its own schedule is measuring itself, and it shares a machine with the node.
+- **A per-second series**, so a rate that holds and a rate that decays through the run are
+  distinguishable. They have the same average.
+- **Ramps.** `--rate-steps 1000,2000,4000` finds the knee in one pass.
 
-It is worth having on its own account regardless: every performance number in this document is
-closed-loop, and each one should say so.
+**How it hits sub-millisecond arrival times.** Tokio's timer ticks at about a millisecond and
+gaps at interesting rates are tens of microseconds, so the loop sleeps only while the next
+arrival is far off and spins the last 1.5ms. That reserves a core, which is why harness lag is
+reported beside every latency and why the tool says so when the node is on the same machine.
+
+**The arrival schedulers get their own threads, and that was a finding rather than a detail.**
+Sharing a runtime with the response handlers means the busier the node's answers make this
+process, the later the generator dispatches — so the offered rate quietly falls exactly when the
+node is under most load. That is the closed-loop coupling this mode exists to remove,
+reintroduced through the scheduler. Measured, on a loopback node at 3,000/s: p99 lag **49.45ms**
+sharing the runtime against **2.33ms** with one thread per active scheduler and requests
+dispatched onto the main runtime through its handle. The first run was reported `INVALID`; the
+second produced a capacity answer. The guard caught its own harness, which is the argument for
+having it.
+
+**Smoke-checked** on loopback, release harness against a debug node (so the node's absolute
+numbers mean nothing — the harness behaviour is the point):
+
+| offered | arrivals | ok/s | shed (503) | in flight peak | lag p50 / p99 | verdict |
+|---|---|---|---|---|---|---|
+| 500/s | 3,058 | 510 | 0 | 18 | 30µs / 1.70ms | sustained |
+| 3,000/s | 17,968 | 1,881 | 6,681 | 241 | 77µs / 2.33ms | node declined 37.2% |
+
+Both runs offered exactly what the rate asked for and the 3,000/s run reproduced its arrival
+count across rebuilds, which is what the seed is for. The in-flight peak of 241 against the
+node's admission limit of 128 is the shape an open-loop run is supposed to show: requests
+outstanding at the client while the node refuses them, which no closed-loop configuration can
+produce.
+
+**What it unblocks, none of it measured yet:**
+
+- [F1](#f1--the-cost-of-a-durable-commit-under-read-load), and the bounded linger, which was
+  rejected on arithmetic computed from a closed-loop rate — 0.046 writes arriving at a shard per
+  200µs window at c16. Poisson arrivals are the condition it needed and never had.
+- [F7](#f7--the-request-timeout-sheds-the-client-not-the-work). Sustained overload plus the
+  `408` count plus the per-second series is the instrument for the metastable failure: a rate
+  that decays through a fixed-λ run is the signature.
+- The audit trail's **read path**, and the trail **under a queue-overrunning workload**, which
+  is the case the `gap` record exists for.
+- [A3](#a3--protocol-compliance-tests-and-agent-query-benchmarks)'s agent-query latency figures.
+
+**Every number elsewhere in this document is still closed-loop** and is labelled so where it is
+tabulated. Nothing here re-measures them.
 
 ### F3 — Take unkeyed searches off the coordinator
 
@@ -1035,8 +1093,12 @@ to completion. Under sustained overload the permits recycle every `request_timeo
 more work while the read-pool backlog fills with searches whose clients have left: admission is
 capped (`max_concurrent_requests`, default 128), the backlog behind it is not, and a retrying
 client makes it worse — the shape of a metastable failure. The read-pool health signal added for
-finding 02 now makes a genuinely wedged pool *visible*; what is still missing is a deadline the
-search itself honours, so the work stops when the client is gone. Give the search a cancellation
+finding 02 now makes a genuinely wedged pool *visible*, and
+[F2](#f2--an-open-loop-load-generator) (2026-09-15) supplies the instrument that would show the
+failure rather than infer it: sustained overload at a fixed arrival rate, the `408` count broken
+out from the other outcomes, and the per-second achieved-rate series — a rate that decays through
+a fixed-rate run is the metastable signature. Not yet run. What is still missing in the node is a
+deadline the search itself honours, so the work stops when the client is gone. Give the search a cancellation
 token or a deadline checked at segment boundaries, and/or bound the backlog so excess load is
 rejected fast rather than queued.
 
@@ -4320,7 +4382,9 @@ cannot arrive until it commits and replies. **The linger waits on itself.**
 A linger can only work where many independent clients hold requests outstanding at once —
 an open-loop arrival process. Do not rebuild it from the reasoning above without first
 having a workload generator that can produce one; against this harness it is untestable, and
-against a closed-loop client it is provably useless. The remaining honest levers on mixed
+against a closed-loop client it is provably useless. **That generator now exists** —
+[F2](#f2--an-open-loop-load-generator), 2026-09-15, `cameodb-bench --rate` with Poisson
+arrivals — so the question is open again and is answerable. It has not been asked yet. The remaining honest levers on mixed
 write cost are the fsync itself (device, `wal_sync`, WAL placement) rather than how the
 writer groups.
 
@@ -4331,5 +4395,5 @@ Questions asked and answered. Two are rejections, kept so they are not rebuilt.
 1. ~~**A latency harness.**~~ ✅ Landed 2026-08-09 as `cameodb-bench` (`crates/bench`): percentiles for writes and searches, the node's `took_ms` beside the client-observed figure, and the worker-pool delta over the measured window. Closed-loop, so runs are comparable at equal concurrency rather than being an SLA
 2. ~~**Document and default the affinity flags.**~~ ✅ Landed 2026-08-09, and the answer was *no*: see [The affinity flags, measured](#the-affinity-flags-measured). Both stay `false`, now present and explained in `cameodb.example.toml`, `crates/server/cameodb.toml`, `docker/cameodb-docker.toml` and `docs/CONFIGURATION.md`
 3. ~~**Give a worker more than one operation at a time.**~~ ✅ Landed 2026-08-10. A worker now carries up to 8 operations, bounded by a semaphore acquired *before* the receive so the channel stays the backpressure signal. Worth **+65-70% write throughput and −64% on p90** where the pool is the constraint, and nothing where it is not — see [Worker concurrency, measured](#worker-concurrency-measured). It did *not* redeem the affinity flags, which was the other reason to do it
-4. ~~**A bounded linger before the writer commits.**~~ ❌ Built and rejected 2026-08-10 — no measurable gain at any concurrency tested, and the arrival arithmetic says there cannot be one against a closed-loop client. Removed; the reasoning is recorded in [Mixed read/write load, measured](#mixed-readwrite-load-measured) so it is not rebuilt. **An open-loop load generator is the prerequisite for revisiting it** — and is worth having anyway, since every number in this document is closed-loop
+4. ~~**A bounded linger before the writer commits.**~~ ❌ Built and rejected 2026-08-10 — no measurable gain at any concurrency tested, and the arrival arithmetic says there cannot be one against a closed-loop client. Removed; the reasoning is recorded in [Mixed read/write load, measured](#mixed-readwrite-load-measured) so it is not rebuilt. **An open-loop load generator was the prerequisite for revisiting it**, and [F2](#f2--an-open-loop-load-generator) landed it on 2026-09-15. The rejection stands on the evidence taken at the time; it is no longer unfalsifiable
 

@@ -3,15 +3,15 @@
 use crate::args::Args;
 use crate::stats::{Samples, Summary};
 use anyhow::{Context, Result};
-use client::CameoClient;
 use client::sdk::AdminWorkersResponse;
+use client::{CameoClient, failure_status};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Words the generated documents are built from, so searches have predictable selectivity:
 /// every document contains `bench`, and the rest vary.
-const WORDS: &[&str] = &[
+pub(crate) const WORDS: &[&str] = &[
     "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
 ];
 
@@ -65,7 +65,7 @@ pub async fn prepare_index(client: &CameoClient, args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn document(id: &str, seq: usize) -> serde_json::Value {
+pub(crate) fn document(id: &str, seq: usize) -> serde_json::Value {
     let a = WORDS[seq % WORDS.len()];
     let b = WORDS[(seq / WORDS.len()) % WORDS.len()];
     json!({
@@ -150,12 +150,17 @@ impl Report {
 /// Each worker owns its own `Samples` and they are merged at the end, so nothing is shared
 /// across tasks on the hot path — a mutex around the sample vector would show up in the very
 /// numbers being collected.
-pub async fn run(client: Arc<CameoClient>, args: &Args, duration: Duration) -> Result<Report> {
+pub async fn run(
+    client: Arc<CameoClient>,
+    args: &Args,
+    concurrency: usize,
+    duration: Duration,
+) -> Result<Report> {
     let deadline = Instant::now() + duration;
     let mut tasks = Vec::new();
 
     if args.mode.writes() {
-        for worker in 0..args.concurrency {
+        for worker in 0..concurrency {
             let client = Arc::clone(&client);
             let index = args.index.clone();
             tasks.push(tokio::spawn(async move {
@@ -165,7 +170,7 @@ pub async fn run(client: Arc<CameoClient>, args: &Args, duration: Duration) -> R
     }
 
     if args.mode.bulk() {
-        for worker in 0..args.concurrency {
+        for worker in 0..concurrency {
             let client = Arc::clone(&client);
             let index = args.index.clone();
             let batch_size = args.batch_size;
@@ -176,7 +181,7 @@ pub async fn run(client: Arc<CameoClient>, args: &Args, duration: Duration) -> R
     }
 
     if args.mode.searches() {
-        for worker in 0..args.concurrency {
+        for worker in 0..concurrency {
             let client = Arc::clone(&client);
             let index = args.index.clone();
             tasks.push(tokio::spawn(async move {
@@ -246,7 +251,7 @@ async fn bulk_worker(
                 samples.record(started.elapsed());
                 docs += batch_size as u64;
             }
-            Err(err) => samples.record_error(err),
+            Err(err) => samples.record_failure(failure_status(&err), &err),
         }
     }
     WorkerOutput::Bulk { samples, docs }
@@ -270,7 +275,7 @@ async fn write_worker(
         let started = Instant::now();
         match client.write_document(&index, &id, &doc, None).await {
             Ok(_) => samples.record(started.elapsed()),
-            Err(err) => samples.record_error(err),
+            Err(err) => samples.record_failure(failure_status(&err), &err),
         }
     }
     WorkerOutput::Writes(samples)
@@ -301,7 +306,7 @@ async fn search_worker(
                     server.record(Duration::from_millis(took));
                 }
             }
-            Err(err) => observed.record_error(err),
+            Err(err) => observed.record_failure(failure_status(&err), &err),
         }
     }
     WorkerOutput::Searches {

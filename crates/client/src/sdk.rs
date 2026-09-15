@@ -191,6 +191,56 @@ pub struct ClientAuth {
     pub allow_plaintext: bool,
 }
 
+/// A request the node answered with a non-success status.
+///
+/// The message is the one the call site would have written with `bail!`, and `Display`
+/// reproduces it exactly — so nothing that prints an error sees a change. What it adds is
+/// the status as a *number*, recoverable with `err.downcast_ref::<HttpFailure>()`.
+///
+/// That distinction is not cosmetic for a load generator. A node under overload sheds with
+/// `503` before it ever reaches a handler and abandons a client with `408` when the request
+/// timeout fires; a connection that never got an answer is a third thing. Counted together
+/// as "errors" they say nothing, and the first two are the whole result of an open-loop run.
+/// Recovering the code from the message text would work until someone reworded the message.
+///
+/// Carried as the error itself rather than as a `context` layer so the chain stays one deep
+/// and `{:?}` prints what it always printed.
+#[derive(Debug, Clone)]
+pub struct HttpFailure {
+    status: u16,
+    message: String,
+}
+
+impl HttpFailure {
+    fn new(status: reqwest::StatusCode, message: String) -> Self {
+        Self {
+            status: status.as_u16(),
+            message,
+        }
+    }
+
+    /// The HTTP status the node answered with.
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+}
+
+impl fmt::Display for HttpFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HttpFailure {}
+
+/// The status a failed call reports, if it failed with one.
+///
+/// `None` covers everything that never became an HTTP response — a refused connection, a
+/// TLS failure, a read that timed out mid-body, a response whose JSON would not parse.
+pub fn failure_status(error: &anyhow::Error) -> Option<u16> {
+    error.downcast_ref::<HttpFailure>().map(HttpFailure::status)
+}
+
 #[derive(Debug, Clone)]
 pub struct CameoClient {
     base_url: Url,
@@ -366,12 +416,16 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Search failed: {} - {}{}",
+            return Err(HttpFailure::new(
                 status,
-                text,
-                self.refusal_hint(status)
-            );
+                format!(
+                    "Search failed: {} - {}{}",
+                    status,
+                    text,
+                    self.refusal_hint(status)
+                ),
+            )
+            .into());
         }
         resp.json().await.context("Failed to parse search response")
     }
@@ -471,12 +525,16 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Write failed: {} - {}{}",
+            return Err(HttpFailure::new(
                 status,
-                text,
-                self.refusal_hint(status)
-            );
+                format!(
+                    "Write failed: {} - {}{}",
+                    status,
+                    text,
+                    self.refusal_hint(status)
+                ),
+            )
+            .into());
         }
         resp.json().await.context("Failed to parse write response")
     }
@@ -564,12 +622,16 @@ impl CameoClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Bulk ingest failed: {} - {}{}",
+            return Err(HttpFailure::new(
                 status,
-                text,
-                self.refusal_hint(status)
-            );
+                format!(
+                    "Bulk ingest failed: {} - {}{}",
+                    status,
+                    text,
+                    self.refusal_hint(status)
+                ),
+            )
+            .into());
         }
         resp.json()
             .await
@@ -1260,5 +1322,49 @@ mod key_id_digest_tests {
         let credential = Credential::parse(&format!("cameo_v1_{}", "A".repeat(43)))
             .expect("a well-formed key parses");
         assert_eq!(credential.key_id(), "373ce68d");
+    }
+}
+
+#[cfg(test)]
+mod http_failure_tests {
+    use super::{HttpFailure, failure_status};
+
+    /// The whole point of the type is that it changes nothing a reader sees. `Display` is the
+    /// message the call site wrote, and because the status rides *in* the error rather than as
+    /// a `context` layer above it, `{:?}` prints no extra "Caused by" line either — so the CLI
+    /// and every `eprintln!` in the tree keep their exact output.
+    #[test]
+    fn a_status_failure_prints_as_the_bare_message() {
+        let err: anyhow::Error = HttpFailure::new(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "Search failed: 503 Service Unavailable - Too many concurrent requests".to_string(),
+        )
+        .into();
+
+        let expected = "Search failed: 503 Service Unavailable - Too many concurrent requests";
+        assert_eq!(format!("{err}"), expected);
+        // `{:#}` joins the chain with ": ". A one-deep chain has nothing to join.
+        assert_eq!(format!("{err:#}"), expected);
+    }
+
+    /// And the point of carrying it at all: a caller can tell a node that shed load from a node
+    /// that abandoned the request, without reading either out of prose.
+    #[test]
+    fn the_status_survives_as_a_number() {
+        let shed: anyhow::Error =
+            HttpFailure::new(reqwest::StatusCode::SERVICE_UNAVAILABLE, String::new()).into();
+        let abandoned: anyhow::Error =
+            HttpFailure::new(reqwest::StatusCode::REQUEST_TIMEOUT, String::new()).into();
+
+        assert_eq!(failure_status(&shed), Some(503));
+        assert_eq!(failure_status(&abandoned), Some(408));
+    }
+
+    /// A failure that never became a response has no status, and must not be reported as one.
+    /// A refused connection counted as a shed request would turn a dead node into a busy one.
+    #[test]
+    fn a_transport_failure_has_no_status() {
+        let err = anyhow::anyhow!("connection refused");
+        assert_eq!(failure_status(&err), None);
     }
 }
