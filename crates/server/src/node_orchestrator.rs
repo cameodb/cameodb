@@ -131,9 +131,9 @@ tokio::task_local! {
     /// Stamped by a layer just inside `TimeoutLayer` (`routes.rs`), so the clock it starts
     /// is the same one the client's deadline runs on — auth has already happened, and
     /// everything after it (body read, parse, dispatch, queue wait) counts against the same
-    /// budget. The deadline checks F7 put at dequeue read it through [`request_started_at`];
-    /// stamping it at dispatch instead would grant every job a fresh budget after whatever
-    /// the body cost, which for a max-size record is the whole timeout.
+    /// budget. The deadline checks F7 put at admission and at dequeue read it through
+    /// [`request_started_at`]; stamping it at dispatch instead would grant every job a fresh
+    /// budget after whatever the body cost, which for a max-size record is the whole timeout.
     ///
     /// A task-local rather than a field on the request or the op: the value is read at job
     /// build inside `handle_client_op`, sixteen call sites upstream of it, and none of them
@@ -159,11 +159,12 @@ pub(crate) fn request_started_at() -> Instant {
 ///
 /// One EWMA for every op would blend a point search's milliseconds with a bulk write's, and
 /// the reserve computed from the blend is wrong for both — over-reserving the cheap op and
-/// under-reserving the expensive one. `Any` is the fallback view: used where the op is not
-/// in hand, and where a class has no samples of its own yet.
+/// under-reserving the expensive one. `Any` is the door's view: the admission guard runs
+/// before the body is read, so it cannot know which the request is and uses the blended
+/// estimate — the honest answer to "what does a request cost" before the request is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpClass {
-    /// Op not yet known or outside the split — reserves fall back to the blended estimate.
+    /// Op not yet known (the admission guard runs before parsing) or outside the split.
     Any,
     /// `Search`, `Stream` — work that lands on the read pool.
     Read,
@@ -1759,6 +1760,23 @@ pub enum OrchestratorError {
     )]
     ReadDeadlineExpired { waited_ms: u64, budget_ms: u64 },
 
+    /// The backlog already in front of this request could not clear inside its budget, so it
+    /// was refused before being queued rather than after waiting out the wait.
+    ///
+    /// The same decision as [`Self::ReadDeadlineExpired`], taken at the door instead of at a
+    /// worker. That one is the backstop for when this one's prediction was wrong; this one is
+    /// what makes the refusal cheap, because everything between the two — the body, the JSON,
+    /// the permit, the channel hop — is work spent on a request that was never going to be
+    /// answered in time.
+    ///
+    /// `Unavailable` for the same reason, and answered as the same `503`: nothing about the
+    /// request is wrong, the node is behind, and a retry is the right move.
+    #[error("overloaded: a {predicted_wait_ms}ms backlog against a {budget_ms}ms request")]
+    Overloaded {
+        predicted_wait_ms: u64,
+        budget_ms: u64,
+    },
+
     /// No shard could run the query, so the empty result it produced is not an answer.
     ///
     /// A scatter-gather reports a failed shard as a partial outage — the hits it did get, plus
@@ -1899,6 +1917,7 @@ impl OrchestratorError {
             Self::SchemaUnconfirmed { .. }
             | Self::PeerUnreachable { .. }
             | Self::ReadDeadlineExpired { .. }
+            | Self::Overloaded { .. }
             | Self::Storage(StoreError::WriterPanicked(_)) => RemoteVerdict::Unavailable,
 
             // Its own verdict because the forwarding node has to act on it and must not confuse
@@ -2229,6 +2248,15 @@ impl From<OrchestratorError> for RemoteError {
             } => RemoteError::Io(format!(
                 "read abandoned: spent {waited_ms}ms of a {budget_ms}ms request before a \
                  worker could start it"
+            )),
+            // Travels like the dequeue refusal above, and for the same reason: a peer that
+            // refused the read at its door did not answer, and the gather reports the shard as
+            // the partial outage it is.
+            OrchestratorError::Overloaded {
+                predicted_wait_ms,
+                budget_ms,
+            } => RemoteError::Io(format!(
+                "overloaded: a {predicted_wait_ms}ms backlog against a {budget_ms}ms request"
             )),
             OrchestratorError::Remote { verdict, message } => match verdict {
                 RemoteVerdict::BadRequest => RemoteError::InvalidInput(message),
@@ -3029,12 +3057,20 @@ struct DispatchCounters {
     /// The shed is otherwise invisible — the work never runs, so it lands in no latency sample
     /// and no `jobs_completed` tally, and a node shedding hard reads as one that is idle.
     abandoned: AtomicU64,
+    /// Requests refused before they were queued, because the backlog already in front of them
+    /// could not clear inside their budget.
+    ///
+    /// Read beside `abandoned`, which is the same decision taken too late. Once the gate is
+    /// working this one carries the refusals and `abandoned` becomes the measure of how often
+    /// the prediction was wrong — so the split between them, not either count alone, is what
+    /// says whether admission control is doing its job.
+    refused_at_admission: AtomicU64,
     /// Jobs anywhere in the pool — queued or running — across all workers.
     ///
-    /// One atomic rather than a sum over the per-worker `queue_depth` + `in_flight` pairs:
-    /// a depth check reads it on every request and the sum is information this counter
-    /// already carries — the per-worker gauges stay, but their job is the `/_admin/workers`
-    /// report.
+    /// This is the depth [`QueueLoad`] predicts wait from. It is one atomic rather than a sum
+    /// over the per-worker `queue_depth` + `in_flight` pairs because the admission guard reads
+    /// it on every request and the sum is information this counter already carries — the
+    /// per-worker gauges stay, but their job is the `/_admin/workers` report, not the gate.
     outstanding: AtomicUsize,
     /// Exponentially-weighted mean of how long a job takes once admitted, in microseconds —
     /// every op class folded together.
@@ -3045,9 +3081,10 @@ struct DispatchCounters {
     /// and load, and a number an operator has to keep in step with those is one that will be
     /// wrong.
     ///
-    /// This is the blend a caller that does not know the op's class reserves against. The two
-    /// per-class estimates beside it are what a check with the op in hand reserves against —
-    /// see [`OpClass`].
+    /// This is the blend the admission door refuses against: the guard runs before the body
+    /// is read, so the op's class is not yet knowable there. The two per-class estimates
+    /// beside it are what a dequeue or dispatch check reserves against, since there the op
+    /// is in hand — see [`OpClass`].
     ///
     /// Starts at zero, so a node under no load admits everything and the estimate only becomes
     /// restrictive once there is evidence to be restrictive about. It cannot go stale while
@@ -3093,7 +3130,8 @@ impl DispatchCounters {
 
     /// A job left the pool — refused at dequeue, or answered. Saturating rather than
     /// `fetch_sub`: an increment that was somehow missed (a sender that is not `try_send`,
-    /// which is what the tests use) must underflow to zero rather than wrap to `usize::MAX`.
+    /// which is what the tests use) must underflow to zero rather than wrap to `usize::MAX`
+    /// and wedge the gate into refusing everything.
     fn job_left_pool(&self) {
         let _ =
             self.outstanding
@@ -3134,6 +3172,146 @@ impl DispatchCounters {
     fn service_reserve_for(&self, class: OpClass, budget: Duration) -> Duration {
         let reserve = Duration::from_micros(self.service_estimate_for(class).saturating_mul(2));
         reserve.min(budget / 2)
+    }
+}
+
+/// The node's own estimate of how long a request arriving right now would wait before it starts.
+///
+/// [`OrchestratorError::ReadDeadlineExpired`] refuses work that cannot meet its deadline, but
+/// only once a worker has reached it — after the request has already paid for decompression,
+/// the body limit, a concurrency permit, JSON parsing, a job allocation and a channel round
+/// trip. Under overload nearly every request pays that and is then refused, and it is where
+/// most of the gap between the ~555/s the node serves and the ~730/s it is capable of goes
+/// (ROADMAP F7).
+///
+/// Admission counts requests, not the work they imply: `max_concurrent_requests` permits at
+/// 3,000 against ~730 searches/s is about four seconds of backlog against a one-second budget.
+/// This turns the gauges the pool already keeps into the number the semaphore is missing, so
+/// the same refusal can be made at the door for the price of a few atomic loads.
+///
+/// Nothing new is measured. `outstanding` is maintained on the dispatch path already — one
+/// increment where a send lands and one decrement where a job leaves the pool — and the
+/// service estimate is [`DispatchCounters::service_ewma_us`].
+pub struct QueueLoad {
+    dispatch_stats: Arc<DispatchCounters>,
+    /// Jobs the whole pool can have running at once — `worker_count × in-flight limit`. The
+    /// divisor in Little's law, and the depth below which the gate never refuses.
+    width: usize,
+    /// The node's request timeout. `None` disables the gate, matching a node whose timeout is
+    /// disabled: there is no deadline to predict against.
+    budget: Option<Duration>,
+}
+
+impl QueueLoad {
+    fn new(dispatch_stats: Arc<DispatchCounters>, width: usize, budget: Option<Duration>) -> Self {
+        Self {
+            dispatch_stats,
+            width: width.max(1),
+            budget,
+        }
+    }
+
+    /// Jobs queued or running across the pool — everything a new arrival waits behind.
+    pub fn depth(&self) -> usize {
+        self.dispatch_stats
+            .outstanding
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    /// Little's law over the gauges above: work ahead, divided by how much of it runs at once,
+    /// times what one job costs.
+    ///
+    /// `div_ceil` because a partly-filled round still has to finish before the next one starts,
+    /// and `saturating_sub` because a pool with a free slot imposes no wait at all.
+    fn predicted_wait_at(&self, depth: usize) -> Duration {
+        let rounds = depth.saturating_sub(self.width).div_ceil(self.width) as u64;
+        Duration::from_micros(
+            self.dispatch_stats
+                .service_ewma_us
+                .load(AtomicOrdering::Relaxed)
+                .saturating_mul(rounds),
+        )
+    }
+
+    /// What a request arriving now would wait before a worker starts it.
+    pub fn predicted_wait(&self) -> Duration {
+        self.predicted_wait_at(self.depth())
+    }
+
+    /// The part of the request budget not yet spent — the full timeout minus whatever the
+    /// request already cost being received, parsed and routed. `None` when the gate is off
+    /// (no configured deadline to measure against).
+    ///
+    /// The same quantity the dequeue check computes as `budget − waited`: a request admitted
+    /// here and judged again at a worker is judged against one deadline either way.
+    fn remaining_budget(&self) -> Option<Duration> {
+        self.budget
+            .map(|b| b.saturating_sub(request_started_at().elapsed()))
+    }
+
+    /// Whether a request of `class` arriving now should be refused rather than queued, and
+    /// the wait that decided it.
+    ///
+    /// **A pool with a free slot always admits, whatever the estimate says.** That is not an
+    /// optimisation, it is the invariant that keeps this from becoming the failure it prevents:
+    /// the estimate is only updated by jobs that complete, so a gate that can refuse an arrival
+    /// into an empty pool can stop every job, stop every sample, and refuse forever on a number
+    /// nothing will ever correct. F7's reserve had exactly this shape before it was capped —
+    /// see [`DispatchCounters::service_reserve_for`] — and it is the same mistake one layer out.
+    pub fn would_refuse(&self, class: OpClass) -> Option<Duration> {
+        let remaining = self.remaining_budget()?;
+        let depth = self.depth();
+        if depth < self.width {
+            return None;
+        }
+        let predicted = self.predicted_wait_at(depth);
+        // The same margin the dequeue check reserves, and the door has to apply it too. A
+        // weaker door was measured — refusing only at `predicted > budget`, on the theory that
+        // the door should catch the certainly-doomed and leave anything marginal to the worker
+        // — and it was 20% slower (424/s against 521/s at 1,000/s offered), because letting
+        // the queue grow past the point the worker will accept just means refusing the same
+        // requests later, after they have been queued rather than before.
+        let reserve = self.dispatch_stats.service_reserve_for(class, remaining);
+        (predicted + reserve > remaining).then_some(predicted)
+    }
+
+    /// The budget refusals are measured against, for the error a refusal answers with.
+    pub fn budget(&self) -> Option<Duration> {
+        self.budget
+    }
+
+    /// Seconds until the refused backlog is predicted to clear — the `Retry-After` a refusal
+    /// should carry. The number the refusal was made on, so the answer is the advice rather
+    /// than a fixed delay that could send a client back into the same backlog.
+    pub fn retry_after_secs(&self, predicted: Duration) -> u64 {
+        (predicted.as_millis() as u64).div_ceil(1000).max(1)
+    }
+
+    /// Count a request refused at the door. See [`DispatchCounters::refused_at_admission`].
+    pub fn record_refused(&self) {
+        self.dispatch_stats
+            .refused_at_admission
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Build the error a refused request answers with, and count it.
+    pub(crate) fn refuse(&self, predicted: Duration) -> OrchestratorError {
+        self.record_refused();
+        OrchestratorError::Overloaded {
+            predicted_wait_ms: predicted.as_millis() as u64,
+            budget_ms: self.budget.unwrap_or_default().as_millis() as u64,
+        }
+    }
+}
+
+impl std::fmt::Debug for QueueLoad {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueLoad")
+            .field("depth", &self.depth())
+            .field("width", &self.width)
+            .field("predicted_wait", &self.predicted_wait())
+            .field("budget", &self.budget)
+            .finish()
     }
 }
 
@@ -3187,6 +3365,10 @@ pub struct DispatchStats {
     /// report still deserializes.
     #[serde(default)]
     pub abandoned: u64,
+    /// Requests refused before being queued, because the backlog could not clear in time.
+    /// Defaulted for the same reason `abandoned` is.
+    #[serde(default)]
+    pub refused_at_admission: u64,
 }
 
 /// Full worker pool report returned by `GET /_admin/workers`.
@@ -3221,6 +3403,9 @@ pub struct OrchestratorWorkerTx {
     worker_stats: Arc<Vec<Arc<WorkerCounters>>>,
     /// Dispatch-level counters across all workers.
     dispatch_stats: Arc<DispatchCounters>,
+    /// The backlog estimate the send path refuses against, shared with the HTTP front door so
+    /// both refuse on one number.
+    queue_load: Arc<QueueLoad>,
     /// Per-worker channel capacity (same for all workers).
     per_worker_queue_capacity: usize,
     /// Whether pinned worker threads were requested and the platform could enumerate
@@ -3245,12 +3430,19 @@ impl OrchestratorWorkerTx {
         core_aligned: bool,
         core_layout: CoreLayout,
         placement: Arc<ArcSwap<ShardPlacement>>,
+        budget: Option<Duration>,
     ) -> Self {
+        let queue_load = Arc::new(QueueLoad::new(
+            Arc::clone(&dispatch_stats),
+            workers.len() * ORCHESTRATOR_WORKER_MAX_IN_FLIGHT,
+            budget,
+        ));
         Self {
             workers: Arc::new(workers),
             next_worker: Arc::new(AtomicUsize::new(0)),
             worker_stats,
             dispatch_stats,
+            queue_load,
             per_worker_queue_capacity,
             pinning_requested,
             core_aligned,
@@ -3261,6 +3453,17 @@ impl OrchestratorWorkerTx {
 
     fn len(&self) -> usize {
         self.workers.len()
+    }
+
+    /// The backlog estimate this pool refuses against. Borrowed, because the dispatch path
+    /// consults it on every request and an `Arc` bump per request is a cost with no purpose.
+    fn load(&self) -> &QueueLoad {
+        &self.queue_load
+    }
+
+    /// The same estimate as a handle, for the HTTP front door to hold. Called once at startup.
+    pub fn queue_load(&self) -> Arc<QueueLoad> {
+        Arc::clone(&self.queue_load)
     }
 
     fn try_send(
@@ -3449,6 +3652,10 @@ impl OrchestratorWorkerTx {
                 .actor_mailbox_fallbacks
                 .load(AtomicOrdering::Relaxed),
             abandoned: self.dispatch_stats.abandoned.load(AtomicOrdering::Relaxed),
+            refused_at_admission: self
+                .dispatch_stats
+                .refused_at_admission
+                .load(AtomicOrdering::Relaxed),
         };
 
         WorkerPoolReport {
@@ -6038,6 +6245,17 @@ impl RouterActor {
                     | ClientOp::Stream { .. }
             );
             if is_worker_eligible {
+                // Refuse before queueing, not after waiting. The dequeue check below this is
+                // the same decision taken at a worker, by which point the request has already
+                // paid for its body, its JSON, a concurrency permit and a channel hop — and
+                // under overload nearly every request pays that and is refused anyway. The
+                // front door (`routes.rs`) consults the same estimate one layer further out;
+                // this is the guard for anything that reaches here another way.
+                let load = tx.load();
+                if let Some(predicted) = load.would_refuse(OpClass::of(&op)) {
+                    return Err(load.refuse(predicted));
+                }
+
                 // Resolve shard affinity hint when shard-affine dispatch is enabled.
                 // For Write ops, the routing_key maps to a shard via the consistent ring.
                 // For Search/Stream ops (scatter-gather), no single shard owns the query,
@@ -6094,7 +6312,23 @@ impl RouterActor {
                     }
                     Err(err) => match *err {
                         mpsc::error::TrySendError::Full(job) => {
-                            // Queue full — fall through to actor mailbox
+                            // Every worker queue is full, so the pool is as backed up as it can
+                            // get. Diverting to the actor here is what this used to do, and it
+                            // was F7's own mechanism surviving in the overflow lane: the actor
+                            // mailbox holds 64, `ask` *waits* for a slot rather than failing,
+                            // the actor serialises everything it takes, and nothing on that
+                            // path checks a deadline. A request sent there under overload
+                            // queues behind a single task, runs whatever happens, and answers
+                            // after its client has gone — which is exactly what the dequeue
+                            // check was added to stop, on the one path it does not cover.
+                            //
+                            // With a budget configured, refuse instead. Without one the node
+                            // has no deadline to fail, so the old relief valve is still the
+                            // better answer for a burst.
+                            let load = tx.load();
+                            if load.budget().is_some() {
+                                return Err(load.refuse(load.predicted_wait()));
+                            }
                             debug!("Worker pool queue full, falling back to actor mailbox");
                             if let OrchestratorJob::Execute { op, .. } = job {
                                 return self.ask_orchestrator(*op).await;
@@ -8968,6 +9202,7 @@ impl NodeOrchestrator {
             aligned,
             self.core_layout.clone(),
             Arc::clone(&self.placement),
+            job_budget,
         );
         self.engine = Some(engine);
         self.worker_count = tx.len();
@@ -9578,6 +9813,15 @@ impl NodeOrchestrator {
     /// [`writer_liveness`](Self::writer_liveness), so health can probe it without a message.
     pub fn read_pool_health(&self) -> Arc<ReadPoolHealth> {
         Arc::clone(&self.read_pool_health)
+    }
+
+    /// A handle to this node's backlog estimate, for the HTTP admission guard to refuse against
+    /// and for health to report. Taken the same way the two handles above are.
+    ///
+    /// `None` before the worker pool exists — a node running everything through the actor
+    /// mailbox has no worker queue to predict, and the guard stays out of the way.
+    pub fn queue_load(&self) -> Option<Arc<QueueLoad>> {
+        self.worker_tx.as_ref().map(|tx| tx.queue_load())
     }
 
     // ========================================================================
@@ -12515,29 +12759,6 @@ mod tests {
         assert!(Duration::ZERO + reserve < budget);
     }
 
-    /// A class with no samples of its own reserves against the blend, not zero: a node that
-    /// has only ever served searches still knows what *a* job costs when the first write
-    /// arrives.
-    #[test]
-    fn a_class_with_no_samples_reserves_against_the_blend() {
-        let budget = Duration::from_secs(10);
-        let stats = DispatchCounters::default();
-        stats.record_service(OpClass::Read, Duration::from_millis(100));
-
-        assert_eq!(
-            stats.service_reserve_for(OpClass::Write, budget),
-            Duration::from_millis(200),
-            "no write samples yet, so the write reserve reads the blended estimate"
-        );
-        // Once writes have their own history, theirs is the one used.
-        stats.record_service(OpClass::Write, Duration::from_millis(900));
-        let reserve = stats.service_reserve_for(OpClass::Write, budget);
-        assert!(
-            reserve > Duration::from_millis(200),
-            "a write estimate exists now; the reserve must track it, got {reserve:?}"
-        );
-    }
-
     /// The F7 fix, at the queue the measurement found it in.
     ///
     /// A job that has been queued longer than its budget is refused at dequeue rather than run,
@@ -12638,6 +12859,207 @@ mod tests {
             WorkerOutcome::Done(Ok(_))
         ));
         assert_eq!(peak.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // F7 fix 2 — refusing at admission rather than at a worker.
+    // ------------------------------------------------------------------
+
+    /// Build a load signal whose pool-wide `outstanding` is set by hand, so the prediction can
+    /// be checked against a backlog the test decides. The split between `queued` and `running`
+    /// describes the scenario — the gate reads only their sum.
+    fn queue_load_with(
+        queued: &[usize],
+        running: &[usize],
+        width: usize,
+        budget: Option<Duration>,
+    ) -> (QueueLoad, Arc<DispatchCounters>) {
+        let dispatch = Arc::new(DispatchCounters::default());
+        dispatch.outstanding.store(
+            queued.iter().sum::<usize>() + running.iter().sum::<usize>(),
+            AtomicOrdering::Relaxed,
+        );
+        let load = QueueLoad::new(Arc::clone(&dispatch), width, budget);
+        (load, dispatch)
+    }
+
+    /// Little's law over the gauges the pool already keeps: work ahead, divided by how much of
+    /// it runs at once, times what one job costs.
+    #[test]
+    fn the_predicted_wait_is_the_backlog_divided_by_how_much_runs_at_once() {
+        // Width 4, so four jobs can be in service at once.
+        let (load, dispatch) = queue_load_with(&[0, 0], &[2, 2], 4, Some(Duration::from_secs(1)));
+        dispatch.record_service(OpClass::Read, Duration::from_millis(100));
+
+        // Exactly full and nothing queued: an arrival waits for the next slot, not a round.
+        assert_eq!(load.depth(), 4);
+        assert_eq!(load.predicted_wait(), Duration::ZERO);
+
+        // One full round of work ahead of the arrival.
+        let (load, dispatch) = queue_load_with(&[2, 2], &[2, 2], 4, Some(Duration::from_secs(1)));
+        dispatch.record_service(OpClass::Read, Duration::from_millis(100));
+        assert_eq!(load.depth(), 8);
+        assert_eq!(load.predicted_wait(), Duration::from_millis(100));
+
+        // Three rounds ahead. This is the number the semaphore cannot see: the same 16
+        // requests are 16 permits either way, but only one of the two says 300ms.
+        let (load, dispatch) = queue_load_with(&[6, 6], &[2, 2], 4, Some(Duration::from_secs(1)));
+        dispatch.record_service(OpClass::Read, Duration::from_millis(100));
+        assert_eq!(load.depth(), 16);
+        assert_eq!(load.predicted_wait(), Duration::from_millis(300));
+    }
+
+    /// A partly-filled round still has to finish before the next one starts, so the arithmetic
+    /// rounds up. Rounding down would predict zero wait for a backlog that plainly has one.
+    #[test]
+    fn a_partly_filled_round_still_counts_as_a_round() {
+        let (load, dispatch) = queue_load_with(&[1, 0], &[2, 2], 4, Some(Duration::from_secs(1)));
+        dispatch.record_service(OpClass::Read, Duration::from_millis(100));
+        assert_eq!(load.depth(), 5);
+        assert_eq!(load.predicted_wait(), Duration::from_millis(100));
+    }
+
+    /// The invariant that keeps this gate from becoming the failure it prevents.
+    ///
+    /// The estimate is only ever updated by jobs that complete. A gate that can refuse an
+    /// arrival into a pool with a free slot can therefore stop every job, stop every sample,
+    /// and go on refusing forever against a number nothing will correct. F7's own reserve had
+    /// this exact shape before it was capped; this is the same mistake one layer out, and it
+    /// is ruled out by construction rather than by the estimate happening to stay small.
+    #[test]
+    fn a_pool_with_a_free_slot_admits_whatever_the_estimate_says() {
+        let budget = Duration::from_millis(100);
+        // Width 8, only 7 jobs anywhere in the pool — one slot free.
+        let (load, dispatch) = queue_load_with(&[3, 0], &[2, 2], 8, Some(budget));
+        // An estimate hundreds of times the budget, which is what a lowered timeout or a very
+        // slow index produces.
+        dispatch.record_service(OpClass::Read, Duration::from_secs(30));
+
+        assert!(load.depth() < 8);
+        assert_eq!(
+            load.would_refuse(OpClass::Any),
+            None,
+            "a pool with a free slot must admit, or nothing ever completes to correct the estimate"
+        );
+    }
+
+    /// The gate itself: a backlog that cannot clear inside the budget is refused before it is
+    /// queued, and the refusal is counted where an operator can read it.
+    #[test]
+    fn a_backlog_that_cannot_clear_in_time_is_refused_at_admission() {
+        let budget = Duration::from_secs(1);
+        // Width 4 with 16 jobs in the pool — three rounds ahead.
+        let (load, dispatch) = queue_load_with(&[6, 6], &[2, 2], 4, Some(budget));
+        dispatch.record_service(OpClass::Read, Duration::from_millis(400));
+
+        // 3 rounds x 400ms predicted, plus the 500ms reserve (2x400ms capped at half the
+        // budget), against a 1s budget.
+        let predicted = load
+            .would_refuse(OpClass::Any)
+            .expect("this backlog cannot be served in time");
+        assert_eq!(predicted, Duration::from_millis(1200));
+
+        assert_eq!(
+            dispatch.refused_at_admission.load(AtomicOrdering::Relaxed),
+            0
+        );
+        let err = load.refuse(predicted);
+        assert_eq!(
+            dispatch.refused_at_admission.load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert!(matches!(
+            err,
+            OrchestratorError::Overloaded {
+                predicted_wait_ms: 1200,
+                budget_ms: 1000
+            }
+        ));
+
+        // And a backlog that *can* clear is admitted: the gate is about the deadline, not
+        // about the queue being non-empty.
+        let (load, dispatch) = queue_load_with(&[1, 1], &[2, 2], 4, Some(budget));
+        dispatch.record_service(OpClass::Read, Duration::from_millis(50));
+        assert_eq!(load.would_refuse(OpClass::Any), None);
+    }
+
+    /// A refusal at the door is the same `503` the semaphore already answers, not a `500` and
+    /// not the `408` the timeout used to produce. Nothing about the request is wrong.
+    #[test]
+    fn an_admission_refusal_is_retryable_rather_than_a_fault() {
+        let err = OrchestratorError::Overloaded {
+            predicted_wait_ms: 1200,
+            budget_ms: 1000,
+        };
+        assert!(matches!(err.verdict(), RemoteVerdict::Unavailable));
+        assert!(
+            err.to_string().contains("1200ms backlog"),
+            "the refusal should say what it predicted: {err}"
+        );
+    }
+
+    /// No budget is no deadline to miss, so there is nothing to predict against and the gate
+    /// stays out of the way — the same shape as the dequeue check without a budget.
+    #[test]
+    fn without_a_budget_nothing_is_refused_at_admission() {
+        let (load, dispatch) = queue_load_with(&[500, 500], &[2, 2], 4, None);
+        dispatch.record_service(OpClass::Read, Duration::from_secs(30));
+        assert_eq!(load.would_refuse(OpClass::Any), None);
+        assert_eq!(load.budget(), None);
+    }
+
+    /// The gate measures the request's *remaining* budget, not the configured one: time the
+    /// request already spent being received, parsed and routed is budget it no longer has.
+    /// A backlog that fits a fresh 1s budget is refused by a request that arrived 800ms ago —
+    /// the case deadline propagation exists for.
+    #[tokio::test]
+    async fn spent_budget_counts_against_the_request_not_just_the_queue_wait() {
+        let budget = Duration::from_secs(1);
+        // One round of 400ms work ahead: predicted 400ms + 500ms reserve (2x400ms capped at
+        // half the remaining budget) — admitted against a full second, refused against the
+        // ~200ms a nearly-spent request actually has.
+        let (load, dispatch) = queue_load_with(&[2, 2], &[2, 2], 4, Some(budget));
+        dispatch.record_service(OpClass::Read, Duration::from_millis(400));
+
+        assert_eq!(
+            load.would_refuse(OpClass::Any),
+            None,
+            "outside a request scope the whole budget remains, and this backlog fits"
+        );
+
+        let refused = REQUEST_STARTED_AT
+            .scope(Instant::now() - Duration::from_millis(800), async {
+                load.would_refuse(OpClass::Any)
+            })
+            .await;
+        assert_eq!(
+            refused,
+            Some(Duration::from_millis(400)),
+            "200ms left of a 1s budget cannot cover a 400ms backlog plus the reserve"
+        );
+    }
+
+    /// A class with no samples of its own reserves against the blend, not zero: a node that
+    /// has only ever served searches still knows what *a* job costs when the first write
+    /// arrives.
+    #[test]
+    fn a_class_with_no_samples_reserves_against_the_blend() {
+        let budget = Duration::from_secs(10);
+        let stats = DispatchCounters::default();
+        stats.record_service(OpClass::Read, Duration::from_millis(100));
+
+        assert_eq!(
+            stats.service_reserve_for(OpClass::Write, budget),
+            Duration::from_millis(200),
+            "no write samples yet, so the write reserve reads the blended estimate"
+        );
+        // Once writes have their own history, theirs is the one used.
+        stats.record_service(OpClass::Write, Duration::from_millis(900));
+        let reserve = stats.service_reserve_for(OpClass::Write, budget);
+        assert!(
+            reserve > Duration::from_millis(200),
+            "a write estimate exists now; the reserve must track it, got {reserve:?}"
+        );
     }
 
     /// A runner that holds each operation for `hold` and records the high-water mark of how

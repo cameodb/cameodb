@@ -51,6 +51,15 @@ pub struct HealthResponse {
     // so it occupies no thread and appears in no latency sample. A node at a healthy in-flight
     // count with this number climbing is one that is shedding, not one that is comfortable.
     pub read_pool_abandoned: u64,
+    // The backlog the admission guard is refusing against: jobs queued or running across the
+    // worker pool, and what the node predicts a request arriving now would wait before it
+    // started. Reported because refusals are made on these two numbers, and an operator asking
+    // why a node is returning 503 should be able to read the reason rather than infer it.
+    // Absent on a node with no worker pool, where there is no backlog to predict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicted_wait_ms: Option<u64>,
 
     // Performance/Debug metrics
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,6 +129,13 @@ pub(super) async fn health_handler(
 
     let (read_pool_in_flight, read_pool_capacity) = state.read_pool_health.gauge();
     let read_pool_abandoned = state.read_pool_health.abandoned();
+    let (queue_depth, predicted_wait_ms) = match state.queue_load.as_ref() {
+        Some(load) => (
+            Some(load.depth()),
+            Some(load.predicted_wait().as_millis() as u64),
+        ),
+        None => (None, None),
+    };
 
     // Get basic shard count and node info from orchestrator. These can queue behind real work,
     // so the expanded body uses bounded waits; on timeout we fall back to defaults rather than
@@ -208,6 +224,8 @@ pub(super) async fn health_handler(
         read_pool_in_flight,
         read_pool_capacity,
         read_pool_abandoned,
+        queue_depth,
+        predicted_wait_ms,
         dial_failures: cluster_status.as_ref().map(|s| s.dial_failures),
         bootstrap_successes: cluster_status.as_ref().map(|s| s.bootstrap_successes),
         routing_updates: cluster_status.as_ref().map(|s| s.routing_updates),

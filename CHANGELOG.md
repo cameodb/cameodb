@@ -36,10 +36,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   more than it has and refusing everything for good, which would have been F7's own failure
   shape rebuilt inside its fix. Bounding the backlog at admission is the remaining half.
 
-- `GET /_cluster/health` gained `read_pool_abandoned`, and `GET /_admin/workers` gained
-  `dispatch.abandoned` — reads and jobs refused at dequeue. Both were unobservable by
-  construction: refused work runs nowhere, so it lands in no latency sample and no completion
-  tally, and a node shedding hard looked exactly like one sitting idle.
+- **An overloaded node now refuses at the door rather than at a worker.** Admission counted
+  requests, not the work they imply — 3,000 permits against a node serving ~500 searches/s is
+  seconds of backlog against a one-second budget — so a request that could not be answered in
+  time still paid for its body, its parse, a permit and a hop to a worker before being refused
+  there. The node now estimates, from the pool's outstanding-work counter and the service time
+  it already tracks, how long an arriving request would wait, and refuses it before reading a
+  body when that wait cannot fit the budget the request has left. At 3,000/s offered, 19,112
+  requests were refused at admission against 144 at a worker, where previously it was 133,039
+  at a worker and none at admission.
+
+  Throughput and latency are unchanged: the difference is smaller than the 8% spread between
+  consecutive runs of the same binary on the test machine. What changes is the cost of a
+  refusal, what the caller is told — `503 Overloaded: a 832ms backlog against a 1000ms request`
+  rather than `read abandoned` — and one queue that had no deadline check at all: a full worker
+  queue used to divert to the actor mailbox, which waits for a slot rather than failing and
+  checks no budget on the way through.
+
+- **Every `503` this node raises now carries `Retry-After`, and where the refusal knows its
+  backlog the header says when it clears.** The admission guard always did; a refusal arriving
+  through the error path — an overloaded pool, an unreachable peer, an unconfirmed schema — did
+  not, so the same condition advised a caller differently depending on which layer noticed it,
+  and a client that retried immediately deepened the overload. A refusal made on a predicted
+  wait now carries that wait as the delay, rather than a fixed second that could send the
+  client back into the backlog it was shed from.
+
+- `GET /_cluster/health` gained `read_pool_abandoned`, `queue_depth` and `predicted_wait_ms`,
+  and `GET /_admin/workers` gained `dispatch.abandoned` and `dispatch.refused_at_admission`.
+  The first pair were unobservable by construction: refused work runs nowhere, so it lands in no
+  latency sample and no completion tally, and a node shedding hard looked exactly like one
+  sitting idle. The rest are the numbers the refusals are actually made on, so an operator can
+  read why a node is returning 503 instead of inferring it.
 
 ### Changed
 
