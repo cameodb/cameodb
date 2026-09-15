@@ -170,9 +170,18 @@ async fn main() -> Result<()> {
 
         // The resolved size limits, because most of them are derived rather than written: an
         // operator reading the file cannot tell what the node will actually enforce.
+        //
+        // The timeout says which of the two it is. A resolved number alone cannot be checked
+        // against the file — that is how a node ran 60s while three shipped example configs
+        // said 30 and nothing anywhere disagreed.
+        let timeout_source = if cameodb_config.network.http.request_timeout_secs.is_some() {
+            "set"
+        } else {
+            "derived"
+        };
         println!(
             "Limits: record {}MB, HTTP body {}MB, remote msg {}MB, MCP response {}MB, \
-             timeout {}s, memory budget {}MB",
+             timeout {}s ({timeout_source}), memory budget {}MB",
             cameodb_config.limits.max_record_size_mb,
             cameodb_config.effective_max_body_size_mb(),
             cameodb_config.effective_remote_message_size_bytes() / (1024 * 1024),
@@ -594,6 +603,7 @@ async fn main() -> Result<()> {
         orchestrator_ref.clone(),
         coordinator_actor.clone(),
         &cameodb_config.network.cluster.messaging,
+        cameodb_config.effective_remote_timeout_secs(),
         StreamingSearchConfig::from_search_config(&cameodb_config.search),
         cameodb_config.search.default_search_limit,
         worker_tx,

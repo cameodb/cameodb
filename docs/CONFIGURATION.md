@@ -93,9 +93,9 @@ port = 9480
 # `profile` under [node]; see Security profiles.
 bind_address = "127.0.0.1"
 
-# Request timeout in seconds (default: 30). Left at the default it is derived from
-# limits.max_record_size_mb instead; see Size and memory limits below.
-request_timeout_secs = 30
+# Request timeout in seconds. Unset, it is derived from limits.max_record_size_mb; see
+# Size and memory limits below. Write it only to override that derivation.
+# request_timeout_secs = 60
 
 # CORS allowed origins (default: [] — no cross-origin browser access).
 # `["*"]` is permitted only on a `local` profile, and warned about there.
@@ -131,13 +131,27 @@ from it:
 | Largest MCP search response | the HTTP body size | 128 MB |
 
 Each derived value can be pinned on its own — `limits.max_body_size_mb`,
-`limits.max_response_bytes`, `network.http.request_timeout_secs` — and an explicit value always
-wins. Because most of them are *not* written in the file, `cameodb check-config` prints what the
-node resolved:
+`limits.max_response_bytes`, `network.http.request_timeout_secs` — and a written value always
+wins, whatever it says. Because most of them are *not* written in the file, `cameodb
+check-config` prints what the node resolved, and says of the timeout which of the two it is:
 
 ```
-Limits: record 420MB, HTTP body 512MB, remote msg 525MB, MCP response 16MB, timeout 90s, memory budget 96000MB
+Limits: record 420MB, HTTP body 512MB, remote msg 525MB, MCP response 16MB, timeout 90s (derived), memory budget 96000MB
 ```
+
+`max_record_size_mb / 10` is also the floor a written timeout is measured against: it is how
+long a maximum-size record needs to arrive, so a shorter timeout means the record size
+configured here can never be received. The node warns and honours the value — a search-only
+node that accepts no large writes is entitled to a short timeout — but on a node that does take
+them, the two settings need to agree.
+
+The timeout is the one setting here with a command-line and environment override,
+`--request-timeout-secs` / `CAMEODB_REQUEST_TIMEOUT_SECS`, because it is usually changed while
+trying something rather than while writing a file.
+
+Inter-node forwarding has its own deadline, `network.cluster.messaging.request_timeout_secs`.
+Unset, it follows the HTTP timeout, so that a forwarded request is not abandoned while the
+client that triggered it is still waiting; set it shorter only deliberately.
 
 **`max_body_size_mb × network.http.max_concurrent_requests` has to fit inside
 `total_memory_limit_mb`.** In-flight request bodies are held in memory, so a large body ceiling

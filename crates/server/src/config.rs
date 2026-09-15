@@ -130,6 +130,11 @@ const OVERRIDES: &[Override] = &[
         apply: |c, v| { c.network.http.max_concurrent_requests = v.parse()?; Ok(()) },
     },
     Override {
+        flag: "--request-timeout-secs", env: "CAMEODB_REQUEST_TIMEOUT_SECS", kind: FlagKind::Value,
+        placeholder: "<SECS>", help: "HTTP request timeout (defaults to derived from record size)",
+        apply: |c, v| { c.network.http.request_timeout_secs = Some(v.parse()?); Ok(()) },
+    },
+    Override {
         flag: "--data-paths", env: "CAMEODB_DATA_PATHS", kind: FlagKind::Value,
         placeholder: "<PATHS>", help: "Colon-separated storage directories",
         apply: |c, v| { c.storage.data_paths = v.split(':').map(PathBuf::from).collect(); Ok(()) },
@@ -659,9 +664,16 @@ pub struct HttpConfig {
     #[serde(default = "default_http_port")]
     pub port: u16,
 
-    /// Request timeout in seconds (default: 30)
-    #[serde(default = "default_request_timeout")]
-    pub request_timeout_secs: u64,
+    /// Request timeout in seconds. Unset, it is derived from
+    /// [`LimitsConfig::max_record_size_mb`]; see
+    /// [`CameoDbConfig::effective_request_timeout_secs`].
+    ///
+    /// `Option` rather than a defaulted `u64` because the two states are different answers and
+    /// the node acts differently on them. It was a `u64` defaulting to 30, with "differs from
+    /// the default" standing in for "the operator set it" — which made 30 the one value the
+    /// file could not express, and every example config shipped with it written out.
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 
     /// CORS allowed origins (default: ["*"])
     #[serde(default = "default_cors_allowed_origins")]
@@ -896,9 +908,12 @@ impl fmt::Debug for ClusterConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MessagingConfig {
-    /// Request timeout in seconds (default: 30)
-    #[serde(default = "default_request_timeout_secs")]
-    pub request_timeout_secs: u64,
+    /// Request timeout in seconds for inter-node asks. Unset, it follows the HTTP timeout; see
+    /// [`CameoDbConfig::effective_remote_timeout_secs`].
+    ///
+    /// `Option` for the same reason as its HTTP counterpart.
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 
     /// Maximum concurrent requests per peer (default: 100)
     #[serde(default = "default_messaging_max_concurrent_requests")]
@@ -1061,30 +1076,43 @@ impl CameoDbConfig {
 
     /// Effective HTTP request timeout in seconds.
     ///
-    /// For large records the default 30 s is insufficient.  Scale linearly
-    /// with record size: `max(60, max_record_size_mb / 10)`.
-    /// An explicit non-default `request_timeout_secs` takes precedence.
+    /// Written, it is honoured — any value, including one equal to a default. Unset, it scales
+    /// with record size: `max(60, max_record_size_mb / 10)`, because a node that accepts a
+    /// 2 GB record has to allow time to receive one.
+    ///
+    /// The floor in that formula is also what makes a written value sound or not:
+    /// `max_record_size_mb / 10` is the time a maximum-size record needs at the ~10 MB/s the
+    /// derivation assumes, so a timeout under it means the configured record size can never be
+    /// received. [`Self::timeout_floor_secs`] computes it and `validate` warns on it; the
+    /// value is still honoured, because a search-only node that wants a short timeout is
+    /// entitled to one.
     pub fn effective_request_timeout_secs(&self) -> u64 {
-        if self.network.http.request_timeout_secs != default_request_timeout() {
-            // User provided an explicit override – honour it.
-            self.network.http.request_timeout_secs
-        } else {
-            let scaled = (self.limits.max_record_size_mb as u64) / 10;
-            scaled.max(60)
-        }
+        self.network
+            .http
+            .request_timeout_secs
+            .unwrap_or_else(|| self.timeout_floor_secs().max(60))
+    }
+
+    /// Seconds a maximum-size record needs on the wire, at the ~10 MB/s the derived timeout
+    /// assumes. The lower bound a written timeout is measured against, and the variable part
+    /// of the derived one.
+    pub fn timeout_floor_secs(&self) -> u64 {
+        (self.limits.max_record_size_mb as u64) / 10
     }
 
     /// Effective Kameo remote messaging timeout in seconds.
     ///
-    /// Uses the same scaled timeout as HTTP so that inter-node forwarding
-    /// does not time out before the origin request.
+    /// Unset, it follows the HTTP timeout, so that a forwarded request is not cut short before
+    /// the origin request it is serving has given up. Every consumer of a remote deadline must
+    /// come through here rather than read the field: `RouterActor` read the raw field and so
+    /// forwarded with 30 s under a 60 s HTTP timeout, which is the bug this accessor exists to
+    /// prevent.
     pub fn effective_remote_timeout_secs(&self) -> u64 {
-        let messaging = &self.network.cluster.messaging;
-        if messaging.request_timeout_secs != default_request_timeout_secs() {
-            messaging.request_timeout_secs
-        } else {
-            self.effective_request_timeout_secs()
-        }
+        self.network
+            .cluster
+            .messaging
+            .request_timeout_secs
+            .unwrap_or_else(|| self.effective_request_timeout_secs())
     }
 
     /// Load configuration from every source, in this order of precedence:
@@ -1422,11 +1450,48 @@ impl CameoDbConfig {
             .into());
         }
 
-        if self.network.http.request_timeout_secs == 0 {
+        if self.network.http.request_timeout_secs == Some(0) {
             return Err(ConfigError::NetworkConfig {
                 message: "Request timeout must be positive".to_string(),
             }
             .into());
+        }
+
+        if self.network.cluster.messaging.request_timeout_secs == Some(0) {
+            return Err(ConfigError::NetworkConfig {
+                message: "Cluster messaging request timeout must be positive".to_string(),
+            }
+            .into());
+        }
+
+        // A written timeout is honoured whatever it says, but one below the time a
+        // maximum-size record needs on the wire means `max_record_size_mb` describes a record
+        // this node will never finish receiving. Warn rather than refuse: a short timeout is a
+        // reasonable choice on a node that serves searches and accepts no large writes, and
+        // refusing would make that node unconfigurable.
+        let floor = self.timeout_floor_secs();
+        if let Some(written) = self.network.http.request_timeout_secs
+            && written < floor
+        {
+            warn!(
+                "network.http.request_timeout_secs is {written}s, below the {floor}s a \
+                 {}MB record needs to arrive. Honouring {written}s — writes near the record \
+                 limit will time out. Raise the timeout or lower limits.max_record_size_mb.",
+                self.limits.max_record_size_mb
+            );
+        }
+
+        // The remote deadline serves an HTTP request that has its own. Shorter, a forwarded
+        // ask is abandoned while the client is still waiting, turning a slow cross-node read
+        // into an error the origin had time to avoid.
+        let remote = self.effective_remote_timeout_secs();
+        let http = self.effective_request_timeout_secs();
+        if remote < http {
+            warn!(
+                "network.cluster.messaging.request_timeout_secs resolves to {remote}s, under \
+                 the {http}s HTTP timeout: a forwarded request gives up while its client is \
+                 still waiting."
+            );
         }
 
         // Validate TLS configuration
@@ -1659,7 +1724,7 @@ impl Default for HttpConfig {
         Self {
             bind_address: default_http_bind_address(),
             port: default_http_port(),
-            request_timeout_secs: default_request_timeout(),
+            request_timeout_secs: None,
             max_concurrent_requests: default_http_max_concurrent_requests(),
             cors_allowed_origins: default_cors_allowed_origins(),
             admin_enabled: default_admin_enabled(),
@@ -1720,7 +1785,7 @@ impl Default for SearchConfig {
 impl Default for MessagingConfig {
     fn default() -> Self {
         Self {
-            request_timeout_secs: default_request_timeout_secs(),
+            request_timeout_secs: None,
             max_concurrent_requests: default_messaging_max_concurrent_requests(),
             connection_pool_size: default_connection_pool_size(),
             remote_retry_attempts: default_remote_retry_attempts(),
@@ -1867,10 +1932,6 @@ fn default_http_port() -> u16 {
     9480
 }
 
-fn default_request_timeout() -> u64 {
-    30
-}
-
 fn default_mcp_enabled() -> bool {
     true
 }
@@ -1997,10 +2058,6 @@ fn default_cluster_port() -> u16 {
 
 fn default_cluster_name() -> String {
     "cameodb-cluster".to_string()
-}
-
-fn default_request_timeout_secs() -> u64 {
-    30
 }
 
 fn default_messaging_max_concurrent_requests() -> usize {
@@ -2786,9 +2843,95 @@ max_response_bytes = 16777216
     #[test]
     fn test_explicit_timeout_override() {
         let mut config = CameoDbConfig::default();
-        config.network.http.request_timeout_secs = 120;
-        // Explicit override wins (120 != default 30)
+        config.network.http.request_timeout_secs = Some(120);
         assert_eq!(config.effective_request_timeout_secs(), 120);
+    }
+
+    /// The regression this type change exists for.
+    ///
+    /// 30 was the previous default, and the accessor recognised an explicit value by its
+    /// *difference* from that default — so this, the one value three shipped example configs
+    /// actually wrote, silently resolved to 60.
+    #[test]
+    fn test_timeout_equal_to_the_old_default_is_honoured() {
+        let mut config = CameoDbConfig::default();
+        config.network.http.request_timeout_secs = Some(30);
+        assert_eq!(config.effective_request_timeout_secs(), 30);
+
+        config.network.cluster.messaging.request_timeout_secs = Some(30);
+        assert_eq!(config.effective_remote_timeout_secs(), 30);
+    }
+
+    /// Absence is a distinct answer from any value, in both file formats.
+    #[test]
+    fn test_unset_timeout_derives_in_toml_and_yaml() {
+        let toml: CameoDbConfig = toml::from_str("[network.http]\nport = 9480\n").unwrap();
+        assert_eq!(toml.network.http.request_timeout_secs, None);
+        assert_eq!(toml.effective_request_timeout_secs(), 60);
+
+        let yaml: CameoDbConfig =
+            serde_saphyr::from_str("network:\n  http:\n    port: 9480\n").unwrap();
+        assert_eq!(yaml.network.http.request_timeout_secs, None);
+        assert_eq!(yaml.effective_request_timeout_secs(), 60);
+    }
+
+    /// The unknown-key sweep builds its schema by serializing the default config, so a key
+    /// that serializes away becomes "unknown" and warns on every start. `Option` must
+    /// serialize as null, not vanish — which is why neither field carries
+    /// `skip_serializing_if`.
+    #[test]
+    fn test_unset_timeout_still_appears_in_the_serialized_schema() {
+        let schema = serde_json::to_value(CameoDbConfig::default()).unwrap();
+        assert!(schema["network"]["http"]["request_timeout_secs"].is_null());
+        assert!(schema["network"]["cluster"]["messaging"]["request_timeout_secs"].is_null());
+
+        let file = "[network.http]\nrequest_timeout_secs = 30\n";
+        assert!(
+            unrecognized_keys(file).is_empty(),
+            "a written timeout must not be reported as an unknown setting"
+        );
+    }
+
+    /// Unset, the remote deadline follows HTTP rather than the field's own former default —
+    /// the invariant `RouterActor` broke by reading the raw field.
+    #[test]
+    fn test_remote_timeout_follows_http_when_unset() {
+        let mut config = CameoDbConfig::default();
+        assert_eq!(config.network.cluster.messaging.request_timeout_secs, None);
+        assert_eq!(config.effective_remote_timeout_secs(), 60);
+
+        config.network.http.request_timeout_secs = Some(120);
+        assert_eq!(config.effective_remote_timeout_secs(), 120);
+
+        config.limits.max_record_size_mb = 2048;
+        config.network.http.request_timeout_secs = None;
+        assert_eq!(config.effective_remote_timeout_secs(), 204);
+    }
+
+    #[test]
+    fn test_timeout_floor_tracks_record_size() {
+        let mut config = CameoDbConfig::default();
+        assert_eq!(config.timeout_floor_secs(), 6); // 64MB / 10
+
+        config.limits.max_record_size_mb = 2048;
+        assert_eq!(config.timeout_floor_secs(), 204);
+
+        // Below the floor is warned about, never refused: the node must stay configurable for
+        // a search-only deployment that wants a short timeout.
+        config.network.http.request_timeout_secs = Some(1);
+        assert!(config.validate().is_ok());
+        assert_eq!(config.effective_request_timeout_secs(), 1);
+    }
+
+    #[test]
+    fn test_zero_timeout_is_refused_on_both_paths() {
+        let mut config = CameoDbConfig::default();
+        config.network.http.request_timeout_secs = Some(0);
+        assert!(config.validate().is_err());
+
+        let mut config = CameoDbConfig::default();
+        config.network.cluster.messaging.request_timeout_secs = Some(0);
+        assert!(config.validate().is_err());
     }
 
     #[test]

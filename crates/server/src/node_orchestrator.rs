@@ -5645,6 +5645,10 @@ impl RouterActor {
         orchestrator: ActorRef<NodeOrchestrator>,
         coordinator: ActorRef<ClusterCoordinator>,
         messaging: &MessagingConfig,
+        // Resolved by `CameoDbConfig::effective_remote_timeout_secs`, not read from
+        // `messaging`: unset, the remote deadline follows the HTTP one, and reading the raw
+        // field here forwarded with 30 s under a 60 s HTTP timeout.
+        remote_timeout_secs: u64,
         streaming: StreamingSearchConfig,
         default_search_limit: usize,
         worker_tx: Option<OrchestratorWorkerTx>,
@@ -5656,7 +5660,7 @@ impl RouterActor {
         Self {
             orchestrator,
             coordinator,
-            remote_timeout: Duration::from_secs(messaging.request_timeout_secs),
+            remote_timeout: Duration::from_secs(remote_timeout_secs),
             broadcast_timeout: Duration::from_secs(messaging.broadcast_timeout_secs),
             broadcast_fanout_limit: messaging.broadcast_fanout_limit,
             remote_retry_attempts: messaging.remote_retry_attempts,
