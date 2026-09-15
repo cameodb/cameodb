@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An overloaded node no longer works for clients that have gone.** A search dispatched to the
+  worker pool ran whatever happened next: nothing downstream is cancellable, so when the request
+  timeout fired the node kept the work, finished it, and produced an answer nobody was waiting
+  for. Under sustained overload that was every request — goodput did not degrade, it reached
+  zero while the node stayed fully busy. A job is now refused when it is dequeued with less
+  budget left than the work is measured to take, which costs one comparison and returns the
+  admission slot immediately. The budget is measured from when the request *arrived*, not when
+  it was dispatched — the body read, parse and routing it already paid for are spent budget too
+  — and the work's cost is estimated per class of operation, so a point search is not held to
+  a bulk write's service time nor a write let through on a search's.
+
+  On an M1 with a 200k-document index and a 1s request timeout: 1,000/s offered went from 1 ok/s
+  with 14,949 timeouts to **572 ok/s with none**, and 3,000/s from ~0 to **554 ok/s**, flat.
+  Refusals are now `503`s the caller can retry rather than `408`s after a wasted second — at
+  3,000/s a 0.037% tail still times out. A node that keeps up is unaffected — at 300/s it sheds
+  nothing and answers in 10ms at p99 — and the check is inert on a default node, where the
+  budget exceeds any plausible queue by three orders of magnitude.
+
+  The same change fixes `/_cluster/health` answering 408 under that overload, which had looked
+  like a middleware ordering problem and was not: the endpoint and the layer order are untouched,
+  and sixteen consecutive probes under 3,000/s now return 200 in ~160ms.
+
+  Not yet recovered: the full ~730/s the node can serve. The reserve is twice the measured
+  service time, capped at half the budget — the cap is what stops a slow node from reserving
+  more than it has and refusing everything for good, which would have been F7's own failure
+  shape rebuilt inside its fix. Bounding the backlog at admission is the remaining half.
+
+- `GET /_cluster/health` gained `read_pool_abandoned`, and `GET /_admin/workers` gained
+  `dispatch.abandoned` — reads and jobs refused at dequeue. Both were unobservable by
+  construction: refused work runs nowhere, so it lands in no latency sample and no completion
+  tally, and a node shedding hard looked exactly like one sitting idle.
+
 ### Changed
 
 - **`request_timeout_secs = 30` now means 30 seconds.** The setting was read as a `u64`

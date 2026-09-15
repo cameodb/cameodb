@@ -124,6 +124,63 @@ const ORCHESTRATOR_WORKER_QUEUE_CAPACITY: usize = SHARD_WRITER_CHANNEL_CAPACITY 
 /// `in_flight_capacity` on `/_admin/workers`.
 const ORCHESTRATOR_WORKER_MAX_IN_FLIGHT: usize = 8;
 
+tokio::task_local! {
+    /// When the request being served reached this node, scoped to the task running its
+    /// handler.
+    ///
+    /// Stamped by a layer just inside `TimeoutLayer` (`routes.rs`), so the clock it starts
+    /// is the same one the client's deadline runs on — auth has already happened, and
+    /// everything after it (body read, parse, dispatch, queue wait) counts against the same
+    /// budget. The deadline checks F7 put at dequeue read it through [`request_started_at`];
+    /// stamping it at dispatch instead would grant every job a fresh budget after whatever
+    /// the body cost, which for a max-size record is the whole timeout.
+    ///
+    /// A task-local rather than a field on the request or the op: the value is read at job
+    /// build inside `handle_client_op`, sixteen call sites upstream of it, and none of them
+    /// has any use for it themselves. `tokio::spawn` inherits the scope, so paths that hand
+    /// the request to a new task — streaming search dispatch, and the worker's op task, which
+    /// re-enters it scoped to the job's `arrived_at` — keep the same stamp. Calls that arrive
+    /// another way — a peer's forwarded op over libp2p, an internal ask, a test — run outside
+    /// any scope and get `Instant::now()` from the helper, which is the dispatch-time
+    /// behaviour this replaced.
+    pub(crate) static REQUEST_STARTED_AT: Instant;
+}
+
+/// When the request being served reached this node, or `Instant::now()` for work that did
+/// not arrive through the HTTP middleware (a peer's forwarded op, an internal call, a test).
+/// See [`REQUEST_STARTED_AT`].
+pub(crate) fn request_started_at() -> Instant {
+    REQUEST_STARTED_AT
+        .try_with(|started| *started)
+        .unwrap_or_else(|_| Instant::now())
+}
+
+/// The kind of work a [`ClientOp`] implies, for the admission-time service estimate.
+///
+/// One EWMA for every op would blend a point search's milliseconds with a bulk write's, and
+/// the reserve computed from the blend is wrong for both — over-reserving the cheap op and
+/// under-reserving the expensive one. `Any` is the fallback view: used where the op is not
+/// in hand, and where a class has no samples of its own yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpClass {
+    /// Op not yet known or outside the split — reserves fall back to the blended estimate.
+    Any,
+    /// `Search`, `Stream` — work that lands on the read pool.
+    Read,
+    /// `Write`, `Delete` — work that lands on a shard's writer thread.
+    Write,
+}
+
+impl OpClass {
+    fn of(op: &ClientOp) -> Self {
+        match op {
+            ClientOp::Search { .. } | ClientOp::Stream { .. } => OpClass::Read,
+            ClientOp::Write { .. } | ClientOp::Delete { .. } => OpClass::Write,
+            _ => OpClass::Any,
+        }
+    }
+}
+
 /// The prefix a per-document reason carries: its place in the batch it was sent in.
 const DOCUMENT_PREFIX: &str = "document ";
 
@@ -1573,6 +1630,12 @@ pub struct NodeConfig {
     pub memory_pressure_threshold_percent: u8,
     /// Number of threads for the dedicated read (search/stats) runtime
     pub search_threads: usize,
+    /// The node's resolved HTTP request timeout, in seconds.
+    ///
+    /// Not used to time anything out — it is the budget a queued read is measured against, so
+    /// a read that has already outlived the request that asked for it is refused rather than
+    /// run. `0` disables the check. See [`dispatch_read_pool`].
+    pub request_timeout_secs: u64,
     /// Enable WAL fsync for durability
     pub wal_sync: bool,
     /// Default batch size for smart commit calculations
@@ -1620,6 +1683,7 @@ impl Default for NodeConfig {
             storage_path: default_path.clone(),
             storage_paths: vec![default_path],
             max_shards: 8,
+            request_timeout_secs: 0,
             indexer_memory_min_mb: 16,
             indexer_memory_max_mb: 256,
             total_memory_limit_mb: 2048,
@@ -1676,6 +1740,24 @@ pub enum OrchestratorError {
     /// matched nothing, which is the reading that makes it dangerous.
     #[error("no clause of this query can run against this index: {notes}")]
     UnrunnableQuery { notes: String },
+
+    /// The read waited longer in the pool queue than the request that asked for it was given,
+    /// so it was dropped at dequeue instead of run.
+    ///
+    /// Tokio never cancels a blocking closure: dropping its `JoinHandle` neither stops work
+    /// that has started nor dequeues work that has not. So when the HTTP timeout fires, the
+    /// search behind it still runs, still occupies a read thread, and still produces an answer
+    /// — for a client that is already gone. Under sustained overload that is *every* search,
+    /// which is why goodput went to zero rather than degrading (ROADMAP F7, measured on two
+    /// machines). The work cannot be cancelled, so it is refused before it starts.
+    ///
+    /// `Unavailable` rather than a fault: nothing about the request is wrong, the node was
+    /// simply behind, and a retry is the right move. That also makes it the same `503` the
+    /// admission guard already answers, so a client under overload sees one behaviour.
+    #[error(
+        "read abandoned: spent {waited_ms}ms of a {budget_ms}ms request before a worker could start it"
+    )]
+    ReadDeadlineExpired { waited_ms: u64, budget_ms: u64 },
 
     /// No shard could run the query, so the empty result it produced is not an answer.
     ///
@@ -1816,6 +1898,7 @@ impl OrchestratorError {
             // is rebuilt on the next write, and the caller should retry.
             Self::SchemaUnconfirmed { .. }
             | Self::PeerUnreachable { .. }
+            | Self::ReadDeadlineExpired { .. }
             | Self::Storage(StoreError::WriterPanicked(_)) => RemoteVerdict::Unavailable,
 
             // Its own verdict because the forwarding node has to act on it and must not confuse
@@ -2138,6 +2221,15 @@ impl From<OrchestratorError> for RemoteError {
             // is the microshard path and has no retryable kind of its own, so `Unavailable`
             // travels as `Io` here — a shard call does not produce one.
             OrchestratorError::PeerUnreachable { message } => RemoteError::Io(message),
+            // Carried like `PeerUnreachable`: a peer that shed the read did not answer, and the
+            // gather reports it as the partial outage it is.
+            OrchestratorError::ReadDeadlineExpired {
+                waited_ms,
+                budget_ms,
+            } => RemoteError::Io(format!(
+                "read abandoned: spent {waited_ms}ms of a {budget_ms}ms request before a \
+                 worker could start it"
+            )),
             OrchestratorError::Remote { verdict, message } => match verdict {
                 RemoteVerdict::BadRequest => RemoteError::InvalidInput(message),
                 RemoteVerdict::NotFound => RemoteError::NotFound(message),
@@ -2514,6 +2606,15 @@ enum DeleteOutcome {
 /// back via the oneshot channel, bypassing the actor mailbox.
 pub enum OrchestratorJob {
     Execute {
+        /// When the request that produced this job reached the node.
+        ///
+        /// Stamped at the HTTP boundary (`REQUEST_STARTED_AT`), not at dispatch — a request
+        /// that spent its budget being received arrives here already expired, and the dequeue
+        /// check below reads this against the node's request timeout to refuse work rather
+        /// than run it for a client that has gone. This channel is where the backlog forms
+        /// under overload — the measurement is in ROADMAP F7 — and nothing downstream of it
+        /// is cancellable.
+        arrived_at: Instant,
         op: Box<ClientOp>,
         /// Shard affinity hint for dispatch. When Some, the job was routed to
         /// a worker determined by `xxh3(shard_id) % worker_count`. Passed to
@@ -2752,6 +2853,10 @@ async fn orchestrator_worker_loop<F, Fut>(
     worker_id: usize,
     counters: Option<Arc<WorkerCounters>>,
     max_in_flight: usize,
+    // How long a job may wait in the queue before it is refused rather than run, and where to
+    // count the refusals. `None` runs every job however stale — the behaviour before F7.
+    budget: Option<Duration>,
+    dispatch_stats: Option<Arc<DispatchCounters>>,
 ) where
     F: Fn(Box<ClientOp>, Option<Uuid>) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = WorkerOutcome> + Send + 'static,
@@ -2766,6 +2871,7 @@ async fn orchestrator_worker_loop<F, Fut>(
 
         match rx.recv().await {
             Some(OrchestratorJob::Execute {
+                arrived_at,
                 op,
                 affinity_shard,
                 reply,
@@ -2774,14 +2880,73 @@ async fn orchestrator_worker_loop<F, Fut>(
                 let counters = counters.clone();
                 if let Some(c) = &counters {
                     c.queue_depth.fetch_sub(1, AtomicOrdering::Relaxed);
+                }
+
+                // The F7 check, and it has to be here rather than deeper. Everything past this
+                // point is uncancellable: the operation runs, the search reaches the read pool
+                // as a blocking closure tokio will never interrupt, and the answer is produced
+                // whether or not anyone is still waiting for it. Under sustained overload that
+                // was *every* request — the node stayed fully busy and delivered nothing.
+                //
+                // Refusing here costs one comparison and gives the permit straight back, so the
+                // queue drains at the rate work is offered rather than the rate it can be
+                // served, and the node returns to serving whatever it can actually keep up with.
+                //
+                // `arrived_at` is the request's arrival at the node, not its enqueue: the body
+                // read, parse and routing it already paid for are spent budget too, and a
+                // request that arrived expired — a max-size record at the derived timeout is
+                // the standing example — is refused here rather than run for nobody.
+                let service_class = OpClass::of(&op);
+                if let Some(budget) = budget {
+                    let waited = arrived_at.elapsed();
+                    // Not `waited > budget`. Admitting a job with barely any budget left is a
+                    // slower way of wasting the work: the queue settles exactly on the
+                    // deadline, every job that passes spends its remaining microseconds being
+                    // searched for, and the answer still lands after the client has gone.
+                    // Measured: 11,656 jobs shed and goodput still zero, because the 13,363
+                    // that passed all finished late. A job is worth starting only if what is
+                    // left can cover what the work takes.
+                    let reserve = dispatch_stats
+                        .as_ref()
+                        .map(|s| s.service_reserve_for(service_class, budget))
+                        .unwrap_or_default();
+                    if waited + reserve > budget {
+                        if let Some(stats) = &dispatch_stats {
+                            stats.abandoned.fetch_add(1, AtomicOrdering::Relaxed);
+                            stats.job_left_pool();
+                        }
+                        let _ = reply.send(WorkerOutcome::Done(Err(
+                            OrchestratorError::ReadDeadlineExpired {
+                                waited_ms: waited.as_millis() as u64,
+                                budget_ms: budget.as_millis() as u64,
+                            },
+                        )));
+                        drop(permit);
+                        continue;
+                    }
+                }
+
+                if let Some(c) = &counters {
                     c.in_flight.fetch_add(1, AtomicOrdering::Relaxed);
                 }
                 // On the pinned path this spawns onto the worker's own current_thread
                 // runtime, so the operation stays on that core and pinning still means what
                 // it says. On the default path it spawns onto the shared multi-threaded
                 // runtime, where a worker is an admission-control unit rather than a place.
-                tokio::spawn(async move {
+                let service_stats = dispatch_stats.clone();
+                // Run the op inside the request's arrival scope: `request_started_at` is
+                // inherited by `spawn`, so deadline checks reached from inside the op — the
+                // read pool's, or a re-dispatch's — measure against the same clock this
+                // dequeue check did rather than a fresh one.
+                tokio::spawn(REQUEST_STARTED_AT.scope(arrived_at, async move {
+                    let started = Instant::now();
                     let result = run_op(op, affinity_shard).await;
+                    // What this job actually cost once admitted, which is what the next job's
+                    // admission decision is measured against.
+                    if let Some(stats) = &service_stats {
+                        stats.record_service(service_class, started.elapsed());
+                        stats.job_left_pool();
+                    }
                     // Ignore the error: the caller may have given up and dropped the receiver.
                     let _ = reply.send(result);
                     if let Some(c) = &counters {
@@ -2789,7 +2954,7 @@ async fn orchestrator_worker_loop<F, Fut>(
                         c.jobs_completed.fetch_add(1, AtomicOrdering::Relaxed);
                     }
                     drop(permit);
-                });
+                }));
             }
             Some(OrchestratorJob::Shutdown) => {
                 debug!(
@@ -2859,6 +3024,117 @@ struct DispatchCounters {
     round_robin_sends: AtomicU64,
     /// Jobs that fell all the way back to the actor mailbox (all workers full/closed).
     actor_mailbox_fallbacks: AtomicU64,
+    /// Jobs refused at dequeue because the budget left could not cover the work.
+    ///
+    /// The shed is otherwise invisible — the work never runs, so it lands in no latency sample
+    /// and no `jobs_completed` tally, and a node shedding hard reads as one that is idle.
+    abandoned: AtomicU64,
+    /// Jobs anywhere in the pool — queued or running — across all workers.
+    ///
+    /// One atomic rather than a sum over the per-worker `queue_depth` + `in_flight` pairs:
+    /// a depth check reads it on every request and the sum is information this counter
+    /// already carries — the per-worker gauges stay, but their job is the `/_admin/workers`
+    /// report.
+    outstanding: AtomicUsize,
+    /// Exponentially-weighted mean of how long a job takes once admitted, in microseconds —
+    /// every op class folded together.
+    ///
+    /// Dequeue-to-answer, so it covers everything downstream — the shard hop, the read-pool
+    /// queue and the search itself — which is exactly what a job needs to have left when it is
+    /// admitted. Measured rather than configured because it moves with index size, shard count
+    /// and load, and a number an operator has to keep in step with those is one that will be
+    /// wrong.
+    ///
+    /// This is the blend a caller that does not know the op's class reserves against. The two
+    /// per-class estimates beside it are what a check with the op in hand reserves against —
+    /// see [`OpClass`].
+    ///
+    /// Starts at zero, so a node under no load admits everything and the estimate only becomes
+    /// restrictive once there is evidence to be restrictive about. It cannot go stale while
+    /// shedding: a queue that drains admits jobs, and those jobs update it.
+    service_ewma_us: AtomicU64,
+    /// Dequeue-to-answer EWMA for reads (`Search`, `Stream`). See `service_ewma_us`.
+    service_ewma_read_us: AtomicU64,
+    /// Dequeue-to-answer EWMA for writes (`Write`, `Delete`). See `service_ewma_us`.
+    service_ewma_write_us: AtomicU64,
+}
+
+impl DispatchCounters {
+    /// Fold one dequeue-to-answer sample into the estimates: the blend, and the class the job
+    /// belonged to when it has one.
+    fn record_service(&self, class: OpClass, sample: Duration) {
+        let sample_us = sample.as_micros() as u64;
+        Self::fold_ewma(&self.service_ewma_us, sample_us);
+        match class {
+            OpClass::Read => Self::fold_ewma(&self.service_ewma_read_us, sample_us),
+            OpClass::Write => Self::fold_ewma(&self.service_ewma_write_us, sample_us),
+            OpClass::Any => {}
+        }
+    }
+
+    /// 1/8 weight — slow enough not to chase a single slow query, fast enough to track a node
+    /// whose load has changed.
+    ///
+    /// Read-modify-write under `fetch_update` rather than load-then-store: every worker folds
+    /// into these values, and a lost update is a sample the estimate never saw.
+    fn fold_ewma(slot: &AtomicU64, sample_us: u64) {
+        let _ = slot.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |previous| {
+                Some(if previous == 0 {
+                    sample_us
+                } else {
+                    (previous.saturating_mul(7).saturating_add(sample_us)) / 8
+                })
+            },
+        );
+    }
+
+    /// A job left the pool — refused at dequeue, or answered. Saturating rather than
+    /// `fetch_sub`: an increment that was somehow missed (a sender that is not `try_send`,
+    /// which is what the tests use) must underflow to zero rather than wrap to `usize::MAX`.
+    fn job_left_pool(&self) {
+        let _ =
+            self.outstanding
+                .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                });
+    }
+
+    /// The estimate a reserve should be computed from for `class`: the class's own EWMA, or
+    /// the blend when the class has no samples yet — a node that has only ever served searches
+    /// still knows what *a* job costs, and zero would reserve nothing at all.
+    fn service_estimate_for(&self, class: OpClass) -> u64 {
+        let class_estimate = match class {
+            OpClass::Read => self.service_ewma_read_us.load(AtomicOrdering::Relaxed),
+            OpClass::Write => self.service_ewma_write_us.load(AtomicOrdering::Relaxed),
+            OpClass::Any => 0,
+        };
+        if class_estimate != 0 {
+            class_estimate
+        } else {
+            self.service_ewma_us.load(AtomicOrdering::Relaxed)
+        }
+    }
+
+    /// What a job should still have left to be worth admitting, given the budget it is measured
+    /// against.
+    ///
+    /// Twice the estimate, so the margin survives the spread rather than only the mean. At one
+    /// times the estimate the queue settles exactly on the deadline and about half of what is
+    /// admitted still misses it — which is the state this whole check exists to leave.
+    ///
+    /// **Capped at half the budget, and that cap is load-bearing rather than tidy.** Uncapped,
+    /// an estimate above half the budget makes the reserve exceed the budget outright, so every
+    /// job is refused — including one that has waited no time at all. Nothing then completes,
+    /// no sample ever updates the estimate, and the node refuses everything forever: the same
+    /// metastable shape F7 is about, reintroduced by its own fix. The cap guarantees a freshly
+    /// arrived job is always admitted, which guarantees the estimate keeps being measured.
+    fn service_reserve_for(&self, class: OpClass, budget: Duration) -> Duration {
+        let reserve = Duration::from_micros(self.service_estimate_for(class).saturating_mul(2));
+        reserve.min(budget / 2)
+    }
 }
 
 /// Snapshot of a single worker's stats for the `/_admin/workers` endpoint.
@@ -2907,6 +3183,10 @@ pub struct DispatchStats {
     pub affine_full_fallbacks: u64,
     pub round_robin_sends: u64,
     pub actor_mailbox_fallbacks: u64,
+    /// Jobs refused at dequeue for having outlived their request. Defaulted so an older peer's
+    /// report still deserializes.
+    #[serde(default)]
+    pub abandoned: u64,
 }
 
 /// Full worker pool report returned by `GET /_admin/workers`.
@@ -2955,9 +3235,11 @@ pub struct OrchestratorWorkerTx {
 }
 
 impl OrchestratorWorkerTx {
+    #[allow(clippy::too_many_arguments)]
     fn new_with_stats(
         workers: Vec<mpsc::Sender<OrchestratorJob>>,
         worker_stats: Arc<Vec<Arc<WorkerCounters>>>,
+        dispatch_stats: Arc<DispatchCounters>,
         per_worker_queue_capacity: usize,
         pinning_requested: bool,
         core_aligned: bool,
@@ -2968,7 +3250,7 @@ impl OrchestratorWorkerTx {
             workers: Arc::new(workers),
             next_worker: Arc::new(AtomicUsize::new(0)),
             worker_stats,
-            dispatch_stats: Arc::new(DispatchCounters::default()),
+            dispatch_stats,
             per_worker_queue_capacity,
             pinning_requested,
             core_aligned,
@@ -3001,6 +3283,9 @@ impl OrchestratorWorkerTx {
                 Ok(()) => {
                     self.worker_stats[idx]
                         .queue_depth
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    self.dispatch_stats
+                        .outstanding
                         .fetch_add(1, AtomicOrdering::Relaxed);
                     return Ok(());
                 }
@@ -3057,6 +3342,9 @@ impl OrchestratorWorkerTx {
                 Ok(()) => {
                     self.worker_stats[idx]
                         .queue_depth
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    self.dispatch_stats
+                        .outstanding
                         .fetch_add(1, AtomicOrdering::Relaxed);
                     if is_affine {
                         if offset == 0 {
@@ -3160,6 +3448,7 @@ impl OrchestratorWorkerTx {
                 .dispatch_stats
                 .actor_mailbox_fallbacks
                 .load(AtomicOrdering::Relaxed),
+            abandoned: self.dispatch_stats.abandoned.load(AtomicOrdering::Relaxed),
         };
 
         WorkerPoolReport {
@@ -3773,6 +4062,9 @@ pub struct MicroshardActor {
     /// Node-wide read-pool health each read on this shard brackets, so health sees saturation and
     /// a wedge. `None` when there is no dedicated pool (tests, and the generic-pool fallback).
     read_pool_health: Option<Arc<ReadPoolHealth>>,
+    /// How long a read may sit in the pool queue before it is refused instead of run. `None`
+    /// disables the check. See [`dispatch_read_pool`].
+    read_budget: Option<Duration>,
     /// Total shards on this node (for per-shard memory budgeting).
     total_shards: usize,
     /// Writer thread shutdown timeout in seconds.
@@ -3813,6 +4105,9 @@ pub struct ShardRuntime {
     /// Node-wide read-pool health each read brackets. Paired with `read_pool_handle`: `Some` for
     /// the dedicated pool, `None` for the generic-pool fallback.
     pub read_pool_health: Option<Arc<ReadPoolHealth>>,
+    /// How long a read may wait for a pool thread before it is refused rather than run — the
+    /// node's request timeout. `None` runs every queued read however stale.
+    pub read_budget: Option<Duration>,
     /// Shards on this node, for per-shard memory budgeting.
     pub total_shards: usize,
     /// How long to let the writer thread drain on shutdown.
@@ -4087,6 +4382,14 @@ pub struct ReadPoolHealth {
     last_progress: AtomicU64,
     capacity: usize,
     origin: Instant,
+    /// Reads dropped at dequeue because they had outlived the request that asked for them.
+    ///
+    /// Counted because the shed is otherwise invisible: the work never runs, so it appears in
+    /// no latency sample and no worker tally, and a node shedding hard would look identical to
+    /// one that is merely idle. A rising count is the node declining work it could not have
+    /// delivered — the signal that load exceeds capacity, and the number to read before
+    /// concluding a node is healthy because its latencies look fine.
+    abandoned: AtomicU64,
 }
 
 impl ReadPoolHealth {
@@ -4096,7 +4399,18 @@ impl ReadPoolHealth {
             last_progress: AtomicU64::new(0),
             capacity: capacity.max(1),
             origin: Instant::now(),
+            abandoned: AtomicU64::new(0),
         }
+    }
+
+    /// Record a read refused at dequeue. See [`Self::abandoned`].
+    fn record_abandoned(&self) {
+        self.abandoned.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Reads refused at dequeue since this node started.
+    pub fn abandoned(&self) -> u64 {
+        self.abandoned.load(AtomicOrdering::Relaxed)
     }
 
     fn now_ticks(&self) -> u64 {
@@ -4176,23 +4490,51 @@ impl Drop for ReadInFlight {
 async fn dispatch_read_pool<F, R>(
     handle: Option<&tokio::runtime::Handle>,
     health: Option<Arc<ReadPoolHealth>>,
+    budget: Option<Duration>,
     f: F,
 ) -> Result<R, OrchestratorError>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    // Stamped at request arrival when the caller runs inside the request's scope — the
+    // worker's op task re-enters it with the job's `arrived_at` — and read after the closure
+    // is dequeued, so the elapsed span is everything the request has already spent: wire,
+    // body, orchestrator queue and this pool's wait. This queue is the one the request
+    // timeout cannot reach: `spawn_blocking` work is uncancellable, so a timed-out request
+    // leaves its search sitting here, and the pool works through a backlog of searches whose
+    // clients have all gone. See [`OrchestratorError::ReadDeadlineExpired`].
+    //
+    // On a path with no arrival stamp — an internal actor call, a read forwarded from a peer —
+    // the helper falls back to `Instant::now()` and the span is the pool wait alone.
+    let queued_at = request_started_at();
     let tracked = move || {
+        if let Some(budget) = budget {
+            let waited = queued_at.elapsed();
+            if waited > budget {
+                if let Some(health) = health.as_ref() {
+                    health.record_abandoned();
+                }
+                return Err(OrchestratorError::ReadDeadlineExpired {
+                    waited_ms: waited.as_millis() as u64,
+                    budget_ms: budget.as_millis() as u64,
+                });
+            }
+        }
         // Held across `f` on the pool thread, so in-flight reflects work actually running and the
-        // guard's drop records completion even if `f` unwinds.
+        // guard's drop records completion even if `f` unwinds. Taken after the deadline check so
+        // a refused read is never counted as in flight.
         let _in_flight = health.as_ref().map(|h| h.track());
-        f()
+        Ok(f())
     };
     let joined = match handle {
         Some(handle) => handle.spawn_blocking(tracked).await,
         None => tokio::task::spawn_blocking(tracked).await,
     };
-    joined.map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
+    match joined {
+        Ok(outcome) => outcome,
+        Err(e) => Err(OrchestratorError::Io(std::io::Error::other(e))),
+    }
 }
 
 /// Why a writer thread left its loop. The monitor rebuilds the writer on `Crashed` and stops on
@@ -4714,6 +5056,7 @@ impl MicroshardActor {
             default_search_limit,
             read_pool_handle,
             read_pool_health,
+            read_budget,
             total_shards,
             writer_shutdown_timeout_secs,
             supervisor_timeout_secs,
@@ -4727,6 +5070,7 @@ impl MicroshardActor {
             writer_tx: Arc::new(ArcSwapOption::empty()),
             writer_monitor_handle: Arc::new(std::sync::Mutex::new(None)),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            read_budget,
             storage_config,
             default_search_limit,
             supervisors: Arc::new(AsyncRwLock::new(HashMap::new())),
@@ -5075,6 +5419,7 @@ impl MicroshardActor {
         dispatch_read_pool(
             self.read_pool_handle.as_ref(),
             self.read_pool_health.clone(),
+            self.read_budget,
             f,
         )
         .await
@@ -5717,6 +6062,11 @@ impl RouterActor {
 
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let job = OrchestratorJob::Execute {
+                    // Arrival, not enqueue: everything the request already spent — body read,
+                    // parse, routing — is budget it no longer has, and the dequeue check must
+                    // see that or a max-size write would be granted a whole second budget after
+                    // spending the first being received.
+                    arrived_at: request_started_at(),
                     op: Box::new(op),
                     affinity_shard,
                     reply: reply_tx,
@@ -7172,6 +7522,9 @@ pub struct NodeOrchestrator {
     /// shard so each read brackets it, and to the health endpoint so it can see the pool saturate
     /// or wedge.
     read_pool_health: Arc<ReadPoolHealth>,
+    /// How long a read may wait for a pool thread before it is refused instead of run. The
+    /// node's request timeout, handed to every shard. `None` when no timeout is configured.
+    read_budget: Option<Duration>,
     /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups.
     remote_peer_pool: Option<Arc<RemotePeerPool>>,
 }
@@ -8370,6 +8723,10 @@ impl NodeOrchestrator {
             "Dedicated read thread pool created"
         );
 
+        // Read before `config` is moved into the struct below.
+        let read_budget = (config.request_timeout_secs > 0)
+            .then(|| Duration::from_secs(config.request_timeout_secs));
+
         let mut orchestrator = Self {
             shards: HashMap::new(),
             writer_liveness: Arc::new(WriterLiveness::default()),
@@ -8389,6 +8746,7 @@ impl NodeOrchestrator {
             worker_threads: Vec::new(),
             read_runtime: Some(read_runtime),
             read_pool_health: Arc::new(ReadPoolHealth::new(read_threads)),
+            read_budget,
             remote_peer_pool: None,
         };
 
@@ -8511,6 +8869,10 @@ impl NodeOrchestrator {
                 .map(|_| Arc::new(WorkerCounters::default()))
                 .collect::<Vec<_>>(),
         );
+        // Built here rather than inside `OrchestratorWorkerTx` so the worker loops, which are
+        // spawned below, count their dequeue refusals into the same counters the send path uses.
+        let dispatch_stats = Arc::new(DispatchCounters::default());
+        let job_budget = self.read_budget;
         let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
         for worker_id in 0..worker_count {
@@ -8518,6 +8880,7 @@ impl NodeOrchestrator {
             worker_txs.push(tx);
             let engine = Arc::clone(&engine);
             let counters = Arc::clone(&worker_stats[worker_id]);
+            let worker_dispatch_stats = Arc::clone(&dispatch_stats);
             // What the worker does with a job it has admitted. Cloned per operation, so it
             // holds an `Arc` rather than borrowing the engine.
             let run_op = move |op: Box<ClientOp>, _affinity_shard: Option<Uuid>| {
@@ -8576,6 +8939,8 @@ impl NodeOrchestrator {
                             worker_id,
                             Some(counters),
                             ORCHESTRATOR_WORKER_MAX_IN_FLIGHT,
+                            job_budget,
+                            Some(worker_dispatch_stats),
                         ));
                     })
                     .expect("Failed to spawn orchestrator worker thread");
@@ -8588,6 +8953,8 @@ impl NodeOrchestrator {
                     worker_id,
                     Some(counters),
                     ORCHESTRATOR_WORKER_MAX_IN_FLIGHT,
+                    job_budget,
+                    Some(worker_dispatch_stats),
                 ));
             }
         }
@@ -8595,6 +8962,7 @@ impl NodeOrchestrator {
         let tx = OrchestratorWorkerTx::new_with_stats(
             worker_txs,
             worker_stats,
+            Arc::clone(&dispatch_stats),
             per_worker_queue_capacity,
             pin_workers,
             aligned,
@@ -8739,6 +9107,7 @@ impl NodeOrchestrator {
             let default_search_limit = self.default_search_limit;
             let read_handle = self.read_runtime.as_ref().map(|rt| rt.handle().clone());
             let read_pool_health = Some(Arc::clone(&self.read_pool_health));
+            let read_budget = self.read_budget;
             let sem = Arc::clone(&semaphore);
             let writer_liveness = Arc::clone(&self.writer_liveness);
             // Placed here rather than inside the task: hydration runs concurrently, and an
@@ -8758,6 +9127,7 @@ impl NodeOrchestrator {
                         default_search_limit,
                         read_pool_handle: read_handle,
                         read_pool_health,
+                        read_budget,
                         total_shards,
                         writer_shutdown_timeout_secs,
                         supervisor_timeout_secs,
@@ -8958,6 +9328,7 @@ impl NodeOrchestrator {
                 default_search_limit: self.default_search_limit,
                 read_pool_handle: read_handle,
                 read_pool_health: Some(Arc::clone(&self.read_pool_health)),
+                read_budget: self.read_budget,
                 total_shards,
                 writer_shutdown_timeout_secs: self.config.writer_shutdown_timeout_secs,
                 supervisor_timeout_secs: self.config.supervisor_timeout_secs,
@@ -11377,7 +11748,7 @@ mod tests {
             // The dedicated-pool path a real search takes, tracked so the in-flight bracket is
             // exercised across the panic too.
             let panicked: Result<(), OrchestratorError> =
-                dispatch_read_pool(Some(&handle), Some(Arc::clone(&health)), || {
+                dispatch_read_pool(Some(&handle), Some(Arc::clone(&health)), None, || {
                     panic!("tantivy panicked on a document")
                 })
                 .await;
@@ -11385,9 +11756,10 @@ mod tests {
                 panicked.is_err(),
                 "a panic in a read must surface as an error, not take the process down"
             );
-            let after: u32 = dispatch_read_pool(Some(&handle), Some(Arc::clone(&health)), || 7)
-                .await
-                .expect("the dedicated read pool serves the next read after a panic");
+            let after: u32 =
+                dispatch_read_pool(Some(&handle), Some(Arc::clone(&health)), None, || 7)
+                    .await
+                    .expect("the dedicated read pool serves the next read after a panic");
             assert_eq!(after, 7);
             // The guard drops on both the panicking and the clean read, so nothing stays counted.
             assert_eq!(
@@ -11398,13 +11770,187 @@ mod tests {
 
             // And the fallback path, for a shard with no dedicated pool.
             let panicked: Result<(), OrchestratorError> =
-                dispatch_read_pool(None, None, || panic!("redb panicked")).await;
+                dispatch_read_pool(None, None, None, || panic!("redb panicked")).await;
             assert!(panicked.is_err(), "the fallback pool isolates a panic too");
-            let after: u32 = dispatch_read_pool(None, None, || 9)
+            let after: u32 = dispatch_read_pool(None, None, None, || 9)
                 .await
                 .expect("the fallback pool serves the next read after a panic");
             assert_eq!(after, 9);
         });
+    }
+
+    /// The F7 fix: a read that has outlived its request is refused at dequeue, not run.
+    ///
+    /// The pool is one thread wide and the first read holds it, so the second is still queued
+    /// when its budget expires — which is exactly the shape of the measured failure, where a
+    /// backlog of searches was worked through for clients that had all timed out. The closure
+    /// must not run: proving that is the entire point, since the wasted work is uncancellable
+    /// once it starts.
+    #[test]
+    fn a_read_that_outlived_its_request_is_refused_instead_of_run() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("read runtime");
+        let handle = runtime.handle().clone();
+        let health = Arc::new(ReadPoolHealth::new(1));
+        let ran = Arc::new(AtomicBool::new(false));
+
+        runtime.block_on(async {
+            let budget = Duration::from_millis(50);
+
+            // Occupy the only pool thread for longer than the second read's budget.
+            let blocker = {
+                let handle = handle.clone();
+                let health = Arc::clone(&health);
+                tokio::spawn(async move {
+                    dispatch_read_pool(Some(&handle), Some(health), None, || {
+                        std::thread::sleep(Duration::from_millis(250));
+                    })
+                    .await
+                })
+            };
+            // Let the blocker reach the pool thread before the queued read is offered.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let ran_flag = Arc::clone(&ran);
+            let queued: Result<(), OrchestratorError> = dispatch_read_pool(
+                Some(&handle),
+                Some(Arc::clone(&health)),
+                Some(budget),
+                move || {
+                    ran_flag.store(true, AtomicOrdering::SeqCst);
+                },
+            )
+            .await;
+
+            match queued {
+                Err(OrchestratorError::ReadDeadlineExpired {
+                    waited_ms,
+                    budget_ms,
+                }) => {
+                    assert_eq!(budget_ms, 50);
+                    assert!(
+                        waited_ms >= 50,
+                        "a refused read reports what it actually waited, got {waited_ms}ms"
+                    );
+                }
+                other => panic!("expected the queued read to be refused, got {other:?}"),
+            }
+            assert!(
+                !ran.load(AtomicOrdering::SeqCst),
+                "the closure ran anyway — the work this fix exists to avoid is still being done"
+            );
+            assert_eq!(
+                health.abandoned(),
+                1,
+                "a refused read must be counted, or the shed is invisible"
+            );
+
+            blocker.await.expect("blocker joined").expect("blocker ran");
+            assert_eq!(
+                health.gauge().0,
+                0,
+                "a refused read must never have been counted as in flight"
+            );
+        });
+    }
+
+    /// The other half: the check costs a comparison and changes nothing when the node keeps up.
+    /// A budget is not a deadline on the work itself — a read that starts in time runs to
+    /// completion however long it takes.
+    #[test]
+    fn a_read_within_its_budget_runs_normally_however_slow() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .expect("read runtime");
+        let handle = runtime.handle().clone();
+        let health = Arc::new(ReadPoolHealth::new(2));
+
+        runtime.block_on(async {
+            // Dequeued immediately, so the budget is never in play.
+            let served: u32 = dispatch_read_pool(
+                Some(&handle),
+                Some(Arc::clone(&health)),
+                Some(Duration::from_millis(50)),
+                || 42,
+            )
+            .await
+            .expect("an unqueued read is served");
+            assert_eq!(served, 42);
+
+            // And once running, it is not interrupted by its own budget.
+            let slow: u32 = dispatch_read_pool(
+                Some(&handle),
+                Some(Arc::clone(&health)),
+                Some(Duration::from_millis(10)),
+                || {
+                    std::thread::sleep(Duration::from_millis(60));
+                    7
+                },
+            )
+            .await
+            .expect("a read that started in time runs to completion");
+            assert_eq!(slow, 7);
+
+            assert_eq!(
+                health.abandoned(),
+                0,
+                "nothing was shed on a pool that kept up"
+            );
+        });
+    }
+
+    /// `None` is the escape hatch, and it must mean what it says: a shard with no configured
+    /// timeout runs every queued read however long it waited.
+    #[test]
+    fn no_budget_runs_a_stale_read() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("read runtime");
+        let handle = runtime.handle().clone();
+        let health = Arc::new(ReadPoolHealth::new(1));
+
+        runtime.block_on(async {
+            let blocker = {
+                let handle = handle.clone();
+                let health = Arc::clone(&health);
+                tokio::spawn(async move {
+                    dispatch_read_pool(Some(&handle), Some(health), None, || {
+                        std::thread::sleep(Duration::from_millis(120));
+                    })
+                    .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let queued: u32 =
+                dispatch_read_pool(Some(&handle), Some(Arc::clone(&health)), None, || 5)
+                    .await
+                    .expect("no budget means no refusal");
+            assert_eq!(queued, 5);
+            assert_eq!(health.abandoned(), 0);
+            blocker.await.expect("blocker joined").expect("blocker ran");
+        });
+    }
+
+    /// A shed read is a `503`, the same answer the admission guard already gives, so a client
+    /// under overload sees one behaviour rather than two.
+    #[test]
+    fn a_shed_read_is_unavailable_not_a_fault() {
+        let err = OrchestratorError::ReadDeadlineExpired {
+            waited_ms: 3_000,
+            budget_ms: 1_000,
+        };
+        assert_eq!(err.verdict(), RemoteVerdict::Unavailable);
     }
 
     /// A saturated read pool is load, not a fault; a saturated pool that has stopped making
@@ -11909,6 +12455,191 @@ mod tests {
         })
     }
 
+    /// The estimate is what makes the dequeue check work, so its two properties are pinned:
+    /// it starts permissive, and it reserves more than one service time.
+    #[test]
+    fn the_service_estimate_starts_permissive_and_reserves_a_margin() {
+        let budget = Duration::from_secs(10);
+        let stats = DispatchCounters::default();
+        assert_eq!(
+            stats.service_reserve_for(OpClass::Read, budget),
+            Duration::ZERO,
+            "a node with no evidence must admit everything"
+        );
+
+        // The first sample is taken whole rather than averaged against a zero that means
+        // "unknown" — otherwise the estimate spends its first jobs climbing out of a value it
+        // never measured.
+        stats.record_service(OpClass::Read, Duration::from_millis(200));
+        assert_eq!(
+            stats.service_reserve_for(OpClass::Read, budget),
+            Duration::from_millis(400)
+        );
+
+        // And it tracks, rather than jumping, once it has a history.
+        for _ in 0..40 {
+            stats.record_service(OpClass::Read, Duration::from_millis(100));
+        }
+        let reserve = stats.service_reserve_for(OpClass::Read, budget);
+        assert!(
+            reserve > Duration::from_millis(190) && reserve < Duration::from_millis(215),
+            "the estimate should have converged on ~100ms, reserving ~200ms, got {reserve:?}"
+        );
+    }
+
+    /// The cap, which is what keeps this fix from becoming the failure it fixes.
+    ///
+    /// An estimate above half the budget would make the reserve exceed the budget, refusing
+    /// every job including one that has waited no time at all. Nothing completes, nothing
+    /// updates the estimate, and the node refuses everything for good. A freshly arrived job
+    /// must always be admitted, whatever the estimate says.
+    #[test]
+    fn a_service_estimate_larger_than_the_budget_cannot_wedge_the_node() {
+        let budget = Duration::from_secs(1);
+        let stats = DispatchCounters::default();
+
+        // Far beyond the budget — a node that was very slow, or a budget that was lowered.
+        stats.record_service(OpClass::Any, Duration::from_secs(30));
+
+        let reserve = stats.service_reserve_for(OpClass::Read, budget);
+        assert_eq!(
+            reserve,
+            budget / 2,
+            "the reserve must be capped at half the budget, got {reserve:?}"
+        );
+        assert!(
+            reserve < budget,
+            "a reserve at or above the budget refuses a job that has waited no time at all"
+        );
+        // Which is the property that matters: a job arriving now still fits.
+        assert!(Duration::ZERO + reserve < budget);
+    }
+
+    /// A class with no samples of its own reserves against the blend, not zero: a node that
+    /// has only ever served searches still knows what *a* job costs when the first write
+    /// arrives.
+    #[test]
+    fn a_class_with_no_samples_reserves_against_the_blend() {
+        let budget = Duration::from_secs(10);
+        let stats = DispatchCounters::default();
+        stats.record_service(OpClass::Read, Duration::from_millis(100));
+
+        assert_eq!(
+            stats.service_reserve_for(OpClass::Write, budget),
+            Duration::from_millis(200),
+            "no write samples yet, so the write reserve reads the blended estimate"
+        );
+        // Once writes have their own history, theirs is the one used.
+        stats.record_service(OpClass::Write, Duration::from_millis(900));
+        let reserve = stats.service_reserve_for(OpClass::Write, budget);
+        assert!(
+            reserve > Duration::from_millis(200),
+            "a write estimate exists now; the reserve must track it, got {reserve:?}"
+        );
+    }
+
+    /// The F7 fix, at the queue the measurement found it in.
+    ///
+    /// A job that has been queued longer than its budget is refused at dequeue rather than run,
+    /// and the refusal is a `503` the client can act on rather than work done for nobody.
+    #[tokio::test]
+    async fn a_job_that_outlived_its_request_is_refused_at_dequeue() {
+        let (tx, rx) = mpsc::channel::<OrchestratorJob>(8);
+        let stats = Arc::new(DispatchCounters::default());
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        tokio::spawn(orchestrator_worker_loop(
+            rx,
+            recording_runner(
+                Duration::from_millis(5),
+                Arc::clone(&live),
+                Arc::clone(&peak),
+            ),
+            0,
+            None,
+            4,
+            Some(Duration::from_millis(50)),
+            Some(Arc::clone(&stats)),
+        ));
+
+        // Enqueued as though it had already been waiting longer than its budget.
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        tx.send(OrchestratorJob::Execute {
+            arrived_at: Instant::now() - Duration::from_millis(500),
+            op: placeholder_op(),
+            affinity_shard: None,
+            reply,
+        })
+        .await
+        .expect("the worker channel is open");
+
+        match answer.await.expect("the worker answers") {
+            WorkerOutcome::Done(Err(OrchestratorError::ReadDeadlineExpired {
+                waited_ms,
+                budget_ms,
+            })) => {
+                assert!(waited_ms >= 500, "got {waited_ms}ms");
+                assert_eq!(budget_ms, 50);
+            }
+            WorkerOutcome::Done(Err(other)) => panic!("expected a refusal, got {other:?}"),
+            _ => panic!("expected a refusal, got an answer"),
+        }
+        assert_eq!(stats.abandoned.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(
+            peak.load(AtomicOrdering::Relaxed),
+            0,
+            "the operation ran anyway — the wasted work is still being done"
+        );
+
+        // And a fresh job on the same worker is served: shedding is per job, not a mode the
+        // worker latches into.
+        let answer = submit(&tx).await;
+        assert!(matches!(
+            answer.await.expect("the worker answers"),
+            WorkerOutcome::Done(Ok(_))
+        ));
+        assert_eq!(stats.abandoned.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    /// No budget is the pre-F7 behaviour, and it has to stay reachable: a stale job runs.
+    #[tokio::test]
+    async fn without_a_budget_a_stale_job_still_runs() {
+        let (tx, rx) = mpsc::channel::<OrchestratorJob>(8);
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        tokio::spawn(orchestrator_worker_loop(
+            rx,
+            recording_runner(
+                Duration::from_millis(5),
+                Arc::clone(&live),
+                Arc::clone(&peak),
+            ),
+            0,
+            None,
+            4,
+            None,
+            None,
+        ));
+
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        tx.send(OrchestratorJob::Execute {
+            arrived_at: Instant::now() - Duration::from_secs(60),
+            op: placeholder_op(),
+            affinity_shard: None,
+            reply,
+        })
+        .await
+        .expect("the worker channel is open");
+
+        assert!(matches!(
+            answer.await.expect("the worker answers"),
+            WorkerOutcome::Done(Ok(_))
+        ));
+        assert_eq!(peak.load(AtomicOrdering::Relaxed), 1);
+    }
+
     /// A runner that holds each operation for `hold` and records the high-water mark of how
     /// many were running at once. That mark is the whole subject of per-worker concurrency
     /// and is not observable from outside the loop any other way.
@@ -11935,6 +12666,7 @@ mod tests {
     ) -> tokio::sync::oneshot::Receiver<WorkerOutcome> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         tx.send(OrchestratorJob::Execute {
+            arrived_at: Instant::now(),
             op: placeholder_op(),
             affinity_shard: None,
             reply,
@@ -11963,6 +12695,8 @@ mod tests {
             0,
             None,
             4,
+            None,
+            None,
         ));
 
         let mut answers = Vec::new();
@@ -11999,6 +12733,8 @@ mod tests {
             0,
             None,
             2,
+            None,
+            None,
         ));
 
         let mut answers = Vec::new();
@@ -12046,13 +12782,14 @@ mod tests {
                 .enable_all()
                 .build()
                 .expect("worker runtime");
-            rt.block_on(orchestrator_worker_loop(rx, runner, 0, None, 4));
+            rt.block_on(orchestrator_worker_loop(rx, runner, 0, None, 4, None, None));
         });
 
         let mut answers = Vec::new();
         for _ in 0..4 {
             let (reply, answer) = tokio::sync::oneshot::channel();
             tx.blocking_send(OrchestratorJob::Execute {
+                arrived_at: Instant::now(),
                 op: placeholder_op(),
                 affinity_shard: None,
                 reply,

@@ -1196,24 +1196,68 @@ requests in flight against the admission ceiling of 128 — and produced **zero 
 The danger is reached by *raising* `max_concurrent_requests`, which is exactly what an operator
 does when they start seeing 503s.
 
-**What to fix, in the order the measurement argues for.**
+**Fix 1 — reject at dequeue. ✅ Done 2026-09-15**, and the implementation corrected the entry
+twice. Both corrections came from measurement, and both are worth keeping.
 
-1. **Check the deadline at dequeue, not at segment boundaries.** The pathology is not work that
-   runs too long, it is work that *starts* after its client is already gone — in the left column
-   above, essentially all of it. Stamping each request with a deadline and having the closure
-   return immediately when it is already past costs one comparison and converts the entire
-   wasted-work regime into instant rejection. A cancellation token checked mid-search is strictly
-   more work for strictly less of the win.
+*The queue is not where this said it was.* The entry blamed `spawn_blocking`, so the first
+attempt stamped a deadline in `dispatch_read_pool`. It shed **nothing** — `read_pool_abandoned`
+stayed at 0 through a full collapse. The backlog forms one layer up, in the orchestrator
+worker channel (`OrchestratorJob`, 512 per worker), and the read pool is downstream of an
+admission gate that keeps it shallow. The check belongs at `rx.recv()` in the worker loop.
+
+*Rejecting **at** the deadline is not enough.* Moved to the worker queue, the check fired
+hard — 11,656 jobs refused — and goodput stayed at zero. A job admitted with 10ms of budget
+left still needs its whole service time, so the queue simply settled onto the deadline and
+every job that passed finished after its client had gone: 13,363 completed, all wasted. The
+check has to reserve what the work costs, not merely what it has already spent. So the worker
+keeps an EWMA of dequeue-to-answer per class of operation — a bulk write is not held to a
+point search's service time — and admits only while `elapsed + 2 × estimate` fits the budget,
+where `elapsed` runs from when the request *arrived*, not when it was dispatched: the body
+read, decompress, parse and routing a large write already paid for are spent budget too.
+Measured rather than configured: it moves with index size, shard count and load.
+
+*The reserve has to be capped, and the cap is load-bearing.* Uncapped, an estimate above half
+the budget makes the reserve exceed the budget outright — every job is refused, including one
+that has waited no time at all, so nothing completes, nothing updates the estimate, and the node
+refuses everything for good. That is F7's own metastable shape, reintroduced by its fix. Capped
+at half the budget, a freshly arrived job is always admitted, which is what keeps the estimate
+measured. The cap also turned out to be worth 44% of goodput on its own, the uncapped reserve
+having been the more conservative of the two.
+
+**Measured after, M1, same node, same 200k index, `request_timeout_secs = 1`:**
+
+| offered | before | after |
+|---|---|---|
+| 300/s (under capacity) | — | 301 ok/s, p99 10.4ms, **0 shed**, 0 × 408 |
+| 1,000/s | **1 ok/s**, 14,949 × 408 | **572 ok/s**, 8,516 × 503, **0 × 408** |
+| 3,000/s | ~0 ok/s, 44,466 × 408 | **554 ok/s**, 44,077 × 503, 20 × 408 |
+
+Goodput is flat under 3× overload instead of zero, essentially every refusal is a 503 a client
+can act on rather than a 408 after a wasted second, and a node that keeps up is untouched — the
+300/s arm sheds nothing and answers in 10ms at p99.
+
+**It does not recover full capacity, and it is no longer perfectly clean.** The control column
+delivers ~730/s where this delivers ~555/s, so the reserve still costs about a quarter of what
+the node could serve; and at 3,000/s a 0.037% tail (20 of 54,071) still times out, against none
+at the more conservative uncapped reserve. Both are the same dial. Whether the factor should be
+tuned further, or replaced by a percentile of the service distribution rather than twice its
+mean, is open and is the obvious next measurement.
+
 2. **Bound the read-pool backlog** so excess load is refused at admission rather than queued
-   behind a semaphore that only counts requests, not the work they imply.
+   behind a semaphore that only counts requests, not the work they imply. Still open, and now
+   the thing standing between ~555/s and ~730/s.
 3. **Warn on the ratio.** `cameodb check-config` already reasons about
    `max_concurrent_requests × body limit` against the memory budget; the same place can say that
    admission divided by a plausible service rate exceeds the request timeout.
 
-Fix 1 also closes [OB13](#ob13--the-health-endpoint-fails-under-overload-but-not-for-the-reason-it-looked-like):
-the health endpoint's 408s under this failure are not a layering problem but this same timeout
-churn starving the request runtime, and rejecting at dequeue removes the churn along with the
-wasted work. Measured there, and the reason no separate change is warranted.
+A second guard remains in `dispatch_read_pool` against the full budget, for a configuration
+where the read pool rather than the worker channel is the deep queue. It did not fire in any
+arm above, and is kept on that basis rather than on evidence.
+
+**[OB13](#ob13--the-health-endpoint-fails-under-overload-but-not-for-the-reason-it-looked-like)
+is closed by this, as predicted and now measured.** Under 3,000/s against the same node that
+previously answered health in 1001.8ms with every probe a 408, fourteen consecutive probes
+returned **200 in ~120ms**. One fix, both entries.
 
 Not yet measured: whether a retrying client deepens it (each arm here used a fixed arrival rate
 and no retries), and the write path, which has its own queue.
@@ -1866,10 +1910,15 @@ reads off the orchestrator mailbox is the general fix, and it is not done.
 
 ### OB13 — The health endpoint fails under overload, but not for the reason it looked like
 
-✅ **Investigated and closed into [F7](#f7--the-request-timeout-sheds-the-client-not-the-work)**
-2026-09-15. Opened the same day on the observation that `/_cluster/health` returned 408 during
-the F7 collapse. It does — but the layering explanation was wrong, and the fix it implied would
-not have worked.
+✅ **Investigated, closed into [F7](#f7--the-request-timeout-sheds-the-client-not-the-work), and
+fixed by it** 2026-09-15. Opened the same day on the observation that `/_cluster/health` returned
+408 during the F7 collapse. It does — but the layering explanation was wrong, and the fix it
+implied would not have worked.
+
+**Confirmed fixed by F7's dequeue rejection**, the same day: under 3,000/s against the node that
+produced the 1001.8ms all-408 row below, sixteen consecutive probes returned **200 in ~160ms**.
+No change was made to the health endpoint or to the layer order, which is the evidence that the
+layering was never the cause.
 
 **The original reading.** `HEALTH_PATH` is exempt from the concurrency guard (`routes.rs` 105) so
 that "a load balancer would [not] evict a node that was merely busy". `TimeoutLayer` is applied

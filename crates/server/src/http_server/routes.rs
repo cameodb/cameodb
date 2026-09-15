@@ -7,7 +7,7 @@
 //! has a row in its authorization table, which is why mounting happens here and nowhere else.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
@@ -41,6 +41,7 @@ use crate::http_server::write::{
     bulk_delete_handler, bulk_write_handler, delete_document_handler, write_handler,
     write_stream_handler,
 };
+use crate::node_orchestrator::REQUEST_STARTED_AT;
 use crate::state::AppState;
 
 /// What the surface in front of the handlers is configured with.
@@ -235,6 +236,18 @@ pub fn create_router(
         .layer(RequestBodyLimitLayer::new(body_limit_bytes))
         // Concurrency guard — reject excess requests with 503
         .layer(concurrency_guard)
+        // Stamp request arrival for the deadline checks downstream — the dispatch path and
+        // the worker dequeue check both measure spent budget against this instant. Just
+        // inside the timeout layer, so the stamp and the client's deadline start together —
+        // a request that spent its budget being received (a max-size record at the derived
+        // timeout) is refused as stale work rather than given a fresh budget.
+        .layer(from_fn(
+            |req: axum::extract::Request, next: Next| async move {
+                REQUEST_STARTED_AT
+                    .scope(Instant::now(), next.run(req))
+                    .await
+            },
+        ))
         // Bound how long a single request may occupy a concurrency permit. Without this,
         // `max_concurrent_requests` trickle-fed connections hold every permit forever and
         // the limit meant to prevent a DoS becomes the mechanism for one.
