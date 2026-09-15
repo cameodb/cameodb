@@ -373,6 +373,9 @@ async fn main() -> Result<()> {
         storage_path: primary_path.clone(),
         storage_paths: cameodb_config.storage.data_paths.clone(),
         max_shards: cameodb_config.storage.max_shards_per_node,
+        // The same timeout the HTTP layer enforces, so a read that has already outlived its
+        // request is refused at dequeue rather than run for a client that has gone.
+        request_timeout_secs: cameodb_config.effective_request_timeout_secs(),
         indexer_memory_min_mb: cameodb_config.search.indexer_memory_min_mb,
         indexer_memory_max_mb: cameodb_config.search.indexer_memory_max_mb,
         total_memory_limit_mb: cameodb_config.limits.total_memory_limit_mb,
