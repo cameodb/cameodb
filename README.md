@@ -369,7 +369,7 @@ Defaults are loopback-bound with no cross-origin browser access.
 
 - **TLS/HTTPS**: rustls with the `ring` provider (see [TLS Configuration](#tlshttps-configuration) above)
 - **Cluster PSK**: membership gate for the libp2p swarm (XSalsa20 via `pnet`), configured with `[network.cluster] psk_file` or `psk`. It controls *who may join*; the transport is already encrypted by Noise regardless. Enabling it disables QUIC, since `pnet` wraps TCP only.
-- **Request limits**: wire-level body limit, per-record cap, request timeout, and a concurrency guard that sheds with 503 while leaving `/_cluster/health` answerable.
+- **Request limits**: wire-level body limit, per-record cap, request timeout, and an admission guard that sheds with `503` plus `Retry-After` — refusing at the door, before a body is read, any request whose predicted wait cannot fit the budget it has left — while leaving `/_cluster/health` and `/_admin/*` answerable so a shedding node stays diagnosable.
 - **Supply Chain**: `cargo audit` and `cargo deny` (config in `deny.toml`); advisory exceptions carry review dates that `scripts/validate/deps.sh` enforces.
 - **Verification**: [`scripts/validate/`](scripts/validate/README.md) is the manual gate — there is no CI. Run it before a release and record the result in [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md).
 

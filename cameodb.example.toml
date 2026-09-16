@@ -28,6 +28,13 @@ port = 9480
 # limits.total_memory_limit_mb below. 32 x 128 MB = 4096 MB, which is exactly the budget; at the
 # 128 this file used to carry, the same arithmetic came to 16 GB against a 4 GB limit and
 # `cameodb check-config` said so. Raise them together.
+#
+# It also has to fit inside the request timeout. A permit is a request, not the time the
+# request implies, so this divided by the timeout is the rate the node must beat for admission
+# rather than the timeout to decide what gets shed — `check-config` prints that figure as the
+# `overload` rule. Raising this because the node is answering 503 is the way into the problem,
+# not out of it: a 503 is a refusal that cost one comparison, and widening admission converts
+# those into timeouts that each cost a full budget of capacity.
 max_concurrent_requests = 32
 # Browser origins allowed to call this node, e.g. ["https://console.example.com"].
 # Empty = no cross-origin browser access (does not affect API/MCP clients).

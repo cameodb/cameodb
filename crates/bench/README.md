@@ -1,10 +1,20 @@
 # cameodb-bench
 
-A latency harness for CameoDB, and a worked example of the client SDK.
+A latency harness for CameoDB, and a worked example of the client SDK. It offers load two
+ways, and they answer different questions.
 
 ```bash
+# Closed loop: N requests in flight, each issued when the last is answered.
+# Measures service time at a fixed concurrency.
 cargo run -p bench -- --url http://localhost:9480 --mode mixed --concurrency 8 --duration 30
+
+# Open loop: requests offered on a schedule that does not wait for answers,
+# so the node's queue is allowed to grow and that growth is the measurement.
+cargo run --release -p bench -- --url http://localhost:9480 --mode search --rate 3000 --duration 20
 ```
+
+`--rate` and `--concurrency` are mutually exclusive: one is a statement about how much work is
+outstanding, the other about how much arrives, and no run is both.
 
 ## Why it exists
 
@@ -21,6 +31,7 @@ bulk requests                 per *request*, plus total documents and docs/s
 searches (client-observed)    the same, for queries
 searches (node-reported)      the node's own took_ms for the same requests
 worker pool                   jobs per worker, core placement, dispatch counters
+open loop only (--rate)       per-second series bucketed by outcome, harness lag, a verdict
 ```
 
 `--mode bulk` measures per *request*, not per document — a 500-document request taking 200ms
@@ -103,17 +114,102 @@ sitting at ~135% CPU of 800% available said the workers were waiting rather than
 so halving them halved what the node had in flight. Neither number is in the latency block;
 both were necessary. See `docs/CONFIGURATION.md` for the full write-up.
 
+## Open loop: offering an arrival rate
+
+`--rate N` offers N requests per second on a schedule that does not wait for answers. A
+saturated node therefore shows up as a growing queue and then as refusals, which is what
+"can this node take 3,000 searches a second" actually asks. Closed loop cannot answer it: it
+stops offering load exactly when the node stops keeping up, so a saturated node reads as
+rising latency and never as an overload.
+
+```
+--rate <PER_SEC>       Requests offered per second, per workload
+--search-rate <N>      Override --rate for searches
+--write-rate <N>       Override --rate for writes (single or bulk)
+--rate-steps <a,b,c>   Ramp through these rates, --duration seconds each
+--arrival <PROCESS>    poisson (default) | uniform
+--max-in-flight <N>    Harness safety ceiling (default: 50000)
+--seed <N>             Arrival-stream seed (default: 1)
+```
+
+Arrivals are Poisson by default, because the bursts are the condition a batching optimisation
+needs in order to pay and a perfectly spaced stream never produces one. `--arrival uniform`
+removes that variance when the question is about the node alone.
+
+### Reading an open-loop run
+
+```
+       10002  500 ok/s over 20.0s
+     service  mean 755.98ms  p50 787.77ms  p90 855.79ms …
+       total  mean 756.08ms  p50 787.88ms  p90 855.96ms …
+  harness lag  p50 16µs  p99 1.36ms  max 30.56ms
+    failures  shed (503) 50207
+       first  Search failed: 503 Service Unavailable - overloaded: a 823ms backlog against a 1000ms request
+           ok/s  989 537 302 598 536 418 490 544 403 508 …
+     503 shed/s  2069 2394 2735 2355 2442 2593 2510 2418 2581 2450 …
+       verdict  the node declined 83.4% of what was offered…
+```
+
+Four things carry the meaning, and the summary percentiles are the least of them:
+
+- **`service` against `total`.** `service` is sent-to-answered; `total` runs from the time the
+  request was *due* to be sent. `total` is the number an SLA is written against, and where the
+  two diverge the gap is queueing ahead of the node that a closed-loop run cannot see at all —
+  time a request spent waiting to be issued rather than waiting to be answered.
+- **`harness lag`, before anything else.** The generator spins to hit sub-millisecond arrival
+  times, so a co-located run competes with the node for cores. Lag climbing while in-flight is
+  below the ceiling means the run measured the harness. The verdict says `INVALID` and refuses
+  to be read as a statement about the node when that happens, rather than printing a plausible
+  number.
+- **The per-second series, bucketed by outcome.** `ok/s` beside `503 shed/s` and `408 timeout/s`
+  is where a collapse is visible: a node whose successes fall while timeouts climb at a fixed
+  offered rate is shedding the client rather than the work, and no summary statistic shows it.
+- **The verdict line.** `sustained` means the node took everything offered. A declined
+  percentage is the capacity answer, not a harness fault — read the failure breakdown, where
+  `503` is a clean refusal the caller can retry and `408` is a client abandoned after paying
+  the full timeout.
+
+### A worked run
+
+The overload work in `ROADMAP.md` (F7) was measured with this, and it is the template worth
+copying: seed the index once, then hold a fixed rate against a node whose request timeout is
+short enough to reach the regime.
+
+```bash
+# One node, 4 shards, search_threads = 2, max_concurrent_requests = 3000,
+# request_timeout_secs = 1, index seeded once and kept between arms.
+cargo run --release -p bench -- --mode search --rate 300  --duration 20 --seed-docs 200000 --keep-index
+cargo run --release -p bench -- --mode search --rate 1000 --duration 20 --seed-docs 0 --keep-index
+cargo run --release -p bench -- --mode search --rate 3000 --duration 20 --seed-docs 0 --keep-index
+
+# Recovery: hold overload, then drop to well under capacity in one run.
+cargo run --release -p bench -- --mode search --rate-steps 3000,300 --duration 15 --seed-docs 0 --keep-index
+
+# The capacity knee in one pass, rather than by re-running by hand.
+cargo run --release -p bench -- --mode search --rate-steps 2000,4000,8000,16000 --duration 20
+```
+
+Seed with `--seed-docs` on the first arm and `--seed-docs 0 --keep-index` on the rest: seeding
+is a bulk load through the node under test, and repeating it per arm both wastes time and
+leaves each arm measuring a differently-sized index. Seed *before* narrowing the timeout — a
+200k-document load through a node running `request_timeout_secs = 1` is a queue of bulk writes
+against a one-second budget, and the node is entitled to refuse it. Load with the timeout at
+its default, then restart the node on the short one. Pair the run with `/_cluster/health`
+(`queue_depth`, `predicted_wait_ms`, `read_pool_abandoned`) and `/_admin/workers`
+(`dispatch.refused_at_admission`, `dispatch.abandoned`), which say *where* a refusal was made —
+the harness only sees that one happened.
+
 ## What it does not measure
 
-Closed-loop: `--concurrency` workers each issue one request, wait for the answer, and issue
-the next. That measures service time at a fixed concurrency. It does not model a fixed
-arrival rate, so a saturated node shows up as rising latency rather than an unbounded queue —
-the harness stops offering load while it waits. **Compare runs at equal concurrency, and do
-not read these percentiles as an open-loop SLA.**
+`--concurrency` is closed-loop and does not model an arrival rate, so **compare closed-loop
+runs only at equal concurrency, and do not read their percentiles as an SLA.** Use `--rate` for
+anything phrased as a rate. Neither mode measures recall or correctness: `--mode mixed`
+searches an index whose newest writes are not yet committed, by design.
 
 Run it against a node on another machine when the numbers matter. Sharing a host with the
-node means the generator competes for the cores under test, which is exactly the interference
-the thread-per-core work is about.
+node means the generator competes for the cores under test — which is exactly the interference
+the thread-per-core work is about, and under `--rate` it is also the generator's own accuracy
+at stake. Read `harness lag` and the verdict before believing a co-located number.
 
 ## As an SDK example
 
