@@ -159,7 +159,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [E4](#e4--two-compatibility-paths-with-no-end-to-end-test) | Two compatibility paths with no end-to-end test | 16 | 2026-08-19 | 📋 |
 | [F1](#f1--the-cost-of-a-durable-commit-under-read-load) | The cost of a durable commit under read load — deferred: redb has no middle durability level, and building one trades the guarantee this node keeps | — | 2026-08-10 | 💭 |
 | [F2](#f2--an-open-loop-load-generator) | An open-loop load generator | — | 2026-09-15 | ✅ |
-| [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator — standalone half done | — | 2026-08-10 | ◐ |
+| [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator — standalone half done, clustered half turned down: the published ring lags the coordinator | — | 2026-08-10 | ◐ |
 | [F4](#f4--the-bulk-paths-asked-the-coordinator-before-they-knew-they-needed-to) | The bulk paths asked the coordinator before they knew they needed to | — | 2026-09-02 | ✅ |
 | [F5](#f5--concurrency-sweep-measured-2026-09-02) | Concurrency sweep on the release build — the operating point, and bulk's serialization measured | — | 2026-09-02 | ✅ |
 | [F6](#f6--what-fsync-actually-costs-measured-2026-09-02) | What fsync actually costs — and why turning it off is a reallocation, not a speedup | — | 2026-09-02 | ✅ |
@@ -1050,8 +1050,35 @@ tabulated. Nothing here re-measures them.
 
 ### F3 — Take unkeyed searches off the coordinator
 
-◐ **Partial** 2026-09-02. **The standalone half is done**; the clustered half still needs the node
-count published alongside the ring, which is what the item was originally about.
+◐ **The standalone half is done** 2026-09-02. **The clustered half is turned down** 2026-09-16,
+on inspection rather than measurement, and the reason is worth more than the hop it would save.
+
+*The node count is genuinely not published.* `ConsistentRing::len()` returns the number of vnode
+tokens, not of nodes — each node contributes many — so nothing in the published state answers
+"how many nodes are there". (It was being logged as `ring_nodes` on every topology update, which
+reads as a cluster size and is not one. Corrected to `ring_tokens`.) Publishing a real count
+alongside the ring is a small change.
+
+*What stops it is that the ring lags the authority.* The coordinator owns `expected_nodes` and
+publishes the ring through a `SubscribeTopology` channel and a fire-and-forget `tell`
+(`main.rs` ~604), so the router's copy is behind the coordinator's own state by a channel hop and
+an actor message. Asking the coordinator — what a keyless operation does today — reads the
+authority; reading a published count reads a copy that is briefly stale.
+
+For a keyed operation that is harmless: a wrong answer is a forward, and
+[OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) bounds it. For a **keyless**
+one it is not, and keyless is the case this item exists for. A scatter-gather that believes the
+cluster is one node returns only local results — no error, no partial flag, just a short answer —
+for the window between a peer becoming live and the ring arriving. That is the failure shape
+[OB8](#ob8--a-paged-search-loses-its-page-on-the-streaming-fan-out) and
+[OB9](#ob9--a-bulk-delete-drops-a-peers-per-id-errors) were opened for.
+
+The saving is one mailbox hop per keyless operation on a clustered node, and
+[F3's own measurement](#f3--take-unkeyed-searches-off-the-coordinator) put that at a
+single-request tail improvement and nothing at concurrency. **Not worth a window where a search
+silently under-reports.** The standalone shortcut stays because `clustered = false` is static
+configuration: a peer can never appear, so there is no window to be stale in. Revisit only with a
+topology version the router can check cheaply enough to make the shortcut provably current.
 
 `resolve_local` opened with `let key = routing_key?`, so every *keyless* operation asked the
 coordinator. Counted on a standalone release build against a 2,000-document index — by grepping
@@ -1938,10 +1965,29 @@ the mechanism proposed here:
   was itself inside a write. OB12 removes the question rather than the blocking, so this bullet
   stands, and the general fix — metadata reads that do not queue behind a write — belongs with it.
 
-  **Half of it closed by [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path)**, which
-  reached the same blocking from the overload side: the lane is gated so a bulk write is refused
-  rather than queued behind, and health no longer waits on the actor at all. What remains is the
-  structural half this bullet asks for — metadata reads that do not share a mailbox with writes.
+  **Closed from both sides** 2026-09-16. [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path)
+  reached it from the overload side: the lane is gated, so a metadata read arriving behind a bulk
+  write is refused rather than queued behind it. This closes the other side for the read that
+  mattered — `GetIdentity` is answered by the worker engine from an immutable identity and an
+  `ArcSwap` shard map, so it never enters the mailbox at all.
+
+  *And health stopped asking twice.* It called `shard_count()` and then `GetIdentity`, two actor
+  round-trips out of one shared budget, when `GetIdentity` already reports `total_shards` and
+  `GetShardCount`'s handler returned the same `shards.len()`. The first ask could spend the
+  budget the second needed. One call now; `RouterActor::shard_count`, the `GetShardCount` message
+  and its handler had no other caller and are gone.
+
+  Measured under a bulk ingest at twice capacity on a one-second budget, health's `degraded` list
+  went from `["active_shards", "node_id", "total_indexes"]` to **`["total_indexes"]`** — it now
+  reports its real identity and shard count while shedding, and two probes in five answered in
+  ~2ms rather than spending the whole actor budget.
+
+  Still open, and deliberately: `ListIndexes` remains on the actor. Moving it means extracting a
+  ~190-line aggregation that calls `load_schema`, and **there are two different `load_schema`s** —
+  the engine's reads the cache then the first shard's store, the orchestrator's reads
+  `durable_schema`. Sharing the body would mean choosing which is correct, which is
+  [L15](#l15--the-schema-cache-machinery-exists-three-times)'s question, and copying it would be
+  the disease [CH1](#ch1--one-scatter-gather-written-twice) is about. It waits for L15.
 - ✅ **The writer thread's two groups are merged** 2026-09-16, and the comment that said they
   already were is now true. `write_groups` and `batch_groups` were drained by separate phases,
   so an index that received both kinds in one drain paid two `apply_batch_and_maybe_commit`

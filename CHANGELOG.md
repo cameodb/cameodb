@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`/_cluster/health` answers its own identity while the node is shedding writes.** Two of the
+  three things it reports about the node came from the orchestrator's mailbox, where they queued
+  behind whatever bulk write was holding it. `GetIdentity` is answered by the worker pool now,
+  from an identity that never changes and a shard map behind an `ArcSwap`, so it never enters
+  that mailbox. Health also asked twice for what one call answers: it requested the shard count
+  and then the identity, two round-trips out of one budget, when the identity response already
+  carries `total_shards` and both were reading the same `shards.len()`. Under a bulk ingest at
+  twice capacity, the incomplete-fields list shrank from `["active_shards", "node_id",
+  "total_indexes"]` to `["total_indexes"]`.
+
+  The unused `RouterActor::shard_count`, the `GetShardCount` message and its handler are removed
+  with it. A topology-update log line reported `ring_nodes` from a count of vnode tokens, which
+  is not a number of nodes; it says `ring_tokens` now.
+
 - **One routing ladder instead of four.** "Document's routing field, then the caller's routing
   key, then the id, then a hash of the document" was written out in four places, and the two
   "hash the document" rungs disagreed — one hashed the whole document with xxh3, the other
