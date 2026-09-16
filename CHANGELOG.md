@@ -18,11 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queues. At 120 requests/s the node went from 0 to 55,500 documents written; a node inside its
   capacity is untouched.
 
-  This is an improvement, not a resolution: goodput is not yet flat under overload the way the
-  search path's is. The gate admits a queue that consumes about 70% of the request budget, and
-  this lane's service times have a p90 near five times their p50, so the back of an admitted queue
-  still times out. Reserving a measured percentile rather than twice the mean is the next step
-  (ROADMAP F8).
+  Admission predicts the wait from a **measured p90** of service time rather than from its mean,
+  because a mean cannot see a tail: a queue held where the average request fits the budget still
+  lets the slow ones past it. A decaying log-bucketed histogram supplies it — recorded with a
+  single atomic add, rotated every two seconds so it tracks load that changed, and the quantile
+  is computed once per rotation so the admission check itself stays one atomic load.
+
+  Measured from a wiped volume re-seeded to 200,000 documents, so both columns start from the
+  same index. At 120 requests/s: **6 ok/s and 1,084 timeouts became 57 ok/s and none**, with
+  573,000 documents written against 58,000. At 300/s: 1 ok/s and 1,492 timeouts became 59 ok/s
+  and 38. Goodput is flat across that range instead of collapsing to zero within three seconds,
+  and a node inside its capacity is untouched. Search is deliberately left predicting on the
+  mean — its overload behaviour is a measured result, and changing what it admits on deserves
+  its own run.
 
   `/_cluster/health` gained `mailbox_depth` and `mailbox_predicted_wait_ms` for the lane, reported
   separately from the worker pool's `queue_depth` because a node can be idle on one and shedding

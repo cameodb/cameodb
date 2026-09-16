@@ -3050,8 +3050,144 @@ impl Default for WorkerCounters {
     }
 }
 
+/// Number of buckets: 16 linear (0..15µs) then four per octave up to 2^63µs.
+const SERVICE_BUCKETS: usize = 256;
+
+/// How long one generation of the histogram collects before it is rotated out.
+///
+/// The EWMA this sits beside decays continuously; a histogram does not, so without rotation it
+/// would answer for every sample the node ever took and could not track load that changed. Two
+/// generations: one collecting, one complete and readable.
+const SERVICE_WINDOW: Duration = Duration::from_secs(2);
+
+/// Which quantile of the service distribution the admission check predicts against.
+///
+/// The mean cannot see a tail. Measured on the mailbox lane: a queue held at depth ~50 predicted
+/// ~900ms from the mean and delivered a client p90 of 960ms and a p99 of 991ms against a 1,000ms
+/// budget — so half the admitted queue made its deadline and the tail did not. What decides
+/// whether admitting one more request is safe is what the *slow* ones cost, not the average one.
+const SERVICE_ADMISSION_QUANTILE: f64 = 0.90;
+
+/// A decaying log-bucketed histogram of service times.
+///
+/// Recording is one `fetch_add` on an atomic counter — cheaper than the `fetch_update` CAS loop
+/// the EWMA beside it uses, and it never retries under contention. Reading a quantile means
+/// walking the buckets, which is far too much for an admission check that runs on every request,
+/// so the quantile is computed once per rotation and cached in a single atomic. The admission
+/// path therefore stays one load, which is what F7's door was built to cost.
+pub(crate) struct ServiceHistogram {
+    /// Two generations. `active` selects the one being recorded into; the other is complete and
+    /// is what a quantile is computed from.
+    generations: [Box<[AtomicU64]>; 2],
+    active: AtomicUsize,
+    /// Microseconds since `base`, when the active generation started.
+    rotated_at_us: AtomicU64,
+    base: Instant,
+    /// Last computed quantile, in microseconds. Zero until a full generation has been seen.
+    cached_us: AtomicU64,
+}
+
+impl ServiceHistogram {
+    pub(crate) fn new() -> Self {
+        let generation = || (0..SERVICE_BUCKETS).map(|_| AtomicU64::new(0)).collect::<Box<[_]>>();
+        Self {
+            generations: [generation(), generation()],
+            active: AtomicUsize::new(0),
+            rotated_at_us: AtomicU64::new(0),
+            base: Instant::now(),
+            cached_us: AtomicU64::new(0),
+        }
+    }
+
+    /// Bucket a sample falls in: linear below 16µs, then four buckets per octave, so the
+    /// quantile is never more than ~25% above the value it stands for.
+    fn bucket_of(sample_us: u64) -> usize {
+        if sample_us < 16 {
+            return sample_us as usize;
+        }
+        let exponent = 63 - sample_us.leading_zeros() as usize;
+        let sub = ((sample_us >> (exponent - 2)) & 0b11) as usize;
+        (16 + (exponent - 4) * 4 + sub).min(SERVICE_BUCKETS - 1)
+    }
+
+    /// The upper edge of a bucket — what a quantile landing in it reports, so the answer errs
+    /// high rather than low. Under-reporting a service time admits work that cannot finish.
+    fn bucket_upper_us(bucket: usize) -> u64 {
+        if bucket < 16 {
+            return bucket as u64;
+        }
+        let exponent = 4 + (bucket - 16) / 4;
+        let sub = ((bucket - 16) % 4) as u64;
+        (5 + sub) << (exponent - 2)
+    }
+
+    pub(crate) fn record(&self, sample: Duration) {
+        let index = self.active.load(AtomicOrdering::Relaxed) & 1;
+        self.generations[index][Self::bucket_of(sample.as_micros() as u64)]
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.maybe_rotate();
+    }
+
+    /// Rotate if the window has elapsed, and fold the generation that just closed into the
+    /// cached quantile. Exactly one caller wins the swap; the rest return immediately.
+    fn maybe_rotate(&self) {
+        let now_us = self.base.elapsed().as_micros() as u64;
+        let started = self.rotated_at_us.load(AtomicOrdering::Relaxed);
+        if now_us.saturating_sub(started) < SERVICE_WINDOW.as_micros() as u64 {
+            return;
+        }
+        if self
+            .rotated_at_us
+            .compare_exchange(started, now_us, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let closing = self.active.fetch_xor(1, AtomicOrdering::Relaxed) & 1;
+        if let Some(value) = self.quantile_of(closing, SERVICE_ADMISSION_QUANTILE) {
+            self.cached_us.store(value, AtomicOrdering::Relaxed);
+        }
+        // Zero it so it is clean when it becomes active again one window from now.
+        for slot in self.generations[closing].iter() {
+            slot.store(0, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// `None` when the generation holds no samples, which is what keeps a quiet window from
+    /// resetting the estimate to zero and admitting everything.
+    fn quantile_of(&self, generation: usize, quantile: f64) -> Option<u64> {
+        let counts = &self.generations[generation];
+        let total: u64 = counts.iter().map(|c| c.load(AtomicOrdering::Relaxed)).sum();
+        if total == 0 {
+            return None;
+        }
+        let target = ((total as f64) * quantile).ceil() as u64;
+        let mut seen = 0u64;
+        for (bucket, count) in counts.iter().enumerate() {
+            seen += count.load(AtomicOrdering::Relaxed);
+            if seen >= target {
+                return Some(Self::bucket_upper_us(bucket));
+            }
+        }
+        None
+    }
+
+    /// The cached quantile in microseconds, or zero before a full window has closed.
+    pub(crate) fn estimate_us(&self) -> u64 {
+        self.cached_us.load(AtomicOrdering::Relaxed)
+    }
+}
+
+impl std::fmt::Debug for ServiceHistogram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceHistogram")
+            .field("estimate_us", &self.estimate_us())
+            .finish()
+    }
+}
+
 /// Dispatch-level counters across the entire worker pool.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DispatchCounters {
     /// Jobs sent directly to the affinity-assigned worker.
     affine_sends: AtomicU64,
@@ -3103,6 +3239,27 @@ struct DispatchCounters {
     service_ewma_read_us: AtomicU64,
     /// Dequeue-to-answer EWMA for writes (`Write`, `Delete`). See `service_ewma_us`.
     service_ewma_write_us: AtomicU64,
+    /// Dequeue-to-answer distribution, for lanes that admit against a tail rather than a mean.
+    /// Fed by the same samples as the EWMAs above; read only where `tail_aware` is set.
+    service_hist: ServiceHistogram,
+}
+
+impl Default for DispatchCounters {
+    fn default() -> Self {
+        Self {
+            affine_sends: AtomicU64::new(0),
+            affine_full_fallbacks: AtomicU64::new(0),
+            round_robin_sends: AtomicU64::new(0),
+            actor_mailbox_fallbacks: AtomicU64::new(0),
+            abandoned: AtomicU64::new(0),
+            refused_at_admission: AtomicU64::new(0),
+            outstanding: AtomicUsize::new(0),
+            service_ewma_us: AtomicU64::new(0),
+            service_ewma_read_us: AtomicU64::new(0),
+            service_ewma_write_us: AtomicU64::new(0),
+            service_hist: ServiceHistogram::new(),
+        }
+    }
 }
 
 impl DispatchCounters {
@@ -3110,6 +3267,7 @@ impl DispatchCounters {
     /// belonged to when it has one.
     fn record_service(&self, class: OpClass, sample: Duration) {
         let sample_us = sample.as_micros() as u64;
+        self.service_hist.record(sample);
         Self::fold_ewma(&self.service_ewma_us, sample_us);
         match class {
             OpClass::Read => Self::fold_ewma(&self.service_ewma_read_us, sample_us),
@@ -3206,6 +3364,9 @@ pub struct QueueLoad {
     /// Jobs the whole pool can have running at once — `worker_count × in-flight limit`. The
     /// divisor in Little's law, and the depth below which the gate never refuses.
     width: usize,
+    /// Whether the wait prediction uses a measured tail rather than the mean. See
+    /// [`QueueLoad::tail_aware`].
+    tail_aware: bool,
     /// The node's request timeout. `None` disables the gate, matching a node whose timeout is
     /// disabled: there is no deadline to predict against.
     budget: Option<Duration>,
@@ -3217,7 +3378,37 @@ impl QueueLoad {
             dispatch_stats,
             width: width.max(1),
             budget,
+            tail_aware: false,
         }
+    }
+
+    /// Predict against a measured tail of the service distribution rather than its mean.
+    ///
+    /// Set for the mailbox lane and deliberately **not** for the worker pool. The pool's
+    /// behaviour under overload is the measured result F7 recorded, and changing what it admits
+    /// on would invalidate those arms without a run of its own — worth doing, separately, with
+    /// its own before and after.
+    fn tail_aware(mut self) -> Self {
+        self.tail_aware = true;
+        self
+    }
+
+    /// The service figure the wait prediction multiplies out.
+    ///
+    /// A mean says what a typical request costs; admission needs to know whether the *last*
+    /// request in the queue it is about to join will still make its deadline, and that is a
+    /// question about the slow ones. Falls back to the mean until a full window has closed, so
+    /// a node that has just started admits on the same basis it always did.
+    fn admission_service_us(&self) -> u64 {
+        if self.tail_aware {
+            let tail = self.dispatch_stats.service_hist.estimate_us();
+            if tail != 0 {
+                return tail;
+            }
+        }
+        self.dispatch_stats
+            .service_ewma_us
+            .load(AtomicOrdering::Relaxed)
     }
 
     /// Jobs queued or running across the pool — everything a new arrival waits behind.
@@ -3234,12 +3425,7 @@ impl QueueLoad {
     /// and `saturating_sub` because a pool with a free slot imposes no wait at all.
     fn predicted_wait_at(&self, depth: usize) -> Duration {
         let rounds = depth.saturating_sub(self.width).div_ceil(self.width) as u64;
-        Duration::from_micros(
-            self.dispatch_stats
-                .service_ewma_us
-                .load(AtomicOrdering::Relaxed)
-                .saturating_mul(rounds),
-        )
+        Duration::from_micros(self.admission_service_us().saturating_mul(rounds))
     }
 
     /// What a request arriving now would wait before a worker starts it.
@@ -6296,11 +6482,10 @@ impl RouterActor {
             .as_ref()
             .and_then(|tx| tx.load().budget())
             .map(|budget| {
-                Arc::new(QueueLoad::new(
-                    Arc::clone(&mailbox_lane.0),
-                    MAILBOX_LANE_WIDTH,
-                    Some(budget),
-                ))
+                Arc::new(
+                    QueueLoad::new(Arc::clone(&mailbox_lane.0), MAILBOX_LANE_WIDTH, Some(budget))
+                        .tail_aware(),
+                )
             });
         Self {
             orchestrator,
@@ -12854,6 +13039,60 @@ mod tests {
             forwarded: false,
             schema_body: None,
         })
+    }
+
+    /// Bucketing must never report a service time *below* what was measured: admission that
+    /// under-reads a cost admits work that cannot finish, which is the failure the whole gate
+    /// exists to prevent. Checked across the range a real sample can land in.
+    #[test]
+    fn a_bucketed_service_time_never_reads_low() {
+        for sample_us in [0u64, 1, 15, 16, 17, 100, 999, 1_000, 8_500, 54_000, 1_000_000] {
+            let bucket = ServiceHistogram::bucket_of(sample_us);
+            let reported = ServiceHistogram::bucket_upper_us(bucket);
+            assert!(
+                reported >= sample_us,
+                "sample {sample_us}µs landed in bucket {bucket} reported as {reported}µs"
+            );
+        }
+    }
+
+    /// A quantile has to actually separate the body of the distribution from its tail, and
+    /// which quantile does that depends on how heavy the tail is. 90 samples at 8ms and 10 at
+    /// 200ms: the p90 sits exactly on the boundary and still reads 8ms, while the p95 is in the
+    /// tail. Pinned because it is the trap in "reserve a percentile instead of the mean" — a
+    /// percentile chosen at the weight of the tail reports the body.
+    #[test]
+    fn a_quantile_reports_the_tail_only_once_it_is_past_it() {
+        let hist = ServiceHistogram::new();
+        for _ in 0..90 {
+            hist.record(Duration::from_millis(8));
+        }
+        for _ in 0..10 {
+            hist.record(Duration::from_millis(200));
+        }
+        let generation = hist.active.load(AtomicOrdering::Relaxed) & 1;
+
+        let p90 = hist.quantile_of(generation, 0.90).expect("samples recorded");
+        assert!(p90 < 16_000, "p90 sits on the boundary and reads the body");
+
+        let p95 = hist.quantile_of(generation, 0.95).expect("samples recorded");
+        assert!(
+            p95 >= 200_000,
+            "p95 should be inside the 200ms tail, read {p95}µs"
+        );
+    }
+
+    /// A window with no samples must not reset the estimate to zero — that would admit
+    /// everything the moment a node went quiet, which is when its next burst arrives.
+    #[test]
+    fn an_empty_window_leaves_the_estimate_alone() {
+        let hist = ServiceHistogram::new();
+        assert_eq!(
+            hist.quantile_of(hist.active.load(AtomicOrdering::Relaxed) & 1, 0.90),
+            None,
+            "an empty generation has no quantile to report"
+        );
+        assert_eq!(hist.estimate_us(), 0, "and nothing is cached from it");
     }
 
     /// A cancelled ask must still give its slot back. `TimeoutLayer` drops the request future
