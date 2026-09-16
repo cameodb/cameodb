@@ -164,6 +164,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F5](#f5--concurrency-sweep-measured-2026-09-02) | Concurrency sweep on the release build — the operating point, and bulk's serialization measured | — | 2026-09-02 | ✅ |
 | [F6](#f6--what-fsync-actually-costs-measured-2026-09-02) | What fsync actually costs — and why turning it off is a reallocation, not a speedup | — | 2026-09-02 | ✅ |
 | [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) | The request timeout sheds the client, not the work — measured: goodput goes to zero, not down | — | 2026-09-15 | ✅ |
+| [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — measured: zero goodput, zero refusals, and OB13 reopened | — | 2026-09-16 | 📋 |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
 | [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8 and CH9 done, CH12 partial | — | 2026-09-01 | ◐ |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
@@ -1241,7 +1242,9 @@ delivers ~730/s where this delivers ~555/s, so the reserve still costs about a q
 the node could serve; and at 3,000/s a 0.037% tail (20 of 54,071) still times out, against none
 at the more conservative uncapped reserve. Both are the same dial. Whether the factor should be
 tuned further, or replaced by a percentile of the service distribution rather than twice its
-mean, is open and is the obvious next measurement.
+mean, is open and is the obvious next measurement. *That measurement was taken on the M5 and the
+premise did not survive it — the reserve costs ~2% there, not a quarter; see the 2026-09-16 M5
+run at the end of this entry.*
 
 **Fix 2 — bound the backlog at admission. ✅ Done 2026-09-15**, and like fix 1 it corrected
 the entry that asked for it — this time about why it was worth doing.
@@ -1320,7 +1323,9 @@ answering the endpoint that explains why it is refusing cannot be diagnosed at t
 matters.
 
 Not measured: whether the earlier refusal pays for itself on a large-body write workload, which
-is the case it was built for and the one arm here does not cover.
+is the case it was built for and the one arm here does not cover. *Measured 2026-09-16 and the
+answer is that it never gets the chance — the bulk lane reaches neither gate. See
+[F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path).*
 
 **Fix 3 — warn on the ratio. ✅ Done 2026-09-15.** `cameodb check-config` gained an `overload`
 rule, beside the `limits` rule that already weighs `max_concurrent_requests × body limit`
@@ -1398,14 +1403,162 @@ rather than evidence when the fixes landed, no arm having fired it. The 2026-09-
 the door, rather than a guard kept on argument alone.
 
 **[OB13](#ob13--the-health-endpoint-fails-under-overload-but-not-for-the-reason-it-looked-like)
-is closed by this, as predicted and now measured.** Under 3,000/s against the same node that
-previously answered health in 1001.8ms with every probe a 408, fourteen consecutive probes
+is closed by this on the search path, as predicted and now measured** — and reopens on the write
+path, where health queues behind a bulk write rather than behind the backlog
+([F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path)). Under 3,000/s against the same
+node that previously answered health in 1001.8ms with every probe a 408, fourteen consecutive probes
 returned **200 in ~120ms**. One fix, both entries. The 2026-09-16 run has it on both binaries at
 once: the pre-fix node answered its third probe and everything after it with a 408 at 1,001ms,
 the current one 200 in ~130ms on sixteen of sixteen.
 
+**Re-measured on the M5 Pro, 2026-09-16.** The before-and-after above is an M1 result; the M5 had
+only a pre-fix column, recorded the day before. This closes that gap on the second machine, and
+one of its numbers contradicts the M1 reading. Release build of `beab920`, 15 cores, 24 GB,
+macOS 26.6.2, same protocol throughout: 200,000 documents, 4 shards, `search_threads = 2`,
+`max_concurrent_requests = 3000`, `request_timeout_secs = 1`, 20s arms after a 5s warmup, Poisson
+arrivals, seed 1. Harness lag p99 stayed at or below 1.12ms on every arm, no arm dropped an
+arrival and no verdict came back INVALID, so these are node measurements and not the generator.
+Seeded once at the default timeout with the node restarted on the one-second budget, which
+`check-config` confirmed as `timeout 1s (set)` while raising the `overload` warning on it.
+
+| offered | before (pre-fix, 2026-09-15) | after (`beab920`) |
+|---|---|---|
+| 300/s | — | 300 ok/s, 0 shed, p99 5.6ms |
+| 1,000/s | **233 ok/s**, 15,304 × 408 | **927 ok/s**, 1,433 × 503, **0 × 408** |
+| 2,000/s | 1 ok/s, 39,990 × 408 | **923 ok/s**, 21,550 × 503, **0 × 408** |
+| 3,000/s | ~0 ok/s, 59,191 × 408, 1,018 × 503 | **919 ok/s**, 41,829 × 503, **0 × 408** |
+| 4,000/s | ~0 ok/s, 60,000 × 408, 20,210 × 503 | **920 ok/s**, 61,815 × 503, **0 × 408** |
+| 3,000/s → 300/s | 0 ok/s for 4s after the drop | 310 ok/s in the first second, p50 1.95ms, 0 shed |
+
+Steady-state goodput is flat at 879–917 ok/s from 1,000/s through 4,000/s offered, and **not one
+408 was raised in the entire session** — every refusal was a 503 carrying `Retry-After` and a
+body naming the backlog against the budget, 157,746 of them client-observed across the measured
+arms. Health answered 25 of 25 probes `200` on every arm, p50 72ms at 4,000/s. `jobs_completed`
+came to ~23,600 per arm whether that arm offered 1,000/s or 4,000/s: the node does a constant
+amount of real work and wastes none of it on clients that have already gone.
+
+Where the refusal is made reproduces and sharpens. Counted node-side across the whole arms
+session, warmups included: 196,132 `refused_at_admission` against 745 `abandoned` at a worker —
+263 to 1 — with `actor_mailbox_fallbacks` at 0 throughout. `read_pool_abandoned` stayed at **0**
+here where the M1 run reached 53, so the read-pool backstop is reached on some machines and not
+others, which is what a backstop should look like.
+
+***The quarter of capacity the reserve was said to cost does not reproduce.*** A same-session
+control — the same node and index restarted on `request_timeout_secs = 300`, so admission is the
+only gate and no deadline logic runs — puts the cost at roughly nothing:
+
+| at 3,000/s offered | steady goodput | p50 | peak in flight |
+|---|---|---|---|
+| control, 300s timeout | 897 ok/s | **3,334ms** | 3,007 |
+| current, 1s timeout | 879 ok/s | **873ms** | 836 |
+
+Two percent apart on goodput, which is inside this harness's noise, against a p50 **3.8× lower**
+and a queue **3.6× shallower**. So on this machine the deadline reserve is close to free, and what
+it buys is latency and a bounded queue rather than throughput — not the 555-against-730 trade the
+M1 recorded. That also empties the open question raised under fix 1: there is no quarter of
+capacity here to reclaim by tuning the 2× factor or replacing it with a percentile of the service
+distribution. Whether the M1 figure was the machine or the older binary is not settled by this run.
+
+*Read as a before and after on one configuration, not as the box's ceiling.* `search_threads = 2`
+is deliberately small so the overload regime is reachable at a few thousand requests a second, the
+harness was co-located on a machine where core pinning is a no-op, and every arm is a single 20s
+run.
+
 Not yet measured: whether a retrying client deepens it (each arm here used a fixed arrival rate
-and no retries), and the write path, which has its own queue.
+and no retries). **The write path, which has its own queue, was measured 2026-09-16 and does not
+hold** — F7's gates are absent on the bulk lane and its original collapse is intact there, with
+OB13 reopening on a second mechanism. Filed as
+[F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path).
+
+### F8 — The overload gates do not cover the bulk write path
+
+📋 **Planned, and measured before it was planned** 2026-09-16, on the M5 Pro against `beab920` —
+the binary that closed [F7](#f7--the-request-timeout-sheds-the-client-not-the-work), with all
+three of its fixes in.
+
+Every F7 arm was a search. Its own closing note said the write path was not covered and has its
+own queue. Measured now, the answer is worse than "not covered": **F7's mechanism is absent on
+the bulk lane, and F7's original failure is intact there** — goodput does not degrade under bulk
+overload, it goes to zero, and no gate refuses anything.
+
+Same node and configuration as the M5 F7 run: 4 shards, `search_threads = 2`,
+`max_concurrent_requests = 3000`, `request_timeout_secs = 1`, `--mode bulk --batch-size 500`,
+20s arms. Capacity probed first rather than assumed — 56 requests/s closed-loop at concurrency 4
+(28,000 docs/s, p50 54ms) — so the offered rates are multiples of a measured number.
+
+| offered | ok/s | 408 | 503 | documents written |
+|---|---|---|---|---|
+| 30/s (under capacity) | 29 ok/s, `sustained` | 0 | 0 | 292,000 |
+| 120/s (≥2×) | **0** | 2,370 (100%) | **0** | **0** |
+| 300/s (≥5×) | **0** | 6,035 (100%) | **0** | **0** |
+
+Zero for the whole 20s of both overload arms, at a steady `408 timeout/s` matching the offered
+rate — F7's signature exactly. For contrast, on the same node and in the same session a *search*
+at 2× overload served 923 ok/s with no 408 at all.
+
+**No gate refused anything, and the counters are unambiguous.** Across both overload arms —
+8,405 requests, every one abandoned at its deadline:
+
+```
+refused_at_admission 0    abandoned 0    actor_mailbox_fallbacks 0    round_robin_sends 0
+```
+
+`round_robin_sends` at 0 is the tell: no bulk work reached the worker pool at all. Two
+independent reasons, both read from the code before the run and confirmed by it (line numbers
+read 2026-09-16, and they drift — the shapes are the durable part):
+
+- **The dequeue check never runs.** `handle_client_op`'s `is_worker_eligible`
+  (`node_orchestrator.rs` ~6241) lists `Write`, `Delete`, `Search`, `Stream`. `BulkWrite` is
+  not among them, so it goes to the orchestrator actor mailbox and never meets fix 1's check at
+  `rx.recv()`. Fix 2 closed the *overflow* route into that mailbox from a full worker queue; the
+  bulk path's *primary* route into it was never gated.
+- **The door sees an idle node.** `QueueLoad::would_refuse` returns `None` early at
+  `depth < self.width` (~3262), and `depth()` reads the pool-wide `outstanding` counter, which is
+  incremented only where a job is sent to a worker. A bulk write never increments it, so however
+  deep the mailbox gets, the door reads a depth of 0 and admits.
+
+A third detail compounds it rather than causing it: `OpClass::of` maps anything outside
+search/single-write to `Any` (~176), and `record_service` ignores `Any` (~3108) — so bulk service
+time never enters any EWMA, and the blended estimate the door judges on is built from searches
+and single writes only. *Not* a zero-reserve bug: `service_estimate_for` falls back to the blend
+when a class has no samples, which is deliberate and documented at the function.
+
+**[OB13](#ob13--the-health-endpoint-fails-under-overload-but-not-for-the-reason-it-looked-like)
+reopens here, on a different mechanism.** Under bulk overload `/_cluster/health` returned **408 at
+1,001ms on twelve of twelve probes**, and five of five on a repeat — the same signature the
+pre-fix node produced under search overload. `/_admin/workers` was unaffected throughout,
+answering **200 in 0.7ms**, and health returns to 0.7ms the moment load stops.
+
+That split is the diagnosis. `/_admin/workers` reads dispatch atomics directly; health is
+actor-served and queues behind the bulk write holding the mailbox — which is
+[CH12](#ch12--write-path-serialization-and-round-trip-waste)'s third bullet ("a large `BulkWrite`
+serializes on the orchestrator actor mailbox for its full duration, blocking other actor-served
+operations"), demonstrated rather than reasoned about. F7 exempted health from the *semaphore and
+the backlog gate*, which is why the search fix held; nothing exempts it from waiting on an actor.
+
+So a node under bulk-ingest overload writes nothing, makes every client wait a full second to be
+told 408, and fails the probe a load balancer evicts on — while `/_admin/workers` reports a node
+in perfect health.
+
+**What the fix has to do**, in the order the evidence supports:
+
+1. **Make the bulk lane visible to the gates.** Either route `BulkWrite` through the worker pool
+   so fix 1's dequeue check applies, or give the mailbox its own deadline check; and count bulk
+   work in `outstanding` either way, because a door that cannot see the queue cannot refuse into
+   it. Counting without checking is the weaker half and should not ship alone.
+2. **Take health off the actor.** It should answer from the same atomics `/_admin/workers`
+   already answers from, so that "is this node alive" never queues behind "is this node busy".
+   This is worth doing independently of 1 — it is the difference between a degraded node and an
+   undiagnosable one.
+3. **Feed bulk into the service estimate**, so the blended figure the door uses reflects the
+   workload with by far the largest per-request cost.
+
+**Caveats, so these are not over-read.** Single 20s runs, harness co-located. The 30/s arm wrote
+292,000 documents, so capacity during the later arms was below the probed 56/s — "≥2×" is a
+floor and the true multiple is higher. Neither affects the finding, which is qualitative: zero
+goodput and zero refusals. Not measured: the single-write path (`Write` *is* worker-eligible, so it
+should be covered, and that is an assumption until an arm says so), and whether a retrying client
+deepens any of this.
 
 ---
 
@@ -2055,8 +2208,14 @@ reads off the orchestrator mailbox is the general fix, and it is not done.
 
 ### OB13 — The health endpoint fails under overload, but not for the reason it looked like
 
-✅ **Investigated, closed into [F7](#f7--the-request-timeout-sheds-the-client-not-the-work), and
-fixed by it** 2026-09-15. Opened the same day on the observation that `/_cluster/health` returned
+◐ **Investigated, closed into [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) and
+fixed by it on the search path** 2026-09-15 — **and reopened on the write path** 2026-09-16.
+Under bulk overload health returns 408 at 1,001ms again, on a different mechanism: it is
+actor-served and queues behind the `BulkWrite` holding the orchestrator mailbox, where F7's
+exemptions cover only the semaphore and the backlog gate. `/_admin/workers` stays at 200 in
+0.7ms throughout, which is what localises it. See
+[F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path); everything below stands as the
+search-path record. Opened the same day on the observation that `/_cluster/health` returned
 408 during the F7 collapse. It does — but the layering explanation was wrong, and the fix it
 implied would not have worked.
 
