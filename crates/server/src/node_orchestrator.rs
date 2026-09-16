@@ -3060,13 +3060,23 @@ const SERVICE_BUCKETS: usize = 256;
 /// generations: one collecting, one complete and readable.
 const SERVICE_WINDOW: Duration = Duration::from_secs(2);
 
-/// Which quantile of the service distribution the admission check predicts against.
+/// Quantile reported for monitoring. Not what admission predicts against — see
+/// [`SERVICE_ADMISSION_SIGMAS`].
+const SERVICE_REPORTED_QUANTILE: f64 = 0.90;
+
+/// How many standard deviations of the *queue's* service sum the wait prediction allows for.
 ///
-/// The mean cannot see a tail. Measured on the mailbox lane: a queue held at depth ~50 predicted
-/// ~900ms from the mean and delivered a client p90 of 960ms and a p99 of 991ms against a 1,000ms
-/// budget — so half the admitted queue made its deadline and the tail did not. What decides
-/// whether admitting one more request is safe is what the *slow* ones cost, not the average one.
-const SERVICE_ADMISSION_QUANTILE: f64 = 0.90;
+/// A queue of `d` jobs has a wait whose mean is `d × µ` and whose standard deviation is `σ√d`,
+/// because variances add and deviations do not. So the honest bound on what a job joining at
+/// depth `d` will wait is `d·µ + k·σ√d`, and `k` is a confidence level rather than a fudge: at
+/// 2 it covers about 98% of arrivals on a normal sum, which is the right shape for a deadline.
+///
+/// The first cut multiplied a per-request p90 by the depth instead. That is the same mistake in
+/// reverse — it grows the spread as `d` rather than `√d`, so it over-predicts deep queues and
+/// admits a shallower one than the budget can actually carry. It worked (goodput went flat), and
+/// it left throughput on the table and a tail of timeouts at the far end; this is the form that
+/// has both.
+const SERVICE_ADMISSION_SIGMAS: f64 = 3.0;
 
 /// A decaying log-bucketed histogram of service times.
 ///
@@ -3084,18 +3094,29 @@ pub(crate) struct ServiceHistogram {
     rotated_at_us: AtomicU64,
     base: Instant,
     /// Last computed quantile, in microseconds. Zero until a full generation has been seen.
+    /// Reported rather than predicted against.
     cached_us: AtomicU64,
+    /// Mean and standard deviation of the closed generation, in microseconds. The pair the wait
+    /// prediction is built from; zero until a full generation has been seen.
+    cached_mean_us: AtomicU64,
+    cached_sigma_us: AtomicU64,
 }
 
 impl ServiceHistogram {
     pub(crate) fn new() -> Self {
-        let generation = || (0..SERVICE_BUCKETS).map(|_| AtomicU64::new(0)).collect::<Box<[_]>>();
+        let generation = || {
+            (0..SERVICE_BUCKETS)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Box<[_]>>()
+        };
         Self {
             generations: [generation(), generation()],
             active: AtomicUsize::new(0),
             rotated_at_us: AtomicU64::new(0),
             base: Instant::now(),
             cached_us: AtomicU64::new(0),
+            cached_mean_us: AtomicU64::new(0),
+            cached_sigma_us: AtomicU64::new(0),
         }
     }
 
@@ -3138,14 +3159,24 @@ impl ServiceHistogram {
         }
         if self
             .rotated_at_us
-            .compare_exchange(started, now_us, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+            .compare_exchange(
+                started,
+                now_us,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            )
             .is_err()
         {
             return;
         }
         let closing = self.active.fetch_xor(1, AtomicOrdering::Relaxed) & 1;
-        if let Some(value) = self.quantile_of(closing, SERVICE_ADMISSION_QUANTILE) {
+        if let Some(value) = self.quantile_of(closing, SERVICE_REPORTED_QUANTILE) {
             self.cached_us.store(value, AtomicOrdering::Relaxed);
+        }
+        if let Some((mean_us, sigma_us)) = self.moments_of(closing) {
+            self.cached_mean_us.store(mean_us, AtomicOrdering::Relaxed);
+            self.cached_sigma_us
+                .store(sigma_us, AtomicOrdering::Relaxed);
         }
         // Zero it so it is clean when it becomes active again one window from now.
         for slot in self.generations[closing].iter() {
@@ -3172,7 +3203,40 @@ impl ServiceHistogram {
         None
     }
 
-    /// The cached quantile in microseconds, or zero before a full window has closed.
+    /// Mean and standard deviation of one generation, in microseconds.
+    ///
+    /// Accumulated in `f64`: a bucket's upper edge squared overflows `u64` at the top of the
+    /// range, and this runs once per rotation rather than per request, so the cost is irrelevant.
+    fn moments_of(&self, generation: usize) -> Option<(u64, u64)> {
+        let counts = &self.generations[generation];
+        let (mut n, mut sum, mut sum_sq) = (0f64, 0f64, 0f64);
+        for (bucket, count) in counts.iter().enumerate() {
+            let c = count.load(AtomicOrdering::Relaxed) as f64;
+            if c == 0.0 {
+                continue;
+            }
+            let value = Self::bucket_upper_us(bucket) as f64;
+            n += c;
+            sum += c * value;
+            sum_sq += c * value * value;
+        }
+        if n == 0.0 {
+            return None;
+        }
+        let mean = sum / n;
+        // Clamped at zero: floating-point cancellation can make this very slightly negative
+        // when every sample landed in one bucket, and a NaN here would disable the gate.
+        let variance = (sum_sq / n - mean * mean).max(0.0);
+        Some((mean as u64, variance.sqrt() as u64))
+    }
+
+    /// The cached mean and standard deviation, or `None` before a full window has closed.
+    pub(crate) fn moments(&self) -> Option<(u64, u64)> {
+        let mean = self.cached_mean_us.load(AtomicOrdering::Relaxed);
+        (mean != 0).then(|| (mean, self.cached_sigma_us.load(AtomicOrdering::Relaxed)))
+    }
+
+    /// The cached reported quantile in microseconds, or zero before a full window has closed.
     pub(crate) fn estimate_us(&self) -> u64 {
         self.cached_us.load(AtomicOrdering::Relaxed)
     }
@@ -3425,6 +3489,16 @@ impl QueueLoad {
     /// and `saturating_sub` because a pool with a free slot imposes no wait at all.
     fn predicted_wait_at(&self, depth: usize) -> Duration {
         let rounds = depth.saturating_sub(self.width).div_ceil(self.width) as u64;
+        if self.tail_aware
+            && let Some((mean_us, sigma_us)) = self.dispatch_stats.service_hist.moments()
+        {
+            // d·µ + k·σ√d — the wait ahead is a *sum* of service times, so its mean scales
+            // with the depth and its spread only with the root of it.
+            let rounds_f = rounds as f64;
+            let predicted = mean_us as f64 * rounds_f
+                + SERVICE_ADMISSION_SIGMAS * sigma_us as f64 * rounds_f.sqrt();
+            return Duration::from_micros(predicted as u64);
+        }
         Duration::from_micros(self.admission_service_us().saturating_mul(rounds))
     }
 
@@ -3685,11 +3759,14 @@ impl OrchestratorWorkerTx {
         placement: Arc<ArcSwap<ShardPlacement>>,
         budget: Option<Duration>,
     ) -> Self {
-        let queue_load = Arc::new(QueueLoad::new(
-            Arc::clone(&dispatch_stats),
-            workers.len() * ORCHESTRATOR_WORKER_MAX_IN_FLIGHT,
-            budget,
-        ));
+        let queue_load = Arc::new(
+            QueueLoad::new(
+                Arc::clone(&dispatch_stats),
+                workers.len() * ORCHESTRATOR_WORKER_MAX_IN_FLIGHT,
+                budget,
+            )
+            .tail_aware(),
+        );
         Self {
             workers: Arc::new(workers),
             next_worker: Arc::new(AtomicUsize::new(0)),
@@ -6483,8 +6560,12 @@ impl RouterActor {
             .and_then(|tx| tx.load().budget())
             .map(|budget| {
                 Arc::new(
-                    QueueLoad::new(Arc::clone(&mailbox_lane.0), MAILBOX_LANE_WIDTH, Some(budget))
-                        .tail_aware(),
+                    QueueLoad::new(
+                        Arc::clone(&mailbox_lane.0),
+                        MAILBOX_LANE_WIDTH,
+                        Some(budget),
+                    )
+                    .tail_aware(),
                 )
             });
         Self {
@@ -6510,6 +6591,17 @@ impl RouterActor {
     /// The mailbox lane's backlog gate, for the endpoints that report what refusals are made on.
     pub fn mailbox_load(&self) -> Option<&Arc<QueueLoad>> {
         self.mailbox_load.as_ref()
+    }
+
+    /// The lane's measured service p90, in milliseconds.
+    ///
+    /// The node published no service percentile at all before this, so an operator could see how
+    /// much work was queued but not how long the node's own work was taking — and could not tell
+    /// a node that had got slower from one that had got busier.
+    pub fn mailbox_service_p90_ms(&self) -> Option<u64> {
+        self.mailbox_load
+            .as_ref()
+            .map(|load| load.dispatch_stats.service_hist.estimate_us() / 1_000)
     }
 
     /// Handles client operations.
@@ -13046,7 +13138,9 @@ mod tests {
     /// exists to prevent. Checked across the range a real sample can land in.
     #[test]
     fn a_bucketed_service_time_never_reads_low() {
-        for sample_us in [0u64, 1, 15, 16, 17, 100, 999, 1_000, 8_500, 54_000, 1_000_000] {
+        for sample_us in [
+            0u64, 1, 15, 16, 17, 100, 999, 1_000, 8_500, 54_000, 1_000_000,
+        ] {
             let bucket = ServiceHistogram::bucket_of(sample_us);
             let reported = ServiceHistogram::bucket_upper_us(bucket);
             assert!(
@@ -13054,6 +13148,35 @@ mod tests {
                 "sample {sample_us}µs landed in bucket {bucket} reported as {reported}µs"
             );
         }
+    }
+
+    /// The wait ahead of a new arrival is a sum of service times, so its spread grows as the
+    /// root of the depth and not with it. Pinned as the property the first cut got wrong: a
+    /// per-request quantile multiplied by depth grows the margin linearly, which over-predicts
+    /// a deep queue and admits a shallower one than the budget can carry.
+    #[test]
+    fn a_queues_predicted_spread_grows_with_the_root_of_its_depth() {
+        let hist = ServiceHistogram::new();
+        // A spread-out distribution, so sigma is meaningfully non-zero.
+        for _ in 0..50 {
+            hist.record(Duration::from_millis(5));
+        }
+        for _ in 0..50 {
+            hist.record(Duration::from_millis(45));
+        }
+        let (mean_us, sigma_us) = hist
+            .moments_of(hist.active.load(AtomicOrdering::Relaxed) & 1)
+            .expect("samples recorded");
+        assert!(sigma_us > 0, "a two-valued distribution has spread");
+
+        // The margin over the mean at depth 4d must be 2x the margin at depth d, not 4x.
+        let margin = |depth: f64| SERVICE_ADMISSION_SIGMAS * sigma_us as f64 * depth.sqrt();
+        let ratio = margin(400.0) / margin(100.0);
+        assert!(
+            (ratio - 2.0).abs() < 1e-9,
+            "quadrupling depth must double the margin, got {ratio}x"
+        );
+        assert!(mean_us > 0);
     }
 
     /// A quantile has to actually separate the body of the distribution from its tail, and
@@ -13072,10 +13195,14 @@ mod tests {
         }
         let generation = hist.active.load(AtomicOrdering::Relaxed) & 1;
 
-        let p90 = hist.quantile_of(generation, 0.90).expect("samples recorded");
+        let p90 = hist
+            .quantile_of(generation, 0.90)
+            .expect("samples recorded");
         assert!(p90 < 16_000, "p90 sits on the boundary and reads the body");
 
-        let p95 = hist.quantile_of(generation, 0.95).expect("samples recorded");
+        let p95 = hist
+            .quantile_of(generation, 0.95)
+            .expect("samples recorded");
         assert!(
             p95 >= 200_000,
             "p95 should be inside the 200ms tail, read {p95}µs"

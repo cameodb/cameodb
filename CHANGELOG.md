@@ -18,19 +18,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queues. At 120 requests/s the node went from 0 to 55,500 documents written; a node inside its
   capacity is untouched.
 
-  Admission predicts the wait from a **measured p90** of service time rather than from its mean,
-  because a mean cannot see a tail: a queue held where the average request fits the budget still
-  lets the slow ones past it. A decaying log-bucketed histogram supplies it — recorded with a
-  single atomic add, rotated every two seconds so it tracks load that changed, and the quantile
-  is computed once per rotation so the admission check itself stays one atomic load.
+  Admission predicts the wait from a **measured spread** rather than from a mean, because a mean
+  cannot see a tail: a queue held where the average request fits the budget still lets the slow
+  ones past it. The wait ahead of an arrival is a sum of service times, so it is estimated as
+  `depth x mean + 3 x sigma x sqrt(depth)` — the spread of a sum grows with the root of the
+  depth, not with the depth. A decaying log-bucketed histogram supplies both figures: recorded
+  with a single atomic add, rotated every two seconds so it tracks load that changed, and reduced
+  once per rotation so the admission check itself stays one atomic load.
 
   Measured from a wiped volume re-seeded to 200,000 documents, so both columns start from the
   same index. At 120 requests/s: **6 ok/s and 1,084 timeouts became 57 ok/s and none**, with
   573,000 documents written against 58,000. At 300/s: 1 ok/s and 1,492 timeouts became 59 ok/s
-  and 38. Goodput is flat across that range instead of collapsing to zero within three seconds,
-  and a node inside its capacity is untouched. Search is deliberately left predicting on the
-  mean — its overload behaviour is a measured result, and changing what it admits on deserves
-  its own run.
+  and 6. Goodput is flat across that range instead of collapsing to zero within three seconds,
+  and a node inside its capacity is untouched.
+
+  Search admission moved to the same basis, which costs nothing and buys latency: at 3,000
+  searches/s offered, 899 ok/s at a p50 of 893ms became 894 ok/s at **820ms**, with the p99
+  down from 904ms to 828ms. Holding a shallower queue answers the same number of requests
+  sooner. A node inside its capacity still sheds nothing and answers in 5.71ms at p99.
+
+  `/_cluster/health` also reports `mailbox_service_p90_ms`. The node published no service
+  percentile at all before, so an operator could see how much work was queued but not how long
+  the node's own work was taking — and could not tell a node that had got slower from one that
+  had got busier.
 
   `/_cluster/health` gained `mailbox_depth` and `mailbox_predicted_wait_ms` for the lane, reported
   separately from the worker pool's `queue_depth` because a node can be idle on one and shedding
