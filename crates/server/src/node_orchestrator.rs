@@ -392,6 +392,40 @@ type BatchCommand = (
     tokio::sync::oneshot::Sender<Result<(Vec<u64>, usize), StoreError>>,
 );
 
+/// Where one caller's slice of a merged write goes back to.
+///
+/// A single write and a batch write to the same index are applied as one transaction, so the
+/// replies have to be split by shape as well as by position: a single write is owed its one
+/// sequence id, a batch is owed its own run of them.
+enum MergedWriteReply {
+    Single(tokio::sync::oneshot::Sender<Result<u64, StoreError>>),
+    /// The number of ops this caller contributed, and where its answer goes.
+    Batch(
+        usize,
+        tokio::sync::oneshot::Sender<Result<(Vec<u64>, usize), StoreError>>,
+    ),
+}
+
+/// The contiguous run of sequence ids each caller in a merged write owns.
+///
+/// Separated out because it is the part that fails silently: a mis-walked offset hands one
+/// caller another caller's sequence ids and nothing anywhere would notice. `None` when the
+/// storage layer did not return one id per op, which the caller turns into an error for
+/// everyone in the merge rather than an index out of bounds on the writer thread.
+fn merged_reply_ranges(
+    op_counts: &[usize],
+    seq_id_count: usize,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let mut ranges = Vec::with_capacity(op_counts.len());
+    let mut offset = 0usize;
+    for count in op_counts {
+        let end = offset.checked_add(*count)?;
+        ranges.push(offset..end);
+        offset = end;
+    }
+    (offset == seq_id_count).then_some(ranges)
+}
+
 /// Type alias for index deletions enqueued in the writer thread: (index, delete_schema, reply)
 type DeleteCommand = (
     String,
@@ -5268,6 +5302,146 @@ fn spawn_writer_thread(
                             }
                             StorageCommand::Shutdown => {
                                 should_shutdown = true;
+                            }
+                        }
+                    }
+
+                    // Phase 3a: indexes that received both single writes and batch writes in
+                    // this same drain.
+                    //
+                    // Applied by the two phases below they are two
+                    // `apply_batch_and_maybe_commit` calls — two redb transactions, and with
+                    // `wal_sync` on two fsyncs — for work one transaction covers. The comment
+                    // above has claimed the two are merged since before they were; this is
+                    // where it becomes true. Singles go ahead of batches, which is the order
+                    // the phases below would have applied them in, so which write wins a
+                    // duplicated id does not change.
+                    let mixed: Vec<String> = write_groups
+                        .keys()
+                        .filter(|index| batch_groups.contains_key(*index))
+                        .cloned()
+                        .collect();
+
+                    for index in mixed {
+                        #[cfg(feature = "fault-injection")]
+                        fault_injection::panic_if_writer_thread_trap(&index);
+
+                        let writes = write_groups.remove(&index).unwrap_or_default();
+                        let batches = batch_groups.remove(&index).unwrap_or_default();
+
+                        let mut merged_ops: Vec<WalOp> = Vec::new();
+                        let mut segments: Vec<MergedWriteReply> = Vec::new();
+                        let mut op_counts: Vec<usize> = Vec::new();
+                        let mut batch_ops_total = 0usize;
+                        let mut batch_segments = 0usize;
+                        for (op, reply) in writes {
+                            merged_ops.push(op);
+                            op_counts.push(1);
+                            segments.push(MergedWriteReply::Single(reply));
+                        }
+                        for (ops, reply) in batches {
+                            let count = ops.len();
+                            batch_ops_total += count;
+                            batch_segments += 1;
+                            merged_ops.extend(ops);
+                            op_counts.push(count);
+                            segments.push(MergedWriteReply::Batch(count, reply));
+                        }
+
+                        let total_ops = merged_ops.len();
+                        let res = guard_writer_op(&writer_store, &index, || {
+                            writer_store.apply_batch_and_maybe_commit(&index, merged_ops)
+                        });
+
+                        let fail_all = |segments: Vec<MergedWriteReply>, reason: String| {
+                            for segment in segments {
+                                let err = Err(StoreError::Serialization(reason.clone()));
+                                match segment {
+                                    MergedWriteReply::Single(reply) => {
+                                        let _ = reply.send(err.map(|_: (Vec<u64>, usize)| 0));
+                                    }
+                                    MergedWriteReply::Batch(_, reply) => {
+                                        let _ = reply.send(err);
+                                    }
+                                }
+                            }
+                        };
+
+                        match res {
+                            Ok(((seq_ids, new_docs), committed)) => {
+                                // One sequence per op is the storage layer's contract. Checked
+                                // rather than indexed on faith: this runs on the writer thread,
+                                // where a panic takes every shard's writes down with it.
+                                let Some(ranges) = merged_reply_ranges(&op_counts, seq_ids.len())
+                                else {
+                                    tracing::error!(
+                                        index = %index,
+                                        expected = total_ops,
+                                        got = seq_ids.len(),
+                                        "Writer: merged write returned the wrong number of sequence ids"
+                                    );
+                                    fail_all(
+                                        segments,
+                                        "merged write returned the wrong number of sequence ids"
+                                            .to_string(),
+                                    );
+                                    continue;
+                                };
+                                if committed {
+                                    tracing::info!(
+                                        index = %index,
+                                        total_ops,
+                                        "Writer: threshold commit after merged single and batch writes"
+                                    );
+                                    committed_indices.insert(index.clone());
+                                }
+                                tracing::debug!(
+                                    index = %index,
+                                    total_ops,
+                                    batch_segments,
+                                    "Writer: merged single and batch writes into one transaction"
+                                );
+
+                                let mut remaining_new_docs = new_docs;
+                                let mut batches_seen = 0usize;
+                                for (segment, range) in segments.into_iter().zip(ranges) {
+                                    match segment {
+                                        MergedWriteReply::Single(reply) => {
+                                            let _ = reply.send(Ok(seq_ids[range.start]));
+                                        }
+                                        MergedWriteReply::Batch(count, reply) => {
+                                            batches_seen += 1;
+                                            let ids = seq_ids[range].to_vec();
+                                            // Split over the batch ops alone, so a batch caller
+                                            // is told what it would have been told had the
+                                            // singles not been merged in. Both callers of this
+                                            // reply discard the figure today; keeping it stable
+                                            // costs nothing and keeps the change to one thing.
+                                            let segment_new_docs = if batches_seen == batch_segments
+                                            {
+                                                remaining_new_docs
+                                            } else {
+                                                new_docs
+                                                    .checked_mul(count)
+                                                    .and_then(|p| p.checked_div(batch_ops_total.max(1)))
+                                                    .unwrap_or(0)
+                                                    .min(remaining_new_docs)
+                                            };
+                                            remaining_new_docs =
+                                                remaining_new_docs.saturating_sub(segment_new_docs);
+                                            let _ = reply.send(Ok((ids, segment_new_docs)));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let reason = e.to_string();
+                                tracing::error!(
+                                    index = %index,
+                                    error = %reason,
+                                    "Writer: merged single and batch write failed"
+                                );
+                                fail_all(segments, reason);
                             }
                         }
                     }
@@ -13220,6 +13394,41 @@ mod tests {
             "an empty generation has no quantile to report"
         );
         assert_eq!(hist.estimate_us(), 0, "and nothing is cached from it");
+    }
+
+    /// A merged write hands each caller a contiguous run of the ids it asked for, and the runs
+    /// partition the result exactly. A mis-walked offset would give one caller another's
+    /// sequence ids, which nothing downstream could detect.
+    #[test]
+    fn a_merged_write_partitions_its_sequence_ids_exactly() {
+        // One single write, a batch of three, another single, a batch of two.
+        let ranges = merged_reply_ranges(&[1, 3, 1, 2], 7).expect("counts match the ids");
+        assert_eq!(
+            ranges,
+            vec![0..1, 1..4, 4..5, 5..7],
+            "each caller owns the run it contributed, in order"
+        );
+        // Contiguous, non-overlapping, and covering everything.
+        assert_eq!(ranges.last().unwrap().end, 7);
+    }
+
+    /// The storage layer's contract is one sequence id per op. If it is ever not, the merge
+    /// must refuse the whole group rather than index past the end — this runs on the writer
+    /// thread, where a panic takes every shard's writes down with it.
+    #[test]
+    fn a_merged_write_refuses_a_short_result_rather_than_indexing_past_it() {
+        assert!(
+            merged_reply_ranges(&[1, 3, 2], 5).is_none(),
+            "six ops against five ids must not produce ranges"
+        );
+        assert!(
+            merged_reply_ranges(&[1, 3, 2], 7).is_none(),
+            "six ops against seven ids is just as wrong"
+        );
+        assert!(
+            merged_reply_ranges(&[], 0).is_some(),
+            "an empty merge is fine"
+        );
     }
 
     /// A cancelled ask must still give its slot back. `TimeoutLayer` drops the request future

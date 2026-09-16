@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A single write and a bulk write to the same index no longer cost two transactions.** The
+  writer thread grouped the two kinds separately and drained them in separate phases, so an index
+  that received both in one pass paid two redb transactions — and with `wal_sync` on, two fsyncs
+  — for work one transaction covers. The comment above that loop had described them as merged
+  since before they were. Only an index that received both kinds takes the merged path; a pass
+  holding one kind runs exactly the code it did before.
+
+  Instrumented on a mixed workload, roughly one transaction in nine was saved. It does not show
+  up as latency: across three repeats of a 30s arm at writer saturation, two favour the merge and
+  the third reverses it, so the ranges overlap and there is no measurable difference. It is kept
+  because the second transaction was unnecessary, not because it is faster.
+
 - **Bulk writes are now refused under overload instead of timing out.** The admission gate and the
   dequeue deadline check both watch the worker pool, and a `BulkWrite` never enters it — it is
   served from the orchestrator's actor mailbox, which nothing gated. Measured at roughly twice
