@@ -1540,15 +1540,56 @@ So a node under bulk-ingest overload writes nothing, makes every client wait a f
 told 408, and fails the probe a load balancer evicts on — while `/_admin/workers` reports a node
 in perfect health.
 
+***The endpoint's own guards could not fire, and that is the part worth keeping.*** "Actor-served"
+is true but too kind: the expanded body already wrapped its actor calls in
+`HEALTH_ACTOR_TIMEOUT` precisely so "a slow node [does not] fail its own health probe". Three
+things stopped that working, and each alone was enough:
+
+- **The wait was per call, and the calls are sequential.** Four of them — `GetStatus`,
+  `shard_count`, `GetIdentity`, `ListIndexes` — at a fixed 5s each is a 20s worst case for a body
+  that is supposed to be the fast answer.
+- **The guard was longer than the budget it guarded.** 5s against a node running
+  `request_timeout_secs = 1`: `TimeoutLayer` abandons the request as a 408 a full second before
+  any fallback can run. A guard above the request timeout is not a guard, and nothing related the
+  two numbers.
+- **`GetStatus` had no guard at all.**
+
+And the fast path that exists for exactly this — the anonymous branch, whose comment says "a
+health flood must not become mailbox pressure" — is **unreachable on an unauthenticated node**:
+`is_identified()` is `!matches!(self, Authz::Anonymous)`, and `[security] enabled = false` yields
+`Authz::Disabled`, which counts as identified. Every probe on a local or dev node takes the
+actor path.
+
+✅ **Fixed 2026-09-16**, and measured on the arm that found it. The four actor calls now share one
+deadline rather than one each, so the total is bounded; the deadline is derived from the node's
+own resolved request timeout (half of it, clamped to 50ms–5s) so it always fires before
+`TimeoutLayer` does; `GetStatus` is inside it; and a `degraded` field names whichever lookups did
+not answer, because `active_shards: 0` from a busy node is otherwise indistinguishable from a node
+that has no shards. Under the same 120/s bulk arm: **200 on twelve of twelve probes at ~505ms**,
+against 408 at 1,001ms before, carrying `degraded: ["active_shards", "node_id", "total_indexes"]`
+— and *not* `cluster_status`, which localises the blocking actor to the orchestrator rather than
+the coordinator. An idle node's body is byte-for-byte what it was.
+
+`Authz::Disabled` was deliberately **not** rerouted to the anonymous fast path. It would have
+removed the timeout by removing the body — that path returns `status` alone, dropping
+`queue_depth`, `predicted_wait_ms` and `read_pool_abandoned` from precisely the unauthenticated
+nodes F7 added them to. Bounding the waits keeps the full body and degrades it honestly instead.
+
+**The instrument is restored, but it still cannot see this lane.** Health now answers under bulk
+overload — reporting `green` with `queue_depth: 0`, because bulk work never enters the counter
+`queue_depth` reads. That is the same root cause as the gap above, and it is fixed by item 1, not
+by anything further here.
+
 **What the fix has to do**, in the order the evidence supports:
 
 1. **Make the bulk lane visible to the gates.** Either route `BulkWrite` through the worker pool
    so fix 1's dequeue check applies, or give the mailbox its own deadline check; and count bulk
    work in `outstanding` either way, because a door that cannot see the queue cannot refuse into
    it. Counting without checking is the weaker half and should not ship alone.
-2. **Take health off the actor.** It should answer from the same atomics `/_admin/workers`
-   already answers from, so that "is this node alive" never queues behind "is this node busy".
-   This is worth doing independently of 1 — it is the difference between a degraded node and an
+2. ✅ **Bound what health waits on.** Done 2026-09-16, above. The aim was "take health off the
+   actor"; what it needed was for the guards it already had to be capable of firing — one shared
+   deadline, sized from the request timeout, and a body that says which fields are fallbacks.
+   Worth having done independently of 1: it is the difference between a degraded node and an
    undiagnosable one.
 3. **Feed bulk into the service estimate**, so the blended figure the door uses reflects the
    workload with by far the largest per-request cost.
@@ -2208,16 +2249,26 @@ reads off the orchestrator mailbox is the general fix, and it is not done.
 
 ### OB13 — The health endpoint fails under overload, but not for the reason it looked like
 
-◐ **Investigated, closed into [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) and
-fixed by it on the search path** 2026-09-15 — **and reopened on the write path** 2026-09-16.
-Under bulk overload health returns 408 at 1,001ms again, on a different mechanism: it is
-actor-served and queues behind the `BulkWrite` holding the orchestrator mailbox, where F7's
-exemptions cover only the semaphore and the backlog gate. `/_admin/workers` stays at 200 in
-0.7ms throughout, which is what localises it. See
+✅ **Investigated, closed into [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) and
+fixed by it on the search path** 2026-09-15 — **reopened on the write path and fixed there too**
+2026-09-16. Under bulk overload health returned 408 at 1,001ms again on a different mechanism:
+it is actor-served and queues behind the `BulkWrite` holding the orchestrator mailbox, where F7's
+exemptions cover only the semaphore and the backlog gate, and its own `HEALTH_ACTOR_TIMEOUT`
+could not fire — five seconds per call, four sequential calls, against a one-second request
+budget. Bounded now against the node's resolved timeout, with a `degraded` field naming what fell
+back: 200 on twelve of twelve probes at ~505ms. `/_admin/workers` stayed at 200 in 0.7ms
+throughout, which is what localised it. See
 [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path); everything below stands as the
-search-path record. Opened the same day on the observation that `/_cluster/health` returned
-408 during the F7 collapse. It does — but the layering explanation was wrong, and the fix it
-implied would not have worked.
+search-path record.
+
+*Twice now this endpoint has failed for a reason other than the one it looked like* — first the
+layer order, which was innocent, then "actor-served", which was true but hid that the guard was
+simply larger than the budget. The lasting rule is the one the fix encodes: a timeout inside a
+request must be derived from that request's own budget, never written as a constant beside it.
+
+**The original observation**, the same day: `/_cluster/health` returned 408 during the F7
+collapse. It does — but the layering explanation was wrong, and the fix it implied would not
+have worked.
 
 **Confirmed fixed by F7's dequeue rejection**, the same day: under 3,000/s against the node that
 produced the 1001.8ms all-408 row below, sixteen consecutive probes returned **200 in ~160ms**.

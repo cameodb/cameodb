@@ -641,6 +641,7 @@ async fn main() -> Result<()> {
         writer_liveness,
         read_pool_health,
         queue_load,
+        request_timeout: Duration::from_secs(cameodb_config.effective_request_timeout_secs()),
     };
 
     // Create the HTTP router with shared state and body limit derived from max_record_size_mb
