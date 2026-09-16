@@ -2501,6 +2501,18 @@ pub enum ClientOp {
     BulkDelete {
         index: String,
         docs: Vec<DeletePayload>,
+        /// True on a batch this node received from a peer that could not place it.
+        ///
+        /// The hop limit [OB3](ROADMAP) put on single writes and deletes, on the bulk path it
+        /// named as still open. Both ends decide from their own view of the ring, those views
+        /// disagree while membership changes, and without this a batch neither node believes it
+        /// owns is passed back and forth — a full remote ask with every document in it, per
+        /// round trip, until something times out.
+        ///
+        /// `serde(default)` so a batch from a peer built before this field reads as a first
+        /// hop, which is what it is.
+        #[serde(default)]
+        forwarded: bool,
     },
     /// Remove one document by its key.
     ///
@@ -10540,7 +10552,11 @@ impl NodeOrchestrator {
                 routing_key,
                 forwarded,
             } => self.orch_delete(&index, id, routing_key, forwarded).await,
-            ClientOp::BulkDelete { index, docs } => self.orch_bulk_delete(&index, docs).await,
+            ClientOp::BulkDelete {
+                index,
+                docs,
+                forwarded,
+            } => self.orch_bulk_delete(&index, docs, forwarded).await,
             ClientOp::CreateConfig { index, schema } => {
                 self.orch_create_config(&index, schema).await
             }
@@ -10919,6 +10935,7 @@ impl NodeOrchestrator {
         &self,
         index: &str,
         docs: Vec<DeletePayload>,
+        forwarded: bool,
     ) -> Result<JsonValue, OrchestratorError> {
         let start = std::time::Instant::now();
         if self.shards.is_empty() {
@@ -11032,6 +11049,25 @@ impl NodeOrchestrator {
                 Err(err) => errors.extend(ids.into_iter().map(|id| {
                     format!("{id}: shard {shard_id} did not take the batch this id was in: {err}")
                 })),
+            }
+        }
+
+        // A batch that was itself forwarded here goes no further. Both ends decide ownership
+        // from their own view of the ring, and while membership changes those views disagree —
+        // two nodes each certain the other owns the shard would otherwise pass the batch back
+        // and forth, a full remote ask carrying every document each time, until something timed
+        // out. Stating the disagreement per id is what `forward_op_to_owner` does for a single
+        // delete; this is the same rule on the path OB3 left open.
+        if forwarded && !remote_by_node.is_empty() {
+            for (node_id, payloads) in std::mem::take(&mut remote_by_node) {
+                errors.extend(payloads.iter().map(|doc| {
+                    format!(
+                        "{}: forwarded here, but this node does not own its shard either. This node \
+                         and node {node_id} disagree about who does; retry once the \
+                         cluster has settled",
+                        doc.id()
+                    )
+                }));
             }
         }
 
@@ -11167,6 +11203,9 @@ impl NodeOrchestrator {
         let op = ClientOp::BulkDelete {
             index: index.to_string(),
             docs,
+            // One hop. If the peer cannot place these either, it says so per id rather than
+            // handing them on again.
+            forwarded: true,
         };
 
         let answer: JsonValue = remote_answer(remote.ask(&op).await)?;
@@ -11445,6 +11484,27 @@ impl NodeOrchestrator {
         // Who owns a shard, and where that node is — asked only if some document actually
         // routed off this node.
         //
+        // A batch that was itself forwarded here goes no further, for the reason
+        // `forward_op_to_owner` gives for a single write: two nodes whose views of the ring
+        // disagree would otherwise pass it between them, carrying every document each time,
+        // until something timed out. This op has carried `forwarded` since OB12 and only the
+        // schema decision ever read it.
+        //
+        // Ahead of the shard-assignment lookup below, so a batch that is going to be refused
+        // does not ask the coordinator who owns what first.
+        if forwarded && !remote_docs.is_empty() {
+            rejections.extend(std::mem::take(&mut remote_docs).into_iter().map(
+                |(placed, target_shard)| {
+                    format!(
+                        "document {}: forwarded here, but shard {target_shard} is not local \
+                         either. This node and the one that forwarded disagree about who owns \
+                         it; retry once the cluster has settled",
+                        placed.doc.id
+                    )
+                },
+            ));
+        }
+
         // Both maps are read in the remote branch below and nowhere else: the local/remote split
         // above uses `self.shards`, which this node already holds. Fetching them up front cost
         // two coordinator mailbox round trips on **every** bulk write, including every bulk write
@@ -13464,6 +13524,41 @@ mod tests {
         );
         // Hex of a JSON prefix, so it is even-length hex and not a 16-char xxh3 digest.
         assert!(derived.len().is_multiple_of(2) && derived.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// A bulk delete from a peer built before the hop marker existed must read as a first hop.
+    ///
+    /// `serde(default)` is the compatibility promise, and it points the safe way for a *mixed*
+    /// cluster: an older peer's forward reads as `false`, which is the behaviour that node
+    /// already had, rather than as `true`, which would make this node refuse a batch it can
+    /// place. The bound closes once both ends are new.
+    #[test]
+    fn a_bulk_delete_without_a_hop_marker_reads_as_a_first_hop() {
+        let op = ClientOp::BulkDelete {
+            index: "books".to_string(),
+            docs: vec![],
+            forwarded: true,
+        };
+        let mut wire = serde_json::to_value(&op).expect("serializes");
+
+        // Strip the field, which is exactly what an older peer sends.
+        let body = wire
+            .get_mut("BulkDelete")
+            .and_then(|v| v.as_object_mut())
+            .expect("externally tagged");
+        assert!(
+            body.remove("forwarded").is_some(),
+            "the marker is on the wire when this node sends it"
+        );
+
+        let parsed: ClientOp = serde_json::from_value(wire).expect("deserializes without it");
+        match parsed {
+            ClientOp::BulkDelete { forwarded, .. } => assert!(
+                !forwarded,
+                "a batch with no marker is a first hop, not a forwarded one"
+            ),
+            other => panic!("round-tripped into {other:?}"),
+        }
     }
 
     /// A merged write hands each caller a contiguous run of the ids it asked for, and the runs
