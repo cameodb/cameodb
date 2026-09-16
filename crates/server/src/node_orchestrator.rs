@@ -1424,8 +1424,44 @@ fn effective_routing_key(
     routing_key: Option<String>,
     doc: &JsonValue,
 ) -> Option<String> {
-    extract_routing_value(doc, schema.get_routing_field())
-        .or(routing_key)
+    routing_key_for(schema.get_routing_field(), routing_key, id, doc)
+}
+
+/// The whole routing ladder, for callers that hold the routing field rather than the schema.
+///
+/// The bulk router resolves the field once and then routes thousands of documents against it, so
+/// it cannot take a schema per document — which is how it came to spell the ladder out a fourth
+/// time. Same rungs, one place.
+pub(crate) fn routing_key_for(
+    routing_field: &str,
+    routing_key: Option<String>,
+    id: &str,
+    doc: &JsonValue,
+) -> Option<String> {
+    extract_routing_value(doc, routing_field)
+        .or_else(|| routing_key_without_schema(routing_key, id, doc))
+}
+
+/// The rungs of the routing precedence that need no schema: the caller's key, then the id, then
+/// a hash of the document.
+///
+/// Split out because the HTTP layer has to pick a *node* for a request before anyone has
+/// resolved the index's schema, so it can only climb from here down — where
+/// [`effective_routing_key`] starts one rung higher, at the schema's routing field. Two callers,
+/// one ladder: they were written out separately and had drifted into using different hashes of
+/// different byte ranges, so a hint and the key it was standing in for could disagree.
+///
+/// A disagreement costs a forwarding hop rather than a misplaced document — per-document shard
+/// placement is decided by `effective_routing_key` alone, and a hint that points at the wrong
+/// node is corrected by the forward OB3 bounded. That is why this unifies on the orchestrator's
+/// existing derivation rather than the HTTP layer's: the hint is free to change, and the shard a
+/// document lands on is not.
+pub(crate) fn routing_key_without_schema(
+    routing_key: Option<String>,
+    id: &str,
+    doc: &JsonValue,
+) -> Option<String> {
+    routing_key
         .or_else(|| (!id.is_empty()).then(|| id.to_string()))
         .or_else(|| derive_routing_key_from_doc(doc))
 }
@@ -11338,11 +11374,14 @@ impl NodeOrchestrator {
             pending
                 .into_par_iter()
                 .map(|mut placed| {
-                    // Calculate effective routing key using schema's routing field
-                    placed.routing_key = extract_routing_value(&placed.doc.doc, &routing_field)
-                        .or_else(|| placed.doc.routing_key.clone())
-                        .or_else(|| (!placed.doc.id.is_empty()).then(|| placed.doc.id.clone()))
-                        .or_else(|| derive_routing_key_from_doc(&placed.doc.doc));
+                    // The same ladder every other write path climbs, resolved against the
+                    // routing field this batch already looked up once.
+                    placed.routing_key = routing_key_for(
+                        &routing_field,
+                        placed.doc.routing_key.clone(),
+                        &placed.doc.id,
+                        &placed.doc.doc,
+                    );
 
                     // Route to shard using consistent hash ring
                     let Some(key) = placed.routing_key.as_ref() else {
@@ -12398,7 +12437,7 @@ impl NodeOrchestrator {
 /// 1. If the document has an "id" field (string), use that directly.
 /// 2. Otherwise, serialize the document to JSON bytes, take a prefix,
 ///    and hex-encode it to produce a stable routing key string.
-fn derive_routing_key_from_doc(doc: &JsonValue) -> Option<String> {
+pub(crate) fn derive_routing_key_from_doc(doc: &JsonValue) -> Option<String> {
     // Fallback: derive from JSON bytes (deterministic for same document)
     let mut bytes = serde_json::to_vec(doc).ok()?;
     if bytes.is_empty() {
@@ -13394,6 +13433,44 @@ mod tests {
             "an empty generation has no quantile to report"
         );
         assert_eq!(hist.estimate_us(), 0, "and nothing is cached from it");
+    }
+
+    /// The HTTP layer picks a *node* before any schema is resolved, so it climbs the same
+    /// ladder from one rung lower. The two used to be written out separately and had drifted
+    /// onto different hashes of different byte ranges — so a hint and the key it stood in for
+    /// could disagree, and the request would take a forwarding hop it did not need.
+    #[test]
+    fn a_routing_hint_agrees_with_the_key_it_stands_in_for() {
+        // No routing field, so `effective_routing_key` falls straight through.
+        let schema = IndexSchema::default();
+        let doc = json!({"title": "Dune", "author": "Herbert"});
+
+        // No schema routing field, so `effective_routing_key` falls straight through to the
+        // shared ladder and the two must produce the same answer at every rung.
+        for (id, caller) in [("d1", Some("caller".to_string())), ("d1", None), ("", None)] {
+            assert_eq!(
+                effective_routing_key(&schema, id, caller.clone(), &doc),
+                routing_key_without_schema(caller.clone(), id, &doc),
+                "hint and key disagree for id={id:?} caller={caller:?}"
+            );
+        }
+    }
+
+    /// The unkeyed rung is the orchestrator's own derivation, and deliberately not the HTTP
+    /// layer's former `xxh3_64`. Which shard a document lands on is decided here, so unifying
+    /// the two spellings had to keep *this* one: a changed hash would move unkeyed documents to
+    /// different shards across an upgrade.
+    #[test]
+    fn the_unkeyed_rung_keeps_the_derivation_that_places_shards() {
+        let doc = json!({"title": "Dune"});
+        let derived = routing_key_without_schema(None, "", &doc).expect("a key is derived");
+        assert_eq!(
+            derived,
+            derive_routing_key_from_doc(&doc).expect("the same derivation"),
+            "the shared ladder's last rung is the orchestrator's derivation"
+        );
+        // Hex of a JSON prefix, so it is even-length hex and not a 16-char xxh3 digest.
+        assert!(derived.len().is_multiple_of(2) && derived.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     /// A merged write hands each caller a contiguous run of the ids it asked for, and the runs
