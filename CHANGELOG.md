@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`/_cluster/health` no longer fails its own probe on a node under write load.** The expanded
+  body makes four actor round-trips, and each was guarded by a fixed five-second timeout so that
+  "a slow node [does not] fail its own health probe". It could not work: the calls are
+  sequential, so four five-second waits are a twenty-second worst case; one of them (`GetStatus`)
+  had no guard at all; and five seconds sits outside a request budget that may be one, so
+  `TimeoutLayer` abandoned the request as a `408` a full second before any fallback could run. A
+  guard larger than the budget it guards never fires.
+
+  The four calls now share a single deadline rather than one each, and it is derived from the
+  node's own resolved request timeout — half of it, clamped to 50ms–5s — so it always expires
+  before the request does. The response gained an optional `degraded` array naming the fields
+  that could not be read in time, because a busy node reporting `active_shards: 0` is otherwise
+  indistinguishable from one that has no shards.
+
+  Measured under a bulk ingest at roughly twice capacity, where health previously returned `408`
+  at 1,001ms on twelve of twelve probes: **`200` on twelve of twelve at ~505ms**, carrying
+  `degraded: ["active_shards", "node_id", "total_indexes"]`. An idle node's body is unchanged.
+  Note this is the endpoint being made honest, not the overload being fixed — under bulk load it
+  reports `green` with `queue_depth: 0`, because bulk writes never reach the worker pool the
+  depth is counted from (ROADMAP F8).
+
 - **An overloaded node no longer works for clients that have gone.** A search dispatched to the
   worker pool ran whatever happened next: nothing downstream is cancellable, so when the request
   timeout fired the node kept the work, finished it, and produced an answer nobody was waiting

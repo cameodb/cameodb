@@ -7,11 +7,33 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tokio::time::{Instant, timeout_at};
 use tracing::error;
 
-/// How long the health endpoint will wait on actor queries that can queue behind real work.
-/// These only affect the expanded body; the liveness status is always fast.
-const HEALTH_ACTOR_TIMEOUT: Duration = Duration::from_secs(5);
+/// Ceiling on what the expanded body may spend waiting on actors, and the value used when the
+/// node's request timeout is larger than anything worth waiting for.
+const HEALTH_ACTOR_BUDGET_MAX: Duration = Duration::from_secs(5);
+
+/// Floor, so a node configured with a very short timeout still gives its actors a chance to
+/// answer rather than degrading every probe by arithmetic.
+const HEALTH_ACTOR_BUDGET_MIN: Duration = Duration::from_millis(50);
+
+/// What the expanded body may spend on actor round-trips — **in total, not per call**.
+///
+/// Both halves of that sentence were wrong before, and each on its own was enough to fail the
+/// probe. The wait was a fixed 5s while the expanded body makes four sequential actor calls, so
+/// the worst case was 20s; and it was compared against nothing, so on a node running
+/// `request_timeout_secs = 1` every one of those calls was abandoned by `TimeoutLayer` as a 408
+/// — the exact failure the fallbacks exist to prevent — a full second before its own guard
+/// expired. A guard longer than the budget it is guarding cannot fire.
+///
+/// Half the request timeout, so a probe that has to fall back still has the other half to build
+/// and serialize its answer in, clamped so neither a 1s node nor a 300s one gets an absurd
+/// figure. Measured: under bulk overload this endpoint returned 408 at 1,001ms on twelve of
+/// twelve probes (ROADMAP F8).
+fn health_actor_budget(request_timeout: Duration) -> Duration {
+    (request_timeout / 2).clamp(HEALTH_ACTOR_BUDGET_MIN, HEALTH_ACTOR_BUDGET_MAX)
+}
 
 use crate::authz::Authz;
 use crate::cluster_coordinator::GetStatus;
@@ -68,6 +90,15 @@ pub struct HealthResponse {
     pub bootstrap_successes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_updates: Option<u64>,
+
+    /// Which parts of this body could not be filled in before the actor budget ran out.
+    ///
+    /// Absent on a healthy answer. Present, it names the fields whose values below are
+    /// fallbacks rather than readings — a node reporting `active_shards: 0` because it is busy
+    /// looks identical to one reporting it because it has no shards, and only this tells them
+    /// apart. The liveness fields beside it are atomics and are never degraded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<Vec<String>>,
 }
 
 /// Handler for cluster health check.
@@ -106,12 +137,27 @@ pub(super) async fn health_handler(
         return Ok(Json(serde_json::json!({ "status": local_status })).into_response());
     }
 
+    // One deadline for every actor round-trip below, rather than one each. They run in
+    // sequence, so a per-call wait bounds none of them: four calls at the old fixed 5s was a
+    // 20s worst case on a node whose whole request budget might be 1s. `degraded` names
+    // whichever did not answer inside it, because the fallbacks below are indistinguishable
+    // from real values — 0 shards, 0 indexes, an unknown node id — and a body that looks
+    // broken is worse to act on than one that says it is incomplete.
+    let actor_deadline = Instant::now() + health_actor_budget(state.request_timeout);
+    let mut degraded: Vec<&'static str> = Vec::new();
+
     // Query cluster status from coordinator — only for the expanded body an identified caller
     // receives, so an anonymous health flood never reaches the actor.
-    let cluster_status = match state.coordinator.ask(GetStatus).await {
-        Ok(status) => Some(status),
-        Err(err) => {
+    let cluster_status = match timeout_at(actor_deadline, state.coordinator.ask(GetStatus)).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(err)) => {
             error!(error = ?err, "Failed to get cluster status from coordinator");
+            degraded.push("cluster_status");
+            None
+        }
+        Err(_) => {
+            error!("health actor budget exhausted: GetStatus");
+            degraded.push("cluster_status");
             None
         }
     };
@@ -140,16 +186,16 @@ pub(super) async fn health_handler(
     // Get basic shard count and node info from orchestrator. These can queue behind real work,
     // so the expanded body uses bounded waits; on timeout we fall back to defaults rather than
     // let a slow node fail its own health probe.
-    let shard_count =
-        match tokio::time::timeout(HEALTH_ACTOR_TIMEOUT, state.router.shard_count()).await {
-            Ok(count) => count,
-            Err(_) => {
-                error!("health actor timeout: shard_count");
-                0
-            }
-        };
-    let (node_id, node_name) = match tokio::time::timeout(
-        HEALTH_ACTOR_TIMEOUT,
+    let shard_count = match timeout_at(actor_deadline, state.router.shard_count()).await {
+        Ok(count) => count,
+        Err(_) => {
+            error!("health actor budget exhausted: shard_count");
+            degraded.push("active_shards");
+            0
+        }
+    };
+    let (node_id, node_name) = match timeout_at(
+        actor_deadline,
         state.router.handle_client_op(ClientOp::GetIdentity),
     )
     .await
@@ -168,14 +214,15 @@ pub(super) async fn health_handler(
             (node_id, node_name)
         }
         Ok(Err(_)) | Err(_) => {
-            error!("health actor timeout or error: GetIdentity");
+            error!("health actor budget exhausted or error: GetIdentity");
+            degraded.push("node_id");
             ("local".to_string(), "unknown".to_string())
         }
     };
 
     // Get index statistics for health check
-    let (total_indexes, indexes_with_data) = match tokio::time::timeout(
-        HEALTH_ACTOR_TIMEOUT,
+    let (total_indexes, indexes_with_data) = match timeout_at(
+        actor_deadline,
         state.router.handle_client_op(ClientOp::ListIndexes {
             include_data_size: false,
         }),
@@ -204,7 +251,8 @@ pub(super) async fn health_handler(
             (total, with_data)
         }
         Ok(Err(_)) | Err(_) => {
-            error!("health actor timeout or error: ListIndexes");
+            error!("health actor budget exhausted or error: ListIndexes");
+            degraded.push("total_indexes");
             (0, 0) // Fallback to 0 if index listing fails
         }
     };
@@ -229,6 +277,8 @@ pub(super) async fn health_handler(
         dial_failures: cluster_status.as_ref().map(|s| s.dial_failures),
         bootstrap_successes: cluster_status.as_ref().map(|s| s.bootstrap_successes),
         routing_updates: cluster_status.as_ref().map(|s| s.routing_updates),
+        degraded: (!degraded.is_empty())
+            .then(|| degraded.iter().map(|name| name.to_string()).collect()),
     };
 
     Ok(Json(response).into_response())
@@ -255,7 +305,47 @@ fn worst_status(
 
 #[cfg(test)]
 mod tests {
-    use super::worst_status;
+    use super::{
+        HEALTH_ACTOR_BUDGET_MAX, HEALTH_ACTOR_BUDGET_MIN, health_actor_budget, worst_status,
+    };
+    use std::time::Duration;
+
+    /// The property the fixed 5s constant did not have: the wait has to be shorter than the
+    /// budget it is taken out of, or `TimeoutLayer` abandons the request as a 408 before the
+    /// fallback can run. Pinned across the range of timeouts a node can resolve.
+    #[test]
+    fn the_actor_budget_always_leaves_room_inside_the_request_timeout() {
+        for secs in [1u64, 2, 5, 30, 60, 300] {
+            let timeout = Duration::from_secs(secs);
+            let budget = health_actor_budget(timeout);
+            assert!(
+                budget < timeout,
+                "actor budget {budget:?} must fit inside request timeout {timeout:?}",
+            );
+        }
+    }
+
+    /// The one-second node is the case F8 measured, and the case the old constant failed
+    /// hardest: 5s of permitted waiting inside a 1s budget.
+    #[test]
+    fn a_one_second_node_gets_half_a_second_rather_than_five() {
+        assert_eq!(
+            health_actor_budget(Duration::from_secs(1)),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn the_actor_budget_is_clamped_at_both_ends() {
+        assert_eq!(
+            health_actor_budget(Duration::from_secs(300)),
+            HEALTH_ACTOR_BUDGET_MAX
+        );
+        assert_eq!(
+            health_actor_budget(Duration::from_millis(1)),
+            HEALTH_ACTOR_BUDGET_MIN
+        );
+    }
 
     #[test]
     fn an_unavailable_writer_forces_red_over_any_cluster_status() {

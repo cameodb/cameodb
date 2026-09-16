@@ -6,6 +6,7 @@
 
 use kameo::actor::ActorRef;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::cluster_coordinator::ClusterCoordinator;
 use crate::node_orchestrator::{QueueLoad, ReadPoolHealth, RouterActor, WriterLiveness};
@@ -57,4 +58,11 @@ pub struct AppState {
     /// `None` when there is no worker pool to predict — nothing to estimate, and the guard
     /// stays out of the way.
     pub queue_load: Option<Arc<QueueLoad>>,
+    /// The request timeout this node resolved, as `TimeoutLayer` enforces it.
+    ///
+    /// Carried here so a handler can size its own internal waits against the budget it is
+    /// actually running under. A guard longer than that budget never fires: the request is
+    /// abandoned as a 408 first, which is the failure the guard existed to prevent. The
+    /// health endpoint derives its actor budget from this — see `health_actor_budget`.
+    pub request_timeout: Duration,
 }
