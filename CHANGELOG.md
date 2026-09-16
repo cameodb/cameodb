@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bulk writes are now refused under overload instead of timing out.** The admission gate and the
+  dequeue deadline check both watch the worker pool, and a `BulkWrite` never enters it — it is
+  served from the orchestrator's actor mailbox, which nothing gated. Measured at roughly twice
+  capacity: every request answered `408` after waiting its full budget, no documents written, and
+  not one refusal recorded by any gate. The mailbox now has its own backlog gate, sized for a lane
+  that runs one operation at a time, and refuses with `503` and `Retry-After` before a request
+  queues. At 120 requests/s the node went from 0 to 55,500 documents written; a node inside its
+  capacity is untouched.
+
+  This is an improvement, not a resolution: goodput is not yet flat under overload the way the
+  search path's is. The gate admits a queue that consumes about 70% of the request budget, and
+  this lane's service times have a p90 near five times their p50, so the back of an admitted queue
+  still times out. Reserving a measured percentile rather than twice the mean is the next step
+  (ROADMAP F8).
+
+  `/_cluster/health` gained `mailbox_depth` and `mailbox_predicted_wait_ms` for the lane, reported
+  separately from the worker pool's `queue_depth` because a node can be idle on one and shedding
+  on the other.
+
+### Changed
+
+- **`/_cluster/health` reports `yellow` when it could not read its own state.** Green is a claim
+  that the node is operating normally, and a node that failed to answer its own metadata inside
+  its budget cannot make it. Yellow rather than red: it is congested, not stopped, and red stays
+  reserved for a data path that has stopped. A status already worse than green is left alone.
+
 - **`/_cluster/health` no longer fails its own probe on a node under write load.** The expanded
   body makes four actor round-trips, and each was guarded by a fixed five-second timeout so that
   "a slow node [does not] fail its own health probe". It could not work: the calls are

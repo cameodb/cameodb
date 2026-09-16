@@ -504,6 +504,9 @@ async fn main() -> Result<()> {
     let queue_load = orchestrator.queue_load();
 
     // NOW spawn the NodeOrchestrator as an actor (after all setup is done)
+    // Taken before the actor is consumed by `spawn`: the router gates the mailbox lane against
+    // the estimate the orchestrator writes, so both ends must hold the same handle.
+    let mailbox_lane = orchestrator.mailbox_lane();
     let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
     let remote_name = orchestrator_remote_name(&node_id);
 
@@ -620,6 +623,7 @@ async fn main() -> Result<()> {
         },
         shard_placement,
         cameodb_config.network.cluster.enabled,
+        mailbox_lane,
     );
 
     // Started before the router, so the writer thread is already draining when the first
