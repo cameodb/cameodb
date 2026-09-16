@@ -199,20 +199,10 @@ pub(super) async fn bulk_write_handler(
         docs.len()
     );
 
-    // Derive a routing hint from the first document to avoid cluster-wide broadcast:
-    // prefer explicit routing_key, then id, then a deterministic hash of the document.
-    let routing_hint = docs.first().and_then(|doc| {
-        doc.routing_key.clone().or_else(|| {
-            if !doc.id.is_empty() {
-                Some(doc.id.clone())
-            } else {
-                // Fallback: hash the document bytes to keep routing stable
-                serde_json::to_vec(&doc.doc)
-                    .ok()
-                    .map(|bytes| format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes)))
-            }
-        })
-    });
+    // Derive a routing hint from the first document to avoid a cluster-wide broadcast. The
+    // schema is not resolved yet at this layer, so this climbs the same ladder the orchestrator
+    // does from the rung below its routing field.
+    let routing_hint = derive_routing_hint(&docs);
 
     let client_op = ClientOp::BulkWrite {
         index,
@@ -547,17 +537,18 @@ async fn flush_lines(
 }
 
 /// Derive a routing hint from the first document in a batch.
+///
+/// One rung below [`effective_routing_key`](crate::node_orchestrator::routing_key_without_schema)'s
+/// ladder, because the schema that names a routing field has not been resolved this early. Shares
+/// the orchestrator's derivation rather than restating it: the two had drifted onto different
+/// hashes of different byte ranges, so a hint could disagree with the key it stood in for.
 fn derive_routing_hint(docs: &[DocPayload]) -> Option<String> {
     docs.first().and_then(|doc| {
-        doc.routing_key.clone().or_else(|| {
-            if !doc.id.is_empty() {
-                Some(doc.id.clone())
-            } else {
-                serde_json::to_vec(&doc.doc)
-                    .ok()
-                    .map(|bytes| format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes)))
-            }
-        })
+        crate::node_orchestrator::routing_key_without_schema(
+            doc.routing_key.clone(),
+            &doc.id,
+            &doc.doc,
+        )
     })
 }
 

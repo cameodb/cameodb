@@ -157,7 +157,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [E2](#e2--stage-3s-deeper-warming-options) | Stage 3's deeper warming options | 16 | 2026-08-19 | 📋 |
 | [E3](#e3--measure-recovery-on-the-reporting-node) | Measure recovery on the reporting node | 16 | 2026-08-19 | 📋 |
 | [E4](#e4--two-compatibility-paths-with-no-end-to-end-test) | Two compatibility paths with no end-to-end test | 16 | 2026-08-19 | 📋 |
-| [F1](#f1--the-cost-of-a-durable-commit-under-read-load) | The cost of a durable commit under read load | — | 2026-08-10 | 📋 |
+| [F1](#f1--the-cost-of-a-durable-commit-under-read-load) | The cost of a durable commit under read load — deferred: redb has no middle durability level, and building one trades the guarantee this node keeps | — | 2026-08-10 | 💭 |
 | [F2](#f2--an-open-loop-load-generator) | An open-loop load generator | — | 2026-09-15 | ✅ |
 | [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator — standalone half done | — | 2026-08-10 | ◐ |
 | [F4](#f4--the-bulk-paths-asked-the-coordinator-before-they-knew-they-needed-to) | The bulk paths asked the coordinator before they knew they needed to | — | 2026-09-02 | ✅ |
@@ -166,6 +166,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) | The request timeout sheds the client, not the work — measured: goodput goes to zero, not down | — | 2026-09-15 | ✅ |
 | [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — health fixed, the lane gated, and admission on both lanes predicts against a measured spread | — | 2026-09-16 | ✅ |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
+| [CH11](#ch11--routing-key-derivation-is-written-four-times-with-two-algorithms) | Routing-key derivation, four spellings and two hashes — closed ahead of the split | — | 2026-09-01 | ✅ |
 | [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8 and CH9 done, CH12 partial | — | 2026-09-01 | ◐ |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
 | [J1](#j1--a-facet-field-cannot-be-written-to) | A facet field cannot be written to | 18 | 2026-08-27 | ✅ |
@@ -930,7 +931,35 @@ regression dressed as a tuning knob.
 
 ### F1 — The cost of a durable commit under read load
 
-📋 **Planned.** What the rejected linger was meant to paper over, still open: a commit costs
+💭 **Deferred 2026-09-16, deliberately: this node stays durable.** The measurements below stand
+and the lever is real; what changed is that the lever this entry names does not exist any more,
+and the thing that would replace it trades away the guarantee the project has chosen to keep.
+
+*The middle durability level cannot be selected, only built.* This entry asks for "a durability
+level between every commit and none". `wal_sync` maps onto redb's `Durability`
+(`storage/src/lib.rs` ~5288), and **redb 4.1 has exactly two variants, `None` and `Immediate`** —
+the `Eventual` level that existed in redb 2.x is gone. So there is nothing to select.
+
+*What building it would look like, recorded so it is not re-derived.* redb's own documentation
+gives the mechanism: a commit at `None` "will not be persisted to disk unless followed by a
+commit with `Durability::Immediate`". So commit `None` normally and have a ticker issue an
+`Immediate` commit every N ms — group commit at the fsync layer, with a bounded loss window and
+one fsync amortised over everything inside it.
+
+*And why that is not simply `wal_sync = false` with a shorter fuse.* The hazard this project
+records against turning the sync off is not lost writes, it is divergence: a crash "can leave the
+search index holding documents the document store lost, which recovery cannot repair". A timed
+flush narrows that window without closing it, because a tantivy commit fires on its own threshold
+or its 5s idle timer and can publish a segment whose documents redb has not yet fsynced. Making
+the middle level *safe* therefore means forcing an `Immediate` redb flush before every tantivy
+commit, so the store is never behind the index. That ordering is the whole design; without it the
+feature is a nicer-sounding way to reach the same corruption.
+
+**Not being built.** A bounded loss window is a different product promise, and the one this node
+makes — a commit that returns is on disk — is worth more than the fsync it costs. Revisit only
+with a deployment that has asked for the trade by name.
+
+What the rejected linger was meant to paper over, still the reason this entry exists: a commit costs
 ~12.5ms with searches running against ~4.6ms without, and `wal_sync = false` recovers +86% of
 write throughput. The lever is **the fsync itself** — WAL device and placement, or a durability
 level between "every commit" and "none" — not how the writer groups writes.
@@ -1856,12 +1885,32 @@ comes from.
 
 ### CH11 — Routing-key derivation is written four times, with two algorithms
 
-📋 The precedence "document's routing field → caller's routing key → id → hash of the
-document" is spelled out in `write.rs:159-170` and `write.rs:443-455` (identical duplicates),
-`node_orchestrator.rs:1175-1185` (`effective_routing_key`), and the inline bulk-routing closure
-(8207-8210) — and the two "hash the document" fallbacks use *different* hashes
-(`xxh3_64` of full bytes in one, hex-of-prefix in the other). One function, one hash, called
-everywhere; this is exactly the rule the code's own comments insist must agree with itself.
+✅ **Done** 2026-09-16. The precedence "document's routing field → caller's routing key → id →
+hash of the document" was spelled out in four places, and the two "hash the document" rungs used
+*different* hashes: `xxh3_64` of the whole document in `write.rs`, hex of a 64-byte JSON prefix in
+`derive_routing_key_from_doc`. One ladder now, in two functions that differ only in what the
+caller is holding — `routing_key_for` where the routing field is in hand, and
+`routing_key_without_schema` for the rungs below it.
+
+**It unified onto the orchestrator's derivation, not the prettier one, and that choice is the
+whole point.** The HTTP layer's hash fed a *hint*, which picks a node before any schema is
+resolved; `effective_routing_key` decides which shard a document lands on. A hint may change
+freely — a wrong one costs the forwarding hop [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard)
+bounded — whereas changing the shard rung would move unkeyed documents to different shards across
+an upgrade, and leave a second copy behind on the old one. A test pins that the surviving rung is
+the orchestrator's.
+
+*The severity as filed was right and the obvious reading of it is not.* Reviewed as a live
+routing inconsistency; it is not. Per-document placement was already single-sourced, and
+`the_routing_key_comes_from_the_document_before_the_caller` records that the hint-decides-shard
+hazard was a real bug and was fixed earlier. What was left was four spellings that had drifted
+apart and would have been scattered across modules by [L11](#l11--node_orchestratorrs-is-13669-lines-and-holds-four-actors)'s
+split, where a disagreement stops being visible in one grep. Closed before the split for that
+reason.
+
+Left alone deliberately: the delete path's `routing_key.or(id)` (`write.rs` ~135). A delete has
+no document, so the lower rungs do not exist for it, and the comment there already explains that
+the schema-aware refusal downstream is what catches a wrong hint.
 
 ### CH12 — Write-path serialization and round-trip waste
 

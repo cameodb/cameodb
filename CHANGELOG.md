@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One routing ladder instead of four.** "Document's routing field, then the caller's routing
+  key, then the id, then a hash of the document" was written out in four places, and the two
+  "hash the document" rungs disagreed — one hashed the whole document with xxh3, the other
+  hex-encoded a 64-byte JSON prefix. So a bulk request's routing hint could point at a different
+  node than the key it stood in for, costing a forwarding hop. They share one implementation now.
+  It is the orchestrator's derivation that survived, deliberately: the hint only picks a node and
+  may change, while that rung decides which shard an unkeyed document lands on, and changing it
+  would place documents differently across an upgrade.
+
 - **A single write and a bulk write to the same index no longer cost two transactions.** The
   writer thread grouped the two kinds separately and drained them in separate phases, so an index
   that received both in one pass paid two redb transactions — and with `wal_sync` on, two fsyncs
