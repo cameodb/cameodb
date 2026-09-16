@@ -206,15 +206,11 @@ pub(super) async fn health_handler(
     // Get basic shard count and node info from orchestrator. These can queue behind real work,
     // so the expanded body uses bounded waits; on timeout we fall back to defaults rather than
     // let a slow node fail its own health probe.
-    let shard_count = match timeout_at(actor_deadline, state.router.shard_count()).await {
-        Ok(count) => count,
-        Err(_) => {
-            error!("health actor budget exhausted: shard_count");
-            degraded.push("active_shards");
-            0
-        }
-    };
-    let (node_id, node_name) = match timeout_at(
+    // One call for all three, because `GetIdentity` already reports the shard count and the
+    // separate `shard_count()` ask returned the same `shards.len()` from the same actor. It
+    // cost health a whole round-trip out of a shared deadline, and being ahead of this in the
+    // queue it could spend the budget that this needed.
+    let (node_id, node_name, shard_count) = match timeout_at(
         actor_deadline,
         state.router.handle_client_op(ClientOp::GetIdentity),
     )
@@ -231,12 +227,17 @@ pub(super) async fn health_handler(
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string();
-            (node_id, node_name)
+            let shards = result
+                .get("total_shards")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            (node_id, node_name, shards)
         }
         Ok(Err(_)) | Err(_) => {
             error!("health actor budget exhausted or error: GetIdentity");
             degraded.push("node_id");
-            ("local".to_string(), "unknown".to_string())
+            degraded.push("active_shards");
+            ("local".to_string(), "unknown".to_string(), 0)
         }
     };
 

@@ -1442,6 +1442,19 @@ pub(crate) fn routing_key_for(
         .or_else(|| routing_key_without_schema(routing_key, id, doc))
 }
 
+/// Who this node is, and how many shards it holds.
+///
+/// A free function because both the actor and the worker engine answer it, and the answer is
+/// two fields and a length — the one metadata read with nothing behind it worth serialising
+/// against a write. See [`OrchestratorEngine::execute`].
+fn identity_json(identity: &NodeIdentity, total_shards: usize) -> JsonValue {
+    serde_json::json!({
+        "node_id": identity.uuid.to_string(),
+        "node_name": identity.name.clone(),
+        "total_shards": total_shards,
+    })
+}
+
 /// The rungs of the routing precedence that need no schema: the caller's key, then the id, then
 /// a hash of the document.
 ///
@@ -2226,10 +2239,6 @@ pub struct SearchRequest {
     pub limit: Option<usize>,
     pub sort: Option<SortSpec>,
 }
-
-/// Message to get the current shard count.
-#[derive(Debug, Clone)]
-pub struct GetShardCount;
 
 /// Message to propose creating a new shard on this node.
 #[derive(Debug, Clone)]
@@ -4095,8 +4104,7 @@ pub struct OrchestratorEngine {
     /// Coordinator actor reference for shard assignments and peer lookups.
     #[allow(dead_code)] // Used when bulk write is moved to engine
     pub coordinator: Option<ActorRef<ClusterCoordinator>>,
-    /// Node identity for response metadata.
-    #[allow(dead_code)] // Used when bulk write is moved to engine
+    /// Node identity for response metadata, and the answer to `GetIdentity`.
     pub identity: NodeIdentity,
     /// Default search result limit.
     pub default_search_limit: usize,
@@ -4294,6 +4302,13 @@ impl OrchestratorEngine {
             // Bulk writes need `staged_schema_validation`, parallel routing and remote
             // forwarding; config and metadata ops are lightweight and rare. Both belong on
             // the actor, which owns the state they touch.
+            // Served here rather than on the actor so that "who is this node" cannot queue
+            // behind a bulk write holding the mailbox for its whole duration (ROADMAP CH12).
+            // It reads an identity that never changes and a shard count from an ArcSwap, so
+            // there is nothing for the actor's `&mut` to protect.
+            ClientOp::GetIdentity => {
+                WorkerOutcome::Done(Ok(identity_json(&self.identity, self.shards.load().len())))
+            }
             other => WorkerOutcome::UseActor(Box::new(other)),
         }
     }
@@ -6829,6 +6844,9 @@ impl RouterActor {
                     | ClientOp::Delete { .. }
                     | ClientOp::Search { .. }
                     | ClientOp::Stream { .. }
+                    // A metadata read with no actor state behind it. On the mailbox it queued
+                    // behind whatever write was there; the pool answers it from an ArcSwap.
+                    | ClientOp::GetIdentity
             );
             if is_worker_eligible {
                 // Refuse before queueing, not after waiting. The dequeue check below this is
@@ -7297,16 +7315,6 @@ impl RouterActor {
             footer_bytes.push(b'\n');
             let _ = tx.send(Ok(bytes::Bytes::from(footer_bytes))).await;
         }
-    }
-
-    /// Get the number of active shards (for health check).
-    pub async fn shard_count(&self) -> usize {
-        // Forward to orchestrator actor
-        (self
-            .orchestrator
-            .ask(crate::node_orchestrator::GetShardCount)
-            .await)
-            .unwrap_or_default()
     }
 
     async fn handle_broadcast(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
@@ -12360,11 +12368,7 @@ impl NodeOrchestrator {
 
     /// Get node identity information
     async fn orch_get_identity(&self) -> Result<JsonValue, OrchestratorError> {
-        Ok(serde_json::json!({
-            "node_id": self.identity.uuid.to_string(),
-            "node_name": self.identity.name.clone(),
-            "total_shards": self.shards.len()
-        }))
+        Ok(identity_json(&self.identity, self.shards.len()))
     }
 
     /// The schema this node holds for `index`, or `None` if it holds none.
@@ -12460,19 +12464,6 @@ pub(crate) fn derive_routing_key_from_doc(doc: &JsonValue) -> Option<String> {
     Some(key)
 }
 
-/// Message handler for GetShardCount
-impl Message<GetShardCount> for NodeOrchestrator {
-    type Reply = usize;
-
-    async fn handle(
-        &mut self,
-        _msg: GetShardCount,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.shards.len()
-    }
-}
-
 #[remote_message("cameo.orchestrator.client_op")]
 impl Message<ClientOp> for NodeOrchestrator {
     type Reply = Result<JsonValue, OrchestratorError>;
@@ -12507,8 +12498,10 @@ impl Message<UpdateTopology> for NodeOrchestrator {
         msg: UpdateTopology,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // `len()` is the number of vnode tokens, not of nodes — each node contributes many.
+        // It was reported as `ring_nodes`, which reads as a cluster size and is not one.
         info!(
-            ring_nodes = msg.ring.len(),
+            ring_tokens = msg.ring.len(),
             "NodeOrchestrator: received global topology update"
         );
         self.routing_ring = msg.ring;
