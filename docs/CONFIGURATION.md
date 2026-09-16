@@ -163,7 +163,33 @@ Startup and `check-config` weigh the product and warn:
                 request data, over this node's limits.total_memory_limit_mb (2048 MB)
 ```
 
-`[limits]` is what this node can hold; [`[security.limits]`](#rate-limiting-mcp-tool-calls-securitylimits)
+**`max_concurrent_requests` also has to fit inside the request timeout, and that is a separate
+check.** The memory arithmetic above bounds how much body the node holds; this one bounds how
+much *work* it admits. A permit is a request, not the time the request implies, so admitting
+3,000 of them on a node that serves 500 searches a second is six seconds of backlog against
+whatever budget the timeout allows. Past that point it is the timeout, not admission, that
+decides what gets shed — and a request shed by the timeout has already consumed a full budget's
+worth of the node's capacity on a client that has gone. `check-config` reports the rate the
+configuration requires:
+
+```
+[PASS] overload    128 concurrent / 30s timeout = safe above 5 requests/s
+[WARN] overload    max_concurrent_requests (3000) against a 1s request timeout admits more
+                   work than the budget covers unless this node serves over 3000 requests/s…
+```
+
+The division is arithmetic with no assumption in it: the tool cannot know a node's service
+rate, so it hands you the threshold and names both knobs that move it. Measure the node's own
+rate from `jobs_completed` on [`/_admin/workers`](API_REFERENCE.md#worker-pool) and compare.
+
+A default node sits three orders of magnitude clear of this, which is why the rule is normally
+quiet. The way in is to raise `max_concurrent_requests` because the node is answering `503` —
+which is the opposite of the fix. A `503` is the node refusing work it cannot finish in time,
+at a cost of one comparison; widening admission does not create capacity, it converts cheap
+refusals into expensive timeouts. If a node is shedding, either give it more capacity or
+lengthen the budget its callers allow.
+
+`[limits]` is what this node can hold; [`[security.limits]`](#rate-limiting-mcp-tool-calls-and-http-search-securitylimits)
 is what one caller may ask of it. Unknown keys inside `[limits]` are refused at startup rather
 than ignored, so a typo cannot leave a limit silently at its default.
 
@@ -233,7 +259,7 @@ legacy_sse_enabled = true          # the superseded /mcp/sse + /mcp/messages tra
 ```
 
 The transport itself, as opposed to what a caller may spend on it — that is
-[`[security.limits]`](#rate-limiting-mcp-tool-calls-securitylimits), which meters a *key*.
+[`[security.limits]`](#rate-limiting-mcp-tool-calls-and-http-search-securitylimits), which meters a *key*.
 Nothing here changes what a client is told; the protocol is the same either way.
 
 #### `session_idle_timeout_secs` — how long a paused client keeps its session
@@ -586,7 +612,7 @@ you only discover on the day you turn authentication on. These all refuse to sta
 - two entries with the same hash — one key cannot hold two roles
 - `allowed_indexes = []`, which reads as "no restriction" but means "no index at all"
 
-### Rate limiting MCP tool calls (`[security.limits]`)
+### Rate limiting MCP tool calls and HTTP search (`[security.limits]`)
 
 ```toml
 [security.limits]
@@ -604,6 +630,13 @@ about **how often**, and the caller this matters for is not an attacker: it is a
 `reader` key held by an agent that decides to call `search_across_indexes` in a loop. Every one of
 those calls is authorized, and a search fans out across every shard, so the loop costs the
 node far more than it costs the agent.
+
+**The same bucket meters HTTP search.** `POST /api/{index}/search` and
+`/api/{index}/search/stream` each spend one token from the caller's own bucket, refusing with
+`429` and a retry delay, because the same work is reachable over either surface and a limit only
+one of them honours is not a limit. `max_search_limit` is enforced on both for the same reason —
+a deep `offset` asks for the same work as a large `limit` while looking like a request for ten
+documents.
 
 A token bucket rather than a fixed window. Agent traffic is bursty by nature — a plan, then
 a flurry of lookups, then a pause — and a fixed window either refuses the flurry or is set

@@ -73,6 +73,33 @@ a load balancer needs neither.
 indexes the key may see, with `total_indexes` adjusted to match — a count over a shorter list
 would itself disclose how many were withheld.
 
+### 🚦 Refusals under load
+
+A node that cannot answer a request in the time the request has left refuses it rather than
+queueing it. Every such refusal is a `503` carrying `Retry-After`, on any route:
+
+```
+HTTP/1.1 503 Service Unavailable
+retry-after: 1
+
+overloaded: a 803ms backlog against a 1000ms request
+```
+
+The refusal is made at the door, before the body is read, from the node's own estimate of the
+backlog against the time left on `request_timeout_secs`. `Retry-After` is that predicted wait
+rounded up to whole seconds where the refusal knows it, and one second otherwise — retrying
+sooner puts the request back into the backlog it was shed from.
+
+| Status | What it means | What a client should do |
+|--------|---------------|-------------------------|
+| `503` + `Retry-After` | The node refused the work up front; nothing was executed | Retry after the header says, ideally with jitter |
+| `408` | The request timeout fired on work already in progress | Treat as unknown: a write may or may not have landed |
+| `429` | A rate limit, not a capacity limit — the per-key token bucket in [`[security.limits]`](CONFIGURATION.md#rate-limiting-mcp-tool-calls-and-http-search-securitylimits), which meters MCP tool calls and both search routes, and is off by default | Slow down; the node is not overloaded |
+
+`408` under load is the outcome worth alerting on: a `503` costs the node almost nothing, while
+a `408` means a client waited its whole budget. `/_cluster/health` and `/_admin/*` are exempt
+from the backlog gate, so a node stays diagnosable while it is shedding.
+
 ### 🔍 Search Operations
 
 #### Standard Search
@@ -364,7 +391,8 @@ EOF
   "items_written": 2,
   "lines_received": 2,
   "batches": 1,
-  "errors": []
+  "errors": [],
+  "suppressed_errors": 0
 }
 ```
 
@@ -379,14 +407,20 @@ leave the documents already committed unreported, with no count and nowhere to r
   "items_written": 1,
   "lines_received": 2,
   "batches": 1,
-  "errors": ["line 2: key must be a string at line 1 column 2"]
+  "errors": ["line 2: key must be a string at line 1 column 2"],
+  "suppressed_errors": 0
 }
 ```
 
-`status` is `partial` whenever `errors` is non-empty and `ok` otherwise. `items_written` plus
-`errors` accounts for every line the body held. Line numbers count physical lines including
-blanks, so `line 2` is what `sed -n 2p` prints — an oversized record reads
+`status` is `partial` whenever any line failed and `ok` otherwise. Line numbers count physical
+lines including blanks, so `line 2` is what `sed -n 2p` prints — an oversized record reads
 `line 2: exceeds the 1 MB single-record limit`.
+
+**`errors` is capped at the first 100 reasons; `suppressed_errors` counts the rest.** A body of
+two-byte garbage lines turns each line into an error string, all held at once and serialized
+whole, so an unbounded list lets a small hostile upload amplify into a large response. The
+accounting still covers every line — `items_written + errors.length + suppressed_errors` equals
+`lines_received` — so a caller reconciling a load reads the totals, not the length of `errors`.
 
 The request fails outright with `400` in two cases only: a body holding no documents at all, and
 one where nothing parsed and nothing was written — the shape that means the upload was not NDJSON
@@ -753,14 +787,123 @@ GET /_cluster/health
 curl -s http://localhost:9480/_cluster/health
 ```
 
-**Response:**
+**Response (anonymous):** liveness only, computed from local atomics — no coordinator
+round-trip, so a probe flood cannot become mailbox pressure.
+
+```json
+{"status": "green"}
+```
+
+**Response (with any valid key):**
 ```json
 {
   "status": "green",
   "node_id": "550e8400-e29b-41d4-a716-446655440000",
-  "active_shards": 4
+  "node_name": "17R4",
+  "cluster_name": "cameodb-cluster",
+  "cluster_enabled": false,
+  "total_nodes": 1,
+  "connected_nodes": 1,
+  "cluster_total_shards": 4,
+  "active_shards": 4,
+  "total_indexes": 1,
+  "indexes_with_data": 1,
+  "read_pool_in_flight": 0,
+  "read_pool_capacity": 2,
+  "read_pool_abandoned": 0,
+  "queue_depth": 0,
+  "predicted_wait_ms": 0,
+  "dial_failures": 0,
+  "bootstrap_successes": 0,
+  "routing_updates": 0
 }
 ```
+
+`status` is `green`, `yellow` or `red`, and it is the real status in both bodies — a health
+check that cannot go yellow is not one. A writer that exited abnormally or stalled mid-batch,
+or a read pool saturated with no progress, turns the node `red`.
+
+The load fields are what an operator reads when a node starts answering `503`:
+
+| Field | Meaning |
+|-------|---------|
+| `read_pool_in_flight` / `read_pool_capacity` | Reads executing now against the pool's width. At capacity is a busy node; at capacity with no progress is a wedged one, and that is what turns it red |
+| `read_pool_abandoned` | Reads refused at dequeue since start, because they had waited longer than the request that asked for them. Refused work runs nowhere, so it appears in no latency sample — a climbing count beside a comfortable in-flight number is a node shedding, not one at rest |
+| `queue_depth` | Jobs queued or running across the worker pool: everything a new arrival waits behind |
+| `predicted_wait_ms` | What the node predicts a request arriving now would wait before starting. Refusals are made on this number against the request's remaining budget |
+
+`queue_depth` and `predicted_wait_ms` are omitted on a node with no worker pool. Under load
+the same body reads, for example, `"read_pool_abandoned": 28, "queue_depth": 449,
+"predicted_wait_ms": 805` — which is the arithmetic behind a `503` saying `a 803ms backlog
+against a 1000ms request`.
+
+#### Worker Pool
+Per-worker queue and dispatch state, and where refusals are being made.
+
+```bash
+GET /_admin/workers
+```
+
+**Example:**
+```bash
+curl -s http://localhost:9480/_admin/workers
+```
+
+**Response:**
+```json
+{
+  "pinning_requested": false,
+  "pinned_workers": 0,
+  "core_aligned": false,
+  "worker_count": 8,
+  "workers": [
+    {
+      "id": 0,
+      "queue_depth": 0,
+      "queue_capacity": 512,
+      "in_flight": 0,
+      "in_flight_capacity": 8,
+      "jobs_completed": 0
+    }
+  ],
+  "shards": [
+    {
+      "shard_id": "0947e593-fd62-445e-af4d-e61c5faee93d",
+      "ordinal": 0,
+      "serving": true,
+      "target_core_id": 0
+    }
+  ],
+  "dispatch": {
+    "affine_sends": 0,
+    "affine_full_fallbacks": 0,
+    "round_robin_sends": 0,
+    "actor_mailbox_fallbacks": 0,
+    "abandoned": 0,
+    "refused_at_admission": 0
+  }
+}
+```
+
+`workers[]` is the balance check: an even `jobs_completed` row with a bad p99 is a different
+problem from a lopsided one, and `in_flight` at `in_flight_capacity` means the worker is the
+bottleneck. `jobs_completed` over the run is also how to measure this node's real service rate,
+which is the number `check-config`'s `overload` rule asks you to compare against.
+
+`dispatch` says where work went, and where it was refused:
+
+| Counter | Meaning |
+|---------|---------|
+| `affine_sends` / `round_robin_sends` | Jobs routed by shard affinity against ordinary round-robin |
+| `affine_full_fallbacks` | Affine target was full, so the job went elsewhere |
+| `actor_mailbox_fallbacks` | Worker queues were full and the job took the overflow path |
+| `refused_at_admission` | Refused at the door, before a body was read, on the predicted wait |
+| `abandoned` | Refused at a worker on dequeue, because the budget could no longer cover the work |
+
+Under overload the first of those two should dominate: refusing at the door costs a comparison,
+while refusing at a worker means the request already paid for its body, its parse, a permit and
+a channel hop. A run shedding mostly at `abandoned` means requests are getting past the door —
+worth reporting rather than tuning around.
 
 #### Memory Statistics
 Get process memory and jemalloc allocator statistics.

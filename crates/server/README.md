@@ -13,7 +13,7 @@ This document focuses on the *node-side* architecture and the distributed workfl
   - Admin routes, mounted only when `admin_enabled` is on and required off by the `external` profile: `/_admin/memory` (GET), `/_admin/memory/purge` (POST), `/_admin/workers` (GET), `/_admin/audit` (GET), `/_admin/index/{index}/commit` (POST), `/_admin/index/{index}/evict-writer` (POST).
   - MCP routes, mounted unless `[mcp] enabled = false`: `/mcp` (POST — JSON-RPC; GET — Streamable HTTP listening stream; DELETE — session termination), and unless `legacy_sse_enabled = false`: `/mcp/sse` (GET — legacy SSE transport, POST — compatibility), `/mcp/messages?session_id=...` (POST — legacy message endpoint).
   - Translates requests into strongly-typed operations (`ClientOp`) and hands them to `RouterActor`.
-  - Middleware, outermost first: trace, catch-panic (a panicking handler becomes a masked `500` rather than a dropped connection), CORS, authentication, request timeout, concurrency guard (sheds `503`, exempting `/_cluster/health`), body limit, decompression, compression. CORS is deny-all by default and permissive only when `cors_allowed_origins` contains `"*"`, which the `internal` and `external` profiles reject. ConnectInfo is enabled at serve for client-address extraction.
+  - Middleware, outermost first: trace, catch-panic (a panicking handler becomes a masked `500` rather than a dropped connection), CORS, authentication, request timeout, arrival stamp (`REQUEST_STARTED_AT`, taken just inside the timeout so the deadline checks downstream measure the same budget the client is waiting on), admission guard, body limit, decompression, compression. The admission guard is two refusals in one layer: a concurrency semaphore, and a backlog gate that refuses when the pool's predicted wait plus the work's estimated cost exceeds the budget the request has left — both `503`, both carrying `Retry-After`. `/_cluster/health` is exempt from the semaphore and `/_admin/*` from the backlog gate, so neither the probe that evicts a node nor the endpoint that explains why it is refusing is starved by the load it is reporting on. CORS is deny-all by default and permissive only when `cors_allowed_origins` contains `"*"`, which the `internal` and `external` profiles reject. ConnectInfo is enabled at serve for client-address extraction.
 - **Local orchestration**
   - Manages microshards (`MicroshardActor`) and their storage configuration.
   - Ensures all redb/tantivy I/O is executed via `tokio::task::spawn_blocking`.
@@ -78,6 +78,16 @@ The `RouterActor` is the primary ingress for database operations on a node.
   - `Message<ClientOp>` delegates to `handle_client_op` or worker pool
   - Hot-path operations (Write, Search) bypass actor mailbox via worker pool
   - Uses `spawn_blocking` for all redb/tantivy calls
+  - A worker re-checks the deadline when it dequeues a job: time spent since the request
+    arrived, plus twice the measured service time for that class of operation, must fit the
+    budget left, or the job is refused instead of run and counted as `dispatch.abandoned`. The
+    reserve is capped at half the budget, so a freshly arrived job is always admitted — an
+    uncapped reserve refuses everything, stops the samples that would correct the estimate, and
+    never recovers
+  - When every worker queue is full, a node with a request timeout refuses rather than diverting
+    to the actor mailbox: that path waits for a slot rather than failing and checks no deadline,
+    so it reinstated the overload it was meant to relieve. A node with no timeout configured has
+    no deadline to fail and still takes the fallback, counted as `dispatch.actor_mailbox_fallbacks`
 - **Remote capability:**
   - `#[derive(Actor, RemoteActor)]`
   - `#[remote_message("cameo.orchestrator.client_op")] impl Message<ClientOp>` enables remote `ask`
