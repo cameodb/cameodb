@@ -1882,15 +1882,54 @@ the mechanism proposed here:
   borrowed it, so taking ownership obliged every caller to hand over a copy it could not get back.
   It borrows now. The two fan-outs still clone once per peer, which is real: those futures run
   concurrently and each needs its own.
-- 📋 Bulk writes never use the worker pool, so a large `BulkWrite` serializes on the orchestrator
+- ◐ Bulk writes never use the worker pool, so a large `BulkWrite` serializes on the orchestrator
   actor mailbox for its full duration, blocking other actor-served operations. **Filed here as
   efficiency and it was not** — [OB12](#ob12--the-schema-gate-deadlocked-a-fan-out-against-itself)
   is what that blocking cost once something on the write path needed an answer from a peer that
   was itself inside a write. OB12 removes the question rather than the blocking, so this bullet
   stands, and the general fix — metadata reads that do not queue behind a write — belongs with it.
-- 📋 The writer thread keeps single `Write`s and `BatchWrite`s in separate maps and applies them
-  as two redb transactions, contradicting the comment at `node_orchestrator.rs:3420-3421` that
-  says they are merged.
+
+  **Half of it closed by [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path)**, which
+  reached the same blocking from the overload side: the lane is gated so a bulk write is refused
+  rather than queued behind, and health no longer waits on the actor at all. What remains is the
+  structural half this bullet asks for — metadata reads that do not share a mailbox with writes.
+- ✅ **The writer thread's two groups are merged** 2026-09-16, and the comment that said they
+  already were is now true. `write_groups` and `batch_groups` were drained by separate phases,
+  so an index that received both kinds in one drain paid two `apply_batch_and_maybe_commit`
+  calls — two redb transactions, and with `wal_sync` on two fsyncs — for work one transaction
+  covers. Only the indexes that received *both* take the merged path; a drain holding one kind
+  runs exactly the code it did before, which keeps the common case untouched. Singles are
+  ordered ahead of batches, the order the two phases applied them in, so which write wins a
+  duplicated id does not change.
+
+  **It fires, and it does not measure.** Instrumented over a 12s run with single writes and bulk
+  writes against one index: 134 merged transactions against 1,077 ordinary coalesced ones — so
+  roughly one transaction in nine was saved. Three repeats of a 30s mixed arm at writer
+  saturation (1,092 single writes/s and 19 bulk/s, both offered open-loop):
+
+  | repeat | before, mean / p90 | after, mean / p90 |
+  |---|---|---|
+  | 1 | 28.87ms / 41.13ms | 24.99ms / 29.40ms |
+  | 2 | 29.05ms / 40.17ms | 25.66ms / 31.75ms |
+  | 3 | 27.39ms / 37.96ms | **28.85ms / 45.93ms** |
+
+  Two repeats favour the merge by 13–28% and the third reverses it, so the ranges overlap and
+  there is no result here. *The first run alone read as a 28% cut to p90 and that figure is
+  noise* — recorded because a single arm of this workload is exactly convincing enough to be
+  quoted. Throughput cannot show anything either way: both generators are open-loop at a fixed
+  rate, so before and after both deliver 1,092 ok/s by construction.
+
+  So this lands for [CH9](#ch9--bulk-validation-clones-the-batch-and-tantivy-docs-are-built-inside-the-transaction)'s
+  reason rather than a performance one: the second transaction was unconditional and
+  unnecessary, and the code now matches the comment that has described it since before it was
+  true. An `fsync` saved is real work removed even where a 30s arm cannot see it.
+
+  *What the measurement did surface is dead weight.* `apply_batch_and_maybe_commit` returns a
+  `new_docs` count that the writer thread splits across callers with careful integer remainder
+  arithmetic — and **both callers discard it**, at `node_orchestrator.rs` ~6232 and ~6290
+  (`let (sequences, _new_docs)`). The split is preserved here rather than removed, to keep this
+  change to one thing; taking the figure out of the channel type belongs with
+  [L17](#l17--dead-code-and-stale-suppressions).
 
 ---
 
