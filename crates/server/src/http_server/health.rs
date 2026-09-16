@@ -99,6 +99,10 @@ pub struct HealthResponse {
     pub mailbox_depth: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mailbox_predicted_wait_ms: Option<u64>,
+    /// The lane's measured service p90, in milliseconds — how long the node's own work is
+    /// taking, as opposed to how much of it is queued. Absent until a full window has closed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mailbox_service_p90_ms: Option<u64>,
 
     /// Which parts of this body could not be filled in before the actor budget ran out.
     ///
@@ -299,6 +303,7 @@ pub(super) async fn health_handler(
         predicted_wait_ms,
         mailbox_depth,
         mailbox_predicted_wait_ms,
+        mailbox_service_p90_ms: state.router.mailbox_service_p90_ms(),
         dial_failures: cluster_status.as_ref().map(|s| s.dial_failures),
         bootstrap_successes: cluster_status.as_ref().map(|s| s.bootstrap_successes),
         routing_updates: cluster_status.as_ref().map(|s| s.routing_updates),

@@ -164,7 +164,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F5](#f5--concurrency-sweep-measured-2026-09-02) | Concurrency sweep on the release build — the operating point, and bulk's serialization measured | — | 2026-09-02 | ✅ |
 | [F6](#f6--what-fsync-actually-costs-measured-2026-09-02) | What fsync actually costs — and why turning it off is a reallocation, not a speedup | — | 2026-09-02 | ✅ |
 | [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) | The request timeout sheds the client, not the work — measured: goodput goes to zero, not down | — | 2026-09-15 | ✅ |
-| [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — health fixed, the lane gated, goodput flat once admission predicts against a measured tail | — | 2026-09-16 | ◐ |
+| [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — health fixed, the lane gated, and admission on both lanes predicts against a measured spread | — | 2026-09-16 | ✅ |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
 | [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8 and CH9 done, CH12 partial | — | 2026-09-01 | ◐ |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
@@ -1608,13 +1608,13 @@ by anything further here.
    times out. The worker pool never had this problem because its service time is milliseconds
    against a one-second budget.
 
-   ✅ **Closed by predicting against a measured tail**, 2026-09-16 — which is F7's own open
+   ✅ **Closed by predicting against a measured spread**, 2026-09-16 — which is F7's own open
    question (*a percentile of the service distribution rather than twice its mean*) answered
    with a run. A decaying log-bucketed histogram now sits beside the EWMAs: recording is one
    `fetch_add` against the EWMA's `fetch_update` CAS loop, two generations rotate every 2s so it
-   tracks a node whose load changed, and the quantile is computed once per rotation and cached
-   in one atomic — so the admission check stays the single load F7 built it to cost. The wait
-   prediction multiplies out the **p90** rather than the mean.
+   tracks a node whose load changed, and the figures are computed once per rotation and cached
+   in atomics — so the admission check stays the single load F7 built it to cost. The first cut
+   multiplied out the p90 and the final form does not; see the sweep below.
 
    **Measured same-session, each arm from a wiped volume re-seeded to 200,000 documents, so both
    columns start from an identical index:**
@@ -1625,15 +1625,15 @@ by anything further here.
    | 120/s | **6 ok/s**, 58,000 docs, 1,170 × 503, **1,084 × 408** | **57 ok/s**, 573,000 docs, 1,224 × 503, **0 × 408** |
    | 300/s | **1 ok/s**, 8,000 docs, 4,527 × 503, **1,492 × 408** | **59 ok/s**, 585,000 docs, 4,827 × 503, 38 × 408 |
    | search, 3,000/s | 916 ok/s | 904 ok/s — inside the noise floor |
+   | search, 3,000/s p50 | 893ms | **820ms**, once the lane went tail-aware too |
 
    Goodput is flat at ~57–59 ok/s from 120/s through 300/s where it used to collapse to zero in
    three seconds, nearly ten times the documents land, and the timeouts are gone: the refusals
    are 503s a client can act on. The under-capacity arm is untouched and still reports green.
-   **The search lane is deliberately not tail-aware** — its behaviour under overload is the
-   result F7 recorded, and changing what it admits on would invalidate those arms without a run
-   of its own. The 1.3% between its two columns is well inside the ~8% spread this document
-   already records for back-to-back runs; what it shows is that the extra `fetch_add` per sample
-   costs nothing measurable.
+   The 1.3% between the search columns is well inside the ~8% spread this document already
+   records for back-to-back runs; what it shows is that the extra `fetch_add` per sample costs
+   nothing measurable. (The search lane was held back from tail-aware admission at this point,
+   and stopped being so later the same day — below.)
 
    ***A percentile is not automatically the tail, and that is the trap in the idea.*** With 90%
    of samples at 8ms and 10% at 200ms, the p90 sits exactly on the boundary and reports **8ms** —
@@ -1641,11 +1641,37 @@ by anything further here.
    "reserve a percentile" is a choice that has to be made against a measured distribution rather
    than assumed. A test pins it.
 
-   Still open here: the reserve is a per-request quantile multiplied by queue depth, and the
-   variance of a sum grows as √d rather than d, so this over-predicts deep queues — it is
-   conservative in the safe direction, and the 38 remaining timeouts at 300/s say it is not
-   conservative enough at the far end. `d × mean + k × σ√d` is the form the histogram could
-   support. Not attempted: no arm here is bad enough to justify it.
+   ✅ **Both of those were closed the same day**, and the second one contradicted the reasoning
+   that opened it.
+
+   *The reserve is now `d·µ + k·σ√d`.* The wait ahead of an arrival is a **sum** of service
+   times, so its mean scales with the depth and its spread only with the root of it — a
+   per-request quantile multiplied by depth grows the margin linearly and over-predicts a deep
+   queue. The histogram computes mean and standard deviation of the closed generation (in `f64`,
+   once per rotation, because a bucket edge squared overflows `u64`), and `k` is a confidence
+   level rather than a fudge factor. Swept at 300/s, three repeats' worth of arms from a wiped
+   volume each:
+
+   | form | 120/s | 300/s |
+   |---|---|---|
+   | p90 × depth | 57 ok/s, 573,000 docs, **0 × 408** | 59 ok/s, 585,000 docs, 38 × 408 |
+   | `d·µ + 2σ√d` | — | 51 ok/s, 508,000 docs, 85 × 408 |
+   | **`d·µ + 3σ√d`** | 56 ok/s, 564,000 docs, **0 × 408** | 57 ok/s, 572,500 docs, **6 × 408** |
+
+   Throughput is flat across all three — every pair is inside the spread this document records
+   for back-to-back runs — so the choice is made on the tail, where `k = 3` leaves **6 timeouts
+   against 38**. `k = 2` is worse than both on both counts, which is the reading worth keeping:
+   the theoretically tidy value is not the measured one, and under saturation service times are
+   correlated rather than independent, so the √d model wants a wider `k` than its own statistics
+   suggest.
+
+   *The search lane is tail-aware too, and the reason to do it was not the one expected.* It was
+   held back because F7's arms were measured against a mean and changing the basis without a run
+   would invalidate them. The run says goodput is untouched and **latency is not**: at 3,000/s
+   offered, 899 ok/s at p50 893ms / p99 904ms becomes 894 ok/s at p50 **820ms** / p99 **828ms** —
+   0.6% on throughput, which is noise, against ~8% on the number an SLA is written against.
+   Predicting conservatively holds a shallower queue, and a shallower queue is a faster one at
+   the same goodput. The under-capacity arm is unchanged: 299 ok/s, nothing shed, p99 5.71ms.
 
    It also closed a reporting gap: **the node published no service percentiles at all**, so an
    operator could see how much work was queued but not how long the node's own work was taking,
