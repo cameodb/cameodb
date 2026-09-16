@@ -177,7 +177,12 @@ pub(super) async fn bulk_delete_handler(
         .first()
         .map(|first| first.routing_key().unwrap_or(first.id()).to_string());
 
-    let client_op = ClientOp::BulkDelete { index, docs };
+    let client_op = ClientOp::BulkDelete {
+        index,
+        docs,
+        // A request off the wire is the first hop.
+        forwarded: false,
+    };
 
     let result = state
         .router
