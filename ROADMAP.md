@@ -1355,14 +1355,54 @@ fix 1 is the one that recovered goodput and recovery time, fix 2 moved the refus
 and closed a queue that checked no deadline, and fix 3 is what tells an operator they are
 walking into it. Two of the three entries were wrong about their own premise until measured.
 
+**Verified against the pre-fix binary, 2026-09-16.** Every arm above was measured as its own
+fix landed, each against the binary carrying it. This is the comparison that was missing: a node
+built from `9a56de5` — the commit before fix 1, and the one that made `request_timeout_secs`
+honoured at all — run in the same session on the same M1, against the same seeded index and the
+same configuration as the current binary. 200,000 documents, 4 shards, `search_threads = 2`,
+`max_concurrent_requests = 3000`, `request_timeout_secs = 1`, 20s arms, harness lag p99 at or
+below 2.2ms on every arm quoted.
+
+| offered | before (`9a56de5`) | after (`bc1a50e`) |
+|---|---|---|
+| 300/s | 299 ok/s, 0 shed, p99 22.9ms | 299 ok/s, 0 shed, p99 16.7ms |
+| 1,000/s | **0 ok/s**, 19,956 × 408 | **541 ok/s**, 9,138 × 503, 10 × 408 |
+| 3,000/s | **0 ok/s**, 58,942 × 408, 1,267 × 503 | **500 ok/s**, 50,207 × 503, **0 × 408** |
+| health under 3,000/s | 408 at 1,001ms, from the third probe on | 200 at ~130ms, 16 of 16 |
+| 3,000/s → 300/s | 0 ok/s for the whole 15s step | 310 ok/s in the first second, p50 4ms |
+
+The counters say the same thing about where the refusal is now made: 71,707
+`refused_at_admission` against 1,518 `abandoned` at a worker across the three arms, with
+`actor_mailbox_fallbacks` at 0 throughout. The two 300/s arms are within noise of each other, so
+the gate still costs nothing to a node that keeps up.
+
+*Read these as a before and after, not as capacity.* The absolute figures sit at the low end of
+the 494–553/s band recorded above because the machine was carrying an ordinary desktop load
+throughout, and every arm is a single 20s run.
+
+The recovery arm came out worse before than the 12s recorded above: the pre-fix node served
+nothing for the entire 15s it was offered 300/s after 3,000/s, where the current binary is back
+to 310 ok/s within a second of the drop. That is the same relationship, not a new one — the dead
+period is admission depth divided by spare capacity, and a busier machine has less to spare.
+
+`cargo test --workspace` passes 797 tests across 43 suites at this commit and `cargo clippy
+--workspace --all-targets` is clean. Fix 3 was checked against the benchmark configuration
+itself, which is also what confirms the arms ran on a one-second budget: `check-config` reports
+`timeout 1s (set)` rather than the derived 60s, and raises the `overload` warning on it.
+
 A second guard remains in `dispatch_read_pool` against the full budget, for a configuration
-where the read pool rather than the worker channel is the deep queue. It did not fire in any
-arm above, and is kept on that basis rather than on evidence.
+where the read pool rather than the worker channel is the deep queue. It was kept on reasoning
+rather than evidence when the fixes landed, no arm having fired it. The 2026-09-16 run did:
+`read_pool_abandoned` reached 53 across the three arms, against 1,518 refused at a worker and
+71,707 at the door. It is a backstop that is genuinely reached, three orders of magnitude below
+the door, rather than a guard kept on argument alone.
 
 **[OB13](#ob13--the-health-endpoint-fails-under-overload-but-not-for-the-reason-it-looked-like)
 is closed by this, as predicted and now measured.** Under 3,000/s against the same node that
 previously answered health in 1001.8ms with every probe a 408, fourteen consecutive probes
-returned **200 in ~120ms**. One fix, both entries.
+returned **200 in ~120ms**. One fix, both entries. The 2026-09-16 run has it on both binaries at
+once: the pre-fix node answered its third probe and everything after it with a 408 at 1,001ms,
+the current one 200 in ~130ms on sixteen of sixteen.
 
 Not yet measured: whether a retrying client deepens it (each arm here used a fixed arrival rate
 and no retries), and the write path, which has its own queue.
@@ -2023,7 +2063,9 @@ implied would not have worked.
 **Confirmed fixed by F7's dequeue rejection**, the same day: under 3,000/s against the node that
 produced the 1001.8ms all-408 row below, sixteen consecutive probes returned **200 in ~160ms**.
 No change was made to the health endpoint or to the layer order, which is the evidence that the
-layering was never the cause.
+layering was never the cause. Re-measured 2026-09-16 against a binary built from the commit
+before the fix, in the same session: that node answered its third probe onward with a 408 at
+1,001ms while the current one held 200 at ~130ms, sixteen of sixteen.
 
 **The original reading.** `HEALTH_PATH` is exempt from the concurrency guard (`routes.rs` 105) so
 that "a load balancer would [not] evict a node that was merely busy". `TimeoutLayer` is applied
