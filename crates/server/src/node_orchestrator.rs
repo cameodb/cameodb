@@ -124,6 +124,15 @@ const ORCHESTRATOR_WORKER_QUEUE_CAPACITY: usize = SHARD_WRITER_CHANNEL_CAPACITY 
 /// `in_flight_capacity` on `/_admin/workers`.
 const ORCHESTRATOR_WORKER_MAX_IN_FLIGHT: usize = 8;
 
+/// How much of the actor-mailbox lane runs at once: one, because the actor serialises
+/// everything it takes.
+///
+/// The divisor in Little's law for that lane, and the reason it needs its own gate rather than
+/// a share of the worker pool's. The pool's width is `workers x in-flight`; this is 1, and a
+/// bulk write's service time is three orders of magnitude above a point search's — folding the
+/// two into one counter would mis-predict both. See [`RouterActor::mailbox_load`].
+const MAILBOX_LANE_WIDTH: usize = 1;
+
 tokio::task_local! {
     /// When the request being served reached this node, scoped to the task running its
     /// handler.
@@ -3304,6 +3313,64 @@ impl QueueLoad {
     }
 }
 
+/// A shared handle to the actor-mailbox lane's counters.
+///
+/// Both ends need the same instance: [`RouterActor`] predicts and refuses against it, and
+/// [`NodeOrchestrator`] folds each op's *true* dequeue-to-answer into it. Measuring at the
+/// caller instead was tried and is wrong in a way that only shows up under load — the caller's
+/// clock spans queue *and* service, so the only samples that are pure service are the
+/// uncontended ones, which are also the fastest. The estimate then sits near the idle p50 (32ms
+/// measured, against a p90 of 152ms), the gate admits a queue far deeper than the budget can
+/// drain, and the back of it times out. The actor handles one op at a time, so start-to-finish
+/// there *is* the service time.
+#[derive(Clone, Debug)]
+pub struct MailboxLane(Arc<DispatchCounters>);
+
+impl MailboxLane {
+    pub fn new() -> Self {
+        Self(Arc::new(DispatchCounters::default()))
+    }
+
+    /// Fold one op's dequeue-to-answer into the lane's estimate.
+    fn record_service(&self, class: OpClass, sample: Duration) {
+        self.0.record_service(class, sample);
+    }
+}
+
+impl Default for MailboxLane {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One in-flight ask on the actor-mailbox lane, counted for as long as this value lives.
+///
+/// The decrement is in `Drop` rather than after the `await`, and that is load-bearing. A request
+/// whose budget expires has its future dropped by `TimeoutLayer` mid-await, which under overload
+/// is most of them; a decrement written after the await never runs for any of those, so every
+/// abandoned request leaves its increment behind. The depth then only climbs, the gate refuses
+/// everything, nothing completes, and no sample ever corrects the estimate — F7's metastable
+/// shape rebuilt inside the fix meant to prevent it.
+///
+/// Measured with the plain decrement, on an **idle** node after one 120/s bulk arm:
+/// `mailbox_depth` 63, every subsequent request refused. With the guard: back to 0.
+struct MailboxSlot {
+    stats: Arc<DispatchCounters>,
+}
+
+impl MailboxSlot {
+    fn enter(stats: Arc<DispatchCounters>) -> Self {
+        stats.outstanding.fetch_add(1, AtomicOrdering::Relaxed);
+        Self { stats }
+    }
+}
+
+impl Drop for MailboxSlot {
+    fn drop(&mut self) {
+        self.stats.job_left_pool();
+    }
+}
+
 impl std::fmt::Debug for QueueLoad {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueueLoad")
@@ -6158,6 +6225,18 @@ pub struct RouterActor {
     /// because the ask was the cost — measured at one mailbox round trip per *keyless*
     /// operation, which is every ordinary search, every streaming search and `GET /_indexes`.
     clustered: bool,
+    /// The backlog gate for the actor-mailbox lane — bulk writes, config and metadata.
+    ///
+    /// F7 gated the worker pool and left this lane open, which measured as its whole original
+    /// failure surviving intact: under a bulk ingest at twice capacity the node served **0 ok/s
+    /// and wrote 0 documents**, every request a 408, and `refused_at_admission` and `abandoned`
+    /// both at **0** — no gate refused anything, because `BulkWrite` is not worker-eligible and
+    /// so never raises the depth the door judges on (ROADMAP F8).
+    ///
+    /// Its own `QueueLoad` rather than a share of the pool's, for the reason
+    /// [`MAILBOX_LANE_WIDTH`] gives. `None` when there is no configured budget to measure
+    /// against, which is the same condition that disables the pool's gate.
+    mailbox_load: Option<Arc<QueueLoad>>,
 }
 
 /// Configuration for shard-affine worker dispatch.
@@ -6208,7 +6287,21 @@ impl RouterActor {
         shard_affine: ShardAffineConfig,
         placement: Arc<ArcSwap<ShardPlacement>>,
         clustered: bool,
+        mailbox_lane: MailboxLane,
     ) -> Self {
+        // The lane's budget is the node's request timeout, which the pool already resolved.
+        // Without a pool there is no budget to read and no deadline to fail, so the gate stays
+        // off — the same condition under which the pool's own gate is off.
+        let mailbox_load = worker_tx
+            .as_ref()
+            .and_then(|tx| tx.load().budget())
+            .map(|budget| {
+                Arc::new(QueueLoad::new(
+                    Arc::clone(&mailbox_lane.0),
+                    MAILBOX_LANE_WIDTH,
+                    Some(budget),
+                ))
+            });
         Self {
             orchestrator,
             coordinator,
@@ -6225,7 +6318,13 @@ impl RouterActor {
             shard_affine,
             placement,
             clustered,
+            mailbox_load,
         }
+    }
+
+    /// The mailbox lane's backlog gate, for the endpoints that report what refusals are made on.
+    pub fn mailbox_load(&self) -> Option<&Arc<QueueLoad>> {
+        self.mailbox_load.as_ref()
     }
 
     /// Handles client operations.
@@ -6364,6 +6463,43 @@ impl RouterActor {
     /// wrong with it. Only the delivery failures need a description; the handler already wrote
     /// one for its own.
     async fn ask_orchestrator(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
+        let Some(load) = self.mailbox_load.as_ref() else {
+            return self.ask_orchestrator_unguarded(op).await;
+        };
+
+        // Refuse before queueing, for the same reason the worker pool's door does: `ask` waits
+        // for a mailbox slot rather than failing, the actor serialises what it takes, and
+        // nothing downstream checks a deadline — so a request sent into a deep mailbox runs to
+        // completion long after its client has gone. Measured before this gate existed: 8,405
+        // bulk requests at 2x and 5x capacity, 100% answered 408, zero documents written, and
+        // not one refusal recorded anywhere (ROADMAP F8).
+        //
+        // This is the lane's door and it has no dequeue counterpart. The re-check a worker
+        // makes after waiting cannot be made here: the actor handles the message in its own
+        // task, where `REQUEST_STARTED_AT` is not in scope, so a job that queued behind a slow
+        // one cannot tell how long it waited. Predicting before the wait is what is available,
+        // and it is the half F7 measured as the more valuable one.
+        let class = OpClass::of(&op);
+        if let Some(predicted) = load.would_refuse(class) {
+            return Err(load.refuse(predicted));
+        }
+
+        // `outstanding` is this lane's own counter, so the depth above is the mailbox's and
+        // never the pool's. Held by a guard rather than decremented after the await — see
+        // [`MailboxSlot`], which is the difference between this gate working and this gate
+        // becoming the failure it prevents.
+        // `_slot` lives to the end of this function, so the count is released on the normal
+        // return and on cancellation alike.
+        let _slot = MailboxSlot::enter(Arc::clone(&load.dispatch_stats));
+        self.ask_orchestrator_unguarded(op).await
+    }
+
+    /// The mailbox ask itself, without the backlog gate. Split out so the guarded path above
+    /// reads as the decision it is, and so a node with no budget keeps exactly its old behaviour.
+    async fn ask_orchestrator_unguarded(
+        &self,
+        op: ClientOp,
+    ) -> Result<JsonValue, OrchestratorError> {
         match self.orchestrator.ask(op).await {
             Ok(result) => Ok(result),
             Err(kameo::error::SendError::HandlerError(err)) => Err(err),
@@ -7706,6 +7842,11 @@ impl RouterActor {
 
 #[derive(Debug, Actor, RemoteActor)]
 pub struct NodeOrchestrator {
+    /// The mailbox lane's service estimate, shared with the [`RouterActor`] that gates it.
+    ///
+    /// Written here rather than at the caller because this actor handles one op at a time, so
+    /// the time around `handle` is service with no queue in it. See [`MailboxLane`].
+    mailbox_lane: MailboxLane,
     /// Map of shard UUIDs to their microshard actors
     pub(crate) shards: HashMap<Uuid, MicroshardActor>,
     /// Node-wide writer-thread liveness, shared with every shard's writer thread and read by
@@ -7764,6 +7905,14 @@ pub struct NodeOrchestrator {
 }
 
 impl NodeOrchestrator {
+    /// The mailbox lane this orchestrator folds its service times into.
+    ///
+    /// Taken before the actor is spawned and handed to [`RouterActor::with_config`], so the end
+    /// that predicts and the end that measures share one instance.
+    pub fn mailbox_lane(&self) -> MailboxLane {
+        self.mailbox_lane.clone()
+    }
+
     fn storage_path_candidates(&self) -> Cow<'_, [PathBuf]> {
         if self.config.storage_paths.is_empty() {
             Cow::Owned(vec![self.config.storage_path.clone()])
@@ -8962,6 +9111,7 @@ impl NodeOrchestrator {
             .then(|| Duration::from_secs(config.request_timeout_secs));
 
         let mut orchestrator = Self {
+            mailbox_lane: MailboxLane::new(),
             shards: HashMap::new(),
             writer_liveness: Arc::new(WriterLiveness::default()),
             identity,
@@ -11842,13 +11992,20 @@ impl Message<ClientOp> for NodeOrchestrator {
         msg: ClientOp,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match msg {
+        // Dequeue-to-answer for the mailbox lane: this actor is serialised, so nothing else is
+        // running inside this span and it holds no queue wait. The gate in `RouterActor`
+        // predicts against what is folded here.
+        let class = OpClass::of(&msg);
+        let started = Instant::now();
+        let result = match msg {
             ClientOp::DeleteIndex {
                 index,
                 delete_schema,
             } => self.orch_delete_index(&index, delete_schema).await,
-            _ => self.handle_client_op(msg).await,
-        }
+            other => self.handle_client_op(other).await,
+        };
+        self.mailbox_lane.record_service(class, started.elapsed());
+        result
     }
 }
 
@@ -12697,6 +12854,47 @@ mod tests {
             forwarded: false,
             schema_body: None,
         })
+    }
+
+    /// A cancelled ask must still give its slot back. `TimeoutLayer` drops the request future
+    /// when the budget expires — under overload, most of them — and an increment that survives
+    /// its request makes the lane's depth climb monotonically until the gate refuses everything
+    /// and no sample can ever correct it. Measured before the guard existed: `mailbox_depth` 63
+    /// on an idle node, 100% of requests refused (ROADMAP F8).
+    #[test]
+    fn a_dropped_mailbox_ask_gives_its_slot_back() {
+        let stats = Arc::new(DispatchCounters::default());
+
+        let slot = MailboxSlot::enter(Arc::clone(&stats));
+        assert_eq!(stats.outstanding.load(AtomicOrdering::Relaxed), 1);
+
+        // Dropping without awaiting anything is what a cancelled request does.
+        drop(slot);
+        assert_eq!(
+            stats.outstanding.load(AtomicOrdering::Relaxed),
+            0,
+            "a cancelled ask must not leave its increment behind"
+        );
+
+        // And the lane is usable again rather than permanently one deeper.
+        let next = MailboxSlot::enter(Arc::clone(&stats));
+        drop(next);
+        assert_eq!(stats.outstanding.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    /// Overlapping asks each account for themselves, in any release order — the depth the gate
+    /// reads is the number actually outstanding, not the number that happened to finish in order.
+    #[test]
+    fn overlapping_mailbox_asks_each_release_their_own_slot() {
+        let stats = Arc::new(DispatchCounters::default());
+        let first = MailboxSlot::enter(Arc::clone(&stats));
+        let second = MailboxSlot::enter(Arc::clone(&stats));
+        assert_eq!(stats.outstanding.load(AtomicOrdering::Relaxed), 2);
+
+        drop(first);
+        assert_eq!(stats.outstanding.load(AtomicOrdering::Relaxed), 1);
+        drop(second);
+        assert_eq!(stats.outstanding.load(AtomicOrdering::Relaxed), 0);
     }
 
     /// The estimate is what makes the dequeue check work, so its two properties are pinned:

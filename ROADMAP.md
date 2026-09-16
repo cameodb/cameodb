@@ -164,7 +164,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F5](#f5--concurrency-sweep-measured-2026-09-02) | Concurrency sweep on the release build — the operating point, and bulk's serialization measured | — | 2026-09-02 | ✅ |
 | [F6](#f6--what-fsync-actually-costs-measured-2026-09-02) | What fsync actually costs — and why turning it off is a reallocation, not a speedup | — | 2026-09-02 | ✅ |
 | [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) | The request timeout sheds the client, not the work — measured: goodput goes to zero, not down | — | 2026-09-15 | ✅ |
-| [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — measured: zero goodput, zero refusals, and OB13 reopened | — | 2026-09-16 | 📋 |
+| [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — health fixed; the lane is gated but goodput is not yet flat | — | 2026-09-16 | ◐ |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
 | [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8 and CH9 done, CH12 partial | — | 2026-09-01 | ◐ |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
@@ -1582,10 +1582,45 @@ by anything further here.
 
 **What the fix has to do**, in the order the evidence supports:
 
-1. **Make the bulk lane visible to the gates.** Either route `BulkWrite` through the worker pool
-   so fix 1's dequeue check applies, or give the mailbox its own deadline check; and count bulk
-   work in `outstanding` either way, because a door that cannot see the queue cannot refuse into
-   it. Counting without checking is the weaker half and should not ship alone.
+1. ◐ **Make the bulk lane visible to the gates.** Partly done 2026-09-16. The mailbox lane got
+   its own `QueueLoad` — width 1, because the actor serialises what it takes, and its own
+   counters, because a bulk write's service time is three orders of magnitude above a point
+   search's and one counter would mis-predict both. `ask_orchestrator` refuses against it before
+   queueing. Routing `BulkWrite` through the worker pool was the alternative and was not taken:
+   [OB12](#ob12--the-schema-gate-deadlocked-a-fan-out-against-itself)'s invariants are written in
+   terms of what holds that mailbox, and this lane can be gated without disturbing them.
+
+   | offered | before | after |
+   |---|---|---|
+   | 30/s (under capacity) | 29 ok/s, sustained | 29 ok/s, sustained — untouched |
+   | 120/s | **0 ok/s**, 0 documents, 100% × 408 | **6 ok/s**, 55,500 documents, 1,333 × 503, 926 × 408 |
+   | 300/s | **0 ok/s**, 0 documents, 100% × 408 | 0 ok/s, 3,000 documents, 4,848 × 503, 1,181 × 408 |
+
+   *Better, and not yet the flat goodput the search lane got.* At 120/s it opens at 77 ok/s and
+   falls to zero within three seconds. Measured mid-arm: `mailbox_depth` 51 against
+   `mailbox_predicted_wait_ms` 684 — the gate admits a queue that consumes ~70% of the budget,
+   and this lane's service distribution has a p90 around **5×** its p50 (32ms against 152ms at
+   30/s). Twice the mean does not reserve against that spread, so the back of an admitted queue
+   times out. The worker pool never had this problem because its service time is milliseconds
+   against a one-second budget.
+
+   Which makes this lane the case that answers F7's own open question — *a percentile of the
+   service distribution rather than twice its mean*. The next piece is a decaying log-bucketed
+   histogram per lane and class: recording is one `fetch_add` against the present CAS loop, the
+   quantile is cached so admission stays a single atomic load, and the decay is the part that
+   needs care, because a cumulative histogram cannot track a node whose load changed. It also
+   closes a reporting gap — **the node publishes no service percentiles at all today**, so an
+   operator can see how much work is queued but not how long the node's own work is taking, and
+   cannot tell a node that got slower from one that got busier.
+
+   ***One bug worth keeping, because it was F7's failure rebuilt inside its own fix.*** The first
+   cut decremented the lane counter after the `await`. `TimeoutLayer` drops the request future on
+   timeout — under overload, most of them — so the increment survived and the decrement never
+   ran. Measured: `mailbox_depth` **63 on an idle node**, every subsequent request refused, for
+   good. An RAII guard now holds the slot, so a cancelled ask gives it back; a test drops one
+   without awaiting anything. The service estimate moved too: sampled at the caller it could only
+   be taken from uncontended asks, which are the fastest, and it settled near the idle p50. It is
+   measured inside the actor now, where start-to-finish is service with no queue in it.
 2. ✅ **Bound what health waits on.** Done 2026-09-16, above. The aim was "take health off the
    actor"; what it needed was for the guards it already had to be capable of firing — one shared
    deadline, sized from the request timeout, and a body that says which fields are fallbacks.

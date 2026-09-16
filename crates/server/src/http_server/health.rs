@@ -91,6 +91,15 @@ pub struct HealthResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_updates: Option<u64>,
 
+    // The actor-mailbox lane's backlog — bulk writes, config and metadata — and what it
+    // predicts a request arriving now would wait. Separate from `queue_depth` above, which is
+    // the worker pool's: the two lanes have different widths and service times, and a node can
+    // be idle on one while shedding on the other. Absent where the lane has no gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mailbox_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mailbox_predicted_wait_ms: Option<u64>,
+
     /// Which parts of this body could not be filled in before the actor budget ran out.
     ///
     /// Absent on a healthy answer. Present, it names the fields whose values below are
@@ -182,6 +191,13 @@ pub(super) async fn health_handler(
         ),
         None => (None, None),
     };
+    let (mailbox_depth, mailbox_predicted_wait_ms) = match state.router.mailbox_load() {
+        Some(load) => (
+            Some(load.depth()),
+            Some(load.predicted_wait().as_millis() as u64),
+        ),
+        None => (None, None),
+    };
 
     // Get basic shard count and node info from orchestrator. These can queue behind real work,
     // so the expanded body uses bounded waits; on timeout we fall back to defaults rather than
@@ -257,6 +273,13 @@ pub(super) async fn health_handler(
         }
     };
 
+    // A node that could not read its own state inside half its request budget is not in a
+    // normal state, whatever the cluster view says — so it reports yellow rather than green.
+    // It is still serving, which is why this is not red: red is reserved for a data path that
+    // has stopped (a dead writer, a wedged pool), and an orchestrator evicting a node that is
+    // merely congested would turn a slow node into an outage.
+    let status = degrade_status(status, !degraded.is_empty());
+
     let response = HealthResponse {
         status,
         node_id,
@@ -274,6 +297,8 @@ pub(super) async fn health_handler(
         read_pool_abandoned,
         queue_depth,
         predicted_wait_ms,
+        mailbox_depth,
+        mailbox_predicted_wait_ms,
         dial_failures: cluster_status.as_ref().map(|s| s.dial_failures),
         bootstrap_successes: cluster_status.as_ref().map(|s| s.bootstrap_successes),
         routing_updates: cluster_status.as_ref().map(|s| s.routing_updates),
@@ -291,6 +316,20 @@ pub(super) async fn health_handler(
 /// to stop routing here and recycle the node, so either forces `red` whatever the cluster view
 /// reported. With every writer serving and the read pool making progress, the cluster status
 /// stands. Saturation alone is not folded in: a busy-but-draining pool is doing its job.
+/// Fold "this body is incomplete" into the reported status.
+///
+/// Green is a claim that the node is operating normally. Having failed to answer its own
+/// metadata inside the budget, it cannot make that claim — but it is still serving requests, so
+/// the honest answer is the middle one. A status already worse than green is left alone: this
+/// only ever moves green to yellow, never anything down to it.
+fn degrade_status(status: String, degraded: bool) -> String {
+    if degraded && status == "green" {
+        "yellow".to_string()
+    } else {
+        status
+    }
+}
+
 fn worst_status(
     cluster_status: String,
     writers_unavailable: usize,
@@ -306,7 +345,8 @@ fn worst_status(
 #[cfg(test)]
 mod tests {
     use super::{
-        HEALTH_ACTOR_BUDGET_MAX, HEALTH_ACTOR_BUDGET_MIN, health_actor_budget, worst_status,
+        HEALTH_ACTOR_BUDGET_MAX, HEALTH_ACTOR_BUDGET_MIN, degrade_status, health_actor_budget,
+        worst_status,
     };
     use std::time::Duration;
 
@@ -333,6 +373,21 @@ mod tests {
             health_actor_budget(Duration::from_secs(1)),
             Duration::from_millis(500)
         );
+    }
+
+    /// Green means "operating normally", and a node that could not read its own state inside
+    /// its budget is not. Yellow rather than red: it is congested, not stopped.
+    #[test]
+    fn an_incomplete_body_reports_yellow_rather_than_green() {
+        assert_eq!(degrade_status("green".to_string(), true), "yellow");
+        assert_eq!(degrade_status("green".to_string(), false), "green");
+    }
+
+    /// Only ever moves green up to yellow — never pulls a worse status back toward it.
+    #[test]
+    fn degrading_never_improves_a_status() {
+        assert_eq!(degrade_status("red".to_string(), true), "red");
+        assert_eq!(degrade_status("yellow".to_string(), true), "yellow");
     }
 
     #[test]
