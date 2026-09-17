@@ -1755,7 +1755,9 @@ impl FieldDef {
         // Only ID field should be stored in Tantivy
         // All other fields are indexed-only, complete data comes from redb
         let stored = name == "id";
-        let fast = Some(Self::fast_by_default(&field_type));
+        // `id` is the exception to the type's default too: the builder always gives the key a
+        // fast column, whatever the declaration says — normalization pins the same flags.
+        let fast = Some(name == "id" || Self::fast_by_default(&field_type));
 
         Self {
             name,
@@ -2465,7 +2467,7 @@ impl IndexSchema {
 
             // The 'id' field has fixed Tantivy attributes regardless of user input, and the
             // type is one of them. The index builder skips `id` entirely and creates the key
-            // itself: raw-tokenized, stored, never fast, whatever the schema declared. A
+            // itself: raw-tokenized, stored, fast-columned, whatever the schema declared. A
             // declared type is therefore fiction the rest of the engine goes on believing —
             // `describe_index` reports it, the slow write validation infers `Text` for the key
             // and refuses every document against an `i64` declaration, and a sort merge asked
@@ -2474,7 +2476,7 @@ impl IndexSchema {
             // same shape, as `can_be_fast` does for the types that carry no column.
             if key == "id" {
                 field_def.field_type = TantivyFieldType::Text;
-                field_def.fast = Some(false);
+                field_def.fast = Some(true);
                 field_def.indexed = true;
                 field_def.stored = true;
                 field_def.tokenizer = Some("raw".to_string());
@@ -4252,8 +4254,12 @@ impl HybridStore {
 
         let mut schema_builder = Schema::builder();
 
-        // ID field is always present - untokenized string for exact matching
-        let id_field = schema_builder.add_text_field("id", STRING | STORED);
+        // ID field is always present - untokenized string for exact matching, stored so the
+        // document answers standalone, and a fast column so a hit's id is a term-ordinal
+        // read rather than a stored-document decompression per hit. STORED stays because
+        // indexes built before the column existed have no `id` fast field and still answer
+        // it from the stored document — the reader falls back per index, not per hit.
+        let id_field = schema_builder.add_text_field("id", STRING | STORED | FAST);
 
         // No `_seq` field. It cost 8 stored bytes plus a fast column per document, and its
         // only reader was the checkpoint scan that `order_by_u64_field` needs — which the
@@ -4647,7 +4653,7 @@ impl HybridStore {
                         field_type: TantivyFieldType::Text,
                         indexed: true,
                         stored: true,
-                        fast: Some(false),
+                        fast: Some(true),
                         is_shadow: false, // The canonical 'id' field is not a shadow field
                         description: None,
                         tokenizer: Some("raw".to_string()),
@@ -6606,63 +6612,84 @@ impl HybridStore {
             return Ok(SearchOutcome::counted(total_hits, discarded, emptied));
         }
 
-        // Step 1: Extract document IDs from Tantivy results using direct stored-field access
+        // Step 1: Extract document IDs from Tantivy results. `id` carries a fast column on
+        // indexes built since it gained one, so a hit's id is a term-ordinal read off the
+        // column rather than a stored-document decompression to get at one field. Whether this
+        // index has the column is a question its own schema answers — the declared `fast` is
+        // the builder's intent, not what an older index was built with — so a legacy index
+        // skips the per-segment open (`str()` re-opens the column on every call) and reads the
+        // stored document, which is how it always answered. The fallback stays for a hit whose
+        // column exists but does not answer.
+        let id_columns: Vec<Option<tantivy::columnar::StrColumn>> =
+            if tantivy_index.schema().get_field_entry(fields.id).is_fast() {
+                searcher
+                    .segment_readers()
+                    .iter()
+                    .map(|reader| reader.fast_fields().str("id").ok().flatten())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        let mut id_buf = String::new();
+        let mut hit_id = |doc_address: tantivy::DocAddress| -> Result<Option<String>, StoreError> {
+            if let Some(Some(column)) = id_columns.get(doc_address.segment_ord as usize)
+                && let Some(ord) = column.term_ords(doc_address.doc_id).next()
+            {
+                // `ord_to_str` writes over the buffer's tail, so it must start empty — and a
+                // column read that fails falls through to the stored document, which still
+                // answers on a damaged column.
+                id_buf.clear();
+                if column.ord_to_str(ord, &mut id_buf).unwrap_or(false) {
+                    return Ok(Some(id_buf.clone()));
+                }
+            }
+            let doc: tantivy::TantivyDocument = searcher.doc(doc_address)?;
+            Ok(doc
+                .get_first(fields.id)
+                .and_then(|value| value.as_str())
+                .map(str::to_string))
+        };
+
         let capacity = match &top_docs {
             SearchResult::Sorted(docs) => docs.len(),
             SearchResult::Unsorted(docs) => docs.len(),
         };
         let mut doc_ids_with_scores = Vec::with_capacity(capacity);
 
-        match &top_docs {
-            SearchResult::Sorted(docs) => {
-                for (_sort_key, doc_address) in docs {
-                    let doc: tantivy::TantivyDocument = searcher.doc(*doc_address)?;
-
-                    if let Some(value) = doc.get_first(fields.id)
-                        && let Some(id_str) = value.as_str()
-                    {
-                        debug!(
-                            index = %index,
-                            doc_id = %id_str,
-                            doc_addr = ?doc_address,
-                            "Tantivy document matched"
-                        );
-                        // For sorted results, use 1.0 as placeholder score (sort order is what matters)
-                        doc_ids_with_scores.push((1.0, id_str.to_string()));
-                    } else {
-                        let tantivy_doc = doc.to_json(&tantivy_index.schema());
-                        warn!(
-                            index = %index,
-                            doc_addr = ?doc_address,
-                            tantivy_doc = %tantivy_doc,
-                            "Tantivy document missing or invalid 'id' field"
-                        );
-                    }
-                }
-            }
+        let hits: Vec<(f32, tantivy::DocAddress)> = match &top_docs {
+            // For sorted results the order is what matters, not the key — a 1.0 placeholder
+            // score, exactly as before.
+            SearchResult::Sorted(docs) => docs.iter().map(|(_, addr)| (1.0, *addr)).collect(),
             SearchResult::Unsorted(docs) => {
-                for (score, doc_address) in docs {
-                    let doc: tantivy::TantivyDocument = searcher.doc(*doc_address)?;
+                docs.iter().map(|(score, addr)| (*score, *addr)).collect()
+            }
+        };
 
-                    if let Some(value) = doc.get_first(fields.id)
-                        && let Some(id_str) = value.as_str()
-                    {
-                        debug!(
-                            index = %index,
-                            doc_id = %id_str,
-                            doc_addr = ?doc_address,
-                            "Tantivy document matched"
-                        );
-                        doc_ids_with_scores.push((*score, id_str.to_string()));
-                    } else {
-                        let tantivy_doc = doc.to_json(&tantivy_index.schema());
-                        warn!(
-                            index = %index,
-                            doc_addr = ?doc_address,
-                            tantivy_doc = %tantivy_doc,
-                            "Tantivy document missing or invalid 'id' field"
-                        );
-                    }
+        for (score, doc_address) in hits {
+            match hit_id(doc_address)? {
+                Some(id_str) => {
+                    debug!(
+                        index = %index,
+                        doc_id = %id_str,
+                        doc_addr = ?doc_address,
+                        "Tantivy document matched"
+                    );
+                    doc_ids_with_scores.push((score, id_str));
+                }
+                None => {
+                    // The stored document answered nothing — fetch it once more only to say
+                    // what it was. Corrupt-state logging, not a hot path.
+                    let tantivy_doc = searcher
+                        .doc(doc_address)
+                        .map(|doc: tantivy::TantivyDocument| doc.to_json(&tantivy_index.schema()))
+                        .unwrap_or_else(|_| "<unreadable>".to_string());
+                    warn!(
+                        index = %index,
+                        doc_addr = ?doc_address,
+                        tantivy_doc = %tantivy_doc,
+                        "Tantivy document missing or invalid 'id' field"
+                    );
                 }
             }
         }
@@ -9135,7 +9162,7 @@ mod tests {
         assert_eq!(id_field.field_type, TantivyFieldType::Text);
         assert!(id_field.indexed);
         assert!(id_field.stored); // "id" field is stored in Tantivy
-        assert!(!id_field.is_fast()); // Text fields are not fast by default
+        assert!(id_field.is_fast()); // the builder always gives the key a fast column
 
         let json_field = FieldDef::new("metadata".to_string(), TantivyFieldType::Json);
         assert_eq!(json_field.field_type, TantivyFieldType::Json);
