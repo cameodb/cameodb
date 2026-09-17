@@ -179,6 +179,11 @@ pub(crate) enum OpClass {
     Read,
     /// `Write`, `Delete` — work that lands on a shard's writer thread.
     Write,
+    /// `BulkWrite`, `BulkDelete` — a fan-out over writer threads and peers whose service is
+    /// orders above a single write's. Folded into the write estimate it would poison it:
+    /// one 300ms bulk sample outweighs a hundred 2ms writes, and single writes would be
+    /// reserved — and refused — against a cost they never pay.
+    Bulk,
 }
 
 impl OpClass {
@@ -186,6 +191,7 @@ impl OpClass {
         match op {
             ClientOp::Search { .. } | ClientOp::Stream { .. } => OpClass::Read,
             ClientOp::Write { .. } | ClientOp::Delete { .. } => OpClass::Write,
+            ClientOp::BulkWrite { .. } | ClientOp::BulkDelete { .. } => OpClass::Bulk,
             _ => OpClass::Any,
         }
     }
@@ -382,6 +388,831 @@ struct Placed {
 
 /// Where one document is going, or why it is going nowhere.
 type RoutingResult = Result<(Placed, Uuid), (usize, String)>;
+
+/// Everything a bulk fan-out reads, borrowed off whichever side of the orchestrator/engine
+/// split is running it.
+///
+/// The actor builds it from its own fields; a worker builds the identical view from the
+/// engine's `ArcSwap` snapshots — the actor publishes every topology change to those
+/// snapshots, so both lanes read the same shard map and ring. The bulk bodies are written
+/// once against this so the two lanes cannot drift: same routing ladder, same grouping, same
+/// one-hop forwarding bound, same per-item accounting. What is *not* here is schema
+/// authority — that stays on the actor, which is why the engine's bulk write defers the
+/// moment a batch needs one written.
+struct BulkCtx<'a> {
+    shards: &'a HashMap<Uuid, MicroshardActor>,
+    ring: &'a ConsistentRing,
+    coordinator: Option<&'a ActorRef<ClusterCoordinator>>,
+    remote_peer_pool: Option<&'a RemotePeerPool>,
+}
+
+impl BulkCtx<'_> {
+    fn first_shard_id(&self) -> Option<Uuid> {
+        self.shards.keys().copied().next()
+    }
+
+    /// Route, group and serve a bulk write whose schema questions are already settled:
+    /// local batches to their shards in parallel, remote batches to their owning nodes
+    /// bounded to one hop, and a response that accounts for every document it was given.
+    ///
+    /// `pending` carries only the documents validation passed and `rejections` the reasons
+    /// for the rest — one per position, which is what makes the accounting anchor derivable:
+    /// the batch arrived as `pending + rejections` and every path below either writes a
+    /// document or adds a reason.
+    async fn apply_bulk_write(
+        &self,
+        index: &str,
+        pending: Vec<Placed>,
+        mut rejections: Vec<String>,
+        schema: &IndexSchema,
+        forwarded: bool,
+        start: Instant,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let items_received = pending.len() + rejections.len();
+        // First, route all documents to determine local vs remote
+        let mut local_docs = Vec::new();
+        let mut remote_docs = Vec::new();
+
+        // Clone routing ring for parallel access
+        let routing_ring = self.ring.clone();
+        let first_shard_id = self.first_shard_id();
+
+        // Schema-based routing: use routing field from schema instead of per-document routing_key
+        let routing_field = schema.get_routing_field().to_string();
+
+        // Route documents in parallel
+        let routing_results: Vec<RoutingResult> = tokio::task::spawn_blocking(move || {
+            pending
+                .into_par_iter()
+                .map(|mut placed| {
+                    // The same ladder every other write path climbs, resolved against the
+                    // routing field this batch already looked up once.
+                    placed.routing_key = routing_key_for(
+                        &routing_field,
+                        placed.doc.routing_key.clone(),
+                        &placed.doc.id,
+                        &placed.doc.doc,
+                    );
+
+                    // Route to shard using consistent hash ring
+                    let Some(key) = placed.routing_key.as_ref() else {
+                        return Err((
+                            placed.position,
+                            "no routing key could be derived for this document".to_string(),
+                        ));
+                    };
+                    let Some(target_shard) = routing_ring.get_owner(key).or(first_shard_id) else {
+                        return Err((
+                            placed.position,
+                            "no shard is available to route this document to".to_string(),
+                        ));
+                    };
+
+                    Ok((placed, target_shard))
+                })
+                .collect::<Vec<RoutingResult>>()
+        })
+        .await
+        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+
+        // Separate local and remote documents. A document that routes nowhere is refused rather
+        // than logged and forgotten: it was received, it will not be written, and the response
+        // has to say so or the counts stop adding up.
+        for result in routing_results {
+            match result {
+                Ok((placed, target_shard)) => {
+                    if self.shards.contains_key(&target_shard) {
+                        local_docs.push((placed, target_shard));
+                    } else {
+                        remote_docs.push((placed, target_shard));
+                    }
+                }
+                Err((position, reason)) => {
+                    tracing::warn!(position, reason, "Routing error");
+                    rejections.push(format!("document {position}: {reason}"));
+                }
+            }
+        }
+
+        // Group local documents by shard
+        let batches = NodeOrchestrator::group_local_documents(local_docs);
+        let unique_shards = batches.len();
+
+        tracing::debug!(
+            items_received = items_received,
+            unique_shards = unique_shards,
+            remote_docs = remote_docs.len(),
+            "BulkWrite grouped items by shard"
+        );
+
+        // Who owns a shard, and where that node is — asked only if some document actually
+        // routed off this node.
+        //
+        // A batch that was itself forwarded here goes no further, for the reason
+        // `forward_op_to_owner` gives for a single write: two nodes whose views of the ring
+        // disagree would otherwise pass it between them, carrying every document each time,
+        // until something timed out. This op has carried `forwarded` since OB12 and only the
+        // schema decision ever read it.
+        //
+        // Ahead of the shard-assignment lookup below, so a batch that is going to be refused
+        // does not ask the coordinator who owns what first.
+        if forwarded && !remote_docs.is_empty() {
+            rejections.extend(std::mem::take(&mut remote_docs).into_iter().map(
+                |(placed, target_shard)| {
+                    format!(
+                        "document {}: forwarded here, but shard {target_shard} is not local \
+                         either. This node and the one that forwarded disagree about who owns \
+                         it; retry once the cluster has settled",
+                        placed.doc.id
+                    )
+                },
+            ));
+        }
+
+        // Both maps are read in the remote branch below and nowhere else: the local/remote split
+        // above uses `self.shards`, which this node already holds. Fetching them up front cost
+        // two coordinator mailbox round trips on **every** bulk write, including every bulk write
+        // on a single-node deployment, where the answer is always "everything is local". The
+        // delete path next door already asked for its peers lazily; this is the same shape.
+        let (shard_assignments, peer_addrs) = if remote_docs.is_empty() {
+            (HashMap::new(), HashMap::new())
+        } else if let Some(coord) = self.coordinator {
+            let assignments = coord.ask(GetShardAssignments).await.unwrap_or_default();
+            let addrs: HashMap<Uuid, String> = coord
+                .ask(GetKnownPeers)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| (p.node_id, p.address))
+                .collect();
+            (assignments, addrs)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+
+        // Separate local and remote batches for parallel processing
+        let mut local_batches = HashMap::new();
+        let mut remote_batches = Vec::new();
+        let mut written = 0usize;
+        // Seeded with the documents validation refused, so the response accounts for every
+        // item it received: `items_written` counts what was stored, and each of the rest has a
+        // reason here.
+        let mut errors = rejections;
+
+        // Process local batches from parallel routing
+        for (shard_id, batch) in batches {
+            local_batches.insert(shard_id, batch);
+        }
+
+        // Group remote documents by owning node
+        let mut remote_by_node: HashMap<Uuid, Vec<Placed>> = HashMap::new();
+        for (placed, target_shard) in remote_docs {
+            match shard_assignments.get(&target_shard) {
+                Some(shard_meta) => remote_by_node
+                    .entry(shard_meta.node_id)
+                    .or_default()
+                    .push(placed),
+                None => errors.push(format!(
+                    "document {}: shard {target_shard} owns this document and no node claims \
+                     that shard",
+                    placed.position
+                )),
+            }
+        }
+
+        // Convert remote batches to the expected format
+        for (node_id, batch) in remote_by_node {
+            match peer_addrs.get(&node_id) {
+                Some(addr) => {
+                    tracing::debug!(
+                        node = %node_id,
+                        count = batch.len(),
+                        "Forwarding bulk write batch to remote node"
+                    );
+                    remote_batches.push((node_id, addr.clone(), batch));
+                }
+                None => errors.extend(batch.iter().map(|placed| {
+                    format!(
+                        "document {}: node {node_id} owns this document and has no known address",
+                        placed.position
+                    )
+                })),
+            }
+        }
+
+        // Phase 3.1: Parallel Local Shard Processing
+        let (local_written, local_errors) = self.local_shard_writes(index, local_batches).await?;
+        written += local_written;
+        errors.extend(local_errors);
+
+        // Phase 3.2: Parallel Remote Forwarding
+        if !remote_batches.is_empty() {
+            use futures::future::join_all;
+
+            // Borrowed once, outside: a shared reference is `Copy`, so each `async move`
+            // below takes the reference and not the schema.
+            let established: &IndexSchema = schema;
+            let remote_futures: Vec<_> = remote_batches
+                .into_iter()
+                .map(|(node_id, addr, batch)| async move {
+                    // Kept so a call that never reached the node can still name what it carried.
+                    let positions: Vec<usize> =
+                        batch.iter().map(|placed| placed.position).collect();
+                    let outcome = self
+                        .forward_write(node_id, &addr, index, batch, established)
+                        .await;
+                    (node_id, positions, outcome)
+                })
+                .collect();
+
+            let remote_results = join_all(remote_futures).await;
+
+            for (node_id, positions, outcome) in remote_results {
+                match outcome {
+                    Ok((items, reasons)) => {
+                        written += items;
+                        errors.extend(reasons);
+                    }
+                    // The batch never got an answer, so none of it was written.
+                    Err(e) => errors.extend(positions.into_iter().map(|position| {
+                        format!("document {position}: forwarding to node {node_id} failed: {e}")
+                    })),
+                }
+            }
+        }
+
+        // Every item is either written or explained. Each path above accounts for what it
+        // loses, so this is a check on that rather than a repair — a batch that reaches here
+        // unbalanced has a path that stopped saying what it dropped, which is the defect this
+        // arithmetic exists to catch.
+        //
+        // Asserted in a debug build and logged in a release one. The assertion is what makes an
+        // unaccounting path a test failure; the log is what makes it findable in the build that
+        // actually serves the caller the unbalanced answer.
+        debug_assert_eq!(
+            written + errors.len(),
+            items_received,
+            "a bulk write must account for every item it received"
+        );
+        if written + errors.len() != items_received {
+            error!(
+                index = %index,
+                items_received = items_received,
+                items_written = written,
+                errors = errors.len(),
+                "BulkWrite did not account for every item it received"
+            );
+        }
+
+        let duration = start.elapsed();
+        info!(
+            index = %index,
+            items_received = items_received,
+            items_written = written,
+            errors = errors.len(),
+            duration_ms = duration.as_millis(),
+            "BulkWrite completed"
+        );
+
+        if !errors.is_empty() {
+            warn!(
+                index = %index,
+                error_count = errors.len(),
+                "BulkWrite had some errors"
+            );
+        }
+
+        Ok(serde_json::json!({
+            "items_written": written,
+            "items_received": items_received,
+            "errors": errors,
+            "duration_ms": duration.as_millis()
+        }))
+    }
+
+    /// Serve a bulk delete: ids grouped onto local shards in parallel, ids whose shard lives
+    /// elsewhere forwarded to the owning node bounded to one hop, and a response that
+    /// accounts for every id it was given.
+    ///
+    /// A delete can never need a schema written — it carries no document that could present
+    /// a field the schema does not know — so unlike [`apply_bulk_write`](Self::apply_bulk_write)
+    /// there is no slow path behind this.
+    async fn apply_bulk_delete(
+        &self,
+        index: &str,
+        docs: Vec<DeletePayload>,
+        schema: &IndexSchema,
+        forwarded: bool,
+        start: Instant,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let items_received = docs.len();
+
+        let mut errors: Vec<String> = Vec::new();
+        // Local work is a plain list of ids per shard: the routing key has already done its job
+        // by the time a shard is chosen, and the storage layer deletes by key.
+        let mut local_by_shard: HashMap<Uuid, Vec<String>> = HashMap::new();
+        // Ids whose shard this node does not hold, kept with the shard that owns them and
+        // resolved to nodes below — once, and only if there are any. Asking who owns a shard is
+        // a coordinator mailbox round trip, and a single-node deployment never has an answer to
+        // use: every shard it routes to is one it holds.
+        let mut off_node: Vec<(Uuid, DeletePayload)> = Vec::new();
+
+        for payload in docs {
+            let id = payload.id().to_string();
+            if id.trim().is_empty() {
+                errors.push("an entry carried an empty id".to_string());
+                continue;
+            }
+            let routing_key = payload.routing_key().map(str::to_string);
+
+            let key = match effective_delete_routing_key(schema, &id, routing_key) {
+                Ok(key) => key,
+                Err(err) => {
+                    errors.push(format!("{id}: {err}"));
+                    continue;
+                }
+            };
+
+            let Some(target) = self.ring.get_owner(&key).or_else(|| self.first_shard_id()) else {
+                errors.push(format!("{id}: no shard available for routing"));
+                continue;
+            };
+
+            if self.shards.contains_key(&target) {
+                local_by_shard.entry(target).or_default().push(id);
+            } else {
+                off_node.push((target, payload));
+            }
+        }
+
+        let mut remote_by_node: HashMap<Uuid, Vec<DeletePayload>> = HashMap::new();
+        if !off_node.is_empty() {
+            let shard_assignments = if let Some(coord) = self.coordinator {
+                coord.ask(GetShardAssignments).await.unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
+            for (target, payload) in off_node {
+                match shard_assignments.get(&target) {
+                    Some(shard_meta) => remote_by_node
+                        .entry(shard_meta.node_id)
+                        .or_default()
+                        .push(payload),
+                    None => errors.push(format!(
+                        "{}: no shard assignment for shard {target}, so it was not deleted",
+                        payload.id()
+                    )),
+                }
+            }
+        }
+
+        let mut deleted = 0usize;
+
+        // Local shards in parallel, serial within each: every shard has its own writer thread,
+        // and one batch per shard is what makes this one transaction per shard.
+        let local_futures: Vec<_> = local_by_shard
+            .into_iter()
+            .map(|(shard_id, ids)| {
+                let shard = self.shards.get(&shard_id).cloned();
+                let index_name = index.to_string();
+                async move {
+                    // Kept so a failure can name every id it took down with it, as the bulk
+                    // write path keeps its positions for the same reason. One reason for a whole
+                    // shard batch left the answer short by however many ids were in it.
+                    let attributable = ids.clone();
+                    let outcome = async {
+                        let shard = shard.ok_or_else(|| {
+                            OrchestratorError::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!("Local shard {shard_id} not found"),
+                            ))
+                        })?;
+                        shard.handle_batch_delete(index_name, ids).await
+                    }
+                    .await;
+                    (shard_id, attributable, outcome)
+                }
+            })
+            .collect();
+
+        for (shard_id, ids, outcome) in futures::future::join_all(local_futures).await {
+            match outcome {
+                Ok(count) => deleted += count,
+                Err(err) => errors.extend(ids.into_iter().map(|id| {
+                    format!("{id}: shard {shard_id} did not take the batch this id was in: {err}")
+                })),
+            }
+        }
+
+        // A batch that was itself forwarded here goes no further. Both ends decide ownership
+        // from their own view of the ring, and while membership changes those views disagree —
+        // two nodes each certain the other owns the shard would otherwise pass the batch back
+        // and forth, a full remote ask carrying every document each time, until something timed
+        // out. Stating the disagreement per id is what `forward_op_to_owner` does for a single
+        // delete; this is the same rule on the path OB3 left open.
+        if forwarded && !remote_by_node.is_empty() {
+            for (node_id, payloads) in std::mem::take(&mut remote_by_node) {
+                errors.extend(payloads.iter().map(|doc| {
+                    format!(
+                        "{}: forwarded here, but this node does not own its shard either. This node \
+                         and node {node_id} disagree about who does; retry once the \
+                         cluster has settled",
+                        doc.id()
+                    )
+                }));
+            }
+        }
+
+        // Peers that own the rest.
+        if !remote_by_node.is_empty() {
+            let peer_addrs: HashMap<Uuid, String> = if let Some(coord) = self.coordinator {
+                coord
+                    .ask(GetKnownPeers)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|peer| (peer.node_id, peer.address))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+
+            let mut remote_futures = Vec::new();
+            for (node_id, payloads) in remote_by_node {
+                match peer_addrs.get(&node_id) {
+                    Some(addr) => {
+                        let addr = addr.clone();
+                        remote_futures.push(async move {
+                            // Kept so a call that never reached the node can still name what it
+                            // carried.
+                            let ids: Vec<String> =
+                                payloads.iter().map(|doc| doc.id().to_string()).collect();
+                            let outcome =
+                                self.forward_delete(node_id, &addr, index, payloads).await;
+                            (node_id, ids, outcome)
+                        });
+                    }
+                    // One reason per id rather than one for the group: the group is not what the
+                    // caller sent or counts in.
+                    None => errors.extend(payloads.iter().map(|doc| {
+                        format!(
+                            "{}: no address known for node {node_id}, which owns its shard",
+                            doc.id()
+                        )
+                    })),
+                }
+            }
+
+            for (node_id, ids, outcome) in futures::future::join_all(remote_futures).await {
+                match outcome {
+                    Ok((count, reasons)) => {
+                        deleted += count;
+                        errors.extend(reasons);
+                    }
+                    // The batch never got an answer, so none of it was deleted.
+                    Err(err) => errors.extend(
+                        ids.into_iter()
+                            .map(|id| format!("{id}: forwarding to node {node_id} failed: {err}")),
+                    ),
+                }
+            }
+        }
+
+        // Every id is either deleted or explained, as on the bulk write path. Each path above
+        // accounts for what it loses, so this is a check on that rather than a repair — a batch
+        // that reaches here unbalanced has a path that stopped saying what it dropped, which is
+        // the defect this arithmetic exists to catch.
+        //
+        // Asserted in a debug build and logged in a release one: the assertion makes an
+        // unaccounting path a test failure, the log makes it findable in the build that actually
+        // serves the caller the unbalanced answer.
+        debug_assert_eq!(
+            deleted + errors.len(),
+            items_received,
+            "a bulk delete must account for every id it received"
+        );
+        if deleted + errors.len() != items_received {
+            error!(
+                index = %index,
+                items_received = items_received,
+                items_deleted = deleted,
+                errors = errors.len(),
+                "BulkDelete did not account for every id it received"
+            );
+        }
+
+        let duration = start.elapsed();
+        info!(
+            index = %index,
+            items_received = items_received,
+            items_deleted = deleted,
+            errors = errors.len(),
+            duration_ms = duration.as_millis(),
+            "BulkDelete completed"
+        );
+
+        Ok(serde_json::json!({
+            "items_received": items_received,
+            "items_deleted": deleted,
+            "errors": errors,
+            "duration_ms": duration.as_millis(),
+        }))
+    }
+
+    /// Process one batch per local shard, all of them in parallel.
+    async fn local_shard_writes(
+        &self,
+        index: &str,
+        local_batches: HashMap<Uuid, Vec<Placed>>,
+    ) -> Result<(usize, Vec<String>), OrchestratorError> {
+        if local_batches.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+
+        let total_docs: usize = local_batches.values().map(|v| v.len()).sum();
+        let shard_count = local_batches.len();
+
+        tracing::debug!(
+            local_shard_count = shard_count,
+            total_docs = total_docs,
+            "Starting local shard processing"
+        );
+
+        let mut total_written = 0usize;
+        let mut all_errors = Vec::new();
+
+        // Process shards in parallel, but ensure serial access per shard
+        // Each shard has its own Tantivy/Redb instance, so cross-shard parallelism is safe
+        let mut local_futures = Vec::with_capacity(local_batches.len());
+        for (shard_id, batch) in local_batches {
+            let shard = self.shards.get(&shard_id).cloned();
+            let index_name = index.to_string();
+
+            local_futures.push(async move {
+                tracing::debug!(
+                    shard_id = %shard_id,
+                    count = batch.len(),
+                    "Processing bulk write batch for local shard"
+                );
+
+                // Kept so a failure can name every document it took down with it.
+                let positions: Vec<usize> = batch.iter().map(|placed| placed.position).collect();
+
+                let outcome = async {
+                    let shard = shard.ok_or_else(|| {
+                        OrchestratorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Local shard {} not found", shard_id),
+                        ))
+                    })?;
+
+                    let docs: Vec<DocPayload> = batch
+                        .into_iter()
+                        .map(|placed| DocPayload {
+                            id: placed.doc.id,
+                            routing_key: placed.routing_key,
+                            doc: placed.doc.doc,
+                        })
+                        .collect();
+
+                    // Each shard handles its own writes serially via its dedicated writer thread
+                    // This prevents IndexWriter lock contention within the same shard
+                    shard
+                        .handle_batch_write(BatchWriteRequest {
+                            index: index_name,
+                            docs,
+                        })
+                        .await
+                }
+                .await;
+
+                (shard_id, positions, outcome)
+            });
+        }
+
+        let local_results = futures::future::join_all(local_futures).await;
+        for (shard_id, positions, outcome) in local_results {
+            match outcome {
+                Ok(seq_ids) => {
+                    tracing::info!(
+                        shard_id = %shard_id,
+                        written_count = seq_ids.len(),
+                        "Local shard batch completed successfully"
+                    );
+                    total_written += seq_ids.len();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        shard_id = %shard_id,
+                        count = positions.len(),
+                        error = %e,
+                        "Local shard batch processing failed"
+                    );
+                    all_errors.extend(positions.into_iter().map(|position| {
+                        format!("document {position}: shard {shard_id} did not take the batch this document was in: {e}")
+                    }));
+                }
+            }
+        }
+
+        tracing::info!(
+            "Local shard processing completed - total_written: {}, errors: {}",
+            total_written,
+            all_errors.len()
+        );
+
+        // Commit strategy: rely on the two existing commit mechanisms:
+        //   1. Threshold-based commit inside apply_batch_and_maybe_commit (writer thread)
+        //      — fires during the batch if enough ops accumulate.
+        //   2. Supervisor idle-timeout commit (signal_supervisor called by handle_batch_write)
+        //      — fires after the batch completes and no more writes arrive.
+        //
+        // No explicit commit here: it would be redundant with #1 (if threshold fired)
+        // or premature (if the caller is about to send more batches). The supervisor
+        // guarantees data is committed within the idle timeout window.
+
+        Ok((total_written, all_errors))
+    }
+
+    /// Forward a bulk batch to a remote node's orchestrator.
+    ///
+    /// Returns what the peer wrote and a reason for every document it did not. The peer's own
+    /// reasons used to be read off the response and thrown away — only `items_written` was kept
+    /// — so a node refusing half a batch contributed nothing to `errors`, and the coordinating
+    /// node answered 200 with a shortfall it could not explain.
+    ///
+    /// Uses the cached RemotePeerPool to avoid repeated swarm registry lookups.
+    async fn forward_write(
+        &self,
+        node_id: Uuid,
+        peer_addr: &str,
+        index: &str,
+        batch: Vec<Placed>,
+        established: &IndexSchema,
+    ) -> Result<(usize, Vec<String>), OrchestratorError> {
+        info!(
+            "🔎 Forwarding bulk batch to remote: node_id={}, addr={}, docs={}",
+            node_id,
+            peer_addr,
+            batch.len()
+        );
+
+        let positions: Vec<usize> = batch.iter().map(|placed| placed.position).collect();
+        let docs: Vec<DocPayload> = batch
+            .into_iter()
+            .map(|placed| DocPayload {
+                id: placed.doc.id,
+                routing_key: placed.routing_key,
+                doc: placed.doc.doc,
+            })
+            .collect();
+
+        let pool = self.remote_peer_pool.ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::other("Remote peer pool not initialized"))
+        })?;
+
+        let remote = pool
+            .get_orchestrator(node_id, ConnectionChannel::Operations)
+            .await
+            .map_err(|e| {
+                warn!("❌ Remote actor lookup error: {}", e);
+                OrchestratorError::Io(std::io::Error::other(e.to_string()))
+            })?
+            .ok_or_else(|| {
+                OrchestratorError::Io(std::io::Error::other(format!(
+                    "Remote orchestrator for node {} not found",
+                    node_id
+                )))
+            })?;
+
+        // One bit, and no schema. `forwarded` tells the owner this share is someone else's
+        // decision, so it neither samples nor canvasses; if it holds nothing to run the share
+        // against it says so, and the resend below carries the body. Nothing about the schema
+        // travels on a forward that does not need it.
+        let op = ClientOp::BulkWrite {
+            index: index.to_string(),
+            docs,
+            forwarded: true,
+            schema_body: None,
+        };
+
+        let answer = match remote_answer(remote.ask(&op).await) {
+            Err(err) if matches!(err.verdict(), RemoteVerdict::SchemaRequired) => {
+                let Some(resend) = with_schema_body(&op, established) else {
+                    return Err(err);
+                };
+                debug!(
+                    %node_id,
+                    "Peer holds no schema for this index; resending the batch with the schema"
+                );
+                remote_answer(remote.ask(&resend).await)
+            }
+            other => other,
+        };
+        let res: serde_json::Value = answer?;
+
+        let Some(items_written) = res.get("items_written").and_then(|v| v.as_u64()) else {
+            return Err(OrchestratorError::Io(std::io::Error::other(
+                "Invalid response from remote bulk write",
+            )));
+        };
+        let written = (items_written as usize).min(positions.len());
+
+        let reasons: Vec<String> = res
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok((
+            written,
+            remote_rejections(node_id, &positions, written, &reasons),
+        ))
+    }
+
+    /// Hand a peer the part of a bulk delete its shards own.
+    async fn forward_delete(
+        &self,
+        node_id: Uuid,
+        peer_addr: &str,
+        index: &str,
+        docs: Vec<DeletePayload>,
+    ) -> Result<(usize, Vec<String>), OrchestratorError> {
+        debug!(
+            %node_id,
+            %peer_addr,
+            count = docs.len(),
+            "Forwarding bulk delete batch to remote node"
+        );
+
+        let pool = self.remote_peer_pool.ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::other("Remote peer pool not initialized"))
+        })?;
+
+        let remote = pool
+            .get_orchestrator(node_id, ConnectionChannel::Operations)
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+            .ok_or_else(|| {
+                OrchestratorError::Io(std::io::Error::other(format!(
+                    "Remote orchestrator for node {} not found",
+                    node_id
+                )))
+            })?;
+
+        // Kept so the peer's answer can be balanced against what it was actually given.
+        let ids: Vec<String> = docs.iter().map(|doc| doc.id().to_string()).collect();
+
+        let op = ClientOp::BulkDelete {
+            index: index.to_string(),
+            docs,
+            // One hop. If the peer cannot place these either, it says so per id rather than
+            // handing them on again.
+            forwarded: true,
+        };
+
+        let answer: JsonValue = remote_answer(remote.ask(&op).await)?;
+
+        let deleted = (answer
+            .get("items_deleted")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize)
+            .min(ids.len());
+
+        let reasons: Vec<String> = answer
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !reasons.is_empty() {
+            warn!(
+                %node_id,
+                error_count = reasons.len(),
+                "Remote node reported errors deleting its share of the batch"
+            );
+        }
+
+        // Its reasons are the caller's reasons too. They used to be logged here and dropped,
+        // so a peer that refused half its share was reported as a shortfall in `items_deleted`
+        // with nothing to explain it — the caller could see that fewer ids were deleted than it
+        // sent and could not learn which, or why. ROADMAP OB9.
+        Ok((
+            deleted,
+            remote_delete_rejections(node_id, &ids, deleted, &reasons),
+        ))
+    }
+}
 
 /// Type alias for single write commands enqueued in the writer thread
 type WriteCommand = (WalOp, tokio::sync::oneshot::Sender<Result<u64, StoreError>>);
@@ -2729,6 +3560,18 @@ enum DeleteOutcome {
     },
 }
 
+/// The engine's verdict on a bulk write, before it becomes a [`WorkerOutcome`].
+enum BulkOutcome {
+    Done(JsonValue),
+    /// The schema has to be written — the index is still unsettled, or a document carries a
+    /// field it does not know. Writing a schema is the actor's, serially: two bulks evolving
+    /// the same index at once is exactly what the mailbox keeps from happening. The batch
+    /// travels back whole so `execute` can rebuild the op without a clone.
+    NeedsActor {
+        docs: Vec<DocPayload>,
+    },
+}
+
 /// A job dispatched to the orchestrator worker pool.
 /// Workers execute the operation on shared state and send the result
 /// back via the oneshot channel, bypassing the actor mailbox.
@@ -3394,6 +4237,8 @@ struct DispatchCounters {
     service_ewma_read_us: AtomicU64,
     /// Dequeue-to-answer EWMA for writes (`Write`, `Delete`). See `service_ewma_us`.
     service_ewma_write_us: AtomicU64,
+    /// Dequeue-to-answer EWMA for bulk ops (`BulkWrite`, `BulkDelete`). See `OpClass::Bulk`.
+    service_ewma_bulk_us: AtomicU64,
     /// Dequeue-to-answer distribution, for lanes that admit against a tail rather than a mean.
     /// Fed by the same samples as the EWMAs above; read only where `tail_aware` is set.
     service_hist: ServiceHistogram,
@@ -3412,6 +4257,7 @@ impl Default for DispatchCounters {
             service_ewma_us: AtomicU64::new(0),
             service_ewma_read_us: AtomicU64::new(0),
             service_ewma_write_us: AtomicU64::new(0),
+            service_ewma_bulk_us: AtomicU64::new(0),
             service_hist: ServiceHistogram::new(),
         }
     }
@@ -3427,6 +4273,7 @@ impl DispatchCounters {
         match class {
             OpClass::Read => Self::fold_ewma(&self.service_ewma_read_us, sample_us),
             OpClass::Write => Self::fold_ewma(&self.service_ewma_write_us, sample_us),
+            OpClass::Bulk => Self::fold_ewma(&self.service_ewma_bulk_us, sample_us),
             OpClass::Any => {}
         }
     }
@@ -3469,6 +4316,7 @@ impl DispatchCounters {
         let class_estimate = match class {
             OpClass::Read => self.service_ewma_read_us.load(AtomicOrdering::Relaxed),
             OpClass::Write => self.service_ewma_write_us.load(AtomicOrdering::Relaxed),
+            OpClass::Bulk => self.service_ewma_bulk_us.load(AtomicOrdering::Relaxed),
             OpClass::Any => 0,
         };
         if class_estimate != 0 {
@@ -4114,7 +4962,6 @@ pub struct OrchestratorEngine {
     /// with whichever index of that shape was cached last — see `IndexSchema::calculate_fingerprint`.
     pub schema_cache: Arc<ArcSwap<HashMap<String, Arc<IndexSchema>>>>,
     /// Coordinator actor reference for shard assignments and peer lookups.
-    #[allow(dead_code)] // Used when bulk write is moved to engine
     pub coordinator: Option<ActorRef<ClusterCoordinator>>,
     /// Node identity for response metadata, and the answer to `GetIdentity`.
     pub identity: NodeIdentity,
@@ -4122,7 +4969,6 @@ pub struct OrchestratorEngine {
     pub default_search_limit: usize,
     pub max_concurrent_shard_searches: usize,
     /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups.
-    #[allow(dead_code)] // Used when bulk write is moved to engine
     pub remote_peer_pool: Arc<RemotePeerPool>,
 }
 
@@ -4319,9 +5165,32 @@ impl OrchestratorEngine {
                 }
                 Err(err) => WorkerOutcome::Done(Err(err)),
             },
-            // Bulk writes need `staged_schema_validation`, parallel routing and remote
-            // forwarding; config and metadata ops are lightweight and rare. Both belong on
-            // the actor, which owns the state they touch.
+            ClientOp::BulkWrite {
+                index,
+                docs,
+                forwarded,
+                schema_body,
+            } => match self.engine_bulk_write(&index, docs, forwarded).await {
+                Ok(BulkOutcome::Done(value)) => WorkerOutcome::Done(Ok(value)),
+                Ok(BulkOutcome::NeedsActor { docs }) => {
+                    WorkerOutcome::UseActor(Box::new(ClientOp::BulkWrite {
+                        index,
+                        docs,
+                        // Whichever hop this is, handing the op to the actor is not another one —
+                        // and the actor re-decides the schema on the terms it arrived with.
+                        forwarded,
+                        schema_body,
+                    }))
+                }
+                Err(err) => WorkerOutcome::Done(Err(err)),
+            },
+            // A delete carries no document, so no delete can ever need a schema written —
+            // there is no slow path to defer to, and this always answers.
+            ClientOp::BulkDelete {
+                index,
+                docs,
+                forwarded,
+            } => WorkerOutcome::Done(self.engine_bulk_delete(&index, docs, forwarded).await),
             // Served here rather than on the actor so that "who is this node" cannot queue
             // behind a bulk write holding the mailbox for its whole duration (ROADMAP CH12).
             // It reads an identity that never changes and a shard count from an ArcSwap, so
@@ -4479,6 +5348,119 @@ impl OrchestratorEngine {
             "version": sequence,
             "shard_id": target.to_string(),
         })))
+    }
+
+    /// Fast-path bulk write: validate against the schema as it stands, then fan out.
+    ///
+    /// What the engine cannot do is *decide* a schema — `staged_schema_validation` evolves or
+    /// creates one under the actor's serial mailbox, and two bulks growing one index at once
+    /// is exactly what that serialisation is for. A batch that needs it — an unsettled index,
+    /// or a document carrying a field the schema does not know — goes back whole on
+    /// [`BulkOutcome::NeedsActor`]. Validation is still run first rather than scanned for, so
+    /// the deferral carries the same cost a single write's does: the actor re-validates either
+    /// way.
+    ///
+    /// Everything past validation — routing, grouping, the one-hop forwarding bound, per-item
+    /// accounting — is [`BulkCtx::apply_bulk_write`], the body the actor runs on the same
+    /// terms, so the mailbox path and this one cannot drift.
+    async fn engine_bulk_write(
+        &self,
+        index: &str,
+        docs: Vec<DocPayload>,
+        forwarded: bool,
+    ) -> Result<BulkOutcome, OrchestratorError> {
+        let start = std::time::Instant::now();
+        let shards = self.shards.load_full();
+        if shards.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards",
+            )));
+        }
+
+        let schema = self.load_schema(index).await?;
+        // An empty or dropped schema is an index whose shape is still being settled — the
+        // actor's staged validation samples and canvasses to decide it, which is a schema
+        // write and therefore not this lane's.
+        if schema.fields.is_empty() || schema.state == storage::SchemaState::Dropped {
+            return Ok(BulkOutcome::NeedsActor { docs });
+        }
+
+        let (results, docs) = NodeOrchestrator::parallel_validate_schema(docs, &schema).await?;
+        if results.iter().any(|result| result.needs_evolution) {
+            return Ok(BulkOutcome::NeedsActor { docs });
+        }
+
+        // The same refusal assembly the actor's head builds: validation failures are reasons
+        // against their positions, the rest carry their position on into routing.
+        let mut rejections: Vec<String> = Vec::new();
+        let mut refused = HashSet::new();
+        for (position, result) in results.iter().enumerate() {
+            if let Some(err) = &result.validation_error {
+                rejections.push(format!("document {position}: {err}"));
+                refused.insert(position);
+            }
+        }
+        if !rejections.is_empty() {
+            tracing::warn!(
+                index = %index,
+                error_count = refused.len(),
+                total_docs = docs.len(),
+                "Some documents failed schema validation and were not written"
+            );
+        }
+
+        let pending: Vec<Placed> = docs
+            .into_iter()
+            .enumerate()
+            .filter(|(position, _)| !refused.contains(position))
+            .map(|(position, doc)| Placed {
+                position,
+                doc,
+                routing_key: None,
+            })
+            .collect();
+
+        let ring = self.routing_ring.load_full();
+        let ctx = BulkCtx {
+            shards: &shards,
+            ring: &ring,
+            coordinator: self.coordinator.as_ref(),
+            remote_peer_pool: Some(&self.remote_peer_pool),
+        };
+        ctx.apply_bulk_write(index, pending, rejections, &schema, forwarded, start)
+            .await
+            .map(BulkOutcome::Done)
+    }
+
+    /// Bulk delete. Nothing on this path can change a schema — a delete carries no document
+    /// that could present a field the schema does not know — so unlike the bulk write there
+    /// is no slow path behind it at all: the same shape `engine_delete` already has.
+    async fn engine_bulk_delete(
+        &self,
+        index: &str,
+        docs: Vec<DeletePayload>,
+        forwarded: bool,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let start = std::time::Instant::now();
+        let shards = self.shards.load_full();
+        if shards.is_empty() {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shards",
+            )));
+        }
+
+        let schema = self.load_schema(index).await?;
+        let ring = self.routing_ring.load_full();
+        let ctx = BulkCtx {
+            shards: &shards,
+            ring: &ring,
+            coordinator: self.coordinator.as_ref(),
+            remote_peer_pool: Some(&self.remote_peer_pool),
+        };
+        ctx.apply_bulk_delete(index, docs, &schema, forwarded, start)
+            .await
     }
 
     /// Parallel scatter-gather search across all local shards.
@@ -6725,13 +7707,15 @@ pub struct RouterActor {
     /// because the ask was the cost — measured at one mailbox round trip per *keyless*
     /// operation, which is every ordinary search, every streaming search and `GET /_indexes`.
     clustered: bool,
-    /// The backlog gate for the actor-mailbox lane — bulk writes, config and metadata.
+    /// The backlog gate for the actor-mailbox lane — deferred bulk writes, config and metadata.
     ///
     /// F7 gated the worker pool and left this lane open, which measured as its whole original
     /// failure surviving intact: under a bulk ingest at twice capacity the node served **0 ok/s
     /// and wrote 0 documents**, every request a 408, and `refused_at_admission` and `abandoned`
-    /// both at **0** — no gate refused anything, because `BulkWrite` is not worker-eligible and
-    /// so never raises the depth the door judges on (ROADMAP F8).
+    /// both at **0** — no gate refused anything, because `BulkWrite` was not worker-eligible
+    /// and so never raised the depth the door judges on (ROADMAP F8). Bulk ops are
+    /// worker-eligible now, but the lane still needs its gate: a bulk write that has to decide
+    /// a schema comes back through `ask_orchestrator`, and that ask must not queue unbounded.
     ///
     /// Its own `QueueLoad` rather than a share of the pool's, for the reason
     /// [`MAILBOX_LANE_WIDTH`] gives. `None` when there is no configured budget to measure
@@ -6843,9 +7827,11 @@ impl RouterActor {
 
     /// Handles client operations.
     ///
-    /// Hot-path ops (Write, Search, Stream) are dispatched to the worker pool
-    /// for concurrent processing, bypassing the actor mailbox.
-    /// Other ops (BulkWrite, config, metadata) go through the actor mailbox.
+    /// Hot-path ops (Write, Search, Stream) and the bulk fan-outs are dispatched to the
+    /// worker pool for concurrent processing, bypassing the actor mailbox. What still goes
+    /// through the mailbox is what needs `&mut NodeOrchestrator`: config and metadata ops,
+    /// and the ops a worker handed back because they need a schema written or a remote shard
+    /// forwarded to.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn handle_client_op(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
         // Try worker pool for hot-path ops
@@ -6856,6 +7842,12 @@ impl RouterActor {
                     | ClientOp::Delete { .. }
                     | ClientOp::Search { .. }
                     | ClientOp::Stream { .. }
+                    // Bulk ops fan out over the same snapshots the rest of the engine reads.
+                    // What they cannot do off the mailbox is *decide* a schema — a bulk write
+                    // that needs one written hands itself back as `UseActor`, which is the
+                    // fast/slow split the single-write path already uses.
+                    | ClientOp::BulkWrite { .. }
+                    | ClientOp::BulkDelete { .. }
                     // A metadata read with no actor state behind it. On the mailbox it queued
                     // behind whatever write was there; the pool answers it from an ArcSwap.
                     | ClientOp::GetIdentity
@@ -8804,7 +9796,7 @@ impl NodeOrchestrator {
         // Stage 1: Parallel validation (read-only). The batch goes in by value and comes back
         // beside the verdicts; nothing downstream reads it in between.
         let total_docs = docs.len();
-        let (validation_results, docs) = self.parallel_validate_schema(docs, schema_cache).await?;
+        let (validation_results, docs) = Self::parallel_validate_schema(docs, schema_cache).await?;
 
         // Stage 2: Aggregate results and identify evolution needs
         let mut summary = SchemaValidationSummary {
@@ -8874,7 +9866,6 @@ impl NodeOrchestrator {
     /// write, to run read-only checks over it. Moving it in and out costs a `Vec` of pointers
     /// either way and copies nothing.
     async fn parallel_validate_schema(
-        &self,
         docs: Vec<DocPayload>,
         schema_cache: &IndexSchema,
     ) -> Result<(Vec<SchemaValidationResult>, Vec<DocPayload>), OrchestratorError> {
@@ -9122,231 +10113,6 @@ impl NodeOrchestrator {
         }
 
         Ok(())
-    }
-
-    /// Process local shard batches sequentially, relying on actor message queues for proper isolation.
-    ///
-    /// Each shard actor processes its messages sequentially from its own queue,
-    /// preventing concurrent access to shared storage resources.
-    /// Returns what was written and one reason for every document that was not.
-    ///
-    /// A shard batch succeeds or fails whole — the writer thread applies it in one transaction —
-    /// so a failure loses every document in it. Reported as one error per document rather than
-    /// one per batch: a caller reading `errors` to decide what to retry cannot act on a single
-    /// line standing for five hundred rows, and the count no longer matches what was lost.
-    async fn parallel_local_shard_processing(
-        &self,
-        index: &str,
-        local_batches: HashMap<Uuid, Vec<Placed>>,
-    ) -> Result<(usize, Vec<String>), OrchestratorError> {
-        if local_batches.is_empty() {
-            return Ok((0, Vec::new()));
-        }
-
-        let total_docs: usize = local_batches.values().map(|v| v.len()).sum();
-        let shard_count = local_batches.len();
-
-        tracing::debug!(
-            local_shard_count = shard_count,
-            total_docs = total_docs,
-            "Starting local shard processing"
-        );
-
-        let mut total_written = 0usize;
-        let mut all_errors = Vec::new();
-
-        // Process shards in parallel, but ensure serial access per shard
-        // Each shard has its own Tantivy/Redb instance, so cross-shard parallelism is safe
-        let mut local_futures = Vec::with_capacity(local_batches.len());
-        for (shard_id, batch) in local_batches {
-            let shard = self.shards.get(&shard_id).cloned();
-            let index_name = index.to_string();
-
-            local_futures.push(async move {
-                tracing::debug!(
-                    shard_id = %shard_id,
-                    count = batch.len(),
-                    "Processing bulk write batch for local shard"
-                );
-
-                // Kept so a failure can name every document it took down with it.
-                let positions: Vec<usize> = batch.iter().map(|placed| placed.position).collect();
-
-                let outcome = async {
-                    let shard = shard.ok_or_else(|| {
-                        OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("Local shard {} not found", shard_id),
-                        ))
-                    })?;
-
-                    let docs: Vec<DocPayload> = batch
-                        .into_iter()
-                        .map(|placed| DocPayload {
-                            id: placed.doc.id,
-                            routing_key: placed.routing_key,
-                            doc: placed.doc.doc,
-                        })
-                        .collect();
-
-                    // Each shard handles its own writes serially via its dedicated writer thread
-                    // This prevents IndexWriter lock contention within the same shard
-                    shard
-                        .handle_batch_write(BatchWriteRequest {
-                            index: index_name,
-                            docs,
-                        })
-                        .await
-                }
-                .await;
-
-                (shard_id, positions, outcome)
-            });
-        }
-
-        let local_results = futures::future::join_all(local_futures).await;
-        for (shard_id, positions, outcome) in local_results {
-            match outcome {
-                Ok(seq_ids) => {
-                    tracing::info!(
-                        shard_id = %shard_id,
-                        written_count = seq_ids.len(),
-                        "Local shard batch completed successfully"
-                    );
-                    total_written += seq_ids.len();
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        shard_id = %shard_id,
-                        count = positions.len(),
-                        error = %e,
-                        "Local shard batch processing failed"
-                    );
-                    all_errors.extend(positions.into_iter().map(|position| {
-                        format!("document {position}: shard {shard_id} did not take the batch this document was in: {e}")
-                    }));
-                }
-            }
-        }
-
-        tracing::info!(
-            "Local shard processing completed - total_written: {}, errors: {}",
-            total_written,
-            all_errors.len()
-        );
-
-        // Commit strategy: rely on the two existing commit mechanisms:
-        //   1. Threshold-based commit inside apply_batch_and_maybe_commit (writer thread)
-        //      — fires during the batch if enough ops accumulate.
-        //   2. Supervisor idle-timeout commit (signal_supervisor called by handle_batch_write)
-        //      — fires after the batch completes and no more writes arrive.
-        //
-        // No explicit commit here: it would be redundant with #1 (if threshold fired)
-        // or premature (if the caller is about to send more batches). The supervisor
-        // guarantees data is committed within the idle timeout window.
-
-        Ok((total_written, all_errors))
-    }
-
-    /// Forward a bulk batch to a remote node's orchestrator.
-    ///
-    /// Returns what the peer wrote and a reason for every document it did not. The peer's own
-    /// reasons used to be read off the response and thrown away — only `items_written` was kept
-    /// — so a node refusing half a batch contributed nothing to `errors`, and the coordinating
-    /// node answered 200 with a shortfall it could not explain.
-    ///
-    /// Uses the cached RemotePeerPool to avoid repeated swarm registry lookups.
-    async fn forward_bulk_to_remote(
-        &self,
-        node_id: Uuid,
-        peer_addr: &str,
-        index: &str,
-        batch: Vec<Placed>,
-        established: &IndexSchema,
-    ) -> Result<(usize, Vec<String>), OrchestratorError> {
-        info!(
-            "🔎 Forwarding bulk batch to remote: node_id={}, addr={}, docs={}",
-            node_id,
-            peer_addr,
-            batch.len()
-        );
-
-        let positions: Vec<usize> = batch.iter().map(|placed| placed.position).collect();
-        let docs: Vec<DocPayload> = batch
-            .into_iter()
-            .map(|placed| DocPayload {
-                id: placed.doc.id,
-                routing_key: placed.routing_key,
-                doc: placed.doc.doc,
-            })
-            .collect();
-
-        let pool = self.remote_peer_pool.as_ref().ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::other("Remote peer pool not initialized"))
-        })?;
-
-        let remote = pool
-            .get_orchestrator(node_id, ConnectionChannel::Operations)
-            .await
-            .map_err(|e| {
-                warn!("❌ Remote actor lookup error: {}", e);
-                OrchestratorError::Io(std::io::Error::other(e.to_string()))
-            })?
-            .ok_or_else(|| {
-                OrchestratorError::Io(std::io::Error::other(format!(
-                    "Remote orchestrator for node {} not found",
-                    node_id
-                )))
-            })?;
-
-        // One bit, and no schema. `forwarded` tells the owner this share is someone else's
-        // decision, so it neither samples nor canvasses; if it holds nothing to run the share
-        // against it says so, and the resend below carries the body. Nothing about the schema
-        // travels on a forward that does not need it.
-        let op = ClientOp::BulkWrite {
-            index: index.to_string(),
-            docs,
-            forwarded: true,
-            schema_body: None,
-        };
-
-        let answer = match remote_answer(remote.ask(&op).await) {
-            Err(err) if matches!(err.verdict(), RemoteVerdict::SchemaRequired) => {
-                let Some(resend) = with_schema_body(&op, established) else {
-                    return Err(err);
-                };
-                debug!(
-                    %node_id,
-                    "Peer holds no schema for this index; resending the batch with the schema"
-                );
-                remote_answer(remote.ask(&resend).await)
-            }
-            other => other,
-        };
-        let res: serde_json::Value = answer?;
-
-        let Some(items_written) = res.get("items_written").and_then(|v| v.as_u64()) else {
-            return Err(OrchestratorError::Io(std::io::Error::other(
-                "Invalid response from remote bulk write",
-            )));
-        };
-        let written = (items_written as usize).min(positions.len());
-
-        let reasons: Vec<String> = res
-            .get("errors")
-            .and_then(|v| v.as_array())
-            .map(|errors| {
-                errors
-                    .iter()
-                    .filter_map(|e| e.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok((
-            written,
-            remote_rejections(node_id, &positions, written, &reasons),
-        ))
     }
 
     /// Fetch a schema from cache if present (lock-free).
@@ -10920,14 +11686,10 @@ impl NodeOrchestrator {
 
     /// Remove many documents in one request.
     ///
-    /// The same shape as [`orch_bulk_write`](Self::orch_bulk_write) with the document work taken
-    /// out: route each id, group by shard, hand each local shard one batch and each owning peer
-    /// one forwarded op. What is absent is the point — no schema validation and no evolution,
-    /// because a delete carries nothing that could grow a schema — so the schema is read once,
-    /// for routing, and never written.
-    ///
-    /// An id that cannot be routed is an error against that id, not a failed batch: a batch may
-    /// span tenants, and one id missing its routing key says nothing about the others.
+    /// The schema is read once — for routing — and never written, because a delete carries
+    /// nothing that could grow it. That is what lets the same body run on a worker: this head
+    /// loads the schema and builds the borrowed view, and [`BulkCtx::apply_bulk_delete`] is
+    /// the routing, grouping, forwarding and accounting the worker lane runs unchanged.
     async fn orch_bulk_delete(
         &self,
         index: &str,
@@ -10942,300 +11704,15 @@ impl NodeOrchestrator {
             )));
         }
 
-        let items_received = docs.len();
         let schema = self.load_schema(index).await?;
-
-        let mut errors: Vec<String> = Vec::new();
-        // Local work is a plain list of ids per shard: the routing key has already done its job
-        // by the time a shard is chosen, and the storage layer deletes by key.
-        let mut local_by_shard: HashMap<Uuid, Vec<String>> = HashMap::new();
-        // Ids whose shard this node does not hold, kept with the shard that owns them and
-        // resolved to nodes below — once, and only if there are any. Asking who owns a shard is
-        // a coordinator mailbox round trip, and a single-node deployment never has an answer to
-        // use: every shard it routes to is one it holds.
-        let mut off_node: Vec<(Uuid, DeletePayload)> = Vec::new();
-
-        for payload in docs {
-            let id = payload.id().to_string();
-            if id.trim().is_empty() {
-                errors.push("an entry carried an empty id".to_string());
-                continue;
-            }
-            let routing_key = payload.routing_key().map(str::to_string);
-
-            let key = match effective_delete_routing_key(&schema, &id, routing_key) {
-                Ok(key) => key,
-                Err(err) => {
-                    errors.push(format!("{id}: {err}"));
-                    continue;
-                }
-            };
-
-            let Some(target) = self
-                .select_shard_for_key(&key)
-                .or_else(|| self.first_shard_id())
-            else {
-                errors.push(format!("{id}: no shard available for routing"));
-                continue;
-            };
-
-            if self.shards.contains_key(&target) {
-                local_by_shard.entry(target).or_default().push(id);
-            } else {
-                off_node.push((target, payload));
-            }
-        }
-
-        let mut remote_by_node: HashMap<Uuid, Vec<DeletePayload>> = HashMap::new();
-        if !off_node.is_empty() {
-            let shard_assignments = if let Some(coord) = &self.coordinator {
-                coord.ask(GetShardAssignments).await.unwrap_or_default()
-            } else {
-                HashMap::new()
-            };
-            for (target, payload) in off_node {
-                match shard_assignments.get(&target) {
-                    Some(shard_meta) => remote_by_node
-                        .entry(shard_meta.node_id)
-                        .or_default()
-                        .push(payload),
-                    None => errors.push(format!(
-                        "{}: no shard assignment for shard {target}, so it was not deleted",
-                        payload.id()
-                    )),
-                }
-            }
-        }
-
-        let mut deleted = 0usize;
-
-        // Local shards in parallel, serial within each: every shard has its own writer thread,
-        // and one batch per shard is what makes this one transaction per shard.
-        let local_futures: Vec<_> = local_by_shard
-            .into_iter()
-            .map(|(shard_id, ids)| {
-                let shard = self.shards.get(&shard_id).cloned();
-                let index_name = index.to_string();
-                async move {
-                    // Kept so a failure can name every id it took down with it, as the bulk
-                    // write path keeps its positions for the same reason. One reason for a whole
-                    // shard batch left the answer short by however many ids were in it.
-                    let attributable = ids.clone();
-                    let outcome = async {
-                        let shard = shard.ok_or_else(|| {
-                            OrchestratorError::Io(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                format!("Local shard {shard_id} not found"),
-                            ))
-                        })?;
-                        shard.handle_batch_delete(index_name, ids).await
-                    }
-                    .await;
-                    (shard_id, attributable, outcome)
-                }
-            })
-            .collect();
-
-        for (shard_id, ids, outcome) in futures::future::join_all(local_futures).await {
-            match outcome {
-                Ok(count) => deleted += count,
-                Err(err) => errors.extend(ids.into_iter().map(|id| {
-                    format!("{id}: shard {shard_id} did not take the batch this id was in: {err}")
-                })),
-            }
-        }
-
-        // A batch that was itself forwarded here goes no further. Both ends decide ownership
-        // from their own view of the ring, and while membership changes those views disagree —
-        // two nodes each certain the other owns the shard would otherwise pass the batch back
-        // and forth, a full remote ask carrying every document each time, until something timed
-        // out. Stating the disagreement per id is what `forward_op_to_owner` does for a single
-        // delete; this is the same rule on the path OB3 left open.
-        if forwarded && !remote_by_node.is_empty() {
-            for (node_id, payloads) in std::mem::take(&mut remote_by_node) {
-                errors.extend(payloads.iter().map(|doc| {
-                    format!(
-                        "{}: forwarded here, but this node does not own its shard either. This node \
-                         and node {node_id} disagree about who does; retry once the \
-                         cluster has settled",
-                        doc.id()
-                    )
-                }));
-            }
-        }
-
-        // Peers that own the rest.
-        if !remote_by_node.is_empty() {
-            let peer_addrs: HashMap<Uuid, String> = if let Some(coord) = &self.coordinator {
-                coord
-                    .ask(GetKnownPeers)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|peer| (peer.node_id, peer.address))
-                    .collect()
-            } else {
-                HashMap::new()
-            };
-
-            let mut remote_futures = Vec::new();
-            for (node_id, payloads) in remote_by_node {
-                match peer_addrs.get(&node_id) {
-                    Some(addr) => {
-                        let addr = addr.clone();
-                        remote_futures.push(async move {
-                            // Kept so a call that never reached the node can still name what it
-                            // carried.
-                            let ids: Vec<String> =
-                                payloads.iter().map(|doc| doc.id().to_string()).collect();
-                            let outcome = self
-                                .forward_bulk_delete_to_remote(node_id, &addr, index, payloads)
-                                .await;
-                            (node_id, ids, outcome)
-                        });
-                    }
-                    // One reason per id rather than one for the group: the group is not what the
-                    // caller sent or counts in.
-                    None => errors.extend(payloads.iter().map(|doc| {
-                        format!(
-                            "{}: no address known for node {node_id}, which owns its shard",
-                            doc.id()
-                        )
-                    })),
-                }
-            }
-
-            for (node_id, ids, outcome) in futures::future::join_all(remote_futures).await {
-                match outcome {
-                    Ok((count, reasons)) => {
-                        deleted += count;
-                        errors.extend(reasons);
-                    }
-                    // The batch never got an answer, so none of it was deleted.
-                    Err(err) => errors.extend(
-                        ids.into_iter()
-                            .map(|id| format!("{id}: forwarding to node {node_id} failed: {err}")),
-                    ),
-                }
-            }
-        }
-
-        // Every id is either deleted or explained, as on the bulk write path. Each path above
-        // accounts for what it loses, so this is a check on that rather than a repair — a batch
-        // that reaches here unbalanced has a path that stopped saying what it dropped, which is
-        // the defect this arithmetic exists to catch.
-        //
-        // Asserted in a debug build and logged in a release one: the assertion makes an
-        // unaccounting path a test failure, the log makes it findable in the build that actually
-        // serves the caller the unbalanced answer.
-        debug_assert_eq!(
-            deleted + errors.len(),
-            items_received,
-            "a bulk delete must account for every id it received"
-        );
-        if deleted + errors.len() != items_received {
-            error!(
-                index = %index,
-                items_received = items_received,
-                items_deleted = deleted,
-                errors = errors.len(),
-                "BulkDelete did not account for every id it received"
-            );
-        }
-
-        let duration = start.elapsed();
-        info!(
-            index = %index,
-            items_received = items_received,
-            items_deleted = deleted,
-            errors = errors.len(),
-            duration_ms = duration.as_millis(),
-            "BulkDelete completed"
-        );
-
-        Ok(serde_json::json!({
-            "items_received": items_received,
-            "items_deleted": deleted,
-            "errors": errors,
-            "duration_ms": duration.as_millis(),
-        }))
-    }
-
-    /// Hand a peer the part of a bulk delete its shards own.
-    async fn forward_bulk_delete_to_remote(
-        &self,
-        node_id: Uuid,
-        peer_addr: &str,
-        index: &str,
-        docs: Vec<DeletePayload>,
-    ) -> Result<(usize, Vec<String>), OrchestratorError> {
-        debug!(
-            %node_id,
-            %peer_addr,
-            count = docs.len(),
-            "Forwarding bulk delete batch to remote node"
-        );
-
-        let pool = self.remote_peer_pool.as_ref().ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::other("Remote peer pool not initialized"))
-        })?;
-
-        let remote = pool
-            .get_orchestrator(node_id, ConnectionChannel::Operations)
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-            .ok_or_else(|| {
-                OrchestratorError::Io(std::io::Error::other(format!(
-                    "Remote orchestrator for node {node_id} not found"
-                )))
-            })?;
-
-        // Kept so the peer's answer can be balanced against what it was actually given.
-        let ids: Vec<String> = docs.iter().map(|doc| doc.id().to_string()).collect();
-
-        let op = ClientOp::BulkDelete {
-            index: index.to_string(),
-            docs,
-            // One hop. If the peer cannot place these either, it says so per id rather than
-            // handing them on again.
-            forwarded: true,
+        let ctx = BulkCtx {
+            shards: &self.shards,
+            ring: &self.routing_ring,
+            coordinator: self.coordinator.as_ref(),
+            remote_peer_pool: self.remote_peer_pool.as_deref(),
         };
-
-        let answer: JsonValue = remote_answer(remote.ask(&op).await)?;
-
-        let deleted = (answer
-            .get("items_deleted")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize)
-            .min(ids.len());
-
-        let reasons: Vec<String> = answer
-            .get("errors")
-            .and_then(|v| v.as_array())
-            .map(|errors| {
-                errors
-                    .iter()
-                    .filter_map(|e| e.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if !reasons.is_empty() {
-            warn!(
-                %node_id,
-                error_count = reasons.len(),
-                "Remote node reported errors deleting its share of the batch"
-            );
-        }
-
-        // Its reasons are the caller's reasons too. They used to be logged here and dropped,
-        // so a peer that refused half its share was reported as a shortfall in `items_deleted`
-        // with nothing to explain it — the caller could see that fewer ids were deleted than it
-        // sent and could not learn which, or why. ROADMAP OB9.
-        Ok((
-            deleted,
-            remote_delete_rejections(node_id, &ids, deleted, &reasons),
-        ))
+        ctx.apply_bulk_delete(index, docs, &schema, forwarded, start)
+            .await
     }
 
     /// Forward a single write or delete to the node that owns `target`, and return its answer.
@@ -11320,6 +11797,17 @@ impl NodeOrchestrator {
         }
     }
 
+    /// Write many documents in one request — the slow half of the bulk-write path.
+    ///
+    /// Reached on the mailbox when the batch has a schema question to answer: the engine
+    /// serves the settled case itself and hands back `NeedsActor` the moment a batch needs a
+    /// schema written, because writing one is serialised here — two bulks evolving one index
+    /// at once is what the mailbox keeps from happening. It is also where a peer's forwarded
+    /// share arrives, since `forwarded`/`schema_body` are the terms [`staged_schema_validation`]
+    /// decides on.
+    ///
+    /// Once validation is settled the fan-out is [`BulkCtx::apply_bulk_write`], the same body
+    /// the worker lane runs.
     async fn orch_bulk_write(
         &self,
         index: &str,
@@ -11354,9 +11842,6 @@ impl NodeOrchestrator {
         if validation_summary.evolution_needed || self.get_cached_schema(index).is_none() {
             self.put_cached_schema(index, &schema_cache);
         }
-
-        // Group documents by target shard using parallel routing for better performance
-        let items_received = docs.len();
 
         // Documents that failed validation are dropped, and their reasons travel to the caller
         // in the response's `errors`. Rejecting the whole batch is the other defensible policy
@@ -11399,267 +11884,17 @@ impl NodeOrchestrator {
             })
             .collect();
 
-        // First, route all documents to determine local vs remote
-        let mut local_docs = Vec::new();
-        let mut remote_docs = Vec::new();
-
-        // Clone routing ring for parallel access
-        let routing_ring = self.routing_ring.clone();
-        let first_shard_id = self.first_shard_id();
-
-        // Schema-based routing: use routing field from schema instead of per-document routing_key
-        let routing_field = schema_cache.get_routing_field().to_string();
-
-        // Route documents in parallel
-        let routing_results: Vec<RoutingResult> = tokio::task::spawn_blocking(move || {
-            pending
-                .into_par_iter()
-                .map(|mut placed| {
-                    // The same ladder every other write path climbs, resolved against the
-                    // routing field this batch already looked up once.
-                    placed.routing_key = routing_key_for(
-                        &routing_field,
-                        placed.doc.routing_key.clone(),
-                        &placed.doc.id,
-                        &placed.doc.doc,
-                    );
-
-                    // Route to shard using consistent hash ring
-                    let Some(key) = placed.routing_key.as_ref() else {
-                        return Err((
-                            placed.position,
-                            "no routing key could be derived for this document".to_string(),
-                        ));
-                    };
-                    let Some(target_shard) = routing_ring.get_owner(key).or(first_shard_id) else {
-                        return Err((
-                            placed.position,
-                            "no shard is available to route this document to".to_string(),
-                        ));
-                    };
-
-                    Ok((placed, target_shard))
-                })
-                .collect::<Vec<RoutingResult>>()
-        })
-        .await
-        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-
-        // Separate local and remote documents. A document that routes nowhere is refused rather
-        // than logged and forgotten: it was received, it will not be written, and the response
-        // has to say so or the counts stop adding up.
-        for result in routing_results {
-            match result {
-                Ok((placed, target_shard)) => {
-                    if self.shards.contains_key(&target_shard) {
-                        local_docs.push((placed, target_shard));
-                    } else {
-                        remote_docs.push((placed, target_shard));
-                    }
-                }
-                Err((position, reason)) => {
-                    tracing::warn!(position, reason, "Routing error");
-                    rejections.push(format!("document {position}: {reason}"));
-                }
-            }
-        }
-
-        // Group local documents by shard
-        let batches = Self::group_local_documents(local_docs);
-        let unique_shards = batches.len();
-
-        tracing::debug!(
-            items_received = items_received,
-            unique_shards = unique_shards,
-            remote_docs = remote_docs.len(),
-            "BulkWrite grouped items by shard"
-        );
-
-        // Who owns a shard, and where that node is — asked only if some document actually
-        // routed off this node.
-        //
-        // A batch that was itself forwarded here goes no further, for the reason
-        // `forward_op_to_owner` gives for a single write: two nodes whose views of the ring
-        // disagree would otherwise pass it between them, carrying every document each time,
-        // until something timed out. This op has carried `forwarded` since OB12 and only the
-        // schema decision ever read it.
-        //
-        // Ahead of the shard-assignment lookup below, so a batch that is going to be refused
-        // does not ask the coordinator who owns what first.
-        if forwarded && !remote_docs.is_empty() {
-            rejections.extend(std::mem::take(&mut remote_docs).into_iter().map(
-                |(placed, target_shard)| {
-                    format!(
-                        "document {}: forwarded here, but shard {target_shard} is not local \
-                         either. This node and the one that forwarded disagree about who owns \
-                         it; retry once the cluster has settled",
-                        placed.doc.id
-                    )
-                },
-            ));
-        }
-
-        // Both maps are read in the remote branch below and nowhere else: the local/remote split
-        // above uses `self.shards`, which this node already holds. Fetching them up front cost
-        // two coordinator mailbox round trips on **every** bulk write, including every bulk write
-        // on a single-node deployment, where the answer is always "everything is local". The
-        // delete path next door already asked for its peers lazily; this is the same shape.
-        let (shard_assignments, peer_addrs) = if remote_docs.is_empty() {
-            (HashMap::new(), HashMap::new())
-        } else if let Some(coord) = &self.coordinator {
-            let assignments = coord.ask(GetShardAssignments).await.unwrap_or_default();
-            let addrs: HashMap<Uuid, String> = coord
-                .ask(GetKnownPeers)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|p| (p.node_id, p.address))
-                .collect();
-            (assignments, addrs)
-        } else {
-            (HashMap::new(), HashMap::new())
+        // From here the body is the one the worker lane runs too — same grouping, same one-hop
+        // bound, same accounting — so it is written once, against the borrowed view `BulkCtx`
+        // names.
+        let ctx = BulkCtx {
+            shards: &self.shards,
+            ring: &self.routing_ring,
+            coordinator: self.coordinator.as_ref(),
+            remote_peer_pool: self.remote_peer_pool.as_deref(),
         };
-
-        // Separate local and remote batches for parallel processing
-        let mut local_batches = HashMap::new();
-        let mut remote_batches = Vec::new();
-        let mut written = 0usize;
-        // Seeded with the documents validation refused, so the response accounts for every
-        // item it received: `items_written` counts what was stored, and each of the rest has a
-        // reason here.
-        let mut errors = rejections;
-
-        // Process local batches from parallel routing
-        for (shard_id, batch) in batches {
-            local_batches.insert(shard_id, batch);
-        }
-
-        // Group remote documents by owning node
-        let mut remote_by_node: HashMap<Uuid, Vec<Placed>> = HashMap::new();
-        for (placed, target_shard) in remote_docs {
-            match shard_assignments.get(&target_shard) {
-                Some(shard_meta) => remote_by_node
-                    .entry(shard_meta.node_id)
-                    .or_default()
-                    .push(placed),
-                None => errors.push(format!(
-                    "document {}: shard {target_shard} owns this document and no node claims \
-                     that shard",
-                    placed.position
-                )),
-            }
-        }
-
-        // Convert remote batches to the expected format
-        for (node_id, batch) in remote_by_node {
-            match peer_addrs.get(&node_id) {
-                Some(addr) => {
-                    tracing::debug!(
-                        node = %node_id,
-                        count = batch.len(),
-                        "Forwarding bulk write batch to remote node"
-                    );
-                    remote_batches.push((node_id, addr.clone(), batch));
-                }
-                None => errors.extend(batch.iter().map(|placed| {
-                    format!(
-                        "document {}: node {node_id} owns this document and has no known address",
-                        placed.position
-                    )
-                })),
-            }
-        }
-
-        // Phase 3.1: Parallel Local Shard Processing
-        let (local_written, local_errors) = self
-            .parallel_local_shard_processing(index, local_batches)
-            .await?;
-        written += local_written;
-        errors.extend(local_errors);
-
-        // Phase 3.2: Parallel Remote Forwarding
-        if !remote_batches.is_empty() {
-            use futures::future::join_all;
-
-            // Borrowed once, outside: a shared reference is `Copy`, so each `async move`
-            // below takes the reference and not the schema.
-            let established: &IndexSchema = &schema_cache;
-            let remote_futures: Vec<_> = remote_batches
-                .into_iter()
-                .map(|(node_id, addr, batch)| async move {
-                    // Kept so a call that never reached the node can still name what it carried.
-                    let positions: Vec<usize> =
-                        batch.iter().map(|placed| placed.position).collect();
-                    let outcome = self
-                        .forward_bulk_to_remote(node_id, &addr, index, batch, established)
-                        .await;
-                    (node_id, positions, outcome)
-                })
-                .collect();
-
-            let remote_results = join_all(remote_futures).await;
-
-            for (node_id, positions, outcome) in remote_results {
-                match outcome {
-                    Ok((items, reasons)) => {
-                        written += items;
-                        errors.extend(reasons);
-                    }
-                    // The batch never got an answer, so none of it was written.
-                    Err(e) => errors.extend(positions.into_iter().map(|position| {
-                        format!("document {position}: forwarding to node {node_id} failed: {e}")
-                    })),
-                }
-            }
-        }
-
-        // Every item is either written or explained. Each path above accounts for what it
-        // loses, so this is a check on that rather than a repair — a batch that reaches here
-        // unbalanced has a path that stopped saying what it dropped, which is the defect this
-        // arithmetic exists to catch.
-        //
-        // Asserted in a debug build and logged in a release one. The assertion is what makes an
-        // unaccounting path a test failure; the log is what makes it findable in the build that
-        // actually serves the caller the unbalanced answer.
-        debug_assert_eq!(
-            written + errors.len(),
-            items_received,
-            "a bulk write must account for every item it received"
-        );
-        if written + errors.len() != items_received {
-            error!(
-                index = %index,
-                items_received = items_received,
-                items_written = written,
-                errors = errors.len(),
-                "BulkWrite did not account for every item it received"
-            );
-        }
-
-        let duration = start.elapsed();
-        info!(
-            index = %index,
-            items_received = items_received,
-            items_written = written,
-            errors = errors.len(),
-            duration_ms = duration.as_millis(),
-            "BulkWrite completed"
-        );
-
-        if !errors.is_empty() {
-            warn!(
-                index = %index,
-                error_count = errors.len(),
-                "BulkWrite had some errors"
-            );
-        }
-
-        Ok(serde_json::json!({
-            "items_written": written,
-            "items_received": items_received,
-            "errors": errors,
-            "duration_ms": duration.as_millis()
-        }))
+        ctx.apply_bulk_write(index, pending, rejections, &schema_cache, forwarded, start)
+            .await
     }
 
     /// Helper method to group local documents by shard
@@ -13352,7 +13587,34 @@ mod tests {
     /// index with no schema used to reach the client as a 500.
     #[tokio::test]
     async fn an_op_the_engine_declines_comes_back_whole() {
+        let dir = tempfile::tempdir().expect("temp dir");
         let engine = bare_engine();
+
+        // A shard in the map is what takes the op past the "no shards" refusal to the schema
+        // question. Never started, so nothing behind it runs: the unsettled index it cannot
+        // serve is what defers.
+        let shard_id = Uuid::new_v4();
+        let shard = MicroshardActor::new(
+            shard_id,
+            writer_test_config(dir.path().to_path_buf()),
+            ShardRuntime {
+                default_search_limit: 10,
+                read_pool_handle: None,
+                read_pool_health: None,
+                read_budget: None,
+                total_shards: 1,
+                writer_shutdown_timeout_secs: 5,
+                supervisor_timeout_secs: 5,
+                writer_pin: WriterPin {
+                    target: None,
+                    outcome: Arc::new(AtomicI64::new(UNPINNED)),
+                },
+                writer_liveness: Arc::new(WriterLiveness::default()),
+            },
+        );
+        engine
+            .shards
+            .store(Arc::new(HashMap::from([(shard_id, shard)])));
 
         let outcome = engine
             .execute(ClientOp::BulkWrite {

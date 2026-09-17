@@ -45,8 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because the second transaction was unnecessary, not because it is faster.
 
 - **Bulk writes are now refused under overload instead of timing out.** The admission gate and the
-  dequeue deadline check both watch the worker pool, and a `BulkWrite` never enters it — it is
-  served from the orchestrator's actor mailbox, which nothing gated. Measured at roughly twice
+  dequeue deadline check both watch the worker pool, and a `BulkWrite` then never entered it —
+  it was served from the orchestrator's actor mailbox, which nothing gated. Measured at roughly twice
   capacity: every request answered `408` after waiting its full budget, no documents written, and
   not one refusal recorded by any gate. The mailbox now has its own backlog gate, sized for a lane
   that runs one operation at a time, and refuses with `503` and `Retry-After` before a request
@@ -83,6 +83,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`BulkWrite` and `BulkDelete` are served by the worker pool, not the orchestrator mailbox.**
+  A bulk op used to hold the single actor lane for its whole duration — validation, routing,
+  per-shard batches, remote forwarding — so every mailbox-served operation queued or was
+  refused behind it, and none of the pool's overload machinery could see it. The fan-out is
+  written once now, against `BulkCtx`, the borrowed view both lanes build: the actor from its
+  own fields, a worker from the engine's `ArcSwap` snapshots, so the two paths share routing,
+  grouping, the one-hop forwarding bound and per-item accounting and cannot drift.
+
+  What stays on the mailbox is what needs its serialisation: a bulk write whose batch has to
+  *decide* a schema — an unsettled index, or a document carrying a field the schema does not
+  know — comes back to the actor as `UseActor`, where `staged_schema_validation` evolves it
+  serially. Two bulks growing one index at once is the race that serialisation exists for.
+  A bulk delete never defers: it carries nothing that could grow a schema, and a peer's
+  forwarded share still arrives at the actor directly, where the one-hop bound applies.
+
+  Bulk ops are measured on their own service estimate (`OpClass::Bulk`), so a fan-out's cost
+  is no longer reserved for, or blended into, a single write's — under a mixed ingest the
+  write estimate would have been a bulk's, and single writes refused on work they never pay.
+
 - **`/_cluster/health` reports `yellow` when it could not read its own state.** Green is a claim
   that the node is operating normally, and a node that failed to answer its own metadata inside
   its budget cannot make it. Yellow rather than red: it is congested, not stopped, and red stays
@@ -105,9 +124,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Measured under a bulk ingest at roughly twice capacity, where health previously returned `408`
   at 1,001ms on twelve of twelve probes: **`200` on twelve of twelve at ~505ms**, carrying
   `degraded: ["active_shards", "node_id", "total_indexes"]`. An idle node's body is unchanged.
-  Note this is the endpoint being made honest, not the overload being fixed — under bulk load it
-  reports `green` with `queue_depth: 0`, because bulk writes never reach the worker pool the
-  depth is counted from (ROADMAP F8).
+  Note this is the endpoint being made honest, not the overload being fixed. It also predates
+  bulk ops moving onto the worker pool: `queue_depth` under bulk load read 0 because a
+  `BulkWrite` never entered the pool it is counted from — it does now, so the figure is real.
 
 - **An overloaded node no longer works for clients that have gone.** A search dispatched to the
   worker pool ran whatever happened next: nothing downstream is cancellable, so when the request
