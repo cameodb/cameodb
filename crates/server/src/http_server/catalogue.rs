@@ -12,7 +12,7 @@ use tracing::info;
 use crate::authz::Authz;
 use crate::cluster_coordinator::OperationType;
 use crate::http_server::error::AppError;
-use crate::node_orchestrator::ClientOp;
+use crate::node::ClientOp;
 use crate::state::AppState;
 use storage::IndexSchema;
 

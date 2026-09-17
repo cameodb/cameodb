@@ -13,7 +13,7 @@ use tracing::{debug, info};
 use crate::authz::Authz;
 use crate::cluster_coordinator::OperationType;
 use crate::http_server::error::AppError;
-use crate::node_orchestrator::{ClientOp, SearchWindow};
+use crate::node::{ClientOp, SearchWindow};
 use crate::query::parse_query_keywords;
 use crate::ratelimit::Verdict;
 use crate::state::AppState;

@@ -25,7 +25,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::cluster_coordinator::ClusterCoordinator;
-use crate::node_orchestrator::{NodeOrchestrator, orchestrator_remote_name};
+use crate::node::{NodeOrchestrator, orchestrator_remote_name};
 
 // ============================================================================
 // Connection Channel (replication-ready)

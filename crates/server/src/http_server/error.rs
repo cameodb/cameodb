@@ -7,7 +7,7 @@ use axum::{
 };
 use tracing::{error, warn};
 
-use crate::node_orchestrator::{OrchestratorError, RemoteVerdict};
+use crate::node::{OrchestratorError, RemoteVerdict};
 
 /// Application error wrapper for consistent error handling.
 ///

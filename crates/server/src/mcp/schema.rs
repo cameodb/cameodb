@@ -6,7 +6,7 @@
 
 use serde_json::Value as JsonValue;
 
-use crate::node_orchestrator::ClientOp;
+use crate::node::ClientOp;
 use crate::state::AppState;
 
 /// An index's field definitions, or `Null` if they cannot be read.

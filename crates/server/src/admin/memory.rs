@@ -13,7 +13,7 @@ use std::fs;
 use kameo::message::{Context, Message};
 use serde::{Deserialize, Serialize};
 
-use crate::node_orchestrator::{NodeOrchestrator, OrchestratorError};
+use crate::node::{NodeOrchestrator, OrchestratorError};
 
 // ── Memory stat structs ──
 

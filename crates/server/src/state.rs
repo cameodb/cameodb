@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cluster_coordinator::ClusterCoordinator;
-use crate::node_orchestrator::{QueueLoad, ReadPoolHealth, RouterActor, WriterLiveness};
+use crate::node::{QueueLoad, ReadPoolHealth, RouterActor, WriterLiveness};
 use crate::ratelimit::ToolRateLimiter;
 
 /// Application state shared across handlers

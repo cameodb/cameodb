@@ -593,7 +593,7 @@ let base_ops = (default_batch_size * (1.0 + budget_ratio * 19.0)) as u64;
 ```
 
 The idle-timeout half lives in the server crate rather than here: each shard's dedicated
-writer thread (`crates/server/src/node_orchestrator.rs`) watches its own command channel and
+writer thread (`crates/server/src/node.rs`) watches its own command channel and
 commits an index that has seen no writes for `supervisor_timeout_secs`.
 
 ### Behavior Scenarios

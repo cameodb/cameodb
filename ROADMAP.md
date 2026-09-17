@@ -1803,7 +1803,7 @@ made inside one of these two files.
 
 **2026-09-09:** the server half is done — [L11](#l11--node_orchestratorrs-is-13669-lines-and-holds-four-actors)
 landed the split, and the merge primitives, sort keys and validation live in
-`node_orchestrator/search.rs` as this item always wanted. `storage/src/lib.rs` keeps the same
+`node/search.rs` as this item always wanted. `storage/src/lib.rs` keeps the same
 disease; its cure is [L12](#l12--storagesrclibrs-is-9961-lines-of-which-one-impl-block-is-4460).
 
 ### CH3 — Cursor paging (`search_after`)
@@ -3215,18 +3215,19 @@ sizes: `mod.rs` 1,131 (module doc, consts, wire and error types, re-exports), `s
 notes beyond the pure move: the single-module privacy model flattened to `pub(crate)` on
 items, fields and inherent methods — the visibility the code already relied on — and
 `validate_document` became the free function CH10's gate already treated it as, with its three
-call sites de-qualified. `crate::node_orchestrator::…` imports resolve untouched through the
-root's `pub use` re-exports. 319 bin, 56 `node_http_api`, 50 `mcp_federated` and 41 client
-tests pass; clippy clean.
+call sites de-qualified. The directory landed as `node/` rather than `node_orchestrator/` —
+the file names already say what each part does — so `crate::node::…` is the import path,
+re-exported from the root's `pub use` as before. 319 bin, 56 `node_http_api`, 50
+`mcp_federated` and 41 client tests pass; clippy clean.
 
 **Deliberately coarse: a handful of files grouped by architectural role, not one file per
 function family.** The point of the split is that a change to one actor, or to the read-side
 machinery, happens in one place — not that no file ever exceeds a line budget. Convert to a
 directory module — the crate already does this for `http_server/`, `swarm/`, `admin/` — with
-`mod.rs` re-exporting so every `use crate::node_orchestrator::…` site compiles untouched:
+`mod.rs` re-exporting so every `use crate::node::…` site compiles untouched:
 
 ```
-node_orchestrator/
+node/
 ├── mod.rs           (~1,000) module doc (keep the thread-topology essay), shared consts,
 │                              every wire/message type, and the error types
 ├── search.rs        (~1,700) the read-side machinery: merge primitives (this is what CH2

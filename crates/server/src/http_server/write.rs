@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::cluster_coordinator::OperationType;
 use crate::http_server::error::AppError;
-use crate::node_orchestrator::{ClientOp, DeletePayload, DocPayload};
+use crate::node::{ClientOp, DeletePayload, DocPayload};
 use crate::state::AppState;
 
 /// The most reasons a streaming-ingest response will list before it counts the rest.
@@ -520,7 +520,7 @@ async fn flush_lines(
                 .unwrap_or_default();
 
             let unwritten = lines.len() - written as usize;
-            let renumbered = crate::node_orchestrator::renumber_reasons(
+            let renumbered = crate::node::renumber_reasons(
                 &reasons,
                 &lines,
                 "line",
@@ -543,13 +543,13 @@ async fn flush_lines(
 
 /// Derive a routing hint from the first document in a batch.
 ///
-/// One rung below [`effective_routing_key`](crate::node_orchestrator::routing_key_without_schema)'s
+/// One rung below [`effective_routing_key`](crate::node::routing_key_without_schema)'s
 /// ladder, because the schema that names a routing field has not been resolved this early. Shares
 /// the orchestrator's derivation rather than restating it: the two had drifted onto different
 /// hashes of different byte ranges, so a hint could disagree with the key it stood in for.
 fn derive_routing_hint(docs: &[DocPayload]) -> Option<String> {
     docs.first().and_then(|doc| {
-        crate::node_orchestrator::routing_key_without_schema(
+        crate::node::routing_key_without_schema(
             doc.routing_key.clone(),
             &doc.id,
             &doc.doc,
@@ -562,7 +562,7 @@ pub(super) async fn flush_write_batch(
     state: &AppState,
     index: &str,
     docs: Vec<DocPayload>,
-) -> Result<JsonValue, crate::node_orchestrator::OrchestratorError> {
+) -> Result<JsonValue, crate::node::OrchestratorError> {
     let routing_hint = derive_routing_hint(&docs);
     let client_op = ClientOp::BulkWrite {
         index: index.to_string(),
