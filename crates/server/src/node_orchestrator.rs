@@ -4147,25 +4147,34 @@ impl OrchestratorEngine {
     /// was dropped cannot put that schema back over the record of the deletion. Ordering by
     /// version costs a comparison and needs nothing coordinated between concurrent writers.
     fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
-        let schema_arc = Arc::new(schema.clone());
+        self.put_cached_schema_arc(index, Arc::new(schema.clone()));
+    }
+
+    /// [`put_cached_schema`](Self::put_cached_schema) for a caller that already holds the `Arc`
+    /// — the store's own read of a schema is shared rather than cloned a second time.
+    fn put_cached_schema_arc(&self, index: &str, schema: Arc<IndexSchema>) {
         let index_str = index.to_string();
 
         self.schema_cache.rcu(|old| {
             if let Some(current) = old.get(&index_str)
-                && current.version > schema_arc.version
+                && current.version > schema.version
             {
                 return Arc::clone(old);
             }
             let mut new = (**old).clone();
-            new.insert(index_str.clone(), schema_arc.clone());
+            new.insert(index_str.clone(), Arc::clone(&schema));
             Arc::new(new)
         });
     }
 
     /// Load schema from first shard's storage.
-    async fn load_schema(&self, index: &str) -> Result<IndexSchema, OrchestratorError> {
+    ///
+    /// Shared, not owned: a hit is the cache's `Arc` and a miss inserts the store's `Arc`, so no
+    /// caller pays a deep clone of the field map per request. Callers that mutate the schema —
+    /// staged validation evolving it — clone out of the `Arc` themselves.
+    async fn load_schema(&self, index: &str) -> Result<Arc<IndexSchema>, OrchestratorError> {
         if let Some(cached) = self.get_cached_schema(index) {
-            return Ok((*cached).clone());
+            return Ok(cached);
         }
 
         let shards = self.shards.load();
@@ -4178,13 +4187,12 @@ impl OrchestratorEngine {
                 .await
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-            if let Some(schema_arc) = schema {
-                let schema = (*schema_arc).clone();
-                self.put_cached_schema(index, &schema);
+            if let Some(schema) = schema {
+                self.put_cached_schema_arc(index, Arc::clone(&schema));
                 return Ok(schema);
             }
         }
-        Ok(IndexSchema::default())
+        Ok(Arc::new(IndexSchema::default()))
     }
 
     /// Route write to shard using deterministic key (no round-robin).
@@ -4348,11 +4356,7 @@ impl OrchestratorEngine {
         }
 
         // Lock-free schema lookup, by the one thing that identifies an index: its name.
-        let schema = if let Some(cached) = self.get_cached_schema(index) {
-            cached
-        } else {
-            Arc::new(self.load_schema(index).await?)
-        };
+        let schema = self.load_schema(index).await?;
 
         // Fast path: mature schema — validate inline
         if !schema.fields.is_empty() {
@@ -4454,11 +4458,7 @@ impl OrchestratorEngine {
             )));
         }
 
-        let schema = if let Some(cached) = self.get_cached_schema(index) {
-            cached
-        } else {
-            Arc::new(self.load_schema(index).await?)
-        };
+        let schema = self.load_schema(index).await?;
 
         let effective = effective_delete_routing_key(&schema, &id, routing_key.clone())?;
 
@@ -9361,17 +9361,22 @@ impl NodeOrchestrator {
     /// was dropped cannot put that schema back over the record of the deletion. Ordering by
     /// version costs a comparison and needs nothing coordinated between concurrent writers.
     fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
-        let schema_arc = Arc::new(schema.clone());
+        self.put_cached_schema_arc(index, Arc::new(schema.clone()));
+    }
+
+    /// [`put_cached_schema`](Self::put_cached_schema) for a caller that already holds the `Arc`
+    /// — the store's own read of a schema is shared rather than cloned a second time.
+    fn put_cached_schema_arc(&self, index: &str, schema: Arc<IndexSchema>) {
         let index_str = index.to_string();
 
         self.schema_cache.rcu(|old| {
             if let Some(current) = old.get(&index_str)
-                && current.version > schema_arc.version
+                && current.version > schema.version
             {
                 return Arc::clone(old);
             }
             let mut new = (**old).clone();
-            new.insert(index_str.clone(), schema_arc.clone());
+            new.insert(index_str.clone(), Arc::clone(&schema));
             Arc::new(new)
         });
     }
@@ -10571,7 +10576,7 @@ impl NodeOrchestrator {
             ClientOp::GetRawSchema { index } => Ok(self
                 .durable_schema(&index)
                 .await?
-                .map(|schema| serde_json::to_value(&schema))
+                .map(|schema| serde_json::to_value(&*schema))
                 .transpose()
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
                 .unwrap_or(JsonValue::Null)),
@@ -10579,7 +10584,7 @@ impl NodeOrchestrator {
                 // This node first. A holder answers from its own store without asking anyone,
                 // which covers every standalone node and the ordinary clustered case.
                 if let Some(schema) = self.durable_schema(&index).await? {
-                    return serde_json::to_value(&schema)
+                    return serde_json::to_value(&*schema)
                         .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)));
                 }
                 match self.peer_schema_for(&index).await {
@@ -10719,11 +10724,7 @@ impl NodeOrchestrator {
         }
 
         // Lock-free schema lookup, by the one thing that identifies an index: its name.
-        let schema = if let Some(cached) = self.get_cached_schema(index) {
-            cached
-        } else {
-            Arc::new(self.load_schema(index).await?)
-        };
+        let schema = self.load_schema(index).await?;
 
         // Fast path: mature schema — validate inline without spawn_blocking/Rayon
         if !schema.fields.is_empty() {
@@ -10883,11 +10884,7 @@ impl NodeOrchestrator {
             )));
         }
 
-        let schema = if let Some(cached) = self.get_cached_schema(index) {
-            cached
-        } else {
-            Arc::new(self.load_schema(index).await?)
-        };
+        let schema = self.load_schema(index).await?;
 
         let effective = effective_delete_routing_key(&schema, &id, routing_key.clone())?;
 
@@ -10946,11 +10943,7 @@ impl NodeOrchestrator {
         }
 
         let items_received = docs.len();
-        let schema = if let Some(cached) = self.get_cached_schema(index) {
-            cached
-        } else {
-            Arc::new(self.load_schema(index).await?)
-        };
+        let schema = self.load_schema(index).await?;
 
         let mut errors: Vec<String> = Vec::new();
         // Local work is a plain list of ids per shard: the routing key has already done its job
@@ -11343,7 +11336,8 @@ impl NodeOrchestrator {
         }
 
         // `load_schema` answers from the cache when it can, and reads a shard when it cannot.
-        let mut schema_cache = self.load_schema(index).await?;
+        // Owned, unlike the read paths: staged validation evolves this copy.
+        let mut schema_cache = Arc::unwrap_or_clone(self.load_schema(index).await?);
 
         // Use staged schema validation: parallel validation + sequential evolution. The batch
         // is handed over and handed back so the fan-out never has to copy it.
@@ -12445,9 +12439,12 @@ impl NodeOrchestrator {
     /// stored schema for the name. `get_schema_cached` rather than `get_schema` because it is
     /// what the write path resolves against — a schema derived from Tantivy and merged with the
     /// stored metadata, so validation and writing agree on the types.
-    async fn durable_schema(&self, index: &str) -> Result<Option<IndexSchema>, OrchestratorError> {
+    async fn durable_schema(
+        &self,
+        index: &str,
+    ) -> Result<Option<Arc<IndexSchema>>, OrchestratorError> {
         if let Some(cached) = self.get_cached_schema(index) {
-            return Ok(Some((*cached).clone()));
+            return Ok(Some(cached));
         }
 
         if let Some(shard) = self.shards.values().next()
@@ -12459,9 +12456,8 @@ impl NodeOrchestrator {
                 .await
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-            if let Some(schema_arc) = schema {
-                let schema = (*schema_arc).clone();
-                self.put_cached_schema(index, &schema);
+            if let Some(schema) = schema {
+                self.put_cached_schema_arc(index, Arc::clone(&schema));
                 return Ok(Some(schema));
             }
         }
@@ -12469,8 +12465,14 @@ impl NodeOrchestrator {
     }
 
     /// Helper: Load schema from first shard, empty when this node holds none.
-    async fn load_schema(&self, index: &str) -> Result<IndexSchema, OrchestratorError> {
-        Ok(self.durable_schema(index).await?.unwrap_or_default())
+    ///
+    /// Shared, not owned: a hit is the cache's `Arc`, so a caller pays no deep clone of the
+    /// field map per request. Callers that mutate the schema clone out of the `Arc`.
+    async fn load_schema(&self, index: &str) -> Result<Arc<IndexSchema>, OrchestratorError> {
+        Ok(self
+            .durable_schema(index)
+            .await?
+            .unwrap_or_else(|| Arc::new(IndexSchema::default())))
     }
 
     /// Helper: Route write to shard using deterministic key (no round-robin).
