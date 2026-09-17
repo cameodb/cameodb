@@ -83,6 +83,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A shard's writer thread no longer allocates its working set per drained batch.**
+  `pending_cmds` was already reused across iterations; the grouping maps and reply lists
+  (`write_groups`, `batch_groups`, `commits`, `evictions`, `deletions`, `committed_indices`,
+  `mixed`) were rebuilt every batch and are now hoisted and cleared — `HashMap::clear` keeps
+  the backing table, so a writer draining at saturation pays each buffer's growth once. The
+  per-index merge vectors inside a group still allocate per batch: they are consumed by the
+  apply call, and reusing them would mean threading emptied buffers back out of it.
+
 - **A search hit's identifier comes from a column, not a stored-document decompression.**
   `id` is built `STRING | STORED | FAST` on new indexes, so the per-hit read is a term-ordinal
   lookup on the column — opened once per segment — instead of a decompressed stored document to
