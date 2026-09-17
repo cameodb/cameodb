@@ -51,15 +51,11 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-
 // Re-export SortSpec and SortOrder from storage crate
 use cluster::{ConsistentRing, IdentityError};
 use serde_json::Value as JsonValue;
-use storage::{
-    IndexSchema,
-    StoreError, TantivyFieldType, WalOp,
-};
 pub use storage::SortSpec;
+use storage::{IndexSchema, StoreError, TantivyFieldType, WalOp};
 
 mod orchestrator;
 mod router;
@@ -148,25 +144,6 @@ pub(crate) fn request_started_at() -> Instant {
     REQUEST_STARTED_AT
         .try_with(|started| *started)
         .unwrap_or_else(|_| Instant::now())
-}
-
-// ============================================================================
-// Streaming Search Results
-// ============================================================================
-
-/// Represents a single search result from a shard or remote node
-#[derive(Debug)]
-pub enum StreamingSearchResult {
-    /// Result from a local microshard
-    Local {
-        hits: Vec<(f32, serde_json::Value)>,
-        total_hits: usize,
-    },
-    /// Result from a remote node
-    Remote {
-        node_id: Uuid,
-        result: Result<serde_json::Value, OrchestratorError>,
-    },
 }
 
 // ============================================================================

@@ -83,6 +83,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The two broadcast fan-outs share one** (L16). `handle_broadcast` and
+  `handle_broadcast_streaming` each spelled out the same preamble — the broadcasts counter,
+  the `GetKnownPeers` ask, the window widening, the per-peer timeout, the remote-concurrency
+  cap and the dispatch-order restore — and the two copies had already drifted. All of it is
+  `RouterActor::broadcast_fanout` now, returning a `BroadcastFanout` with the local answer and
+  every peer's `(node_id, answer-or-timeout)` in dispatch order. What stays per-path is what
+  the roadmap said differed: the local future (worker-pool dispatch vs a direct orchestrator
+  ask) and the merge — `push_hits`/`BroadcastStats` on one side, source-keyed blocks on the
+  other. `StreamingSearchResult` is gone with the second fan-out, and the streaming local
+  block no longer drops hits that carry no `_score` or round-trips scores through `f32`.
+
 - **One `SchemaCache` owns the schema cache** (L15). The `ArcSwap` map behind the engine's
   and the actor's identical cache fields is a newtype now — `get`, `put` (version decides,
   not arrival order), `put_arc` and `remove` are its methods, and "cache, then the first

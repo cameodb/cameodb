@@ -51,7 +51,7 @@ on one.
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8, CH9, CH10 and CH11 done, CH2 (server half) and CH12 partial |
-| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11 done), six simplifications (L15 and L17 done), and the retrospective itself |
+| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11 done), six simplifications (L15, L16 and L17 done), and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
 
@@ -3317,11 +3317,15 @@ delegations to `SchemaCache::schema_for`/`durable`.
 
 ### L16 — `handle_broadcast` and `handle_broadcast_streaming` are one fan-out written twice
 
-**Simplification.** 📋 **Planned.** 568 and 313 lines sharing preamble (peer ask, counters,
-window widening) and postamble (merge, discard and approximate-sort bookkeeping); the file's own
-comment says the two "answered this differently", and [CH1](#ch1--one-scatter-gather-written-twice)
-records what written-twice costs. Extract the shared phases; the local future and the merge
-strategy are all that genuinely differ. Do beside CH1, not separately.
+**Simplification.** ✅ **Done 2026-09-09.** The shared phase is `broadcast_fanout`: the
+counter, `GetKnownPeers`, window widening (`widen_broadcast_op`), the per-peer timeout, the
+concurrency cap, dispatch-ordinal tagging and the local+remote join return a
+`BroadcastFanout` — the local result and every peer's `(node_id, answer-or-timeout)` in
+dispatch order. The local future and the merge stay per-path: the non-streaming merge folds
+each response through `push_hits` into `BroadcastStats`; the streaming merge keeps its
+source-keyed blocks. Along the way: `StreamingSearchResult` is gone — the fan-out carries
+typed results, and the streaming local block no longer drops hits that lack `_score` or
+round-trips scores through `f32`.
 
 ### L17 — Dead code and stale suppressions
 
