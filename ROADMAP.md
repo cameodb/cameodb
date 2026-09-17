@@ -50,7 +50,7 @@ on one.
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
-| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8 and CH9 done, CH12 partial, CH10–CH11 are write-path duplication |
+| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8, CH9, CH10 and CH11 done, CH12 partial |
 | L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions, six simplifications (L17 done), and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
@@ -167,7 +167,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — health fixed, the lane gated, and admission on both lanes predicts against a measured spread | — | 2026-09-16 | ✅ |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items — CH1 done | — | 2026-08-16 | 📋 |
 | [CH11](#ch11--routing-key-derivation-is-written-four-times-with-two-algorithms) | Routing-key derivation, four spellings and two hashes — closed ahead of the split | — | 2026-09-01 | ✅ |
-| [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8 and CH9 done, CH12 partial | — | 2026-09-01 | ◐ |
+| [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8, CH9 and CH10 done, CH12 partial | — | 2026-09-01 | ◐ |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
 | [J1](#j1--a-facet-field-cannot-be-written-to) | A facet field cannot be written to | 18 | 2026-08-27 | ✅ |
 | [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
@@ -1905,11 +1905,20 @@ code agrees with itself.
 
 ### CH10 — `engine_write` and `orch_write` are near-duplicates
 
-📋 The single-write counterpart to CH1. The worker path (`engine_write`, 2844–2934) and the
-actor fallback (`orch_write`, 7729–7849) repeat the same validation, effective-key derivation,
-ring routing and shard dispatch, and the two have already drifted on the routing rule this
-review's OB3 names. Extract the shared body; the two callers differ only in where the schema
-comes from.
+✅ **Done** 2026-10-12, with `engine_delete`/`orch_delete` in the same sweep — the OB3 fix had
+charged this toll on both pairs. The shared body is `WriteCtx`, the borrowed view the pattern
+established: the actor builds it from its own fields, a worker from the engine's `ArcSwap`
+snapshots. `gate` owns validation, the stable-schema cache populate, effective-key derivation
+and ring routing; `dispatch`/`dispatch_delete` own the shard lookup, the request build and the
+response shape. What stays per-lane is the divergence that defines each: a worker answers
+`NeedsActor` where the actor calls `forward_op_to_owner`, and only the actor runs the
+`staged_schema_validation` slow path — which now ends by routing through the same ctx.
+
+The gate needed the schema cache, so its machinery — `get`/`put`/`put_arc`, byte-identical on
+both types — became `schema_cache_get`/`schema_cache_put`/`schema_cache_put_arc`, free
+functions over the `ArcSwap` map. That is a slice of [L15](#l15--the-schema-cache-machinery-exists-three-times)
+paid early: two of its three spellings are one now (the differing `load_schema`s remain its
+question).
 
 ### CH11 — Routing-key derivation is written four times, with two algorithms
 

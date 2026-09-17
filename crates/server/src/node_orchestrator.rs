@@ -1386,6 +1386,211 @@ impl ScatterCtx<'_> {
     }
 }
 
+/// The schema cache is one `ArcSwap` map on both the engine and the actor, and both used to
+/// spell these three touches out for themselves — identical code, twice.
+fn schema_cache_get(
+    cache: &ArcSwap<HashMap<String, Arc<IndexSchema>>>,
+    index: &str,
+) -> Option<Arc<IndexSchema>> {
+    cache.load().get(index).cloned()
+}
+
+/// Insert a schema in the cache, unless the cache already holds a newer one.
+///
+/// Version decides, not arrival order, so a write that resolved against a schema before it
+/// was dropped cannot put that schema back over the record of the deletion. Ordering by
+/// version costs a comparison and needs nothing coordinated between concurrent writers.
+fn schema_cache_put(
+    cache: &ArcSwap<HashMap<String, Arc<IndexSchema>>>,
+    index: &str,
+    schema: &IndexSchema,
+) {
+    schema_cache_put_arc(cache, index, Arc::new(schema.clone()));
+}
+
+/// [`schema_cache_put`] for a caller that already holds the `Arc` — the store's own read of a
+/// schema is shared rather than cloned a second time.
+fn schema_cache_put_arc(
+    cache: &ArcSwap<HashMap<String, Arc<IndexSchema>>>,
+    index: &str,
+    schema: Arc<IndexSchema>,
+) {
+    let index_str = index.to_string();
+
+    cache.rcu(|old| {
+        if let Some(current) = old.get(&index_str)
+            && current.version > schema.version
+        {
+            return Arc::clone(old);
+        }
+        let mut new = (**old).clone();
+        new.insert(index_str.clone(), Arc::clone(&schema));
+        Arc::new(new)
+    });
+}
+
+/// What the write gate settled. `Routed` carries what dispatch needs; `Grow` means the schema
+/// is empty or must evolve — only the actor can do that, under the mailbox's serialisation.
+enum WriteGate {
+    Routed {
+        target: Uuid,
+        effective_routing_key: Option<String>,
+    },
+    Grow,
+}
+
+/// A dispatched write, or its parts back when the ring's target is not on this node. What
+/// `Elsewhere` means is the lane's call: the actor forwards to the owning node, a worker hands
+/// the op back for the mailbox to retry.
+enum WriteDispatch {
+    Done(JsonValue),
+    Elsewhere {
+        id: String,
+        effective_routing_key: Option<String>,
+        doc: JsonValue,
+    },
+}
+
+/// The borrowed view a single write or delete routes and dispatches against — shard map, ring,
+/// schema cache — identical on both lanes: the actor reads its own fields, a worker reads the
+/// engine's `ArcSwap` snapshots. The shape `BulkCtx` established for the bulk fan-out.
+struct WriteCtx<'a> {
+    shards: &'a HashMap<Uuid, MicroshardActor>,
+    ring: &'a ConsistentRing,
+    schema_cache: &'a ArcSwap<HashMap<String, Arc<IndexSchema>>>,
+}
+
+impl WriteCtx<'_> {
+    /// Route a write or delete to the shard the ring gives its key.
+    ///
+    /// The ring decides the shard, always — never the dispatch hint. The hint is
+    /// `owner(routing_key.or(id))`, computed before the schema was in hand, while the
+    /// effective key prefers the document's own routing field; on an index whose routing field
+    /// is a real, non-key field those two disagree, and taking the hint used to put the
+    /// document on a shard the ring does not believe owns it. Nothing looked wrong — searches
+    /// are scatter-gather and found it anyway — until the same id was written again through a
+    /// path with no hint and landed on a second shard.
+    ///
+    /// What the hint is for is choosing the worker, and it still does that in
+    /// `try_send_affine`: same dense shard ordinal, same co-located writer thread, same saved
+    /// cross-core wakeup. This lookup is an xxh3 and a `BTreeMap` range descent, which is not
+    /// a saving worth a class of divergence in front of a redb transaction.
+    fn route_write(&self, routing_key: &Option<String>) -> Result<Uuid, OrchestratorError> {
+        let key = routing_key.as_ref().ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Missing routing key for write",
+            ))
+        })?;
+
+        let target = self
+            .ring
+            .get_owner(key)
+            .or_else(|| self.shards.keys().copied().next());
+
+        target.ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No shard selected",
+            ))
+        })
+    }
+
+    /// Validate `doc` against `schema` and, when the schema already covers every field, cache
+    /// the schema and route the write. Anything else — an empty schema, a field the schema
+    /// does not describe — is [`WriteGate::Grow`], the actor's to settle.
+    fn gate(
+        &self,
+        index: &str,
+        id: &str,
+        routing_key: &Option<String>,
+        doc: &JsonValue,
+        schema: &IndexSchema,
+    ) -> Result<WriteGate, OrchestratorError> {
+        if schema.fields.is_empty() {
+            return Ok(WriteGate::Grow);
+        }
+
+        let result = NodeOrchestrator::validate_document(id, doc, schema);
+        if let Some(err) = result.validation_error {
+            return Err(OrchestratorError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err,
+            )));
+        }
+        if result.needs_evolution {
+            return Ok(WriteGate::Grow);
+        }
+
+        // Schema is stable — populate the cache if it does not hold this index yet.
+        if schema_cache_get(self.schema_cache, index).is_none() {
+            schema_cache_put(self.schema_cache, index, schema);
+        }
+
+        let effective_routing_key = effective_routing_key(schema, id, routing_key.clone(), doc);
+        let target = self.route_write(&effective_routing_key)?;
+        Ok(WriteGate::Routed {
+            target,
+            effective_routing_key,
+        })
+    }
+
+    /// Dispatch a routed write to its shard. `Elsewhere` hands the parts back — the ring's
+    /// target is not on this node, and what that means is the lane's call.
+    async fn dispatch(
+        &self,
+        target: Uuid,
+        index: &str,
+        id: String,
+        effective_routing_key: Option<String>,
+        doc: JsonValue,
+    ) -> Result<WriteDispatch, OrchestratorError> {
+        let Some(shard) = self.shards.get(&target) else {
+            return Ok(WriteDispatch::Elsewhere {
+                id,
+                effective_routing_key,
+                doc,
+            });
+        };
+
+        let req = WriteRequest {
+            index: index.to_string(),
+            id: id.clone(),
+            routing_key: effective_routing_key.unwrap_or_default(),
+            doc,
+        };
+
+        let seq = shard.handle_write(req).await?;
+        Ok(WriteDispatch::Done(serde_json::json!({
+            "id": id, "result": "created", "version": seq,
+            "shard_id": target.to_string()
+        })))
+    }
+
+    /// Same shape for a delete: the shard answers, or `None` says the target is not local and
+    /// the lane decides between forwarding and deferring.
+    async fn dispatch_delete(
+        &self,
+        target: Uuid,
+        index: &str,
+        id: &str,
+    ) -> Result<Option<JsonValue>, OrchestratorError> {
+        let Some(shard) = self.shards.get(&target) else {
+            return Ok(None);
+        };
+
+        let sequence = shard
+            .handle_delete(index.to_string(), id.to_string())
+            .await?;
+        Ok(Some(serde_json::json!({
+            "id": id,
+            "result": "deleted",
+            "version": sequence,
+            "shard_id": target.to_string(),
+        })))
+    }
+}
+
 /// Type alias for single write commands enqueued in the writer thread
 type WriteCommand = (WalOp, tokio::sync::oneshot::Sender<Result<u64, StoreError>>);
 
@@ -5138,45 +5343,13 @@ impl std::fmt::Debug for OrchestratorEngine {
 }
 
 impl OrchestratorEngine {
-    /// Fetch a schema from cache if present (lock-free).
-    fn get_cached_schema(&self, index: &str) -> Option<Arc<IndexSchema>> {
-        let map = self.schema_cache.load();
-        map.get(index).cloned()
-    }
-
-    /// Insert a schema in the cache, unless the cache already holds a newer one.
-    ///
-    /// Version decides, not arrival order, so a write that resolved against a schema before it
-    /// was dropped cannot put that schema back over the record of the deletion. Ordering by
-    /// version costs a comparison and needs nothing coordinated between concurrent writers.
-    fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
-        self.put_cached_schema_arc(index, Arc::new(schema.clone()));
-    }
-
-    /// [`put_cached_schema`](Self::put_cached_schema) for a caller that already holds the `Arc`
-    /// — the store's own read of a schema is shared rather than cloned a second time.
-    fn put_cached_schema_arc(&self, index: &str, schema: Arc<IndexSchema>) {
-        let index_str = index.to_string();
-
-        self.schema_cache.rcu(|old| {
-            if let Some(current) = old.get(&index_str)
-                && current.version > schema.version
-            {
-                return Arc::clone(old);
-            }
-            let mut new = (**old).clone();
-            new.insert(index_str.clone(), Arc::clone(&schema));
-            Arc::new(new)
-        });
-    }
-
     /// Load schema from first shard's storage.
     ///
     /// Shared, not owned: a hit is the cache's `Arc` and a miss inserts the store's `Arc`, so no
     /// caller pays a deep clone of the field map per request. Callers that mutate the schema —
     /// staged validation evolving it — clone out of the `Arc` themselves.
     async fn load_schema(&self, index: &str) -> Result<Arc<IndexSchema>, OrchestratorError> {
-        if let Some(cached) = self.get_cached_schema(index) {
+        if let Some(cached) = schema_cache_get(&self.schema_cache, index) {
             return Ok(cached);
         }
 
@@ -5191,37 +5364,11 @@ impl OrchestratorEngine {
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
             if let Some(schema) = schema {
-                self.put_cached_schema_arc(index, Arc::clone(&schema));
+                schema_cache_put_arc(&self.schema_cache, index, Arc::clone(&schema));
                 return Ok(schema);
             }
         }
         Ok(Arc::new(IndexSchema::default()))
-    }
-
-    /// Route write to shard using deterministic key (no round-robin).
-    fn route_write(&self, routing_key: &Option<String>) -> Result<Uuid, OrchestratorError> {
-        let key = routing_key.as_ref().ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Missing routing key for write",
-            ))
-        })?;
-
-        let ring = self.routing_ring.load();
-        let target = ring.get_owner(key).or_else(|| self.first_shard_id());
-
-        target.ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No shard selected",
-            ))
-        })
-    }
-
-    /// Returns the first shard id if any exist (fallback for empty ring).
-    fn first_shard_id(&self) -> Option<Uuid> {
-        let shards = self.shards.load();
-        shards.keys().copied().next()
     }
 
     /// Execute a ClientOp on the shared engine state.
@@ -5384,81 +5531,45 @@ impl OrchestratorEngine {
         // Lock-free schema lookup, by the one thing that identifies an index: its name.
         let schema = self.load_schema(index).await?;
 
-        // Fast path: mature schema — validate inline
-        if !schema.fields.is_empty() {
-            let result = NodeOrchestrator::validate_document(&id, &doc, &schema);
-            if let Some(err) = result.validation_error {
-                return Err(OrchestratorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    err,
-                )));
-            }
+        let ring = self.routing_ring.load_full();
+        let ctx = WriteCtx {
+            shards: &shards,
+            ring: &ring,
+            schema_cache: &self.schema_cache,
+        };
 
-            if !result.needs_evolution {
-                // Schema is stable — populate cache if not yet present
-                if self.get_cached_schema(index).is_none() {
-                    self.put_cached_schema(index, &schema);
-                }
-
-                // Schema-based routing
-                let effective_routing_key = effective_routing_key(&schema, &id, routing_key, &doc);
-
-                // The ring decides the shard, always — never the dispatch hint.
-                //
-                // The hint is `owner(routing_key.or(id))`, computed by the router before the
-                // schema was in hand, while the key above prefers the document's own routing
-                // field. On an index whose routing field is a real, non-key field those two
-                // disagree, and taking the hint used to put the document on a shard the ring
-                // does not believe owns it. Nothing looked wrong — searches are scatter-gather
-                // and found it anyway — until the same id was written again through a path with
-                // no hint (the actor-mailbox fallback when a worker queue is full), which routed
-                // by the ring, landed elsewhere, and left the id on two shards at once.
-                //
-                // What the hint is for is choosing the worker, and it still does that in
-                // `try_send_affine`: same dense shard ordinal, same co-located writer thread,
-                // same saved cross-core wakeup. This lookup is an xxh3 and a `BTreeMap` range
-                // descent, which is not a saving worth a class of divergence in front of a redb
-                // transaction.
-                let target = self.route_write(&effective_routing_key)?;
-
-                let Some(shard) = shards.get(&target) else {
-                    // The shard is on another node. The engine cannot forward — it holds
-                    // snapshots, not the peer pool — so hand the op back and let the actor
-                    // forward it. The effective key travels in place of the caller's hint: it is
-                    // the value the actor re-derives anyway.
-                    return Ok(WriteOutcome::NeedsActor {
-                        id,
-                        routing_key: effective_routing_key,
-                        doc,
-                    });
-                };
-
-                let req = WriteRequest {
-                    index: index.to_string(),
-                    id: id.clone(),
-                    routing_key: effective_routing_key.unwrap_or_default(),
+        match ctx.gate(index, &id, &routing_key, &doc, &schema)? {
+            // The schema is empty (a new index) or the document carries fields it does not
+            // describe. Either way this write has to grow the schema, which only the actor
+            // can do — give the caller back everything it needs to retry there.
+            WriteGate::Grow => Ok(WriteOutcome::NeedsActor {
+                id,
+                routing_key,
+                doc,
+            }),
+            WriteGate::Routed {
+                target,
+                effective_routing_key,
+            } => match ctx
+                .dispatch(target, index, id, effective_routing_key, doc)
+                .await?
+            {
+                WriteDispatch::Done(response) => Ok(WriteOutcome::Done(response)),
+                // The shard is on another node. The engine cannot forward — it holds
+                // snapshots, not the peer pool — so hand the op back and let the actor
+                // forward it. The effective key travels in place of the caller's hint: it is
+                // the value the actor re-derives anyway.
+                WriteDispatch::Elsewhere {
+                    id,
+                    effective_routing_key,
                     doc,
-                };
-
-                return match shard.handle_write(req).await {
-                    Ok(seq) => Ok(WriteOutcome::Done(serde_json::json!({
-                        "id": id, "result": "created", "version": seq,
-                        "shard_id": target.to_string()
-                    }))),
-                    Err(e) => Err(e),
-                };
-            }
-            // needs_evolution == true: fall through and hand the op back.
+                } => Ok(WriteOutcome::NeedsActor {
+                    id,
+                    routing_key: effective_routing_key,
+                    doc,
+                }),
+            },
         }
-
-        // The schema is empty (a new index) or the document carries fields it does not
-        // describe. Either way this write has to grow the schema, which only the actor can
-        // do — give the caller back everything it needs to retry there.
-        Ok(WriteOutcome::NeedsActor {
-            id,
-            routing_key,
-            doc,
-        })
     }
 
     /// Remove one document by key.
@@ -5488,23 +5599,23 @@ impl OrchestratorEngine {
 
         let effective = effective_delete_routing_key(&schema, &id, routing_key.clone())?;
 
-        // The ring owns the placement decision here as it does for a write, and a delete cannot
-        // disagree with the hint the router dispatched on: both are this same key.
-        let target = self.route_write(&Some(effective))?;
-
-        let Some(shard) = shards.get(&target) else {
-            // The shard is on another node. The engine cannot forward — it holds snapshots, not
-            // the peer pool — so hand the op back and let the actor forward it.
-            return Ok(DeleteOutcome::NeedsActor { id, routing_key });
+        let ring = self.routing_ring.load_full();
+        let ctx = WriteCtx {
+            shards: &shards,
+            ring: &ring,
+            schema_cache: &self.schema_cache,
         };
 
-        let sequence = shard.handle_delete(index.to_string(), id.clone()).await?;
-        Ok(DeleteOutcome::Done(serde_json::json!({
-            "id": id,
-            "result": "deleted",
-            "version": sequence,
-            "shard_id": target.to_string(),
-        })))
+        // The ring owns the placement decision here as it does for a write, and a delete cannot
+        // disagree with the hint the router dispatched on: both are this same key.
+        let target = ctx.route_write(&Some(effective))?;
+
+        match ctx.dispatch_delete(target, index, &id).await? {
+            Some(response) => Ok(DeleteOutcome::Done(response)),
+            // The shard is on another node. The engine cannot forward — it holds snapshots, not
+            // the peer pool — so hand the op back and let the actor forward it.
+            None => Ok(DeleteOutcome::NeedsActor { id, routing_key }),
+        }
     }
 
     /// Fast-path bulk write: validate against the schema as it stands, then fan out.
@@ -10095,38 +10206,6 @@ impl NodeOrchestrator {
         Ok(())
     }
 
-    /// Fetch a schema from cache if present (lock-free).
-    fn get_cached_schema(&self, index: &str) -> Option<Arc<IndexSchema>> {
-        let map = self.schema_cache.load();
-        map.get(index).cloned()
-    }
-
-    /// Insert a schema in the cache, unless the cache already holds a newer one.
-    ///
-    /// Version decides, not arrival order, so a write that resolved against a schema before it
-    /// was dropped cannot put that schema back over the record of the deletion. Ordering by
-    /// version costs a comparison and needs nothing coordinated between concurrent writers.
-    fn put_cached_schema(&self, index: &str, schema: &IndexSchema) {
-        self.put_cached_schema_arc(index, Arc::new(schema.clone()));
-    }
-
-    /// [`put_cached_schema`](Self::put_cached_schema) for a caller that already holds the `Arc`
-    /// — the store's own read of a schema is shared rather than cloned a second time.
-    fn put_cached_schema_arc(&self, index: &str, schema: Arc<IndexSchema>) {
-        let index_str = index.to_string();
-
-        self.schema_cache.rcu(|old| {
-            if let Some(current) = old.get(&index_str)
-                && current.version > schema.version
-            {
-                return Arc::clone(old);
-            }
-            let mut new = (**old).clone();
-            new.insert(index_str.clone(), Arc::clone(&schema));
-            Arc::new(new)
-        });
-    }
-
     /// Produce sorted field names with "id" first (if present), others alphabetical.
     ///
     /// `_seq` is excluded for the same reason `describe_fields` excludes it: it is the engine's
@@ -11195,16 +11274,6 @@ impl NodeOrchestrator {
         self.publish_engine_state();
     }
 
-    /// Determines the shard that should handle a routing key.
-    fn select_shard_for_key(&self, key: &str) -> Option<Uuid> {
-        self.routing_ring.get_owner(key)
-    }
-
-    /// Returns the first shard id if any exist (fallback for empty ring).
-    fn first_shard_id(&self) -> Option<Uuid> {
-        self.shards.keys().copied().next()
-    }
-
     /// Gets the number of active shards.
     pub fn shard_count(&self) -> usize {
         self.shards.len()
@@ -11419,7 +11488,7 @@ impl NodeOrchestrator {
 
         // Drop the entry, then cache what the shards now hold in its place.
         //
-        // An empty entry gives `put_cached_schema` nothing to compare against, so a write that
+        // An empty entry gives `schema_cache_put` nothing to compare against, so a write that
         // resolved against the old schema and is only now finishing validation would install
         // it again. The record of the deletion carries a version above anything a write in
         // flight holds, which is what makes that comparison refuse.
@@ -11440,7 +11509,7 @@ impl NodeOrchestrator {
             if let Ok(Ok(Some(dropped))) =
                 tokio::task::spawn_blocking(move || sc.get_schema(&idx)).await
             {
-                self.put_cached_schema(index, &dropped);
+                schema_cache_put(&self.schema_cache, index, &dropped);
             }
         }
 
@@ -11472,31 +11541,33 @@ impl NodeOrchestrator {
         // Lock-free schema lookup, by the one thing that identifies an index: its name.
         let schema = self.load_schema(index).await?;
 
-        // Fast path: mature schema — validate inline without spawn_blocking/Rayon
-        if !schema.fields.is_empty() {
-            let result = Self::validate_document(&id, &doc, &schema);
-            if let Some(err) = result.validation_error {
-                return Err(OrchestratorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    err,
-                )));
-            }
+        let ctx = WriteCtx {
+            shards: &self.shards,
+            ring: &self.routing_ring,
+            schema_cache: &self.schema_cache,
+        };
 
-            // If new fields detected, fall through to full validation for schema evolution
-            if !result.needs_evolution {
-                // Schema is stable — populate cache if not yet present
-                if self.get_cached_schema(index).is_none() {
-                    self.put_cached_schema(index, &schema);
-                }
-
-                // Schema-based routing
-                let effective_routing_key = effective_routing_key(&schema, &id, routing_key, &doc);
-
-                let target = self.route_write(&effective_routing_key)?;
-
-                let Some(shard) = self.shards.get(&target) else {
-                    return self
-                        .forward_op_to_owner(
+        // Fast path: mature schema — the gate validates, caches and routes; the dispatch is
+        // the same one the worker lane runs, so the two paths cannot drift on where a
+        // document lands.
+        let (id, routing_key, doc) = match ctx.gate(index, &id, &routing_key, &doc, &schema)? {
+            // needs_evolution, or an empty schema: fall through to the slow path below.
+            WriteGate::Grow => (id, routing_key, doc),
+            WriteGate::Routed {
+                target,
+                effective_routing_key,
+            } => {
+                return match ctx
+                    .dispatch(target, index, id, effective_routing_key, doc)
+                    .await?
+                {
+                    WriteDispatch::Done(response) => Ok(response),
+                    WriteDispatch::Elsewhere {
+                        id,
+                        effective_routing_key,
+                        doc,
+                    } => {
+                        self.forward_op_to_owner(
                             target,
                             forwarded,
                             ClientOp::Write {
@@ -11514,25 +11585,11 @@ impl NodeOrchestrator {
                             },
                             Some(&schema),
                         )
-                        .await;
-                };
-
-                let req = WriteRequest {
-                    index: index.to_string(),
-                    id: id.clone(),
-                    routing_key: effective_routing_key.unwrap_or_default(),
-                    doc,
-                };
-
-                return match shard.handle_write(req).await {
-                    Ok(seq) => Ok(
-                        serde_json::json!({"id": id, "result": "created", "version": seq, "shard_id": target.to_string()}),
-                    ),
-                    Err(e) => Err(e),
+                        .await
+                    }
                 };
             }
-            // needs_evolution == true: fall through to slow path below
-        }
+        };
 
         // Slow path: initial schema creation or schema evolution needed
         // Must use full staged_schema_validation with DocPayload wrapping
@@ -11553,8 +11610,10 @@ impl NodeOrchestrator {
             )
             .await?;
 
-        if validation_summary.evolution_needed || self.get_cached_schema(index).is_none() {
-            self.put_cached_schema(index, &schema_mut);
+        if validation_summary.evolution_needed
+            || schema_cache_get(&self.schema_cache, index).is_none()
+        {
+            schema_cache_put(&self.schema_cache, index, &schema_mut);
         }
 
         if !validation_summary.errors.is_empty() {
@@ -11573,11 +11632,19 @@ impl NodeOrchestrator {
         // Schema-based routing
         let effective_routing_key = effective_routing_key(&schema_mut, &id, routing_key, &doc);
 
-        let target = self.route_write(&effective_routing_key)?;
+        let target = ctx.route_write(&effective_routing_key)?;
 
-        let Some(shard) = self.shards.get(&target) else {
-            return self
-                .forward_op_to_owner(
+        match ctx
+            .dispatch(target, index, id, effective_routing_key, doc)
+            .await?
+        {
+            WriteDispatch::Done(response) => Ok(response),
+            WriteDispatch::Elsewhere {
+                id,
+                effective_routing_key,
+                doc,
+            } => {
+                self.forward_op_to_owner(
                     target,
                     forwarded,
                     ClientOp::Write {
@@ -11592,21 +11659,8 @@ impl NodeOrchestrator {
                     },
                     Some(&schema_mut),
                 )
-                .await;
-        };
-
-        let req = WriteRequest {
-            index: index.to_string(),
-            id: id.clone(),
-            routing_key: effective_routing_key.unwrap_or_default(),
-            doc,
-        };
-
-        match shard.handle_write(req).await {
-            Ok(seq) => Ok(
-                serde_json::json!({"id": id, "result": "created", "version": seq, "shard_id": target.to_string()}),
-            ),
-            Err(e) => Err(e),
+                .await
+            }
         }
     }
 
@@ -11634,13 +11688,19 @@ impl NodeOrchestrator {
 
         let effective = effective_delete_routing_key(&schema, &id, routing_key.clone())?;
 
-        let target = self.route_write(&Some(effective.clone()))?;
+        let ctx = WriteCtx {
+            shards: &self.shards,
+            ring: &self.routing_ring,
+            schema_cache: &self.schema_cache,
+        };
+        let target = ctx.route_write(&Some(effective.clone()))?;
 
-        let Some(shard) = self.shards.get(&target) else {
+        match ctx.dispatch_delete(target, index, &id).await? {
+            Some(response) => Ok(response),
             // The ring placed this delete on a peer. Forward it; the peer re-derives the key
             // from the same schema and routes to the shard it actually hosts.
-            return self
-                .forward_op_to_owner(
+            None => {
+                self.forward_op_to_owner(
                     target,
                     forwarded,
                     ClientOp::Delete {
@@ -11652,16 +11712,9 @@ impl NodeOrchestrator {
                     // A delete carries no document, so it can never need a schema.
                     None,
                 )
-                .await;
-        };
-
-        let sequence = shard.handle_delete(index.to_string(), id.clone()).await?;
-        Ok(serde_json::json!({
-            "id": id,
-            "result": "deleted",
-            "version": sequence,
-            "shard_id": target.to_string(),
-        }))
+                .await
+            }
+        }
     }
 
     /// Remove many documents in one request.
@@ -11805,7 +11858,7 @@ impl NodeOrchestrator {
 
         // `load_schema` answers from the cache when it can, and reads a shard when it cannot.
         // Owned, unlike the read paths: staged validation evolves this copy.
-        let mut schema_cache = Arc::unwrap_or_clone(self.load_schema(index).await?);
+        let mut schema_mut = Arc::unwrap_or_clone(self.load_schema(index).await?);
 
         // Use staged schema validation: parallel validation + sequential evolution. The batch
         // is handed over and handed back so the fan-out never has to copy it.
@@ -11813,14 +11866,16 @@ impl NodeOrchestrator {
             .staged_schema_validation(
                 index,
                 docs,
-                &mut schema_cache,
+                &mut schema_mut,
                 forwarded,
                 schema_body.as_deref(),
             )
             .await?;
 
-        if validation_summary.evolution_needed || self.get_cached_schema(index).is_none() {
-            self.put_cached_schema(index, &schema_cache);
+        if validation_summary.evolution_needed
+            || schema_cache_get(&self.schema_cache, index).is_none()
+        {
+            schema_cache_put(&self.schema_cache, index, &schema_mut);
         }
 
         // Documents that failed validation are dropped, and their reasons travel to the caller
@@ -11873,7 +11928,7 @@ impl NodeOrchestrator {
             coordinator: self.coordinator.as_ref(),
             remote_peer_pool: self.remote_peer_pool.as_deref(),
         };
-        ctx.apply_bulk_write(index, pending, rejections, &schema_cache, forwarded, start)
+        ctx.apply_bulk_write(index, pending, rejections, &schema_mut, forwarded, start)
             .await
     }
 
@@ -12004,7 +12059,7 @@ impl NodeOrchestrator {
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
         }
 
-        self.put_cached_schema(index, &schema);
+        schema_cache_put(&self.schema_cache, index, &schema);
 
         tracing::info!(
             index = %index,
@@ -12072,7 +12127,7 @@ impl NodeOrchestrator {
         if let Some(store) = stores.first()
             && let Ok(Some(schema)) = store.get_schema(index)
         {
-            self.put_cached_schema(index, &schema);
+            schema_cache_put(&self.schema_cache, index, &schema);
         }
 
         tracing::info!(
@@ -12507,7 +12562,7 @@ impl NodeOrchestrator {
 
     /// The schema this node holds for `index`, or `None` if it holds none.
     ///
-    /// **Not the same question as [`get_cached_schema`](Self::get_cached_schema).** That cache is
+    /// **Not the same question as [`schema_cache_get`].** That cache is
     /// filled lazily by the first operation to touch an index, so a node that has just booted
     /// answers "nothing" for every index it holds on disk until something asks. Where the answer
     /// only decides whether to re-read, that is a miss. Where it is reported to another node it
@@ -12523,7 +12578,7 @@ impl NodeOrchestrator {
         &self,
         index: &str,
     ) -> Result<Option<Arc<IndexSchema>>, OrchestratorError> {
-        if let Some(cached) = self.get_cached_schema(index) {
+        if let Some(cached) = schema_cache_get(&self.schema_cache, index) {
             return Ok(Some(cached));
         }
 
@@ -12537,7 +12592,7 @@ impl NodeOrchestrator {
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
             if let Some(schema) = schema {
-                self.put_cached_schema_arc(index, Arc::clone(&schema));
+                schema_cache_put_arc(&self.schema_cache, index, Arc::clone(&schema));
                 return Ok(Some(schema));
             }
         }
@@ -12553,27 +12608,6 @@ impl NodeOrchestrator {
             .durable_schema(index)
             .await?
             .unwrap_or_else(|| Arc::new(IndexSchema::default())))
-    }
-
-    /// Helper: Route write to shard using deterministic key (no round-robin).
-    fn route_write(&self, routing_key: &Option<String>) -> Result<Uuid, OrchestratorError> {
-        let key = routing_key.as_ref().ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Missing routing key for write",
-            ))
-        })?;
-
-        let target = self
-            .select_shard_for_key(key)
-            .or_else(|| self.first_shard_id());
-
-        target.ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No shard selected",
-            ))
-        })
     }
 }
 
