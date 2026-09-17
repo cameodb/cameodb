@@ -38,7 +38,7 @@ fn health_actor_budget(request_timeout: Duration) -> Duration {
 use crate::authz::Authz;
 use crate::cluster_coordinator::GetStatus;
 use crate::http_server::error::AppError;
-use crate::node_orchestrator::ClientOp;
+use crate::node::ClientOp;
 use crate::state::AppState;
 
 /// Liveness endpoint path. Exempt from the concurrency guard so that an overloaded node

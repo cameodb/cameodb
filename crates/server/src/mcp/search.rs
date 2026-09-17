@@ -11,7 +11,7 @@ use crate::mcp::diagnostics::{
     short_page_note, with_valid_fields, zero_results_advice,
 };
 use crate::mcp::schema::absent_index_reason;
-use crate::node_orchestrator::{APPROXIMATE_SORT_FIELD, ClientOp, SearchWindow, order_hit_blocks};
+use crate::node::{APPROXIMATE_SORT_FIELD, ClientOp, SearchWindow, order_hit_blocks};
 use crate::query::parse_query_keywords;
 use crate::state::AppState;
 

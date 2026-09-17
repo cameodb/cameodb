@@ -11,7 +11,7 @@ use crate::mcp::schema::{
     absent_index_reason, catalogue_entry, enrich_index_entry, enrich_index_entry_owned,
     extract_field_info, extract_field_names, field_query_hint, index_schema,
 };
-use crate::node_orchestrator::ClientOp;
+use crate::node::ClientOp;
 use crate::state::AppState;
 
 pub(super) fn describe_index(

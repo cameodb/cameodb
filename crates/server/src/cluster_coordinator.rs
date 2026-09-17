@@ -164,7 +164,7 @@ pub struct PeerNodeMetadataDiscovered {
 /// Message to set the local orchestrator reference
 #[derive(Debug, Clone)]
 pub struct SetLocalOrchestrator {
-    pub orchestrator: kameo::actor::ActorRef<crate::node_orchestrator::NodeOrchestrator>,
+    pub orchestrator: kameo::actor::ActorRef<crate::node::NodeOrchestrator>,
 }
 
 /// Message to coordinate index deletion across all nodes
@@ -268,7 +268,7 @@ pub struct ClusterCoordinator {
     state_store: Option<Arc<ClusterStateStore>>,
 
     /// Reference to local orchestrator for coordinated operations
-    local_orchestrator: Option<kameo::actor::ActorRef<crate::node_orchestrator::NodeOrchestrator>>,
+    local_orchestrator: Option<kameo::actor::ActorRef<crate::node::NodeOrchestrator>>,
 
     // Track expected shards from snapshot for reconciliation
     expected_shards: HashMap<Uuid, ShardMetadata>,
@@ -1828,7 +1828,7 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
     /// retrying; a delete the local node could not perform at all is not. Collapsed into one
     /// string both arrived at the HTTP boundary as `500`, which reads as "this failed, and not
     /// because of you" for the one case where a retry is exactly what the caller should do.
-    type Reply = Result<JsonValue, crate::node_orchestrator::OrchestratorError>;
+    type Reply = Result<JsonValue, crate::node::OrchestratorError>;
 
     async fn handle(
         &mut self,
@@ -1844,7 +1844,7 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
         // 1. Delete from local node first
         let local_result = if let Some(local_orchestrator) = &self.local_orchestrator {
             local_orchestrator
-                .ask(crate::node_orchestrator::ClientOp::DeleteIndex {
+                .ask(crate::node::ClientOp::DeleteIndex {
                     index: msg.index.clone(),
                     delete_schema: msg.delete_schema,
                 })
@@ -1853,13 +1853,13 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                 // of it: it already carries the verdict the caller's status is read from.
                 .map_err(|e| match e {
                     kameo::error::SendError::HandlerError(err) => err,
-                    other => crate::node_orchestrator::OrchestratorError::Io(std::io::Error::new(
+                    other => crate::node::OrchestratorError::Io(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         format!("Failed to communicate with local orchestrator: {}", other),
                     )),
                 })
         } else {
-            Err(crate::node_orchestrator::OrchestratorError::Io(
+            Err(crate::node::OrchestratorError::Io(
                 std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "Local orchestrator not available",
@@ -1895,9 +1895,9 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                             .map_err(|e| format!("Lookup failed for node {}: {}", peer.node_id, e))
                     } else {
                         let remote_orchestrator_name =
-                            crate::node_orchestrator::orchestrator_remote_name(&peer.node_id);
+                            crate::node::orchestrator_remote_name(&peer.node_id);
                         kameo::actor::RemoteActorRef::<
-                            crate::node_orchestrator::NodeOrchestrator,
+                            crate::node::NodeOrchestrator,
                         >::lookup(remote_orchestrator_name.as_str())
                         .await
                         .map_err(|e| format!("Lookup failed for node {}: {}", peer.node_id, e))
@@ -1905,7 +1905,7 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
 
                     let result = match lookup_result {
                         Ok(Some(remote_orchestrator)) => {
-                            let delete_msg = crate::node_orchestrator::ClientOp::DeleteIndex {
+                            let delete_msg = crate::node::ClientOp::DeleteIndex {
                                 index: index.clone(),
                                 delete_schema,
                             };
@@ -1913,7 +1913,7 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                             // `remote_answer` so a peer that ran the delete and refused it
                             // keeps its own verdict, instead of it being flattened into the
                             // same string as a peer that never received the message.
-                            match crate::node_orchestrator::remote_answer(
+                            match crate::node::remote_answer(
                                 remote_orchestrator.ask(&delete_msg).await,
                             ) {
                                 Ok(result) => {
@@ -2021,7 +2021,7 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
         // may survive somewhere, and that is the same either way. The reason is preserved in the
         // message and in the warning logged above.
         Err(
-            crate::node_orchestrator::OrchestratorError::PeerUnreachable {
+            crate::node::OrchestratorError::PeerUnreachable {
                 // The reasons go last: each one is already a sentence about a node, so any
                 // phrasing that reads them as a noun ("but <reason> could not be reached")
                 // comes out mangled.

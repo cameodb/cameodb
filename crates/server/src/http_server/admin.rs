@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
 use crate::http_server::error::AppError;
-use crate::node_orchestrator::{
+use crate::node::{
     AdminIndexCommitReport, AdminIndexEvictWriterReport, AdminMemoryReport, WorkerPoolReport,
 };
 use crate::state::AppState;

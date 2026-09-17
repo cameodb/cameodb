@@ -41,7 +41,7 @@ use crate::http_server::write::{
     bulk_delete_handler, bulk_write_handler, delete_document_handler, write_handler,
     write_stream_handler,
 };
-use crate::node_orchestrator::{OpClass, REQUEST_STARTED_AT};
+use crate::node::{OpClass, REQUEST_STARTED_AT};
 use crate::state::AppState;
 
 /// What the surface in front of the handlers is configured with.

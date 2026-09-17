@@ -128,7 +128,7 @@ pub(super) fn short_page_note(
 
 /// What an approximate sort order means for the caller holding it.
 ///
-/// Attached whenever the engine reports [`crate::node_orchestrator::APPROXIMATE_SORT_FIELD`],
+/// Attached whenever the engine reports [`crate::node::APPROXIMATE_SORT_FIELD`],
 /// rather than left in the node's log where the caller cannot see it. An agent reading a sorted
 /// page has no other way to tell that it is holding the alphabetical order of a sample: the hits
 /// look exactly like an exact answer, and every hit in them is real.
@@ -177,7 +177,7 @@ pub(super) fn with_valid_fields(error: &str, index: &str, field_names: &[String]
 /// [`DISCARDED_CLAUSES_FIELD`].
 pub(super) fn refuse_if_clauses_discarded(response: &JsonValue) -> Result<(), String> {
     let discarded: Vec<&str> = response
-        .get(crate::node_orchestrator::DISCARDED_CLAUSES_FIELD)
+        .get(crate::node::DISCARDED_CLAUSES_FIELD)
         .and_then(|value| value.as_array())
         .map(|notes| notes.iter().filter_map(|note| note.as_str()).collect())
         .unwrap_or_default();

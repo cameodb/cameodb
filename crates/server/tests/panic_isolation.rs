@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-/// Trap inputs — the same literals the feature-gated seams in `node_orchestrator` and `routes`
+/// Trap inputs — the same literals the feature-gated seams in `node` and `routes`
 /// match. Kept in step by hand because the binary crate exposes no library to import them from.
 const READ_TRAP_QUERY: &str = "__fault_panic_read__";
 const WRITE_OP_TRAP_INDEX: &str = "fault_panic_write_op__";

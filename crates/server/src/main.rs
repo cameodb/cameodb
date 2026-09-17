@@ -20,7 +20,7 @@ mod config;
 mod distributed;
 mod http_server;
 mod mcp;
-mod node_orchestrator;
+mod node;
 mod posture;
 mod query;
 mod ratelimit;
@@ -35,7 +35,7 @@ use cluster_state::ClusterStateStore;
 use config::CameoDbConfig;
 use distributed::{ClusterStatus, DistributedCluster};
 use http_server::create_router;
-use node_orchestrator::{
+use node::{
     NodeConfig, NodeOrchestrator, ProposeShard, RouterActor, ShardAffineConfig,
     StreamingSearchConfig, UpdateTopology, orchestrator_remote_name,
 };
@@ -939,7 +939,7 @@ async fn main() -> Result<()> {
     );
     match timeout(
         Duration::from_secs(SHARD_SHUTDOWN_TIMEOUT_SECS),
-        orchestrator_ref.ask(crate::node_orchestrator::ShutdownAllShards),
+        orchestrator_ref.ask(crate::node::ShutdownAllShards),
     )
     .await
     {
@@ -973,7 +973,7 @@ async fn main() -> Result<()> {
     let read_pool_reply_timeout = Duration::from_secs(READ_RUNTIME_SHUTDOWN_TIMEOUT_SECS + 5);
     match timeout(
         read_pool_reply_timeout,
-        orchestrator_ref.ask(crate::node_orchestrator::ShutdownReadRuntime {
+        orchestrator_ref.ask(crate::node::ShutdownReadRuntime {
             timeout: Duration::from_secs(READ_RUNTIME_SHUTDOWN_TIMEOUT_SECS),
         }),
     )
