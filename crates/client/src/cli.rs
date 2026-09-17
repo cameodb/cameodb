@@ -2497,35 +2497,7 @@ fn read_local_prefix_bytes(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-fn source_extension(source: &str) -> Option<String> {
-    let compression = detect_compression(source);
-
-    let extract_ext = |path: &Path| -> Option<String> {
-        if compression != Compression::None {
-            // Strip compression extension to get inner format extension
-            // e.g. "data.csv.gz" -> stem "data.csv" -> extension "csv"
-            let stem = path.file_stem()?.to_str()?;
-            Path::new(stem)
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.to_ascii_lowercase())
-        } else {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.to_ascii_lowercase())
-        }
-    };
-
-    if is_http_source(source) {
-        Url::parse(source)
-            .ok()
-            .and_then(|url| extract_ext(Path::new(url.path())))
-    } else {
-        extract_ext(Path::new(source))
-    }
-}
-
-fn detect_source_format_from_hint(_extension: Option<&str>, bytes: &[u8]) -> Result<SourceFormat> {
+fn detect_source_format_from_bytes(bytes: &[u8]) -> Result<SourceFormat> {
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Err(anyhow!("Source is empty"));
     }
@@ -2536,7 +2508,7 @@ fn detect_source_format_from_hint(_extension: Option<&str>, bytes: &[u8]) -> Res
         .find(|byte| !byte.is_ascii_whitespace())
         .ok_or_else(|| anyhow!("Source is empty"))?;
 
-    // Content-based detection takes precedence over extension
+    // Detection is by content alone — the file's extension is deliberately not consulted.
     match first_non_whitespace {
         b'[' => Ok(SourceFormat::JsonArray),
         b'{' => {
@@ -2567,14 +2539,9 @@ fn detect_source_format_from_hint(_extension: Option<&str>, bytes: &[u8]) -> Res
     }
 }
 
-fn detect_source_format_from_prefix(path: &Path, bytes: &[u8]) -> Result<SourceFormat> {
-    let extension = path.extension().and_then(|ext| ext.to_str());
-    detect_source_format_from_hint(extension, bytes)
-}
-
 fn detect_local_source_format(path: &Path) -> Result<SourceFormat> {
     let prefix = read_local_prefix_bytes(path, SOURCE_SNIFF_BYTES)?;
-    detect_source_format_from_prefix(path, &prefix)
+    detect_source_format_from_bytes(&prefix)
 }
 
 fn effective_json_document(doc: &JsonValue) -> Result<JsonValue> {
@@ -3463,8 +3430,7 @@ async fn detect_source_format_for_source(
 ) -> Result<SourceFormat> {
     if is_http_source(source) {
         let prefix = fetch_source_prefix_bytes(client, source, SOURCE_SNIFF_BYTES).await?;
-        let extension = source_extension(source);
-        detect_source_format_from_hint(extension.as_deref(), &prefix)
+        detect_source_format_from_bytes(&prefix)
     } else {
         detect_local_source_format(Path::new(source))
     }

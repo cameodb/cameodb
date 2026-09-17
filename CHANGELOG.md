@@ -83,6 +83,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A dead-code sweep ahead of the orchestrator split** (L17). `StreamingSearchResult::Local`
+  dropped the `shard_id` (always `Uuid::nil()`) and `took_ms` fields nothing read. The
+  `new_docs` count the writer channel split across callers with remainder arithmetic — and
+  both callers discarded — is out of the channel and reply types. `GetWorkerStats` had no
+  caller and no handler and is gone, as is `MergedWriteReply::Batch`'s never-read op count.
+  The blanket `allow(dead_code)` suppressions came off types the bulk move made live, so the
+  compiler reports the next corpse instead of hiding it. The broadcast hot path's per-request
+  `info!` — the per-peer loop, fan-out summary, streaming banner, remote-attempt line — is
+  `debug!`. In the client, the dead `_extension` parameter took its `source_extension` helper
+  with it.
+
 - **The scatter-gather is written once.** `engine_search` and `orch_search` were ~150-line
   near-duplicates — fan-out, gather accounting, sort-key stamping, merge, projection, response
   assembly — and three separate fixes had already been made in both. The body lives in
