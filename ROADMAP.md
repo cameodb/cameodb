@@ -50,7 +50,7 @@ on one.
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
-| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8, CH9, CH10 and CH11 done, CH2 (server half) and CH12 partial |
+| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half under L12 |
 | L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11 done), six simplifications (L15, L16 and L17 done), and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
@@ -167,7 +167,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — health fixed, the lane gated, and admission on both lanes predicts against a measured spread | — | 2026-09-16 | ✅ |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items — CH1 done | — | 2026-08-16 | 📋 |
 | [CH11](#ch11--routing-key-derivation-is-written-four-times-with-two-algorithms) | Routing-key derivation, four spellings and two hashes — closed ahead of the split | — | 2026-09-01 | ✅ |
-| [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8, CH9 and CH10 done, CH12 partial | — | 2026-09-01 | ◐ |
+| [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — all done | — | 2026-09-01 | ✅ |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
 | [J1](#j1--a-facet-field-cannot-be-written-to) | A facet field cannot be written to | 18 | 2026-08-27 | ✅ |
 | [J2](#j2--a-json-field-should-mean-subfield-addressing) | A json field should mean subfield addressing | 18 | 2026-08-27 | 📋 |
@@ -1956,7 +1956,7 @@ the schema-aware refusal downstream is what catches a wrong hint.
 
 ### CH12 — Write-path serialization and round-trip waste
 
-◐ **Partial** 2026-09-02. The small ones collected, none of which alone justifies an item. The
+✅ **Done** 2026-09-18. The small ones collected, none of which alone justifies an item. The
 first two landed ahead of the public 0.3.3; both were smaller than described, and neither needed
 the mechanism proposed here:
 
@@ -2005,12 +2005,18 @@ the mechanism proposed here:
   reports its real identity and shard count while shedding, and two probes in five answered in
   ~2ms rather than spending the whole actor budget.
 
-  Still open, and deliberately: `ListIndexes` remains on the actor. Moving it means extracting a
-  ~190-line aggregation that calls `load_schema`, and **there are two different `load_schema`s** —
-  the engine's reads the cache then the first shard's store, the orchestrator's reads
-  `durable_schema`. Sharing the body would mean choosing which is correct, which is
-  [L15](#l15--the-schema-cache-machinery-exists-three-times)'s question, and copying it would be
-  the disease [CH1](#ch1--one-scatter-gather-written-twice) is about. It waits for L15.
+  `ListIndexes` stayed on the actor by choice — moving it meant extracting the
+  ~190-line aggregation, and the two different `load_schema`s it called were
+  [L15](#l15--the-schema-cache-machinery-exists-three-times)'s question to settle first.
+  **Moved** 2026-09-18. Both `load_schema`s now delegate to `SchemaCache::schema_for`, so
+  there is one load-schema semantics to share and nothing to choose between. The
+  aggregation is the free function `list_indexes` in `node/orchestrator.rs`, taking the
+  shard map, the `SchemaCache` and the identity as borrows — the actor's
+  `orch_list_indexes` delegates to it, and the engine calls it on its `ArcSwap` snapshot.
+  `ListIndexes` and `ListClusterIndexes` are worker-eligible, so "what indexes exist" —
+  and the local half of the cluster listing, which is the same body — no longer queues
+  behind a bulk write. `GetShardStats` was always asked on a shard clone rather than the
+  shard's mailbox, so the worker consults the same state the actor did.
 - ✅ **The writer thread's two groups are merged** 2026-09-16, and the comment that said they
   already were is now true. `write_groups` and `batch_groups` were drained by separate phases,
   so an index that received both kinds in one drain paid two `apply_batch_and_maybe_commit`

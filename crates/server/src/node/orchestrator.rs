@@ -3163,6 +3163,21 @@ impl OrchestratorEngine {
             ClientOp::GetIdentity => {
                 WorkerOutcome::Done(Ok(identity_json(&self.identity, self.shards.load().len())))
             }
+            // Same reason as GetIdentity — the listing is a metadata read: shard stats,
+            // one schema per index, an immutable identity. The shards' own actor state is
+            // consulted through `handle_get_stats` on a snapshot clone, so nothing here
+            // needs the orchestrator's `&mut`. `ListClusterIndexes` shares the arm because
+            // the local half of its broadcast is the same listing (ROADMAP CH12).
+            ClientOp::ListIndexes { include_data_size }
+            | ClientOp::ListClusterIndexes { include_data_size } => WorkerOutcome::Done(
+                list_indexes(
+                    &self.shards.load(),
+                    &self.schema_cache,
+                    &self.identity,
+                    include_data_size,
+                )
+                .await,
+            ),
             other => WorkerOutcome::UseActor(Box::new(other)),
         }
     }
@@ -6269,202 +6284,227 @@ impl NodeOrchestrator {
         }))
     }
 
-    /// List all available indexes (unified function for both local and cluster operations)
+    /// List all available indexes — the mailbox entry for [`list_indexes`]. On the actor it
+    /// is the fallback for callers that never met the worker pool; the answer itself is
+    /// computed from `&self` state, so the engine answers the same question from a snapshot
+    /// without queueing behind whatever the mailbox is holding.
     pub(crate) async fn orch_list_indexes(
         &self,
         include_data_size: bool,
     ) -> Result<JsonValue, OrchestratorError> {
-        // For now, cluster mode is handled at the RouterActor level
-        // This function handles the local aggregation logic
-        if self.shards.is_empty() {
-            return Ok(serde_json::json!({
-                "indexes": [],
-                "total_indexes": 0,
-                "node_id": self.identity.uuid.to_string(),
-                "node_name": self.identity.name.clone(),
-                "total_shards": 0
-            }));
-        }
+        list_indexes(
+            &self.shards,
+            &self.schema_cache,
+            &self.identity,
+            include_data_size,
+        )
+        .await
+    }
+}
 
-        /// Per-index totals accumulated across this node's shards.
-        #[derive(Default)]
-        struct IndexTotals {
-            pub(crate) document_count: u64,
-            pub(crate) redb_bytes: u64,
-            pub(crate) tantivy_bytes: u64,
-            /// Shards that hold data for this index.
-            pub(crate) shard_count: usize,
-            /// Of those, how many have finished warming their reader.
-            pub(crate) warm_shards: usize,
-            /// Union of the fields the built index can actually search, across shards.
-            ///
-            /// A union rather than an intersection: a shard that has the column can answer a
-            /// query on that field, and a scatter-gather asks every shard. Reporting the
-            /// intersection would call a field unsearchable because one empty shard lacks it.
-            pub(crate) searchable: HashSet<String>,
-            /// Union of the fields the built index can sort exactly, across shards, on the same
-            /// reasoning.
-            pub(crate) sortable: HashSet<String>,
-        }
-
-        let mut all: HashMap<String, IndexTotals> = HashMap::new();
-
-        // Create GetShardStats message
-        let msg = GetShardStats { include_data_size };
-
-        // Collect futures for all shard stats requests using actor message pattern
-        let mut shard_futures = Vec::new();
-        for (shard_id, shard) in &self.shards {
-            let shard_id = *shard_id;
-            let shard_clone = shard.clone();
-            let msg_clone = msg.clone();
-
-            // Call handle_get_stats on each shard actor asynchronously
-            let future = async move {
-                let result = shard_clone.handle_get_stats(msg_clone).await;
-                (shard_id, result)
-            };
-            shard_futures.push(future);
-        }
-
-        // Await all futures in parallel using join_all
-        let results = join_all(shard_futures).await;
-
-        let mut shard_timings: Vec<(Uuid, ShardStatsTimings)> = Vec::new();
-        for (shard_id, result) in results {
-            match result {
-                Ok(snapshot) => {
-                    shard_timings.push((shard_id, snapshot.timings.clone()));
-
-                    for (index_name, stats) in snapshot.per_index {
-                        let entry = all.entry(index_name).or_default();
-                        entry.document_count += stats.document_count;
-                        entry.redb_bytes += stats.redb_bytes;
-                        entry.tantivy_bytes += stats.tantivy_bytes;
-
-                        if stats.document_count > 0
-                            || stats.redb_bytes > 0
-                            || stats.tantivy_bytes > 0
-                            || stats.tantivy_index_exists
-                        {
-                            entry.shard_count += 1;
-                            if stats.warmup_state == storage::IndexWarmupState::Warm {
-                                entry.warm_shards += 1;
-                            }
-                        }
-                        for field in stats.searchable_fields {
-                            entry.searchable.insert(field);
-                        }
-                        for field in stats.sortable_fields {
-                            entry.sortable.insert(field);
-                        }
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        let mut total_redb_ms: u128 = 0;
-        let mut total_tantivy_ms: u128 = 0;
-        for (shard_id, timings) in shard_timings {
-            debug!(
-                shard = %shard_id,
-                redb_ms = timings.redb_ms,
-                tantivy_ms = timings.tantivy_ms,
-                total_ms = timings.total_ms,
-                "Collected shard index statistics"
-            );
-
-            total_redb_ms = total_redb_ms.max(timings.redb_ms);
-            total_tantivy_ms = total_tantivy_ms.max(timings.tantivy_ms);
-        }
-
-        let total_ms = total_redb_ms + total_tantivy_ms;
-
-        let mut indexes: Vec<(String, JsonValue)> = Vec::new();
-        for (name, totals) in all {
-            let IndexTotals {
-                document_count,
-                redb_bytes,
-                tantivy_bytes,
-                shard_count,
-                warm_shards,
-                searchable,
-                sortable,
-            } = totals;
-            let mut json_obj = JsonMap::new();
-            json_obj.insert("name".to_string(), JsonValue::String(name.clone()));
-            json_obj.insert(
-                "document_count".to_string(),
-                JsonValue::from(document_count),
-            );
-
-            // Bytes rather than megabytes, everywhere. The cluster listing sums these across
-            // nodes, and summing values already rounded to whole megabytes lost up to a megabyte
-            // per node. A renderer that wants megabytes divides once, at the end.
-            json_obj.insert(
-                "index_size_bytes".to_string(),
-                JsonValue::from(tantivy_bytes),
-            );
-            json_obj.insert(
-                "memory_bytes".to_string(),
-                JsonValue::from(redb_bytes + tantivy_bytes),
-            );
-
-            // The redb half is only measured when it was asked for — walking it is the expensive
-            // part of the statistics call — so these are absent rather than reported as zero.
-            if include_data_size {
-                json_obj.insert("data_size_bytes".to_string(), JsonValue::from(redb_bytes));
-                json_obj.insert(
-                    "total_size_bytes".to_string(),
-                    JsonValue::from(tantivy_bytes + redb_bytes),
-                );
-            }
-
-            json_obj.insert("shard_count".to_string(), JsonValue::from(shard_count));
-            // Warmup coverage on this node: how many of the shards holding this index are
-            // already serving from warm readers. Below shard_count means the first query
-            // routed to a cold shard still pays the open-and-fault cost.
-            json_obj.insert("warm_shards".to_string(), JsonValue::from(warm_shards));
-            // The schema is read here, once, and rendered in full. Every caller used to fetch it
-            // again per index to learn field types — the client sequentially, the MCP tools
-            // concurrently — because the listing offered names alone.
-            match self.load_schema(&name).await {
-                Ok(schema) => {
-                    if let Some(description) = &schema.description {
-                        json_obj.insert(
-                            "description".to_string(),
-                            JsonValue::String(description.clone()),
-                        );
-                    }
-                    let fields = Self::describe_fields(&schema, &searchable, &sortable);
-                    json_obj.insert("field_count".to_string(), JsonValue::from(fields.len()));
-                    json_obj.insert("fields".to_string(), JsonValue::Array(fields));
-                }
-                Err(_) => {
-                    // An unreadable schema is reported as no fields rather than as a missing key,
-                    // so a consumer never has to distinguish "absent" from "empty".
-                    json_obj.insert("field_count".to_string(), JsonValue::from(0));
-                    json_obj.insert("fields".to_string(), JsonValue::Array(Vec::new()));
-                }
-            }
-
-            indexes.push((name, JsonValue::Object(json_obj)));
-        }
-
-        indexes.sort_by(|a, b| a.0.cmp(&b.0));
-        let indexes: Vec<JsonValue> = indexes.into_iter().map(|(_, json)| json).collect();
-
-        Ok(serde_json::json!({
-            "indexes": indexes,
-            "total_indexes": indexes.len(),
-            "node_id": self.identity.uuid.to_string(),
-            "node_name": self.identity.name.clone(),
-            "total_shards": self.shards.len(),
-            "took_ms": total_ms,
-        }))
+/// Local index listing: stats per index across shards, then each index's schema read once
+/// for its fields. Cluster mode is handled at the RouterActor level — this is the local
+/// aggregation logic its broadcast merges on top of.
+///
+/// Shared by `NodeOrchestrator::orch_list_indexes` and `OrchestratorEngine` — every input
+/// is a borrow (`&HashMap` of shards, the cache, the identity), so a worker holding the
+/// `ArcSwap` snapshots computes the identical answer.
+pub(crate) async fn list_indexes(
+    shards: &HashMap<Uuid, MicroshardActor>,
+    schema_cache: &SchemaCache,
+    identity: &NodeIdentity,
+    include_data_size: bool,
+) -> Result<JsonValue, OrchestratorError> {
+    if shards.is_empty() {
+        return Ok(serde_json::json!({
+            "indexes": [],
+            "total_indexes": 0,
+            "node_id": identity.uuid.to_string(),
+            "node_name": identity.name.clone(),
+            "total_shards": 0
+        }));
     }
 
+    /// Per-index totals accumulated across this node's shards.
+    #[derive(Default)]
+    struct IndexTotals {
+        pub(crate) document_count: u64,
+        pub(crate) redb_bytes: u64,
+        pub(crate) tantivy_bytes: u64,
+        /// Shards that hold data for this index.
+        pub(crate) shard_count: usize,
+        /// Of those, how many have finished warming their reader.
+        pub(crate) warm_shards: usize,
+        /// Union of the fields the built index can actually search, across shards.
+        ///
+        /// A union rather than an intersection: a shard that has the column can answer a
+        /// query on that field, and a scatter-gather asks every shard. Reporting the
+        /// intersection would call a field unsearchable because one empty shard lacks it.
+        pub(crate) searchable: HashSet<String>,
+        /// Union of the fields the built index can sort exactly, across shards, on the same
+        /// reasoning.
+        pub(crate) sortable: HashSet<String>,
+    }
+
+    let mut all: HashMap<String, IndexTotals> = HashMap::new();
+
+    // Create GetShardStats message
+    let msg = GetShardStats { include_data_size };
+
+    // Collect futures for all shard stats requests using actor message pattern
+    let mut shard_futures = Vec::new();
+    for (shard_id, shard) in shards {
+        let shard_id = *shard_id;
+        let shard_clone = shard.clone();
+        let msg_clone = msg.clone();
+
+        // Call handle_get_stats on each shard actor asynchronously
+        let future = async move {
+            let result = shard_clone.handle_get_stats(msg_clone).await;
+            (shard_id, result)
+        };
+        shard_futures.push(future);
+    }
+
+    // Await all futures in parallel using join_all
+    let results = join_all(shard_futures).await;
+
+    let mut shard_timings: Vec<(Uuid, ShardStatsTimings)> = Vec::new();
+    for (shard_id, result) in results {
+        match result {
+            Ok(snapshot) => {
+                shard_timings.push((shard_id, snapshot.timings.clone()));
+
+                for (index_name, stats) in snapshot.per_index {
+                    let entry = all.entry(index_name).or_default();
+                    entry.document_count += stats.document_count;
+                    entry.redb_bytes += stats.redb_bytes;
+                    entry.tantivy_bytes += stats.tantivy_bytes;
+
+                    if stats.document_count > 0
+                        || stats.redb_bytes > 0
+                        || stats.tantivy_bytes > 0
+                        || stats.tantivy_index_exists
+                    {
+                        entry.shard_count += 1;
+                        if stats.warmup_state == storage::IndexWarmupState::Warm {
+                            entry.warm_shards += 1;
+                        }
+                    }
+                    for field in stats.searchable_fields {
+                        entry.searchable.insert(field);
+                    }
+                    for field in stats.sortable_fields {
+                        entry.sortable.insert(field);
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let mut total_redb_ms: u128 = 0;
+    let mut total_tantivy_ms: u128 = 0;
+    for (shard_id, timings) in shard_timings {
+        debug!(
+            shard = %shard_id,
+            redb_ms = timings.redb_ms,
+            tantivy_ms = timings.tantivy_ms,
+            total_ms = timings.total_ms,
+            "Collected shard index statistics"
+        );
+
+        total_redb_ms = total_redb_ms.max(timings.redb_ms);
+        total_tantivy_ms = total_tantivy_ms.max(timings.tantivy_ms);
+    }
+
+    let total_ms = total_redb_ms + total_tantivy_ms;
+
+    let mut indexes: Vec<(String, JsonValue)> = Vec::new();
+    for (name, totals) in all {
+        let IndexTotals {
+            document_count,
+            redb_bytes,
+            tantivy_bytes,
+            shard_count,
+            warm_shards,
+            searchable,
+            sortable,
+        } = totals;
+        let mut json_obj = JsonMap::new();
+        json_obj.insert("name".to_string(), JsonValue::String(name.clone()));
+        json_obj.insert(
+            "document_count".to_string(),
+            JsonValue::from(document_count),
+        );
+
+        // Bytes rather than megabytes, everywhere. The cluster listing sums these across
+        // nodes, and summing values already rounded to whole megabytes lost up to a megabyte
+        // per node. A renderer that wants megabytes divides once, at the end.
+        json_obj.insert(
+            "index_size_bytes".to_string(),
+            JsonValue::from(tantivy_bytes),
+        );
+        json_obj.insert(
+            "memory_bytes".to_string(),
+            JsonValue::from(redb_bytes + tantivy_bytes),
+        );
+
+        // The redb half is only measured when it was asked for — walking it is the expensive
+        // part of the statistics call — so these are absent rather than reported as zero.
+        if include_data_size {
+            json_obj.insert("data_size_bytes".to_string(), JsonValue::from(redb_bytes));
+            json_obj.insert(
+                "total_size_bytes".to_string(),
+                JsonValue::from(tantivy_bytes + redb_bytes),
+            );
+        }
+
+        json_obj.insert("shard_count".to_string(), JsonValue::from(shard_count));
+        // Warmup coverage on this node: how many of the shards holding this index are
+        // already serving from warm readers. Below shard_count means the first query
+        // routed to a cold shard still pays the open-and-fault cost.
+        json_obj.insert("warm_shards".to_string(), JsonValue::from(warm_shards));
+        // The schema is read here, once, and rendered in full. Every caller used to fetch it
+        // again per index to learn field types — the client sequentially, the MCP tools
+        // concurrently — because the listing offered names alone.
+        match schema_cache.schema_for(shards, &name).await {
+            Ok(schema) => {
+                if let Some(description) = &schema.description {
+                    json_obj.insert(
+                        "description".to_string(),
+                        JsonValue::String(description.clone()),
+                    );
+                }
+                let fields = NodeOrchestrator::describe_fields(&schema, &searchable, &sortable);
+                json_obj.insert("field_count".to_string(), JsonValue::from(fields.len()));
+                json_obj.insert("fields".to_string(), JsonValue::Array(fields));
+            }
+            Err(_) => {
+                // An unreadable schema is reported as no fields rather than as a missing key,
+                // so a consumer never has to distinguish "absent" from "empty".
+                json_obj.insert("field_count".to_string(), JsonValue::from(0));
+                json_obj.insert("fields".to_string(), JsonValue::Array(Vec::new()));
+            }
+        }
+
+        indexes.push((name, JsonValue::Object(json_obj)));
+    }
+
+    indexes.sort_by(|a, b| a.0.cmp(&b.0));
+    let indexes: Vec<JsonValue> = indexes.into_iter().map(|(_, json)| json).collect();
+
+    Ok(serde_json::json!({
+        "indexes": indexes,
+        "total_indexes": indexes.len(),
+        "node_id": identity.uuid.to_string(),
+        "node_name": identity.name.clone(),
+        "total_shards": shards.len(),
+        "took_ms": total_ms,
+    }))
+}
+
+impl NodeOrchestrator {
     /// Get node identity information
     pub(crate) async fn orch_get_identity(&self) -> Result<JsonValue, OrchestratorError> {
         Ok(identity_json(&self.identity, self.shards.len()))
