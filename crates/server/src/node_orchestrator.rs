@@ -1392,7 +1392,7 @@ type WriteCommand = (WalOp, tokio::sync::oneshot::Sender<Result<u64, StoreError>
 /// Type alias for batch write commands enqueued in the writer thread
 type BatchCommand = (
     Vec<WalOp>,
-    tokio::sync::oneshot::Sender<Result<(Vec<u64>, usize), StoreError>>,
+    tokio::sync::oneshot::Sender<Result<Vec<u64>, StoreError>>,
 );
 
 /// Where one caller's slice of a merged write goes back to.
@@ -1402,11 +1402,7 @@ type BatchCommand = (
 /// sequence id, a batch is owed its own run of them.
 enum MergedWriteReply {
     Single(tokio::sync::oneshot::Sender<Result<u64, StoreError>>),
-    /// The number of ops this caller contributed, and where its answer goes.
-    Batch(
-        usize,
-        tokio::sync::oneshot::Sender<Result<(Vec<u64>, usize), StoreError>>,
-    ),
+    Batch(tokio::sync::oneshot::Sender<Result<Vec<u64>, StoreError>>),
 }
 
 /// The contiguous run of sequence ids each caller in a merged write owns.
@@ -1439,7 +1435,7 @@ type DeleteCommand = (
 /// Type alias for tracking reply slices when coalescing batch writes
 type BatchReplySegment = (
     usize,
-    tokio::sync::oneshot::Sender<Result<(Vec<u64>, usize), StoreError>>,
+    tokio::sync::oneshot::Sender<Result<Vec<u64>, StoreError>>,
 );
 
 /// Extract routing key value from JSON document using field name
@@ -2550,12 +2546,8 @@ fn is_write_operation(op: &ClientOp) -> bool {
 pub enum StreamingSearchResult {
     /// Result from a local microshard
     Local {
-        #[allow(dead_code)] // Constructed for completeness; matched with wildcard
-        shard_id: Uuid,
         hits: Vec<(f32, serde_json::Value)>,
         total_hits: usize,
-        #[allow(dead_code)] // Constructed for completeness; matched with wildcard
-        took_ms: u64,
     },
     /// Result from a remote node
     Remote {
@@ -2801,7 +2793,6 @@ impl Default for NodeConfig {
 }
 
 /// Errors that can occur during node orchestration operations.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, thiserror::Error)]
 pub enum OrchestratorError {
     #[error("identity error: {0}")]
@@ -3410,7 +3401,6 @@ pub struct SearchReply {
 }
 
 /// Client operation messages for RouterActor.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientOp {
     /// Search operation across shards of an index
@@ -3619,7 +3609,7 @@ pub enum StorageCommand {
     BatchWrite {
         index: String,
         ops: Vec<WalOp>,
-        reply: tokio::sync::oneshot::Sender<Result<(Vec<u64>, usize), StoreError>>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<u64>, StoreError>>,
     },
     Commit {
         index: String,
@@ -4827,11 +4817,6 @@ pub struct WorkerPoolReport {
     pub shards: Vec<ShardPlacementStats>,
     pub dispatch: DispatchStats,
 }
-
-/// Message to retrieve worker pool stats from the RouterActor.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct GetWorkerStats;
 
 #[derive(Clone, Debug)]
 pub struct OrchestratorWorkerTx {
@@ -6423,7 +6408,6 @@ fn spawn_writer_thread(
                         let mut merged_ops: Vec<WalOp> = Vec::new();
                         let mut segments: Vec<MergedWriteReply> = Vec::new();
                         let mut op_counts: Vec<usize> = Vec::new();
-                        let mut batch_ops_total = 0usize;
                         let mut batch_segments = 0usize;
                         for (op, reply) in writes {
                             merged_ops.push(op);
@@ -6432,11 +6416,10 @@ fn spawn_writer_thread(
                         }
                         for (ops, reply) in batches {
                             let count = ops.len();
-                            batch_ops_total += count;
                             batch_segments += 1;
                             merged_ops.extend(ops);
                             op_counts.push(count);
-                            segments.push(MergedWriteReply::Batch(count, reply));
+                            segments.push(MergedWriteReply::Batch(reply));
                         }
 
                         let total_ops = merged_ops.len();
@@ -6449,9 +6432,9 @@ fn spawn_writer_thread(
                                 let err = Err(StoreError::Serialization(reason.clone()));
                                 match segment {
                                     MergedWriteReply::Single(reply) => {
-                                        let _ = reply.send(err.map(|_: (Vec<u64>, usize)| 0));
+                                        let _ = reply.send(err.map(|_: Vec<u64>| 0));
                                     }
-                                    MergedWriteReply::Batch(_, reply) => {
+                                    MergedWriteReply::Batch(reply) => {
                                         let _ = reply.send(err);
                                     }
                                 }
@@ -6459,7 +6442,7 @@ fn spawn_writer_thread(
                         };
 
                         match res {
-                            Ok(((seq_ids, new_docs), committed)) => {
+                            Ok(((seq_ids, _new_docs), committed)) => {
                                 // One sequence per op is the storage layer's contract. Checked
                                 // rather than indexed on faith: this runs on the writer thread,
                                 // where a panic takes every shard's writes down with it.
@@ -6493,34 +6476,13 @@ fn spawn_writer_thread(
                                     "Writer: merged single and batch writes into one transaction"
                                 );
 
-                                let mut remaining_new_docs = new_docs;
-                                let mut batches_seen = 0usize;
                                 for (segment, range) in segments.into_iter().zip(ranges) {
                                     match segment {
                                         MergedWriteReply::Single(reply) => {
                                             let _ = reply.send(Ok(seq_ids[range.start]));
                                         }
-                                        MergedWriteReply::Batch(count, reply) => {
-                                            batches_seen += 1;
-                                            let ids = seq_ids[range].to_vec();
-                                            // Split over the batch ops alone, so a batch caller
-                                            // is told what it would have been told had the
-                                            // singles not been merged in. Both callers of this
-                                            // reply discard the figure today; keeping it stable
-                                            // costs nothing and keeps the change to one thing.
-                                            let segment_new_docs = if batches_seen == batch_segments
-                                            {
-                                                remaining_new_docs
-                                            } else {
-                                                new_docs
-                                                    .checked_mul(count)
-                                                    .and_then(|p| p.checked_div(batch_ops_total.max(1)))
-                                                    .unwrap_or(0)
-                                                    .min(remaining_new_docs)
-                                            };
-                                            remaining_new_docs =
-                                                remaining_new_docs.saturating_sub(segment_new_docs);
-                                            let _ = reply.send(Ok((ids, segment_new_docs)));
+                                        MergedWriteReply::Batch(reply) => {
+                                            let _ = reply.send(Ok(seq_ids[range].to_vec()));
                                         }
                                     }
                                 }
@@ -6625,7 +6587,7 @@ fn spawn_writer_thread(
                                 Ok((_, false)) => {}
                                 Err(e) => tracing::error!(index = %index, error = %e, "Writer: batch write failed"),
                             }
-                            let _ = reply.send(res.map(|(result, _)| result));
+                            let _ = reply.send(res.map(|((seq_ids, _), _)| seq_ids));
                         } else {
                             // Coalesced batches — merge N batch writes into one
                             let coalesced_count = batches.len();
@@ -6643,7 +6605,7 @@ fn spawn_writer_thread(
                                 writer_store.apply_batch_and_maybe_commit(&index, merged_ops)
                             });
                             match res {
-                                Ok(((seq_ids, new_docs), committed)) => {
+                                Ok(((seq_ids, _new_docs), committed)) => {
                                     if committed {
                                         tracing::info!(
                                             index = %index,
@@ -6663,26 +6625,10 @@ fn spawn_writer_thread(
 
                                     // Split merged seq_ids back to each caller by their original op count
                                     let mut offset = 0usize;
-                                    let mut remaining_new_docs = new_docs;
-                                    let total_segments = reply_segments.len();
-                                    for (idx, (op_count, reply)) in reply_segments.into_iter().enumerate() {
-                                        let segment: Vec<u64> = seq_ids[offset..offset + op_count].to_vec();
-                                        // Use integer arithmetic with remainder distribution to avoid rounding errors
-                                        // Each segment gets: (new_docs * op_count) / total_ops
-                                        // Last segment gets any remainder to ensure exact sum
-                                        let segment_new_docs = if idx == total_segments - 1 {
-                                            // Last segment gets all remaining to ensure exact total
-                                            remaining_new_docs
-                                        } else {
-                                            // Integer division with proper distribution
-                                            let proportional = new_docs
-                                                .checked_mul(op_count)
-                                                .and_then(|product| product.checked_div(total_ops))
-                                                .unwrap_or(0);
-                                            proportional.min(remaining_new_docs)
-                                        };
-                                        remaining_new_docs = remaining_new_docs.saturating_sub(segment_new_docs);
-                                        let _ = reply.send(Ok((segment, segment_new_docs)));
+                                    for (op_count, reply) in reply_segments {
+                                        let segment: Vec<u64> =
+                                            seq_ids[offset..offset + op_count].to_vec();
+                                        let _ = reply.send(Ok(segment));
                                         offset += op_count;
                                     }
                                 }
@@ -7092,7 +7038,7 @@ impl MicroshardActor {
         &self,
         index: String,
         ops: Vec<WalOp>,
-    ) -> Result<(Vec<u64>, usize), OrchestratorError> {
+    ) -> Result<Vec<u64>, OrchestratorError> {
         let index_for_log = index.clone();
         tracing::debug!(
             shard_id = %self.shard_id,
@@ -7119,7 +7065,7 @@ impl MicroshardActor {
         tracing::debug!(
             shard_id = %self.shard_id,
             index = %index_for_log,
-            seq_count = result.0.len(),
+            seq_count = result.len(),
             "MicroshardActor: Batch write completed successfully"
         );
         Ok(result)
@@ -7493,7 +7439,7 @@ impl MicroshardActor {
         let ops: Vec<WalOp> = ids.into_iter().map(|id| WalOp::Delete { id }).collect();
         let expected = ops.len();
 
-        let (sequences, _new_docs) = self
+        let sequences = self
             .handle_batch_write_via_channel(index.clone(), ops)
             .await?;
 
@@ -7551,7 +7497,7 @@ impl MicroshardActor {
                 "MicroshardActor: Sending batch to writer thread"
             );
 
-            let (seq_ids, _new_docs) = self
+            let seq_ids = self
                 .handle_batch_write_via_channel(index.clone(), wal_ops)
                 .await?;
             all_seq_ids.extend(seq_ids);
@@ -7722,7 +7668,6 @@ impl Message<ShutdownShard> for MicroshardActor {
 
 /// Router actor that forwards client operations to NodeOrchestrator via actor messaging.
 /// Uses actor messaging instead of Arc<RwLock> - no locks needed.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Actor)]
 pub struct RouterActor {
     orchestrator: ActorRef<NodeOrchestrator>,
@@ -7878,7 +7823,6 @@ impl RouterActor {
     /// through the mailbox is what needs `&mut NodeOrchestrator`: config and metadata ops,
     /// and the ops a worker handed back because they need a schema written or a remote shard
     /// forwarded to.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn handle_client_op(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
         // Try worker pool for hot-path ops
         if let Some(tx) = &self.worker_tx {
@@ -8150,7 +8094,6 @@ impl RouterActor {
     }
 
     /// Route via ClusterCoordinator then handle locally (remote/broadcast stubbed).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn route_and_handle(
         &self,
         op: ClientOp,
@@ -8281,7 +8224,6 @@ impl RouterActor {
     /// - Incremental flushing (each hit serialized and sent individually)
     /// - Bounded backpressure via channel capacity
     /// - Early client disconnect detection
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn route_and_handle_stream(
         &self,
         op: ClientOp,
@@ -8406,16 +8348,16 @@ impl RouterActor {
             .await
             .unwrap_or_default();
 
-        info!(
+        debug!(
             "🔍 Broadcast operation: got {} known peers from coordinator",
             peers.len()
         );
         for peer in &peers {
-            info!("  📍 Peer: {} at {}", peer.node_id, peer.address);
+            debug!("  📍 Peer: {} at {}", peer.node_id, peer.address);
         }
 
         let peer_count = peers.len().min(self.broadcast_fanout_limit);
-        info!(
+        debug!(
             timeout_ms = self.broadcast_timeout.as_millis(),
             fanout_limit = self.broadcast_fanout_limit,
             local_shard_concurrency_limit = self.streaming.max_concurrent_shard_searches,
@@ -8939,7 +8881,7 @@ impl RouterActor {
         &self,
         op: ClientOp,
     ) -> Result<JsonValue, OrchestratorError> {
-        tracing::info!(
+        tracing::debug!(
             max_concurrent_shard_searches = self.streaming.max_concurrent_shard_searches,
             max_concurrent_remote_searches = self.streaming.max_concurrent_remote_searches.max(1),
             "🚀 Using STREAMING search for improved performance"
@@ -9018,7 +8960,6 @@ impl RouterActor {
                         .await;
                     match local_result {
                         Ok(result) => StreamingSearchResult::Local {
-                            shard_id: Uuid::nil(), // Individual shard IDs are in the documents
                             hits: result
                                 .get("hits")
                                 .and_then(|h| h.as_array())
@@ -9035,13 +8976,10 @@ impl RouterActor {
                                 .get("total_hits")
                                 .and_then(|t| t.as_u64())
                                 .unwrap_or(0) as usize,
-                            took_ms: 0,
                         },
                         Err(_) => StreamingSearchResult::Local {
-                            shard_id: Uuid::nil(),
                             hits: Vec::new(),
                             total_hits: 0,
-                            took_ms: 0,
                         },
                     }
                 };
@@ -9134,12 +9072,7 @@ impl RouterActor {
                     // empty and nothing refills it.
 
                     match search_result {
-                        StreamingSearchResult::Local {
-                            shard_id,
-                            hits,
-                            total_hits,
-                            took_ms: _,
-                        } => {
+                        StreamingSearchResult::Local { hits, total_hits } => {
                             // Process streaming local search results
                             let mut block: Vec<JsonValue> = Vec::with_capacity(hits.len());
                             for (score, doc) in hits {
@@ -9158,8 +9091,9 @@ impl RouterActor {
                             // Counted from the result, not from its hits — a shard that matched
                             // nothing still answered, and reading the id back out of each
                             // document missed that as well as costing a copy of it per hit.
-                            unique_shard_ids.insert(shard_id);
-                            blocks.push(((0, shard_id), block));
+                            // The local block carries no shard identity — one nil stands in.
+                            unique_shard_ids.insert(Uuid::nil());
+                            blocks.push(((0, Uuid::nil()), block));
                             total_hits_sum += total_hits;
                             shards_queried = unique_shard_ids.len();
                             nodes_contacted += 1;
@@ -9360,7 +9294,7 @@ impl RouterActor {
         node_id: Uuid,
         peer_addr: &str,
     ) -> Result<JsonValue, OrchestratorError> {
-        info!(
+        debug!(
             "🔎 Attempting remote call: node_id={}, addr={}",
             node_id, peer_addr
         );

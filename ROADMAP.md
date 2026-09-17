@@ -51,7 +51,7 @@ on one.
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8 and CH9 done, CH12 partial, CH10–CH11 are write-path duplication |
-| L — Post-0.3.4 review: the refactor cycle | 📋 Planned | Twenty items in five groups — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective itself |
+| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions, six simplifications (L17 done), and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
 
@@ -3301,13 +3301,23 @@ strategy are all that genuinely differ. Do beside CH1, not separately.
 
 ### L17 — Dead code and stale suppressions
 
-**Simplification.** 📋 **Planned.** A sweep, each item small: `StreamingSearchResult::Local.
-{shard_id, took_ms}` (constructed, never read, `shard_id` always `Uuid::nil()`); blanket
-`#[cfg_attr(not(test), allow(dead_code))]` on live public types, which masks real signal;
-`OrchestratorEngine`'s bulk-write fields held under `#[allow(dead_code)]` for a move that never
-happened — finish the move or drop the fields; the dead `_extension` parameter in cli's
-`detect_source_format_from_hint`; the dead `_inactive_nodes` computation in the coordinator;
-per-request `info!` with a per-peer loop on the broadcast hot path should be `debug!`.
+**Simplification.** ✅ **Done** 2026-10-12. Each named item resolved, and the sweep found more
+of the same kind along the way:
+
+- `StreamingSearchResult::Local.{shard_id, took_ms}` are gone — `shard_id` was always
+  `Uuid::nil()`, `took_ms` was never read. The variant carries only `results`.
+- The `new_docs` count threaded through the writer channel — split across callers with
+  integer-remainder arithmetic, then discarded by both (`let (sequences, _new_docs)`) — is out
+  of `WriteResultsChannel` and `MergedWriteReply`. `apply_batch_and_maybe_commit` still
+  computes it; its ~20 test callers keep their signature.
+- `GetWorkerStats` deleted outright — no callers, no handler.
+- The blanket `#[allow(dead_code)]` / `cfg_attr(not(test), ...)` sites in the orchestrator
+  were stripped from types the bulk move made live; the unmasking surfaced exactly one real
+  corpse, `MergedWriteReply::Batch`'s op-count field, also gone.
+- cli's dead `_extension` parameter went with the `source_extension` helper that existed only
+  to feed it; the coordinator's `_inactive_nodes` was already cleaned.
+- The broadcast hot path's per-request `info!` — the per-peer loop, the fan-out summary, the
+  streaming banner, `try_remote` — is `debug!`.
 
 ### L18 — `cli.rs` says the same thing three ways
 

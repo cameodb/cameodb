@@ -310,8 +310,6 @@ impl ClusterCoordinator {
 
         let configured_nodes = cluster.cluster_config.cluster_nodes.len();
         let total_expected = configured_nodes.max(1); // At least the local node
-        let active_nodes = 1;
-        let _inactive_nodes = total_expected.saturating_sub(active_nodes); // Prefix with _ to suppress warning
 
         info!(
             generation = 1,
