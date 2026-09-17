@@ -72,7 +72,11 @@ pub enum SortOrder {
 /// Wrapper to handle both sorted (u64) and unsorted (f32) search results
 enum SearchResult {
     Unsorted(Vec<(f32, tantivy::DocAddress)>),
-    Sorted(Vec<(Option<u64>, tantivy::DocAddress)>),
+    /// The key slot is `Some` only when the sort was on the document key itself — then the
+    /// collector's sort key *is* the document id, already read off the column, and no hit
+    /// needs a second read to answer it. Every other sort drops its key here: the ordering
+    /// lives in the sequence.
+    Sorted(Vec<(Option<String>, tantivy::DocAddress)>),
 }
 
 const TANTIVY_DATA_FILE_EXTENSIONS: &[&str] = &["store", "fast", "idx", "doc", "pos", "term"];
@@ -6487,7 +6491,7 @@ impl HybridStore {
                         top_docs_handle.extract(&mut multi_fruit);
                     let total_hits = count_handle.extract(&mut multi_fruit);
 
-                    let docs: Vec<(Option<u64>, tantivy::DocAddress)> =
+                    let docs: Vec<(Option<String>, tantivy::DocAddress)> =
                         sorted.into_iter().map(|(_, addr)| (None, addr)).collect();
                     (SearchResult::Sorted(docs), total_hits)
                 }};
@@ -6519,9 +6523,14 @@ impl HybridStore {
                     let total_hits = count_handle.extract(&mut multi_fruit);
 
                     // Ordering is carried by the sequence from here on, as it is for the
-                    // numeric branches, so the key itself is dropped.
-                    let docs: Vec<(Option<u64>, tantivy::DocAddress)> =
-                        sorted.into_iter().map(|(_, addr)| (None, addr)).collect();
+                    // numeric branches. The key survives only when the sort named the
+                    // document key — then the column ordered on is `id` and each key is
+                    // the hit's identifier; any other string column's key is the field's
+                    // value, not an id, and is dropped as before.
+                    let docs: Vec<(Option<String>, tantivy::DocAddress)> = sorted
+                        .into_iter()
+                        .map(|(key, addr)| (if sorts_by_document_key { key } else { None }, addr))
+                        .collect();
                     (SearchResult::Sorted(docs), total_hits)
                 }
                 tantivy::schema::FieldType::Str(_) => {
@@ -6613,43 +6622,19 @@ impl HybridStore {
         }
 
         // Step 1: Extract document IDs from Tantivy results. `id` carries a fast column on
-        // indexes built since it gained one, so a hit's id is a term-ordinal read off the
-        // column rather than a stored-document decompression to get at one field. Whether this
-        // index has the column is a question its own schema answers — the declared `fast` is
-        // the builder's intent, not what an older index was built with — so a legacy index
-        // skips the per-segment open (`str()` re-opens the column on every call) and reads the
-        // stored document, which is how it always answered. The fallback stays for a hit whose
-        // column exists but does not answer.
-        let id_columns: Vec<Option<tantivy::columnar::StrColumn>> =
-            if tantivy_index.schema().get_field_entry(fields.id).is_fast() {
-                searcher
-                    .segment_readers()
-                    .iter()
-                    .map(|reader| reader.fast_fields().str("id").ok().flatten())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-        let mut id_buf = String::new();
-        let mut hit_id = |doc_address: tantivy::DocAddress| -> Result<Option<String>, StoreError> {
-            if let Some(Some(column)) = id_columns.get(doc_address.segment_ord as usize)
-                && let Some(ord) = column.term_ords(doc_address.doc_id).next()
-            {
-                // `ord_to_str` writes over the buffer's tail, so it must start empty — and a
-                // column read that fails falls through to the stored document, which still
-                // answers on a damaged column.
-                id_buf.clear();
-                if column.ord_to_str(ord, &mut id_buf).unwrap_or(false) {
-                    return Ok(Some(id_buf.clone()));
-                }
-            }
-            let doc: tantivy::TantivyDocument = searcher.doc(doc_address)?;
-            Ok(doc
-                .get_first(fields.id)
-                .and_then(|value| value.as_str())
-                .map(str::to_string))
-        };
+        // indexes built since it gained one, but a per-hit `ord_to_str` re-opens the term
+        // block and scans it from the top — slower than a stored-document read on a warm
+        // block cache. The column pays off only as a batch: collect a segment's hit ords,
+        // sort them, and let `sorted_ords_to_term_cb` walk the dictionary once. That is
+        // worth doing only when a segment contributes enough hits packed densely enough —
+        // a handful of hits spread over the term range would scan most of the dictionary
+        // to answer a few ids, so sparse hits keep the stored-document read, which is also
+        // the fallback for a hit the column does not answer. Whether this index has the
+        // column at all is a question its own schema answers — the declared `fast` is the
+        // builder's intent, not what an older index was built with — so a legacy index
+        // takes the stored-document path it always used.
+        const DENSE_HIT_MIN: usize = 32;
+        const DENSE_HIT_SPAN: u64 = 4;
 
         let capacity = match &top_docs {
             SearchResult::Sorted(docs) => docs.len(),
@@ -6657,17 +6642,95 @@ impl HybridStore {
         };
         let mut doc_ids_with_scores = Vec::with_capacity(capacity);
 
-        let hits: Vec<(f32, tantivy::DocAddress)> = match &top_docs {
+        // A document-key sort's keys are the ids themselves — they arrive with the hits and
+        // answer every position outright; every other hit starts unresolved.
+        let mut resolved: Vec<Option<String>> = Vec::with_capacity(capacity);
+        let hits: Vec<(f32, tantivy::DocAddress)> = match top_docs {
             // For sorted results the order is what matters, not the key — a 1.0 placeholder
             // score, exactly as before.
-            SearchResult::Sorted(docs) => docs.iter().map(|(_, addr)| (1.0, *addr)).collect(),
-            SearchResult::Unsorted(docs) => {
-                docs.iter().map(|(score, addr)| (*score, *addr)).collect()
-            }
+            SearchResult::Sorted(docs) => docs
+                .into_iter()
+                .map(|(id, addr)| {
+                    resolved.push(id);
+                    (1.0, addr)
+                })
+                .collect(),
+            SearchResult::Unsorted(docs) => docs
+                .into_iter()
+                .map(|(score, addr)| {
+                    resolved.push(None);
+                    (score, addr)
+                })
+                .collect(),
         };
 
-        for (score, doc_address) in hits {
-            match hit_id(doc_address)? {
+        let id_is_fast = tantivy_index.schema().get_field_entry(fields.id).is_fast();
+        if id_is_fast && hits.len() >= DENSE_HIT_MIN {
+            let mut by_segment: Vec<Vec<usize>> = (0..searcher.segment_readers().len())
+                .map(|_| Vec::new())
+                .collect();
+            for (pos, (_, doc_address)) in hits.iter().enumerate() {
+                if resolved[pos].is_none() {
+                    by_segment[doc_address.segment_ord as usize].push(pos);
+                }
+            }
+            for (segment_ord, positions) in by_segment.iter().enumerate() {
+                if positions.len() < DENSE_HIT_MIN {
+                    continue;
+                }
+                let Some(column) = searcher.segment_readers()[segment_ord]
+                    .fast_fields()
+                    .str("id")
+                    .ok()
+                    .flatten()
+                else {
+                    continue;
+                };
+                let mut ord_pos: Vec<(u64, usize)> = positions
+                    .iter()
+                    .filter_map(|&pos| {
+                        column
+                            .term_ords(hits[pos].1.doc_id)
+                            .next()
+                            .map(|ord| (ord, pos))
+                    })
+                    .collect();
+                ord_pos.sort_unstable_by_key(|&(ord, _)| ord);
+                let (Some(&(first_ord, _)), Some(&(last_ord, _))) =
+                    (ord_pos.first(), ord_pos.last())
+                else {
+                    continue;
+                };
+                if last_ord - first_ord + 1 > DENSE_HIT_SPAN * ord_pos.len() as u64 {
+                    continue;
+                }
+                // One walk over the hit ords; the callback fires once per ord in order. A
+                // failed or truncated walk leaves positions unresolved, and the stored
+                // document answers them below.
+                let mut positions_it = ord_pos.iter().map(|&(_, pos)| pos);
+                let _ = column.dictionary().sorted_ords_to_term_cb(
+                    ord_pos.iter().map(|&(ord, _)| ord),
+                    |term| {
+                        if let Some(pos) = positions_it.next() {
+                            resolved[pos] = std::str::from_utf8(term).ok().map(str::to_string);
+                        }
+                        Ok(())
+                    },
+                );
+            }
+        }
+
+        for (pos, (score, doc_address)) in hits.into_iter().enumerate() {
+            let id_str = match resolved[pos].take() {
+                Some(id) => Some(id),
+                None => {
+                    let doc: tantivy::TantivyDocument = searcher.doc(doc_address)?;
+                    doc.get_first(fields.id)
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                }
+            };
+            match id_str {
                 Some(id_str) => {
                     debug!(
                         index = %index,
