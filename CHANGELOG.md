@@ -83,6 +83,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A search hit's identifier comes from a column, not a stored-document decompression.**
+  `id` is built `STRING | STORED | FAST` on new indexes, so the per-hit read is a term-ordinal
+  lookup on the column — opened once per segment — instead of a decompressed stored document to
+  get at one field. `STORED` stays: an index built before the column existed has none to read,
+  and its hits still answer the id from the stored document. One consequence is worth the name
+  change it earned: a sort on the document key — `id`, or a shadow field that stands for it —
+  is now exact over every match rather than the post-fetch order of a top-scoring window, so
+  `_approximate_sort` no longer appears on those responses. A field with no column still sorts
+  the way it did and still reports it.
+
 - **`BulkWrite` and `BulkDelete` are served by the worker pool, not the orchestrator mailbox.**
   A bulk op used to hold the single actor lane for its whole duration — validation, routing,
   per-shard batches, remote forwarding — so every mailbox-served operation queued or was

@@ -1526,12 +1526,12 @@ async fn a_shadow_field_sorts_by_the_key_it_stands_for() {
         "descending should be the reverse order: {descending}"
     );
 
-    // The field has no fast column, so the order is reported as approximate — under the name
-    // the caller asked for, not the one the engine ordered on.
-    assert_eq!(
-        by_shadow["_approximate_sort"].as_str(),
-        Some("doi"),
-        "the approximate-order note should name the caller's field: {by_shadow}"
+    // The key carries a fast column, so ordering on it is exact and the response reports no
+    // approximation. (An index built before `id` gained the column still reports
+    // `_approximate_sort` under the caller's name.)
+    assert!(
+        by_shadow.get("_approximate_sort").is_none(),
+        "a sort on the document key is exact now that `id` has a fast column: {by_shadow}"
     );
 }
 
@@ -2536,8 +2536,8 @@ async fn a_declared_id_type_does_not_contradict_the_key_the_index_builds() {
         );
         assert_eq!(
             id_field["fast"].as_bool(),
-            Some(false),
-            "the key never gets a fast column, so it must not claim one: {described}"
+            Some(true),
+            "the key is built with a fast column, so the config must say so: {described}"
         );
 
         // Enough documents to take the slow validation path, which infers `Text` for the key.
@@ -2696,10 +2696,9 @@ async fn a_declared_id_beside_a_shadow_field_is_still_the_shadow_name() {
             )
             .await
             .expect("sorted search");
-        assert_eq!(
-            sorted["_approximate_sort"].as_str(),
-            Some("sha256"),
-            "the order is reported under the name the hits carry: {sorted}"
+        assert!(
+            sorted.get("_approximate_sort").is_none(),
+            "ordering on the key is exact — no approximation to report: {sorted}"
         );
         let keys: Vec<&str> = sorted["hits"]
             .as_array()

@@ -2803,38 +2803,43 @@ async fn a_plain_index_reports_no_substitution_for_its_key() {
 
 /// `_approximate_sort` must name a field the hits in the same response actually carry.
 ///
-/// A caller may sort a shadow index by `id`, which the engine answers by ordering on the key,
-/// and every hit comes back carrying the shadow name instead. Reporting the order as being on
-/// `id` would name the one field absent from every hit, leaving the caller nothing to check it
-/// against. Both spellings of the sort report the name the documents use.
+/// The document key carries a fast column, so ordering on it — under its own name or the
+/// shadow's — is exact and reports no note at all. A text field has no column: its sort is the
+/// post-fetch order, and the note must name `title` — the name every hit carries — not some
+/// internal spelling of it.
 #[tokio::test]
 async fn an_approximate_order_names_the_field_the_hits_carry() {
     let node = TestNode::start().await;
     node.create_shadow_index("files").await;
     node.seed_shadow("files", &["d3", "d1", "d2"]).await;
 
+    let search = |field: String| {
+        node.call_tool(
+            "search_index",
+            json!({
+                "index": "files",
+                "query": "title:record",
+                "sort": {"field": field, "order": "asc"}
+            }),
+        )
+    };
+
     for sort_field in ["id", "sha1"] {
-        let (_, result) = node
-            .call_tool(
-                "search_index",
-                json!({
-                    "index": "files",
-                    "query": "title:record",
-                    "sort": {"field": sort_field, "order": "asc"}
-                }),
-            )
-            .await;
-        assert_eq!(
-            result["_approximate_sort"].as_str(),
-            Some("sha1"),
-            "sorting by {sort_field:?} orders on the key, which the hits carry as `sha1`: {result}"
+        let (_, result) = search(sort_field.to_string()).await;
+        assert!(
+            result.get("_approximate_sort").is_none(),
+            "sorting by {sort_field:?} orders on the key's fast column — exact: {result}"
         );
-        let named = result["_approximate_sort"].as_str().expect("field named");
-        for hit in result["hits"].as_array().expect("hits") {
-            assert!(
-                hit.get(named).is_some(),
-                "the field the order is reported on must be on every hit: {result}"
-            );
-        }
+    }
+
+    let (_, result) = search("title".to_string()).await;
+    let named = result["_approximate_sort"]
+        .as_str()
+        .expect("a sort on a field with no column is approximate");
+    for hit in result["hits"].as_array().expect("hits") {
+        assert!(
+            hit.get(named).is_some(),
+            "the field the order is reported on must be on every hit: {result}"
+        );
     }
 }

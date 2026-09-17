@@ -615,10 +615,51 @@ fn a_sort_on_a_shadow_field_orders_by_the_document_key() {
         "both names are the same field, so both orders are the same order"
     );
 
-    // Reported under the name the caller used, not the column the engine ordered on.
+    // `id` carries a fast column, so a sort on the document key is a true alphabetical order
+    // over every match — there is nothing approximate left to report. (An index built before
+    // `id` gained the column still takes the approximate path and would report it.)
     assert_eq!(
         by_shadow.approximate_sort.as_deref(),
-        Some("sha1"),
-        "the approximate-order note should name the caller's field"
+        None,
+        "a sort on the document key is exact now that `id` has a fast column"
     );
+}
+
+/// An index built before `id` carried a fast column has none to read. A search against it must
+/// still find its documents: the identifier comes back out of the stored document, the way it
+/// did before the column existed.
+#[test]
+fn an_index_without_the_id_fast_column_still_finds_its_documents() {
+    let dir = TempDir::new().unwrap();
+    let store = setup_index(&dir, "books", sample_docs());
+    let index_path = store.index_dir("books").unwrap();
+    drop(store);
+
+    // Rewrite the stored schema the way an index built before this change reads: `id` indexed
+    // and stored, no fast column. Tantivy serializes each field's options into meta.json;
+    // dropping the `fast` key leaves a schema that builds and reports no column for it.
+    let meta_path = index_path.join("meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    let id_field = meta["schema"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|f| f["name"] == "id")
+        .expect("id field in meta.json schema");
+    assert!(
+        id_field["options"].as_object_mut().unwrap().remove("fast").is_some(),
+        "the index built for the test must carry the column the edit removes"
+    );
+    std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+
+    let store =
+        HybridStore::new(test_config(dir.path().to_path_buf()), 1).expect("reopen store");
+    let outcome = store
+        .search_documents("books", "rust", 10, None)
+        .expect("search on an index with no id column");
+    let mut found = ids(&outcome.hits);
+    found.sort();
+    assert_eq!(found, ["a", "b", "c", "d"]);
+    assert_eq!(outcome.total_hits, 4);
 }
