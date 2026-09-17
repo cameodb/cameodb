@@ -83,6 +83,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **One `SchemaCache` owns the schema cache** (L15). The `ArcSwap` map behind the engine's
+  and the actor's identical cache fields is a newtype now — `get`, `put` (version decides,
+  not arrival order), `put_arc` and `remove` are its methods, and "cache, then the first
+  shard's store, then `None`" is `SchemaCache::durable`, with `schema_for` adding the
+  empty-schema answer the write paths want. "Load schema from the first shard's store" —
+  written three times with the same double `map_err` — is `schema_from_shards` over
+  `schema_from_store`, which every reader including the iterate-all-shards schema handler
+  now calls. The per-owner `load_schema`/`durable_schema` are one-line delegations.
+
 - **`node_orchestrator` is a `node/` directory module** (L11). The 15,900-line file holding four
   actors, a worker pool, an engine and ~90 tests is split by architectural role the way
   `http_server/`, `swarm/` and `admin/` already were: `mod.rs` keeps the module doc, consts

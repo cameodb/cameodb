@@ -51,7 +51,7 @@ on one.
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8, CH9, CH10 and CH11 done, CH2 (server half) and CH12 partial |
-| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11 done), six simplifications (L17 done), and the retrospective itself |
+| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11 done), six simplifications (L15 and L17 done), and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
 
@@ -3307,11 +3307,13 @@ running.
 
 ### L15 — The schema-cache machinery exists three times
 
-**Simplification.** 📋 **Planned.** `get/put_cached_schema` are byte-identical in
-`OrchestratorEngine` and `NodeOrchestrator`; "load schema from the first shard's store" appears
-three times with the same double `map_err`; `route_write` twice; the load-from-cache-or-shard
-preamble opens every write handler. One `SchemaCache` newtype plus one `schema_for(index)`
-helper removes all of it — and gives the version-ordering rule added in 0.3.4 a single home.
+**Simplification.** ✅ **Done 2026-09-09.** `get`/`put`/`put_arc` had already become free
+functions under CH10; they are now the methods of `SchemaCache`, the `ArcSwap` map behind a
+newtype both `OrchestratorEngine` and `NodeOrchestrator` hold as `Arc<SchemaCache>` — so the
+version-ordering rule and the delete-path `remove` have one home. "Load schema from the first
+shard's store" is `schema_from_shards`/`schema_from_store`, one `spawn_blocking` + verdict
+mapping for every reader, and the per-owner `load_schema`/`durable_schema` bodies are one-line
+delegations to `SchemaCache::schema_for`/`durable`.
 
 ### L16 — `handle_broadcast` and `handle_broadcast_streaming` are one fan-out written twice
 

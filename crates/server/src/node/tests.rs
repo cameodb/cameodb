@@ -459,7 +459,7 @@ use super::*;
         OrchestratorEngine {
             shards: ArcSwap::from_pointee(HashMap::new()),
             routing_ring: Arc::new(ArcSwap::from_pointee(ConsistentRing::new())),
-            schema_cache: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            schema_cache: Arc::new(SchemaCache::new()),
             coordinator: None,
             identity: NodeIdentity::new(),
             default_search_limit: 10,
