@@ -915,47 +915,135 @@ impl BulkCtx<'_> {
     }
 }
 
-/// The schema cache is one `ArcSwap` map on both the engine and the actor, and both used to
-/// spell these three touches out for themselves — identical code, twice.
-pub(crate) fn schema_cache_get(
-    cache: &ArcSwap<HashMap<String, Arc<IndexSchema>>>,
-    index: &str,
-) -> Option<Arc<IndexSchema>> {
-    cache.load().get(index).cloned()
+/// The schema cache — one `ArcSwap` map behind a newtype, so how a schema is read, written
+/// and ordered by version has a single home. The engine and the actor each hold one
+/// `Arc<SchemaCache>`; a hit is the cached `Arc`, so no caller pays a deep clone of the field
+/// map per request. Callers that mutate the schema clone out of the `Arc` themselves.
+#[derive(Debug)]
+pub(crate) struct SchemaCache {
+    map: ArcSwap<HashMap<String, Arc<IndexSchema>>>,
 }
 
-/// Insert a schema in the cache, unless the cache already holds a newer one.
-///
-/// Version decides, not arrival order, so a write that resolved against a schema before it
-/// was dropped cannot put that schema back over the record of the deletion. Ordering by
-/// version costs a comparison and needs nothing coordinated between concurrent writers.
-pub(crate) fn schema_cache_put(
-    cache: &ArcSwap<HashMap<String, Arc<IndexSchema>>>,
-    index: &str,
-    schema: &IndexSchema,
-) {
-    schema_cache_put_arc(cache, index, Arc::new(schema.clone()));
-}
-
-/// [`schema_cache_put`] for a caller that already holds the `Arc` — the store's own read of a
-/// schema is shared rather than cloned a second time.
-pub(crate) fn schema_cache_put_arc(
-    cache: &ArcSwap<HashMap<String, Arc<IndexSchema>>>,
-    index: &str,
-    schema: Arc<IndexSchema>,
-) {
-    let index_str = index.to_string();
-
-    cache.rcu(|old| {
-        if let Some(current) = old.get(&index_str)
-            && current.version > schema.version
-        {
-            return Arc::clone(old);
+impl SchemaCache {
+    pub(crate) fn new() -> Self {
+        SchemaCache {
+            map: ArcSwap::from_pointee(HashMap::new()),
         }
-        let mut new = (**old).clone();
-        new.insert(index_str.clone(), Arc::clone(&schema));
-        Arc::new(new)
-    });
+    }
+
+    /// The cached schema for `index`, or `None` on a miss. Shared, not owned.
+    pub(crate) fn get(&self, index: &str) -> Option<Arc<IndexSchema>> {
+        self.map.load().get(index).cloned()
+    }
+
+    /// Insert a schema in the cache, unless the cache already holds a newer one.
+    ///
+    /// Version decides, not arrival order, so a write that resolved against a schema before
+    /// it was dropped cannot put that schema back over the record of the deletion. Ordering
+    /// by version costs a comparison and needs nothing coordinated between concurrent
+    /// writers.
+    pub(crate) fn put(&self, index: &str, schema: &IndexSchema) {
+        self.put_arc(index, Arc::new(schema.clone()));
+    }
+
+    /// [`put`](Self::put) for a caller that already holds the `Arc` — the store's own read of
+    /// a schema is shared rather than cloned a second time.
+    pub(crate) fn put_arc(&self, index: &str, schema: Arc<IndexSchema>) {
+        let index_str = index.to_string();
+
+        self.map.rcu(|old| {
+            if let Some(current) = old.get(&index_str)
+                && current.version > schema.version
+            {
+                return Arc::clone(old);
+            }
+            let mut new = (**old).clone();
+            new.insert(index_str.clone(), Arc::clone(&schema));
+            Arc::new(new)
+        });
+    }
+
+    /// Drop the cached entry outright. Deletion uses this before caching the record of the
+    /// drop — an empty entry gives [`put`](Self::put) nothing to compare against, so a write
+    /// in flight that resolved against the old schema would install it again.
+    pub(crate) fn remove(&self, index: &str) {
+        let index = index.to_string();
+        self.map.rcu(|old| {
+            let mut new = (**old).clone();
+            new.remove(&index);
+            new
+        });
+    }
+
+    /// The schema this node holds for `index`, or `None` if it holds none: cache, then the
+    /// first shard's store.
+    ///
+    /// **Not the same question as [`get`](Self::get).** The cache is filled lazily by the
+    /// first operation to touch an index, so a node that has just booted answers "nothing"
+    /// for every index it holds on disk until something asks. Where the answer only decides
+    /// whether to re-read, that is a miss. Where it is reported to another node it is a lie —
+    /// [`NodeOrchestrator::peer_schema_for`] reads exactly that answer to decide whether a
+    /// schema may be invented: a cold holder saying "none" licenses the divergence the gate
+    /// exists to prevent. `get_schema_cached` rather than `get_schema` because it is what the
+    /// write path resolves against — a schema derived from Tantivy and merged with the stored
+    /// metadata, so validation and writing agree on the types.
+    pub(crate) async fn durable(
+        &self,
+        shards: &HashMap<Uuid, MicroshardActor>,
+        index: &str,
+    ) -> Result<Option<Arc<IndexSchema>>, OrchestratorError> {
+        if let Some(cached) = self.get(index) {
+            return Ok(Some(cached));
+        }
+        if let Some(schema) = schema_from_shards(shards, index).await? {
+            self.put_arc(index, Arc::clone(&schema));
+            return Ok(Some(schema));
+        }
+        Ok(None)
+    }
+
+    /// [`durable`](Self::durable) plus the empty-schema answer a miss means on the write
+    /// path: an index this node has never seen starts with no declared fields.
+    pub(crate) async fn schema_for(
+        &self,
+        shards: &HashMap<Uuid, MicroshardActor>,
+        index: &str,
+    ) -> Result<Arc<IndexSchema>, OrchestratorError> {
+        Ok(self
+            .durable(shards, index)
+            .await?
+            .unwrap_or_else(|| Arc::new(IndexSchema::default())))
+    }
+}
+
+/// The schema the first shard's store holds for `index`, or `None` when no shard has a store
+/// or none holds one — the read every load-from-store path used to spell out for itself.
+pub(crate) async fn schema_from_shards(
+    shards: &HashMap<Uuid, MicroshardActor>,
+    index: &str,
+) -> Result<Option<Arc<IndexSchema>>, OrchestratorError> {
+    let Some(shard) = shards.values().next() else {
+        return Ok(None);
+    };
+    let Some(store) = &shard.store else {
+        return Ok(None);
+    };
+    schema_from_store(store, index).await
+}
+
+/// One store's answer for `index`, off the async runtime — `get_schema_cached` is a blocking
+/// read. The double `map_err` is the join failure and the store error, collapsed into the
+/// same `Io` verdict every caller used to spell out twice.
+pub(crate) async fn schema_from_store(
+    store: &Arc<HybridStore>,
+    index: &str,
+) -> Result<Option<Arc<IndexSchema>>, OrchestratorError> {
+    let sc = Arc::clone(store);
+    let idx = index.to_string();
+    tokio::task::spawn_blocking(move || sc.get_schema_cached(&idx))
+        .await
+        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))
 }
 
 /// What the write gate settled. `Routed` carries what dispatch needs; `Grow` means the schema
@@ -986,7 +1074,7 @@ pub(crate) enum WriteDispatch {
 pub(crate) struct WriteCtx<'a> {
     shards: &'a HashMap<Uuid, MicroshardActor>,
     ring: &'a ConsistentRing,
-    schema_cache: &'a ArcSwap<HashMap<String, Arc<IndexSchema>>>,
+    schema_cache: &'a SchemaCache,
 }
 
 impl WriteCtx<'_> {
@@ -1055,8 +1143,8 @@ impl WriteCtx<'_> {
         }
 
         // Schema is stable — populate the cache if it does not hold this index yet.
-        if schema_cache_get(self.schema_cache, index).is_none() {
-            schema_cache_put(self.schema_cache, index, schema);
+        if self.schema_cache.get(index).is_none() {
+            self.schema_cache.put(index, schema);
         }
 
         let effective_routing_key = effective_routing_key(schema, id, routing_key.clone(), doc);
@@ -2912,7 +3000,7 @@ pub struct OrchestratorEngine {
     /// Keyed by index name, which is the only thing that identifies an index. A reverse
     /// lookup keyed by a hash of the field names used to sit in front of this and answered
     /// with whichever index of that shape was cached last — see `IndexSchema::calculate_fingerprint`.
-    pub schema_cache: Arc<ArcSwap<HashMap<String, Arc<IndexSchema>>>>,
+    pub schema_cache: Arc<SchemaCache>,
     /// Coordinator actor reference for shard assignments and peer lookups.
     pub coordinator: Option<ActorRef<ClusterCoordinator>>,
     /// Node identity for response metadata, and the answer to `GetIdentity`.
@@ -2933,35 +3021,15 @@ impl std::fmt::Debug for OrchestratorEngine {
 }
 
 impl OrchestratorEngine {
-    /// Load schema from first shard's storage.
-    ///
-    /// Shared, not owned: a hit is the cache's `Arc` and a miss inserts the store's `Arc`, so no
-    /// caller pays a deep clone of the field map per request. Callers that mutate the schema —
-    /// staged validation evolving it — clone out of the `Arc` themselves.
+    /// Load schema from first shard's storage — [`SchemaCache::schema_for`] against the
+    /// engine's snapshot of the shard map.
     pub(crate) async fn load_schema(
         &self,
         index: &str,
     ) -> Result<Arc<IndexSchema>, OrchestratorError> {
-        if let Some(cached) = schema_cache_get(&self.schema_cache, index) {
-            return Ok(cached);
-        }
-
-        let shards = self.shards.load();
-        if let Some(shard) = shards.values().next()
-            && let Some(store) = &shard.store
-        {
-            let sc = Arc::clone(store);
-            let idx = index.to_string();
-            let schema = tokio::task::spawn_blocking(move || sc.get_schema_cached(&idx))
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-            if let Some(schema) = schema {
-                schema_cache_put_arc(&self.schema_cache, index, Arc::clone(&schema));
-                return Ok(schema);
-            }
-        }
-        Ok(Arc::new(IndexSchema::default()))
+        self.schema_cache
+            .schema_for(&self.shards.load(), index)
+            .await
     }
 
     /// Execute a ClientOp on the shared engine state.
@@ -3388,7 +3456,7 @@ pub struct NodeOrchestrator {
     pub(crate) placement: Arc<ArcSwap<ShardPlacement>>,
     /// Per-index schema cache to avoid repeated metadata reads (lock-free via ArcSwap).
     /// Wrapped in Arc so it can be shared with the OrchestratorEngine worker pool.
-    pub(crate) schema_cache: Arc<ArcSwap<HashMap<String, Arc<IndexSchema>>>>,
+    pub(crate) schema_cache: Arc<SchemaCache>,
     /// Default search result limit when not specified in request
     pub(crate) default_search_limit: usize,
     pub(crate) max_concurrent_shard_searches: usize,
@@ -4313,7 +4381,7 @@ impl NodeOrchestrator {
             shared_routing_ring: Arc::new(ArcSwap::from_pointee(ConsistentRing::new())),
             core_layout: CoreLayout::detect(),
             placement: Arc::new(ArcSwap::from_pointee(ShardPlacement::default())),
-            schema_cache: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            schema_cache: Arc::new(SchemaCache::new()),
             default_search_limit,
             max_concurrent_shard_searches,
             engine: None,
@@ -5347,18 +5415,11 @@ impl NodeOrchestrator {
 
         // Drop the entry, then cache what the shards now hold in its place.
         //
-        // An empty entry gives `schema_cache_put` nothing to compare against, so a write that
+        // An empty entry gives `SchemaCache::put` nothing to compare against, so a write that
         // resolved against the old schema and is only now finishing validation would install
         // it again. The record of the deletion carries a version above anything a write in
         // flight holds, which is what makes that comparison refuse.
-        {
-            let idx = index.to_string();
-            self.schema_cache.rcu(|old| {
-                let mut new = (**old).clone();
-                new.remove(&idx);
-                new
-            });
-        }
+        self.schema_cache.remove(index);
         if delete_schema
             && let Some(shard) = self.shards.values().next()
             && let Some(store) = &shard.store
@@ -5368,7 +5429,7 @@ impl NodeOrchestrator {
             if let Ok(Ok(Some(dropped))) =
                 tokio::task::spawn_blocking(move || sc.get_schema(&idx)).await
             {
-                schema_cache_put(&self.schema_cache, index, &dropped);
+                self.schema_cache.put(index, &dropped);
             }
         }
 
@@ -5469,10 +5530,8 @@ impl NodeOrchestrator {
             )
             .await?;
 
-        if validation_summary.evolution_needed
-            || schema_cache_get(&self.schema_cache, index).is_none()
-        {
-            schema_cache_put(&self.schema_cache, index, &schema_mut);
+        if validation_summary.evolution_needed || self.schema_cache.get(index).is_none() {
+            self.schema_cache.put(index, &schema_mut);
         }
 
         if !validation_summary.errors.is_empty() {
@@ -5731,10 +5790,8 @@ impl NodeOrchestrator {
             )
             .await?;
 
-        if validation_summary.evolution_needed
-            || schema_cache_get(&self.schema_cache, index).is_none()
-        {
-            schema_cache_put(&self.schema_cache, index, &schema_mut);
+        if validation_summary.evolution_needed || self.schema_cache.get(index).is_none() {
+            self.schema_cache.put(index, &schema_mut);
         }
 
         // Documents that failed validation are dropped, and their reasons travel to the caller
@@ -5920,7 +5977,7 @@ impl NodeOrchestrator {
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
         }
 
-        schema_cache_put(&self.schema_cache, index, &schema);
+        self.schema_cache.put(index, &schema);
 
         tracing::info!(
             index = %index,
@@ -5988,7 +6045,7 @@ impl NodeOrchestrator {
         if let Some(store) = stores.first()
             && let Ok(Some(schema)) = store.get_schema(index)
         {
-            schema_cache_put(&self.schema_cache, index, &schema);
+            self.schema_cache.put(index, &schema);
         }
 
         tracing::info!(
@@ -6121,24 +6178,13 @@ impl NodeOrchestrator {
 
         for (shard_id, shard) in &self.shards {
             if let Some(store) = &shard.store {
-                let sc = Arc::clone(store);
-                let idx = index.to_string();
-                let sid = *shard_id;
-
-                // Use spawn_blocking to safely call blocking storage function
-                let schema = tokio::task::spawn_blocking(move || {
-                    let result = sc.get_schema_cached(&idx);
-                    tracing::debug!(
-                        index = %idx,
-                        shard_id = %sid,
-                        found = result.as_ref().ok().and_then(|s| s.as_ref()).is_some(),
-                        "Schema retrieval attempt"
-                    );
-                    result
-                })
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
+                let schema = schema_from_store(store, index).await?;
+                tracing::debug!(
+                    index = %index,
+                    shard_id = %shard_id,
+                    found = schema.is_some(),
+                    "Schema retrieval attempt"
+                );
 
                 if let Some(s) = schema {
                     tracing::debug!(
@@ -6424,57 +6470,22 @@ impl NodeOrchestrator {
         Ok(identity_json(&self.identity, self.shards.len()))
     }
 
-    /// The schema this node holds for `index`, or `None` if it holds none.
-    ///
-    /// **Not the same question as [`schema_cache_get`].** That cache is
-    /// filled lazily by the first operation to touch an index, so a node that has just booted
-    /// answers "nothing" for every index it holds on disk until something asks. Where the answer
-    /// only decides whether to re-read, that is a miss. Where it is reported to another node it
-    /// is a lie, and [`peer_schema_for`](Self::peer_schema_for) reads exactly that answer to
-    /// decide whether a schema may be invented: a cold holder saying "none" licenses the
-    /// divergence the gate exists to prevent.
-    ///
-    /// So cache, then disk, and `None` only when the store has neither a Tantivy index nor a
-    /// stored schema for the name. `get_schema_cached` rather than `get_schema` because it is
-    /// what the write path resolves against — a schema derived from Tantivy and merged with the
-    /// stored metadata, so validation and writing agree on the types.
+    /// The schema this node holds for `index`, or `None` if it holds none —
+    /// [`SchemaCache::durable`] against the actor's own shard map.
     pub(crate) async fn durable_schema(
         &self,
         index: &str,
     ) -> Result<Option<Arc<IndexSchema>>, OrchestratorError> {
-        if let Some(cached) = schema_cache_get(&self.schema_cache, index) {
-            return Ok(Some(cached));
-        }
-
-        if let Some(shard) = self.shards.values().next()
-            && let Some(store) = &shard.store
-        {
-            let sc = Arc::clone(store);
-            let idx = index.to_string();
-            let schema = tokio::task::spawn_blocking(move || sc.get_schema_cached(&idx))
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-            if let Some(schema) = schema {
-                schema_cache_put_arc(&self.schema_cache, index, Arc::clone(&schema));
-                return Ok(Some(schema));
-            }
-        }
-        Ok(None)
+        self.schema_cache.durable(&self.shards, index).await
     }
 
-    /// Helper: Load schema from first shard, empty when this node holds none.
-    ///
-    /// Shared, not owned: a hit is the cache's `Arc`, so a caller pays no deep clone of the
-    /// field map per request. Callers that mutate the schema clone out of the `Arc`.
+    /// Helper: Load schema from first shard, empty when this node holds none —
+    /// [`SchemaCache::schema_for`] against the actor's own shard map.
     pub(crate) async fn load_schema(
         &self,
         index: &str,
     ) -> Result<Arc<IndexSchema>, OrchestratorError> {
-        Ok(self
-            .durable_schema(index)
-            .await?
-            .unwrap_or_else(|| Arc::new(IndexSchema::default())))
+        self.schema_cache.schema_for(&self.shards, index).await
     }
 }
 
