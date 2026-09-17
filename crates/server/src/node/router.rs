@@ -2,10 +2,9 @@
 
 use super::*;
 
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::StreamExt;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering as AtomicOrdering},
@@ -14,16 +13,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
-use kameo::actor::ActorRef;
 use kameo::Actor;
+use kameo::actor::ActorRef;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::cluster_coordinator::{
-    ClusterCoordinator, OperationType,
-    RequestBootstrapRedial, RouteOperation, RoutingDecision,
+    ClusterCoordinator, OperationType, RequestBootstrapRedial, RouteOperation, RoutingDecision,
 };
 use crate::config::{MessagingConfig, SearchConfig};
 use crate::remote_peer_pool::{ConnectionChannel, RemotePeerPool};
@@ -108,6 +106,105 @@ impl StreamingSearchConfig {
             max_concurrent_shard_searches: sc.max_concurrent_shard_searches,
             max_concurrent_remote_searches: sc.max_concurrent_remote_searches,
         }
+    }
+}
+
+/// A paged search is widened before it is fanned out: every node — this one included — is
+/// asked for `offset + limit` hits from the front of its own order, and the skip is applied
+/// once, after their blocks have been merged into one order. A node that skipped `offset` of
+/// its own hits would drop rows that belong on this page.
+///
+/// The window is read off the original op and the copies carry no offset, so this cannot be
+/// applied twice however many levels the request travels through. Only `Search` widens —
+/// the streaming fan-out converts `Stream` to `Search` itself before calling this, and every
+/// other op passes through unchanged.
+pub(crate) fn widen_broadcast_op(op: ClientOp, window: SearchWindow) -> ClientOp {
+    match op {
+        ClientOp::Search {
+            index,
+            query,
+            fields,
+            sort,
+            ..
+        } => ClientOp::Search {
+            index,
+            query,
+            limit: Some(window.fetch_count()),
+            offset: None,
+            fields,
+            sort,
+        },
+        other => other,
+    }
+}
+
+/// A peer's answer to a broadcast: the remote ask's own verdict, or the timeout that fired
+/// waiting for it.
+pub(crate) type PeerAnswer =
+    Result<Result<JsonValue, OrchestratorError>, tokio::time::error::Elapsed>;
+
+/// What a broadcast asks every source and gets back, before the merge differs.
+///
+/// Built once by [`RouterActor::broadcast_fanout`] for both broadcast paths — the counter,
+/// the peer ask, the per-peer timeout, the concurrency cap, the dispatch-ordinal tagging and
+/// the join with the local future were written twice and had already drifted (ROADMAP L16
+/// records what written-twice cost). What stays per-caller is the local future and the
+/// merge.
+pub(crate) struct BroadcastFanout {
+    /// The window read off the op before widening — the merge pages through it.
+    pub(crate) window: SearchWindow,
+    /// The op as fanned out — a `Search` carries `fetch_count` and no offset.
+    pub(crate) op: ClientOp,
+    /// This node's answer.
+    pub(crate) local: Result<JsonValue, OrchestratorError>,
+    /// Every asked peer's answer back in dispatch order — not completion order, which a
+    /// merge reading ties off source order would leak into the response. The outer `Err`
+    /// is the timeout.
+    pub(crate) remote: Vec<(Uuid, PeerAnswer)>,
+    /// When the local + remote join started — the `took_ms` floor when no source says one.
+    pub(crate) started: Instant,
+    /// How many peers the fan-out asked, after `broadcast_fanout_limit`.
+    pub(crate) peers_asked: usize,
+}
+
+/// One block per source, taken whole. Ordering across blocks is `order_hit_blocks`'s
+/// business, and it needs to know which source each hit came from to settle a tie the same
+/// way twice. The rest of what a broadcast response carries is folded into `stats` here so
+/// the merge loop is one call per source.
+pub(crate) fn push_hits(
+    value: &mut JsonValue,
+    blocks: &mut Vec<Vec<JsonValue>>,
+    stats: &mut BroadcastStats,
+) {
+    if let Some(hits) = value.get_mut("hits").and_then(|h| h.as_array_mut()) {
+        blocks.push(std::mem::take(hits));
+    }
+    // Extract shard statistics from the response
+    if let Some(stats_obj) = value.get("stats").and_then(|s| s.as_object())
+        && let Some(shards) = stats_obj.get("shards").and_then(|s| s.as_object())
+        && let Some(responded) = shards.get("responded").and_then(|r| r.as_u64())
+    {
+        stats.total_shards_queried += responded as usize;
+        _ = shards.get("total").and_then(|t| t.as_u64()); // Could track total shards attempted
+    }
+    if let Some(total) = value.get("total_hits").and_then(|t| t.as_u64()) {
+        stats.total_hits_sum += total as usize;
+    }
+    for note in collect_discarded(std::slice::from_ref(value)) {
+        if !stats.discarded.contains(&note) {
+            stats.discarded.push(note);
+        }
+    }
+    stats.approximate_sort = stats
+        .approximate_sort
+        .take()
+        .or_else(|| collect_approximate_sort(std::slice::from_ref(value)));
+    stats.nodes_contacted += 1;
+    if let Some(t) = value.get("took_ms").and_then(|v| v.as_u64()) {
+        stats.max_took_ms = match stats.max_took_ms {
+            Some(cur) => Some(cur.max(t)),
+            None => Some(t),
+        };
     }
 }
 
@@ -327,7 +424,10 @@ impl RouterActor {
     /// schema rejected answered `500 Internal server error` instead of a `400` naming what was
     /// wrong with it. Only the delivery failures need a description; the handler already wrote
     /// one for its own.
-    pub(crate) async fn ask_orchestrator(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
+    pub(crate) async fn ask_orchestrator(
+        &self,
+        op: ClientOp,
+    ) -> Result<JsonValue, OrchestratorError> {
         let Some(load) = self.mailbox_load.as_ref() else {
             return self.ask_orchestrator_unguarded(op).await;
         };
@@ -675,37 +775,32 @@ impl RouterActor {
         }
     }
 
-    pub(crate) async fn handle_broadcast(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
+    /// The fan-out both broadcast paths share.
+    ///
+    /// The broadcasts counter, the `GetKnownPeers` ask, the per-peer timeout, the
+    /// remote-concurrency cap, the dispatch-ordinal tagging and the join with the local
+    /// future were all written twice — once here and once in `handle_broadcast_streaming` —
+    /// and had already drifted: the streaming half answered a paged search with page 1
+    /// (ROADMAP OB8) and dropped a source when it thought it could stop early. What stays
+    /// per-caller is the local future — `handle_broadcast` runs the op through
+    /// `handle_client_op`'s worker-pool dispatch, the streaming path asks the orchestrator
+    /// directly — and the merge.
+    ///
+    /// `op` arrives already widened by [`widen_broadcast_op`]; the window it was widened
+    /// from is reported back on [`BroadcastFanout::window`] so the merge can page with it.
+    async fn broadcast_fanout<F, Fut>(
+        &self,
+        op: ClientOp,
+        window: SearchWindow,
+        local: F,
+    ) -> BroadcastFanout
+    where
+        F: FnOnce(ClientOp) -> Fut + Send,
+        Fut: Future<Output = Result<JsonValue, OrchestratorError>> + Send,
+    {
         use crate::cluster_coordinator::{GetKnownPeers, KnownPeer};
 
         self.broadcasts_total.fetch_add(1, AtomicOrdering::Relaxed);
-
-        // A paged search is widened before it is fanned out: every node — this one included —
-        // is asked for `offset + limit` hits from the front of its own order, and the skip is
-        // applied here, once, after their blocks have been merged into one order. A node that
-        // skipped `offset` of its own hits would drop rows that belong on this page.
-        //
-        // The window is read off the original op and the copies carry no offset, so this cannot
-        // be applied twice however many levels the request travels through. Shared with the
-        // streaming fan-out, which had its own reading of the same op and a different answer.
-        let window = search_window_for(&op, self.default_search_limit);
-        let op = match op {
-            ClientOp::Search {
-                index,
-                query,
-                fields,
-                sort,
-                ..
-            } => ClientOp::Search {
-                index,
-                query,
-                limit: Some(window.fetch_count()),
-                offset: None,
-                fields,
-                sort,
-            },
-            other => other,
-        };
 
         // Get known peers for remote fan-out
         let peers: Vec<KnownPeer> = self
@@ -734,8 +829,7 @@ impl RouterActor {
         );
 
         // Start local operation
-        let local_op = op.clone();
-        let local_future = self.handle_client_op(local_op);
+        let local_future = local(op.clone());
 
         // Fan out to remote peers (up to fanout_limit)
         let remote_limit = self.streaming.max_concurrent_remote_searches.max(1);
@@ -761,7 +855,7 @@ impl RouterActor {
                             remote_router.try_remote(&op_clone, node_id, &peer_addr),
                         )
                         .await;
-                        (dispatch_ordinal, outcome)
+                        (dispatch_ordinal, node_id, outcome)
                     }
                 }),
         )
@@ -769,8 +863,42 @@ impl RouterActor {
         .collect::<Vec<_>>();
 
         // Execute local + remote concurrently
-        let t_start = Instant::now();
-        let (local_result, remote_results) = tokio::join!(local_future, remote_results_future);
+        let started = Instant::now();
+        let (local_result, mut remote_results) = tokio::join!(local_future, remote_results_future);
+
+        // Back into dispatch order before merging, rather than the order they finished in.
+        remote_results.sort_by_key(|(dispatch_ordinal, ..)| *dispatch_ordinal);
+
+        BroadcastFanout {
+            window,
+            op,
+            local: local_result,
+            remote: remote_results
+                .into_iter()
+                .map(|(_, node_id, outcome)| (node_id, outcome))
+                .collect(),
+            started,
+            peers_asked: peer_count,
+        }
+    }
+
+    pub(crate) async fn handle_broadcast(
+        &self,
+        op: ClientOp,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let window = search_window_for(&op, self.default_search_limit);
+        let op = widen_broadcast_op(op, window);
+        let fanout = self
+            .broadcast_fanout(op, window, |op| self.handle_client_op(op))
+            .await;
+        let BroadcastFanout {
+            window,
+            op,
+            local: local_result,
+            remote: remote_results,
+            started: t_start,
+            peers_asked: peer_count,
+        } = fanout;
 
         // If this is a search, prefer fastest/local results and stop after hitting the limit.
         if let ClientOp::Search { sort, .. } = &op {
@@ -787,46 +915,6 @@ impl RouterActor {
                 approximate_sort: None,
             };
 
-            // One block per source, taken whole. Ordering across blocks is
-            // `order_hit_blocks`'s business, and it needs to know which source each hit came
-            // from to settle a tie the same way twice.
-            pub(crate) fn push_hits(
-                value: &mut JsonValue,
-                blocks: &mut Vec<Vec<JsonValue>>,
-                stats: &mut BroadcastStats,
-            ) {
-                if let Some(hits) = value.get_mut("hits").and_then(|h| h.as_array_mut()) {
-                    blocks.push(std::mem::take(hits));
-                }
-                // Extract shard statistics from the response
-                if let Some(stats_obj) = value.get("stats").and_then(|s| s.as_object())
-                    && let Some(shards) = stats_obj.get("shards").and_then(|s| s.as_object())
-                    && let Some(responded) = shards.get("responded").and_then(|r| r.as_u64())
-                {
-                    stats.total_shards_queried += responded as usize;
-                    _ = shards.get("total").and_then(|t| t.as_u64()); // Could track total shards attempted
-                }
-                if let Some(total) = value.get("total_hits").and_then(|t| t.as_u64()) {
-                    stats.total_hits_sum += total as usize;
-                }
-                for note in collect_discarded(std::slice::from_ref(value)) {
-                    if !stats.discarded.contains(&note) {
-                        stats.discarded.push(note);
-                    }
-                }
-                stats.approximate_sort = stats
-                    .approximate_sort
-                    .take()
-                    .or_else(|| collect_approximate_sort(std::slice::from_ref(value)));
-                stats.nodes_contacted += 1;
-                if let Some(t) = value.get("took_ms").and_then(|v| v.as_u64()) {
-                    stats.max_took_ms = match stats.max_took_ms {
-                        Some(cur) => Some(cur.max(t)),
-                        None => Some(t),
-                    };
-                }
-            }
-
             // The local node is rank 0, then each peer in the order it was dispatched to.
             let mut blocks: Vec<Vec<JsonValue>> = Vec::new();
 
@@ -838,9 +926,6 @@ impl RouterActor {
                 }
             }
 
-            // Back into dispatch order before merging, rather than the order they finished in.
-            let mut remote_results = remote_results;
-            remote_results.sort_by_key(|(dispatch_ordinal, _)| *dispatch_ordinal);
             for (_, result) in remote_results {
                 match result {
                     Ok(Ok(mut val)) => push_hits(&mut val, &mut blocks, &mut stats),
@@ -899,10 +984,8 @@ impl RouterActor {
             }
         }
 
-        // Back into dispatch order, so that the merge below ranks the nodes the same way on
-        // every run rather than by which of them answered first.
-        let mut remote_results = remote_results;
-        remote_results.sort_by_key(|(dispatch_ordinal, _)| *dispatch_ordinal);
+        // Already back in dispatch order — the fan-out sorted them — so the merge below
+        // ranks the nodes the same way on every run rather than by which answered first.
         for (_, result) in remote_results {
             match result {
                 Ok(Ok(val)) => all_results.push(val),
@@ -1242,7 +1325,30 @@ impl RouterActor {
         }
     }
 
-    /// Streaming version of handle_broadcast for improved search performance
+    /// Streaming version of handle_broadcast for improved search performance.
+    ///
+    /// The fan-out is [`broadcast_fanout`](Self::broadcast_fanout) — the same one
+    /// [`handle_broadcast`](Self::handle_broadcast) uses. What is streaming about this path is
+    /// the local future (a direct ask on the orchestrator rather than `handle_client_op`'s
+    /// worker-pool dispatch) and the merge below, which keeps each source's block keyed by
+    /// the identity it arrived under.
+    ///
+    /// The page is read before the arm below destructures the op — `Search` and `Stream`
+    /// share the arm and only one of them can be paged, so the distinction is drawn in
+    /// `search_window_for` rather than by the pattern.
+    ///
+    /// It used to be drawn by discarding the offset for both (`offset: _`), so a paged search
+    /// on this path silently answered page 1 — hits and count, at every offset, with a 200,
+    /// for every unkeyed search on a clustered node with `enable_streaming_search` on.
+    /// Tracked as ROADMAP OB8. Honouring it took three things and only the third was here:
+    /// the offset had to survive to this point, every source had to be asked for
+    /// `offset + limit` rather than `limit` so the merge has enough to page through, and the
+    /// merge had to be handed the real window. `order_hit_blocks` already applies whatever
+    /// window it is given; the other two are in the shared fan-out.
+    ///
+    /// It could not have been fixed while this merge still terminated early either: a page
+    /// assembled from whichever sources answered first is not the page that was asked for,
+    /// wherever the skip is applied. Every source now always answers (2d13f4c).
     pub(crate) async fn handle_broadcast_streaming(
         &self,
         op: ClientOp,
@@ -1253,252 +1359,124 @@ impl RouterActor {
             "🚀 Using STREAMING search for improved performance"
         );
 
-        use crate::cluster_coordinator::{GetKnownPeers, KnownPeer};
-
-        self.broadcasts_total.fetch_add(1, AtomicOrdering::Relaxed);
-
-        // Get known peers for remote fan-out
-        let peers: Vec<KnownPeer> = self
-            .coordinator
-            .ask(GetKnownPeers)
-            .await
-            .unwrap_or_default();
-
-        let start_time = std::time::Instant::now();
-
-        // The page, read before the arm below destructures the op — `Search` and `Stream` share
-        // that arm and only one of them can be paged, so the distinction is drawn in
-        // `search_window_for` rather than by the pattern.
-        //
-        // It used to be drawn by discarding the offset for both (`offset: _`), so a paged search
-        // on this path silently answered page 1 — hits and count, at every offset, with a 200,
-        // for every unkeyed search on a clustered node with `enable_streaming_search` on.
-        // Tracked as ROADMAP OB8. Honouring it took three things and only the third was here:
-        // the offset had to survive to this point, every source had to be asked for
-        // `offset + limit` rather than `limit` so the merge has enough to page through, and the
-        // merge had to be handed the real window. `order_hit_blocks` already applies whatever
-        // window it is given; the other two are below.
-        //
-        // It could not have been fixed while this loop still terminated early either: a page
-        // assembled from whichever sources answered first is not the page that was asked for,
-        // wherever the skip is applied. Every source now always answers (2d13f4c).
-        let window = search_window_for(&op, self.default_search_limit);
-
         // Handle search operations with streaming
         match op {
-            ClientOp::Search {
-                index,
-                query,
-                limit: _,
-                offset: _,
-                fields,
-                sort,
-            }
-            | ClientOp::Stream {
-                index,
-                query,
-                limit: _,
-                fields,
-                sort,
-            } => {
-                // Every source is asked for the whole window from the front of its own order.
-                // A source that skipped `window.offset` of its own hits would drop rows that
-                // belong on this page, so the skip is applied once, after the merge.
-                let fetch_count = window.fetch_count();
-
-                // Create local search stream using improved concurrent approach
-                let local_future = async {
-                    // Bind to an explicit `Result` type: the reply flows through a nested
-                    // `async` block feeding a `Pin<Box<dyn Future>>`, which defeats
-                    // rust-analyzer's inference of the `ask().await` output and makes it
-                    // flag the `Ok`/`Err` match as non-exhaustive (E0004). The annotation
-                    // resolves the type without changing behavior (rustc already accepts it).
-                    let local_result: Result<JsonValue, _> = self
-                        .orchestrator
-                        .ask(ClientOp::Search {
-                            index: index.clone(),
-                            query: query.clone(),
-                            limit: Some(fetch_count),
-                            offset: None,
-                            fields: fields.clone(),
-                            sort: sort.clone(),
-                        })
-                        .await;
-                    match local_result {
-                        Ok(result) => StreamingSearchResult::Local {
-                            hits: result
-                                .get("hits")
-                                .and_then(|h| h.as_array())
-                                .map(|arr| arr.to_vec())
-                                .unwrap_or_default()
-                                .iter()
-                                .filter_map(|hit| {
-                                    hit.get("_score")
-                                        .and_then(|s| s.as_f64())
-                                        .map(|score| (score as f32, hit.clone()))
-                                })
-                                .collect(),
-                            total_hits: result
-                                .get("total_hits")
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0) as usize,
-                        },
-                        Err(_) => StreamingSearchResult::Local {
-                            hits: Vec::new(),
-                            total_hits: 0,
-                        },
-                    }
+            ClientOp::Search { .. } | ClientOp::Stream { .. } => {
+                // A `Stream` is fanned out as the `Search` it names: both asks are the same
+                // window from the front of every source's order. `widen_broadcast_op` then
+                // gives it the fetch count — inside the shared fan-out, as the non-streaming
+                // path's own widening also is.
+                let op = match op {
+                    ClientOp::Stream {
+                        index,
+                        query,
+                        limit,
+                        fields,
+                        sort,
+                    } => ClientOp::Search {
+                        index,
+                        query,
+                        limit,
+                        offset: None,
+                        fields,
+                        sort,
+                    },
+                    other => other,
                 };
-
-                let remote_limit = self.streaming.max_concurrent_remote_searches.max(1);
-                let remote_timeout = self.broadcast_timeout;
-                let mut peer_iter = peers.into_iter().take(self.broadcast_fanout_limit);
-                let remote_router = self.clone();
-
-                let mut search_futures = FuturesUnordered::new();
-                search_futures.push(Box::pin(local_future)
-                    as Pin<Box<dyn Future<Output = StreamingSearchResult> + Send>>);
-
-                let push_remote_future = |peer: KnownPeer,
-                                          search_futures: &mut FuturesUnordered<
-                    Pin<Box<dyn Future<Output = StreamingSearchResult> + Send>>,
-                >| {
-                    let remote_router = remote_router.clone();
-                    let index = index.clone();
-                    let query = query.clone();
-                    let fields = fields.clone();
-                    let sort = sort.clone();
-                    let node_id = peer.node_id;
-                    let peer_addr = peer.address;
-                    search_futures.push(Box::pin(async move {
-                        let op = ClientOp::Search {
-                            index,
-                            query,
-                            limit: Some(fetch_count),
-                            offset: None,
-                            fields,
-                            sort,
-                        };
-                        let result = timeout(
-                            remote_timeout,
-                            remote_router.try_remote(&op, node_id, &peer_addr),
-                        )
-                        .await
-                        .unwrap_or(Err(OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "Remote operation timed out",
-                        ))));
-                        StreamingSearchResult::Remote { node_id, result }
-                    })
-                        as Pin<Box<dyn Future<Output = StreamingSearchResult> + Send>>);
+                let window = search_window_for(&op, self.default_search_limit);
+                let op = widen_broadcast_op(op, window);
+                let ClientOp::Search { sort, .. } = &op else {
+                    unreachable!("a stream was rewritten to a search above")
                 };
+                let sort = sort.clone();
 
-                for _ in 0..remote_limit {
-                    if let Some(peer) = peer_iter.next() {
-                        push_remote_future(peer, &mut search_futures);
-                    }
-                }
+                let fanout = self
+                    .broadcast_fanout(op, window, |op| self.ask_orchestrator_unguarded(op))
+                    .await;
+                let BroadcastFanout {
+                    window,
+                    op: _,
+                    local,
+                    remote,
+                    started,
+                    peers_asked: _,
+                } = fanout;
 
-                // Process results as they arrive with early termination
                 // One block per source, keyed by that source's identity: this node's shards
-                // ahead of its peers, each ordered by id. Streaming means they arrive in
-                // whatever order they finish, and the key is what puts them back.
+                // ahead of its peers, each ordered by id. Sources report in the fan-out's
+                // dispatch order; the key is what puts a tie back the same way every time.
                 let mut blocks: Vec<((u8, Uuid), Vec<JsonValue>)> = Vec::new();
                 let mut total_hits_sum = 0usize;
-                let mut shards_queried = 0usize;
                 let mut nodes_contacted = 0usize;
+                // The local block carries no shard identity — one nil stands in.
                 let mut unique_shard_ids = std::collections::HashSet::new();
                 let mut errors = Vec::new();
 
-                while let Some(search_result) = search_futures.next().await {
-                    let refill_remote =
-                        matches!(&search_result, StreamingSearchResult::Remote { .. });
-                    if refill_remote && let Some(peer) = peer_iter.next() {
-                        push_remote_future(peer, &mut search_futures);
-                    }
-
-                    // No early exit here, and there is nowhere one could go.
-                    //
-                    // A `break` used to sit at exactly this point, guarded by
-                    // `hits_collected >= limit && search_futures.is_empty() && peer_iter is
-                    // empty`. Every part of that guard was satisfied only when there was no work
-                    // left to skip — so it never saved anything — and it fired *after*
-                    // `next().await` had already handed over a result, which the `break` then
-                    // threw away. One whole source, silently, on every search whose limit was
-                    // smaller than the number of matches.
-                    //
-                    // `limit == 0` made `hits_collected >= limit` true from the start, so a
-                    // count-only search dropped a source every time: 29 or 33 reported where the
-                    // answer was 46, and five of nine shards accounted for. Worse than the count,
-                    // the merge lost that source's hits too — a sorted top-5 over three nodes
-                    // returned `[45, 44, 43, 40, 38]` instead of `[46, 45, 44, 43, 42]`,
-                    // depending on which node happened to answer last.
-                    //
-                    // The loop ends on its own: `FuturesUnordered::next` yields `None` once it is
-                    // empty and nothing refills it.
-
-                    match search_result {
-                        StreamingSearchResult::Local { hits, total_hits } => {
-                            // Process streaming local search results
-                            let mut block: Vec<JsonValue> = Vec::with_capacity(hits.len());
-                            for (score, doc) in hits {
-                                let mut hit_doc = doc;
-                                if let JsonValue::Object(ref mut o) = hit_doc {
-                                    o.insert(
-                                        "_score".to_string(),
-                                        JsonValue::Number(
-                                            serde_json::Number::from_f64(score as f64)
-                                                .unwrap_or(serde_json::Number::from(0)),
-                                        ),
-                                    );
-                                }
-                                block.push(hit_doc);
-                            }
-                            // Counted from the result, not from its hits — a shard that matched
-                            // nothing still answered, and reading the id back out of each
-                            // document missed that as well as costing a copy of it per hit.
-                            // The local block carries no shard identity — one nil stands in.
-                            unique_shard_ids.insert(Uuid::nil());
-                            blocks.push(((0, Uuid::nil()), block));
-                            total_hits_sum += total_hits;
-                            shards_queried = unique_shard_ids.len();
-                            nodes_contacted += 1;
+                match local {
+                    Ok(mut val) => {
+                        // Taken whole, the way the remote arm takes its blocks — an earlier
+                        // form of this path kept only hits that carried a `_score`, so a
+                        // sorted search's local block could shed hits its peers kept.
+                        if let Some(hits) = val.get_mut("hits").and_then(|h| h.as_array_mut()) {
+                            blocks.push(((0, Uuid::nil()), std::mem::take(hits)));
                         }
-                        StreamingSearchResult::Remote { node_id, result } => {
-                            nodes_contacted += 1;
-                            match result {
-                                Ok(mut val) => {
-                                    // Note: mut val
-                                    // OPTIMIZATION: Take mutable reference to array to move items
-                                    if let Some(hits) =
-                                        val.get_mut("hits").and_then(|h| h.as_array_mut())
-                                    {
-                                        let block: Vec<JsonValue> = std::mem::take(hits);
-                                        blocks.push(((1, node_id), block));
-                                    }
-                                    if let Some(total) =
-                                        val.get("total_hits").and_then(|t| t.as_u64())
-                                    {
-                                        total_hits_sum += total as usize;
-                                    }
-                                    // Extract shard statistics from the response
-                                    if let Some(stats) =
-                                        val.get("stats").and_then(|s| s.as_object())
-                                        && let Some(shards) =
-                                            stats.get("shards").and_then(|s| s.as_object())
-                                        && let Some(responded) =
-                                            shards.get("responded").and_then(|r| r.as_u64())
-                                    {
-                                        shards_queried += responded as usize;
-                                    }
-                                }
-                                Err(e) => {
-                                    errors.push(format!(
-                                        "Remote node {} search failed: {}",
-                                        node_id, e
-                                    ));
-                                }
+                        // Counted from the result, not from its hits — a shard that matched
+                        // nothing still answered, and reading the id back out of each
+                        // document missed that as well as costing a copy of it per hit.
+                        if let Some(total) = val.get("total_hits").and_then(|t| t.as_u64()) {
+                            total_hits_sum += total as usize;
+                        }
+                        unique_shard_ids.insert(Uuid::nil());
+                        nodes_contacted += 1;
+                    }
+                    Err(_) => {
+                        // A failed local answer still holds this node's place in the merge —
+                        // an empty block, no error note. That was the streaming merge's
+                        // answer before the fan-out was shared, and it stands.
+                        unique_shard_ids.insert(Uuid::nil());
+                        blocks.push(((0, Uuid::nil()), Vec::new()));
+                        nodes_contacted += 1;
+                    }
+                }
+
+                // This node's nil sentinel counts for one; each peer's `responded` adds its
+                // own below.
+                let mut shards_queried = unique_shard_ids.len();
+
+                for (node_id, result) in remote {
+                    nodes_contacted += 1;
+                    match result {
+                        Ok(Ok(mut val)) => {
+                            // Take mutable reference to array to move items
+                            if let Some(hits) = val.get_mut("hits").and_then(|h| h.as_array_mut()) {
+                                let block: Vec<JsonValue> = std::mem::take(hits);
+                                blocks.push(((1, node_id), block));
                             }
+                            if let Some(total) = val.get("total_hits").and_then(|t| t.as_u64()) {
+                                total_hits_sum += total as usize;
+                            }
+                            // Extract shard statistics from the response
+                            if let Some(stats) = val.get("stats").and_then(|s| s.as_object())
+                                && let Some(shards) =
+                                    stats.get("shards").and_then(|s| s.as_object())
+                                && let Some(responded) =
+                                    shards.get("responded").and_then(|r| r.as_u64())
+                            {
+                                shards_queried += responded as usize;
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            errors.push(format!("Remote node {} search failed: {}", node_id, e));
+                        }
+                        Err(_) => {
+                            errors.push(format!(
+                                "Remote node {} search failed: {}",
+                                node_id,
+                                OrchestratorError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "Remote operation timed out",
+                                ))
+                            ));
                         }
                     }
                 }
@@ -1525,7 +1503,7 @@ impl RouterActor {
                     // that cannot see which page it was given cannot tell a correct answer from
                     // page 1 returned twice, which is how the bug above stayed invisible.
                     "offset": window.offset,
-                    "took_ms": start_time.elapsed().as_millis(),
+                    "took_ms": started.elapsed().as_millis(),
                     "stats": {
                         "shards": {
                             "total": shards_queried,
@@ -1548,7 +1526,10 @@ impl RouterActor {
     }
 
     /// Broadcast request method for non-search operations
-    pub(crate) async fn handle_broadcast_request(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
+    pub(crate) async fn handle_broadcast_request(
+        &self,
+        op: ClientOp,
+    ) -> Result<JsonValue, OrchestratorError> {
         // Implementation for non-search operations (write, bulk_write, etc.)
         // This is the existing handle_broadcast logic
         self.handle_broadcast(op).await
