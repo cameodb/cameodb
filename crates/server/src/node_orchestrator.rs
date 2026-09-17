@@ -6289,8 +6289,18 @@ fn spawn_writer_thread(
                 let writer_heartbeat = writer_liveness.register_writer();
 
                 let loop_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // Reusable buffers to avoid per-iteration allocations
+                    // Reusable buffers to avoid per-iteration allocations. Every one is
+                    // cleared where the iteration used to allocate it; `HashMap::clear` and
+                    // `Vec::clear` keep the backing storage, so a busy writer pays the growth
+                    // once rather than once per drained batch.
                     let mut pending_cmds: Vec<StorageCommand> = Vec::with_capacity(256);
+                    let mut write_groups: HashMap<String, Vec<WriteCommand>> = HashMap::new();
+                    let mut batch_groups: HashMap<String, Vec<BatchCommand>> = HashMap::new();
+                    let mut commits: Vec<(String, tokio::sync::oneshot::Sender<Result<(), StoreError>>)> = Vec::new();
+                    let mut evictions: Vec<(String, tokio::sync::oneshot::Sender<bool>)> = Vec::new();
+                    let mut deletions: Vec<DeleteCommand> = Vec::new();
+                    let mut committed_indices: HashSet<String> = HashSet::new();
+                    let mut mixed: Vec<String> = Vec::new();
 
                     while let Some(first_cmd) = rx.blocking_recv() {
                     // Mark the writer busy for the whole batch it is about to drain and apply;
@@ -6317,16 +6327,16 @@ fn spawn_writer_thread(
                     // Phase 2: Group commands by type and index for coalescing.
                     // Both single Write and BatchWrite commands for the same index
                     // are merged to reduce redb transactions and fsyncs.
-                    let mut write_groups: HashMap<String, Vec<WriteCommand>> = HashMap::new();
-                    let mut batch_groups: HashMap<String, Vec<BatchCommand>> = HashMap::new();
-                    let mut commits: Vec<(String, tokio::sync::oneshot::Sender<Result<(), StoreError>>)> = Vec::new();
-                    let mut evictions: Vec<(String, tokio::sync::oneshot::Sender<bool>)> = Vec::new();
-                    let mut deletions: Vec<DeleteCommand> = Vec::new();
+                    write_groups.clear();
+                    batch_groups.clear();
+                    commits.clear();
+                    evictions.clear();
+                    deletions.clear();
                     let mut should_shutdown = false;
                     // Indices whose Tantivy commit published a new segment this iteration.
                     // Collected rather than posted inline so a burst that commits the same
                     // index several times results in one re-warm request.
-                    let mut committed_indices: HashSet<String> = HashSet::new();
+                    committed_indices.clear();
 
                     for cmd in pending_cmds.drain(..) {
                         match cmd {
@@ -6361,13 +6371,15 @@ fn spawn_writer_thread(
                     // where it becomes true. Singles go ahead of batches, which is the order
                     // the phases below would have applied them in, so which write wins a
                     // duplicated id does not change.
-                    let mixed: Vec<String> = write_groups
-                        .keys()
-                        .filter(|index| batch_groups.contains_key(*index))
-                        .cloned()
-                        .collect();
+                    mixed.clear();
+                    mixed.extend(
+                        write_groups
+                            .keys()
+                            .filter(|index| batch_groups.contains_key(*index))
+                            .cloned(),
+                    );
 
-                    for index in mixed {
+                    for index in mixed.drain(..) {
                         #[cfg(feature = "fault-injection")]
                         fault_injection::panic_if_writer_thread_trap(&index);
 
@@ -6564,7 +6576,7 @@ fn spawn_writer_thread(
                     // Phase 4: Process coalesced batch writes.
                     // Multiple BatchWrite commands for the same index are merged into
                     // a single apply_batch call, then results are split back to callers.
-                    for (index, batches) in batch_groups {
+                    for (index, batches) in batch_groups.drain() {
                         if batches.len() == 1 {
                             // Single batch — no coalescing overhead needed
                             let (ops, reply) = batches.into_iter().next().unwrap();
@@ -6657,7 +6669,7 @@ fn spawn_writer_thread(
                     }
 
                     // Phase 5: Process commits after all writes are applied
-                    for (index, reply) in commits {
+                    for (index, reply) in commits.drain(..) {
                         let res = guard_writer_op(&writer_store, &index, || {
                             writer_store.commit_index(&index)
                         });
@@ -6668,7 +6680,7 @@ fn spawn_writer_thread(
                     }
 
                     // Phase 5b: Process writer evictions (commit then drop from cache)
-                    for (index, reply) in evictions {
+                    for (index, reply) in evictions.drain(..) {
                         if let Err(e) = guard_writer_op(&writer_store, &index, || {
                             writer_store.commit_index(&index)
                         }) {
@@ -6681,7 +6693,7 @@ fn spawn_writer_thread(
 
                     // Phase 5c: Process index deletions last, so any writes that were
                     // batched alongside the delete are applied before their tables go away.
-                    for (index, delete_schema, reply) in deletions {
+                    for (index, delete_schema, reply) in deletions.drain(..) {
                         let res = guard_writer_op(&writer_store, &index, || {
                             writer_store.delete_index_data(&index, delete_schema)
                         });
