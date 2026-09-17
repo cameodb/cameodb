@@ -1958,12 +1958,20 @@ the mechanism proposed here:
   borrowed it, so taking ownership obliged every caller to hand over a copy it could not get back.
   It borrows now. The two fan-outs still clone once per peer, which is real: those futures run
   concurrently and each needs its own.
-- ◐ Bulk writes never use the worker pool, so a large `BulkWrite` serializes on the orchestrator
+- ✅ Bulk writes never use the worker pool, so a large `BulkWrite` serializes on the orchestrator
   actor mailbox for its full duration, blocking other actor-served operations. **Filed here as
   efficiency and it was not** — [OB12](#ob12--the-schema-gate-deadlocked-a-fan-out-against-itself)
   is what that blocking cost once something on the write path needed an answer from a peer that
-  was itself inside a write. OB12 removes the question rather than the blocking, so this bullet
-  stands, and the general fix — metadata reads that do not queue behind a write — belongs with it.
+  was itself inside a write.
+
+  **The blocking itself is gone.** `BulkWrite` and `BulkDelete` are worker-eligible now: the
+  fan-out — validation, routing, per-shard batches, bounded remote forwarding, per-item
+  accounting — is written once against `BulkCtx`, the borrowed view the actor builds from its
+  fields and a worker builds from the engine's `ArcSwap` snapshots. What stayed on the mailbox
+  is the one thing that needs its serialisation: a batch that has to *write* a schema defers
+  back as `UseActor`, because `staged_schema_validation` evolving two concurrent bulks into
+  one index is the race the mailbox exists to prevent. Bulk service is estimated on its own
+  class, so a fan-out's cost is no longer blended into a single write's reserve.
 
   **Closed from both sides** 2026-09-16. [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path)
   reached it from the overload side: the lane is gated, so a metadata read arriving behind a bulk
