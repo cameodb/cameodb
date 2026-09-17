@@ -50,8 +50,8 @@ on one.
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
-| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8, CH9, CH10 and CH11 done, CH12 partial |
-| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions, six simplifications (L17 done), and the retrospective itself |
+| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8, CH9, CH10 and CH11 done, CH2 (server half) and CH12 partial |
+| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11 done), six simplifications (L17 done), and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
 
@@ -1801,6 +1801,11 @@ cure — the sorted-collector logic, query preparation and schema description ar
 which is the case for this item rather than against it: every fix in the 0.3.3 review had to be
 made inside one of these two files.
 
+**2026-09-09:** the server half is done — [L11](#l11--node_orchestratorrs-is-13669-lines-and-holds-four-actors)
+landed the split, and the merge primitives, sort keys and validation live in
+`node_orchestrator/search.rs` as this item always wanted. `storage/src/lib.rs` keeps the same
+disease; its cure is [L12](#l12--storagesrclibrs-is-9961-lines-of-which-one-impl-block-is-4460).
+
 ### CH3 — Cursor paging (`search_after`)
 
 📋 The deep-page refusal already tells callers to "sort on a field that lets you resume from the
@@ -3203,9 +3208,16 @@ panic isolation), `cargo test -p cameodb_mcp`, and `cargo check --workspace --al
 
 ### L11 — `node_orchestrator.rs` is 13,669 lines and holds four actors
 
-**Decomposition.** 📋 **Planned.** One module containing four actors, a worker pool, an engine,
-~60 free helpers, ~25 wire types and ~90 tests. [CH2](#ch2--the-merge-primitives-deserve-their-own-module)
-has tracked the growth since 0.3.1 (9,300 → 9,683 → 11,012 → 13,669).
+**Decomposition.** ✅ **Done 2026-09-09.** One module containing four actors, a worker pool, an
+engine, ~60 free helpers, ~25 wire types and ~90 tests, split by the layout below. The landed
+sizes: `mod.rs` 1,131 (module doc, consts, wire and error types, re-exports), `search.rs`
+1,373, `shard.rs` 2,096, `router.rs` 1,686, `orchestrator.rs` 6,643, `tests.rs` 3,161. Two
+notes beyond the pure move: the single-module privacy model flattened to `pub(crate)` on
+items, fields and inherent methods — the visibility the code already relied on — and
+`validate_document` became the free function CH10's gate already treated it as, with its three
+call sites de-qualified. `crate::node_orchestrator::…` imports resolve untouched through the
+root's `pub use` re-exports. 319 bin, 56 `node_http_api`, 50 `mcp_federated` and 41 client
+tests pass; clippy clean.
 
 **Deliberately coarse: a handful of files grouped by architectural role, not one file per
 function family.** The point of the split is that a change to one actor, or to the read-side

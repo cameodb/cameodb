@@ -83,6 +83,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`node_orchestrator` is a directory module** (L11). The 15,900-line file holding four
+  actors, a worker pool, an engine and ~90 tests is split by architectural role the way
+  `http_server/`, `swarm/` and `admin/` already were: `mod.rs` keeps the module doc, consts
+  and the wire/error types and re-exports the siblings; `search.rs` holds the read-side
+  machinery — the merge primitives CH2 always wanted their own module for — plus validation
+  and reason accounting; `shard.rs` the `MicroshardActor`, writer thread and liveness
+  machinery; `router.rs` the `RouterActor` whole; `orchestrator.rs` the `NodeOrchestrator`,
+  engine and worker pool; `tests.rs` the unit tests. Two moves were not pure: the
+  single-module privacy model flattened to `pub(crate)` on the items, fields and inherent
+  methods the code already shared, and `validate_document` became the free function CH10's
+  `WriteCtx` gate already treated it as. Every `crate::node_orchestrator::…` import resolves
+  untouched.
+
 - **The single-write and delete paths are written once** (CH10). `engine_write`/`orch_write`
   and `engine_delete`/`orch_delete` were near-duplicates that had already drifted once — the
   OB3 ring-over-hint fix had to be made in both. Validation, stable-schema caching, effective
