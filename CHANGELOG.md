@@ -83,6 +83,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The single-write and delete paths are written once** (CH10). `engine_write`/`orch_write`
+  and `engine_delete`/`orch_delete` were near-duplicates that had already drifted once — the
+  OB3 ring-over-hint fix had to be made in both. Validation, stable-schema caching, effective
+  routing-key derivation, ring routing and shard dispatch now live on `WriteCtx`, the borrowed
+  view both lanes build: the actor from its own fields, a worker from the engine's `ArcSwap`
+  snapshots. The lanes still differ where the lane is the point — a worker answers
+  `NeedsActor` where the actor forwards to the owning node, and only the actor runs
+  `staged_schema_validation` — but that slow path now routes and dispatches through the same
+  code as the fast one. The schema cache's `get`/`put`/`put_arc` machinery, byte-identical on
+  both types, became three free functions over the `ArcSwap` map.
+
 - **A dead-code sweep ahead of the orchestrator split** (L17). `StreamingSearchResult::Local`
   dropped the `shard_id` (always `Uuid::nil()`) and `took_ms` fields nothing read. The
   `new_docs` count the writer channel split across callers with remainder arithmetic — and
