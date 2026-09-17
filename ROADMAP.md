@@ -50,7 +50,7 @@ on one.
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
-| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH8 and CH9 done, CH12 partial, CH10–CH11 are write-path duplication |
+| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8 and CH9 done, CH12 partial, CH10–CH11 are write-path duplication |
 | L — Post-0.3.4 review: the refactor cycle | 📋 Planned | Twenty items in five groups — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
@@ -165,7 +165,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F6](#f6--what-fsync-actually-costs-measured-2026-09-02) | What fsync actually costs — and why turning it off is a reallocation, not a speedup | — | 2026-09-02 | ✅ |
 | [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) | The request timeout sheds the client, not the work — measured: goodput goes to zero, not down | — | 2026-09-15 | ✅ |
 | [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — health fixed, the lane gated, and admission on both lanes predicts against a measured spread | — | 2026-09-16 | ✅ |
-| [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items | — | 2026-08-16 | 📋 |
+| [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items — CH1 done | — | 2026-08-16 | 📋 |
 | [CH11](#ch11--routing-key-derivation-is-written-four-times-with-two-algorithms) | Routing-key derivation, four spellings and two hashes — closed ahead of the split | — | 2026-09-01 | ✅ |
 | [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — CH8 and CH9 done, CH12 partial | — | 2026-09-01 | ◐ |
 | [OB1](#ob1--fast-false-is-not-honoured-on-a-numeric-field) | `fast: false` is not honoured on a numeric field — landed ahead of [J2](#j2--a-json-field-should-mean-subfield-addressing), whose override it would otherwise have eaten | 18 | 2026-08-13 | ✅ |
@@ -1770,12 +1770,13 @@ write-path allocations and duplication that cost latency but are not defects.
 
 ### CH1 — One scatter-gather, written twice
 
-📋 `engine_search` and `orch_search` in `node_orchestrator.rs` are ~150-line near-duplicates:
-the same shard fan-out, gather loop, sort-key stamping, merge, window application, projection
-and response assembly. The paging change had to be made in both, and was — which is the
-warning, not the reassurance: the next change to one of them will be forgotten in the other.
-Extract the shared gather-merge-respond into one function; the two callers differ only in where
-the shard map comes from.
+✅ `engine_search` and `orch_search` were ~150-line near-duplicates: the same shard fan-out,
+gather loop, sort-key stamping, merge, window application, projection and response assembly.
+The paging change had to be made in both, and was — which is the warning, not the reassurance:
+the next change to one of them would have been forgotten in the other. The gather now lives
+once in `ScatterCtx::gather`, the borrowed view both lanes build — the actor from its own shard
+map, the engine from its `ArcSwap` snapshot — same shape as `BulkCtx`. What stayed per-lane is
+what the lanes genuinely own: the empty-shards early return and `load_schema`.
 
 **2026-08-26:** the 0.3.2 sort work is the second change that had to be made twice.
 

@@ -1214,6 +1214,178 @@ impl BulkCtx<'_> {
     }
 }
 
+/// The borrowed pieces a scatter-gather search reads, whichever lane serves it: the actor's
+/// own shard map or the engine's `ArcSwap` snapshot of the same map, the schema `load_schema`
+/// resolved, and the fan-out bound both lanes carry. The gather body is written once against
+/// this so the two paths cannot drift — same per-shard window, same failure accounting, same
+/// merge order, same refusal sequence.
+struct ScatterCtx<'a> {
+    shards: &'a HashMap<Uuid, MicroshardActor>,
+    schema: &'a IndexSchema,
+    max_concurrent_shard_searches: usize,
+}
+
+impl ScatterCtx<'_> {
+    /// Ask every shard for the whole window from the front — any of them may hold all of it —
+    /// then merge the pages under the requested order and answer the caller's slice.
+    async fn gather(
+        &self,
+        index: &str,
+        query: &str,
+        window: SearchWindow,
+        fields: Option<&[String]>,
+        sort: Option<&SortSpec>,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let start = std::time::Instant::now();
+        let schema = self.schema;
+
+        // The identifier travels under the shadow name on the way out, so the projection is
+        // rewritten before it is checked or applied.
+        let fields = fields.map(|list| normalize_projection_fields(schema, list));
+        let fields = fields.as_deref();
+
+        // Refuse a sort the index cannot answer before asking any shard: every shard would
+        // fail the same way, and a scatter-gather reports that as a partial failure inside a
+        // 200 rather than as the bad request it is.
+        if let Some(refusal) = unsortable_sort_field(schema, sort) {
+            return Err(refusal);
+        }
+
+        let shard_targets: Vec<(Uuid, MicroshardActor)> = self
+            .shards
+            .iter()
+            .map(|(&shard_id, shard)| (shard_id, shard.clone()))
+            .collect();
+        let shard_results: Vec<_> =
+            futures::stream::iter(shard_targets.into_iter().map(|(shard_id, shard)| {
+                // Every shard is asked for the whole window from the front, because any of
+                // them may hold all of it. The skip is applied once, below.
+                let req = SearchRequest {
+                    index: index.to_string(),
+                    query: query.to_string(),
+                    limit: Some(window.fetch_count()),
+                    sort: sort.cloned(),
+                };
+                async move { (shard_id, shard.handle_search(req).await) }
+            }))
+            .buffer_unordered(self.max_concurrent_shard_searches.max(1))
+            .collect()
+            .await;
+
+        let mut results: Vec<(Uuid, f32, JsonValue)> = Vec::new();
+        // Kept as values rather than formatted here: whether nothing ran at all, and whose fault
+        // that was, is decided from the errors themselves once the gather is complete.
+        let mut failures: Vec<(Uuid, OrchestratorError)> = Vec::new();
+        let mut shard_success = 0usize;
+        let mut total_hits_sum = 0usize;
+        // Every shard parses the same query string, so collect the distinct set.
+        let mut discarded: Vec<String> = Vec::new();
+        // Every shard runs the same sort against the same schema, so one shard reporting an
+        // approximate order describes the whole answer. A shard with no built index reports
+        // nothing, hence first-wins rather than agreement.
+        let mut approximate_sort: Option<String> = None;
+        // One shard is enough. Shards can hold different schemas for the same index, and a
+        // query that one of them could not run at all is not answered by the ones that could.
+        let mut emptied = false;
+        for (shard_id, result) in shard_results {
+            match result {
+                Ok(r) => {
+                    emptied |= r.emptied;
+                    total_hits_sum += r.total_hits;
+                    for hit in r.hits {
+                        results.push((shard_id, hit.score, hit.doc));
+                    }
+                    for note in r.discarded {
+                        if !discarded.contains(&note) {
+                            discarded.push(note);
+                        }
+                    }
+                    approximate_sort = approximate_sort.or(r.approximate_sort);
+                    shard_success += 1;
+                }
+                Err(err) => {
+                    warn!(%shard_id, error = %err, "Scatter search shard failed");
+                    failures.push((shard_id, err));
+                }
+            }
+        }
+
+        // Nothing ran, so there is nothing to qualify: refuse rather than answer with the empty
+        // page a partial outage would produce. This is where the one refusal the sort guard above
+        // cannot make lands — `fast` is a declaration and the column is written from it when the
+        // index is built, so a field declared fast after the fact has no column to order by, and
+        // only the built index knows that.
+        if let Some(refusal) = no_shard_answered(index, shard_success, &failures) {
+            return Err(refusal);
+        }
+        let errors = shard_error_notes(&failures);
+
+        // Order merged results: by the requested sort field when provided, otherwise by
+        // score descending. Each shard already returned field-sorted results, so a global
+        // re-sort here is required to interleave them correctly across shards.
+        //
+        // When sorting, stamp each hit with the normalized `SORT_KEY_FIELD` first (while
+        // the full doc is still present) and key the sort on it. The metadata field
+        // survives the field projection below and lets a downstream cross-node merge
+        // re-order these results even if the sort field is not among the returned fields.
+        if let Some(spec) = sort {
+            stamp_sort_keys(&mut results, spec, schema);
+        }
+        order_shard_hits(&mut results, sort);
+        let results: Vec<(Uuid, f32, JsonValue)> = window.apply(results);
+        let hits: Vec<JsonValue> = results
+            .into_iter()
+            .map(|(_shard_id, score, mut doc)| {
+                // Add metadata fields
+                if let JsonValue::Object(ref mut o) = doc {
+                    o.insert(
+                        "_score".to_string(),
+                        serde_json::Number::from_f64(score as f64)
+                            .map(JsonValue::Number)
+                            .unwrap_or(JsonValue::Null),
+                    );
+                }
+
+                // Apply field projection if specified
+                if let Some(field_list) = fields {
+                    apply_field_projection(doc, field_list)
+                } else {
+                    doc
+                }
+            })
+            .collect();
+        let mut response = serde_json::json!({
+            "hits": hits,
+            "hits_returned": hits.len(),
+            "total_hits": total_hits_sum,
+            "limit": window.limit,
+            "offset": window.offset,
+            "took_ms": start.elapsed().as_millis(),
+            "stats": {
+                "shards": {
+                    "total": self.shards.len(),
+                    "responded": shard_success,
+                    "failed": errors.len()
+                }
+            },
+        });
+        attach_shard_errors(&mut response, errors);
+        // Refuse instead of answering. An emptied query ran as nothing, so the zero it
+        // produces is not a negative result — reported as a 200 it cannot be told apart from
+        // "no document matches", which is the same confusion an unrunnable sort caused.
+        if emptied {
+            return Err(OrchestratorError::UnrunnableQuery {
+                notes: discarded.join("; "),
+            });
+        }
+
+        discarded.extend(unknown_projection_fields(schema, fields));
+        attach_discarded(&mut response, discarded);
+        attach_approximate_sort(&mut response, approximate_sort);
+        Ok(response)
+    }
+}
+
 /// Type alias for single write commands enqueued in the writer thread
 type WriteCommand = (WalOp, tokio::sync::oneshot::Sender<Result<u64, StoreError>>);
 
@@ -5473,7 +5645,6 @@ impl OrchestratorEngine {
         sort: Option<&SortSpec>,
     ) -> Result<JsonValue, OrchestratorError> {
         let shards = self.shards.load();
-        let start = std::time::Instant::now();
         if shards.is_empty() {
             return Ok(
                 serde_json::json!({"hits": [], "hits_returned": 0, "total_hits": 0, "took_ms": 0}),
@@ -5482,154 +5653,17 @@ impl OrchestratorEngine {
 
         // Get the schema for shadow field transformation. Read through to the store on a miss
         // rather than treating "not cached yet" as "no schema": with an empty schema the
-        // projection rewrite below is a no-op, so the first search after a boot dropped any
-        // field a shadow name refers to. One disk read per index per process.
+        // projection rewrite in the gather is a no-op, so the first search after a boot dropped
+        // any field a shadow name refers to. One disk read per index per process.
         let schema = self.load_schema(index).await?;
 
-        // The identifier travels under the shadow name on the way out, so the projection is
-        // rewritten before it is checked or applied.
-        let fields = fields.map(|list| normalize_projection_fields(&schema, list));
-        let fields = fields.as_deref();
-
-        // Refuse a sort the index cannot answer before asking any shard: every shard would
-        // fail the same way, and a scatter-gather reports that as a partial failure inside a
-        // 200 rather than as the bad request it is.
-        if let Some(refusal) = unsortable_sort_field(&schema, sort) {
-            return Err(refusal);
+        ScatterCtx {
+            shards: shards.as_ref(),
+            schema: &schema,
+            max_concurrent_shard_searches: self.max_concurrent_shard_searches,
         }
-
-        let shard_targets: Vec<(Uuid, MicroshardActor)> = shards
-            .iter()
-            .map(|(&shard_id, shard)| (shard_id, shard.clone()))
-            .collect();
-        let shard_results: Vec<_> =
-            futures::stream::iter(shard_targets.into_iter().map(|(shard_id, shard)| {
-                // Every shard is asked for the whole window from the front, because any of
-                // them may hold all of it. The skip is applied once, below.
-                let req = SearchRequest {
-                    index: index.to_string(),
-                    query: query.to_string(),
-                    limit: Some(window.fetch_count()),
-                    sort: sort.cloned(),
-                };
-                async move { (shard_id, shard.handle_search(req).await) }
-            }))
-            .buffer_unordered(self.max_concurrent_shard_searches.max(1))
-            .collect()
-            .await;
-
-        let mut results: Vec<(Uuid, f32, JsonValue)> = Vec::new();
-        // Kept as values rather than formatted here: whether nothing ran at all, and whose fault
-        // that was, is decided from the errors themselves once the gather is complete.
-        let mut failures: Vec<(Uuid, OrchestratorError)> = Vec::new();
-        let mut shard_success = 0usize;
-        let mut total_hits_sum = 0usize;
-        // Every shard parses the same query string, so collect the distinct set.
-        let mut discarded: Vec<String> = Vec::new();
-        // Every shard runs the same sort against the same schema, so one shard reporting an
-        // approximate order describes the whole answer. A shard with no built index reports
-        // nothing, hence first-wins rather than agreement.
-        let mut approximate_sort: Option<String> = None;
-        // One shard is enough. Shards can hold different schemas for the same index, and a
-        // query that one of them could not run at all is not answered by the ones that could.
-        let mut emptied = false;
-        for (shard_id, result) in shard_results {
-            match result {
-                Ok(r) => {
-                    emptied |= r.emptied;
-                    total_hits_sum += r.total_hits;
-                    for hit in r.hits {
-                        results.push((shard_id, hit.score, hit.doc));
-                    }
-                    for note in r.discarded {
-                        if !discarded.contains(&note) {
-                            discarded.push(note);
-                        }
-                    }
-                    approximate_sort = approximate_sort.or(r.approximate_sort);
-                    shard_success += 1;
-                }
-                Err(err) => {
-                    warn!(%shard_id, error = %err, "Engine scatter search shard failed");
-                    failures.push((shard_id, err));
-                }
-            }
-        }
-
-        // Nothing ran, so there is nothing to qualify: refuse rather than answer with the empty
-        // page a partial outage would produce. This is where the one refusal the sort guard above
-        // cannot make lands — `fast` is a declaration and the column is written from it when the
-        // index is built, so a field declared fast after the fact has no column to order by, and
-        // only the built index knows that.
-        if let Some(refusal) = no_shard_answered(index, shard_success, &failures) {
-            return Err(refusal);
-        }
-        let errors = shard_error_notes(&failures);
-
-        // Order merged results: by the requested sort field when provided, otherwise by
-        // score descending. Each shard already returned field-sorted results, so a global
-        // re-sort here is required to interleave them correctly across shards.
-        //
-        // When sorting, stamp each hit with the normalized `SORT_KEY_FIELD` first (while
-        // the full doc is still present) and key the sort on it. The metadata field
-        // survives the field projection below and lets a downstream cross-node merge
-        // re-order these results even if the sort field is not among the returned fields.
-        if let Some(spec) = sort {
-            stamp_sort_keys(&mut results, spec, &schema);
-        }
-        order_shard_hits(&mut results, sort);
-        let results = window.apply(results);
-        let total_shards = shards.len();
-        let hits: Vec<JsonValue> = results
-            .into_iter()
-            .map(|(_shard_id, score, mut doc)| {
-                // Add metadata fields
-                if let JsonValue::Object(ref mut o) = doc {
-                    o.insert(
-                        "_score".to_string(),
-                        serde_json::Number::from_f64(score as f64)
-                            .map(JsonValue::Number)
-                            .unwrap_or(JsonValue::Null),
-                    );
-                }
-
-                // Apply field projection if specified
-                if let Some(field_list) = fields {
-                    apply_field_projection(doc, field_list)
-                } else {
-                    doc
-                }
-            })
-            .collect();
-        let mut response = serde_json::json!({
-            "hits": hits,
-            "hits_returned": hits.len(),
-            "total_hits": total_hits_sum,
-            "limit": window.limit,
-            "offset": window.offset,
-            "took_ms": start.elapsed().as_millis(),
-            "stats": {
-                "shards": {
-                    "total": total_shards,
-                    "responded": shard_success,
-                    "failed": errors.len()
-                }
-            },
-        });
-        attach_shard_errors(&mut response, errors);
-        // Refuse instead of answering. An emptied query ran as nothing, so the zero it
-        // produces is not a negative result — reported as a 200 it cannot be told apart from
-        // "no document matches", which is the same confusion an unrunnable sort caused.
-        if emptied {
-            return Err(OrchestratorError::UnrunnableQuery {
-                notes: discarded.join("; "),
-            });
-        }
-
-        discarded.extend(unknown_projection_fields(&schema, fields));
-        attach_discarded(&mut response, discarded);
-        attach_approximate_sort(&mut response, approximate_sort);
-        Ok(response)
+        .gather(index, query, window, fields, sort)
+        .await
     }
 }
 
@@ -11928,7 +11962,6 @@ impl NodeOrchestrator {
         fields: Option<&[String]>,
         sort: Option<&SortSpec>,
     ) -> Result<JsonValue, OrchestratorError> {
-        let start = std::time::Instant::now();
         if self.shards.is_empty() {
             return Ok(
                 serde_json::json!({"hits": [], "hits_returned": 0, "total_hits": 0, "took_ms": 0}),
@@ -11937,151 +11970,17 @@ impl NodeOrchestrator {
 
         // Get the schema for shadow field transformation. Read through to the store on a miss
         // rather than treating "not cached yet" as "no schema": with an empty schema the
-        // projection rewrite below is a no-op, so the first search after a boot dropped any
-        // field a shadow name refers to. One disk read per index per process.
+        // projection rewrite in the gather is a no-op, so the first search after a boot dropped
+        // any field a shadow name refers to. One disk read per index per process.
         let schema = self.load_schema(index).await?;
 
-        // The identifier travels under the shadow name on the way out, so the projection is
-        // rewritten before it is checked or applied.
-        let fields = fields.map(|list| normalize_projection_fields(&schema, list));
-        let fields = fields.as_deref();
-
-        // Refuse a sort the index cannot answer before asking any shard: every shard would
-        // fail the same way, and a scatter-gather reports that as a partial failure inside a
-        // 200 rather than as the bad request it is.
-        if let Some(refusal) = unsortable_sort_field(&schema, sort) {
-            return Err(refusal);
+        ScatterCtx {
+            shards: &self.shards,
+            schema: &schema,
+            max_concurrent_shard_searches: self.max_concurrent_shard_searches,
         }
-
-        let shard_targets: Vec<(Uuid, MicroshardActor)> = self
-            .shards
-            .iter()
-            .map(|(&shard_id, shard)| (shard_id, shard.clone()))
-            .collect();
-        let shard_searches = shard_targets.into_iter().map(|(shard_id, shard)| {
-            // The whole window from the front of each shard, for the reason given on
-            // `SearchWindow::fetch_count` — the skip cannot be pushed down here either.
-            let req = SearchRequest {
-                index: index.to_string(),
-                query: query.to_string(),
-                limit: Some(window.fetch_count()),
-                sort: sort.cloned(),
-            };
-            async move { (shard_id, shard.handle_search(req).await) }
-        });
-        let shard_results: Vec<_> = futures::stream::iter(shard_searches)
-            .buffer_unordered(self.max_concurrent_shard_searches.max(1))
-            .collect::<Vec<_>>()
-            .await;
-
-        let mut results: Vec<(Uuid, f32, JsonValue)> = Vec::new();
-        // Kept as values rather than formatted here: whether nothing ran at all, and whose fault
-        // that was, is decided from the errors themselves once the gather is complete.
-        let mut failures: Vec<(Uuid, OrchestratorError)> = Vec::new();
-        let mut shard_success = 0usize;
-        let mut total_hits_sum = 0usize;
-        // Every shard parses the same query string, so collect the distinct set.
-        let mut discarded: Vec<String> = Vec::new();
-        // One shard reporting an approximate order describes the whole answer; see the same
-        // gather in `engine_search`.
-        let mut approximate_sort: Option<String> = None;
-        // One shard is enough. Shards can hold different schemas for the same index, and a
-        // query that one of them could not run at all is not answered by the ones that could.
-        let mut emptied = false;
-        for (shard_id, result) in shard_results {
-            match result {
-                Ok(r) => {
-                    emptied |= r.emptied;
-                    total_hits_sum += r.total_hits;
-                    for hit in r.hits {
-                        results.push((shard_id, hit.score, hit.doc));
-                    }
-                    for note in r.discarded {
-                        if !discarded.contains(&note) {
-                            discarded.push(note);
-                        }
-                    }
-                    approximate_sort = approximate_sort.or(r.approximate_sort);
-                    shard_success += 1;
-                }
-                Err(err) => {
-                    warn!(%shard_id, error = %err, "Scatter search shard failed");
-                    failures.push((shard_id, err));
-                }
-            }
-        }
-
-        // Nothing ran, so there is nothing to qualify: refuse rather than answer with the empty
-        // page a partial outage would produce. This is where the one refusal the sort guard above
-        // cannot make lands — `fast` is a declaration and the column is written from it when the
-        // index is built, so a field declared fast after the fact has no column to order by, and
-        // only the built index knows that.
-        if let Some(refusal) = no_shard_answered(index, shard_success, &failures) {
-            return Err(refusal);
-        }
-        let errors = shard_error_notes(&failures);
-
-        // Order merged results: by the requested sort field when provided, otherwise by
-        // score descending. Each shard already returned field-sorted results, so a global
-        // re-sort here interleaves them correctly across this node's shards. When sorting,
-        // stamp the normalized `SORT_KEY_FIELD` first (while the full doc is present) so it
-        // survives projection and lets the requesting node's cross-node merge re-order
-        // these hits even when the sort field is not among the returned fields.
-        if let Some(spec) = sort {
-            stamp_sort_keys(&mut results, spec, &schema);
-        }
-        order_shard_hits(&mut results, sort);
-        let results: Vec<(Uuid, f32, JsonValue)> = window.apply(results);
-        let hits: Vec<JsonValue> = results
-            .into_iter()
-            .map(|(_shard_id, score, mut doc)| {
-                // Add metadata fields
-                if let JsonValue::Object(ref mut o) = doc {
-                    o.insert(
-                        "_score".to_string(),
-                        serde_json::Number::from_f64(score as f64)
-                            .map(JsonValue::Number)
-                            .unwrap_or(JsonValue::Null),
-                    );
-                }
-
-                // Apply field projection if specified
-                if let Some(field_list) = fields {
-                    apply_field_projection(doc, field_list)
-                } else {
-                    doc
-                }
-            })
-            .collect();
-        let mut response = serde_json::json!({
-            "hits": hits,
-            "hits_returned": hits.len(),
-            "total_hits": total_hits_sum,
-            "limit": window.limit,
-            "offset": window.offset,
-            "took_ms": start.elapsed().as_millis(),
-            "stats": {
-                "shards": {
-                    "total": self.shards.len(),
-                    "responded": shard_success,
-                    "failed": errors.len()
-                }
-            },
-        });
-        attach_shard_errors(&mut response, errors);
-        // Refuse instead of answering. An emptied query ran as nothing, so the zero it
-        // produces is not a negative result — reported as a 200 it cannot be told apart from
-        // "no document matches", which is the same confusion an unrunnable sort caused.
-        if emptied {
-            return Err(OrchestratorError::UnrunnableQuery {
-                notes: discarded.join("; "),
-            });
-        }
-
-        discarded.extend(unknown_projection_fields(&schema, fields));
-        attach_discarded(&mut response, discarded);
-        attach_approximate_sort(&mut response, approximate_sort);
-        Ok(response)
+        .gather(index, query, window, fields, sort)
+        .await
     }
 
     async fn orch_create_config(

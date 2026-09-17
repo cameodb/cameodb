@@ -83,6 +83,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The scatter-gather is written once.** `engine_search` and `orch_search` were ~150-line
+  near-duplicates — fan-out, gather accounting, sort-key stamping, merge, projection, response
+  assembly — and three separate fixes had already been made in both. The body lives in
+  `ScatterCtx::gather` now, the borrowed view each lane builds: the actor from its own shard
+  map, a worker from the engine's `ArcSwap` snapshot. What stays per-lane is what the lane
+  owns: the empty-shards early return and `load_schema`. No behaviour changed; the point is
+  that the next change cannot be made in only one of them.
+
 - **A shard's writer thread no longer allocates its working set per drained batch.**
   `pending_cmds` was already reused across iterations; the grouping maps and reply lists
   (`write_groups`, `batch_groups`, `commits`, `evictions`, `deletions`, `committed_indices`,
