@@ -663,3 +663,71 @@ fn an_index_without_the_id_fast_column_still_finds_its_documents() {
     assert_eq!(found, ["a", "b", "c", "d"]);
     assert_eq!(outcome.total_hits, 4);
 }
+
+/// A segment that contributes enough hits resolves their ids off the `id` fast column in a
+/// single sorted dictionary walk rather than a stored-document fetch per hit. The ids that
+/// come back must be exactly the ones the documents were written under.
+#[test]
+fn a_dense_enough_hit_list_reads_ids_off_the_column() {
+    let dir = TempDir::new().unwrap();
+    let docs: Vec<WalOp> = (0..80)
+        .map(|i| {
+            let id = format!("doc-{i:03}");
+            put(
+                &id,
+                json!({"id": id, "title": format!("rust entry {i}"), "year": 2000 + i}),
+            )
+        })
+        .collect();
+    let store = setup_index(&dir, "books", docs);
+
+    let outcome = store
+        .search_documents("books", "rust", 80, None)
+        .expect("search failed");
+    assert_eq!(outcome.total_hits, 80);
+    assert_eq!(outcome.hits.len(), 80);
+
+    let mut found = ids(&outcome.hits);
+    found.sort();
+    let expected: Vec<String> = (0..80).map(|i| format!("doc-{i:03}")).collect();
+    assert_eq!(found, expected);
+}
+
+/// A sort on the document key orders by the `id` column — and the sort key the collector
+/// returns is the identifier itself, so those hits answer their ids without a stored-document
+/// read or a column walk. The documents that come back prove the keys were the right ones.
+#[test]
+fn a_sort_on_the_document_key_carries_the_ids_back() {
+    let dir = TempDir::new().unwrap();
+    let docs: Vec<WalOp> = (0..40)
+        .map(|i| {
+            // Shuffled ids so collection order and alphabetical order disagree.
+            let id = format!("doc-{:03}", (i * 37) % 40);
+            put(&id, json!({"id": id, "title": format!("rust entry {i}")}))
+        })
+        .collect();
+    let store = setup_index(&dir, "books", docs);
+
+    let outcome = store
+        .search_documents(
+            "books",
+            "rust",
+            40,
+            Some(&SortSpec {
+                field: "id".to_string(),
+                order: SortOrder::Asc,
+            }),
+        )
+        .expect("sort by id failed");
+    assert_eq!(outcome.hits.len(), 40);
+    assert!(outcome.approximate_sort.is_none(), "id sorts exactly");
+
+    let found = ids(&outcome.hits);
+    let mut expected: Vec<String> = (0..40).map(|i| format!("doc-{i:03}")).collect();
+    expected.sort();
+    assert_eq!(found, expected, "ascending id order mismatch");
+    // Each hit is the document whose key ordered it — the carried id fetched the right body.
+    for (i, (_, doc)) in outcome.hits.iter().enumerate() {
+        assert_eq!(doc["id"].as_str().unwrap(), expected[i]);
+    }
+}

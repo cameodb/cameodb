@@ -99,15 +99,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-index merge vectors inside a group still allocate per batch: they are consumed by the
   apply call, and reusing them would mean threading emptied buffers back out of it.
 
-- **A search hit's identifier comes from a column, not a stored-document decompression.**
-  `id` is built `STRING | STORED | FAST` on new indexes, so the per-hit read is a term-ordinal
-  lookup on the column — opened once per segment — instead of a decompressed stored document to
-  get at one field. `STORED` stays: an index built before the column existed has none to read,
-  and its hits still answer the id from the stored document. One consequence is worth the name
-  change it earned: a sort on the document key — `id`, or a shadow field that stands for it —
-  is now exact over every match rather than the post-fetch order of a top-scoring window, so
-  `_approximate_sort` no longer appears on those responses. A field with no column still sorts
-  the way it did and still reports it.
+- **A search hit's identifier is read off the `id` column in one dictionary walk per
+  segment.** `id` is built `STRING | STORED | FAST` on new indexes. A per-hit ordinal read
+  turned out slower than the stored-document fetch it replaced — each `ord_to_str` re-opens
+  the term block and scans it from the top — so the column is used only where it amortizes:
+  a segment contributing enough hits, packed densely enough in term order, resolves all of
+  them in a single walk. Sparse hits and indexes built before the column existed keep the
+  stored-document read. One consequence is worth the name change it earned: a sort on the
+  document key — `id`, or a shadow field that stands for it — is now exact over every match
+  rather than the post-fetch order of a top-scoring window, so `_approximate_sort` no longer
+  appears on those responses. A field with no column still sorts the way it did and still
+  reports it.
 
 - **`BulkWrite` and `BulkDelete` are served by the worker pool, not the orchestrator mailbox.**
   A bulk op used to hold the single actor lane for its whole duration — validation, routing,
