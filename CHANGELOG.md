@@ -81,6 +81,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separately from the worker pool's `queue_depth` because a node can be idle on one and shedding
   on the other.
 
+- **The index listing no longer queues behind a bulk write.** `ListIndexes` was the last read
+  still served from the orchestrator's mailbox, where it waited behind whatever write held the
+  lane — the reason `/_cluster/health` could not report `total_indexes` under load. The
+  aggregation (per-shard stats folded per index, then one schema read per index) asks only
+  `&self` questions — it always asked `GetShardStats` on a shard clone rather than the shard's
+  mailbox — so it is a free function now, taking the shard map, the `SchemaCache` and the
+  identity as borrows. `ListIndexes` and `ListClusterIndexes` are worker-eligible, and the
+  local half of a cluster listing computes the identical answer from the engine's `ArcSwap`
+  snapshots. The actor's handler delegates to the same body, so the mailbox fallback answers
+  identically.
+
 ### Changed
 
 - **The two broadcast fan-outs share one** (L16). `handle_broadcast` and

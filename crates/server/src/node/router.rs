@@ -304,6 +304,12 @@ impl RouterActor {
                     // A metadata read with no actor state behind it. On the mailbox it queued
                     // behind whatever write was there; the pool answers it from an ArcSwap.
                     | ClientOp::GetIdentity
+                    // The index listing asks only `&self` questions of the shard map — stats
+                    // gathered per shard, one schema per index, an identity that never
+                    // changes. `ListClusterIndexes` lands here only as the local half of a
+                    // broadcast, which is the same listing (ROADMAP CH12).
+                    | ClientOp::ListIndexes { .. }
+                    | ClientOp::ListClusterIndexes { .. }
             );
             if is_worker_eligible {
                 // Refuse before queueing, not after waiting. The dequeue check below this is

@@ -1842,8 +1842,9 @@ fn normalize_projection_fields_rewrites_id_to_the_shadow_name() {
     );
 }
 
-/// Metadata ops are never dispatched to the pool today, but if one ever is, it must be
-/// handed to the actor rather than answered with an error — the same contract.
+/// A metadata op the pool has no answer for must be handed to the actor rather than
+/// answered with an error — the same contract. `GetIdentity` and the index listing are
+/// metadata the pool *does* answer; the rest still defer.
 #[tokio::test]
 async fn a_metadata_op_defers_rather_than_failing() {
     let engine = bare_engine();
@@ -1880,6 +1881,38 @@ async fn the_cluster_schema_lookup_defers_to_the_actor() {
         matches!(outcome, WorkerOutcome::UseActor(op) if matches!(*op, ClientOp::FindSchemaInCluster { .. })),
         "the cluster schema lookup must be deferred to the actor, carrying its own op"
     );
+}
+
+/// The index listing is a metadata read — shard stats asked on a clone, one schema per
+/// index, an identity that never changes — so a worker answers it from snapshots and
+/// never hands it back. The day it defers, "what indexes exist" queues behind a held
+/// mailbox again, which is what moved it off the actor (ROADMAP CH12).
+#[tokio::test]
+async fn the_index_listing_is_answered_by_the_worker() {
+    let engine = bare_engine();
+
+    for op in [
+        ClientOp::ListIndexes {
+            include_data_size: false,
+        },
+        ClientOp::ListIndexes {
+            include_data_size: true,
+        },
+        ClientOp::ListClusterIndexes {
+            include_data_size: false,
+        },
+    ] {
+        match engine.execute(op).await {
+            WorkerOutcome::Done(Ok(json)) => {
+                assert_eq!(json["total_indexes"], 0);
+                assert_eq!(json["total_shards"], 0);
+            }
+            WorkerOutcome::UseActor(_) => {
+                panic!("the index listing must not be deferred to the actor")
+            }
+            WorkerOutcome::Done(Err(other)) => panic!("expected a listing, got {other:?}"),
+        }
+    }
 }
 
 /// A node is standalone unless its configuration says otherwise.
