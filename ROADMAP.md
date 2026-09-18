@@ -50,8 +50,8 @@ on one.
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
-| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half under L12 |
-| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11 done), six simplifications (L14–L19 done), and the retrospective itself |
+| Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
+| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11, L12 done; L13 open), six simplifications (L14–L19 done), and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
 
@@ -1806,6 +1806,11 @@ landed the split, and the merge primitives, sort keys and validation live in
 `node/search.rs` as this item always wanted. `storage/src/lib.rs` keeps the same
 disease; its cure is [L12](#l12--storagesrclibrs-is-9961-lines-of-which-one-impl-block-is-4460).
 
+**2026-09-19:** the storage half is done too — L12 split `storage/src/lib.rs` into `query.rs`,
+`schema.rs`, `store.rs` and `search.rs`, so the sorted-collector logic lives in
+`storage/src/search.rs`, query preparation in `storage/src/query.rs` and schema description in
+`storage/src/schema.rs`. Both files this item tracked are now directories.
+
 ### CH3 — Cursor paging (`search_after`)
 
 📋 The deep-page refusal already tells callers to "sort on a field that lets you resume from the
@@ -3255,29 +3260,35 @@ passes are L15 and L16.
 
 ### L12 — `storage/src/lib.rs` is 9,961 lines, of which one impl block is 4,460
 
-**Decomposition.** 📋 **Planned.** Same coarse rule as L11: five files grouped by what the code
-*is*, so a write-path change happens in `store.rs`, a query-syntax change in `query.rs`, a field
-or document shape change in `schema.rs`. The pure sections (query normalization, schema model,
-document building) lift out first, verbatim and at zero risk; the `impl HybridStore` block then
-splits along the two boundaries it already draws — writes and reads:
+**Decomposition.** ✅ **Done** 2026-09-19. Five siblings, grouped by what the code *is* — the
+pure sections lifted verbatim, then `impl HybridStore` split into a second impl block along the
+write/read boundary it already drew:
 
 ```
 storage/src/
-├── lib.rs      (~700)   docs, re-exports, StorageConfig, StoreError, stats types
-├── query.rs    (~1,700) the pure query machinery: whitespace/date/prefix/shadow passes,
-│                        field-reference scanning, parser preparation, discarded-clause reports
-├── schema.rs   (~2,300) the data model: FieldDef, IndexSchema, SchemaState, date typing,
-│                        document building, WAL/StoredDoc types, tokenizers
-├── store.rs    (~2,900) HybridStore + the write path and everything that guards it: lifecycle,
-│                        get_or_create_index, apply_write/apply_batch, commit and checkpoint,
-│                        recovery and warmup
-├── search.rs   (~1,200) reader pool, search_documents, validate_query, stats gathering
-└── (tests move to tests/ alongside, or stay with the file they test)
+├── lib.rs      (465)   crate docs, StorageConfig, StoreError, SortSpec/SortOrder,
+│                       SearchOutcome/QueryValidation, stats + warmup wire types, re-exports
+├── query.rs    (970)   the pure query machinery: whitespace/date/prefix/shadow passes,
+│                       field-reference scanning, parser preparation, discarded-clause reports
+├── schema.rs   (1,683) the data model: FieldDef, IndexSchema, SchemaState, date typing,
+│                       document building, WAL/StoredDoc types, tokenizers
+├── store.rs    (3,356) HybridStore + the write path and everything that guards it: lifecycle,
+│                       get_or_create_index, apply_write/apply_batch, commit and checkpoint,
+│                       recovery and warmup
+├── search.rs   (1,605) reader pool, read caches, search_documents, validate_query, stats
+└── tests.rs    (2,160) the unit tests, verbatim (mod tests keeps its name behind an allow)
 ```
 
-Keep `lib.rs` re-exports so the ~12 consuming files and every integration test compile
-unchanged. Longest functions: `search_documents` (560 lines), `apply_batch` (376),
-`get_or_create_index` (278) — breaking those is part of the move, not a follow-up.
+`lib.rs` re-exports by glob (`pub use query::*` etc.), so every `storage::X` path the ~12
+consuming files and all integration tests import resolves unchanged. The long functions moved
+whole rather than shrinking — `search_documents` (560 lines) into `search.rs`, `apply_batch`
+(376) and `get_or_create_index` (278) into `store.rs`.
+
+Same privacy flattening as L11: items, `HybridStore` fields and the private methods called
+across the two impl blocks went `pub(crate)` — the visibility the single file already relied
+on — and `use crate::*` carries intra-crate names through the glob re-exports. `search.rs` is
+`pub(crate) use`d because it holds no public items; everything it exports is on `HybridStore`
+itself.
 
 ### L13 — `cli.rs`, `config.rs` and `cluster_coordinator.rs` (5,387 / 2,955 / 2,840 lines)
 
