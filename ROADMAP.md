@@ -3137,7 +3137,17 @@ threat model in `ratelimit.rs` already names the runaway-agent-loop scenario thi
 
 ### L6 — A `GET /mcp` listening stream without a session is unbounded
 
-**Security, medium.** 📋 **Planned.** A `GET /mcp` with no `MCP-Session-Id` is answered with an
+**Security, medium.** ✅ **Done.** Refused rather than capped: `streamable_listen_handler` now
+requires the `MCP-Session-Id` header and answers `400` (`anonymous_listener_refusal`) when it
+is absent. Capping anonymous listeners was the alternative; refusing is the honest answer
+because the stream carries keep-alives and nothing else — the server never initiates requests —
+so a session-less one could only ever occupy a connection, and a client handed the refusal
+learns to `initialize` first. `ListeningStream`'s guard is a `ListenerGuard` rather than an
+`Option` — a stream now always belongs to a session. Covered by
+`a_listening_stream_must_belong_to_a_session` in `mcp_federated` (anonymous → 400, unknown →
+404, live session → 200).
+
+**Original entry.** A `GET /mcp` with no `MCP-Session-Id` is answered with an
 infinite keep-alive stream (`mcp/transport.rs` ~481–516). It creates no session (so
 `max_sessions` never bounds it), holds no semaphore permit and no timeout (both end when the
 headers stream), and repeats per connection. Refuse pre-`initialize` listeners, or cap a global

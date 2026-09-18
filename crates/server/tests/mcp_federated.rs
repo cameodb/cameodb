@@ -263,6 +263,34 @@ max_shards_per_node = 1
             .expect("mcp post");
         resp.json().await.expect("mcp json")
     }
+
+    /// One `initialize`, returning the session id the node issued in its header.
+    async fn initialize(&self) -> String {
+        let resp = http()
+            .post(format!("{}/mcp", self.url))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "mcp-federated-tests", "version": "0"},
+                },
+            }))
+            .send()
+            .await
+            .expect("mcp initialize");
+        assert_eq!(resp.status(), 200, "initialize was refused");
+        resp.headers()
+            .get("mcp-session-id")
+            .expect("initialize issued no session id")
+            .to_str()
+            .expect("the session id is not text")
+            .to_string()
+    }
 }
 
 impl Drop for TestNode {
@@ -2842,4 +2870,50 @@ async fn an_approximate_order_names_the_field_the_hits_carry() {
             "the field the order is reported on must be on every hit: {result}"
         );
     }
+}
+
+/// A `GET /mcp` listening stream has to belong to a session.
+///
+/// The stream emits keep-alives and nothing else — the server never initiates requests — so
+/// one opened before `initialize` could only occupy a connection, and creating no session meant
+/// `max_sessions` never bounded how many a caller held. It is refused now; a session that is
+/// not there still gets the 404 the spec requires, and a real session's listener is served.
+#[tokio::test]
+async fn a_listening_stream_must_belong_to_a_session() {
+    let node = TestNode::start().await;
+
+    let get = |headers: &[(&str, &str)]| {
+        let mut request = http()
+            .get(format!("{}/mcp", node.url))
+            .header("accept", "text/event-stream");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request
+    };
+
+    let anonymous = get(&[]).send().await.expect("mcp get");
+    assert_eq!(
+        anonymous.status(),
+        400,
+        "a session-less listening stream was served"
+    );
+
+    let unknown = get(&[("mcp-session-id", "no-such-session")])
+        .send()
+        .await
+        .expect("mcp get");
+    assert_eq!(unknown.status(), 404, "an unknown session was not refused");
+
+    // The real path is untouched: a live session's listener is answered.
+    let session_id = node.initialize().await;
+    let listening = get(&[("mcp-session-id", &session_id)])
+        .send()
+        .await
+        .expect("mcp get");
+    assert_eq!(
+        listening.status(),
+        200,
+        "a session's listening stream was refused"
+    );
 }
