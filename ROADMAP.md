@@ -3155,12 +3155,23 @@ anonymous-listener count.
 
 ### L7 — MCP tool errors leak what HTTP deliberately masks
 
-**Security, medium.** 📋 **Planned.** `rpc.rs` ~329–338 puts any tool error verbatim into the
-response text, and `server/mcp/search.rs` forwards `OrchestratorError::to_string()` — shard and
-storage diagnostics, forwarded peer fault text — while the HTTP layer masks exactly this class
-on 5xx ([C7](#c7--a-500-printed-the-nodes-internal-error-text) closed this on HTTP; MCP has no
-equivalent). Classify tool errors the same way: client-fault verdicts pass through, server
-faults become a generic string.
+**Security, medium.** ✅ **Done** 2026-10-06. Tool failures now travel as a typed
+`ToolError{Caller, Internal}` end to end — `McpBackend`'s every method returns it, the tool
+dispatcher raises `Caller` for the refusals it owns (arguments, bounds, scope, unsupported
+names), and `server/mcp/diagnostics.rs::tool_error` classifies a routing error by
+`RemoteVerdict`: `BadRequest`/`NotFound` keep the message written for the caller;
+`Unavailable`, `SchemaRequired` and `ServerFault` are masked. `rpc.rs` answers with
+`into_response_text()` — caller text verbatim, internal as `Internal server error`, the same
+mask HTTP puts on a `500` — while `record_tool_call` audits `detail()`, so the operator's
+record keeps what the caller cannot see. The federated `errors` array is masked per entry the
+same way, since it rides inside a successful result. Tests pin each verdict arm, the
+envelope-level mask, and the caller passthrough.
+
+**Original entry.** `rpc.rs` ~329–338 put any tool error verbatim into the response text, and
+`server/mcp/search.rs` forwarded `OrchestratorError::to_string()` — shard and storage
+diagnostics, forwarded peer fault text — while the HTTP layer masks exactly this class on 5xx
+([C7](#c7--a-500-printed-the-nodes-internal-error-text) closed this on HTTP; MCP had no
+equivalent).
 
 ### L8 — The streaming-ingest error vector grows one string per bad line
 
@@ -3460,8 +3471,10 @@ output is this group's sequencing and the next cycle's goals:
    each item names) *before* the next feature phase starts, so the next review does not read a
    13k-line diff context again.
 4. **L14–L19 after the splits**, each with the per-module tests that the split creates.
-5. **L5, L6, L7, L9 are posture changes, not fixes** — each needs an explicit decision in the
-   retrospective (bound, gate, classify, document) before it is coded.
+5. **L5, L6, L7 are done** — the decisions landed as bound, refuse, classify respectively.
+   **L9 remains a posture change, not a fix** — it needs an explicit decision in the
+   retrospective (gate implicit index creation, or document it as `Writer`'s to make) before
+   it is coded.
 
 Measures of success for the group: the five tracked files each become a small set of
 feature-grouped files (four to six production files apiece, not fifteen); a change of one

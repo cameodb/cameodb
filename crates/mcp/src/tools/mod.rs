@@ -7,7 +7,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::{
     authz::{McpAuthzRef, tool_capability},
-    backend::{McpBackend, McpIndexSearchRequest},
+    backend::{McpBackend, McpIndexSearchRequest, ToolError},
     tools::schema::{
         DescribeIndexArgs, GetCatalogStatsArgs, ListIndexesArgs, SearchAcrossIndexesArgs,
         SearchIndexArgs, ToolLimits, ValidateQueryArgs, describe_index_input_schema,
@@ -28,13 +28,14 @@ pub(crate) struct ToolCallParams {
 /// An absent `arguments` and an explicit `null` both mean the call carried none, which for a
 /// tool whose parameters are all optional is a call in its own right: `validate_query` with
 /// nothing supplied is how an agent asks for the query reference.
-fn decode_args<T: DeserializeOwned>(tool: &str, arguments: JsonValue) -> Result<T, String> {
+fn decode_args<T: DeserializeOwned>(tool: &str, arguments: JsonValue) -> Result<T, ToolError> {
     let arguments = if arguments.is_null() {
         json!({})
     } else {
         arguments
     };
-    serde_json::from_value(arguments).map_err(|err| format!("Invalid {tool} arguments: {err}"))
+    serde_json::from_value(arguments)
+        .map_err(|err| ToolError::caller(format!("Invalid {tool} arguments: {err}")))
 }
 
 /// Refuse a `limit` past what the schema advertises.
@@ -44,12 +45,12 @@ fn decode_args<T: DeserializeOwned>(tool: &str, arguments: JsonValue) -> Result<
 /// catalogue did not show it. Checked here as well as by the host because the schema is this
 /// crate's promise about what a call may carry, and a promise nothing enforces describes
 /// nothing.
-fn check_limit(limit: Option<usize>, max_search_limit: usize) -> Result<(), String> {
+fn check_limit(limit: Option<usize>, max_search_limit: usize) -> Result<(), ToolError> {
     match limit {
-        Some(limit) if limit > max_search_limit => Err(format!(
+        Some(limit) if limit > max_search_limit => Err(ToolError::caller(format!(
             "limit {limit} is above the maximum of {max_search_limit}; ask for at most that many \
              and narrow the query to reach the rest"
-        )),
+        ))),
         _ => Ok(()),
     }
 }
@@ -69,16 +70,16 @@ fn check_offset_window(
     offset: Option<usize>,
     default_search_limit: usize,
     max_search_limit: usize,
-) -> Result<(), String> {
+) -> Result<(), ToolError> {
     let limit = limit.unwrap_or(default_search_limit);
     let offset = offset.unwrap_or(0);
     let window = offset.saturating_add(limit);
     if window > max_search_limit {
-        return Err(format!(
+        return Err(ToolError::caller(format!(
             "offset {offset} + limit {limit} = {window} is above the maximum of \
              {max_search_limit}; the engine fetches offset + limit hits, so a page this deep \
              costs what a limit that large costs. Narrow the query, or reduce the offset."
-        ));
+        )));
     }
     Ok(())
 }
@@ -92,31 +93,30 @@ fn check_offset_window(
 fn check_index_list(
     indexes: &[McpIndexSearchRequest],
     max_federated_indexes: usize,
-) -> Result<(), String> {
+) -> Result<(), ToolError> {
     if indexes.is_empty() {
-        return Err(
+        return Err(ToolError::caller(
             "no index was named; `indexes` needs at least one entry, or an empty result would \
-             read as a query that matched nothing"
-                .to_string(),
-        );
+             read as a query that matched nothing",
+        ));
     }
     if indexes.len() > max_federated_indexes {
-        return Err(format!(
+        return Err(ToolError::caller(format!(
             "{} indexes named; at most {max_federated_indexes} may be searched at once, and \
              `list_indexes` describes the whole catalogue in one call",
             indexes.len()
-        ));
+        )));
     }
     for (position, request) in indexes.iter().enumerate() {
         if let Some(earlier) = indexes[..position]
             .iter()
             .find(|seen| seen.index == request.index)
         {
-            return Err(format!(
+            return Err(ToolError::caller(format!(
                 "index '{}' is named twice; each mention is searched and counted separately, so \
                  the totals would exceed what the index holds",
                 earlier.index
-            ));
+            )));
         }
     }
     Ok(())
@@ -126,21 +126,24 @@ pub(crate) async fn call_tool<S>(
     backend: &S,
     params: ToolCallParams,
     authz: &McpAuthzRef,
-) -> Result<JsonValue, String>
+) -> Result<JsonValue, ToolError>
 where
     S: McpBackend,
 {
     // Capability before arguments: an unknown tool and a forbidden one both stop here, so a
     // tool that was never classified cannot be reached by naming it.
     let Some(required) = tool_capability(&params.name) else {
-        return Err(format!("Unsupported MCP tool: {}", params.name));
+        return Err(ToolError::caller(format!(
+            "Unsupported MCP tool: {}",
+            params.name
+        )));
     };
     if !authz.has(required) {
-        return Err(format!(
+        return Err(ToolError::caller(format!(
             "tool '{}' requires the '{}' capability, which this key does not hold",
             params.name,
             required.as_str()
-        ));
+        )));
     }
 
     match params.name.as_str() {
@@ -212,7 +215,7 @@ where
             backend.get_catalog_stats(authz.clone()).await
         }
         // Unreachable: `tool_capability` above rejects anything not in this match.
-        other => Err(format!("Unsupported MCP tool: {other}")),
+        other => Err(ToolError::caller(format!("Unsupported MCP tool: {other}"))),
     }
 }
 
@@ -277,11 +280,13 @@ pub(crate) fn tool_cost(arguments: &JsonValue, max_federated_indexes: usize) -> 
 }
 
 /// Refuse a tool call that names an index outside the caller's scope.
-fn check_index(authz: &McpAuthzRef, index: &str) -> Result<(), String> {
+fn check_index(authz: &McpAuthzRef, index: &str) -> Result<(), ToolError> {
     if authz.allows_index(index) {
         Ok(())
     } else {
-        Err(format!("this key is not permitted on index '{index}'"))
+        Err(ToolError::caller(format!(
+            "this key is not permitted on index '{index}'"
+        )))
     }
 }
 
@@ -552,7 +557,7 @@ mod tests {
         let authz: McpAuthzRef = Arc::new(Scoped("docs"));
         assert!(check_index(&authz, "docs").is_ok());
         let err = check_index(&authz, "payroll").unwrap_err();
-        assert!(err.contains("payroll"), "{err}");
+        assert!(err.detail().contains("payroll"), "{err}");
     }
 
     /// A tool whose parameters are all optional is callable with none of them.
@@ -605,7 +610,7 @@ mod tests {
                 .await
                 .expect_err("{tool} accepted an argument it does not take");
             assert!(
-                err.contains("unknown field"),
+                err.detail().contains("unknown field"),
                 "{tool} did not name the field it refused: {err}"
             );
         }
@@ -634,7 +639,7 @@ mod tests {
                 .await
                 .expect_err("an over-large limit was accepted");
             assert!(
-                err.contains(&DEFAULT_MAX_SEARCH_LIMIT.to_string()),
+                err.detail().contains(&DEFAULT_MAX_SEARCH_LIMIT.to_string()),
                 "{tool}: the refusal does not say what the maximum is: {err}"
             );
         }
@@ -682,7 +687,7 @@ mod tests {
             .await
             .expect_err("the host's lowered ceiling was not enforced");
         assert!(
-            err.contains("25"),
+            err.detail().contains("25"),
             "the refusal quotes another number: {err}"
         );
 
@@ -728,7 +733,7 @@ mod tests {
             match call_tool(&StubBackend::default(), params, &authz).await {
                 Ok(result) => panic!("{case} was accepted, returning {result}"),
                 Err(err) => assert!(
-                    err.contains(expected),
+                    err.detail().contains(expected),
                     "{case}: the refusal does not say why: {err}"
                 ),
             }
@@ -764,7 +769,7 @@ mod tests {
         let err = call_tool(&StubBackend::default(), params, &authz)
             .await
             .expect_err("an index outside the scope was accepted");
-        assert!(err.contains("payroll"), "{err}");
+        assert!(err.detail().contains("payroll"), "{err}");
 
         // Duplicate detection reads through both forms, since one name twice is one name twice
         // however it was written.
@@ -775,7 +780,7 @@ mod tests {
         let err = call_tool(&StubBackend::default(), params, &authz)
             .await
             .expect_err("the same index named twice in two forms was accepted");
-        assert!(err.contains("twice"), "{err}");
+        assert!(err.detail().contains("twice"), "{err}");
 
         // And the object form still names what it refused.
         let params = ToolCallParams {
@@ -786,7 +791,7 @@ mod tests {
             .await
             .expect_err("a misspelled projection was accepted");
         assert!(
-            err.contains("feilds"),
+            err.detail().contains("feilds"),
             "the bare-name form cost the object form its error: {err}"
         );
     }
@@ -847,7 +852,7 @@ mod tests {
             .await
             .expect_err("the host's narrowed fan-out was not enforced");
         assert!(
-            err.contains('3'),
+            err.detail().contains('3'),
             "the refusal quotes another number: {err}"
         );
 
@@ -920,9 +925,9 @@ mod tests {
     #[test]
     fn check_offset_window_error_names_the_window_and_the_bound() {
         let err = check_offset_window(Some(20), Some(9_990), 10, 10_000).unwrap_err();
-        assert!(err.contains("9990"), "{err}");
-        assert!(err.contains("20"), "{err}");
-        assert!(err.contains("10010"), "{err}");
-        assert!(err.contains("10000"), "{err}");
+        assert!(err.detail().contains("9990"), "{err}");
+        assert!(err.detail().contains("20"), "{err}");
+        assert!(err.detail().contains("10010"), "{err}");
+        assert!(err.detail().contains("10000"), "{err}");
     }
 }

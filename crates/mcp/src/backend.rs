@@ -98,6 +98,65 @@ impl<'de> Deserialize<'de> for McpIndexSearchRequest {
     }
 }
 
+/// Why an operation failed, classified by whose problem it is.
+///
+/// A `String` cannot carry this, and the difference decides what the caller is told: a refusal
+/// the caller can act on is handed to them, while a fault on the host is masked the way HTTP
+/// masks a `500` — the caller learns the call failed, and the detail goes to the log where the
+/// operator reads it. The host knows which it raised; the verdict, not the message text, is
+/// what says so.
+#[derive(Debug)]
+pub enum ToolError {
+    /// The caller's problem, written for the caller: bad arguments, a name that does not
+    /// resolve, a bound they exceeded. Passed into the response unchanged.
+    Caller(String),
+    /// The host's problem: a shard that did not answer, a store that failed, a peer's fault
+    /// forwarded home. The detail is logged for the operator; the caller gets a generic
+    /// refusal.
+    Internal(String),
+}
+
+/// What an internal failure is answered with — the same mask the HTTP surface puts on a `500`.
+pub(crate) const INTERNAL_ERROR_TEXT: &str = "Internal server error";
+
+impl ToolError {
+    /// A failure the caller can act on.
+    pub fn caller(message: impl Into<String>) -> Self {
+        Self::Caller(message.into())
+    }
+
+    /// A failure the caller can neither fix nor usefully be told about.
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(message.into())
+    }
+
+    /// The full text, whoever it was written for. The audit record and the log get this —
+    /// the mask is for the caller, not for the record of what happened.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Caller(message) | Self::Internal(message) => message,
+        }
+    }
+
+    /// What the caller is answered with. `Caller` passes its text through; `Internal` is
+    /// masked, because the detail would leak the node's internals to an agent that cannot
+    /// act on it.
+    pub fn into_response_text(self) -> String {
+        match self {
+            Self::Caller(message) => message,
+            Self::Internal(_) => INTERNAL_ERROR_TEXT.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.detail())
+    }
+}
+
+impl std::error::Error for ToolError {}
+
 /// The operations MCP exposes, implemented by the host.
 ///
 /// Methods that **name** their index take no caller: the tool dispatcher has the name in
@@ -112,7 +171,7 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
         query: String,
         limit: Option<usize>,
         offset: Option<usize>,
-    ) -> BoxFuture<'_, Result<JsonValue, String>>;
+    ) -> BoxFuture<'_, Result<JsonValue, ToolError>>;
 
     fn search_across_indexes(
         &self,
@@ -120,32 +179,32 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
         query: String,
         limit: Option<usize>,
         offset: Option<usize>,
-    ) -> BoxFuture<'_, Result<JsonValue, String>>;
+    ) -> BoxFuture<'_, Result<JsonValue, ToolError>>;
 
-    fn describe_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, String>>;
+    fn describe_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, ToolError>>;
 
-    fn list_indexes(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>>;
+    fn list_indexes(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, ToolError>>;
 
     fn validate_query(
         &self,
         index: Option<String>,
         partial_field: Option<String>,
         query: Option<String>,
-    ) -> BoxFuture<'_, Result<JsonValue, String>>;
+    ) -> BoxFuture<'_, Result<JsonValue, ToolError>>;
 
     /// Totals across the whole catalogue, scoped to what this caller may see.
     ///
     /// Takes no index. One index's statistics are part of describing it, and answering the same
     /// question from two tools is how the two come to disagree.
-    fn get_catalog_stats(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>>;
+    fn get_catalog_stats(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, ToolError>>;
 
-    fn list_resources(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>>;
+    fn list_resources(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, ToolError>>;
 
     fn read_resource(
         &self,
         uri: String,
         authz: McpAuthzRef,
-    ) -> BoxFuture<'_, Result<JsonValue, String>>;
+    ) -> BoxFuture<'_, Result<JsonValue, ToolError>>;
 
     /// The largest `limit` a search tool may be asked for.
     ///
@@ -255,10 +314,10 @@ pub(crate) mod testing {
     use futures::future::BoxFuture;
     use serde_json::{Value as JsonValue, json};
 
-    use super::{McpBackend, McpIndexSearchRequest};
+    use super::{McpBackend, McpIndexSearchRequest, ToolError};
     use crate::authz::McpAuthzRef;
 
-    /// Answers every operation with an empty object.
+    /// Answers every operation with an empty object — or with the failure it was built with.
     ///
     /// The dispatcher tests are about the JSON-RPC envelope — which messages get a reply, what
     /// an error carries — so what a tool *returns* is deliberately uninteresting here.
@@ -270,6 +329,15 @@ pub(crate) mod testing {
     pub(crate) struct StubBackend {
         max_search_limit: Option<usize>,
         max_federated_indexes: Option<usize>,
+        failure: Option<StubFailure>,
+    }
+
+    /// Every operation fails the same way, so the tests can check what the envelope does with
+    /// each kind of error without standing up a host that can produce one.
+    #[derive(Clone)]
+    pub(crate) enum StubFailure {
+        Caller(&'static str),
+        Internal(&'static str),
     }
 
     impl StubBackend {
@@ -288,10 +356,25 @@ pub(crate) mod testing {
                 ..Self::default()
             }
         }
-    }
 
-    fn empty() -> BoxFuture<'static, Result<JsonValue, String>> {
-        Box::pin(async { Ok(json!({})) })
+        /// A host that fails every operation the same way.
+        pub(crate) fn failing(failure: StubFailure) -> Self {
+            Self {
+                failure: Some(failure),
+                ..Self::default()
+            }
+        }
+
+        fn outcome(&self) -> BoxFuture<'static, Result<JsonValue, ToolError>> {
+            let failure = self.failure.clone();
+            Box::pin(async move {
+                match failure {
+                    Some(StubFailure::Caller(message)) => Err(ToolError::caller(message)),
+                    Some(StubFailure::Internal(message)) => Err(ToolError::internal(message)),
+                    None => Ok(json!({})),
+                }
+            })
+        }
     }
 
     impl McpBackend for StubBackend {
@@ -311,8 +394,8 @@ pub(crate) mod testing {
             _query: String,
             _limit: Option<usize>,
             _offset: Option<usize>,
-        ) -> BoxFuture<'_, Result<JsonValue, String>> {
-            empty()
+        ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
+            self.outcome()
         }
 
         fn search_across_indexes(
@@ -321,16 +404,16 @@ pub(crate) mod testing {
             _query: String,
             _limit: Option<usize>,
             _offset: Option<usize>,
-        ) -> BoxFuture<'_, Result<JsonValue, String>> {
-            empty()
+        ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
+            self.outcome()
         }
 
-        fn describe_index(&self, _index: String) -> BoxFuture<'_, Result<JsonValue, String>> {
-            empty()
+        fn describe_index(&self, _index: String) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
+            self.outcome()
         }
 
-        fn list_indexes(&self, _authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>> {
-            empty()
+        fn list_indexes(&self, _authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
+            self.outcome()
         }
 
         fn validate_query(
@@ -338,27 +421,30 @@ pub(crate) mod testing {
             _index: Option<String>,
             _partial_field: Option<String>,
             _query: Option<String>,
-        ) -> BoxFuture<'_, Result<JsonValue, String>> {
-            empty()
+        ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
+            self.outcome()
         }
 
         fn get_catalog_stats(
             &self,
             _authz: McpAuthzRef,
-        ) -> BoxFuture<'_, Result<JsonValue, String>> {
-            empty()
+        ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
+            self.outcome()
         }
 
-        fn list_resources(&self, _authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>> {
-            empty()
+        fn list_resources(
+            &self,
+            _authz: McpAuthzRef,
+        ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
+            self.outcome()
         }
 
         fn read_resource(
             &self,
             _uri: String,
             _authz: McpAuthzRef,
-        ) -> BoxFuture<'_, Result<JsonValue, String>> {
-            empty()
+        ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
+            self.outcome()
         }
     }
 }
