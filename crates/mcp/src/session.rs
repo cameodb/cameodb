@@ -41,6 +41,16 @@ pub(crate) struct SessionLimits {
     /// `initialize` hands the flood a way to lock everyone else out, while evicting costs the
     /// idlest caller one re-initialize.
     pub(crate) max_sessions: usize,
+
+    /// The most requests one session may hold in flight at once.
+    ///
+    /// The legacy transport answers `202` and does the work on a spawned task afterwards, so
+    /// nothing the request layer enforces — the concurrency semaphore, the request timeout —
+    /// bounds it: the permit is released and the clock stops before the work begins. This is
+    /// the bound on that work, per session rather than per key because it is the session's
+    /// map the requests accumulate in; a key that wants more opens more sessions, and
+    /// `max_sessions` is the bound on that move.
+    pub(crate) max_in_flight: usize,
 }
 
 #[derive(Clone)]
@@ -90,9 +100,10 @@ impl McpTransportState {
         let session_id = Uuid::new_v4().to_string();
         let mut inner = self.inner.lock().await;
         inner.evict_idlest_if_full(self.limits.max_sessions);
-        inner
-            .sessions
-            .insert(session_id.clone(), McpSession::new(None, key_id));
+        inner.sessions.insert(
+            session_id.clone(),
+            McpSession::new(None, key_id, self.limits.max_in_flight),
+        );
         session_id
     }
 
@@ -113,7 +124,7 @@ impl McpTransportState {
         let session_id = Uuid::new_v4().to_string();
         let (tx, rx) = mpsc::channel::<Event>(128);
 
-        let session = McpSession::new(Some(tx.clone()), key_id);
+        let session = McpSession::new(Some(tx.clone()), key_id, self.limits.max_in_flight);
 
         let mut inner = self.inner.lock().await;
         inner.evict_idlest_if_full(self.limits.max_sessions);
@@ -333,6 +344,9 @@ pub(crate) struct McpSession {
     /// server returns 202 Accepted. A `notifications/cancelled` message can cancel one of
     /// these tasks; the last handle to the session going away cancels them all.
     in_flight: Arc<InFlight>,
+    /// The most entries `in_flight` may hold — the session's bound on work that outlives
+    /// the request that started it.
+    max_in_flight: usize,
 }
 
 /// The in-flight registry for one session, shared by every clone of it.
@@ -389,18 +403,24 @@ impl Drop for RequestGuard {
 }
 
 impl McpSession {
-    fn new(sender: Option<mpsc::Sender<Event>>, key_id: Option<String>) -> Self {
+    fn new(
+        sender: Option<mpsc::Sender<Event>>,
+        key_id: Option<String>,
+        max_in_flight: usize,
+    ) -> Self {
         Self {
             sender,
             listeners: 0,
             last_activity: std::time::Instant::now(),
             key_id,
             in_flight: Arc::new(InFlight::default()),
+            max_in_flight,
         }
     }
 
     /// Register a request that will be processed asynchronously, returning the token its task
-    /// should stop on and the guard that un-registers it once it has.
+    /// should stop on and the guard that un-registers it once it has — or `None` when the
+    /// session is already holding its bound.
     ///
     /// Called *before* the task is spawned, and both halves come back from the one call so that
     /// ordering is not something a caller can get wrong. It is the only safe order: registering
@@ -408,18 +428,28 @@ impl McpSession {
     /// entry that does not exist yet, and the insertion that follows is one nothing will ever
     /// take out. An `AbortHandle` cannot be registered this early — it does not exist until the
     /// task does — which is why the map holds a token instead.
-    pub(crate) fn start_request(&self, request_id: JsonValue) -> (CancellationToken, RequestGuard) {
+    ///
+    /// The cap is checked and the entry inserted under the one lock, so the count a refusal is
+    /// decided on is the count that is registered — a refusal cannot race an insert. A `None`
+    /// answer means the work was refused rather than queued: one more in-flight request on a
+    /// session already at its bound is backlog the node is better off not taking on.
+    pub(crate) fn start_request(
+        &self,
+        request_id: JsonValue,
+    ) -> Option<(CancellationToken, RequestGuard)> {
         let token = CancellationToken::new();
-        self.in_flight
-            .lock()
-            .insert(request_id.clone(), token.clone());
-        (
+        let mut in_flight = self.in_flight.lock();
+        if in_flight.len() >= self.max_in_flight {
+            return None;
+        }
+        in_flight.insert(request_id.clone(), token.clone());
+        Some((
             token,
             RequestGuard {
                 in_flight: Arc::downgrade(&self.in_flight),
                 id: request_id,
             },
-        )
+        ))
     }
 
     /// Cancel an in-flight request by its JSON-RPC id. Returns true if the id was known.
@@ -464,6 +494,7 @@ mod tests {
     const TEST_LIMITS: SessionLimits = SessionLimits {
         idle_timeout: Duration::from_secs(1800),
         max_sessions: 1024,
+        max_in_flight: 8,
     };
 
     fn state() -> McpTransportState {
@@ -482,7 +513,9 @@ mod tests {
         request_id: JsonValue,
         work: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> tokio::task::JoinHandle<bool> {
-        let (token, guard) = session.start_request(request_id);
+        let (token, guard) = session
+            .start_request(request_id)
+            .expect("the test session is far from its in-flight bound");
         tokio::spawn(async move {
             let _guard = guard;
             tokio::select! {
@@ -579,6 +612,52 @@ mod tests {
             left_behind, 0,
             "{left_behind} finished requests are still registered as in flight"
         );
+    }
+
+    /// The bound the transport's `202`-then-spawn dance needs: past it the session refuses
+    /// rather than queues, and a finished request frees the slot it held.
+    ///
+    /// The refusal is decided under the same lock as the insertion, so what the test asserts —
+    /// that the `cap + 1`th registration is the one refused — is the property the race would
+    /// break if the check and the insert could interleave.
+    #[tokio::test]
+    async fn a_session_refuses_past_its_in_flight_bound_until_one_finishes() {
+        let state = McpTransportState::new(SessionLimits {
+            max_in_flight: 2,
+            ..TEST_LIMITS
+        });
+        let session_id = state.create_session(None).await;
+        let SessionClaim::Granted(session) = state.claim_session(&session_id, None).await else {
+            panic!("session should be claimable");
+        };
+
+        let first = spawn_request(&session, JsonValue::from(1), std::future::pending());
+        let second = spawn_request(&session, JsonValue::from(2), std::future::pending());
+
+        assert!(
+            session.start_request(JsonValue::from(3)).is_none(),
+            "the third in-flight request was queued rather than refused"
+        );
+
+        // A task that ends drops its guard, which removes the entry — so the bound is held
+        // against work that is actually still running, not against work that merely ran.
+        second.abort();
+        let _ = second.await;
+        // Held, not just asserted: the guard frees the slot when it drops, which is the
+        // mechanism under test — dropping it here would admit the next request for the wrong
+        // reason.
+        let _held = session
+            .start_request(JsonValue::from(4))
+            .expect("a finished request did not free its in-flight slot");
+
+        // And once that slot is spent the bound holds again.
+        assert!(
+            session.start_request(JsonValue::from(5)).is_none(),
+            "a refilled session stopped refusing at the bound"
+        );
+
+        first.abort();
+        let _ = first.await;
     }
 
     #[tokio::test]

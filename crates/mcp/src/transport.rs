@@ -53,6 +53,15 @@ pub struct McpTransportConfig {
     /// The most sessions the registry will hold, evicting the idlest at the cap.
     pub max_sessions: usize,
 
+    /// The most requests one session may hold in flight at once.
+    ///
+    /// Only the legacy transport needs the number: it answers `202` and runs the work on a
+    /// spawned task, so a session's queued work would otherwise grow without bound — the
+    /// request's own semaphore permit and timeout end when the `202` is written, before the
+    /// work begins. Streamable HTTP holds no such state: a request there is the work, bounded
+    /// by the ordinary guards for its duration.
+    pub max_in_flight_per_session: usize,
+
     /// How often an idle SSE stream is written to, on both transports.
     ///
     /// The number that decides whether an intermediary calls the connection dead. It has to be
@@ -75,6 +84,9 @@ impl Default for McpTransportConfig {
         Self {
             session_idle_timeout: Duration::from_secs(1800),
             max_sessions: 1024,
+            // Well past what an agent's parallel tool calls reach for — the bound exists for
+            // the loop that does not stop, not the client that batches a few.
+            max_in_flight_per_session: 32,
             sse_keepalive: Duration::from_secs(15),
             legacy_sse_enabled: true,
         }
@@ -114,6 +126,7 @@ where
     let transport_state = McpTransportState::new(SessionLimits {
         idle_timeout: config.session_idle_timeout,
         max_sessions: config.max_sessions,
+        max_in_flight: config.max_in_flight_per_session,
     });
 
     // Start global session cleanup task (respects cancellation token)
@@ -296,12 +309,26 @@ async fn process_mcp_message<B: McpBackend>(
                     // `notifications/cancelled`, or by its session ending — and registering it
                     // first is what keeps the bookkeeping honest: the task cannot finish and
                     // un-register itself before it has been registered. One without an id is a
-                    // notification, which nothing can refer to and so nothing can cancel.
-                    let (token, guard) = request
-                        .id
-                        .clone()
-                        .map(|id| mcp_session.start_request(id))
-                        .unzip();
+                    // notification, which nothing can refer to and so nothing can cancel — and
+                    // whose spawned task is trivial (a notification is answered with silence),
+                    // so it does not count against the bound.
+                    let (token, guard) = match request.id.clone() {
+                        Some(id) => match mcp_session.start_request(id) {
+                            Some((token, guard)) => (Some(token), Some(guard)),
+                            // The session is already holding its bound of in-flight work, and
+                            // the work is what is expensive — a refused request here is the
+                            // same admission refusal the HTTP guards make upstream, rather than
+                            // one more spawned task the session sweeps up later.
+                            None => {
+                                debug!(
+                                    session_id = %session_id,
+                                    "MCP request refused: session in-flight bound reached"
+                                );
+                                return in_flight_refusal().into_response();
+                            }
+                        },
+                        None => (None, None),
+                    };
 
                     // Process the message on a spawned task: this transport answers 202 first
                     // and pushes the result down the SSE stream afterwards, so the work has to
@@ -586,6 +613,23 @@ fn unknown_session_refusal(session_id: &str) -> impl IntoResponse {
         Json(json!({
             "error": "Unknown MCP session",
             "message": "this session is not known to the server; start a new one with `initialize`",
+        })),
+    )
+}
+
+/// A request refused because its session is already holding its bound of in-flight work.
+///
+/// 429 with a retry hint, the same shape the rest of the node's admission refusals take. The
+/// honest retry time is "when one of the session's running requests finishes", which the
+/// transport cannot know — one second is the same non-answer every other refusal without a
+/// backlog estimate gives.
+fn in_flight_refusal() -> impl IntoResponse {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        Json(json!({
+            "error": "Too Many Requests",
+            "message": "this session already has too many requests in flight; retry once one of them has finished",
         })),
     )
 }

@@ -3111,7 +3111,23 @@ unsound. Either way, remove them.
 
 ### L5 — Legacy-SSE work outlives its request and bypasses the guards
 
-**Security, medium.** 📋 **Planned.** Every `POST /mcp/messages` `tokio::spawn`s the full
+**Security, medium.** ✅ **Done.** The per-session bound is `max_in_flight` on
+`SessionLimits`, enforced inside `McpSession::start_request` — the check and the map insert
+run under the one lock, so a refusal cannot race a registration. A session at its bound gets
+`429 Too Many Requests` with `Retry-After` on the POST itself (`in_flight_refusal`), the same
+admission shape the HTTP guards make; notifications are exempt because their spawned task is
+trivial (a notification is answered with silence before any dispatch). The number is
+configurable as `mcp.max_in_flight_per_session`, default **32** — past what an agent's
+parallel calls reach for, since the bound exists for the loop that does not stop. `0` is
+refused at load. Covered by `a_session_refuses_past_its_in_flight_bound_until_one_finishes`
+(refusal at the cap, slot freed when a task's guard drops, bound holds again).
+
+The `tool_calls_per_minute` default stays `0`, deliberately: `ratelimit.rs` documents that an
+upgrade must not start refusing calls it used to serve, and the in-flight bound is what
+bounds the runaway-loop case the finding names — a non-zero rate would change behaviour for
+every existing deployment without being the fix this item needed.
+
+**Original entry.** Every `POST /mcp/messages` `tokio::spawn`s the full
 `handle_rpc_request` and answers 202 (`mcp/transport.rs` ~295–326). The concurrency semaphore
 (`routes.rs` ~100–119) releases its permit at the 202, the timeout never applies to the work,
 and the MCP rate limiter is inert by default — so one session can hold an unbounded number of

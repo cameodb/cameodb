@@ -256,6 +256,7 @@ session_idle_timeout_secs = 1800   # how long a disconnected client may pause
 max_sessions = 1024                # concurrent MCP clients held, idlest evicted at the cap
 sse_keepalive_secs = 15            # how often an idle SSE stream is written to
 legacy_sse_enabled = true          # the superseded /mcp/sse + /mcp/messages transport
+max_in_flight_per_session = 32     # requests one session may hold in flight on /mcp/messages
 ```
 
 The transport itself, as opposed to what a caller may spend on it — that is
@@ -298,6 +299,20 @@ load balancer — 30 s on nginx by default, 60 s on an AWS ALB. It defaults to *
 It also has to be below `session_idle_timeout_secs`, or a stream written to less often than its
 session expires cannot keep that session open; the node refuses to start rather than leaving
 the contradiction to be discovered as a 404.
+
+#### `max_in_flight_per_session` — the bound on a session's outstanding work
+
+Only the legacy `/mcp/messages` transport needs this number: it answers `202` and runs the
+request on a spawned task, so the request's own guards — the concurrency semaphore, the
+timeout — end before the work begins. This is the bound on that work, counted per session
+because the session is where the requests accumulate.
+
+- **Defaults to 32** — well past what an agent's parallel tool calls reach for. The bound
+  exists for the loop that does not stop, not for a client that batches a few calls.
+- **Past the bound a request is refused `429`** with a `Retry-After` hint rather than queued.
+  One more in-flight request on a saturated session is backlog the node is better off not
+  taking on.
+- **`0` is refused** — it would refuse every request on an otherwise valid session.
 
 #### `legacy_sse_enabled` — the superseded transport
 

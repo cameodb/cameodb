@@ -556,6 +556,7 @@ max_response_bytes = 16777216
             max_sessions: 64,
             sse_keepalive_secs: 5,
             legacy_sse_enabled: false,
+            max_in_flight_per_session: 12,
             enabled: true,
         };
         let transport = config.transport();
@@ -566,6 +567,7 @@ max_response_bytes = 16777216
         assert_eq!(transport.max_sessions, 64);
         assert_eq!(transport.sse_keepalive, std::time::Duration::from_secs(5));
         assert!(!transport.legacy_sse_enabled);
+        assert_eq!(transport.max_in_flight_per_session, 12);
     }
 
     /// Each of these numbers means something else at zero, and none of the meanings is "off".
@@ -590,6 +592,13 @@ max_response_bytes = 16777216
                 "sse_keepalive_secs",
                 McpConfig {
                     sse_keepalive_secs: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_in_flight_per_session",
+                McpConfig {
+                    max_in_flight_per_session: 0,
                     ..Default::default()
                 },
             ),
