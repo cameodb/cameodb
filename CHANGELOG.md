@@ -108,6 +108,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`config.rs` validates by section, not by repetition** (L19). `CameoDbConfig::validate`
+  was ~330 lines of one repeated `if … return Err` shape; it is five `validate_*` methods —
+  `security`, `mcp`, `network`, `storage`, `memory` — called in the order the checks always
+  ran, with their rationale comments moved verbatim. `adopt_moved_settings` wrote the
+  take/adopt/warn protocol four times; it is `adopt_moved`, called four times. The 45
+  one-line `default_*` functions serde names in `#[serde(default = "…")]` are one
+  `config_defaults!` invocation. And `merge_configs` is deleted rather than implemented:
+  its `base` argument was always ignored because the file parse already layers over serde
+  defaults — the comment promising per-key merging was the false abstraction.
+
 - **The CLI's data-load paths are one pipeline, one ranking, one finalizer** (L18). The two
   JSON single-pass loaders — the HTTP stream and the blocking reader behind a channel — ran
   the same sample-detect-schema-replay-batch protocol written out twice; it is one
