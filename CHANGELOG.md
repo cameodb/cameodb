@@ -92,6 +92,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshots. The actor's handler delegates to the same body, so the mailbox fallback answers
   identically.
 
+- **A starting-up node now answers `503` instead of `500`.** The error enum carried almost
+  everything as a kind-tagged `io::Error`, and the kind was the semantics: `verdict` and the
+  `RemoteError` conversions re-derived them by matching `ErrorKind` one way and flattening
+  four kinds the other. Three dedicated variants carry it now — `Validation` (still `400`),
+  `NotReady` and `Missing`. The verdicts were assigned by reading the sites, not by the kind
+  they happened to use: "No shards", not-initialized writer channels, store handles and
+  pools, and the absent local orchestrator are `Unavailable` — the node is not broken, it is
+  not up, and the request may succeed once it is — where the `NotFound` kind had them answer
+  `500`. Internal inconsistencies (a shard the ring selected that the map does not hold, no
+  local stores to write a schema into) keep `500` under `Missing`, and the four "remote
+  orchestrator for node N not found" sites moved to the existing `PeerUnreachable`, `500` →
+  `503`. A peer's `InvalidData` no longer flattens to `Io` on the wire and arrives as a
+  `500`: it round-trips as the `400` it was raised as.
+
 ### Changed
 
 - **The two broadcast fan-outs share one** (L16). `handle_broadcast` and

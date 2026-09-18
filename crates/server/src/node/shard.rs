@@ -18,13 +18,9 @@ use tokio::sync::{RwLock as AsyncRwLock, mpsc};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-
 // Re-export SortSpec and SortOrder from storage crate
 use serde_json::Value as JsonValue;
-use storage::{
-    HybridStore, StorageConfig,
-    StoreError, WalOp,
-};
+use storage::{HybridStore, StorageConfig, StoreError, WalOp};
 
 /// Type alias for single write commands enqueued in the writer thread
 pub(crate) type WriteCommand = (WalOp, tokio::sync::oneshot::Sender<Result<u64, StoreError>>);
@@ -77,7 +73,6 @@ pub(crate) type BatchReplySegment = (
     usize,
     tokio::sync::oneshot::Sender<Result<Vec<u64>, StoreError>>,
 );
-
 
 /// Helper struct for aggregating index statistics across cluster nodes.
 #[derive(Debug, Clone)]
@@ -1163,7 +1158,9 @@ pub(crate) fn spawn_writer_thread(
 /// store, the new sender published into the shared slot before the writer starts draining so a
 /// racing write finds the live channel. No recovery and no startup warmup — see [`relaunch_writer`]
 /// callers and `WriterExit::Crashed`.
-pub(crate) fn relaunch_writer(rt: &WriterRuntime) -> std::io::Result<std::thread::JoinHandle<WriterExit>> {
+pub(crate) fn relaunch_writer(
+    rt: &WriterRuntime,
+) -> std::io::Result<std::thread::JoinHandle<WriterExit>> {
     let (tx, rx) = mpsc::channel::<StorageCommand>(SHARD_WRITER_CHANNEL_CAPACITY);
     let (warm_tx, warm_rx) = std::sync::mpsc::sync_channel::<String>(WARM_REQUEST_CAPACITY);
     rt.writer_tx.store(Some(Arc::new(tx)));
@@ -1429,12 +1426,12 @@ impl MicroshardActor {
     /// slot, so a command sent just after a crash reaches the monitor's replacement writer once it
     /// has published its channel. A send that lands in the brief window before the replacement is
     /// up fails as "Writer thread closed" and is retriable, exactly as it was before this slot.
-    pub(crate) async fn send_write_command(&self, cmd: StorageCommand) -> Result<(), OrchestratorError> {
+    pub(crate) async fn send_write_command(
+        &self,
+        cmd: StorageCommand,
+    ) -> Result<(), OrchestratorError> {
         let tx = self.writer_tx.load_full().ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Writer channel not initialized",
-            ))
+            OrchestratorError::NotReady("Writer channel not initialized".to_string())
         })?;
         tx.send(cmd)
             .await
@@ -1606,10 +1603,7 @@ impl MicroshardActor {
         request: SearchRequest,
     ) -> Result<SearchReply, OrchestratorError> {
         let store = self.store.as_ref().ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "HybridStore not initialized",
-            ))
+            OrchestratorError::NotReady("HybridStore not initialized".to_string())
         })?;
 
         let store = Arc::clone(store);
@@ -1630,12 +1624,12 @@ impl MicroshardActor {
                 // A field this index does not carry, or a query it cannot parse, is the
                 // request's fault rather than the node's — and the distinction has to survive
                 // the crossing, because an error leaves this actor as a string and everything
-                // downstream reads its `ErrorKind` to decide who is at fault. Flattened to
+                // downstream reads its verdict to decide who is at fault. Flattened to
                 // `other`, a sort naming a column the index never built read as an internal
                 // failure, which is how it came back as a partial outage inside a `200`.
-                StoreError::FieldNotFound(_) | StoreError::QueryParser(_) => OrchestratorError::Io(
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
-                ),
+                StoreError::FieldNotFound(_) | StoreError::QueryParser(_) => {
+                    OrchestratorError::Validation(e.to_string())
+                }
                 _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
             })?;
 
@@ -1660,10 +1654,7 @@ impl MicroshardActor {
         msg: GetShardStats,
     ) -> Result<storage::ShardStatsSnapshot, OrchestratorError> {
         let store = self.store.as_ref().ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "HybridStore not initialized",
-            ))
+            OrchestratorError::NotReady("HybridStore not initialized".to_string())
         })?;
 
         let store = Arc::clone(store);
@@ -1800,10 +1791,10 @@ impl MicroshardActor {
             doc.get("id")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    OrchestratorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Document must be written with a non-empty 'id' beside its body",
-                    ))
+                    OrchestratorError::Validation(
+                        "Document must be written with a non-empty 'id' beside its body"
+                            .to_string(),
+                    )
                 })?
                 .to_string()
         };
@@ -2092,5 +2083,3 @@ impl Message<ShutdownShard> for MicroshardActor {
         Ok(())
     }
 }
-
-

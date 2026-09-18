@@ -307,6 +307,37 @@ pub enum OrchestratorError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The request was refused before it ran — a document the schema rejects, a routing
+    /// key the index needs that was not sent, an id the body did not carry.
+    ///
+    /// `BadRequest` wherever it is answered. `InvalidInput`/`InvalidData` carried this
+    /// across the actor boundary as an `io::Error` kind before, and the kind match was
+    /// done twice over to learn it — once on the way into `RemoteError`, once in
+    /// `verdict`.
+    #[error("{0}")]
+    Validation(String),
+
+    /// A component this node needs for the operation is not up — the shard map is
+    /// empty, a writer channel or store handle is not initialized, a pool is absent.
+    ///
+    /// `Unavailable`, not `ServerFault`: the node is not broken, it is not ready, and a
+    /// retry may succeed once it is — the same "not now" [`Self::PeerUnreachable`]
+    /// carries for a peer. These were `NotFound`-kind `io::Error`s before, which read
+    /// as `500`: the node reported itself at fault for still starting up.
+    #[error("{0}")]
+    NotReady(String),
+
+    /// A thing this node was asked to use is not there — a shard the ring selected that
+    /// the map does not hold, a store to write a schema into, an owner for a routed
+    /// shard.
+    ///
+    /// `ServerFault` rather than `NotFound`: the caller did not name the missing thing —
+    /// this is the node's internals disagreeing with themselves, not an absent index,
+    /// and a `404` would say otherwise. Also `NotFound`-kind `io::Error`s before, which
+    /// the verdict read as `500` anyway; the variant names what the kind only implied.
+    #[error("{0}")]
+    Missing(String),
+
     #[error("storage error: {0}")]
     Storage(#[from] StoreError),
 
@@ -510,7 +541,10 @@ impl OrchestratorError {
             | Self::PeerUnreachable { .. }
             | Self::ReadDeadlineExpired { .. }
             | Self::Overloaded { .. }
+            | Self::NotReady(_)
             | Self::Storage(StoreError::WriterPanicked(_)) => RemoteVerdict::Unavailable,
+
+            Self::Validation(_) => RemoteVerdict::BadRequest,
 
             // Its own verdict because the forwarding node has to act on it and must not confuse
             // it with any other "not now": the retry that answers it carries something extra,
@@ -740,6 +774,15 @@ impl From<OrchestratorError> for RemoteError {
     fn from(err: OrchestratorError) -> Self {
         match err {
             OrchestratorError::Identity(e) => RemoteError::Identity(e.to_string()),
+            // The dedicated variants map onto the kinds `RemoteError` already has —
+            // what used to be re-derived from an `io::Error`'s kind. A real `Io` still
+            // carries its kind for the same mapping, because a genuine filesystem
+            // `NotFound` means the same thing.
+            OrchestratorError::Validation(s) => RemoteError::InvalidInput(s),
+            OrchestratorError::Missing(s) => RemoteError::NotFound(s),
+            // `RemoteError` is the microshard path and has no "not now" kind — a shard
+            // that is not ready reads as a fault on the far side, as it did before.
+            OrchestratorError::NotReady(s) => RemoteError::Io(s),
             OrchestratorError::Io(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     RemoteError::NotFound(e.to_string())
@@ -826,14 +869,16 @@ impl From<RemoteError> for OrchestratorError {
         match err {
             // The kind is kept for this one: a peer refusing the request — an unsortable sort
             // field, say — has to stay distinguishable from a peer that failed, because the
-            // HTTP surface answers 400 for the first and 500 for the second.
-            RemoteError::InvalidInput(s) => {
-                OrchestratorError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, s))
+            // HTTP surface answers 400 for the first and 500 for the second. It was rebuilt
+            // as an `InvalidInput`-kind `Io` before; `Validation` carries it directly, which
+            // also keeps a peer's `InvalidData` a 400 instead of flattening it to a 500.
+            RemoteError::InvalidInput(s) => OrchestratorError::Validation(s),
+            // An absence a peer reported stays an absence — `Missing` holds the same
+            // `ServerFault` verdict the flattened `Io` carried.
+            RemoteError::NotFound(s) => OrchestratorError::Missing(s),
+            RemoteError::Io(s) | RemoteError::Identity(s) | RemoteError::Other(s) => {
+                OrchestratorError::Io(std::io::Error::other(s))
             }
-            RemoteError::Io(s)
-            | RemoteError::Identity(s)
-            | RemoteError::NotFound(s)
-            | RemoteError::Other(s) => OrchestratorError::Io(std::io::Error::other(s)),
         }
     }
 }

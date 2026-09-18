@@ -1853,17 +1853,14 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                 // of it: it already carries the verdict the caller's status is read from.
                 .map_err(|e| match e {
                     kameo::error::SendError::HandlerError(err) => err,
-                    other => crate::node::OrchestratorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("Failed to communicate with local orchestrator: {}", other),
+                    other => crate::node::OrchestratorError::NotReady(format!(
+                        "Failed to communicate with local orchestrator: {}",
+                        other
                     )),
                 })
         } else {
-            Err(crate::node::OrchestratorError::Io(
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Local orchestrator not available",
-                ),
+            Err(crate::node::OrchestratorError::NotReady(
+                "Local orchestrator not available".to_string(),
             ))
         };
 
@@ -1896,9 +1893,9 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
                     } else {
                         let remote_orchestrator_name =
                             crate::node::orchestrator_remote_name(&peer.node_id);
-                        kameo::actor::RemoteActorRef::<
-                            crate::node::NodeOrchestrator,
-                        >::lookup(remote_orchestrator_name.as_str())
+                        kameo::actor::RemoteActorRef::<crate::node::NodeOrchestrator>::lookup(
+                            remote_orchestrator_name.as_str(),
+                        )
                         .await
                         .map_err(|e| format!("Lookup failed for node {}: {}", peer.node_id, e))
                     };
@@ -2020,20 +2017,18 @@ impl Message<DeleteIndexCluster> for ClusterCoordinator {
         // Its verdict is not carried through: what the caller needs to know is that the index
         // may survive somewhere, and that is the same either way. The reason is preserved in the
         // message and in the warning logged above.
-        Err(
-            crate::node::OrchestratorError::PeerUnreachable {
-                // The reasons go last: each one is already a sentence about a node, so any
-                // phrasing that reads them as a noun ("but <reason> could not be reached")
-                // comes out mangled.
-                message: format!(
-                    "index '{}' was deleted here, but the cluster could not confirm it is gone \
+        Err(crate::node::OrchestratorError::PeerUnreachable {
+            // The reasons go last: each one is already a sentence about a node, so any
+            // phrasing that reads them as a noun ("but <reason> could not be reached")
+            // comes out mangled.
+            message: format!(
+                "index '{}' was deleted here, but the cluster could not confirm it is gone \
                      everywhere; retry once the cluster is whole, and a 404 then means nothing \
                      is left to delete. Unconfirmed: {}",
-                    msg.index,
-                    all_errors.join("; ")
-                ),
-            },
-        )
+                msg.index,
+                all_errors.join("; ")
+            ),
+        })
     }
 }
 

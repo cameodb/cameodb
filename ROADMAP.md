@@ -51,7 +51,7 @@ on one.
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half under L12 |
-| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11 done), six simplifications (L15, L16 and L17 done), and the retrospective itself |
+| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11 done), six simplifications (L14–L17 done), and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
 
@@ -3303,13 +3303,34 @@ the largest single-file reductions at near-zero risk).
 
 ### L14 — `OrchestratorError::Io` is the wire's catch-all, and semantics round-trip through strings
 
-**Simplification.** 📋 **Planned.** 93 sites construct `OrchestratorError::Io(io::Error::…)` for
-conditions that are not IO ("No shards", "Missing routing key", validation failures), and the
-two `From` impls on `RemoteError` then re-derive the lost semantics by matching `ErrorKind` one
-way and flattening four kinds into `Io` the other. Dedicated variants (`NotFound`,
-`InvalidInput`, `Validation`) delete most of both impls and dozens of constructions. The largest
-risk item in the group — take it after the split (L11) and only with the per-module tests
-running.
+**Simplification.** ✅ **Done** 2026-09-18. The `io::Error` kind channel is gone; three
+dedicated variants carry what `ErrorKind` was carrying, and the verdicts were assigned by
+reading the sites rather than by the kind they happened to use:
+
+- `Validation(String)` → `BadRequest` — the `InvalidInput`/`InvalidData` sites: a routing
+  key the index needs, a document the schema refuses, an id the body did not carry, and
+  the shard boundary's `FieldNotFound`/`QueryParser` mapping. `is_caller_error` and
+  `verdict` keep their `Io`-kind arms for genuine `io::Error`s from the `#[from]` path.
+- `NotReady(String)` → `Unavailable` — "No shards", the not-initialized writer
+  channels, store handles and pools, and the absent local orchestrator. These answered
+  `500` as `NotFound`-kind `io::Error`s, which reported the node at fault for still
+  starting up; `503` is the same "not now, worth retrying" `PeerUnreachable` already
+  carries.
+- `Missing(String)` → `ServerFault`, preserved — "Local shard {id} not found", "No
+  local stores", a routed shard no node owns. Internal inconsistencies, not the caller's
+  absence: a `NotFound` verdict would have answered `404` for the node's own internals,
+  which is why the sketch's `NotFound` variant name did not survive contact with the
+  sites.
+
+Four "remote orchestrator for node {} not found" sites moved to the existing
+`PeerUnreachable` — its literal purpose, `500` → `503`.
+
+The `RemoteError` impls shrank to mapping rather than re-derivation: `Validation` ↔
+`InvalidInput`, `Missing` ↔ `NotFound`, `NotReady` → `Io` (the microshard wire has no
+"not now" kind, and the far side reads a fault as it did before). Inbound,
+`RemoteError::InvalidInput` rebuilds `Validation` instead of a kind-tagged `Io` — which
+also fixes a hole where a peer's `InvalidData` flattened to `Io` on the way out and
+arrived as a `500`. A genuine `io::Error` still keeps its kind through the same mapping.
 
 ### L15 — The schema-cache machinery exists three times
 
