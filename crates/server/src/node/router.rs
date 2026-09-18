@@ -527,9 +527,9 @@ impl RouterActor {
     pub fn admin_worker_stats(&self) -> Result<WorkerPoolReport, OrchestratorError> {
         match &self.worker_tx {
             Some(tx) => Ok(tx.snapshot()),
-            None => Err(OrchestratorError::Io(std::io::Error::other(
-                "Worker pool not initialized",
-            ))),
+            None => Err(OrchestratorError::NotReady(
+                "Worker pool not initialized".to_string(),
+            )),
         }
     }
 
@@ -650,10 +650,9 @@ impl RouterActor {
                 // CRITICAL: Never broadcast write operations - this causes data duplication
                 // and inconsistency. Writes must be routed to a specific shard.
                 if is_write_operation(&op) {
-                    return Err(OrchestratorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "Write operation cannot be broadcast - routing failed",
-                    )));
+                    return Err(OrchestratorError::Missing(
+                        "Write operation cannot be broadcast - routing failed".to_string(),
+                    ));
                 }
 
                 // Use streaming for search operations if enabled
@@ -1662,10 +1661,9 @@ impl RouterActor {
             })?
             .ok_or_else(|| {
                 warn!("❌ Remote orchestrator not found: node_id={}", node_id);
-                OrchestratorError::Io(std::io::Error::other(format!(
-                    "remote orchestrator for node {} not found",
-                    node_id
-                )))
+                OrchestratorError::PeerUnreachable {
+                    message: format!("remote orchestrator for node {} not found", node_id),
+                }
             })?;
 
         remote_answer(remote.ask(op).await)

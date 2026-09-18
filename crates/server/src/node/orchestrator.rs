@@ -483,10 +483,7 @@ impl BulkCtx<'_> {
                     let attributable = ids.clone();
                     let outcome = async {
                         let shard = shard.ok_or_else(|| {
-                            OrchestratorError::Io(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                format!("Local shard {shard_id} not found"),
-                            ))
+                            OrchestratorError::Missing(format!("Local shard {shard_id} not found"))
                         })?;
                         shard.handle_batch_delete(index_name, ids).await
                     }
@@ -661,10 +658,7 @@ impl BulkCtx<'_> {
 
                 let outcome = async {
                     let shard = shard.ok_or_else(|| {
-                        OrchestratorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("Local shard {} not found", shard_id),
-                        ))
+                        OrchestratorError::Missing(format!("Local shard {} not found", shard_id))
                     })?;
 
                     let docs: Vec<DocPayload> = batch
@@ -769,7 +763,7 @@ impl BulkCtx<'_> {
             .collect();
 
         let pool = self.remote_peer_pool.ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::other("Remote peer pool not initialized"))
+            OrchestratorError::NotReady("Remote peer pool not initialized".to_string())
         })?;
 
         let remote = pool
@@ -780,10 +774,9 @@ impl BulkCtx<'_> {
                 OrchestratorError::Io(std::io::Error::other(e.to_string()))
             })?
             .ok_or_else(|| {
-                OrchestratorError::Io(std::io::Error::other(format!(
-                    "Remote orchestrator for node {} not found",
-                    node_id
-                )))
+                OrchestratorError::PeerUnreachable {
+                    message: format!("Remote orchestrator for node {} not found", node_id),
+                }
             })?;
 
         // One bit, and no schema. `forwarded` tells the owner this share is someone else's
@@ -852,7 +845,7 @@ impl BulkCtx<'_> {
         );
 
         let pool = self.remote_peer_pool.ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::other("Remote peer pool not initialized"))
+            OrchestratorError::NotReady("Remote peer pool not initialized".to_string())
         })?;
 
         let remote = pool
@@ -860,10 +853,9 @@ impl BulkCtx<'_> {
             .await
             .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
             .ok_or_else(|| {
-                OrchestratorError::Io(std::io::Error::other(format!(
-                    "Remote orchestrator for node {} not found",
-                    node_id
-                )))
+                OrchestratorError::PeerUnreachable {
+                    message: format!("Remote orchestrator for node {} not found", node_id),
+                }
             })?;
 
         // Kept so the peer's answer can be balanced against what it was actually given.
@@ -1097,10 +1089,7 @@ impl WriteCtx<'_> {
         routing_key: &Option<String>,
     ) -> Result<Uuid, OrchestratorError> {
         let key = routing_key.as_ref().ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Missing routing key for write",
-            ))
+            OrchestratorError::Validation("Missing routing key for write".to_string())
         })?;
 
         let target = self
@@ -1108,12 +1097,7 @@ impl WriteCtx<'_> {
             .get_owner(key)
             .or_else(|| self.shards.keys().copied().next());
 
-        target.ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No shard selected",
-            ))
-        })
+        target.ok_or_else(|| OrchestratorError::NotReady("No shard selected".to_string()))
     }
 
     /// Validate `doc` against `schema` and, when the schema already covers every field, cache
@@ -1133,10 +1117,7 @@ impl WriteCtx<'_> {
 
         let result = validate_document(id, doc, schema);
         if let Some(err) = result.validation_error {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                err,
-            )));
+            return Err(OrchestratorError::Validation(err));
         }
         if result.needs_evolution {
             return Ok(WriteGate::Grow);
@@ -1243,6 +1224,9 @@ pub(crate) struct BroadcastStats {
 /// about what was asked.
 pub(crate) fn is_caller_error(err: &OrchestratorError) -> bool {
     match err {
+        // `Validation` is the dedicated form; the `Io` arm stays because a genuine
+        // `io::Error` can still arrive with the same kind from the `#[from]` conversion.
+        OrchestratorError::Validation(_) => true,
         OrchestratorError::Io(io) => matches!(
             io.kind(),
             std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
@@ -1364,13 +1348,10 @@ pub(crate) fn effective_delete_routing_key(
     // must supply the same key the write used; an empty one is as useless as none.
     match routing_key {
         Some(key) if !key.is_empty() => Ok(key),
-        _ => Err(OrchestratorError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "index routes by '{routing_field}', which is not the document key, so a delete \
+        _ => Err(OrchestratorError::Validation(format!(
+            "index routes by '{routing_field}', which is not the document key, so a delete \
                  must carry the same routing_key the write used — read it off the document with \
                  a search for id:{id}"
-            ),
         ))),
     }
 }
@@ -3198,10 +3179,7 @@ impl OrchestratorEngine {
     ) -> Result<WriteOutcome, OrchestratorError> {
         let shards = self.shards.load();
         if shards.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No shards",
-            )));
+            return Err(OrchestratorError::NotReady("No shards".to_string()));
         }
 
         // Lock-free schema lookup, by the one thing that identifies an index: its name.
@@ -3265,10 +3243,7 @@ impl OrchestratorEngine {
     ) -> Result<DeleteOutcome, OrchestratorError> {
         let shards = self.shards.load();
         if shards.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No shards",
-            )));
+            return Err(OrchestratorError::NotReady("No shards".to_string()));
         }
 
         let schema = self.load_schema(index).await?;
@@ -3316,10 +3291,7 @@ impl OrchestratorEngine {
         let start = std::time::Instant::now();
         let shards = self.shards.load_full();
         if shards.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No shards",
-            )));
+            return Err(OrchestratorError::NotReady("No shards".to_string()));
         }
 
         let schema = self.load_schema(index).await?;
@@ -3389,10 +3361,7 @@ impl OrchestratorEngine {
         let start = std::time::Instant::now();
         let shards = self.shards.load_full();
         if shards.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No shards",
-            )));
+            return Err(OrchestratorError::NotReady("No shards".to_string()));
         }
 
         let schema = self.load_schema(index).await?;
@@ -4108,10 +4077,9 @@ impl NodeOrchestrator {
             .collect();
 
         if stores.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No local stores available to persist schema",
-            )));
+            return Err(OrchestratorError::Missing(
+                "No local stores available to persist schema".to_string(),
+            ));
         }
 
         let index_name = index.to_string();
@@ -5380,10 +5348,9 @@ impl NodeOrchestrator {
         delete_schema: bool,
     ) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No shards available",
-            )));
+            return Err(OrchestratorError::NotReady(
+                "No shards available".to_string(),
+            ));
         }
 
         // Delete index data from all local shards in parallel
@@ -5467,10 +5434,7 @@ impl NodeOrchestrator {
         schema_body: Option<Box<IndexSchema>>,
     ) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No shards",
-            )));
+            return Err(OrchestratorError::NotReady("No shards".to_string()));
         }
 
         // Lock-free schema lookup, by the one thing that identifies an index: its name.
@@ -5551,15 +5515,14 @@ impl NodeOrchestrator {
 
         if !validation_summary.errors.is_empty() {
             // One document, so its position adds nothing to the message.
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+            return Err(OrchestratorError::Validation(
                 validation_summary
                     .errors
                     .into_iter()
                     .map(|(_, reason)| reason)
                     .collect::<Vec<_>>()
                     .join("; "),
-            )));
+            ));
         }
 
         // Schema-based routing
@@ -5611,10 +5574,7 @@ impl NodeOrchestrator {
         forwarded: bool,
     ) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No shards",
-            )));
+            return Err(OrchestratorError::NotReady("No shards".to_string()));
         }
 
         let schema = self.load_schema(index).await?;
@@ -5664,10 +5624,7 @@ impl NodeOrchestrator {
     ) -> Result<JsonValue, OrchestratorError> {
         let start = std::time::Instant::now();
         if self.shards.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No shards",
-            )));
+            return Err(OrchestratorError::NotReady("No shards".to_string()));
         }
 
         let schema = self.load_schema(index).await?;
@@ -5721,24 +5678,21 @@ impl NodeOrchestrator {
         };
 
         let Some(node_id) = node_id else {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("shard {target} is not local and no node owns it"),
+            return Err(OrchestratorError::Missing(format!(
+                "shard {target} is not local and no node owns it"
             )));
         };
 
         let pool = self.remote_peer_pool.as_ref().ok_or_else(|| {
-            OrchestratorError::Io(std::io::Error::other("Remote peer pool not initialized"))
+            OrchestratorError::NotReady("Remote peer pool not initialized".to_string())
         })?;
 
         let remote = pool
             .get_orchestrator(node_id, ConnectionChannel::Operations)
             .await
             .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-            .ok_or_else(|| {
-                OrchestratorError::Io(std::io::Error::other(format!(
-                    "Remote orchestrator for node {node_id} not found"
-                )))
+            .ok_or_else(|| OrchestratorError::PeerUnreachable {
+                message: format!("Remote orchestrator for node {node_id} not found"),
             })?;
 
         // One retry, and only for the one answer a retry can change. The peer holds no schema
@@ -5783,10 +5737,7 @@ impl NodeOrchestrator {
     ) -> Result<JsonValue, OrchestratorError> {
         let start = std::time::Instant::now();
         if self.shards.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No shards",
-            )));
+            return Err(OrchestratorError::NotReady("No shards".to_string()));
         }
 
         // `load_schema` answers from the cache when it can, and reads a shard when it cannot.
@@ -5947,10 +5898,9 @@ impl NodeOrchestrator {
             .collect();
 
         if stores.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No local stores available to persist schema",
-            )));
+            return Err(OrchestratorError::Missing(
+                "No local stores available to persist schema".to_string(),
+            ));
         }
 
         let index_name = index.to_string();
@@ -6037,10 +5987,9 @@ impl NodeOrchestrator {
             .collect();
 
         if stores.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No local stores available to update schema",
-            )));
+            return Err(OrchestratorError::Missing(
+                "No local stores available to update schema".to_string(),
+            ));
         }
 
         let plan = self
@@ -6176,12 +6125,9 @@ impl NodeOrchestrator {
 
         // If no shards are initialized yet, return a helpful error
         if self.shards.is_empty() {
-            return Err(OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "No shards initialized on this node. Schema for index '{}' may exist but cannot be retrieved until shards are created.",
-                    index
-                ),
+            return Err(OrchestratorError::NotReady(format!(
+                "No shards initialized on this node. Schema for index '{}' may exist but cannot be retrieved until shards are created.",
+                index
             )));
         }
 

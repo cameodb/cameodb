@@ -658,11 +658,8 @@ fn a_delete_routes_by_the_id_unless_the_index_routes_by_something_else() {
         "and how to find its value: {message}"
     );
     assert!(
-        matches!(
-            &refused,
-            OrchestratorError::Io(io) if io.kind() == std::io::ErrorKind::InvalidInput
-        ),
-        "InvalidInput is what `AppError::from_route` turns into a 400 rather than a 500"
+        matches!(&refused, OrchestratorError::Validation(_)),
+        "Validation is what `AppError::from_route` turns into a 400 rather than a 500"
     );
 
     // ...and with the key supplied a tenant index routes by it.
@@ -2721,11 +2718,18 @@ fn a_verdict_survives_the_wire() {
             RemoteVerdict::Unavailable,
         ),
         (
-            OrchestratorError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Type mismatch for field 'n': expected I64, got F64",
-            )),
+            OrchestratorError::Validation(
+                "Type mismatch for field 'n': expected I64, got F64".into(),
+            ),
             RemoteVerdict::BadRequest,
+        ),
+        (
+            OrchestratorError::NotReady("No shards".into()),
+            RemoteVerdict::Unavailable,
+        ),
+        (
+            OrchestratorError::Missing("Local shard 7 not found".into()),
+            RemoteVerdict::ServerFault,
         ),
         (
             OrchestratorError::UnsortableField {
