@@ -1,13 +1,12 @@
-//! ClusterCoordinator actor wrapping DistributedCluster lifecycle and queries.
-//!
-//! This actor owns the DistributedCluster and provides message-based access
-//! to swarm initialization, peer discovery, status queries, and shard routing.
+//! The `ClusterCoordinator` actor: owns the `DistributedCluster` and answers every
+//! message in `messages.rs`.
+
+use super::*;
 
 use anyhow::Result;
 use kameo::actor::RemoteActorRef;
 use kameo::message::{Context, Message};
-use kameo::{Actor, RemoteActor, Reply, remote_message};
-use serde::{Deserialize, Serialize};
+use kameo::{Actor, RemoteActor, remote_message};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,267 +25,40 @@ use crate::distributed::{ClusterStatus, DistributedCluster, NodeInfo, NodeStatus
 use crate::swarm::CoordinatorEvent;
 use cluster::{ConsistentRing, NodeIdentity};
 
-// ============================================================================
-// Message Definitions
-// ============================================================================
-
-/// Message to subscribe to topology (ring) updates.
-#[derive(Debug, Clone)]
-pub struct SubscribeTopology {
-    pub subscriber: mpsc::Sender<ConsistentRing>,
-}
-
-/// Message to initialize the distributed swarm.
-#[derive(Debug, Clone)]
-pub struct InitSwarm;
-
-/// Message to gracefully shutdown the swarm.
-#[derive(Debug, Clone)]
-pub struct ShutdownSwarm;
-
-/// Message to trigger peer discovery.
-#[derive(Debug, Clone)]
-pub struct DiscoverPeers;
-
-/// Message to get the current cluster status.
-#[derive(Debug, Clone)]
-pub struct GetStatus;
-
-/// Routing table update event from swarm.
-#[derive(Debug, Clone)]
-pub struct RoutingUpdated;
-
-/// Dial/connect failure event from swarm.
-#[derive(Debug, Clone)]
-pub struct DialFailed {
-    pub peer_id: Option<String>,
-    pub error: String,
-}
-
-/// Peer discovered/updated event.
-#[derive(Debug, Clone)]
-pub struct PeerDiscovered {
-    pub node_id: Uuid,
-    pub address: String,
-}
-
-/// Peer lost/disconnected event.
-#[derive(Debug, Clone)]
-pub struct PeerLost {
-    pub node_id: Uuid,
-}
-
-/// Message to route a shard operation (stub for future remote actor support).
-#[derive(Debug, Clone)]
-pub struct RouteShard {
-    pub shard_id: Uuid,
-}
-
-/// Metadata describing a shard and its owning node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShardMetadata {
-    pub shard_id: Uuid,
-    pub node_id: Uuid,
-    pub vnode_tokens: Vec<u64>,
-    pub storage_bytes: u64,
-    pub document_count: u64,
-}
-
-/// Register or refresh local shards with the coordinator so assignments can be shared.
-#[derive(Debug, Clone)]
-pub struct RegisterLocalShards {
-    pub node_id: Uuid,
-    pub shards: Vec<ShardMetadata>,
-}
-
-/// Get the current shard-to-node assignments.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetShardAssignments;
-
-/// Response indicating where an operation should be routed.
-#[derive(Debug, Clone, Reply)]
-pub enum RoutingDecision {
-    /// Handle locally on this node.
-    Local,
-    /// Forward to a remote node (node_id, peer_addr).
-    Remote { node_id: Uuid, peer_addr: String },
-    /// Broadcast to all nodes (scatter-gather).
-    Broadcast,
-}
-
-/// Message to determine routing for an operation based on routing key.
-#[derive(Debug, Clone)]
-pub struct RouteOperation {
-    pub routing_key: Option<String>,
-    pub operation_type: OperationType,
-}
-
-/// Type of operation for routing decisions.
-#[derive(Debug, Clone)]
-pub enum OperationType {
-    Read,
-    Write,
-}
-
-/// Stub message to request bootstrap peer redial on connection failures.
-/// Used for future resilience when remote shard lookup fails.
-#[derive(Debug, Clone)]
-pub struct RequestBootstrapRedial {
-    pub reason: String,
-}
-
-/// Message to get known peers for broadcast scatter-gather.
-#[derive(Debug, Clone)]
-pub struct GetKnownPeers;
-
-/// Response containing known peer information for broadcast.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KnownPeer {
-    pub node_id: Uuid,
-    pub node_name: Option<String>,
-    pub address: String,
-}
-
-/// Message when node metadata is discovered via DHT.
-#[derive(Debug, Clone)]
-pub struct PeerNodeMetadataDiscovered {
-    pub node_uuid: String,
-    pub node_name: String,
-    pub shard_count: u32,
-    pub generation: u64,
-    pub checksum: u64,
-    pub address: Option<String>,
-    pub status: String,
-    pub total_storage_bytes: u64,
-    pub total_document_count: u64,
-}
-
-/// Message to set the local orchestrator reference
-#[derive(Debug, Clone)]
-pub struct SetLocalOrchestrator {
-    pub orchestrator: kameo::actor::ActorRef<crate::node::NodeOrchestrator>,
-}
-
-/// Message to coordinate index deletion across all nodes
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteIndexCluster {
-    pub index: String,
-    pub delete_schema: bool,
-}
-
-/// Message when a single shard is discovered via DHT.
-#[derive(Debug, Clone)]
-pub struct PeerShardDiscovered {
-    pub node_uuid: String,
-    pub shard: ShardMetadata,
-}
-
-/// Message to merge remote shard assignments into local coordinator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MergeRemoteShards {
-    pub node_id: Uuid,
-    pub node_name: String,
-    pub shards: HashMap<Uuid, ShardMetadata>,
-    /// Generation of the sender's cluster state (for deduplication)
-    pub generation: u64,
-    /// Checksum of all shard metadata (for quick comparison)
-    pub shard_checksum: u64,
-}
-
-/// Message to query remote cluster state version before pushing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueryClusterState {
-    pub node_id: Uuid,
-    pub generation: u64,
-    pub shard_checksum: u64,
-}
-
-/// Response to QueryClusterState with remote state info
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterStateResponse {
-    pub node_id: Uuid,
-    pub generation: u64,
-    pub shard_checksum: u64,
-    pub needs_full_sync: bool,
-}
-
-/// Internal message to perform intelligent shard exchange with a peer
-#[derive(Debug, Clone)]
-pub struct ExchangeShardsWithPeer {
-    pub peer_id: Uuid,
-    pub generation: u64,
-    pub checksum: u64,
-    pub shards: HashMap<Uuid, ShardMetadata>,
-}
-
-/// Message to get complete cluster snapshot for persistence
-#[derive(Debug, Clone)]
-pub struct GetClusterSnapshot;
-
-/// Internal message to track push failures for DHT fallback
-#[derive(Debug, Clone)]
-pub struct TrackPushFailure {
-    pub node_id: Uuid,
-}
-
-/// Internal message to reset push failure count on successful push
-#[derive(Debug, Clone)]
-pub struct ResetPushFailure {
-    pub node_id: Uuid,
-}
-
-/// Internal message to mark bootstrap as complete
-#[derive(Debug, Clone)]
-pub struct MarkBootstrapComplete;
-
-/// Snapshot of cluster topology for persistence
-#[derive(Debug, Clone, Reply)]
-#[allow(dead_code)] // Reply struct for GetClusterSnapshot; no external consumer yet
-pub struct ClusterSnapshot {
-    pub config: PersistedClusterConfig,
-    pub shards: HashMap<Uuid, ShardMetadata>,
-    pub nodes: HashMap<Uuid, NodeInfo>,
-    pub ring: ConsistentRing,
-}
-
-// ============================================================================
-// Actor Definition
-// ============================================================================
-
 /// Actor that owns the DistributedCluster instance and coordinates cluster operations.
 #[derive(Actor, RemoteActor)]
 pub struct ClusterCoordinator {
-    cluster: DistributedCluster,
-    shard_assignments: HashMap<Uuid, ShardMetadata>,
-    ring: ConsistentRing,
+    pub(crate) cluster: DistributedCluster,
+    pub(crate) shard_assignments: HashMap<Uuid, ShardMetadata>,
+    pub(crate) ring: ConsistentRing,
 
     // State management
-    state: ClusterState,
+    pub(crate) state: ClusterState,
     /// Authoritative registry of all known cluster nodes (active or disconnected)
-    expected_nodes: HashMap<Uuid, NodeInfo>,
-    generation: u64,
-    state_store: Option<Arc<ClusterStateStore>>,
+    pub(crate) expected_nodes: HashMap<Uuid, NodeInfo>,
+    pub(crate) generation: u64,
+    pub(crate) state_store: Option<Arc<ClusterStateStore>>,
 
     /// Reference to local orchestrator for coordinated operations
-    local_orchestrator: Option<kameo::actor::ActorRef<crate::node::NodeOrchestrator>>,
+    pub(crate) local_orchestrator: Option<kameo::actor::ActorRef<crate::node::NodeOrchestrator>>,
 
     // Track expected shards from snapshot for reconciliation
-    expected_shards: HashMap<Uuid, ShardMetadata>,
+    pub(crate) expected_shards: HashMap<Uuid, ShardMetadata>,
 
     // Subscribers for topology updates
-    topology_subscribers: Vec<mpsc::Sender<ConsistentRing>>,
+    pub(crate) topology_subscribers: Vec<mpsc::Sender<ConsistentRing>>,
 
     // DHT Bootstrap tracking - DHT is used only during bootstrap, then push-only
-    bootstrap_complete: bool,
+    pub(crate) bootstrap_complete: bool,
 
     // Track last persisted generation to avoid redundant snapshots
-    last_persisted_generation: u64,
+    pub(crate) last_persisted_generation: u64,
 
     // Track push failures per peer for DHT fallback recovery
-    push_failure_count: HashMap<Uuid, u32>,
+    pub(crate) push_failure_count: HashMap<Uuid, u32>,
 
     // Track last seen generation and checksum per node for deduplication
-    last_seen_state: HashMap<Uuid, (u64, u64)>,
+    pub(crate) last_seen_state: HashMap<Uuid, (u64, u64)>,
 
     /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups
     pub(crate) remote_peer_pool: Option<Arc<RemotePeerPool>>,
@@ -913,7 +685,7 @@ impl ClusterCoordinator {
         }
     }
 
-    fn decide_route(
+    pub(crate) fn decide_route(
         &self,
         routing_key: Option<String>,
         operation_type: OperationType,
@@ -1109,7 +881,7 @@ impl Message<GetShardAssignments> for ClusterCoordinator {
 }
 
 impl ClusterCoordinator {
-    fn rebuild_ring(&mut self) {
+    pub(crate) fn rebuild_ring(&mut self) {
         self.ring = ConsistentRing::new();
         for (shard_id, meta) in &self.shard_assignments {
             let name: String = shard_id.simple().to_string().chars().take(3).collect();
@@ -2600,234 +2372,5 @@ impl Drop for ClusterCoordinator {
         {
             warn!(%error, "ClusterCoordinator drop: failed to signal swarm shutdown");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::ClusterConfig;
-    use crate::distributed::NodeStatus;
-
-    fn make_cluster() -> DistributedCluster {
-        let cfg = ClusterConfig::default();
-        let path = std::env::temp_dir();
-        DistributedCluster::new(
-            cfg,
-            Uuid::new_v4(),
-            "TST".to_string(),
-            path,
-            64 * 1024 * 1024,
-            60,
-        )
-    }
-
-    #[test]
-    fn decide_route_defaults_to_local_when_no_key() {
-        let cc = ClusterCoordinator::new(make_cluster());
-        let decision = cc.decide_route(None, OperationType::Read);
-        assert!(matches!(decision, RoutingDecision::Local));
-    }
-
-    /// Every routing decision on a lone node is `Local`, whatever it is asked.
-    ///
-    /// This is what lets `RouterActor::resolve_local` answer for a *keyless* operation without a
-    /// mailbox round trip when `[network.cluster] enabled` is off. Measured on a release build
-    /// against a 2,000-document index, that ask was happening once per ordinary search, once per
-    /// streaming search and once per `GET /_indexes` — for an answer that could not have been
-    /// anything else. Keyed writes already resolved locally from the published ring and
-    /// placement; the keyless reads were the gap, and they are the common case.
-    ///
-    /// Asserted here rather than in the router, because the claim is *this function's*: if it
-    /// ever gains an answer other than `Local` for a single-node cluster, the shortcut becomes a
-    /// lie and this test is what says so.
-    #[test]
-    fn a_lone_node_can_only_ever_be_routed_to_locally() {
-        // No shards registered, so the ring is empty — the state a node is in before its first
-        // write, and the one the shortcut has to be right about too.
-        let empty = ClusterCoordinator::new(make_cluster());
-        // And with a shard of its own, which is every later operation.
-        let cluster = make_cluster();
-        let local = cluster.local_node_id;
-        let mut owning = ClusterCoordinator::new(cluster);
-        let shard_id = Uuid::new_v4();
-        owning.shard_assignments.insert(
-            shard_id,
-            ShardMetadata {
-                shard_id,
-                node_id: local,
-                vnode_tokens: vec![1, 2, 3],
-                storage_bytes: 0,
-                document_count: 0,
-            },
-        );
-        owning.rebuild_ring();
-
-        for cc in [&empty, &owning] {
-            for key in [None, Some("any-key".to_string())] {
-                for op in [OperationType::Read, OperationType::Write] {
-                    let decision = cc.decide_route(key.clone(), op.clone());
-                    assert!(
-                        matches!(decision, RoutingDecision::Local),
-                        "a node that is the whole cluster has nowhere else to send \
-                         {key:?}/{op:?}, got {decision:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn decide_route_returns_local_when_owner_is_self() {
-        let cluster = make_cluster();
-        let local = cluster.local_node_id;
-        let mut cc = ClusterCoordinator::new(cluster);
-
-        let shard_id = Uuid::new_v4();
-        cc.shard_assignments.insert(
-            shard_id,
-            ShardMetadata {
-                shard_id,
-                node_id: local,
-                vnode_tokens: vec![1, 2, 3],
-                storage_bytes: 0,
-                document_count: 0,
-            },
-        );
-        cc.rebuild_ring();
-
-        let decision = cc.decide_route(Some("key-1".into()), OperationType::Read);
-        assert!(matches!(decision, RoutingDecision::Local));
-    }
-
-    #[test]
-    fn decide_route_returns_remote_when_owner_known_with_addr() {
-        let mut cluster = make_cluster();
-        let owner = Uuid::new_v4();
-        cluster.peer_nodes.insert(
-            owner,
-            NodeInfo {
-                node_id: owner,
-                node_name: None,
-                address: "127.0.0.1:9000".into(),
-                status: NodeStatus::Connected,
-                shard_count: 0,
-            },
-        );
-        let mut cc = ClusterCoordinator::new(cluster);
-
-        let shard_id = Uuid::new_v4();
-        cc.shard_assignments.insert(
-            shard_id,
-            ShardMetadata {
-                shard_id,
-                node_id: owner,
-                vnode_tokens: vec![1, 2, 3],
-                storage_bytes: 0,
-                document_count: 0,
-            },
-        );
-        cc.rebuild_ring();
-
-        let decision = cc.decide_route(Some("key-remote".into()), OperationType::Write);
-        match decision {
-            RoutingDecision::Remote { node_id, .. } => assert_eq!(node_id, owner),
-            other => panic!("expected Remote, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn decide_route_broadcasts_when_owner_address_missing() {
-        let mut cc = ClusterCoordinator::new(make_cluster());
-        let shard_id = Uuid::new_v4();
-        let owner = Uuid::new_v4(); // not present in peer_nodes
-        cc.shard_assignments.insert(
-            shard_id,
-            ShardMetadata {
-                shard_id,
-                node_id: owner,
-                vnode_tokens: vec![1, 2, 3],
-                storage_bytes: 0,
-                document_count: 0,
-            },
-        );
-        cc.rebuild_ring();
-
-        let decision = cc.decide_route(Some("key-no-addr".into()), OperationType::Read);
-        assert!(matches!(decision, RoutingDecision::Broadcast));
-    }
-
-    #[test]
-    fn ring_distribution_splits_across_multiple_nodes() {
-        use cluster::generate_tokens;
-
-        let mut cluster = make_cluster();
-        let n1 = Uuid::new_v4();
-        let n2 = Uuid::new_v4();
-        cluster.peer_nodes.insert(
-            n1,
-            NodeInfo {
-                node_id: n1,
-                node_name: None,
-                address: "127.0.0.1:9101".into(),
-                status: NodeStatus::Connected,
-                shard_count: 0,
-            },
-        );
-        cluster.peer_nodes.insert(
-            n2,
-            NodeInfo {
-                node_id: n2,
-                node_name: None,
-                address: "127.0.0.1:9102".into(),
-                status: NodeStatus::Connected,
-                shard_count: 0,
-            },
-        );
-        let mut cc = ClusterCoordinator::new(cluster);
-
-        let s1 = Uuid::new_v4();
-        let s2 = Uuid::new_v4();
-        // Use realistic token distribution across the u64 hash space
-        cc.shard_assignments.insert(
-            s1,
-            ShardMetadata {
-                shard_id: s1,
-                node_id: n1,
-                vnode_tokens: generate_tokens(s1),
-                storage_bytes: 0,
-                document_count: 0,
-            },
-        );
-        cc.shard_assignments.insert(
-            s2,
-            ShardMetadata {
-                shard_id: s2,
-                node_id: n2,
-                vnode_tokens: generate_tokens(s2),
-                storage_bytes: 0,
-                document_count: 0,
-            },
-        );
-        cc.rebuild_ring();
-
-        let mut counts = std::collections::HashMap::new();
-        for i in 0..200 {
-            let key = format!("key-{i}");
-            match cc.decide_route(Some(key), OperationType::Read) {
-                RoutingDecision::Remote { node_id, .. } => {
-                    *counts.entry(node_id).or_insert(0usize) += 1;
-                }
-                RoutingDecision::Local => {
-                    *counts.entry(cc.cluster.local_node_id).or_insert(0usize) += 1;
-                }
-                RoutingDecision::Broadcast => {
-                    *counts.entry(Uuid::nil()).or_insert(0usize) += 1;
-                }
-            }
-        }
-
-        assert!(counts.get(&n1).copied().unwrap_or(0) > 0);
-        assert!(counts.get(&n2).copied().unwrap_or(0) > 0);
     }
 }

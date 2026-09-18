@@ -108,6 +108,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`cli.rs`, `config.rs` and `cluster_coordinator.rs` are directories now** (L13). The
+  client's 5,100-line `cli.rs` split by surface: `cli/mod.rs` keeps the clap grammar,
+  `run_cli` dispatch and the list/output helpers; `cli/ingest.rs` holds the whole ingest
+  pipeline (source and compression detection, the JSON chunk parsers, schema detection, the
+  loaders); `cli/shell.rs` holds the interactive session, `IndexCompleter` and the command
+  dispatch; `cli/tests.rs` the tests. The interactive help is generated from a `usage`
+  module that every `Usage:` error in the dispatch quotes — the hand-written copy it
+  replaced had already drifted from the grammar. `config.rs` kept the model, loading and
+  validation; the `OVERRIDES` table, `CliOverrides`, unknown-key reporting and `cli_help`
+  moved to `config/overrides.rs`, tests to `config/tests.rs`. Its stale module-doc TOML
+  example now names real sections, and a stray `impl StorageConfig` follows its struct.
+  `cluster_coordinator.rs` split the way `node/` did: `coordinator.rs` (the actor and its
+  handlers), `messages.rs` (the ~30 wire types), `tests.rs`, and a `mod.rs` of declarations
+  and re-exports. Same flattening as the earlier splits — `pub(crate)` on what the single
+  files already shared; every `crate::cli::X`, `config::X` and `cluster_coordinator::X`
+  path resolves unchanged.
+
 - **`storage/src/lib.rs` is five siblings, split by what the code is** (L12). The 10,200-line
   file that held the query machinery, the data model and the whole `HybridStore` in one impl
   block now reads the way the roadmap drew it: `lib.rs` (465 lines) keeps the crate doc,

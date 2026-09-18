@@ -51,7 +51,7 @@ on one.
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
-| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11, L12 done; L13 open), six simplifications (L14–L19 done), and the retrospective itself |
+| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11–L13 done), six simplifications (L14–L19 done), and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
 
@@ -3292,25 +3292,32 @@ itself.
 
 ### L13 — `cli.rs`, `config.rs` and `cluster_coordinator.rs` (5,387 / 2,955 / 2,840 lines)
 
-**Decomposition.** 📋 **Planned.** Three files, one item, same coarse rule — a few files each,
-grouped by feature, tests moved out first (config.rs carries 909 lines of tests, cli.rs 374 —
-the largest single-file reductions at near-zero risk).
+**Decomposition.** ✅ **Done** 2026-09-19. Three files, same coarse rule — grouped by feature,
+tests out:
 
-- `cli.rs` → four files. `mod.rs`: the clap definitions, top-level dispatch, the list/output
-  helpers (~1,200). `ingest.rs`: the whole ingest pipeline — source and compression detection,
-  the JSON stream parsers, schema detection, the loaders (~2,600, shrinking toward ~2,400 when
-  L18 folds its duplicates). `shell.rs`: the interactive session, completer and help (~1,900).
-  `tests.rs`. The interactive help text is a hand-written restatement of the clap grammar and
-  will drift forever — generate one from the other while the file is open.
-- `config.rs` → keep the config model in one file; move only the CLI-override machinery and the
-  ~50 one-line `default_*` functions: `config.rs` (~2,000, incl. loading and validation),
-  `overrides.rs` (~700, incl. `cli_help` and the defaults table), tests out. Note the stale
-  module-doc TOML example (lines 9–23) that matches no current struct, and the
-  `impl StorageConfig` that precedes its struct — both fixed in passing.
-- `cluster_coordinator.rs` → `coordinator.rs` (the actor and every handler, ~2,300),
-  `messages.rs` (~250 — the 26 message types are already a contiguous block at the top), tests
-  out. If a second cut is ever wanted, the swarm-event forwarder inside `InitSwarm` is the piece
-  to lift — not half the handlers.
+- `cli.rs` → `cli/`: `mod.rs` (881 — the clap grammar, `run_cli` dispatch, the list/output
+  helpers, `pub(crate) use` globs), `ingest.rs` (2,309 — source/compression detection, the
+  JSON chunk parsers, schema detection, the CSV/JSON loaders), `shell.rs` (1,660 —
+  `InteractiveSession`, `IndexCompleter`, the interactive dispatch), `tests.rs` (383). The
+  interactive help is generated now: a `usage` module holds one string per command, the help
+  table is built from it, and every `Usage:` error in the dispatch quotes the same strings —
+  the hand-written copy had already drifted (it said `search … [limit]` where the grammar is
+  `[limit N]`, and the delete error spelled placeholders differently than the help).
+- `config.rs` (1,610 — the model, loading, validation) + `config/overrides.rs` (419 — the
+  `OVERRIDES` table, `CliOverrides`, unknown-key reporting, the moved-key adoption protocol,
+  `cli_help`) + `config/tests.rs` (1,001). The stale module-doc TOML example now names real
+  sections (`network.http`, `storage.data_paths`, `search.*`), and the misplaced
+  `impl StorageConfig` follows its struct. The `default_*` functions stayed in `config.rs`
+  as the `config_defaults!` macro — L19 had already collapsed them, and the serde
+  `#[serde(default = "…")]` attributes resolve the names in the config module's scope.
+- `cluster_coordinator.rs` → `cluster_coordinator/`: `mod.rs` (12 — decls and re-exports),
+  `coordinator.rs` (2,376 — the actor and every handler), `messages.rs` (235 — the ~30 wire
+  types, the contiguous block they always were), `tests.rs` (237).
+
+Same privacy flattening as L11/L12: `pub(crate)` on the items, fields and methods the single
+files already shared (`Override`'s fields, `CliOverrides`'s lookup methods, the coordinator's
+`decide_route`/`rebuild_ring` and fields, the cli cross-file calls). Every `crate::cli::X`,
+`config::X` and `crate::cluster_coordinator::X` path resolves through the glob re-exports.
 
 ### L14 — `OrchestratorError::Io` is the wire's catch-all, and semantics round-trip through strings
 
