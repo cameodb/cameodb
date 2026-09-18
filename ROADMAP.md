@@ -51,7 +51,7 @@ on one.
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half under L12 |
-| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11 done), six simplifications (L14–L18 done), and the retrospective itself |
+| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11 done), six simplifications (L14–L19 done), and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
 
@@ -3392,12 +3392,15 @@ documents instead of erroring — the reader path's existing leniency, unified.
 
 ### L19 — `config.rs` validates by repetition
 
-**Simplification.** 📋 **Planned.** `CameoDbConfig::validate` is ~296 lines of one repeated
-shape (split per section, or drive the zero-checks from a table); `adopt_moved_settings` writes
-the same take/adopt/warn protocol four times (and goes away at 0.4.0 regardless); the ~50
-one-line `default_*` functions (~185 lines) collapse into a macro or consistent derive; and
-`merge_configs` ignores its `base` argument entirely — implement per-key merging or delete the
-abstraction, because the current layering story is false.
+**Simplification.** ✅ **Done 2026-10-26.** `validate` is five `validate_*` methods —
+`security`, `mcp`, `network`, `storage`, `memory` — called in the same order the checks
+always ran in, with their rationale comments moved verbatim (the checks are bespoke and
+cross-field, so per-section split won over table-driving). `adopt_moved_settings` writes
+the take/adopt/warn protocol once as `adopt_moved`, called four times. The 45 one-line
+`default_*` functions are one `config_defaults!` macro invocation — each constant written
+once, serde still naming the same functions. And `merge_configs` is deleted rather than
+implemented: the file parse already layers over serde defaults, so "merge" was always
+replacement — the comment that promised per-key merging was the false abstraction.
 
 ### L20 — The retrospective, and the sequence into the next cycle
 

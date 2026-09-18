@@ -389,6 +389,28 @@ fn moved(file: &str, old: &str, new: &str, applied: bool, value: &dyn std::fmt::
     }
 }
 
+/// The one take/adopt/warn step `adopt_moved_settings` repeats per moved key: if the old
+/// spelling was written at all, adopt it into `slot` when the slot is still at its
+/// default — `[limits]` wins where it says anything — and warn either way.
+fn adopt_moved<T, S>(
+    path: &str,
+    old_key: &str,
+    new_key: &str,
+    old: Option<T>,
+    slot: &mut S,
+    default: &S,
+) where
+    S: PartialEq + From<T>,
+    T: std::fmt::Display,
+{
+    let Some(value) = old else { return };
+    let free = *slot == *default;
+    moved(path, old_key, new_key, free, &value);
+    if free {
+        *slot = S::from(value);
+    }
+}
+
 /// Settings a config file may set that no serialization can contain, and which therefore
 /// cannot appear in the schema above.
 ///
@@ -1143,7 +1165,9 @@ impl CameoDbConfig {
 
         // Layer the config file on top, if there is one
         match Self::load_from_file(cli.config_path.as_deref()) {
-            Ok(file_config) => config = Self::merge_configs(config, file_config),
+            // The file is already a complete config — every field it omits arrived at
+            // its serde default inside the parse — so layering is replacement, not merge.
+            Ok(file_config) => config = file_config,
             // Only a *missing* file from the implicit search list is survivable. A file the
             // operator explicitly named, or one that exists but does not parse, is an error:
             // booting on defaults because a config was unreadable is how a node quietly comes
@@ -1255,55 +1279,38 @@ impl CameoDbConfig {
     fn adopt_moved_settings(&mut self, path: &str) {
         let defaults = LimitsConfig::default();
 
-        if let Some(mb) = self.max_record_size_mb.take() {
-            let free = self.limits.max_record_size_mb == defaults.max_record_size_mb;
-            if free {
-                self.limits.max_record_size_mb = mb;
-            }
-            moved(path, "max_record_size_mb", "max_record_size_mb", free, &mb);
-        }
-
-        if let Some(mb) = self.network.http.max_body_size_mb.take() {
-            let free = self.limits.max_body_size_mb == defaults.max_body_size_mb;
-            if free {
-                self.limits.max_body_size_mb = mb;
-            }
-            moved(
-                path,
-                "network.http.max_body_size_mb",
-                "max_body_size_mb",
-                free,
-                &mb,
-            );
-        }
-
-        if let Some(mb) = self.search.total_memory_limit_mb.take() {
-            let free = self.limits.total_memory_limit_mb == defaults.total_memory_limit_mb;
-            if free {
-                self.limits.total_memory_limit_mb = mb;
-            }
-            moved(
-                path,
-                "search.total_memory_limit_mb",
-                "total_memory_limit_mb",
-                free,
-                &mb,
-            );
-        }
-
-        if let Some(bytes) = self.security.limits.max_response_bytes.take() {
-            let free = self.limits.max_response_bytes.is_none();
-            if free {
-                self.limits.max_response_bytes = Some(bytes);
-            }
-            moved(
-                path,
-                "security.limits.max_response_bytes",
-                "max_response_bytes",
-                free,
-                &bytes,
-            );
-        }
+        adopt_moved(
+            path,
+            "max_record_size_mb",
+            "max_record_size_mb",
+            self.max_record_size_mb.take(),
+            &mut self.limits.max_record_size_mb,
+            &defaults.max_record_size_mb,
+        );
+        adopt_moved(
+            path,
+            "network.http.max_body_size_mb",
+            "max_body_size_mb",
+            self.network.http.max_body_size_mb.take(),
+            &mut self.limits.max_body_size_mb,
+            &defaults.max_body_size_mb,
+        );
+        adopt_moved(
+            path,
+            "search.total_memory_limit_mb",
+            "total_memory_limit_mb",
+            self.search.total_memory_limit_mb.take(),
+            &mut self.limits.total_memory_limit_mb,
+            &defaults.total_memory_limit_mb,
+        );
+        adopt_moved(
+            path,
+            "security.limits.max_response_bytes",
+            "max_response_bytes",
+            self.security.limits.max_response_bytes.take(),
+            &mut self.limits.max_response_bytes,
+            &defaults.max_response_bytes,
+        );
     }
 
     /// Apply the environment and then the command line over `config`.
@@ -1333,15 +1340,30 @@ impl CameoDbConfig {
         Ok(config)
     }
 
-    /// Merge two configurations, with `override_config` taking precedence
-    fn merge_configs(_base: Self, override_config: Self) -> Self {
-        // For now, override completely replaces base
-        // In the future, we could implement more sophisticated merging
-        override_config
-    }
-
     /// Validate the configuration for consistency and constraints
     pub fn validate(&self) -> Result<()> {
+        self.validate_security()?;
+        self.validate_mcp()?;
+        self.validate_network()?;
+        self.validate_storage()?;
+        self.validate_memory()?;
+
+        // A trail configured into uselessness — a zero-length buffer, a zero-slot queue —
+        // is caught here rather than discovered empty during the incident it was turned on
+        // for.
+        self.security
+            .audit
+            .validate()
+            .map_err(|message| ConfigError::SecurityConfig { message })?;
+
+        // Posture rules run last: the checks above establish that individual values are
+        // usable, and this decides whether the combination is allowed where this node sits.
+        self.check_posture()?;
+
+        Ok(())
+    }
+
+    fn validate_security(&self) -> Result<()> {
         // A ceiling of zero would mean no search may return anything. Refused rather than read
         // as "no ceiling", because a bound whose zero inverts its meaning is a trap: an
         // operator who wants a high ceiling should write a high number.
@@ -1393,6 +1415,10 @@ impl CameoDbConfig {
             .into());
         }
 
+        Ok(())
+    }
+
+    fn validate_mcp(&self) -> Result<()> {
         // A timeout of zero expires a session before its next request can arrive, so every
         // call after `initialize` would be answered 404. Refused rather than read as "never
         // expire", which is what an operator wanting a long-lived session should write as a
@@ -1442,7 +1468,10 @@ impl CameoDbConfig {
             .into());
         }
 
-        // Validate HTTP configuration
+        Ok(())
+    }
+
+    fn validate_network(&self) -> Result<()> {
         if self.network.http.port == 0 {
             return Err(ConfigError::NetworkConfig {
                 message: "HTTP port cannot be 0".to_string(),
@@ -1608,7 +1637,10 @@ impl CameoDbConfig {
             }
         }
 
-        // Validate storage configuration
+        Ok(())
+    }
+
+    fn validate_storage(&self) -> Result<()> {
         if self.storage.data_paths.is_empty() {
             return Err(ConfigError::StorageConfig {
                 message: "At least one data path must be specified".to_string(),
@@ -1623,7 +1655,10 @@ impl CameoDbConfig {
             .into());
         }
 
-        // Validate memory configuration
+        Ok(())
+    }
+
+    fn validate_memory(&self) -> Result<()> {
         if self.search.indexer_memory_min_mb < 16 {
             return Err(ConfigError::MemoryConfig {
                 message: "Indexer memory minimum cannot be less than 16MB".to_string(),
@@ -1659,18 +1694,6 @@ impl CameoDbConfig {
             }
             .into());
         }
-
-        // A trail configured into uselessness — a zero-length buffer, a zero-slot queue —
-        // is caught here rather than discovered empty during the incident it was turned on
-        // for.
-        self.security
-            .audit
-            .validate()
-            .map_err(|message| ConfigError::SecurityConfig { message })?;
-
-        // Posture rules run last: the checks above establish that individual values are
-        // usable, and this decides whether the combination is allowed where this node sits.
-        self.check_posture()?;
 
         Ok(())
     }
@@ -1918,186 +1941,79 @@ impl Default for ClusterConfig {
     }
 }
 
-// Default value functions for serde
-/// Loopback by default.
-///
-/// Binding every interface out of the box put an unauthenticated read/write/delete API on
-/// the network the moment the binary ran. Reaching the node from other hosts is now a
-/// deliberate act — set `bind_address` and declare a `profile` to go with it.
-fn default_http_bind_address() -> String {
-    "127.0.0.1".to_string()
+/// Every `#[serde(default = "...")]` name in this module resolves to one of these
+/// functions — each exists only so serde can name it, so the macro writes each
+/// constant exactly once.
+macro_rules! config_defaults {
+    ($($(#[$meta:meta])* $name:ident -> $ty:ty = $value:expr;)*) => {
+        $(
+            $(#[$meta])*
+            fn $name() -> $ty {
+                $value
+            }
+        )*
+    };
 }
 
-fn default_http_port() -> u16 {
-    9480
-}
-
-fn default_mcp_enabled() -> bool {
-    true
-}
-
-/// Thirty minutes. See [`McpConfig::session_idle_timeout_secs`] for why it is not five.
-fn default_session_idle_timeout_secs() -> u64 {
-    1800
-}
-
-fn default_max_sessions() -> usize {
-    1024
-}
-
-/// Fifteen seconds, which is under every idle-read timeout common in front of a node: 30 s on
-/// nginx by default, 60 s on an AWS ALB.
-fn default_sse_keepalive_secs() -> u64 {
-    15
-}
-
-fn default_legacy_sse_enabled() -> bool {
-    true
-}
-
-fn default_max_record_size_mb() -> usize {
-    64
-}
-
-fn default_http_max_concurrent_requests() -> usize {
-    128
-}
-
-fn default_admin_enabled() -> bool {
-    true
-}
-
-/// No cross-origin browser access by default.
-///
-/// CORS governs browsers and nothing else, so an empty list costs API and MCP clients
-/// nothing while removing the drive-by attack surface that `["*"]` handed to any web page
-/// the operator happened to visit — which mattered because no endpoint requires auth.
-fn default_cors_allowed_origins() -> Vec<String> {
-    Vec::new()
-}
-
-fn default_node_label_opt() -> Option<String> {
-    Some("cameodb".to_string())
-}
-
-fn default_node_zone() -> String {
-    "default".to_string()
-}
-
-fn default_disk_usage_threshold_percent() -> u8 {
-    90
-}
-fn default_wal_sync() -> bool {
-    true
-}
-fn default_wal_segment_size_mb() -> usize {
-    64
-}
-fn default_default_batch_size() -> usize {
-    1000
-}
-
-fn default_num_shards_init() -> usize {
-    4
-}
-fn default_max_shards_per_node() -> usize {
-    8
-}
-fn default_writer_core_affinity() -> bool {
-    true
-}
-
-fn default_shard_affine_dispatch() -> bool {
-    false
-}
-
-fn default_worker_core_affinity() -> bool {
-    false
-}
-
-fn default_indexer_memory_min_mb() -> usize {
-    64
-}
-fn default_indexer_memory_max_mb() -> usize {
-    512
-}
-fn default_total_memory_limit_mb() -> usize {
-    2048
-}
-fn default_memory_pressure_threshold_percent() -> u8 {
-    80
-}
-fn default_search_threads() -> usize {
-    8
-}
-fn default_search_limit() -> usize {
-    10
-}
-
-fn default_indexer_num_threads() -> usize {
-    1
-}
-fn default_merge_num_threads() -> usize {
-    2
-}
-fn default_supervisor_timeout_secs() -> u64 {
-    5
-}
-
-fn default_cluster_enabled() -> bool {
-    false
-}
-
-fn default_cluster_bind_address() -> String {
-    "0.0.0.0".to_string()
-}
-
-fn default_cluster_port() -> u16 {
-    9580
-}
-
-fn default_cluster_name() -> String {
-    "cameodb-cluster".to_string()
-}
-
-fn default_messaging_max_concurrent_requests() -> usize {
-    100
-}
-
-fn default_connection_pool_size() -> usize {
-    10
-}
-
-fn default_remote_retry_attempts() -> u8 {
-    2
-}
-
-fn default_broadcast_timeout_secs() -> u64 {
-    5
-}
-
-fn default_broadcast_fanout_limit() -> usize {
-    16
-}
-
-fn default_enable_streaming_search() -> bool {
-    true
-}
-
-fn default_max_concurrent_shard_searches() -> usize {
-    32
-}
-
-fn default_max_concurrent_remote_searches() -> usize {
-    8
-}
-
-fn default_enable_early_termination() -> bool {
-    true
-}
-
-fn default_stream_batch_size() -> usize {
-    400
+config_defaults! {
+    /// Loopback by default.
+    ///
+    /// Binding every interface out of the box put an unauthenticated read/write/delete API on
+    /// the network the moment the binary ran. Reaching the node from other hosts is now a
+    /// deliberate act — set `bind_address` and declare a `profile` to go with it.
+    default_http_bind_address -> String = "127.0.0.1".to_string();
+    default_http_port -> u16 = 9480;
+    default_mcp_enabled -> bool = true;
+    /// Thirty minutes. See [`McpConfig::session_idle_timeout_secs`] for why it is not five.
+    default_session_idle_timeout_secs -> u64 = 1800;
+    default_max_sessions -> usize = 1024;
+    /// Fifteen seconds, which is under every idle-read timeout common in front of a node: 30 s on
+    /// nginx by default, 60 s on an AWS ALB.
+    default_sse_keepalive_secs -> u64 = 15;
+    default_legacy_sse_enabled -> bool = true;
+    default_max_record_size_mb -> usize = 64;
+    default_http_max_concurrent_requests -> usize = 128;
+    default_admin_enabled -> bool = true;
+    /// No cross-origin browser access by default.
+    ///
+    /// CORS governs browsers and nothing else, so an empty list costs API and MCP clients
+    /// nothing while removing the drive-by attack surface that `["*"]` handed to any web page
+    /// the operator happened to visit — which mattered because no endpoint requires auth.
+    default_cors_allowed_origins -> Vec<String> = Vec::new();
+    default_node_label_opt -> Option<String> = Some("cameodb".to_string());
+    default_node_zone -> String = "default".to_string();
+    default_disk_usage_threshold_percent -> u8 = 90;
+    default_wal_sync -> bool = true;
+    default_wal_segment_size_mb -> usize = 64;
+    default_default_batch_size -> usize = 1000;
+    default_num_shards_init -> usize = 4;
+    default_max_shards_per_node -> usize = 8;
+    default_writer_core_affinity -> bool = true;
+    default_shard_affine_dispatch -> bool = false;
+    default_worker_core_affinity -> bool = false;
+    default_indexer_memory_min_mb -> usize = 64;
+    default_indexer_memory_max_mb -> usize = 512;
+    default_total_memory_limit_mb -> usize = 2048;
+    default_memory_pressure_threshold_percent -> u8 = 80;
+    default_search_threads -> usize = 8;
+    default_search_limit -> usize = 10;
+    default_indexer_num_threads -> usize = 1;
+    default_merge_num_threads -> usize = 2;
+    default_supervisor_timeout_secs -> u64 = 5;
+    default_cluster_enabled -> bool = false;
+    default_cluster_bind_address -> String = "0.0.0.0".to_string();
+    default_cluster_port -> u16 = 9580;
+    default_cluster_name -> String = "cameodb-cluster".to_string();
+    default_messaging_max_concurrent_requests -> usize = 100;
+    default_connection_pool_size -> usize = 10;
+    default_remote_retry_attempts -> u8 = 2;
+    default_broadcast_timeout_secs -> u64 = 5;
+    default_broadcast_fanout_limit -> usize = 16;
+    default_enable_streaming_search -> bool = true;
+    default_max_concurrent_shard_searches -> usize = 32;
+    default_max_concurrent_remote_searches -> usize = 8;
+    default_enable_early_termination -> bool = true;
+    default_stream_batch_size -> usize = 400;
 }
 
 #[cfg(test)]
