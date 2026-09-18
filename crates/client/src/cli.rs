@@ -2111,72 +2111,231 @@ struct IdFieldDetection {
     is_shadow: bool, // true if original field != "id"
 }
 
-/// Detect the ID field from CSV headers with shadow field support.
-///
-/// Priority order:
-/// 1. Exact match: field named "id" (case-insensitive)
-/// 2. Hash algorithms: "sha256", "sha1", "md5" (in order of complexity)
-/// 3. Substring match: any field containing "id" (case-insensitive)
-/// 4. Fallback: first column (index 0)
-fn detect_id_field(headers: &[(String, Option<TantivyFieldType>)]) -> IdFieldDetection {
-    // Hash algorithms ordered by complexity (most complex first for better distribution)
-    let hash_algorithms = ["sha256", "sha1", "md5"];
-
-    // Try exact match first
-    if let Some(pos) = headers.iter().position(|(h, _)| h.to_lowercase() == "id") {
-        return IdFieldDetection {
-            index: pos,
-            original_field_name: "id".to_string(),
-            is_shadow: false, // No shadow needed for canonical "id" field
-        };
+/// The id-candidate ranking every source format shares: a field named exactly `id`,
+/// then a hash column (`sha256`, `sha1`, `md5` in that order — more digest bits, better
+/// spread), then anything ending in `id` (`user_id`, `videoId`), then anything containing
+/// it. Inside a rank the first field in source order wins; an altogether unmatched list
+/// falls back to its first field.
+fn id_field_rank(name: &str) -> u8 {
+    let lower = name.to_lowercase();
+    if lower == "id" {
+        0
+    } else if lower == "sha256" {
+        1
+    } else if lower == "sha1" {
+        2
+    } else if lower == "md5" {
+        3
+    } else if lower.ends_with("id") {
+        4
+    } else if lower.contains("id") {
+        5
+    } else {
+        6
     }
+}
 
-    // Look for hash algorithm fields in priority order
-    for hash_name in &hash_algorithms {
-        if let Some(pos) = headers
-            .iter()
-            .position(|(h, _)| h.to_lowercase() == *hash_name)
-        {
-            return IdFieldDetection {
-                index: pos,
-                original_field_name: hash_name.to_string(),
-                is_shadow: true, // Create shadow field for hash algorithm fields
-            };
+fn detect_id_field_index<'a>(names: impl Iterator<Item = &'a str>) -> Option<usize> {
+    names
+        .enumerate()
+        .min_by_key(|(_, name)| id_field_rank(name))
+        .map(|(idx, _)| idx)
+}
+
+/// Detect the ID field from CSV headers with shadow field support.
+fn detect_id_field(headers: &[(String, Option<TantivyFieldType>)]) -> IdFieldDetection {
+    let index = detect_id_field_index(headers.iter().map(|(name, _)| name.as_str()))
+        .expect("CSV headers are non-empty");
+    let name = &headers[index].0;
+    let lower = name.to_lowercase();
+    IdFieldDetection {
+        index,
+        // Exact and hash matches canonicalize to lowercase — "ID" and "SHA256" name the
+        // same field their spelling hides. Suffix and substring matches keep the source
+        // spelling, which is what the shadow field is named after.
+        original_field_name: if id_field_rank(name) <= 3 {
+            lower.clone()
+        } else {
+            name.clone()
+        },
+        is_shadow: lower != "id",
+    }
+}
+
+/// The CSV schema's final pass, run the same way whether the schema was built by
+/// `detect_schema_from_csv` or mid-ingest: every non-shadow field is marked indexed —
+/// an explicit load is not write-time evolution, where fields start non-indexed — and
+/// only `id` stays stored in Tantivy (the rest comes from redb). Shadow fields keep
+/// their non-indexed, non-stored status, and header type hints are applied last.
+fn finalize_csv_schema(schema: &mut IndexSchema, headers: &[(String, Option<TantivyFieldType>)]) {
+    for (name, field_def) in schema.fields.iter_mut() {
+        if !field_def.is_shadow {
+            field_def.indexed = true;
+            field_def.stored = name == "id";
         }
     }
 
-    // Prefer suffix-based matches (common for camelCase/PascalCase like videoId, userID)
-    if let Some(pos) = headers.iter().position(|(h, _)| {
-        let lower = h.to_lowercase();
-        lower.ends_with("id") || lower.ends_with("_id")
-    }) {
-        let field_name = &headers[pos].0;
-        return IdFieldDetection {
-            index: pos,
-            original_field_name: field_name.clone(),
-            is_shadow: field_name.to_lowercase() != "id",
-        };
+    for (name, hint) in headers {
+        if let Some(t) = hint.clone()
+            && !schema.fields.get(name).is_some_and(|f| f.is_shadow)
+        {
+            // FieldDef::new already sets the stored flag — only 'id' = true.
+            let mut field_def = FieldDef::new(name.clone(), t);
+            field_def.indexed = true;
+            schema.fields.insert(name.clone(), field_def);
+        }
+    }
+}
+
+/// Build the schema a buffered CSV sample describes: the shadow for a non-`id` source
+/// column, one evolution pass per sampled row, then the CSV finalization.
+fn csv_sample_schema(
+    headers: &[(String, Option<TantivyFieldType>)],
+    id_detection: &IdFieldDetection,
+    rows: &[csv::StringRecord],
+) -> Result<JsonValue> {
+    let mut schema = IndexSchema::default();
+    if id_detection.is_shadow {
+        let field_type = headers[id_detection.index]
+            .1
+            .clone()
+            .unwrap_or(TantivyFieldType::Text);
+        schema.add_shadow_field(id_detection.original_field_name.clone(), field_type);
     }
 
-    // Look for substring match
-    if let Some(pos) = headers
-        .iter()
-        .position(|(h, _)| h.to_lowercase().contains("id"))
-    {
-        let field_name = &headers[pos].0;
-        return IdFieldDetection {
-            index: pos,
-            original_field_name: field_name.clone(),
-            is_shadow: field_name.to_lowercase() != "id", // Shadow if not canonical "id"
-        };
+    for row in rows {
+        let mut obj: JsonMap<String, JsonValue> = JsonMap::new();
+        for (idx, value) in row.iter().enumerate() {
+            if let Some((header, _)) = headers.get(idx) {
+                obj.insert(header.clone(), parse_csv_cell(value));
+            }
+        }
+        if let Some(raw_id) = row.get(id_detection.index) {
+            let id_val = raw_id.trim();
+            if !id_val.is_empty() {
+                obj.insert("id".to_string(), JsonValue::String(id_val.to_string()));
+            }
+        }
+        schema.evolve_from_document(&JsonValue::Object(obj));
     }
 
-    // Fallback: first column
-    let field_name = &headers[0].0;
-    IdFieldDetection {
-        index: 0,
-        original_field_name: field_name.clone(),
-        is_shadow: field_name.to_lowercase() != "id", // Shadow if not canonical "id"
+    finalize_csv_schema(&mut schema, headers);
+    serde_json::to_value(&schema).context("Failed to serialize schema")
+}
+
+/// Serialize one CSV record as the NDJSON payload line the ingest stream accepts:
+/// canonical `id`, the routing key (the source column's value, or the id), and the row.
+fn csv_ndjson_line(
+    record: &csv::StringRecord,
+    headers: &[(String, Option<TantivyFieldType>)],
+    id_detection: &IdFieldDetection,
+    id_header: &str,
+) -> Result<Vec<u8>> {
+    let id_value = record
+        .get(id_detection.index)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut doc_obj: JsonMap<String, JsonValue> = JsonMap::new();
+    for (idx, value) in record.iter().enumerate() {
+        if let Some((header, _)) = headers.get(idx) {
+            doc_obj.insert(header.clone(), parse_csv_cell(value));
+        }
+    }
+    doc_obj.insert("id".to_string(), JsonValue::String(id_value.clone()));
+    let routing_key = doc_obj
+        .get(id_header)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| id_value.clone());
+    let payload = json!({"id": id_value, "routing_key": routing_key, "doc": doc_obj});
+    let mut line = serde_json::to_vec(&payload).context("Failed to serialize CSV payload")?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+/// The CSV loader's batch state: payload serialization, accumulation, and the flush
+/// that ships a full batch. Kept as a struct because the loader's two phases (replay
+/// the sample buffer, then stream) both write through it.
+struct CsvIngest {
+    headers: Vec<(String, Option<TantivyFieldType>)>,
+    id_detection: IdFieldDetection,
+    id_header: String,
+    batch_size: usize,
+    batch_body: Vec<u8>,
+    docs_in_batch: usize,
+    total_sent: usize,
+    total_failed: usize,
+}
+
+impl CsvIngest {
+    fn new(
+        headers: Vec<(String, Option<TantivyFieldType>)>,
+        id_detection: IdFieldDetection,
+        id_header: String,
+        batch_size: usize,
+    ) -> Self {
+        Self {
+            headers,
+            id_detection,
+            id_header,
+            batch_size: batch_size.max(1),
+            batch_body: Vec::new(),
+            docs_in_batch: 0,
+            total_sent: 0,
+            total_failed: 0,
+        }
+    }
+
+    async fn push_row(
+        &mut self,
+        client: &CameoClient,
+        index: &str,
+        record: &csv::StringRecord,
+    ) -> Result<()> {
+        let line = csv_ndjson_line(record, &self.headers, &self.id_detection, &self.id_header)?;
+        self.batch_body.extend_from_slice(&line);
+        self.docs_in_batch += 1;
+        if self.docs_in_batch >= self.batch_size {
+            self.flush(client, index).await?;
+        }
+        Ok(())
+    }
+
+    /// Build the schema the buffered rows describe, install it, then replay the rows as
+    /// ordinary data — the order matters, the index must have its schema first.
+    async fn create_schema_and_drain(
+        &mut self,
+        client: &CameoClient,
+        index: &str,
+        sample_rows: &mut Vec<csv::StringRecord>,
+    ) -> Result<()> {
+        let schema_json = csv_sample_schema(&self.headers, &self.id_detection, sample_rows)?;
+        client
+            .put_index_config(index, &schema_json)
+            .await
+            .with_context(|| format!("Failed to create schema for index '{}'", index))?;
+        println!(
+            "Schema was missing; detected and applied schema to index '{}'",
+            index
+        );
+        for row in sample_rows.drain(..) {
+            self.push_row(client, index, &row).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self, client: &CameoClient, index: &str) -> Result<()> {
+        flush_ndjson_batch(
+            client,
+            index,
+            &mut self.batch_body,
+            &mut self.total_sent,
+            &mut self.total_failed,
+        )
+        .await?;
+        self.docs_in_batch = 0;
+        Ok(())
     }
 }
 
@@ -2290,33 +2449,7 @@ async fn detect_schema_from_csv(
         schema.add_shadow_field(name, field_type);
     }
 
-    // CRITICAL: Mark all fields as indexed when loading schema from CSV/TSV file
-    // This is different from dynamic evolution during writes, where fields start as non-indexed
-    // When explicitly creating a schema from CSV/TSV, all fields should be indexed by default
-    // IMPORTANT: Only 'id' field is stored in Tantivy; all other data comes from redb
-    // CRITICAL: Preserve shadow field status - shadow fields should remain non-indexed and non-stored
-    for (name, field_def) in schema.fields.iter_mut() {
-        // Don't modify shadow fields - they have special requirements
-        if !field_def.is_shadow {
-            field_def.indexed = true;
-            // Only 'id' field should be stored in Tantivy (architecture rule)
-            field_def.stored = name == "id";
-        }
-    }
-
-    // Apply type hints where provided
-    for (name, hint) in &headers {
-        if let Some(t) = hint.clone() {
-            // Don't overwrite shadow fields - preserve their special status
-            if !schema.fields.get(name).is_some_and(|f| f.is_shadow) {
-                // FieldDef::new already sets correct stored/fast flags per architecture
-                let mut field_def = FieldDef::new(name.clone(), t);
-                field_def.indexed = true;
-                // stored flag already set correctly by FieldDef::new (only 'id' = true)
-                schema.fields.insert(name.clone(), field_def);
-            }
-        }
-    }
+    finalize_csv_schema(&mut schema, &headers);
 
     // Ensure 'id' field is explicitly defined in schema with proper settings
     if !schema.fields.contains_key("id") {
@@ -2562,38 +2695,11 @@ fn collect_effective_json_documents(docs: &[JsonValue]) -> Result<Vec<JsonValue>
     docs.iter().map(effective_json_document).collect()
 }
 
+/// The same ranking as [`detect_id_field`], but JSON keeps the field's own spelling —
+/// the shadow field is named after it.
 fn detect_id_field_name(field_names: &[String]) -> Option<String> {
-    if let Some(name) = field_names
-        .iter()
-        .find(|name| name.eq_ignore_ascii_case("id"))
-    {
-        return Some(name.clone());
-    }
-
-    for hash_name in ["sha256", "sha1", "md5"] {
-        if let Some(name) = field_names
-            .iter()
-            .find(|name| name.eq_ignore_ascii_case(hash_name))
-        {
-            return Some(name.clone());
-        }
-    }
-
-    if let Some(name) = field_names.iter().find(|name| {
-        let lower = name.to_lowercase();
-        lower.ends_with("id") || lower.ends_with("_id")
-    }) {
-        return Some(name.clone());
-    }
-
-    if let Some(name) = field_names
-        .iter()
-        .find(|name| name.to_lowercase().contains("id"))
-    {
-        return Some(name.clone());
-    }
-
-    field_names.first().cloned()
+    detect_id_field_index(field_names.iter().map(String::as_str))
+        .map(|idx| field_names[idx].clone())
 }
 
 fn detect_json_id_field_name(docs: &[JsonValue]) -> Result<String> {
@@ -3215,47 +3321,13 @@ where
     }
 }
 
-fn for_each_json_document_in_local_source<F>(
-    source: &str,
-    format: SourceFormat,
-    on_doc: F,
-) -> Result<usize>
-where
-    F: FnMut(JsonValue) -> Result<()>,
-{
-    let path = Path::new(source);
-    let compression = detect_compression(source);
-    let reader = open_local_reader(path, compression)?;
-    for_each_json_document_in_reader(reader, format, on_doc)
-}
-
-fn analyze_local_json_source_for_schema(
-    source: &str,
-    format: SourceFormat,
+/// The shared tail of every analyze pass: a stream that produced no usable document
+/// cannot describe a schema, and one that did must name its id field.
+fn json_source_analysis(
+    sample_docs: Vec<JsonValue>,
+    field_names: Vec<String>,
+    count: usize,
 ) -> Result<JsonSourceAnalysis> {
-    let mut sample_docs = Vec::new();
-    let mut field_names = Vec::new();
-    let mut seen = HashSet::new();
-
-    let count = for_each_json_document_in_local_source(source, format, |raw_doc| {
-        let effective_doc = effective_json_document(&raw_doc)?;
-        let obj = effective_doc
-            .as_object()
-            .ok_or_else(|| anyhow!("JSON source documents must be objects"))?;
-
-        if sample_docs.len() < SCHEMA_SAMPLE_LIMIT {
-            sample_docs.push(JsonValue::Object(obj.clone()));
-        }
-
-        for key in obj.keys() {
-            if seen.insert(key.clone()) {
-                field_names.push(key.clone());
-            }
-        }
-
-        Ok(())
-    })?;
-
     if count == 0 || sample_docs.is_empty() {
         anyhow::bail!("JSON source does not contain any valid object documents");
     }
@@ -3267,6 +3339,14 @@ fn analyze_local_json_source_for_schema(
         sample_docs,
         id_field,
     })
+}
+
+fn analyze_local_json_source_for_schema(
+    source: &str,
+    format: SourceFormat,
+) -> Result<JsonSourceAnalysis> {
+    let reader = open_local_reader(Path::new(source), detect_compression(source))?;
+    analyze_reader_json_source_for_schema(reader, format)
 }
 
 fn analyze_reader_json_source_for_schema<R: Read>(
@@ -3278,35 +3358,10 @@ fn analyze_reader_json_source_for_schema<R: Read>(
     let mut seen = HashSet::new();
 
     let count = for_each_json_document_in_reader(reader, format, |raw_doc| {
-        let effective_doc = effective_json_document(&raw_doc)?;
-        let obj = effective_doc
-            .as_object()
-            .ok_or_else(|| anyhow!("JSON source documents must be objects"))?;
-
-        if sample_docs.len() < SCHEMA_SAMPLE_LIMIT {
-            sample_docs.push(JsonValue::Object(obj.clone()));
-        }
-
-        for key in obj.keys() {
-            if seen.insert(key.clone()) {
-                field_names.push(key.clone());
-            }
-        }
-
-        Ok(())
+        collect_json_analysis_doc(&raw_doc, &mut sample_docs, &mut field_names, &mut seen)
     })?;
 
-    if count == 0 || sample_docs.is_empty() {
-        anyhow::bail!("JSON source does not contain any valid object documents");
-    }
-
-    let id_field = detect_id_field_name(&field_names)
-        .ok_or_else(|| anyhow!("Unable to detect an id field from JSON documents"))?;
-
-    Ok(JsonSourceAnalysis {
-        sample_docs,
-        id_field,
-    })
+    json_source_analysis(sample_docs, field_names, count)
 }
 
 fn build_doc_payload_from_json_document(raw_doc: &JsonValue, id_field: &str) -> Result<JsonValue> {
@@ -3448,17 +3503,11 @@ async fn load_json_value_from_source(client: &CameoClient, source: &str) -> Resu
     }
 }
 
-async fn for_each_json_document_in_http_source<F>(
-    client: &CameoClient,
-    source: &str,
-    format: SourceFormat,
-    mut on_doc: F,
-) -> Result<usize>
-where
-    F: FnMut(JsonValue) -> Result<()>,
-{
+/// Open a streaming GET against a remote JSON source, refusing a non-2xx status before
+/// the caller reads an error page as documents.
+async fn open_http_json_stream(client: &CameoClient, source: &str) -> Result<reqwest::Response> {
     let url = Url::parse(source).context("Invalid URL for JSON source")?;
-    let mut response = client
+    let response = client
         .source_http()
         .get(url)
         .send()
@@ -3469,7 +3518,19 @@ where
         let text = response.text().await.unwrap_or_default();
         anyhow::bail!("Failed to fetch remote JSON source: {} - {}", status, text);
     }
+    Ok(response)
+}
 
+async fn for_each_json_document_in_http_source<F>(
+    client: &CameoClient,
+    source: &str,
+    format: SourceFormat,
+    mut on_doc: F,
+) -> Result<usize>
+where
+    F: FnMut(JsonValue) -> Result<()>,
+{
+    let mut response = open_http_json_stream(client, source).await?;
     let mut parser = JsonChunkParser::new(format)?;
     let mut count = 0usize;
 
@@ -3507,17 +3568,7 @@ async fn analyze_http_json_source_for_schema(
     })
     .await?;
 
-    if count == 0 || sample_docs.is_empty() {
-        anyhow::bail!("JSON source does not contain any valid object documents");
-    }
-
-    let id_field = detect_id_field_name(&field_names)
-        .ok_or_else(|| anyhow!("Unable to detect an id field from JSON documents"))?;
-
-    Ok(JsonSourceAnalysis {
-        sample_docs,
-        id_field,
-    })
+    json_source_analysis(sample_docs, field_names, count)
 }
 
 async fn analyze_json_source_for_schema(
@@ -3580,6 +3631,169 @@ async fn flush_ndjson_batch(
     Ok(())
 }
 
+/// What a document pushed through [`JsonIngestPipeline`] made ready. The schema is
+/// emitted once, the moment the sample names an id field; a batch is emitted each time
+/// the buffer fills — and once at the end with whatever is left.
+enum JsonIngestEvent {
+    CreateSchema(JsonSourceAnalysis),
+    DataBatch(Vec<u8>),
+}
+
+/// The single-pass JSON ingest protocol both loaders run: buffer up to
+/// `SCHEMA_SAMPLE_LIMIT` documents until their fields name an id, emit the schema (when
+/// the index has none), replay the buffer as the first batches, then stream the rest
+/// straight into NDJSON batches. What differs between the loaders is only how the events
+/// are delivered — awaited inline for an HTTP stream, sent down a channel from the
+/// blocking reader thread.
+struct JsonIngestPipeline {
+    schema_exists: bool,
+    batch_size: usize,
+    sample_docs: Vec<JsonValue>,
+    raw_sample_docs: Vec<JsonValue>,
+    field_names: Vec<String>,
+    seen_fields: HashSet<String>,
+    batch_body: Vec<u8>,
+    docs_in_batch: usize,
+    id_field: Option<String>,
+    samples_flushed: bool,
+}
+
+impl JsonIngestPipeline {
+    fn new(batch_size: usize, schema_exists: bool) -> Self {
+        Self {
+            schema_exists,
+            batch_size: batch_size.max(1),
+            sample_docs: Vec::new(),
+            raw_sample_docs: Vec::new(),
+            field_names: Vec::new(),
+            seen_fields: HashSet::new(),
+            batch_body: Vec::new(),
+            docs_in_batch: 0,
+            id_field: None,
+            samples_flushed: false,
+        }
+    }
+
+    fn push(&mut self, raw_doc: &JsonValue, events: &mut Vec<JsonIngestEvent>) -> Result<()> {
+        if self.samples_flushed {
+            return self.append_doc(raw_doc, events);
+        }
+
+        let effective_doc = effective_json_document(raw_doc)?;
+        let obj = effective_doc
+            .as_object()
+            .ok_or_else(|| anyhow!("JSON source documents must be objects"))?;
+        if self.sample_docs.len() < SCHEMA_SAMPLE_LIMIT {
+            self.sample_docs.push(JsonValue::Object(obj.clone()));
+            self.raw_sample_docs.push(raw_doc.clone());
+            for key in obj.keys() {
+                if self.seen_fields.insert(key.clone()) {
+                    self.field_names.push(key.clone());
+                }
+            }
+        }
+        if self.id_field.is_none() && self.sample_docs.len() >= SCHEMA_SAMPLE_LIMIT {
+            self.id_field = Some(self.detect_id_field()?);
+        }
+        if self.id_field.is_some() {
+            self.flush_samples(events)?;
+        }
+        Ok(())
+    }
+
+    /// End of stream: name the id field from whatever sample the source produced, replay
+    /// it, and emit the last partial batch. An empty source is simply an empty load.
+    fn finish(&mut self, events: &mut Vec<JsonIngestEvent>) -> Result<()> {
+        if !self.samples_flushed && !self.sample_docs.is_empty() {
+            if self.id_field.is_none() {
+                self.id_field = Some(self.detect_id_field()?);
+            }
+            self.flush_samples(events)?;
+        }
+        if !self.batch_body.is_empty() {
+            events.push(JsonIngestEvent::DataBatch(std::mem::take(
+                &mut self.batch_body,
+            )));
+            self.docs_in_batch = 0;
+        }
+        Ok(())
+    }
+
+    fn detect_id_field(&self) -> Result<String> {
+        detect_id_field_name(&self.field_names)
+            .ok_or_else(|| anyhow!("Unable to detect an id field from JSON documents"))
+    }
+
+    /// The sample has named an id field: emit the schema built from it, then replay the
+    /// buffered documents through the normal append path so they land in batches.
+    fn flush_samples(&mut self, events: &mut Vec<JsonIngestEvent>) -> Result<()> {
+        if !self.schema_exists {
+            events.push(JsonIngestEvent::CreateSchema(JsonSourceAnalysis {
+                sample_docs: self.sample_docs.clone(),
+                id_field: self.id_field.clone().expect("set before flush_samples"),
+            }));
+        }
+        let buffered = std::mem::take(&mut self.raw_sample_docs);
+        self.samples_flushed = true;
+        for raw_doc in &buffered {
+            self.append_doc(raw_doc, events)?;
+        }
+        Ok(())
+    }
+
+    fn append_doc(&mut self, raw_doc: &JsonValue, events: &mut Vec<JsonIngestEvent>) -> Result<()> {
+        let id_field = self
+            .id_field
+            .as_deref()
+            .expect("set before the first append");
+        let payload = build_doc_payload_from_json_document(raw_doc, id_field)?;
+        let mut line = serde_json::to_vec(&payload).context("Failed to serialize JSON payload")?;
+        line.push(b'\n');
+        self.batch_body.extend_from_slice(&line);
+        self.docs_in_batch += 1;
+        if self.docs_in_batch >= self.batch_size {
+            events.push(JsonIngestEvent::DataBatch(std::mem::take(
+                &mut self.batch_body,
+            )));
+            self.docs_in_batch = 0;
+        }
+        Ok(())
+    }
+}
+
+/// Deliver one event the HTTP way: the schema becomes a `PUT /index` and a batch becomes
+/// an NDJSON stream. The reader loader's consumer runs the same match per channel message.
+async fn deliver_json_ingest_event(
+    client: &CameoClient,
+    index: &str,
+    event: JsonIngestEvent,
+    total_sent: &mut usize,
+    total_failed: &mut usize,
+) -> Result<()> {
+    match event {
+        JsonIngestEvent::CreateSchema(analysis) => {
+            let schema = build_schema_from_effective_json_documents(
+                &analysis.sample_docs,
+                &analysis.id_field,
+            )
+            .context("Failed to detect schema while auto-creating index schema")?;
+            client
+                .put_index_config(index, &schema)
+                .await
+                .with_context(|| format!("Failed to create schema for index '{}'", index))?;
+            println!(
+                "Schema was missing; detected and applied schema to index '{}'",
+                index
+            );
+        }
+        JsonIngestEvent::DataBatch(batch_body) => {
+            let response = client.stream_index_ndjson(index, batch_body).await?;
+            record_ingest_response(&response, total_sent, total_failed);
+        }
+    }
+    Ok(())
+}
+
 async fn load_data_from_http_json_source_single_pass(
     client: &CameoClient,
     index: &str,
@@ -3590,244 +3804,58 @@ async fn load_data_from_http_json_source_single_pass(
 ) -> Result<()> {
     let batch_size = batch_size.max(1);
     let mut spinner = ProgressSpinner::new();
-    let url = Url::parse(source).context("Invalid URL for JSON source")?;
-    let mut response = client
-        .source_http()
-        .get(url)
-        .send()
-        .await
-        .context("Failed to fetch remote JSON source")?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
-        spinner.stop();
-        anyhow::bail!("Failed to fetch remote JSON source: {} - {}", status, text);
-    }
 
-    let mut parser = JsonChunkParser::new(format)?;
-    let mut sample_docs = Vec::new();
-    let mut field_names = Vec::new();
-    let mut seen = HashSet::new();
-    let mut raw_sample_docs: Vec<JsonValue> = Vec::new();
-    let mut batch_body = Vec::new();
-    let mut docs_in_batch = 0usize;
-    let mut total_sent = 0usize;
-    let mut total_failed = 0usize;
-    let mut id_field_detected: Option<String> = None;
-    let mut samples_flushed = false;
+    let result: Result<(usize, usize)> = async {
+        let mut response = open_http_json_stream(client, source).await?;
+        let mut parser = JsonChunkParser::new(format)?;
+        let mut pipeline = JsonIngestPipeline::new(batch_size, schema_exists);
+        let mut events = Vec::new();
+        let mut total_sent = 0usize;
+        let mut total_failed = 0usize;
 
-    // Helper: collect effective doc fields for schema sampling
-    let collect_sample = |raw_doc: &JsonValue,
-                          sample_docs: &mut Vec<JsonValue>,
-                          raw_sample_docs: &mut Vec<JsonValue>,
-                          field_names: &mut Vec<String>,
-                          seen: &mut HashSet<String>|
-     -> Result<()> {
-        let effective_doc = effective_json_document(raw_doc)?;
-        let obj = effective_doc
-            .as_object()
-            .ok_or_else(|| anyhow!("JSON source documents must be objects"))?;
-        if sample_docs.len() < SCHEMA_SAMPLE_LIMIT {
-            sample_docs.push(JsonValue::Object(obj.clone()));
-            raw_sample_docs.push(raw_doc.clone());
-            for key in obj.keys() {
-                if seen.insert(key.clone()) {
-                    field_names.push(key.clone());
-                }
-            }
-        }
-        Ok(())
-    };
-
-    // Helper: serialize a single doc into the NDJSON batch buffer
-    let append_doc_to_batch = |raw_doc: &JsonValue,
-                               id_field: &str,
-                               batch_body: &mut Vec<u8>,
-                               docs_in_batch: &mut usize|
-     -> Result<()> {
-        let payload = build_doc_payload_from_json_document(raw_doc, id_field)?;
-        let mut line = serde_json::to_vec(&payload).context("Failed to serialize JSON payload")?;
-        line.push(b'\n');
-        batch_body.extend_from_slice(&line);
-        *docs_in_batch += 1;
-        Ok(())
-    };
-
-    let result: Result<JsonSourceAnalysis> = async {
         while let Some(chunk) = response
             .chunk()
             .await
             .context("Failed to read remote JSON source body")?
         {
             for raw_doc in parser.push_chunk(&chunk)? {
-                if !samples_flushed {
-                    collect_sample(
-                        &raw_doc,
-                        &mut sample_docs,
-                        &mut raw_sample_docs,
-                        &mut field_names,
-                        &mut seen,
-                    )?;
-                    if id_field_detected.is_none() && sample_docs.len() >= SCHEMA_SAMPLE_LIMIT {
-                        id_field_detected = Some(
-                            detect_id_field_name(&field_names)
-                                .ok_or_else(|| anyhow!("Unable to detect id field"))?,
-                        );
-                    }
-                    if let Some(ref id_field) = id_field_detected {
-                        if !schema_exists {
-                            let schema =
-                                build_schema_from_effective_json_documents(&sample_docs, id_field)?;
-                            client
-                                .put_index_config(index, &schema)
-                                .await
-                                .with_context(|| {
-                                    format!("Failed to create schema for index '{}'", index)
-                                })?;
-                            println!(
-                                "Schema was missing; detected and applied schema to index '{}'",
-                                index
-                            );
-                        }
-                        // Flush all buffered sample docs
-                        for buffered_doc in raw_sample_docs.drain(..) {
-                            append_doc_to_batch(
-                                &buffered_doc,
-                                id_field,
-                                &mut batch_body,
-                                &mut docs_in_batch,
-                            )?;
-                            if docs_in_batch >= batch_size {
-                                flush_ndjson_batch(
-                                    client,
-                                    index,
-                                    &mut batch_body,
-                                    &mut total_sent,
-                                    &mut total_failed,
-                                )
-                                .await?;
-                                docs_in_batch = 0;
-                            }
-                        }
-                        samples_flushed = true;
-                    }
-                    continue;
-                }
-                if let Some(ref id_field) = id_field_detected {
-                    append_doc_to_batch(&raw_doc, id_field, &mut batch_body, &mut docs_in_batch)?;
-                    if docs_in_batch >= batch_size {
-                        flush_ndjson_batch(
-                            client,
-                            index,
-                            &mut batch_body,
-                            &mut total_sent,
-                            &mut total_failed,
-                        )
-                        .await?;
-                        docs_in_batch = 0;
-                    }
-                }
-            }
-        }
-        for raw_doc in parser.finish()? {
-            if !samples_flushed {
-                collect_sample(
-                    &raw_doc,
-                    &mut sample_docs,
-                    &mut raw_sample_docs,
-                    &mut field_names,
-                    &mut seen,
-                )?;
-            }
-            if id_field_detected.is_none() {
-                id_field_detected = Some(
-                    detect_id_field_name(&field_names)
-                        .ok_or_else(|| anyhow!("Unable to detect id field"))?,
-                );
-            }
-            if !samples_flushed {
-                if let Some(ref id_field) = id_field_detected {
-                    if !schema_exists {
-                        let schema =
-                            build_schema_from_effective_json_documents(&sample_docs, id_field)?;
-                        client
-                            .put_index_config(index, &schema)
-                            .await
-                            .with_context(|| {
-                                format!("Failed to create schema for index '{}'", index)
-                            })?;
-                        println!(
-                            "Schema was missing; detected and applied schema to index '{}'",
-                            index
-                        );
-                    }
-                    for buffered_doc in raw_sample_docs.drain(..) {
-                        append_doc_to_batch(
-                            &buffered_doc,
-                            id_field,
-                            &mut batch_body,
-                            &mut docs_in_batch,
-                        )?;
-                        if docs_in_batch >= batch_size {
-                            flush_ndjson_batch(
-                                client,
-                                index,
-                                &mut batch_body,
-                                &mut total_sent,
-                                &mut total_failed,
-                            )
-                            .await?;
-                            docs_in_batch = 0;
-                        }
-                    }
-                    samples_flushed = true;
-                }
-                continue;
-            }
-            if let Some(ref id_field) = id_field_detected {
-                append_doc_to_batch(&raw_doc, id_field, &mut batch_body, &mut docs_in_batch)?;
-                if docs_in_batch >= batch_size {
-                    flush_ndjson_batch(
+                pipeline.push(&raw_doc, &mut events)?;
+                for event in events.drain(..) {
+                    deliver_json_ingest_event(
                         client,
                         index,
-                        &mut batch_body,
+                        event,
                         &mut total_sent,
                         &mut total_failed,
                     )
                     .await?;
-                    docs_in_batch = 0;
                 }
             }
         }
-        flush_ndjson_batch(
-            client,
-            index,
-            &mut batch_body,
-            &mut total_sent,
-            &mut total_failed,
-        )
-        .await?;
-        let id_field = id_field_detected.ok_or_else(|| anyhow!("Unable to detect id field"))?;
-        Ok(JsonSourceAnalysis {
-            sample_docs,
-            id_field,
-        })
+        for raw_doc in parser.finish()? {
+            pipeline.push(&raw_doc, &mut events)?;
+            for event in events.drain(..) {
+                deliver_json_ingest_event(client, index, event, &mut total_sent, &mut total_failed)
+                    .await?;
+            }
+        }
+        pipeline.finish(&mut events)?;
+        for event in events.drain(..) {
+            deliver_json_ingest_event(client, index, event, &mut total_sent, &mut total_failed)
+                .await?;
+        }
+        Ok((total_sent, total_failed))
     }
     .await;
 
     spinner.stop();
-    let _analysis = result?;
+    let (total_sent, total_failed) = result?;
 
     println!(
         "Ingestion complete for index '{}': loaded={} failed={} (batch size {})",
         index, total_sent, total_failed, batch_size
     );
     Ok(())
-}
-
-enum LocalJsonProducerMsg {
-    CreateSchema(JsonSourceAnalysis),
-    DataBatch(Vec<u8>),
 }
 
 async fn load_data_from_reader_json_source_single_pass(
@@ -3840,173 +3868,44 @@ async fn load_data_from_reader_json_source_single_pass(
 ) -> Result<()> {
     let batch_size = batch_size.max(1);
     let mut spinner = ProgressSpinner::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<LocalJsonProducerMsg>(2);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<JsonIngestEvent>(2);
 
-    let producer = tokio::task::spawn_blocking(move || -> Result<usize> {
-        let mut sample_docs = Vec::new();
-        let mut field_names = Vec::new();
-        let mut seen = HashSet::new();
-        let mut raw_sample_docs: Vec<JsonValue> = Vec::new();
-        let mut batch_body = Vec::new();
-        let mut docs_in_batch = 0usize;
-        let mut total_docs = 0usize;
-        let mut id_field_detected: Option<String> = None;
-        let mut samples_flushed = false;
-
+    // The reader is blocking, so the pipeline runs on a worker thread and reports
+    // readiness as events; the async side delivers them in the order they arrive.
+    let producer = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut pipeline = JsonIngestPipeline::new(batch_size, schema_exists);
+        let mut events = Vec::new();
         let send_err = || anyhow!("Failed to send message because receiver was dropped");
+        let drain = |events: &mut Vec<JsonIngestEvent>| -> Result<()> {
+            for event in events.drain(..) {
+                tx.blocking_send(event).map_err(|_| send_err())?;
+            }
+            Ok(())
+        };
 
         for_each_json_document_in_reader(reader, format, |raw_doc| {
-            let effective_doc = effective_json_document(&raw_doc)?;
-            let obj = effective_doc
-                .as_object()
-                .ok_or_else(|| anyhow!("JSON source documents must be objects"))?;
-
-            // Phase 1: Collect samples
-            if !samples_flushed {
-                if sample_docs.len() < SCHEMA_SAMPLE_LIMIT {
-                    sample_docs.push(JsonValue::Object(obj.clone()));
-                    raw_sample_docs.push(raw_doc.clone());
-                    for key in obj.keys() {
-                        if seen.insert(key.clone()) {
-                            field_names.push(key.clone());
-                        }
-                    }
-                }
-
-                if id_field_detected.is_none() && sample_docs.len() >= SCHEMA_SAMPLE_LIMIT {
-                    id_field_detected =
-                        Some(detect_id_field_name(&field_names).ok_or_else(|| {
-                            anyhow!("Unable to detect an id field from JSON documents")
-                        })?);
-                }
-
-                if let Some(ref id_field) = id_field_detected {
-                    if !schema_exists {
-                        tx.blocking_send(LocalJsonProducerMsg::CreateSchema(JsonSourceAnalysis {
-                            sample_docs: sample_docs.clone(),
-                            id_field: id_field.clone(),
-                        }))
-                        .map_err(|_| send_err())?;
-                    }
-
-                    // Flush all buffered raw docs as data batches
-                    for buffered_doc in raw_sample_docs.drain(..) {
-                        let payload =
-                            build_doc_payload_from_json_document(&buffered_doc, id_field)?;
-                        let mut line = serde_json::to_vec(&payload)?;
-                        line.push(b'\n');
-                        batch_body.extend_from_slice(&line);
-                        docs_in_batch += 1;
-                        total_docs += 1;
-
-                        if docs_in_batch >= batch_size {
-                            tx.blocking_send(LocalJsonProducerMsg::DataBatch(std::mem::take(
-                                &mut batch_body,
-                            )))
-                            .map_err(|_| send_err())?;
-                            docs_in_batch = 0;
-                        }
-                    }
-                    samples_flushed = true;
-                }
-                return Ok(());
-            }
-
-            // Phase 2: Normal ingestion after samples flushed
-            let id_field = id_field_detected.as_ref().unwrap();
-            let payload = build_doc_payload_from_json_document(&raw_doc, id_field)?;
-            let mut line = serde_json::to_vec(&payload)?;
-            line.push(b'\n');
-            batch_body.extend_from_slice(&line);
-            docs_in_batch += 1;
-            total_docs += 1;
-
-            if docs_in_batch >= batch_size {
-                tx.blocking_send(LocalJsonProducerMsg::DataBatch(std::mem::take(
-                    &mut batch_body,
-                )))
-                .map_err(|_| send_err())?;
-                docs_in_batch = 0;
-            }
-
-            Ok(())
+            pipeline.push(&raw_doc, &mut events)?;
+            drain(&mut events)
         })?;
-
-        // Handle small files (fewer than SCHEMA_SAMPLE_LIMIT docs)
-        if !samples_flushed && !sample_docs.is_empty() {
-            let id_field = id_field_detected
-                .or_else(|| detect_id_field_name(&field_names))
-                .ok_or_else(|| anyhow!("Unable to detect an id field from JSON documents"))?;
-
-            if !schema_exists {
-                tx.blocking_send(LocalJsonProducerMsg::CreateSchema(JsonSourceAnalysis {
-                    sample_docs,
-                    id_field: id_field.clone(),
-                }))
-                .map_err(|_| send_err())?;
-            }
-
-            for buffered_doc in raw_sample_docs.drain(..) {
-                let payload = build_doc_payload_from_json_document(&buffered_doc, &id_field)?;
-                let mut line = serde_json::to_vec(&payload)?;
-                line.push(b'\n');
-                batch_body.extend_from_slice(&line);
-                docs_in_batch += 1;
-                total_docs += 1;
-
-                if docs_in_batch >= batch_size {
-                    tx.blocking_send(LocalJsonProducerMsg::DataBatch(std::mem::take(
-                        &mut batch_body,
-                    )))
-                    .map_err(|_| send_err())?;
-                    docs_in_batch = 0;
-                }
-            }
-        }
-
-        if !batch_body.is_empty() {
-            tx.blocking_send(LocalJsonProducerMsg::DataBatch(batch_body))
-                .map_err(|_| send_err())?;
-        }
-
-        Ok(total_docs)
+        pipeline.finish(&mut events)?;
+        drain(&mut events)?;
+        Ok(())
     });
 
     let mut total_sent = 0usize;
     let mut total_failed = 0usize;
 
     let send_result: Result<()> = async {
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                LocalJsonProducerMsg::CreateSchema(analysis) => {
-                    let schema = build_schema_from_effective_json_documents(
-                        &analysis.sample_docs,
-                        &analysis.id_field,
-                    )
-                    .context("Failed to detect schema while auto-creating index schema")?;
-                    client
-                        .put_index_config(index, &schema)
-                        .await
-                        .with_context(|| {
-                            format!("Failed to create schema for index '{}'", index)
-                        })?;
-                    println!(
-                        "Schema was missing; detected and applied schema to index '{}'",
-                        index
-                    );
-                }
-                LocalJsonProducerMsg::DataBatch(batch_body) => {
-                    let response = client.stream_index_ndjson(index, batch_body).await?;
-                    record_ingest_response(&response, &mut total_sent, &mut total_failed);
-                }
-            }
+        while let Some(event) = rx.recv().await {
+            deliver_json_ingest_event(client, index, event, &mut total_sent, &mut total_failed)
+                .await?;
         }
         Ok(())
     }
     .await;
 
     drop(rx);
-    let _total_docs = producer
+    producer
         .await
         .map_err(|err| anyhow!("Local JSON batch producer failed: {}", err))??;
 
@@ -4134,7 +4033,6 @@ async fn load_data_from_csv_single_pass(
     batch_size: usize,
     schema_exists: bool,
 ) -> Result<()> {
-    let batch_size = batch_size.max(1);
     let mut spinner = ProgressSpinner::new();
     let mut reader = open_csv_reader(client, source, delimiter).await?;
     let raw_headers = reader
@@ -4145,218 +4043,51 @@ async fn load_data_from_csv_single_pass(
         raw_headers.iter().map(parse_header_with_hint).collect();
     let id_detection = detect_id_field(&headers);
     let id_header = id_detection.original_field_name.clone();
+    let mut ingest = CsvIngest::new(headers, id_detection, id_header, batch_size);
 
+    // Rows whose id cell is empty are skipped. Until the schema exists the rows are
+    // only buffered — the sample must name the fields before anything can be sent.
     let mut sample_rows: Vec<csv::StringRecord> = Vec::new();
-    let mut batch_body = Vec::new();
-    let mut docs_in_batch = 0usize;
-    let mut total_sent = 0usize;
-    let mut total_failed = 0usize;
-    let mut schema_created = schema_exists;
-
-    // Helper: convert a CSV record into an NDJSON payload line
-    let build_csv_ndjson_line = |record: &csv::StringRecord,
-                                 headers: &[(String, Option<TantivyFieldType>)],
-                                 id_detection: &IdFieldDetection,
-                                 id_header: &str|
-     -> Result<Vec<u8>> {
-        let id_value = record
-            .get(id_detection.index)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let mut doc_obj: JsonMap<String, JsonValue> = JsonMap::new();
-        for (idx, value) in record.iter().enumerate() {
-            if let Some((header, _)) = headers.get(idx) {
-                doc_obj.insert(header.clone(), parse_csv_cell(value));
-            }
-        }
-        doc_obj.insert("id".to_string(), JsonValue::String(id_value.clone()));
-        let routing_key = doc_obj
-            .get(id_header)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| id_value.clone());
-        let payload = json!({"id": id_value, "routing_key": routing_key, "doc": doc_obj});
-        let mut line = serde_json::to_vec(&payload).context("Failed to serialize CSV payload")?;
-        line.push(b'\n');
-        Ok(line)
-    };
+    let mut needs_schema = !schema_exists;
 
     for record in reader.records() {
         let record = record.context("Failed to read CSV record")?;
-        let id_value_raw = record.get(id_detection.index).unwrap_or_default();
-        if id_value_raw.trim().is_empty() {
+        if record
+            .get(ingest.id_detection.index)
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
             continue;
         }
 
-        if !schema_created {
+        if needs_schema {
             sample_rows.push(record.clone());
             if sample_rows.len() >= SCHEMA_SAMPLE_LIMIT {
-                let mut schema = IndexSchema::default();
-                if id_detection.is_shadow {
-                    let field_type = headers[id_detection.index]
-                        .1
-                        .clone()
-                        .unwrap_or(TantivyFieldType::Text);
-                    schema.add_shadow_field(id_detection.original_field_name.clone(), field_type);
-                }
-                // Use the same schema detection logic as detect_schema_from_csv
-                // This ensures all fields are marked as indexed (not just evolved as non-indexed)
-                for row in &sample_rows {
-                    let mut obj: JsonMap<String, JsonValue> = JsonMap::new();
-                    for (idx, value) in row.iter().enumerate() {
-                        if let Some((header, _)) = headers.get(idx) {
-                            obj.insert(header.clone(), parse_csv_cell(value));
-                        }
-                    }
-                    if let Some(raw_id) = row.get(id_detection.index) {
-                        let id_val = raw_id.trim();
-                        if !id_val.is_empty() {
-                            obj.insert("id".to_string(), JsonValue::String(id_val.to_string()));
-                        }
-                    }
-                    schema.evolve_from_document(&JsonValue::Object(obj));
-                }
-
-                // CRITICAL: Apply the same field indexing logic as detect_schema_from_csv
-                // This ensures all fields are marked as indexed when loading data, not just during schema detection
-                for (name, field_def) in schema.fields.iter_mut() {
-                    // Don't modify shadow fields - they have special requirements
-                    if !field_def.is_shadow {
-                        field_def.indexed = true;
-                        // Only 'id' field should be stored in Tantivy (architecture rule)
-                        field_def.stored = name == "id";
-                    }
-                }
-
-                // Apply type hints where provided
-                for (name, hint) in &headers {
-                    if let Some(t) = hint.clone() {
-                        // Don't overwrite shadow fields - preserve their special status
-                        if !schema.fields.get(name).is_some_and(|f| f.is_shadow) {
-                            // FieldDef::new already sets correct stored/fast flags per architecture
-                            let mut field_def = FieldDef::new(name.clone(), t);
-                            field_def.indexed = true;
-                            // stored flag already set correctly by FieldDef::new (only 'id' = true)
-                            schema.fields.insert(name.clone(), field_def);
-                        }
-                    }
-                }
-                let schema_json =
-                    serde_json::to_value(&schema).context("Failed to serialize schema")?;
-                client
-                    .put_index_config(index, &schema_json)
-                    .await
-                    .with_context(|| format!("Failed to create schema for index '{}'", index))?;
-                schema_created = true;
-
-                // Flush all buffered sample rows as NDJSON payloads
-                for row in sample_rows.drain(..) {
-                    let line = build_csv_ndjson_line(&row, &headers, &id_detection, &id_header)?;
-                    batch_body.extend_from_slice(&line);
-                    docs_in_batch += 1;
-                    if docs_in_batch >= batch_size {
-                        flush_ndjson_batch(
-                            client,
-                            index,
-                            &mut batch_body,
-                            &mut total_sent,
-                            &mut total_failed,
-                        )
-                        .await?;
-                        docs_in_batch = 0;
-                    }
-                }
+                ingest
+                    .create_schema_and_drain(client, index, &mut sample_rows)
+                    .await?;
+                needs_schema = false;
             }
             continue;
         }
 
-        let line = build_csv_ndjson_line(&record, &headers, &id_detection, &id_header)?;
-        batch_body.extend_from_slice(&line);
-        docs_in_batch += 1;
+        ingest.push_row(client, index, &record).await?;
+    }
 
-        if docs_in_batch >= batch_size {
-            flush_ndjson_batch(
-                client,
-                index,
-                &mut batch_body,
-                &mut total_sent,
-                &mut total_failed,
-            )
+    // A source smaller than the sample limit describes its schema at the end instead.
+    if needs_schema && !sample_rows.is_empty() {
+        ingest
+            .create_schema_and_drain(client, index, &mut sample_rows)
             .await?;
-            docs_in_batch = 0;
-        }
     }
 
-    // Handle sources with fewer rows than SCHEMA_SAMPLE_LIMIT
-    if !schema_created && !sample_rows.is_empty() {
-        let mut schema = IndexSchema::default();
-        if id_detection.is_shadow {
-            let field_type = headers[id_detection.index]
-                .1
-                .clone()
-                .unwrap_or(TantivyFieldType::Text);
-            schema.add_shadow_field(id_detection.original_field_name.clone(), field_type);
-        }
-        for row in &sample_rows {
-            let mut obj: JsonMap<String, JsonValue> = JsonMap::new();
-            for (idx, value) in row.iter().enumerate() {
-                if let Some((header, _)) = headers.get(idx) {
-                    obj.insert(header.clone(), parse_csv_cell(value));
-                }
-            }
-            if let Some(raw_id) = row.get(id_detection.index) {
-                let id_val = raw_id.trim();
-                if !id_val.is_empty() {
-                    obj.insert("id".to_string(), JsonValue::String(id_val.to_string()));
-                }
-            }
-            schema.evolve_from_document(&JsonValue::Object(obj));
-        }
-        let schema_json = serde_json::to_value(&schema).context("Failed to serialize schema")?;
-        client
-            .put_index_config(index, &schema_json)
-            .await
-            .with_context(|| format!("Failed to create schema for index '{}'", index))?;
-        schema_created = true;
-
-        for row in sample_rows.drain(..) {
-            let line = build_csv_ndjson_line(&row, &headers, &id_detection, &id_header)?;
-            batch_body.extend_from_slice(&line);
-            docs_in_batch += 1;
-            if docs_in_batch >= batch_size {
-                flush_ndjson_batch(
-                    client,
-                    index,
-                    &mut batch_body,
-                    &mut total_sent,
-                    &mut total_failed,
-                )
-                .await?;
-                docs_in_batch = 0;
-            }
-        }
-    }
-
-    flush_ndjson_batch(
-        client,
-        index,
-        &mut batch_body,
-        &mut total_sent,
-        &mut total_failed,
-    )
-    .await?;
+    ingest.flush(client, index).await?;
     spinner.stop();
 
-    if schema_created {
-        println!(
-            "Schema was missing; detected and applied schema to index '{}'",
-            index
-        );
-    }
     println!(
         "Ingestion complete for index '{}': loaded={} failed={} (batch size {})",
-        index, total_sent, total_failed, batch_size
+        index, ingest.total_sent, ingest.total_failed, batch_size
     );
     Ok(())
 }

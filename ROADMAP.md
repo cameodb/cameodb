@@ -51,7 +51,7 @@ on one.
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half under L12 |
-| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11 done), six simplifications (L14–L17 done), and the retrospective itself |
+| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11 done), six simplifications (L14–L18 done), and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
 
@@ -3376,12 +3376,19 @@ of the same kind along the way:
 
 ### L18 — `cli.rs` says the same thing three ways
 
-**Simplification.** 📋 **Planned.** The two JSON single-pass loaders (HTTP and reader variants)
-run one ingest protocol written out twice; id-field detection exists in three flavours
-re-implementing one priority ranking; the CSV schema finalization block at ~2298–2319 is copied
-verbatim at ~4257–4278 behind a comment that says "CRITICAL: apply the same logic" — the
-comment is the bug report. One pipeline struct with a pluggable source, one ranking function,
-one finalizer.
+**Simplification.** ✅ **Done 2026-10-26.** One `JsonIngestPipeline` runs the single-pass
+protocol — buffer the sample, name the id field, emit the schema, replay, then batch —
+and reports readiness as `JsonIngestEvent`s; the HTTP loader awaits them inline, the
+reader loader's blocking producer sends them down a channel to the same
+`deliver_json_ingest_event` match. `id_field_rank` + `detect_id_field_index` are the one
+ranking; `detect_id_field` and `detect_id_field_name` keep only their different
+projections (CSV canonicalizes exact/hash matches to lowercase, JSON keeps the spelling).
+`finalize_csv_schema` is the one finalizer, called from `detect_schema_from_csv` and the
+loader's `csv_sample_schema`; `CsvIngest` holds the batch state both loader phases write
+through. Three fixes fell out: the small-file CSV branch now gets the index-marking and
+type hints the "same logic" comment always promised, the loader no longer prints "Schema
+was missing" when the index already had one, and an empty HTTP source loads zero
+documents instead of erroring — the reader path's existing leniency, unified.
 
 ### L19 — `config.rs` validates by repetition
 

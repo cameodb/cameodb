@@ -108,6 +108,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The CLI's data-load paths are one pipeline, one ranking, one finalizer** (L18). The two
+  JSON single-pass loaders — the HTTP stream and the blocking reader behind a channel — ran
+  the same sample-detect-schema-replay-batch protocol written out twice; it is one
+  `JsonIngestPipeline` now, reporting `JsonIngestEvent`s (`CreateSchema`, `DataBatch`) that
+  each side delivers its own way through the same `deliver_json_ingest_event` match.
+  Id-field detection existed in three flavours re-implementing one priority ranking —
+  exact `id`, then `sha256`/`sha1`/`md5`, then `*id`, then any `id` substring, else the
+  first field — which is `id_field_rank` + `detect_id_field_index` now; the CSV and JSON
+  wrappers keep only their different projections. And the CSV schema finalization that a
+  "CRITICAL: apply the same logic" comment copied between `detect_schema_from_csv` and the
+  loader is `finalize_csv_schema`, run from both. Three fixes fell out: a CSV smaller than
+  the sample limit now gets the index-marking and header type hints the larger path always
+  applied (its fields would otherwise have loaded unsearchable), the loader no longer
+  reports "Schema was missing" when the index already had one, and an empty HTTP source
+  loads zero documents instead of erroring — the reader path's existing leniency, unified.
+
 - **The two broadcast fan-outs share one** (L16). `handle_broadcast` and
   `handle_broadcast_streaming` each spelled out the same preamble — the broadcasts counter,
   the `GetKnownPeers` ask, the window widening, the per-peer timeout, the remote-concurrency
