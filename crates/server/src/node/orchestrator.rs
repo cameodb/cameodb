@@ -773,10 +773,8 @@ impl BulkCtx<'_> {
                 warn!("❌ Remote actor lookup error: {}", e);
                 OrchestratorError::Io(std::io::Error::other(e.to_string()))
             })?
-            .ok_or_else(|| {
-                OrchestratorError::PeerUnreachable {
-                    message: format!("Remote orchestrator for node {} not found", node_id),
-                }
+            .ok_or_else(|| OrchestratorError::PeerUnreachable {
+                message: format!("Remote orchestrator for node {} not found", node_id),
             })?;
 
         // One bit, and no schema. `forwarded` tells the owner this share is someone else's
@@ -852,10 +850,8 @@ impl BulkCtx<'_> {
             .get_orchestrator(node_id, ConnectionChannel::Operations)
             .await
             .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-            .ok_or_else(|| {
-                OrchestratorError::PeerUnreachable {
-                    message: format!("Remote orchestrator for node {} not found", node_id),
-                }
+            .ok_or_else(|| OrchestratorError::PeerUnreachable {
+                message: format!("Remote orchestrator for node {} not found", node_id),
             })?;
 
         // Kept so the peer's answer can be balanced against what it was actually given.

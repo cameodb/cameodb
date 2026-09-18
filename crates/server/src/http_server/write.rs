@@ -520,14 +520,10 @@ async fn flush_lines(
                 .unwrap_or_default();
 
             let unwritten = lines.len() - written as usize;
-            let renumbered = crate::node::renumber_reasons(
-                &reasons,
-                &lines,
-                "line",
-                unwritten,
-                "batch",
-                || "a document in this batch was neither written nor refused".to_string(),
-            );
+            let renumbered =
+                crate::node::renumber_reasons(&reasons, &lines, "line", unwritten, "batch", || {
+                    "a document in this batch was neither written nor refused".to_string()
+                });
             (written, renumbered)
         }
         // The batch never got an answer, so none of it was written.
@@ -549,11 +545,7 @@ async fn flush_lines(
 /// hashes of different byte ranges, so a hint could disagree with the key it stood in for.
 fn derive_routing_hint(docs: &[DocPayload]) -> Option<String> {
     docs.first().and_then(|doc| {
-        crate::node::routing_key_without_schema(
-            doc.routing_key.clone(),
-            &doc.id,
-            &doc.doc,
-        )
+        crate::node::routing_key_without_schema(doc.routing_key.clone(), &doc.id, &doc.doc)
     })
 }
 
