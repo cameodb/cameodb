@@ -512,7 +512,7 @@ async fn process_streamable_http<B: McpBackend>(
 
 /// Streamable HTTP transport GET handler (MCP spec 2025-03-26+).
 ///
-/// Opens a server-to-client SSE stream. CameoDB does not currently initiate
+/// Opens a server-to-client SSE stream on a session. CameoDB does not currently initiate
 /// server-side requests, so this stream only emits keep-alive comments to hold
 /// the connection open, satisfying clients that establish a listening channel.
 ///
@@ -521,33 +521,36 @@ async fn process_streamable_http<B: McpBackend>(
 /// are the reason that is sound: a client that disappears without closing the connection is
 /// noticed the next time one of them fails to write, and the guard below then releases the
 /// session to the ordinary idle timeout.
+///
+/// A stream has to *belong* to a session. One opened before `initialize` names nothing the
+/// server holds — it would never carry an event, and since it creates no session nothing in
+/// the registry bounds how many of them a caller may hold open. Refused rather than served.
 async fn streamable_listen_handler(
     state: McpTransportState,
     authz: McpAuthzRef,
     headers: HeaderMap,
     keepalive: Duration,
 ) -> Response {
-    // `Some` only for a stream opened on a session, which is what there is to hold open. A
-    // client may open one before `initialize`, and there is nothing to register for that.
-    let mut listening = None;
-    if let Some(session_id) = session_id_of(&headers) {
-        let key_id = authz.key_id();
-        match state.claim_session(session_id, key_id.as_deref()).await {
-            SessionClaim::Granted(_) => {}
-            SessionClaim::WrongKey => return session_refusal(session_id).into_response(),
-            SessionClaim::Unknown => return unknown_session_refusal(session_id).into_response(),
-        }
-        if state.open_listener(session_id).await {
-            listening = Some(ListenerGuard {
-                session_id: session_id.to_string(),
-                state: state.clone(),
-            });
-        } else {
-            // The session was reclaimed/swept between claim and open; a keep-alive stream without
-            // a listener guard would let the client hold a connection to a dead session.
-            return unknown_session_refusal(session_id).into_response();
-        }
+    let Some(session_id) = session_id_of(&headers) else {
+        return anonymous_listener_refusal().into_response();
+    };
+
+    let key_id = authz.key_id();
+    match state.claim_session(session_id, key_id.as_deref()).await {
+        SessionClaim::Granted(_) => {}
+        SessionClaim::WrongKey => return session_refusal(session_id).into_response(),
+        SessionClaim::Unknown => return unknown_session_refusal(session_id).into_response(),
     }
+    let listening = if state.open_listener(session_id).await {
+        ListenerGuard {
+            session_id: session_id.to_string(),
+            state: state.clone(),
+        }
+    } else {
+        // The session was reclaimed/swept between claim and open; a keep-alive stream without
+        // a listener guard would let the client hold a connection to a dead session.
+        return unknown_session_refusal(session_id).into_response();
+    };
 
     let stream = ListeningStream {
         inner: futures::stream::pending::<Result<Event, Infallible>>(),
@@ -584,7 +587,7 @@ impl Drop for ListenerGuard {
 struct ListeningStream<S> {
     inner: S,
     #[allow(dead_code)] // Held for its Drop impl
-    guard: Option<ListenerGuard>,
+    guard: ListenerGuard,
 }
 
 impl<S: Stream + Unpin> Stream for ListeningStream<S> {
@@ -613,6 +616,24 @@ fn unknown_session_refusal(session_id: &str) -> impl IntoResponse {
         Json(json!({
             "error": "Unknown MCP session",
             "message": "this session is not known to the server; start a new one with `initialize`",
+        })),
+    )
+}
+
+/// A `GET` listening stream that names no session.
+///
+/// 400 rather than an answered stream: the stream carries keep-alives and nothing else — the
+/// server never initiates requests — so the only thing a session-less one can do is occupy a
+/// connection, unbounded by `max_sessions` because it creates none. The spec's allowance for a
+/// standalone GET exists for servers that push; this one does not, and a client that gets the
+/// refusal learns to `initialize` first rather than holding an infinite stream of nothing.
+fn anonymous_listener_refusal() -> impl IntoResponse {
+    debug!("MCP listening stream refused: no MCP-Session-Id header");
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "Bad Request",
+            "message": "a listening stream belongs to a session; `initialize` one and send its MCP-Session-Id header",
         })),
     )
 }

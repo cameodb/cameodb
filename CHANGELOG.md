@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A session-less `GET /mcp` listening stream is refused.** It was answered with an infinite
+  keep-alive stream that created no session — so `max_sessions` never bounded how many a caller
+  held open — and carried nothing but keep-alives, since the server never initiates requests.
+  The handler now answers `400` without the `MCP-Session-Id` header; a live session's listener
+  is unchanged.
+
 - **A legacy-SSE session can no longer queue unbounded work.** Every `POST /mcp/messages`
   spawned the request's task and answered `202`, so the concurrency semaphore's permit and
   the request timeout ended before the work began — one session could hold any number of
