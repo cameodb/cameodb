@@ -648,13 +648,16 @@ fn an_index_without_the_id_fast_column_still_finds_its_documents() {
         .find(|f| f["name"] == "id")
         .expect("id field in meta.json schema");
     assert!(
-        id_field["options"].as_object_mut().unwrap().remove("fast").is_some(),
+        id_field["options"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fast")
+            .is_some(),
         "the index built for the test must carry the column the edit removes"
     );
     std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
 
-    let store =
-        HybridStore::new(test_config(dir.path().to_path_buf()), 1).expect("reopen store");
+    let store = HybridStore::new(test_config(dir.path().to_path_buf()), 1).expect("reopen store");
     let outcome = store
         .search_documents("books", "rust", 10, None)
         .expect("search on an index with no id column");

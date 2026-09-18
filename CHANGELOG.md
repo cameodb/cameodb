@@ -108,6 +108,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`storage/src/lib.rs` is five siblings, split by what the code is** (L12). The 10,200-line
+  file that held the query machinery, the data model and the whole `HybridStore` in one impl
+  block now reads the way the roadmap drew it: `lib.rs` (465 lines) keeps the crate doc,
+  `StorageConfig`, `StoreError`, the wire types — `SortSpec`/`SortOrder`,
+  `SearchOutcome`/`QueryValidation`, the stats and warmup shapes — and re-exports the
+  siblings by glob, so every `storage::X` import resolves unchanged. `query.rs` is the pure
+  query machinery — whitespace/date/prefix/shadow normalization, field-reference scanning,
+  parser preparation, discarded-clause reports. `schema.rs` is the data model — `FieldDef`,
+  `IndexSchema`, `SchemaState`, date typing, document building, WAL/`StoredDoc` types and the
+  tokenizers. `store.rs` holds `HybridStore`'s state plus the write side: lifecycle,
+  `get_or_create_index`, `apply_write`/`apply_batch`, commits, checkpoints, WAL, recovery and
+  warmup. `search.rs` holds the read side in a second `impl HybridStore`: the reader pool,
+  read caches, `validate_query`, `search_documents`, key lookups and stats. The unit tests
+  moved to `tests.rs` verbatim. The split's only non-pure move is the same as L11's: the
+  single-module privacy model flattened to `pub(crate)` on the items, fields and methods the
+  code already shared, and `use crate::*` carries intra-crate names through the re-exports.
+
 - **`config.rs` validates by section, not by repetition** (L19). `CameoDbConfig::validate`
   was ~330 lines of one repeated `if … return Err` shape; it is five `validate_*` methods —
   `security`, `mcp`, `network`, `storage`, `memory` — called in the order the checks always
