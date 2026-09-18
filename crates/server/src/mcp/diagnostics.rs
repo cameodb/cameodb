@@ -5,8 +5,29 @@
 
 use serde_json::Value as JsonValue;
 
+use cameodb_mcp::ToolError;
+
 use crate::mcp::schema::{FieldInfo, field_query_hint};
+use crate::node::{OrchestratorError, RemoteVerdict};
 use crate::query::parse_query_keywords;
+
+/// Turn a routing error into what the tool answers, classified the way HTTP classifies.
+///
+/// `verdict` is the node's own account of whose fault a failure is, decided where the error
+/// was raised rather than guessed from its text here. The mapping is the HTTP surface's
+/// masking boundary: a `BadRequest` or `NotFound` message was written for the caller and
+/// passes through, while anything the node answers `5xx` for is masked — including
+/// `Unavailable`, whose text names the topology the caller cannot act on (which shard is
+/// absent, which peer did not answer). The detail is not lost: [`ToolError::detail`] is what
+/// the audit record and the log receive.
+pub(super) fn tool_error(err: OrchestratorError) -> ToolError {
+    match err.verdict() {
+        RemoteVerdict::BadRequest | RemoteVerdict::NotFound => ToolError::caller(err.to_string()),
+        RemoteVerdict::Unavailable | RemoteVerdict::SchemaRequired | RemoteVerdict::ServerFault => {
+            ToolError::internal(err.to_string())
+        }
+    }
+}
 
 /// Why a search that matched nothing may have asked for less than it meant to, or `None` when
 /// the query gives no reason to think so.
@@ -521,5 +542,63 @@ mod search_error_interception_tests {
             enriched.contains("title, body") && enriched.contains("docs"),
             "the caller needs the real fields and the index they belong to: {enriched}"
         );
+    }
+}
+
+/// The verdict mapping is the whole contract: caller-fault verdicts keep their text, every
+/// 5xx verdict is masked. If a new variant lands on the wrong side of that line the leak is
+/// silent, so each arm is pinned.
+#[cfg(test)]
+mod tool_error_tests {
+    use super::tool_error;
+    use cameodb_mcp::ToolError;
+    use storage::StoreError;
+
+    use crate::node::OrchestratorError;
+
+    /// What the caller reads: `Caller` keeps its text, `Internal` the mask.
+    fn shown(err: OrchestratorError) -> String {
+        tool_error(err).into_response_text()
+    }
+
+    #[test]
+    fn a_caller_fault_keeps_the_message_written_for_it() {
+        let text = shown(OrchestratorError::Validation(
+            "Missing routing key for index 'docs'".to_string(),
+        ));
+        assert_eq!(text, "Missing routing key for index 'docs'");
+
+        let text = shown(OrchestratorError::Storage(StoreError::IndexNotFound(
+            "docs".to_string(),
+        )));
+        assert!(
+            text.contains("docs"),
+            "a missing index names itself: {text}"
+        );
+    }
+
+    #[test]
+    fn a_server_fault_is_masked_but_not_lost() {
+        let err = tool_error(OrchestratorError::Missing(
+            "local shard 7 for 'docs' not found".to_string(),
+        ));
+        assert!(matches!(err, ToolError::Internal(_)));
+        // The mask is for the caller; the record of what happened keeps the detail.
+        assert!(err.detail().contains("local shard 7"));
+    }
+
+    #[test]
+    fn an_unavailable_is_masked_too() {
+        // Its text names topology the caller cannot act on — which shard, which peer — so it
+        // is masked like any other 5xx rather than passed through like a 503 body.
+        for err in [
+            OrchestratorError::NotReady("no shards for 'docs'".to_string()),
+            OrchestratorError::PeerUnreachable {
+                message: "peer node-3 did not answer".to_string(),
+            },
+        ] {
+            let err = tool_error(err);
+            assert!(matches!(err, ToolError::Internal(_)), "{err}");
+        }
     }
 }

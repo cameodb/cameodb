@@ -12,7 +12,7 @@ use tracing::debug;
 
 use crate::{
     authz::McpAuthzRef,
-    backend::{McpBackend, RateLimitVerdict, ToolCall},
+    backend::{McpBackend, RateLimitVerdict, ToolCall, ToolError},
     guidance::{INSTRUCTIONS, ORCHESTRATOR_SKILL},
     protocol::negotiate_protocol_version,
     tools::{
@@ -134,7 +134,7 @@ where
         // --- Resources ---
         "resources/list" => Some(match backend.list_resources(authz.clone()).await {
             Ok(resources) => success_response(request.id, json!({ "resources": resources })),
-            Err(err) => error_response(request.id, -32603, err),
+            Err(err) => error_response(request.id, -32603, err.into_response_text()),
         }),
         "resources/read" => Some(
             match serde_json::from_value::<ReadResourceArgs>(request.params) {
@@ -152,7 +152,7 @@ where
                             }]
                         }),
                     ),
-                    Err(err) => error_response(request.id, -32603, err),
+                    Err(err) => error_response(request.id, -32603, err.into_response_text()),
                 },
                 Err(err) => error_response(
                     request.id,
@@ -293,7 +293,7 @@ where
             tool: &tool,
             index: subject.as_deref(),
             query: query.as_deref(),
-            error: outcome.as_ref().err().map(String::as_str),
+            error: outcome.as_ref().err().map(ToolError::detail),
         },
     );
     match outcome {
@@ -331,7 +331,7 @@ where
             json!({
                 "content": [{
                     "type": "text",
-                    "text": err,
+                    "text": err.into_response_text(),
                 }],
                 "isError": true,
             }),
@@ -342,7 +342,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{authz::McpUnrestricted, backend::testing::StubBackend};
+    use crate::{
+        authz::McpUnrestricted,
+        backend::testing::{StubBackend, StubFailure},
+    };
 
     fn caller() -> McpAuthzRef {
         Arc::new(McpUnrestricted)
@@ -458,6 +461,64 @@ mod tests {
             result.get("structuredContent").is_none(),
             "a result carried structuredContent for a server that advertises no outputSchema: \
              {result}"
+        );
+    }
+
+    /// A tool call that fails carries the failure in the text block, not the error object.
+    ///
+    /// The two cases assert different things about the text: a caller fault arrives verbatim
+    /// because it was written for the caller to act on, while an internal fault is masked the
+    /// way HTTP masks a `500` — the detail names this node's internals, and an agent that
+    /// cannot act on it must not read it.
+    #[tokio::test]
+    async fn a_caller_fault_is_answered_with_its_own_message() {
+        let response = handle_rpc_request(
+            StubBackend::failing(StubFailure::Caller("Index 'payroll' not found")),
+            message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "describe_index", "arguments": {"index": "payroll"}},
+            })),
+            &caller(),
+        )
+        .await
+        .expect("a tool call is answered");
+
+        let result = &response["result"];
+        assert_eq!(result["isError"], json!(true), "{response}");
+        assert_eq!(
+            result["content"][0]["text"],
+            json!("Index 'payroll' not found"),
+            "a caller fault passes its text through: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_internal_fault_is_masked() {
+        let response = handle_rpc_request(
+            StubBackend::failing(StubFailure::Internal("local shard 7 for 'docs' not found")),
+            message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "search_index", "arguments": {"index": "docs", "query": "a"}},
+            })),
+            &caller(),
+        )
+        .await
+        .expect("a tool call is answered");
+
+        let result = &response["result"];
+        assert_eq!(result["isError"], json!(true), "{response}");
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert_eq!(
+            text, "Internal server error",
+            "the caller gets the mask: {result}"
+        );
+        assert!(
+            !text.contains("shard"),
+            "the detail must not reach the caller: {result}"
         );
     }
 

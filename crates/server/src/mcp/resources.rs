@@ -1,6 +1,6 @@
 //! The `cameodb://` resource URIs, which are the browsing form of the same catalogue.
 
-use cameodb_mcp::McpAuthzRef;
+use cameodb_mcp::{McpAuthzRef, ToolError};
 use futures::future::BoxFuture;
 use serde_json::Value as JsonValue;
 
@@ -19,7 +19,7 @@ fn resource_descriptor(uri: String, name: String, description: String) -> JsonVa
 pub(super) fn list_resources(
     state: AppState,
     authz: McpAuthzRef,
-) -> BoxFuture<'static, Result<JsonValue, String>> {
+) -> BoxFuture<'static, Result<JsonValue, ToolError>> {
     Box::pin(async move {
         // Every per-index resource URI below is derived from this listing, so a scoped
         // caller is never handed a URI it would be refused for.
@@ -42,7 +42,7 @@ pub(super) fn list_resources(
             let index_name = item
                 .get("index")
                 .and_then(|value| value.as_str())
-                .ok_or_else(|| "Index entry missing index name".to_string())?
+                .ok_or_else(|| ToolError::internal("Index entry missing index name"))?
                 .to_string();
 
             resources.push(resource_descriptor(
@@ -73,7 +73,7 @@ pub(super) fn read_resource(
     state: AppState,
     uri: String,
     authz: McpAuthzRef,
-) -> BoxFuture<'static, Result<JsonValue, String>> {
+) -> BoxFuture<'static, Result<JsonValue, ToolError>> {
     Box::pin(async move {
         if uri == "cameodb://indexes" {
             return list_indexes(state.clone(), authz).await;
@@ -81,14 +81,16 @@ pub(super) fn read_resource(
 
         let resource = uri
             .strip_prefix("cameodb://indexes/")
-            .ok_or_else(|| format!("Unsupported resource URI: {uri}"))?;
+            .ok_or_else(|| ToolError::caller(format!("Unsupported resource URI: {uri}")))?;
 
         let index_name = resource
             .strip_suffix("/schema")
             .or_else(|| resource.strip_suffix("/stats"))
             .unwrap_or(resource);
         if !authz.allows_index(index_name) {
-            return Err(format!("this key is not permitted on index '{index_name}'"));
+            return Err(ToolError::caller(format!(
+                "this key is not permitted on index '{index_name}'"
+            )));
         }
 
         if let Some(index_name) = resource.strip_suffix("/schema") {

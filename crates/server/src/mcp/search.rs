@@ -3,12 +3,12 @@
 use futures::{StreamExt, future::BoxFuture, stream};
 use serde_json::Value as JsonValue;
 
-use cameodb_mcp::McpIndexSearchRequest;
+use cameodb_mcp::{McpIndexSearchRequest, ToolError};
 
 use crate::cluster_coordinator::OperationType;
 use crate::mcp::diagnostics::{
     approximate_sort_note, names_a_missing_field, paged_past_the_end, refuse_if_clauses_discarded,
-    short_page_note, with_valid_fields, zero_results_advice,
+    short_page_note, tool_error, with_valid_fields, zero_results_advice,
 };
 use crate::mcp::schema::absent_index_reason;
 use crate::node::{APPROXIMATE_SORT_FIELD, ClientOp, SearchWindow, order_hit_blocks};
@@ -110,13 +110,14 @@ fn effective_window(
     state: &AppState,
     limit: Option<usize>,
     offset: Option<usize>,
-) -> Result<SearchWindow, String> {
+) -> Result<SearchWindow, ToolError> {
     SearchWindow::checked(
         limit,
         offset,
         state.router.default_search_limit(),
         state.max_search_limit,
     )
+    .map_err(ToolError::caller)
 }
 
 /// Say what a caller cannot read off the hits: why a page is empty, and when its order is only
@@ -186,7 +187,7 @@ pub(super) fn search_index(
     query: String,
     limit: Option<usize>,
     offset: Option<usize>,
-) -> BoxFuture<'static, Result<JsonValue, String>> {
+) -> BoxFuture<'static, Result<JsonValue, ToolError>> {
     Box::pin(async move {
         let index_name = index.index.clone();
 
@@ -231,7 +232,7 @@ pub(super) fn search_index(
             Ok(mut response) => {
                 // Checked before the hits are described, since a dropped clause makes the
                 // rest of this response answer a different query.
-                refuse_if_clauses_discarded(&response)?;
+                refuse_if_clauses_discarded(&response).map_err(ToolError::caller)?;
 
                 let total_hits = response
                     .get("total_hits")
@@ -243,7 +244,7 @@ pub(super) fn search_index(
                 if total_hits == 0
                     && let Some(reason) = absent_index_reason(&state, &index_name).await
                 {
-                    return Err(reason);
+                    return Err(ToolError::caller(reason));
                 }
 
                 annotate_search_response(&mut response, &query, window, total_hits as usize);
@@ -264,10 +265,14 @@ pub(super) fn search_index(
                         schema_result.get("fields").and_then(|v| v.as_object())
                 {
                     let field_names: Vec<String> = fields_obj.keys().cloned().collect();
-                    return Err(with_valid_fields(&err_str, &index_name, &field_names));
+                    return Err(ToolError::caller(with_valid_fields(
+                        &err_str,
+                        &index_name,
+                        &field_names,
+                    )));
                 }
 
-                Err(err_str)
+                Err(tool_error(err))
             }
         }
     })
@@ -279,7 +284,7 @@ pub(super) fn search_across_indexes(
     query: String,
     limit: Option<usize>,
     offset: Option<usize>,
-) -> BoxFuture<'static, Result<JsonValue, String>> {
+) -> BoxFuture<'static, Result<JsonValue, ToolError>> {
     Box::pin(async move {
         // Preprocess query to extract return/limit/offset/sort modifiers (same as HTTP server)
         let inline = parse_query_keywords(&query);
@@ -406,8 +411,10 @@ pub(super) fn search_across_indexes(
                 Ok(r) => r,
                 Err(err) => {
                     let err_str = err.to_string();
-
-                    let mut message = err_str.clone();
+                    // The errors array is part of a successful result, so it gets the
+                    // caller-facing text — a caller-fault message as raised, an internal
+                    // fault masked the way the call's own failure would be.
+                    let mut message = tool_error(err).into_response_text();
                     if names_a_missing_field(&err_str)
                         && let Ok(schema_result) = state
                             .router
@@ -430,7 +437,9 @@ pub(super) fn search_across_indexes(
             // One query string covers every index, so a dropped clause affects the whole
             // merge rather than this index alone.
             if let Err(refusal) = refuse_if_clauses_discarded(&result) {
-                return Err(format!("index '{index_name}': {refusal}"));
+                return Err(ToolError::caller(format!(
+                    "index '{index_name}': {refusal}"
+                )));
             }
 
             let index_hits = result
@@ -491,7 +500,9 @@ pub(super) fn search_across_indexes(
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            return Err(format!("no index in this search could be read — {detail}"));
+            return Err(ToolError::caller(format!(
+                "no index in this search could be read — {detail}"
+            )));
         }
 
         // Ordered by the requested sort when there is one, otherwise by relevance — and, where

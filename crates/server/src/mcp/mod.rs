@@ -12,7 +12,9 @@ mod resources;
 mod schema;
 mod search;
 
-use cameodb_mcp::{McpAuthzRef, McpBackend, McpIndexSearchRequest, RateLimitVerdict, ToolCall};
+use cameodb_mcp::{
+    McpAuthzRef, McpBackend, McpIndexSearchRequest, RateLimitVerdict, ToolCall, ToolError,
+};
 use futures::future::BoxFuture;
 use serde_json::Value as JsonValue;
 
@@ -33,7 +35,7 @@ impl McpBackend for AppState {
         query: String,
         limit: Option<usize>,
         offset: Option<usize>,
-    ) -> BoxFuture<'_, Result<JsonValue, String>> {
+    ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
         search::search_index(self.clone(), index, query, limit, offset)
     }
 
@@ -43,15 +45,15 @@ impl McpBackend for AppState {
         query: String,
         limit: Option<usize>,
         offset: Option<usize>,
-    ) -> BoxFuture<'_, Result<JsonValue, String>> {
+    ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
         search::search_across_indexes(self.clone(), indexes, query, limit, offset)
     }
 
-    fn describe_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, String>> {
+    fn describe_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
         discovery::describe_index(self.clone(), index)
     }
 
-    fn list_indexes(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>> {
+    fn list_indexes(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
         discovery::list_indexes(self.clone(), authz)
     }
 
@@ -60,15 +62,15 @@ impl McpBackend for AppState {
         index: Option<String>,
         partial_field: Option<String>,
         query: Option<String>,
-    ) -> BoxFuture<'_, Result<JsonValue, String>> {
+    ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
         discovery::validate_query(self.clone(), index, partial_field, query)
     }
 
-    fn get_catalog_stats(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>> {
+    fn get_catalog_stats(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
         discovery::index_stats(self.clone(), None, authz)
     }
 
-    fn list_resources(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, String>> {
+    fn list_resources(&self, authz: McpAuthzRef) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
         resources::list_resources(self.clone(), authz)
     }
 
@@ -76,7 +78,7 @@ impl McpBackend for AppState {
         &self,
         uri: String,
         authz: McpAuthzRef,
-    ) -> BoxFuture<'_, Result<JsonValue, String>> {
+    ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
         resources::read_resource(self.clone(), uri, authz)
     }
 

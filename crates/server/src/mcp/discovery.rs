@@ -3,10 +3,10 @@
 use futures::future::BoxFuture;
 use serde_json::Value as JsonValue;
 
-use cameodb_mcp::McpAuthzRef;
+use cameodb_mcp::{McpAuthzRef, ToolError};
 
 use crate::authz::retain_visible_indexes;
-use crate::mcp::diagnostics::{analyze_query, cameodb_syntax_reference};
+use crate::mcp::diagnostics::{analyze_query, cameodb_syntax_reference, tool_error};
 use crate::mcp::schema::{
     absent_index_reason, catalogue_entry, enrich_index_entry, enrich_index_entry_owned,
     extract_field_info, extract_field_names, field_query_hint, index_schema,
@@ -17,7 +17,7 @@ use crate::state::AppState;
 pub(super) fn describe_index(
     state: AppState,
     index: String,
-) -> BoxFuture<'static, Result<JsonValue, String>> {
+) -> BoxFuture<'static, Result<JsonValue, ToolError>> {
     Box::pin(async move {
         let listing = state
             .router
@@ -25,7 +25,7 @@ pub(super) fn describe_index(
                 include_data_size: false,
             })
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(tool_error)?;
 
         // The listing entry *is* the description. It used to be half of one — statistics here,
         // field definitions from a second `GetConfig`, stitched together by this function in a
@@ -40,7 +40,7 @@ pub(super) fn describe_index(
                     .find(|item| item.get("name").and_then(|v| v.as_str()) == Some(index.as_str()))
             })
             .cloned()
-            .ok_or_else(|| format!("Index '{}' not found", index))?;
+            .ok_or_else(|| ToolError::caller(format!("Index '{index}' not found")))?;
 
         Ok(enrich_index_entry(entry))
     })
@@ -54,7 +54,7 @@ pub(super) fn describe_index(
 pub(super) fn list_indexes(
     state: AppState,
     authz: McpAuthzRef,
-) -> BoxFuture<'static, Result<JsonValue, String>> {
+) -> BoxFuture<'static, Result<JsonValue, ToolError>> {
     Box::pin(async move {
         let mut listing = state
             .router
@@ -62,7 +62,7 @@ pub(super) fn list_indexes(
                 include_data_size: false,
             })
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(tool_error)?;
         retain_visible_indexes(&mut listing, authz.as_ref());
 
         // One request. Each entry already describes its fields, so the schema read this used to
@@ -96,7 +96,7 @@ pub(super) fn validate_query(
     index: Option<String>,
     partial_field: Option<String>,
     query: Option<String>,
-) -> BoxFuture<'static, Result<JsonValue, String>> {
+) -> BoxFuture<'static, Result<JsonValue, ToolError>> {
     Box::pin(async move {
         // The index's schema, named — not the catalogue. This wants field definitions and
         // nothing else, and reaching them through `describe_index` meant gathering statistics for
@@ -109,7 +109,7 @@ pub(super) fn validate_query(
             if schema.is_null()
                 && let Some(reason) = absent_index_reason(&state, &index_name).await
             {
-                return Err(reason);
+                return Err(ToolError::caller(reason));
             }
             // Already the one description shape, fields and all — nothing to stitch.
             Some(schema)
@@ -213,7 +213,7 @@ pub(super) fn validate_query(
                     query: query_text.clone(),
                 })
                 .await
-                .map_err(|err| err.to_string())?;
+                .map_err(tool_error)?;
 
             merge_parser_verdict(analysis, &parsed);
         }
@@ -297,7 +297,7 @@ pub(super) fn index_stats(
     state: AppState,
     index: Option<String>,
     authz: McpAuthzRef,
-) -> BoxFuture<'static, Result<JsonValue, String>> {
+) -> BoxFuture<'static, Result<JsonValue, ToolError>> {
     Box::pin(async move {
         if let Some(index_name) = index {
             let details = describe_index(state.clone(), index_name.clone()).await?;
@@ -323,7 +323,7 @@ pub(super) fn index_stats(
                 include_data_size: true,
             })
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(tool_error)?;
         // Already scoped: the aggregate is over the indexes this caller can see, so
         // the totals it reports do not count documents it cannot read.
         retain_visible_indexes(&mut listing, authz.as_ref());

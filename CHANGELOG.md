@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MCP tool errors no longer leak the node's internals.** A failed `tools/call` answered with
+  the engine's error verbatim — shard and storage diagnostics, forwarded peer fault text —
+  while HTTP masks exactly this class behind a `500`. Tool failures now travel as a typed
+  `ToolError`, classified by the routing layer's own verdict: errors written for the caller
+  (bad arguments, a missing index, a refused key) pass through unchanged, and internal faults
+  answer `Internal server error` — the same mask HTTP uses. The real detail still reaches the
+  audit record and the log; the federated search's per-index `errors` array is masked the same
+  way.
+
 - **A session-less `GET /mcp` listening stream is refused.** It was answered with an infinite
   keep-alive stream that created no session — so `max_sessions` never bounded how many a caller
   held open — and carried nothing but keep-alives, since the server never initiates requests.
