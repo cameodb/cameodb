@@ -149,6 +149,15 @@ pub struct McpConfig {
     /// Streamable HTTP on `/mcp` and never touch these; turning them off removes the surface.
     /// On by default because turning it off strands any client still configured for it.
     pub legacy_sse_enabled: bool,
+
+    /// The most requests one session may hold in flight at once (default: 32).
+    ///
+    /// Bounds the legacy transport's spawned work: `/mcp/messages` answers `202` and runs the
+    /// request on a task afterwards, so without this a session's queued work grows without
+    /// bound — the request's own concurrency permit and timeout end when the `202` is written.
+    /// Past the bound a request is refused `429` rather than queued. Well past what an agent's
+    /// parallel tool calls reach for; the loop this stops is the one that does not stop.
+    pub max_in_flight_per_session: usize,
 }
 
 /// Written out rather than derived, so a config built in code and one parsed from an absent
@@ -162,6 +171,7 @@ impl Default for McpConfig {
             max_sessions: default_max_sessions(),
             sse_keepalive_secs: default_sse_keepalive_secs(),
             legacy_sse_enabled: default_legacy_sse_enabled(),
+            max_in_flight_per_session: default_max_in_flight_per_session(),
         }
     }
 }
@@ -177,6 +187,7 @@ impl McpConfig {
             max_sessions: self.max_sessions,
             sse_keepalive: std::time::Duration::from_secs(self.sse_keepalive_secs),
             legacy_sse_enabled: self.legacy_sse_enabled,
+            max_in_flight_per_session: self.max_in_flight_per_session,
         }
     }
 }
@@ -1045,6 +1056,17 @@ impl CameoDbConfig {
             .into());
         }
 
+        // Zero in flight means every legacy request is refused the moment it arrives — the
+        // transport would accept the session and then refuse the work forever.
+        if self.mcp.max_in_flight_per_session == 0 {
+            return Err(ConfigError::McpConfig {
+                message: "mcp.max_in_flight_per_session is 0, which would refuse every request \
+                          on a session; set how many in-flight requests one session may hold"
+                    .to_string(),
+            }
+            .into());
+        }
+
         // A keep-alive that fires less often than a session expires cannot hold one open: the
         // stream would be swept between two writes. Refused because the two settings look
         // independent and are not — an operator who shortened the timeout for a reason should
@@ -1564,6 +1586,8 @@ config_defaults! {
     /// nginx by default, 60 s on an AWS ALB.
     default_sse_keepalive_secs -> u64 = 15;
     default_legacy_sse_enabled -> bool = true;
+    /// Thirty-two — see [`McpConfig::max_in_flight_per_session`].
+    default_max_in_flight_per_session -> usize = 32;
     default_max_record_size_mb -> usize = 64;
     default_http_max_concurrent_requests -> usize = 128;
     default_admin_enabled -> bool = true;

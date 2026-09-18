@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A legacy-SSE session can no longer queue unbounded work.** Every `POST /mcp/messages`
+  spawned the request's task and answered `202`, so the concurrency semaphore's permit and
+  the request timeout ended before the work began — one session could hold any number of
+  concurrent searches. `mcp.max_in_flight_per_session` (default **32**) bounds the in-flight
+  registry each session holds: a request past the bound is refused `429` with a
+  `Retry-After` rather than queued, checked and registered under the session's own lock.
+  Notifications are exempt — theirs is a trivial task, answered with silence before dispatch.
+
 - **`/_cluster/health` answers its own identity while the node is shedding writes.** Two of the
   three things it reports about the node came from the orchestrator's mailbox, where they queued
   behind whatever bulk write was holding it. `GetIdentity` is answered by the worker pool now,
