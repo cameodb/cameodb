@@ -16,10 +16,10 @@ use storage::{FieldDef, IndexSchema, TantivyFieldType};
 pub use storage::{SortOrder, SortSpec};
 
 /// The prefix a per-document reason carries: its place in the batch it was sent in.
-pub(crate) const DOCUMENT_PREFIX: &str = "document ";
+pub(super) const DOCUMENT_PREFIX: &str = "document ";
 
 /// Split `document 7: reason` into its position and its reason, if that is what it is.
-pub(crate) fn split_document_reason(error: &str) -> Option<(usize, &str)> {
+pub(super) fn split_document_reason(error: &str) -> Option<(usize, &str)> {
     let rest = error.strip_prefix(DOCUMENT_PREFIX)?;
     let (position, reason) = rest.split_once(": ")?;
     Some((position.parse().ok()?, reason))
@@ -77,7 +77,7 @@ pub(crate) fn renumber_reasons(
 /// `unexplained`, because a shortfall a caller has to find by subtracting is not an answer; too
 /// many is folded onto the last reason, because a reason someone took the trouble to send is the
 /// only account of a failure that exists.
-pub(crate) fn balance_reasons(
+pub(super) fn balance_reasons(
     reasons: &[String],
     unaccounted: usize,
     restate: impl Fn(&str) -> String,
@@ -128,7 +128,7 @@ pub(crate) fn balance_reasons(
 /// to write. It cannot happen between two nodes running this code, and it is stated rather than
 /// left as a silent shortfall when it does, because a caller cannot act on a gap it has to infer
 /// by subtracting.
-pub(crate) fn remote_rejections(
+pub(super) fn remote_rejections(
     node_id: Uuid,
     positions: &[usize],
     written: usize,
@@ -163,7 +163,7 @@ pub(crate) fn remote_rejections(
 /// Which node matters there, and does not for an id-shaped reason: the caller's own local
 /// failures read `{id}: why` too, and one flat list keyed by id is the answer, whichever node
 /// handled the id.
-pub(crate) fn remote_delete_rejections(
+pub(super) fn remote_delete_rejections(
     node_id: Uuid,
     ids: &[String],
     deleted: usize,
@@ -195,16 +195,16 @@ pub(crate) fn remote_delete_rejections(
 /// resolved, and the fan-out bound both lanes carry. The gather body is written once against
 /// this so the two paths cannot drift — same per-shard window, same failure accounting, same
 /// merge order, same refusal sequence.
-pub(crate) struct ScatterCtx<'a> {
-    pub(crate) shards: &'a HashMap<Uuid, MicroshardActor>,
-    pub(crate) schema: &'a IndexSchema,
-    pub(crate) max_concurrent_shard_searches: usize,
+pub(super) struct ScatterCtx<'a> {
+    pub(super) shards: &'a HashMap<Uuid, MicroshardActor>,
+    pub(super) schema: &'a IndexSchema,
+    pub(super) max_concurrent_shard_searches: usize,
 }
 
 impl ScatterCtx<'_> {
     /// Ask every shard for the whole window from the front — any of them may hold all of it —
     /// then merge the pages under the requested order and answer the caller's slice.
-    pub(crate) async fn gather(
+    pub(super) async fn gather(
         &self,
         index: &str,
         query: &str,
@@ -370,7 +370,7 @@ impl ScatterCtx<'_> {
 /// are appended afterwards. This guarantees a consistent field order whether or not a
 /// sort is active — the internal `_sort_key` (if present) simply appears at the end and
 /// is stripped by `strip_sort_keys` at the client boundary.
-pub(crate) fn apply_field_projection(doc: JsonValue, fields: &[String]) -> JsonValue {
+pub(super) fn apply_field_projection(doc: JsonValue, fields: &[String]) -> JsonValue {
     if let JsonValue::Object(mut map) = doc {
         let mut filtered = serde_json::Map::new();
 
@@ -394,7 +394,7 @@ pub(crate) fn apply_field_projection(doc: JsonValue, fields: &[String]) -> JsonV
     }
 }
 
-pub(crate) fn hit_score(hit: &JsonValue) -> f64 {
+pub(super) fn hit_score(hit: &JsonValue) -> f64 {
     hit.get("_score").and_then(|s| s.as_f64()).unwrap_or(0.0)
 }
 
@@ -405,7 +405,7 @@ pub(crate) fn hit_score(hit: &JsonValue) -> f64 {
 /// it survives `apply_field_projection` automatically, so cross-node merges can order
 /// results even when the user's `return` projection excludes the sort field itself. It
 /// is stripped from every hit at the client boundary (`route_and_handle`).
-pub(crate) const SORT_KEY_FIELD: &str = "_sort_key";
+pub(super) const SORT_KEY_FIELD: &str = "_sort_key";
 
 /// The refusal a scatter-gather owes its caller when not one shard could run the query.
 ///
@@ -417,7 +417,7 @@ pub(crate) const SORT_KEY_FIELD: &str = "_sort_key";
 /// The reasons are deduplicated and the shard ids dropped: every shard runs the same query
 /// against the same schema, so they fail the same way, and repeating one reason per shard reads
 /// as several different problems.
-pub(crate) fn no_shard_answered(
+pub(super) fn no_shard_answered(
     index: &str,
     shard_success: usize,
     failures: &[(Uuid, OrchestratorError)],
@@ -445,7 +445,7 @@ pub(crate) fn no_shard_answered(
 }
 
 /// The per-shard failures as a response reports them, one line each, naming the shard.
-pub(crate) fn shard_error_notes(failures: &[(Uuid, OrchestratorError)]) -> Vec<String> {
+pub(super) fn shard_error_notes(failures: &[(Uuid, OrchestratorError)]) -> Vec<String> {
     failures
         .iter()
         .map(|(shard_id, err)| format!("Shard {}: {}", shard_id, err))
@@ -458,7 +458,7 @@ pub(crate) fn shard_error_notes(failures: &[(Uuid, OrchestratorError)]) -> Vec<S
 /// rule the federated search follows for the indexes it could not reach. An `errors: []` on every
 /// successful search teaches a caller to skip the key, which is precisely the habit that hides
 /// the one response where it matters.
-pub(crate) fn attach_shard_errors(response: &mut JsonValue, errors: Vec<String>) {
+pub(super) fn attach_shard_errors(response: &mut JsonValue, errors: Vec<String>) {
     if errors.is_empty() {
         return;
     }
@@ -473,10 +473,10 @@ pub(crate) fn attach_shard_errors(response: &mut JsonValue, errors: Vec<String>)
 /// Response key listing the clauses the query parser dropped.
 ///
 /// Absent on a clean parse rather than present and empty, so a caller can test for presence.
-pub const DISCARDED_CLAUSES_FIELD: &str = "_discarded_clauses";
+pub(crate) const DISCARDED_CLAUSES_FIELD: &str = "_discarded_clauses";
 
 /// Attach `DISCARDED_CLAUSES_FIELD` to a search response, if anything was discarded.
-pub(crate) fn attach_discarded(response: &mut JsonValue, discarded: Vec<String>) {
+pub(super) fn attach_discarded(response: &mut JsonValue, discarded: Vec<String>) {
     if discarded.is_empty() {
         return;
     }
@@ -500,7 +500,7 @@ pub(crate) fn attach_discarded(response: &mut JsonValue, discarded: Vec<String>)
 ///
 /// Skipped entirely for an index whose schema is not yet known, where every field would look
 /// unknown.
-pub(crate) fn unknown_projection_fields(
+pub(super) fn unknown_projection_fields(
     schema: &IndexSchema,
     fields: Option<&[String]>,
 ) -> Vec<String> {
@@ -531,7 +531,7 @@ pub(crate) fn unknown_projection_fields(
 /// else the rewrite is identity: `document_key_field` is `id` on a plain index. Done once,
 /// before the list is checked or applied, so `return id` on a shadow index finds the field
 /// rather than reporting it missing and returning a document with nothing in it.
-pub(crate) fn normalize_projection_fields(schema: &IndexSchema, fields: &[String]) -> Vec<String> {
+pub(super) fn normalize_projection_fields(schema: &IndexSchema, fields: &[String]) -> Vec<String> {
     let key = storage::document_key_field(schema);
     if key == "id" {
         return fields.to_vec();
@@ -555,7 +555,7 @@ pub(crate) fn normalize_projection_fields(schema: &IndexSchema, fields: &[String
 /// the source. So the identifier is read as a number too before those two are called a
 /// disagreement, which is what keeps a body saying `"id": 42` beside an envelope saying `"42"`
 /// from being refused. Any other JSON type is not an identifier and cannot name one.
-pub(crate) fn names_identifier(value: &JsonValue, id: &str) -> bool {
+pub(super) fn names_identifier(value: &JsonValue, id: &str) -> bool {
     match value {
         JsonValue::String(text) => text == id,
         JsonValue::Number(number) => id
@@ -579,7 +579,7 @@ pub(crate) fn names_identifier(value: &JsonValue, id: &str) -> bool {
 /// with the envelope. Disagreement is refused for the same reason a disagreeing shadow field
 /// is: the blob keeps its own `id` and reconstruction prefers it, so the document would answer
 /// to the key it was stored under and report a different one to whoever found it.
-pub(crate) fn unusable_document_identity(id: &str, doc: &JsonValue) -> Option<String> {
+pub(super) fn unusable_document_identity(id: &str, doc: &JsonValue) -> Option<String> {
     let obj = match doc.as_object() {
         Some(obj) => obj,
         None => return Some("Document body must be a JSON object".to_string()),
@@ -625,7 +625,7 @@ pub(crate) fn unusable_document_identity(id: &str, doc: &JsonValue) -> Option<St
 /// `id` is the identifier the write arrived with rather than anything read out of the body,
 /// because a body need not carry `id` at all. Reading it from the body skipped this check
 /// entirely on exactly the documents the documented bulk shape sends.
-pub(crate) fn disagreeing_shadow_field(
+pub(super) fn disagreeing_shadow_field(
     doc: &JsonValue,
     schema: &IndexSchema,
     id: &str,
@@ -664,7 +664,7 @@ pub(crate) fn disagreeing_shadow_field(
 /// It is deliberately not applied to `id`: the document key is text whatever it looks like, and
 /// inferring `i64` from a numeric identifier is how an index came to declare `id` as a type the
 /// key it builds does not use.
-pub(crate) fn infer_field_type(value: &JsonValue) -> TantivyFieldType {
+pub(super) fn infer_field_type(value: &JsonValue) -> TantivyFieldType {
     FieldDef::infer_type_from_value(value)
 }
 
@@ -693,7 +693,7 @@ pub(crate) fn infer_field_type(value: &JsonValue) -> TantivyFieldType {
 ///
 /// Values whose *shape* rather than type decides the answer — a list, a null, a text or json
 /// field that takes anything, a facet path — are settled by `unstorable_value` before this is asked.
-pub(crate) fn scalar_type_is_storable(declared: &TantivyFieldType, value: &JsonValue) -> bool {
+pub(super) fn scalar_type_is_storable(declared: &TantivyFieldType, value: &JsonValue) -> bool {
     match declared {
         TantivyFieldType::U64 => return value.as_u64().is_some(),
         TantivyFieldType::I64 => return value.as_i64().is_some(),
@@ -735,7 +735,7 @@ pub(crate) fn scalar_type_is_storable(declared: &TantivyFieldType, value: &JsonV
 /// query matches it, and the document reads back exactly as written — so refusing a document
 /// for carrying an explicit null where it could have omitted the key would be a distinction
 /// without a difference to anything downstream.
-pub(crate) fn unstorable_value(
+pub(super) fn unstorable_value(
     field: &str,
     declared: &TantivyFieldType,
     value: &JsonValue,
@@ -784,7 +784,7 @@ pub(crate) fn unstorable_value(
 /// wrong here: it made a *nested* list look like a value a numeric field accepts, where the
 /// writer's `as_i64()` returns `None` and skips it, storing the document with the field
 /// unindexed. That is the one outcome this function exists to prevent.
-pub(crate) fn unstorable_scalar(
+pub(super) fn unstorable_scalar(
     field: &str,
     declared: &TantivyFieldType,
     value: &JsonValue,
@@ -826,7 +826,7 @@ pub(crate) fn unstorable_scalar(
 }
 
 /// The one wording for a value whose type the field cannot hold.
-pub(crate) fn type_mismatch(field: &str, declared: &TantivyFieldType, value: &JsonValue) -> String {
+pub(super) fn type_mismatch(field: &str, declared: &TantivyFieldType, value: &JsonValue) -> String {
     format!(
         "Type mismatch for field '{field}': expected {declared:?}, got {:?}",
         infer_field_type(value)
@@ -867,7 +867,7 @@ pub(crate) fn type_mismatch(field: &str, declared: &TantivyFieldType, value: &Js
 ///
 /// Skipped entirely for an index whose schema is not known yet, where every field would look
 /// unknown.
-pub(crate) fn unsortable_sort_field(
+pub(super) fn unsortable_sort_field(
     schema: &IndexSchema,
     sort: Option<&SortSpec>,
 ) -> Option<OrchestratorError> {
@@ -931,7 +931,7 @@ pub(crate) fn unsortable_sort_field(
 /// Collect the distinct dropped clauses from per-node responses.
 ///
 /// Cross-node merges see [`DISCARDED_CLAUSES_FIELD`] as JSON rather than as a typed reply.
-pub(crate) fn collect_discarded(responses: &[JsonValue]) -> Vec<String> {
+pub(super) fn collect_discarded(responses: &[JsonValue]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for response in responses {
         let Some(notes) = response
@@ -957,10 +957,10 @@ pub(crate) fn collect_discarded(responses: &[JsonValue]) -> Vec<String> {
 ///
 /// Carries the field name rather than `true`, because the caller's next move is to look that
 /// field up in the schema and see that it has no fast column.
-pub const APPROXIMATE_SORT_FIELD: &str = "_approximate_sort";
+pub(crate) const APPROXIMATE_SORT_FIELD: &str = "_approximate_sort";
 
 /// Attach [`APPROXIMATE_SORT_FIELD`] to a search response, if the order returned is approximate.
-pub(crate) fn attach_approximate_sort(response: &mut JsonValue, field: Option<String>) {
+pub(super) fn attach_approximate_sort(response: &mut JsonValue, field: Option<String>) {
     let Some(field) = field else {
         return;
     };
@@ -974,7 +974,7 @@ pub(crate) fn attach_approximate_sort(response: &mut JsonValue, field: Option<St
 /// One field, not a list: every node ran the same sort on the same field, so either that field
 /// has a fast column everywhere or it has one nowhere. A node whose shards are all empty reports
 /// nothing at all, which is why the first answer wins rather than requiring agreement.
-pub(crate) fn collect_approximate_sort(responses: &[JsonValue]) -> Option<String> {
+pub(super) fn collect_approximate_sort(responses: &[JsonValue]) -> Option<String> {
     responses.iter().find_map(|response| {
         response
             .get(APPROXIMATE_SORT_FIELD)
@@ -991,7 +991,7 @@ pub(crate) fn collect_approximate_sort(responses: &[JsonValue]) -> Option<String
 /// Every other value passes through unchanged — the merge comparator handles the
 /// numeric-vs-string distinction. Returns `None` when the value cannot be keyed
 /// (e.g. an unparseable date string), in which case the hit sorts last.
-pub(crate) fn normalize_sort_key(
+pub(super) fn normalize_sort_key(
     value: &JsonValue,
     field_def: Option<&FieldDef>,
 ) -> Option<JsonValue> {
@@ -1016,7 +1016,7 @@ pub(crate) fn normalize_sort_key(
 /// look for whichever of the two is on the hit. Reading only the caller's name leaves every hit
 /// unstamped, and an unstamped merge keeps each shard's block whole — a per-shard order
 /// presented as a global one.
-pub(crate) fn stamp_sort_keys(
+pub(super) fn stamp_sort_keys(
     hits: &mut [(Uuid, f32, JsonValue)],
     spec: &SortSpec,
     schema: &IndexSchema,
@@ -1040,7 +1040,7 @@ pub(crate) fn stamp_sort_keys(
 
 /// Remove the internal `SORT_KEY_FIELD` from every hit in a search response, in place.
 /// Called once at the client boundary so the key never leaks to callers.
-pub(crate) fn strip_sort_keys(response: &mut JsonValue) {
+pub(super) fn strip_sort_keys(response: &mut JsonValue) {
     if let Some(hits) = response.get_mut("hits").and_then(|h| h.as_array_mut()) {
         for hit in hits.iter_mut() {
             if let Some(o) = hit.as_object_mut() {
@@ -1056,7 +1056,7 @@ pub(crate) fn strip_sort_keys(response: &mut JsonValue) {
 /// range, e.g. large ids or nanosecond timestamps, order precisely); otherwise values
 /// are compared as `f64`, then fall back to string comparison. Documents missing the
 /// field always sort last, regardless of the requested order.
-pub(crate) fn compare_hits_by_field(
+pub(super) fn compare_hits_by_field(
     a: &JsonValue,
     b: &JsonValue,
     field: &str,
@@ -1094,7 +1094,7 @@ pub(crate) fn compare_hits_by_field(
 /// hands hits back — or the injected `SORT_KEY_FIELD` when a sort was requested. Keyed on that
 /// metadata field rather than on the sort field itself, because projection may have removed
 /// the latter from the hit.
-pub(crate) fn compare_hits_primary(
+pub(super) fn compare_hits_primary(
     a: &JsonValue,
     b: &JsonValue,
     sort: Option<&SortSpec>,
@@ -1115,7 +1115,7 @@ pub(crate) fn compare_hits_primary(
 /// shard was created — and then to the hit's place in that shard's own ordering, which Tantivy
 /// has already made total. `results` holds each shard's hits contiguously, so a comparison of
 /// positions within one shard is a comparison within its block.
-pub(crate) fn order_shard_hits(results: &mut Vec<(Uuid, f32, JsonValue)>, sort: Option<&SortSpec>) {
+pub(super) fn order_shard_hits(results: &mut Vec<(Uuid, f32, JsonValue)>, sort: Option<&SortSpec>) {
     let mut ranked: Vec<(usize, (Uuid, f32, JsonValue))> =
         std::mem::take(results).into_iter().enumerate().collect();
 
@@ -1142,14 +1142,14 @@ pub(crate) fn order_shard_hits(results: &mut Vec<(Uuid, f32, JsonValue)>, sort: 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SearchWindow {
     /// How many ordered hits to discard before the first one returned.
-    pub offset: usize,
+    pub(crate) offset: usize,
     /// How many to return after that.
-    pub limit: usize,
+    pub(crate) limit: usize,
 }
 
 impl SearchWindow {
     /// The first `limit` hits — what every caller that does not page asks for.
-    pub fn first(limit: usize) -> Self {
+    pub(super) fn first(limit: usize) -> Self {
         SearchWindow { offset: 0, limit }
     }
 
@@ -1168,7 +1168,7 @@ impl SearchWindow {
     /// [`Self::fetch_count`]), and Tantivy's collector allocates against the number it is given
     /// before it has matched anything. So a deep page is exactly as expensive as a large limit,
     /// and `max_search_limit` has to bound both or it bounds neither.
-    pub fn checked(
+    pub(crate) fn checked(
         limit: Option<usize>,
         offset: Option<usize>,
         default_limit: usize,
@@ -1213,12 +1213,12 @@ impl SearchWindow {
     /// that skipped `offset` of *its own* hits would drop rows that belong in the answer and
     /// promote rows that do not. This is why Tantivy's own `and_offset` is not used here: it is
     /// the right tool for one segment and the wrong one for a scatter-gather.
-    pub fn fetch_count(&self) -> usize {
+    pub(crate) fn fetch_count(&self) -> usize {
         self.offset.saturating_add(self.limit)
     }
 
     /// Take this window out of a sequence that is already in its final order.
-    pub fn apply<T>(&self, ordered: Vec<T>) -> Vec<T> {
+    pub(super) fn apply<T>(&self, ordered: Vec<T>) -> Vec<T> {
         ordered
             .into_iter()
             .skip(self.offset)
@@ -1290,7 +1290,7 @@ pub(crate) fn order_hit_blocks(
 /// A `Stream` has no offset to read. It hands the caller the whole result as it is produced, so
 /// there is no page to take, and the HTTP stream route refuses an `offset` rather than accepting
 /// one it would not honour. Its limit is still its own.
-pub(crate) fn search_window_for(op: &ClientOp, default_limit: usize) -> SearchWindow {
+pub(super) fn search_window_for(op: &ClientOp, default_limit: usize) -> SearchWindow {
     match op {
         ClientOp::Search { limit, offset, .. } => SearchWindow {
             offset: offset.unwrap_or(0),
@@ -1308,7 +1308,7 @@ pub(crate) fn search_window_for(op: &ClientOp, default_limit: usize) -> SearchWi
 ///
 /// `id` is the identifier the write arrived with, beside the body rather than in it — see
 /// `unusable_document_identity` for why that is the authoritative one.
-pub(crate) fn validate_document(
+pub(super) fn validate_document(
     id: &str,
     doc: &JsonValue,
     schema_cache: &IndexSchema,

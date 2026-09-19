@@ -33,35 +33,35 @@ use serde_json::Value as JsonValue;
 /// Router actor that forwards client operations to NodeOrchestrator via actor messaging.
 /// Uses actor messaging instead of Arc<RwLock> - no locks needed.
 #[derive(Clone, Actor)]
-pub struct RouterActor {
-    pub(crate) orchestrator: ActorRef<NodeOrchestrator>,
-    pub(crate) coordinator: ActorRef<ClusterCoordinator>,
-    pub(crate) remote_timeout: Duration,
-    pub(crate) broadcast_timeout: Duration,
-    pub(crate) broadcast_fanout_limit: usize,
-    pub(crate) remote_retry_attempts: u8,
-    pub(crate) default_search_limit: usize,
-    pub(crate) broadcasts_total: Arc<AtomicU64>,
-    pub(crate) broadcast_failures: Arc<AtomicU64>,
+pub(crate) struct RouterActor {
+    pub(super) orchestrator: ActorRef<NodeOrchestrator>,
+    pub(super) coordinator: ActorRef<ClusterCoordinator>,
+    pub(super) remote_timeout: Duration,
+    pub(super) broadcast_timeout: Duration,
+    pub(super) broadcast_fanout_limit: usize,
+    pub(super) remote_retry_attempts: u8,
+    pub(super) default_search_limit: usize,
+    pub(super) broadcasts_total: Arc<AtomicU64>,
+    pub(super) broadcast_failures: Arc<AtomicU64>,
     // Streaming search configuration
-    pub(crate) streaming: StreamingSearchConfig,
+    pub(super) streaming: StreamingSearchConfig,
     /// Worker pool channel for dispatching hot-path ops (Write, Search)
     /// bypassing the actor mailbox for concurrent processing.
-    pub(crate) worker_tx: Option<OrchestratorWorkerTx>,
+    pub(super) worker_tx: Option<OrchestratorWorkerTx>,
     /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups.
-    pub(crate) remote_peer_pool: Arc<RemotePeerPool>,
+    pub(super) remote_peer_pool: Arc<RemotePeerPool>,
     /// Shard-affine dispatch configuration and shared routing ring.
-    pub(crate) shard_affine: ShardAffineConfig,
+    pub(super) shard_affine: ShardAffineConfig,
     /// This node's shards, published lock-free. Lets a keyed operation be recognised as
     /// local without asking the coordinator — see `route_and_handle`.
-    pub(crate) placement: Arc<ArcSwap<ShardPlacement>>,
+    pub(super) placement: Arc<ArcSwap<ShardPlacement>>,
     /// Whether `[network.cluster] enabled` is on.
     ///
     /// A node with it off is the whole system, so every routing decision is `Local` and the
     /// coordinator has nothing to add. Static configuration, read here rather than asked,
     /// because the ask was the cost — measured at one mailbox round trip per *keyless*
     /// operation, which is every ordinary search, every streaming search and `GET /_indexes`.
-    pub(crate) clustered: bool,
+    pub(super) clustered: bool,
     /// The backlog gate for the actor-mailbox lane — deferred bulk writes, config and metadata.
     ///
     /// F7 gated the worker pool and left this lane open, which measured as its whole original
@@ -75,31 +75,31 @@ pub struct RouterActor {
     /// Its own `QueueLoad` rather than a share of the pool's, for the reason
     /// [`MAILBOX_LANE_WIDTH`] gives. `None` when there is no configured budget to measure
     /// against, which is the same condition that disables the pool's gate.
-    pub(crate) mailbox_load: Option<Arc<QueueLoad>>,
+    pub(super) mailbox_load: Option<Arc<QueueLoad>>,
 }
 
 /// Configuration for shard-affine worker dispatch.
 #[derive(Clone, Debug)]
-pub struct ShardAffineConfig {
+pub(crate) struct ShardAffineConfig {
     /// Shared routing ring for shard-affine dispatch (lock-free via ArcSwap).
     /// When `enabled` is true, the router resolves the target shard from the
     /// routing key and routes the job to the affine worker.
-    pub routing_ring: Arc<ArcSwap<ConsistentRing>>,
+    pub(crate) routing_ring: Arc<ArcSwap<ConsistentRing>>,
     /// Enable shard-affine worker dispatch (default: false).
-    pub enabled: bool,
+    pub(crate) enabled: bool,
 }
 
 /// Configuration for streaming search behavior.
 #[derive(Clone, Debug)]
-pub struct StreamingSearchConfig {
-    pub enable_streaming_search: bool,
+pub(crate) struct StreamingSearchConfig {
+    pub(super) enable_streaming_search: bool,
 
-    pub max_concurrent_shard_searches: usize,
-    pub max_concurrent_remote_searches: usize,
+    pub(super) max_concurrent_shard_searches: usize,
+    pub(super) max_concurrent_remote_searches: usize,
 }
 
 impl StreamingSearchConfig {
-    pub fn from_search_config(sc: &SearchConfig) -> Self {
+    pub(crate) fn from_search_config(sc: &SearchConfig) -> Self {
         Self {
             enable_streaming_search: sc.enable_streaming_search,
 
@@ -118,7 +118,7 @@ impl StreamingSearchConfig {
 /// applied twice however many levels the request travels through. Only `Search` widens —
 /// the streaming fan-out converts `Stream` to `Search` itself before calling this, and every
 /// other op passes through unchanged.
-pub(crate) fn widen_broadcast_op(op: ClientOp, window: SearchWindow) -> ClientOp {
+pub(super) fn widen_broadcast_op(op: ClientOp, window: SearchWindow) -> ClientOp {
     match op {
         ClientOp::Search {
             index,
@@ -140,7 +140,7 @@ pub(crate) fn widen_broadcast_op(op: ClientOp, window: SearchWindow) -> ClientOp
 
 /// A peer's answer to a broadcast: the remote ask's own verdict, or the timeout that fired
 /// waiting for it.
-pub(crate) type PeerAnswer =
+pub(super) type PeerAnswer =
     Result<Result<JsonValue, OrchestratorError>, tokio::time::error::Elapsed>;
 
 /// What a broadcast asks every source and gets back, before the merge differs.
@@ -150,28 +150,28 @@ pub(crate) type PeerAnswer =
 /// the join with the local future were written twice and had already drifted (ROADMAP L16
 /// records what written-twice cost). What stays per-caller is the local future and the
 /// merge.
-pub(crate) struct BroadcastFanout {
+pub(super) struct BroadcastFanout {
     /// The window read off the op before widening — the merge pages through it.
-    pub(crate) window: SearchWindow,
+    pub(super) window: SearchWindow,
     /// The op as fanned out — a `Search` carries `fetch_count` and no offset.
-    pub(crate) op: ClientOp,
+    pub(super) op: ClientOp,
     /// This node's answer.
-    pub(crate) local: Result<JsonValue, OrchestratorError>,
+    pub(super) local: Result<JsonValue, OrchestratorError>,
     /// Every asked peer's answer back in dispatch order — not completion order, which a
     /// merge reading ties off source order would leak into the response. The outer `Err`
     /// is the timeout.
-    pub(crate) remote: Vec<(Uuid, PeerAnswer)>,
+    pub(super) remote: Vec<(Uuid, PeerAnswer)>,
     /// When the local + remote join started — the `took_ms` floor when no source says one.
-    pub(crate) started: Instant,
+    pub(super) started: Instant,
     /// How many peers the fan-out asked, after `broadcast_fanout_limit`.
-    pub(crate) peers_asked: usize,
+    pub(super) peers_asked: usize,
 }
 
 /// One block per source, taken whole. Ordering across blocks is `order_hit_blocks`'s
 /// business, and it needs to know which source each hit came from to settle a tie the same
 /// way twice. The rest of what a broadcast response carries is folded into `stats` here so
 /// the merge loop is one call per source.
-pub(crate) fn push_hits(
+pub(super) fn push_hits(
     value: &mut JsonValue,
     blocks: &mut Vec<Vec<JsonValue>>,
     stats: &mut BroadcastStats,
@@ -210,7 +210,7 @@ pub(crate) fn push_hits(
 
 impl RouterActor {
     #[allow(clippy::too_many_arguments)]
-    pub fn with_config(
+    pub(crate) fn with_config(
         orchestrator: ActorRef<NodeOrchestrator>,
         coordinator: ActorRef<ClusterCoordinator>,
         messaging: &MessagingConfig,
@@ -264,7 +264,7 @@ impl RouterActor {
     }
 
     /// The mailbox lane's backlog gate, for the endpoints that report what refusals are made on.
-    pub fn mailbox_load(&self) -> Option<&Arc<QueueLoad>> {
+    pub(crate) fn mailbox_load(&self) -> Option<&Arc<QueueLoad>> {
         self.mailbox_load.as_ref()
     }
 
@@ -273,7 +273,7 @@ impl RouterActor {
     /// The node published no service percentile at all before this, so an operator could see how
     /// much work was queued but not how long the node's own work was taking — and could not tell
     /// a node that had got slower from one that had got busier.
-    pub fn mailbox_service_p90_ms(&self) -> Option<u64> {
+    pub(crate) fn mailbox_service_p90_ms(&self) -> Option<u64> {
         self.mailbox_load
             .as_ref()
             .map(|load| load.dispatch_stats.service_hist.estimate_us() / 1_000)
@@ -286,7 +286,10 @@ impl RouterActor {
     /// through the mailbox is what needs `&mut NodeOrchestrator`: config and metadata ops,
     /// and the ops a worker handed back because they need a schema written or a remote shard
     /// forwarded to.
-    pub async fn handle_client_op(&self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
+    pub(crate) async fn handle_client_op(
+        &self,
+        op: ClientOp,
+    ) -> Result<JsonValue, OrchestratorError> {
         // Try worker pool for hot-path ops
         if let Some(tx) = &self.worker_tx {
             let is_worker_eligible = matches!(
@@ -430,7 +433,7 @@ impl RouterActor {
     /// schema rejected answered `500 Internal server error` instead of a `400` naming what was
     /// wrong with it. Only the delivery failures need a description; the handler already wrote
     /// one for its own.
-    pub(crate) async fn ask_orchestrator(
+    pub(super) async fn ask_orchestrator(
         &self,
         op: ClientOp,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -467,7 +470,7 @@ impl RouterActor {
 
     /// The mailbox ask itself, without the backlog gate. Split out so the guarded path above
     /// reads as the decision it is, and so a node with no budget keeps exactly its old behaviour.
-    pub(crate) async fn ask_orchestrator_unguarded(
+    pub(super) async fn ask_orchestrator_unguarded(
         &self,
         op: ClientOp,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -481,13 +484,13 @@ impl RouterActor {
         }
     }
 
-    pub async fn admin_memory(&self) -> Result<AdminMemoryReport, OrchestratorError> {
+    pub(crate) async fn admin_memory(&self) -> Result<AdminMemoryReport, OrchestratorError> {
         self.orchestrator.ask(GetAdminMemory).await.map_err(|e| {
             OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
         })
     }
 
-    pub async fn admin_purge_memory(
+    pub(crate) async fn admin_purge_memory(
         &self,
         force: bool,
     ) -> Result<AdminMemoryReport, OrchestratorError> {
@@ -499,7 +502,7 @@ impl RouterActor {
             })
     }
 
-    pub async fn admin_commit_index(
+    pub(crate) async fn admin_commit_index(
         &self,
         index: String,
     ) -> Result<AdminIndexCommitReport, OrchestratorError> {
@@ -511,7 +514,7 @@ impl RouterActor {
             })
     }
 
-    pub async fn admin_evict_index_writer(
+    pub(crate) async fn admin_evict_index_writer(
         &self,
         index: String,
     ) -> Result<AdminIndexEvictWriterReport, OrchestratorError> {
@@ -524,7 +527,7 @@ impl RouterActor {
     }
 
     /// Returns a snapshot of the worker pool stats for `/_admin/workers`.
-    pub fn admin_worker_stats(&self) -> Result<WorkerPoolReport, OrchestratorError> {
+    pub(crate) fn admin_worker_stats(&self) -> Result<WorkerPoolReport, OrchestratorError> {
         match &self.worker_tx {
             Some(tx) => Ok(tx.snapshot()),
             None => Err(OrchestratorError::NotReady(
@@ -539,7 +542,7 @@ impl RouterActor {
     /// for the one caller that has to know the number before the search runs: a federated merge
     /// truncates the combined result itself, and doing that against a different default than
     /// the searches used would report a limit the node did not apply.
-    pub fn default_search_limit(&self) -> usize {
+    pub(crate) fn default_search_limit(&self) -> usize {
         self.default_search_limit
     }
 
@@ -549,7 +552,7 @@ impl RouterActor {
     /// Deliberately conservative: it returns `Some` only for a key whose owning shard is on
     /// this node. An unkeyed operation is a scatter-gather whose answer depends on how many
     /// nodes are in the cluster, which is the coordinator's to know, so it is left alone.
-    pub(crate) fn resolve_local(&self, routing_key: Option<&str>) -> Option<RoutingDecision> {
+    pub(super) fn resolve_local(&self, routing_key: Option<&str>) -> Option<RoutingDecision> {
         // A node with clustering off is the whole system: `decide_route` has one node in
         // `expected_nodes` and can only ever answer `Local`, whether or not a key was given.
         // Taking that arm here is what keeps a keyless operation off the coordinator — and
@@ -566,7 +569,7 @@ impl RouterActor {
     }
 
     /// Route via ClusterCoordinator then handle locally (remote/broadcast stubbed).
-    pub async fn route_and_handle(
+    pub(crate) async fn route_and_handle(
         &self,
         op: ClientOp,
         routing_key: Option<String>,
@@ -583,7 +586,7 @@ impl RouterActor {
     /// strip**: the key is metadata and must not reach a client. Re-deriving the key from the
     /// hit is not an alternative — the sort field may have been projected away, which is the
     /// reason the key exists at all.
-    pub async fn route_and_handle_keeping_sort_keys(
+    pub(crate) async fn route_and_handle_keeping_sort_keys(
         &self,
         op: ClientOp,
         routing_key: Option<String>,
@@ -593,7 +596,7 @@ impl RouterActor {
             .await
     }
 
-    pub(crate) async fn route_and_handle_inner(
+    pub(super) async fn route_and_handle_inner(
         &self,
         op: ClientOp,
         routing_key: Option<String>,
@@ -695,13 +698,13 @@ impl RouterActor {
     /// - Incremental flushing (each hit serialized and sent individually)
     /// - Bounded backpressure via channel capacity
     /// - Early client disconnect detection
-    pub fn route_and_handle_stream(
+    pub(crate) fn route_and_handle_stream(
         &self,
         op: ClientOp,
         routing_key: Option<String>,
         operation_type: OperationType,
     ) -> mpsc::Receiver<Result<bytes::Bytes, std::io::Error>> {
-        pub(crate) const STREAM_CHANNEL_CAPACITY: usize = 64;
+        pub(super) const STREAM_CHANNEL_CAPACITY: usize = 64;
 
         let (tx, rx) =
             mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(STREAM_CHANNEL_CAPACITY);
@@ -737,7 +740,7 @@ impl RouterActor {
     ///
     /// Sends each hit as a separate NDJSON line, followed by a footer line
     /// containing aggregated metadata (total_hits, took_ms, stats, errors).
-    pub(crate) async fn stream_search_result_as_ndjson(
+    pub(super) async fn stream_search_result_as_ndjson(
         tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
         mut val: JsonValue,
     ) {
@@ -887,7 +890,7 @@ impl RouterActor {
         }
     }
 
-    pub(crate) async fn handle_broadcast(
+    pub(super) async fn handle_broadcast(
         &self,
         op: ClientOp,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -1354,7 +1357,7 @@ impl RouterActor {
     /// It could not have been fixed while this merge still terminated early either: a page
     /// assembled from whichever sources answered first is not the page that was asked for,
     /// wherever the skip is applied. Every source now always answers (2d13f4c).
-    pub(crate) async fn handle_broadcast_streaming(
+    pub(super) async fn handle_broadcast_streaming(
         &self,
         op: ClientOp,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -1531,7 +1534,7 @@ impl RouterActor {
     }
 
     /// Broadcast request method for non-search operations
-    pub(crate) async fn handle_broadcast_request(
+    pub(super) async fn handle_broadcast_request(
         &self,
         op: ClientOp,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -1552,7 +1555,7 @@ impl RouterActor {
     /// the same schema and the same verdict; not wrapped, because the wrapper described a
     /// transport that worked perfectly; and not reported as a dial failure, because it says
     /// nothing about connectivity. Only an attempt that failed to *reach* the peer is retried.
-    pub(crate) async fn handle_remote(
+    pub(super) async fn handle_remote(
         &self,
         op: ClientOp,
         node_id: Uuid,
@@ -1640,7 +1643,7 @@ impl RouterActor {
     /// attempt including the first, so an ordinary cross-node write deep-cloned its whole
     /// document for a call that succeeded. A fan-out still clones once per peer, which is real:
     /// those futures run concurrently and each needs its own.
-    pub(crate) async fn try_remote(
+    pub(super) async fn try_remote(
         &self,
         op: &ClientOp,
         node_id: Uuid,

@@ -41,6 +41,23 @@
 //!
 //! Note that `core_affinity::set_for_current` is a no-op on macOS, so every pinning path
 //! here degrades to unpinned threads on that platform and only takes effect on Linux.
+//!
+//! # The modules
+//!
+//! `node_orchestrator.rs` was one file of 13,669 lines before L11 split it. What the split is
+//! *for* is that each of these can be read, and changed, without the other five in view:
+//!
+//! - [`orchestrator`] — the dispatch core: [`NodeOrchestrator`], [`OrchestratorEngine`], the
+//!   worker loop and the `Message` impls, plus the write-path machinery the two lanes share.
+//! - [`admission`] — what the node lets in and the counters it decides on: [`OpClass`],
+//!   [`ServiceHistogram`], [`QueueLoad`], [`MailboxLane`]/[`MailboxSlot`], and the
+//!   `/_admin/workers` report types. One subsystem, because its invariants are properties of
+//!   the whole set rather than of any one type.
+//! - [`routing`] — the routing-key ladder: the one rule that decides which shard a document
+//!   lands on, in one place so it cannot disagree with itself.
+//! - [`router`] — [`RouterActor`], the front door that decides local against remote.
+//! - [`search`] — the scatter/gather across shards and peers, and hit ordering.
+//! - [`shard`] — [`MicroshardActor`] and the writer-thread boundary.
 
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet};
@@ -57,15 +74,37 @@ use serde_json::Value as JsonValue;
 pub use storage::SortSpec;
 use storage::{IndexSchema, StoreError, TantivyFieldType, WalOp};
 
+mod admission;
 mod orchestrator;
 mod router;
+mod routing;
 mod search;
 mod shard;
 
-pub use orchestrator::*;
-pub use router::*;
-pub use search::*;
-pub use shard::*;
+// Inside `node/`, every submodule reaches its siblings through `use super::*`, so these globs
+// stay — but scoped to `node` and no wider. That is what makes the list below the whole
+// boundary: an item the rest of the crate may use has to be named there on purpose, and a new
+// `pub(super)` item cannot escape by being swept up in a glob. Before L11's split this file was
+// one module and the question did not arise; after it, `pub use <submodule>::*` re-exported 129
+// submodule items crate-wide, of which 15 are ever used outside `node/` (O1).
+pub(in crate::node) use admission::*;
+pub(in crate::node) use orchestrator::*;
+pub(in crate::node) use routing::*;
+pub(in crate::node) use search::*;
+pub(in crate::node) use shard::*;
+
+// Everything outside `node/` may use from `node/`'s submodules. Adding a line here is the
+// deliberate act of widening a boundary; nothing else in `node/` is reachable as
+// `crate::node::*` unless it is declared in this file.
+pub(crate) use admission::{OpClass, QueueLoad, WorkerPoolReport};
+pub(crate) use orchestrator::NodeOrchestrator;
+pub(crate) use router::{RouterActor, ShardAffineConfig, StreamingSearchConfig};
+pub(crate) use routing::routing_key_without_schema;
+pub(crate) use search::{
+    APPROXIMATE_SORT_FIELD, DISCARDED_CLAUSES_FIELD, SearchWindow, order_hit_blocks,
+    renumber_reasons,
+};
+pub(crate) use shard::{ReadPoolHealth, WriterLiveness};
 
 /// Sample limit for enhanced schema detection during initial creation
 pub(crate) const SCHEMA_SAMPLE_LIMIT: usize = 200;
