@@ -3823,6 +3823,15 @@ names a node has touched, and that is precisely the dimension
   fallback inside `should_commit_writer` — leaving one. The regression guard is the timestamp:
   it is stamped when the budget is measured, so an unchanged one after three commits is proof
   no walk happened.
+
+  **Measured 2026-09-19, and it does not show — which is the honest result.** `cameodb-bench`
+  bulk mode, 1 shard, a commit every 100 operations, 500-document batches, alternating against
+  `0e2c1b2`: 12 922 / 12 883 docs/s baseline against 13 013 / 12 885 on this build, p99 within
+  noise of each other. The reason is measurable too: after that run the index directory holds
+  **65 files**, not the ~300 this entry's fifty-segment figure assumes, so the walk removed some
+  66 syscalls from a request that spends ~150 ms indexing 500 documents. The syscalls are gone —
+  that part is mechanical and the timestamp test proves it — but the saving is invisible at this
+  index size and grows with segment count, so no throughput claim is made for it.
 - **M0-h — dead code that documents behaviour the engine does not have, and the decision it
   needs.** `StorageConfig::get_bulk_operation_budget` is called by nothing in production —
   its only caller is `crates/storage/tests/bulk_memory_budget_test.rs`. Its doc describes bulk
@@ -3887,6 +3896,28 @@ batch size, which is the disagreement L-group work already closed. The cost is s
   What no in-process test can show is the atomicity itself — that needs a crash between two
   commits, and there is now no between.
 
+  **Measured 2026-09-19.** `cargo run -p storage --release --example evolving_write_cost`, 400
+  writes per cell, three rounds alternating between this build and `0e2c1b2`, on one developer
+  machine (macOS, so every pinning path is a no-op) — relative figures, not an SLA.
+
+  | 400 writes, `wal_sync=true` | baseline | this build |
+  |---|---|---|
+  | every write introduces a field | 2817 ms | **1503 ms** |
+  | no write introduces a field | 1304 ms | 1304 ms |
+  | ratio, evolving ÷ plain | **2.16** | **1.15** |
+
+  **1.88× on the shipped default**, and the ratio is the clearer statement of it: an evolving
+  write cost twice a plain one because it paid two fsyncs, and now costs roughly what a plain
+  one costs. The plain column is identical across builds, which is what says the gain is on the
+  evolving path rather than a general shift in the machine. With `wal_sync=false`, where both
+  builds pay exactly one fsync, the gain is 1.08× — the second transaction's own overhead, and
+  the right size for what is left after the fsync is not the difference.
+
+  The harness is an example rather than a test: it asserts nothing and takes tens of seconds, so
+  it does not belong in a gate, but without it this number could not be taken again. It exists
+  because `cameodb-bench` declares its schema up front, deliberately, and so never exercises the
+  write this item is about.
+
 #### The order of work
 
 Ranked by impact × certainty ÷ effort. Items 1–3 and 7 are mechanically verifiable — the code
@@ -3923,6 +3954,15 @@ the only steps that change where the other five are *read*, and every one of the
 through M0-i work against a module layout that was about to move under it. O4 is what is left of
 step 5; it is in `storage`, touches no `node/` path, and can ride with whichever storage-side
 step reaches it first. `cargo clippy --workspace --all-targets` is clean and
+**Validated 2026-09-19.** `scripts/validate/all.sh` against the release binary: deps 7, unit 1,
+posture 46, auth 114, tls 9, remote-sources 4, artifact 8 — **7 suites, 189 checks, 0 failed,
+0 skipped**, which is the standard
+[L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) set. A node-level A/B
+against `0e2c1b2` on the mixed workload found no regression and no gain (375 → 373 writes/s,
+19 008 → 18 652 searches/s, p99 34.0 → 35.0 ms and 600 → 597 µs) — expected, because the
+harness declares its schema and so never evolves one. The change that *is* visible is recorded
+under M0-i.
+
 `scripts/validate/unit.sh` reports 829 tests across 44 targets, 0 skipped. Steps 4 and 5 are
 behaviour-preserving by construction — visibility narrowing and code motion, no logic edited —
 and the suite is the evidence, not the argument; steps 1, 3 and 7 do change behaviour, and each
