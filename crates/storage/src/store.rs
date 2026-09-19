@@ -275,8 +275,6 @@ pub struct HybridStore {
     pub(crate) current_seq: Arc<DashMap<String, AtomicU64>>,
     /// Operation counters for smart commits per index
     pub(crate) operations_counter: Arc<DashMap<String, AtomicU64>>,
-    /// Simple per-index read cache for frequently accessed documents
-    pub(crate) read_cache: Arc<DashMap<String, IndexReadCache>>,
     /// Cache of optimal memory budgets per index to avoid frequent syscalls.
     /// See [`BudgetCacheEntry`] for why it carries a timestamp rather than a bare number.
     pub(crate) budget_cache: Arc<DashMap<String, BudgetCacheEntry>>,
@@ -458,7 +456,6 @@ impl HybridStore {
             readers: Arc::new(DashMap::new()),
             current_seq: Arc::new(DashMap::new()),
             operations_counter: Arc::new(DashMap::new()),
-            read_cache: Arc::new(DashMap::new()),
             budget_cache: Arc::new(DashMap::new()),
             schema_cache: Arc::new(DashMap::new()),
             fields_cache: Arc::new(DashMap::new()),
@@ -2122,10 +2119,6 @@ impl HybridStore {
                     is_new
                 };
 
-                // The cached body for this id is now the previous one. Removing it after the
-                // commit rather than before is what makes the removal stick.
-                self.invalidate_read_cache(index, [id.as_str()]);
-
                 // The schema cache moves only once the row it describes is durable. It used to
                 // be written optimistically before the transaction and again after it, so a
                 // failure anywhere in between left the cache ahead of the store.
@@ -2170,8 +2163,6 @@ impl HybridStore {
                 }
                 write_txn.commit()?;
 
-                self.invalidate_read_cache(index, [id.as_str()]);
-
                 // Tantivy delete, after redb committed the removal.
                 {
                     let writer = writer_arc.lock().unwrap_or_else(|poisoned| {
@@ -2199,9 +2190,6 @@ impl HybridStore {
         self.writers.remove(index);
         self.readers.remove(index);
         self.current_seq.remove(index);
-        // Cleared rather than removed: a reader mid-flight read this index's generation and
-        // must be refused its insert, which a fresh entry starting from zero would allow.
-        self.invalidate_read_cache_all(index);
         self.schema_cache.remove(index);
         self.fields_cache.remove(index);
         self.budget_cache.remove(index);
@@ -3097,11 +3085,6 @@ impl HybridStore {
         }
 
         write_txn.commit()?;
-
-        // Every id in this batch had its row written or removed, so any cached body for it is
-        // the previous one. Done after the commit and before the Tantivy work, with the ids
-        // still borrowed out of `final_ops` rather than collected into a second vector.
-        self.invalidate_read_cache(index, final_ops.iter().map(|entry| entry.id.as_str()));
 
         // Apply the final Tantivy operation per id, in the order redb committed: the prior
         // version removed where there was one, then the batch's last put or delete for that id.

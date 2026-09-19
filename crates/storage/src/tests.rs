@@ -115,7 +115,7 @@ mod tests {
         writer.commit().unwrap();
 
         let temp_dir = TempDir::new().unwrap();
-        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+        let store = HybridStore::new(small_store_config(&temp_dir), 1).unwrap();
 
         assert!(
             store.get_highest_indexed_seq(&tantivy_index).is_err(),
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn a_poisoned_size_cache_does_not_poison_the_calls_that_follow() {
         let temp_dir = TempDir::new().unwrap();
-        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+        let store = HybridStore::new(small_store_config(&temp_dir), 1).unwrap();
 
         let cache = Arc::clone(&store.index_size_cache);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn a_value_that_is_not_a_facet_path_is_refused_rather_than_fatal() {
         let temp_dir = TempDir::new().unwrap();
-        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+        let store = HybridStore::new(small_store_config(&temp_dir), 1).unwrap();
 
         let mut schema = IndexSchema::default();
         schema.fields.insert(
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn a_batch_keeps_the_last_document_of_a_repeated_id() {
         let temp_dir = TempDir::new().unwrap();
-        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+        let store = HybridStore::new(small_store_config(&temp_dir), 1).unwrap();
 
         let mut schema = IndexSchema::default();
         schema.fields.insert(
@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn a_batch_replaces_a_committed_document_it_deletes_and_puts_again() {
         let temp_dir = TempDir::new().unwrap();
-        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+        let store = HybridStore::new(small_store_config(&temp_dir), 1).unwrap();
 
         let mut schema = IndexSchema::default();
         schema.fields.insert(
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn a_batch_that_puts_then_deletes_an_id_leaves_no_document() {
         let temp_dir = TempDir::new().unwrap();
-        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+        let store = HybridStore::new(small_store_config(&temp_dir), 1).unwrap();
 
         let mut schema = IndexSchema::default();
         schema.fields.insert(
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn deleting_from_an_unknown_index_creates_nothing() {
         let temp_dir = TempDir::new().unwrap();
-        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+        let store = HybridStore::new(small_store_config(&temp_dir), 1).unwrap();
         let indices = temp_dir.path().join("indices");
 
         for op in [
@@ -508,18 +508,23 @@ mod tests {
         assert!(indices.join("fresh").exists());
     }
 
-    /// The read cache must not outlive the row it mirrors.
+    /// A key lookup answers with the row as it now stands, after an update and after a delete.
     ///
-    /// Its only writer is a body hydration on the read path, and until 2026-08-26 its only
-    /// invalidation was dropping an entire index. So a document read once and then updated kept
-    /// serving its previous body, and a document read once and then deleted kept being served at
-    /// all — which is fatal for deletion, since an `id:VALUE` lookup is answered from redb and
-    /// never consults Tantivy. Both halves are asserted here on the single-write path and on the
-    /// batch path, because each does its own invalidation.
+    /// This used to be a property of an invalidation protocol rather than of the store. A
+    /// per-index cache of document bodies sat in front of redb, its only writer a hydration on
+    /// the read path, and until 2026-08-26 its only invalidation was dropping an entire index —
+    /// so a document read once and then updated kept serving its previous body, and one read
+    /// once and then deleted kept being served at all, which is fatal for deletion because an
+    /// `id:VALUE` lookup is answered from redb and never consults Tantivy. The cache is gone
+    /// (2026-09-19), so the property now holds by construction: `get_by_key` reads redb, and
+    /// redb's own page cache is coherent with its own writes.
+    ///
+    /// The test stays, because "a read after a write sees the write" is worth asserting however
+    /// it comes to be true, and because both paths — single write and batch — are covered.
     #[test]
-    fn a_changed_row_is_not_served_from_the_read_cache() {
+    fn a_key_lookup_sees_the_latest_row_on_both_write_paths() {
         let temp_dir = TempDir::new().unwrap();
-        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
+        let store = HybridStore::new(small_store_config(&temp_dir), 1).unwrap();
 
         let body = |index: &str, id: &str| -> Option<String> {
             store
@@ -621,64 +626,7 @@ mod tests {
         assert_eq!(body(batch, "d2"), None, "a batched delete must be visible");
     }
 
-    /// A reader whose snapshot predates a write must not install that snapshot's body.
-    ///
-    /// Removing the entry is not sufficient on its own: the removal happens after the redb
-    /// commit, and a reader that opened its transaction earlier legitimately still sees the
-    /// pre-write row. If it caches that body after the removal, the staleness is back and
-    /// nothing will remove it a second time. The generation is what makes such a reader decline,
-    /// and the interleaving that needs it cannot be produced from a single thread — so this
-    /// drives the two halves directly, in the order the race would put them.
-    #[test]
-    fn a_body_read_before_a_write_is_refused_by_the_cache() {
-        let temp_dir = TempDir::new().unwrap();
-        let store = HybridStore::new(read_cache_config(&temp_dir), 1).unwrap();
-        let index = "cache_generation";
-
-        store
-            .apply_write(
-                index,
-                WalOp::Put {
-                    id: "d1".to_string(),
-                    json_blob: Some(serde_json::json!({"id": "d1", "title": "v1"})),
-                },
-            )
-            .unwrap();
-
-        // What a reader would have captured before opening its transaction.
-        let seen_generation = store.cache_generation(index);
-
-        // The write it is about to race, committed and invalidated.
-        store
-            .apply_write(
-                index,
-                WalOp::Delete {
-                    id: "d1".to_string(),
-                },
-            )
-            .unwrap();
-
-        // The reader, arriving late with a body that was true when it looked.
-        store.insert_into_cache(index, "d1", b"stale".to_vec(), seen_generation);
-
-        assert_eq!(
-            store.get_from_cache(index, "d1"),
-            None,
-            "a body read before the write must be refused, not installed"
-        );
-
-        // A reader that saw the current generation is still served by the cache, or the guard
-        // would have turned the cache off rather than made it correct.
-        let current = store.cache_generation(index);
-        store.insert_into_cache(index, "d1", b"fresh".to_vec(), current);
-        assert_eq!(
-            store.get_from_cache(index, "d1").as_deref(),
-            Some(&b"fresh"[..]),
-            "a body read after the write must still be cacheable"
-        );
-    }
-
-    fn read_cache_config(temp_dir: &TempDir) -> StorageConfig {
+    fn small_store_config(temp_dir: &TempDir) -> StorageConfig {
         StorageConfig {
             shard_path: temp_dir.path().to_path_buf(),
             indexer_memory_budget: 32 * 1024 * 1024,
@@ -702,7 +650,7 @@ mod tests {
     #[test]
     fn invalidating_one_indexs_cached_sizes_leaves_its_neighbours_alone() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let store = HybridStore::new(read_cache_config(&temp_dir), 1).expect("store");
+        let store = HybridStore::new(small_store_config(&temp_dir), 1).expect("store");
 
         let entry = IndexSizeCache {
             tantivy_bytes: 1,
@@ -728,62 +676,6 @@ mod tests {
         assert!(!cache.contains_key(&(true, "a".to_string())));
     }
 
-    /// A full read cache evicts a body nobody has read, not whichever one the hash map named
-    /// first.
-    ///
-    /// The bound bit with `entries.keys().next()` as the victim — arbitrary `HashMap` order,
-    /// neither LRU nor FIFO however the surrounding comments described it — so a cache under
-    /// pressure could drop the hot set and keep bodies nothing had asked for since they were
-    /// stored. CLOCK gives a read since the last sweep a second chance, which is the property
-    /// this pins: fill the cache past its bound, reading one key throughout, and that key must
-    /// still be there.
-    #[test]
-    fn the_read_cache_evicts_what_nobody_is_reading() {
-        const BOUND: usize = 1024;
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let store = HybridStore::new(read_cache_config(&temp_dir), 1).expect("store");
-        let index = "hot";
-
-        let generation = store.cache_generation(index);
-        store.insert_into_cache(index, "hot-key", b"hot body".to_vec(), generation);
-
-        // Two full turns of cold traffic, re-reading the hot key each time round. Two, because
-        // one pass only clears every bit; the pass after it is the one that evicts.
-        for round in 0..2 {
-            for n in 0..BOUND {
-                assert_eq!(
-                    store.get_from_cache(index, "hot-key").as_deref(),
-                    Some(&b"hot body"[..]),
-                    "the hot key must survive round {round}, insert {n}"
-                );
-                store.insert_into_cache(
-                    index,
-                    &format!("cold-{round}-{n}"),
-                    b"cold body".to_vec(),
-                    generation,
-                );
-            }
-        }
-
-        assert_eq!(
-            store.get_from_cache(index, "hot-key").as_deref(),
-            Some(&b"hot body"[..]),
-            "a body read on every round must outlive {BOUND} bodies read once"
-        );
-
-        // And the bound still holds: the cache is capped, it just chose better.
-        assert!(
-            store.read_cache.get(index).expect("cache").entries.len() <= BOUND,
-            "the per-index bound must still be enforced"
-        );
-
-        // The earliest cold bodies are what went.
-        assert!(
-            store.get_from_cache(index, "cold-0-0").is_none(),
-            "a body stored first and never read again is the one to evict"
-        );
-    }
-
     /// A commit does not re-walk the index directory to refresh the memory budget.
     ///
     /// `commit_index` used to call `get_optimal_memory_budget` on every commit, which is a
@@ -800,7 +692,7 @@ mod tests {
     #[test]
     fn a_commit_does_not_re_measure_the_memory_budget() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let store = HybridStore::new(read_cache_config(&temp_dir), 1).expect("store");
+        let store = HybridStore::new(small_store_config(&temp_dir), 1).expect("store");
         let index = "cadence";
 
         store
