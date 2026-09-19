@@ -268,6 +268,15 @@ pub struct NodeConfig {
     /// whether there are any. A single node is the whole system, so its own answer is the
     /// cluster's answer and there is nothing to wait for.
     pub clustered: bool,
+
+    /// Whether a write to an index with no schema anywhere may create it
+    /// (`security.implicit_index_creation`).
+    ///
+    /// Carried here for the same reason `clustered` is: the write path decides on it inside
+    /// the orchestrator, which never sees the file-level config. When `false`, the sampling
+    /// that types an index from its first documents is refused and the index has to be
+    /// created explicitly.
+    pub implicit_index_creation: bool,
 }
 
 impl Default for NodeConfig {
@@ -294,6 +303,7 @@ impl Default for NodeConfig {
             worker_core_affinity: false,
             // Standalone by default, matching `network.cluster.enabled`.
             clustered: false,
+            implicit_index_creation: true,
         }
     }
 }

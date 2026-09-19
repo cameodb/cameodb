@@ -581,6 +581,12 @@ capability each endpoint needs.
 # Enforce authentication on every route (default: false)
 enabled = true
 
+# Whether a write to an index that does not exist may create it (default: true).
+# Set false where minting indexes must be an explicit decision — a write to an
+# unknown index is then refused, and the index has to be created with
+# PUT /api/{index}/_config, which needs the index-admin capability.
+implicit_index_creation = true
+
 [[security.api_keys]]
 # The SHA-256 digest of the key — never the key itself
 key_hash = "sha256:1db44a37dcf74ef70439a8887862839803d9686a41fe7c9d75d8fdfa0c72cdb1"
@@ -617,6 +623,15 @@ Roles bundle four capabilities:
 `allowed_indexes` applies on top of the role and holds everywhere a key can reach: naming
 another index is refused, and `/_indexes`, the MCP catalog and the MCP resource list return
 only the indexes that key may see.
+
+**`implicit_index_creation`** decides whether a write may mint an index. On by default: a write
+to an index that does not exist samples the documents into a schema and creates it, which is
+what makes semi-structured input work — and what lets any caller with `write` grow the node's
+disk with arbitrarily many indexes. Set it `false` where creating indexes must be an explicit
+decision: a write to an index with no schema anywhere is then refused `400` naming the remedy,
+and the index has to be created with `PUT /api/{index}/_config` — the `index-admin`
+capability's route. The setting decides what a write may cause, so it holds whoever sends the
+write, key or no key.
 
 The config is validated even when `enabled = false`, so a key stanza cannot be wrong in a way
 you only discover on the day you turn authentication on. These all refuse to start:

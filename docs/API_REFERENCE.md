@@ -55,6 +55,12 @@ Roles bundle these: `admin` holds all four, `writer` holds `read` and `write`, `
 `read`. Where a path contains `{index}`, a key restricted with `allowed_indexes` is refused
 unless that index is in its list.
 
+A `write` call on an index that does not exist creates it — the documents are sampled into a
+schema — so `write` includes minting indexes unless the node sets
+`security.implicit_index_creation = false` (see
+[Configuration](CONFIGURATION.md#authentication-security)). With that off, such a write is
+refused `400` and the index has to be created explicitly with `PUT /api/{index}/_config`.
+
 **Health is the one public route, and its body depends on who is asking.** An anonymous
 caller gets liveness only; presenting any valid key returns the full body:
 

@@ -1312,6 +1312,25 @@ async fn put_config(
     (status, body)
 }
 
+async fn put_document(
+    node: &TestNode,
+    index: &str,
+    id: &str,
+    doc: &serde_json::Value,
+) -> (u16, serde_json::Value) {
+    with_tls_provider();
+    let response = reqwest::Client::new()
+        .put(format!("{}/api/{index}/document", node.url))
+        .json(&serde_json::json!({"id": id, "doc": doc}))
+        .send()
+        .await
+        .expect("put document request");
+
+    let status = response.status().as_u16();
+    let body = response.json().await.unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
 /// `/api/{index}/_config` describes a field exactly as the listing does.
 ///
 /// The two used to disagree on every property name — the schema keyed fields by map key with
@@ -3622,5 +3641,54 @@ async fn writing_after_a_drop_types_the_index_afresh() {
         gone["hits"].as_array().map(|h| h.len()).unwrap_or(0),
         0,
         "the documents the drop removed must not come back with the name"
+    );
+}
+
+/// Minting an index is the resource decision `IndexAdmin` owns, so a deployment can gate it.
+///
+/// With `security.implicit_index_creation = false` a write to an index that does not exist is
+/// refused rather than sampling a schema — the refusal is a `400` that names the explicit path
+/// — and `PUT /_config`, which needs `IndexAdmin`, still creates the index the write then lands
+/// on. The gate decides on the *write*, whoever sends it, so a second unknown index is refused
+/// the same way.
+#[tokio::test]
+async fn a_write_to_an_unknown_index_is_refused_when_implicit_creation_is_off() {
+    let node = TestNode::start("[security]\nimplicit_index_creation = false").await;
+
+    let (status, body) = put_document(&node, "minted", "d1", &json!({"id": "d1"})).await;
+    assert_eq!(
+        status, 400,
+        "a write minting an index was served with the gate off: {body}"
+    );
+    let detail = body["details"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("minted") && detail.contains("/_config"),
+        "the refusal must name the index and the explicit path: {body}"
+    );
+
+    // The explicit path is untouched: the admin creates the index, the write lands.
+    let (status, body) = put_config(
+        &node,
+        "minted",
+        &json!({
+            "fields": {
+                "id": {"name": "id", "field_type": "text", "indexed": true},
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "explicit creation should still work: {body}");
+
+    let (status, body) = put_document(&node, "minted", "d1", &json!({"id": "d1"})).await;
+    assert_eq!(
+        status, 200,
+        "the write refused a moment ago should now land: {body}"
+    );
+
+    // And the gate is not a one-off: a second unknown index is refused the same way.
+    let (status, body) = put_document(&node, "also-minted", "d2", &json!({"id": "d2"})).await;
+    assert_eq!(
+        status, 400,
+        "the gate must hold for every index a write would mint: {body}"
     );
 }

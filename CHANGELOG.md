@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`security.implicit_index_creation` gates whether a write may mint an index.** A write to
+  an index that does not exist samples the documents into a schema and creates it — so any
+  caller with `write` (or anyone, when authentication is off) could grow the node's disk
+  with arbitrarily many indexes, the resource decision `index-admin` exists to own. The
+  setting defaults to `true`, so upgrades keep today's behavior; set it `false` and a write
+  to an index with no schema anywhere is refused `400` naming the remedy — create it
+  explicitly with `PUT /api/{index}/_config`, which needs `index-admin`. Adopting a schema
+  that already exists on a peer is not gated: that applies an existing declaration rather
+  than minting one.
+
 - **MCP tool errors no longer leak the node's internals.** A failed `tools/call` answered with
   the engine's error verbatim — shard and storage diagnostics, forwarded peer fault text —
   while HTTP masks exactly this class behind a `500`. Tool failures now travel as a typed

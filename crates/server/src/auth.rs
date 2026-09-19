@@ -283,7 +283,7 @@ impl fmt::Debug for KeyDigest {
 }
 
 /// `[security]` — authentication for the HTTP and MCP surface.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecurityConfig {
     /// Require a key on every request that is not explicitly public (default: false).
@@ -292,6 +292,17 @@ pub struct SecurityConfig {
     /// Whether that default is *acceptable* is the posture system's decision, not this
     /// field's: `external` refuses it, `internal` warns, `local` accepts it.
     pub enabled: bool,
+
+    /// Whether a write to an index that does not exist may create it (default: true).
+    ///
+    /// Implicit creation is what makes semi-structured input work: the first document an
+    /// index sees becomes its schema. On by default so an upgrade does not start refusing
+    /// writes it used to serve. Set `false` where minting indexes must be an explicit
+    /// decision — a write to an index with no schema anywhere is then refused, and the index
+    /// has to be created with `PUT /api/{index}/_config`, which needs the `IndexAdmin`
+    /// capability. Applies to every write whoever sends it: a capability grants the write,
+    /// and this decides what the write may cause.
+    pub implicit_index_creation: bool,
 
     /// `[[security.api_keys]]` entries.
     pub api_keys: Vec<ApiKeyConfig>,
@@ -316,6 +327,22 @@ pub struct SecurityConfig {
     /// Here for the same reason as `limits`: the record it writes is *about a key*, so it
     /// belongs to the section that defines keys. Off by default.
     pub audit: crate::audit::AuditConfig,
+}
+
+impl Default for SecurityConfig {
+    /// Written by hand because the derived one would set `implicit_index_creation: false`,
+    /// and a default that refuses what an upgrade used to serve is the trap `enabled`'s
+    /// own default exists to avoid.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            implicit_index_creation: true,
+            api_keys: Vec::new(),
+            override_key: None,
+            limits: crate::ratelimit::McpLimitsConfig::default(),
+            audit: crate::audit::AuditConfig::default(),
+        }
+    }
 }
 
 /// One `[[security.api_keys]]` entry, exactly as written.

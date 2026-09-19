@@ -519,6 +519,32 @@ max_response_bytes = 16777216
         );
     }
 
+    /// Implicit creation is on unless an operator turns it off — an upgrade must not start
+    /// refusing writes it used to serve.
+    ///
+    /// Both spellings of "unset" are pinned: the field absent from the file, and the
+    /// programmatic default, because the two took different code paths and a default that
+    /// quietly flips behaviour is exactly the trap the manual `Default` impl exists against.
+    #[test]
+    fn implicit_index_creation_defaults_on_and_reads_false() {
+        let config = CameoDbConfig::parse_config_content(
+            "[security]\nimplicit_index_creation = false\n",
+            "gated.toml",
+        )
+        .expect("parse");
+        assert!(!config.security.implicit_index_creation);
+
+        let config = CameoDbConfig::parse_config_content("", "empty.toml").expect("parse");
+        assert!(
+            config.security.implicit_index_creation,
+            "an absent key must not close the gate"
+        );
+        assert!(
+            crate::auth::SecurityConfig::default().implicit_index_creation,
+            "the programmatic default must match the file default"
+        );
+    }
+
     /// `[mcp]` is optional, and the defaults are the ones documented on the section.
     ///
     /// The numbers are asserted rather than compared to the `default_*` functions, because

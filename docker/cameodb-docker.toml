@@ -39,6 +39,11 @@ cors_allowed_origins = []
 [security]
 enabled = false
 
+# Whether a write to an index that does not exist may create it (default: true). Set false
+# where minting indexes must be an explicit decision: a write to an unknown index is then
+# refused, and the index has to be created with PUT /api/{index}/_config.
+# implicit_index_creation = false
+
 # This node is reachable off-box — profile = "internal" with a non-loopback bind — so with
 # authentication off every route, including /_admin/*, is open to anyone who can reach the
 # port. The node starts and warns; `cameodb check-config` exits non-zero, so a deploy step
