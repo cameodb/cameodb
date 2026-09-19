@@ -539,10 +539,11 @@ async fn flush_lines(
 
 /// Derive a routing hint from the first document in a batch.
 ///
-/// One rung below [`effective_routing_key`](crate::node::routing_key_without_schema)'s
-/// ladder, because the schema that names a routing field has not been resolved this early. Shares
-/// the orchestrator's derivation rather than restating it: the two had drifted onto different
-/// hashes of different byte ranges, so a hint could disagree with the key it stood in for.
+/// Rungs 2–4 of the routing ladder, via
+/// [`routing_key_without_schema`](crate::node::routing_key_without_schema): rung 1 is the
+/// schema's own routing field, and the schema has not been resolved this early. Shares the
+/// orchestrator's derivation rather than restating it: the two had drifted onto different hashes
+/// of different byte ranges, so a hint could disagree with the key it stood in for.
 fn derive_routing_hint(docs: &[DocPayload]) -> Option<String> {
     docs.first().and_then(|doc| {
         crate::node::routing_key_without_schema(doc.routing_key.clone(), &doc.id, &doc.doc)

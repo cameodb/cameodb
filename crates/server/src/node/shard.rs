@@ -23,10 +23,10 @@ use serde_json::Value as JsonValue;
 use storage::{HybridStore, StorageConfig, StoreError, WalOp};
 
 /// Type alias for single write commands enqueued in the writer thread
-pub(crate) type WriteCommand = (WalOp, tokio::sync::oneshot::Sender<Result<u64, StoreError>>);
+pub(super) type WriteCommand = (WalOp, tokio::sync::oneshot::Sender<Result<u64, StoreError>>);
 
 /// Type alias for batch write commands enqueued in the writer thread
-pub(crate) type BatchCommand = (
+pub(super) type BatchCommand = (
     Vec<WalOp>,
     tokio::sync::oneshot::Sender<Result<Vec<u64>, StoreError>>,
 );
@@ -36,7 +36,7 @@ pub(crate) type BatchCommand = (
 /// A single write and a batch write to the same index are applied as one transaction, so the
 /// replies have to be split by shape as well as by position: a single write is owed its one
 /// sequence id, a batch is owed its own run of them.
-pub(crate) enum MergedWriteReply {
+pub(super) enum MergedWriteReply {
     Single(tokio::sync::oneshot::Sender<Result<u64, StoreError>>),
     Batch(tokio::sync::oneshot::Sender<Result<Vec<u64>, StoreError>>),
 }
@@ -47,7 +47,7 @@ pub(crate) enum MergedWriteReply {
 /// caller another caller's sequence ids and nothing anywhere would notice. `None` when the
 /// storage layer did not return one id per op, which the caller turns into an error for
 /// everyone in the merge rather than an index out of bounds on the writer thread.
-pub(crate) fn merged_reply_ranges(
+pub(super) fn merged_reply_ranges(
     op_counts: &[usize],
     seq_id_count: usize,
 ) -> Option<Vec<std::ops::Range<usize>>> {
@@ -62,79 +62,81 @@ pub(crate) fn merged_reply_ranges(
 }
 
 /// Type alias for index deletions enqueued in the writer thread: (index, delete_schema, reply)
-pub(crate) type DeleteCommand = (
+pub(super) type DeleteCommand = (
     String,
     bool,
     tokio::sync::oneshot::Sender<Result<(), StoreError>>,
 );
 
 /// Type alias for tracking reply slices when coalescing batch writes
-pub(crate) type BatchReplySegment = (
+pub(super) type BatchReplySegment = (
     usize,
     tokio::sync::oneshot::Sender<Result<Vec<u64>, StoreError>>,
 );
 
 /// Helper struct for aggregating index statistics across cluster nodes.
 #[derive(Debug, Clone)]
-pub(crate) struct IndexStats {
-    pub(crate) name: String,
-    pub(crate) description: Option<String>,
-    pub(crate) document_count: u64,
-    pub(crate) index_size_bytes: u64,
-    pub(crate) memory_bytes: u64,
-    pub(crate) data_size_bytes: u64,
-    pub(crate) total_size_bytes: u64,
-    pub(crate) shard_count: usize,
-    pub(crate) warm_shards: usize,
+pub(super) struct IndexStats {
+    pub(super) name: String,
+    pub(super) description: Option<String>,
+    pub(super) document_count: u64,
+    pub(super) index_size_bytes: u64,
+    pub(super) memory_bytes: u64,
+    pub(super) data_size_bytes: u64,
+    pub(super) total_size_bytes: u64,
+    pub(super) shard_count: usize,
+    pub(super) warm_shards: usize,
     /// Field descriptions merged by name across nodes.
     ///
     /// A field is `searchable` in the cluster when any node can search it, for the same reason
     /// the per-node union is a union: a scatter-gather asks every node, so one node holding the
     /// column is enough to answer.
-    pub(crate) fields: BTreeMap<String, JsonValue>,
+    pub(super) fields: BTreeMap<String, JsonValue>,
 }
 
 /// Microshard actor that manages a single shard's storage and search operations.
 #[derive(Clone, Actor, RemoteActor)]
-pub struct MicroshardActor {
-    pub(crate) shard_id: Uuid,
-    pub(crate) store: Option<Arc<HybridStore>>,
+/// `pub(crate)`: `crate::admin::memory` implements the admin-memory messages for
+/// `NodeOrchestrator` and walks its shard map, so the element type crosses with the field.
+pub(crate) struct MicroshardActor {
+    pub(super) shard_id: Uuid,
+    pub(super) store: Option<Arc<HybridStore>>,
     /// Shared slot holding the current writer thread's command sender. A shared slot rather than a
     /// plain field so a monitor can swap in a replacement writer's channel after a crash and every
     /// clone of this actor — the engine holds cloned snapshots — sees it at once.
-    pub(crate) writer_tx: Arc<ArcSwapOption<mpsc::Sender<StorageCommand>>>,
+    pub(super) writer_tx: Arc<ArcSwapOption<mpsc::Sender<StorageCommand>>>,
     /// The writer monitor thread's handle. The monitor owns the writer thread's own handle and
     /// respawns it on a crash; shutdown joins the monitor.
-    pub(crate) writer_monitor_handle: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    pub(super) writer_monitor_handle: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
     /// Set before a requested shutdown so the monitor stops instead of respawning the writer.
-    pub(crate) shutting_down: Arc<AtomicBool>,
-    pub(crate) storage_config: StorageConfig,
-    pub(crate) default_search_limit: usize,
+    pub(super) shutting_down: Arc<AtomicBool>,
+    pub(super) storage_config: StorageConfig,
+    pub(super) default_search_limit: usize,
     /// Active supervision tasks per index (idle-timeout commits).
-    pub(crate) supervisors: Arc<AsyncRwLock<HashMap<String, mpsc::Sender<()>>>>,
+    pub(super) supervisors: Arc<AsyncRwLock<HashMap<String, mpsc::Sender<()>>>>,
     /// Notified when writer thread has stopped.
-    pub(crate) shutdown_notify: Arc<tokio::sync::Notify>,
+    pub(super) shutdown_notify: Arc<tokio::sync::Notify>,
     /// Read thread pool handle for isolated search/stats operations.
-    pub(crate) read_pool_handle: Option<tokio::runtime::Handle>,
+    pub(super) read_pool_handle: Option<tokio::runtime::Handle>,
     /// Node-wide read-pool health each read on this shard brackets, so health sees saturation and
     /// a wedge. `None` when there is no dedicated pool (tests, and the generic-pool fallback).
-    pub(crate) read_pool_health: Option<Arc<ReadPoolHealth>>,
+    pub(super) read_pool_health: Option<Arc<ReadPoolHealth>>,
     /// How long a read may sit in the pool queue before it is refused instead of run. `None`
     /// disables the check. See [`dispatch_read_pool`].
-    pub(crate) read_budget: Option<Duration>,
+    pub(super) read_budget: Option<Duration>,
     /// Total shards on this node (for per-shard memory budgeting).
-    pub(crate) total_shards: usize,
+    pub(super) total_shards: usize,
     /// Writer thread shutdown timeout in seconds.
-    pub(crate) writer_shutdown_timeout_secs: u64,
+    pub(super) writer_shutdown_timeout_secs: u64,
     /// Seconds of write inactivity before this shard's supervisor commits an index.
-    pub(crate) supervisor_timeout_secs: u64,
+    pub(super) supervisor_timeout_secs: u64,
     /// Where this shard's writer thread should pin, resolved from the shard's ordinal by the
     /// orchestrator, plus the cell the thread reports its actual core through. Resolving the
     /// target upstream is what keeps a writer on the same core as the worker that feeds it:
     /// both come from one ordinal and one layout.
-    pub(crate) writer_pin: WriterPin,
+    pub(super) writer_pin: WriterPin,
     /// Node-wide writer liveness this shard's writer thread marks if it stops serving.
-    pub(crate) writer_liveness: Arc<WriterLiveness>,
+    pub(super) writer_liveness: Arc<WriterLiveness>,
 }
 
 impl std::fmt::Debug for MicroshardActor {
@@ -154,34 +156,34 @@ impl std::fmt::Debug for MicroshardActor {
 /// orchestrator at spawn time, they travel together, and at the call site
 /// `ShardRuntime { supervisor_timeout_secs, .. }` says what it is where a bare `5` would not.
 #[derive(Clone, Debug)]
-pub struct ShardRuntime {
+pub(super) struct ShardRuntime {
     /// Hits returned when a query names no limit.
-    pub default_search_limit: usize,
+    pub(super) default_search_limit: usize,
     /// The shared read pool. `None` falls back to tokio's generic blocking pool.
-    pub read_pool_handle: Option<tokio::runtime::Handle>,
+    pub(super) read_pool_handle: Option<tokio::runtime::Handle>,
     /// Node-wide read-pool health each read brackets. Paired with `read_pool_handle`: `Some` for
     /// the dedicated pool, `None` for the generic-pool fallback.
-    pub read_pool_health: Option<Arc<ReadPoolHealth>>,
+    pub(super) read_pool_health: Option<Arc<ReadPoolHealth>>,
     /// How long a read may wait for a pool thread before it is refused rather than run — the
     /// node's request timeout. `None` runs every queued read however stale.
-    pub read_budget: Option<Duration>,
+    pub(super) read_budget: Option<Duration>,
     /// Shards on this node, for per-shard memory budgeting.
-    pub total_shards: usize,
+    pub(super) total_shards: usize,
     /// How long to let the writer thread drain on shutdown.
-    pub writer_shutdown_timeout_secs: u64,
+    pub(super) writer_shutdown_timeout_secs: u64,
     /// Write inactivity before an index is committed anyway.
-    pub supervisor_timeout_secs: u64,
+    pub(super) supervisor_timeout_secs: u64,
     /// Where the writer thread pins, and where it reports what happened.
-    pub writer_pin: WriterPin,
+    pub(super) writer_pin: WriterPin,
     /// Node-wide writer liveness the writer thread marks if it stops serving.
-    pub writer_liveness: Arc<WriterLiveness>,
+    pub(super) writer_liveness: Arc<WriterLiveness>,
 }
 
 /// A writer that has been mid-batch longer than this is treated as wedged. A single coalesced
 /// write batch that genuinely runs this long is already pathological, so the bound is loose
 /// enough that a busy-but-progressing writer never trips it, and tight enough that a truly stuck
 /// shard surfaces within a health check or two rather than never.
-pub(crate) const WRITER_STALL_THRESHOLD: Duration = Duration::from_secs(60);
+pub(super) const WRITER_STALL_THRESHOLD: Duration = Duration::from_secs(60);
 
 /// Node-wide writer health, read by the anonymous health branch as a bounded, non-blocking probe.
 ///
@@ -201,10 +203,10 @@ pub(crate) const WRITER_STALL_THRESHOLD: Duration = Duration::from_secs(60);
 /// has stalled or died stops reporting green. Ticks are milliseconds from a monotonic origin
 /// shared by every writer and the reader, so an NTP step cannot fake or mask a stall.
 #[derive(Debug)]
-pub struct WriterLiveness {
-    pub(crate) down: AtomicUsize,
-    pub(crate) heartbeats: Arc<std::sync::Mutex<Vec<Option<Arc<AtomicU64>>>>>,
-    pub(crate) origin: Instant,
+pub(crate) struct WriterLiveness {
+    pub(super) down: AtomicUsize,
+    pub(super) heartbeats: Arc<std::sync::Mutex<Vec<Option<Arc<AtomicU64>>>>>,
+    pub(super) origin: Instant,
 }
 
 /// A heartbeat entry returned by [`WriterLiveness::register_writer`]. The guard derefs to the
@@ -212,10 +214,10 @@ pub struct WriterLiveness {
 /// registry when it is dropped — so a crashed or cleanly exited writer does not leave a dead
 /// heartbeat behind for future health scans.
 #[derive(Debug)]
-pub struct WriterHeartbeat {
-    pub(crate) index: usize,
-    pub(crate) registry: Arc<std::sync::Mutex<Vec<Option<Arc<AtomicU64>>>>>,
-    pub(crate) heartbeat: Arc<AtomicU64>,
+pub(super) struct WriterHeartbeat {
+    pub(super) index: usize,
+    pub(super) registry: Arc<std::sync::Mutex<Vec<Option<Arc<AtomicU64>>>>>,
+    pub(super) heartbeat: Arc<AtomicU64>,
 }
 
 impl std::ops::Deref for WriterHeartbeat {
@@ -248,14 +250,14 @@ impl Default for WriterLiveness {
 impl WriterLiveness {
     /// Milliseconds since this liveness was created. The clock every heartbeat is stamped with and
     /// compared against — monotonic, so it never runs backwards under a wall-clock adjustment.
-    pub fn now_ticks(&self) -> u64 {
+    pub(super) fn now_ticks(&self) -> u64 {
         self.origin.elapsed().as_millis() as u64
     }
 
     /// Register a writer thread and hand back its heartbeat. The thread stamps it with
     /// [`now_ticks`](Self::now_ticks) as it starts a batch and resets it to 0 when it goes back to
     /// waiting; a stalled writer is one whose stamp stops advancing while non-zero.
-    pub fn register_writer(&self) -> WriterHeartbeat {
+    pub(super) fn register_writer(&self) -> WriterHeartbeat {
         let heartbeat = Arc::new(AtomicU64::new(0));
         let mut guard = self.heartbeats.lock().unwrap_or_else(|p| p.into_inner());
         let index = guard.len();
@@ -268,14 +270,14 @@ impl WriterLiveness {
     }
 
     /// Record that a writer thread has stopped serving. Called once, as the thread exits.
-    pub fn mark_writer_down(&self) {
+    pub(super) fn mark_writer_down(&self) {
         self.down.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Record that a replacement writer thread is serving again, undoing one earlier
     /// `mark_writer_down`. Called once, after a monitor relaunches a crashed writer. Saturating at
     /// zero so it can never wrap the count below the number of writers actually down.
-    pub fn mark_writer_up(&self) {
+    pub(super) fn mark_writer_up(&self) {
         let _ = self
             .down
             .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
@@ -285,7 +287,7 @@ impl WriterLiveness {
 
     /// How many registered writers have been mid-batch longer than `threshold_ms` as of `now_ms`.
     /// A writer that idles on `blocking_recv` holds a 0 stamp and is never counted.
-    pub(crate) fn stalled_count(&self, now_ms: u64, threshold_ms: u64) -> usize {
+    pub(super) fn stalled_count(&self, now_ms: u64, threshold_ms: u64) -> usize {
         self.heartbeats
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -301,13 +303,13 @@ impl WriterLiveness {
     /// Writers that cannot currently take writes: exited abnormally, or wedged mid-batch past
     /// [`WRITER_STALL_THRESHOLD`]. Self-contained — reads its own clock and threshold — so the
     /// health branch folds the whole data-path verdict from one call.
-    pub fn unavailable_writers(&self) -> usize {
+    pub(crate) fn unavailable_writers(&self) -> usize {
         self.unavailable_at(self.now_ticks())
     }
 
     /// The verdict [`unavailable_writers`](Self::unavailable_writers) computes, against a supplied
     /// clock so a test can place a stall without waiting out the real threshold.
-    pub(crate) fn unavailable_at(&self, now_ms: u64) -> usize {
+    pub(super) fn unavailable_at(&self, now_ms: u64) -> usize {
         self.down.load(AtomicOrdering::Relaxed)
             + self.stalled_count(now_ms, WRITER_STALL_THRESHOLD.as_millis() as u64)
     }
@@ -328,27 +330,27 @@ impl WriterLiveness {
 #[cfg(feature = "fault-injection")]
 mod fault_injection {
     /// A search whose query is exactly this panics on the read pool.
-    pub const READ_TRAP_QUERY: &str = "__fault_panic_read__";
+    pub(super) const READ_TRAP_QUERY: &str = "__fault_panic_read__";
     /// A write to this index panics inside the per-command guard: caught, the writer rebuilt.
-    pub const WRITE_OP_TRAP_INDEX: &str = "fault_panic_write_op__";
+    pub(super) const WRITE_OP_TRAP_INDEX: &str = "fault_panic_write_op__";
     /// A write to this index panics past the guard, so the writer thread itself dies.
-    pub const WRITER_THREAD_TRAP_INDEX: &str = "fault_kill_writer__";
+    pub(super) const WRITER_THREAD_TRAP_INDEX: &str = "fault_kill_writer__";
 
-    pub fn panic_if_read_trap(query: &str) {
+    pub(super) fn panic_if_read_trap(query: &str) {
         assert!(
             query != READ_TRAP_QUERY,
             "fault-injection: read on the read pool"
         );
     }
 
-    pub fn panic_if_write_op_trap(index: &str) {
+    pub(super) fn panic_if_write_op_trap(index: &str) {
         assert!(
             index != WRITE_OP_TRAP_INDEX,
             "fault-injection: write inside the per-command guard"
         );
     }
 
-    pub fn panic_if_writer_thread_trap(index: &str) {
+    pub(super) fn panic_if_writer_thread_trap(index: &str) {
         assert!(
             index != WRITER_THREAD_TRAP_INDEX,
             "fault-injection: writer thread past its guard"
@@ -361,7 +363,7 @@ mod fault_injection {
     /// faster than a health poll can see it. Widening it here lets the smoke test assert the red
     /// that a dead writer must report, instead of racing it. Unset (the default) holds not at all,
     /// so every other run keeps the immediate respawn.
-    pub fn hold_before_respawn() {
+    pub(super) fn hold_before_respawn() {
         let held = std::env::var("CAMEODB_FAULT_RESPAWN_DELAY_MS")
             .ok()
             .and_then(|ms| ms.parse::<u64>().ok())
@@ -372,7 +374,7 @@ mod fault_injection {
     }
 }
 
-pub(crate) fn guard_writer_op<T>(
+pub(super) fn guard_writer_op<T>(
     store: &HybridStore,
     index: &str,
     op: impl FnOnce() -> Result<T, StoreError>,
@@ -400,7 +402,7 @@ pub(crate) fn guard_writer_op<T>(
 /// per-read panic guard can catch because the threads never unwind. The bound sits well past any
 /// healthy search, so a pool merely busy-but-draining — completions still landing — never trips
 /// it; only a pool that has stopped making progress does.
-pub(crate) const READ_POOL_WEDGE_THRESHOLD: Duration = Duration::from_secs(60);
+pub(super) const READ_POOL_WEDGE_THRESHOLD: Duration = Duration::from_secs(60);
 
 /// Node-wide read-pool health, read by the health endpoint the same bounded, non-blocking way as
 /// [`WriterLiveness`].
@@ -434,11 +436,11 @@ pub(crate) const READ_POOL_WEDGE_THRESHOLD: Duration = Duration::from_secs(60);
 ///
 /// [`track`]: ReadPoolHealth::track
 #[derive(Debug)]
-pub struct ReadPoolHealth {
-    pub(crate) in_flight: AtomicUsize,
-    pub(crate) last_progress: AtomicU64,
-    pub(crate) capacity: usize,
-    pub(crate) origin: Instant,
+pub(crate) struct ReadPoolHealth {
+    pub(super) in_flight: AtomicUsize,
+    pub(super) last_progress: AtomicU64,
+    pub(super) capacity: usize,
+    pub(super) origin: Instant,
     /// Reads dropped at dequeue because they had outlived the request that asked for them.
     ///
     /// Counted because the shed is otherwise invisible: the work never runs, so it appears in
@@ -446,11 +448,11 @@ pub struct ReadPoolHealth {
     /// one that is merely idle. A rising count is the node declining work it could not have
     /// delivered — the signal that load exceeds capacity, and the number to read before
     /// concluding a node is healthy because its latencies look fine.
-    pub(crate) abandoned: AtomicU64,
+    pub(super) abandoned: AtomicU64,
 }
 
 impl ReadPoolHealth {
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(super) fn new(capacity: usize) -> Self {
         Self {
             in_flight: AtomicUsize::new(0),
             last_progress: AtomicU64::new(0),
@@ -461,29 +463,29 @@ impl ReadPoolHealth {
     }
 
     /// Record a read refused at dequeue. See [`Self::abandoned`].
-    pub(crate) fn record_abandoned(&self) {
+    pub(super) fn record_abandoned(&self) {
         self.abandoned.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Reads refused at dequeue since this node started.
-    pub fn abandoned(&self) -> u64 {
+    pub(crate) fn abandoned(&self) -> u64 {
         self.abandoned.load(AtomicOrdering::Relaxed)
     }
 
-    pub(crate) fn now_ticks(&self) -> u64 {
+    pub(super) fn now_ticks(&self) -> u64 {
         self.origin.elapsed().as_millis() as u64
     }
 
     /// Mark a read as it begins executing on a pool thread; the returned guard marks it done when
     /// dropped — including as a panicking read unwinds — so both bracket edges always land.
-    pub(crate) fn track(self: &Arc<Self>) -> ReadInFlight {
+    pub(super) fn track(self: &Arc<Self>) -> ReadInFlight {
         self.track_at(self.now_ticks())
     }
 
     /// [`track`](Self::track) against a supplied clock, so a test can place a read's start
     /// somewhere other than a few microseconds after the pool was built — the same split as
     /// [`is_wedged`](Self::is_wedged) and `is_wedged_at`, and for the same reason.
-    pub(crate) fn track_at(self: &Arc<Self>, now_ms: u64) -> ReadInFlight {
+    pub(super) fn track_at(self: &Arc<Self>, now_ms: u64) -> ReadInFlight {
         self.in_flight.fetch_add(1, AtomicOrdering::Relaxed);
         // A read beginning is progress. See the type's docs for why this edge is safe: it can
         // only land while a pool thread is free, so a wedged pool never produces one.
@@ -495,17 +497,17 @@ impl ReadPoolHealth {
     }
 
     /// In-flight reads and the pool's blocking width — the saturation gauge for the health body.
-    pub fn gauge(&self) -> (usize, usize) {
+    pub(crate) fn gauge(&self) -> (usize, usize) {
         (self.in_flight.load(AtomicOrdering::Relaxed), self.capacity)
     }
 
     /// Whether every pool thread is busy and no read has started, finished or unwound for longer
     /// than [`READ_POOL_WEDGE_THRESHOLD`] — a stuck pool, not merely a loaded one.
-    pub fn is_wedged(&self) -> bool {
+    pub(crate) fn is_wedged(&self) -> bool {
         self.is_wedged_at(self.now_ticks())
     }
 
-    pub(crate) fn is_wedged_at(&self, now_ms: u64) -> bool {
+    pub(super) fn is_wedged_at(&self, now_ms: u64) -> bool {
         if self.in_flight.load(AtomicOrdering::Relaxed) < self.capacity {
             return false;
         }
@@ -516,8 +518,8 @@ impl ReadPoolHealth {
 
 /// Drop guard bracketing one read: decrements the in-flight count and stamps the progress tick as
 /// the read leaves the pool, whether it returned or unwound.
-pub(crate) struct ReadInFlight {
-    pub(crate) pool: Arc<ReadPoolHealth>,
+pub(super) struct ReadInFlight {
+    pub(super) pool: Arc<ReadPoolHealth>,
 }
 
 impl Drop for ReadInFlight {
@@ -544,7 +546,7 @@ impl Drop for ReadInFlight {
 ///
 /// Split out from [`MicroshardActor::spawn_on_read_pool`] so the isolation itself is testable
 /// without standing up a shard: it depends on nothing but the pool handle.
-pub(crate) async fn dispatch_read_pool<F, R>(
+pub(super) async fn dispatch_read_pool<F, R>(
     handle: Option<&tokio::runtime::Handle>,
     health: Option<Arc<ReadPoolHealth>>,
     budget: Option<Duration>,
@@ -598,7 +600,7 @@ where
 /// `Clean`; a panic that somehow escaped even the writer's own outer catch surfaces as a join
 /// error, which the monitor also treats as `Crashed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WriterExit {
+pub(super) enum WriterExit {
     /// A requested shutdown, or the command channel closing at teardown.
     Clean,
     /// A panic escaped past every per-command guard and ended the thread.
@@ -610,20 +612,20 @@ pub(crate) enum WriterExit {
 /// clone, and `writer_tx` is the same shared slot the send path reads, so a relaunched writer's
 /// channel becomes visible everywhere at once.
 #[derive(Clone)]
-pub(crate) struct WriterRuntime {
-    pub(crate) shard_id: Uuid,
-    pub(crate) store: Arc<HybridStore>,
-    pub(crate) writer_pin: WriterPin,
-    pub(crate) writer_liveness: Arc<WriterLiveness>,
-    pub(crate) writer_tx: Arc<ArcSwapOption<mpsc::Sender<StorageCommand>>>,
-    pub(crate) shutdown_notify: Arc<tokio::sync::Notify>,
-    pub(crate) shutting_down: Arc<AtomicBool>,
+pub(super) struct WriterRuntime {
+    pub(super) shard_id: Uuid,
+    pub(super) store: Arc<HybridStore>,
+    pub(super) writer_pin: WriterPin,
+    pub(super) writer_liveness: Arc<WriterLiveness>,
+    pub(super) writer_tx: Arc<ArcSwapOption<mpsc::Sender<StorageCommand>>>,
+    pub(super) shutdown_notify: Arc<tokio::sync::Notify>,
+    pub(super) shutting_down: Arc<AtomicBool>,
 }
 
 /// Spawn a shard's warmup thread: it warms the indices named in `pending_warmup` once (empty on a
 /// respawn), then serves post-commit re-warm requests until the writer drops its sender. A failure
 /// to spawn is not fatal — every index still warms itself on its first query.
-pub(crate) fn spawn_warmup_thread(
+pub(super) fn spawn_warmup_thread(
     rt: &WriterRuntime,
     warm_rx: std::sync::mpsc::Receiver<String>,
     pending_warmup: Vec<String>,
@@ -695,7 +697,7 @@ pub(crate) fn spawn_warmup_thread(
 /// Spawn a shard's writer thread — the sole serialized path for its writes. It returns a
 /// [`WriterExit`] so the monitor can tell a clean shutdown from a crash. Extracted from
 /// `start` so the monitor can spawn a replacement over the same store.
-pub(crate) fn spawn_writer_thread(
+pub(super) fn spawn_writer_thread(
     rt: &WriterRuntime,
     mut rx: mpsc::Receiver<StorageCommand>,
     warm_tx: std::sync::mpsc::SyncSender<String>,
@@ -751,7 +753,7 @@ pub(crate) fn spawn_writer_thread(
                     // The first command blocks until available; subsequent commands
                     // are non-blocking to coalesce as many writes as possible.
                     // Limit drain to prevent starvation - max 256 additional commands per iteration.
-                    pub(crate) const MAX_DRAIN_PER_ITERATION: usize = 256;
+                    pub(super) const MAX_DRAIN_PER_ITERATION: usize = 256;
                     pending_cmds.clear();
                     pending_cmds.push(first_cmd);
                     let mut drained = 0;
@@ -1158,7 +1160,7 @@ pub(crate) fn spawn_writer_thread(
 /// store, the new sender published into the shared slot before the writer starts draining so a
 /// racing write finds the live channel. No recovery and no startup warmup — see [`relaunch_writer`]
 /// callers and `WriterExit::Crashed`.
-pub(crate) fn relaunch_writer(
+pub(super) fn relaunch_writer(
     rt: &WriterRuntime,
 ) -> std::io::Result<std::thread::JoinHandle<WriterExit>> {
     let (tx, rx) = mpsc::channel::<StorageCommand>(SHARD_WRITER_CHANNEL_CAPACITY);
@@ -1174,7 +1176,7 @@ pub(crate) fn relaunch_writer(
 /// handle, so a genuinely wedged writer that never exits simply keeps the monitor parked rather
 /// than being force-killed — Rust has no safe way to terminate a running thread, and that case is
 /// already surfaced red by the stall heartbeat.
-pub(crate) fn writer_monitor(rt: WriterRuntime, mut handle: std::thread::JoinHandle<WriterExit>) {
+pub(super) fn writer_monitor(rt: WriterRuntime, mut handle: std::thread::JoinHandle<WriterExit>) {
     loop {
         let exit = match handle.join() {
             Ok(exit) => exit,
@@ -1223,7 +1225,11 @@ pub(crate) fn writer_monitor(rt: WriterRuntime, mut handle: std::thread::JoinHan
 }
 
 impl MicroshardActor {
-    pub fn new(shard_id: Uuid, storage_config: StorageConfig, runtime: ShardRuntime) -> Self {
+    pub(super) fn new(
+        shard_id: Uuid,
+        storage_config: StorageConfig,
+        runtime: ShardRuntime,
+    ) -> Self {
         let ShardRuntime {
             default_search_limit,
             read_pool_handle,
@@ -1257,7 +1263,7 @@ impl MicroshardActor {
         }
     }
 
-    pub async fn start(&mut self) -> Result<(), OrchestratorError> {
+    pub(super) async fn start(&mut self) -> Result<(), OrchestratorError> {
         info!(
             shard_id = %self.shard_id,
             path = %self.storage_config.shard_path.display(),
@@ -1426,7 +1432,7 @@ impl MicroshardActor {
     /// slot, so a command sent just after a crash reaches the monitor's replacement writer once it
     /// has published its channel. A send that lands in the brief window before the replacement is
     /// up fails as "Writer thread closed" and is retriable, exactly as it was before this slot.
-    pub(crate) async fn send_write_command(
+    pub(super) async fn send_write_command(
         &self,
         cmd: StorageCommand,
     ) -> Result<(), OrchestratorError> {
@@ -1439,7 +1445,7 @@ impl MicroshardActor {
     }
 
     /// Write a single document via the dedicated writer thread.
-    pub async fn handle_write_via_channel(
+    pub(super) async fn handle_write_via_channel(
         &self,
         index: String,
         op: WalOp,
@@ -1458,7 +1464,7 @@ impl MicroshardActor {
     }
 
     /// Write a batch of documents via the dedicated writer thread.
-    pub async fn handle_batch_write_via_channel(
+    pub(super) async fn handle_batch_write_via_channel(
         &self,
         index: String,
         ops: Vec<WalOp>,
@@ -1495,7 +1501,10 @@ impl MicroshardActor {
         Ok(result)
     }
 
-    pub async fn admin_commit_via_channel(&self, index: String) -> Result<(), OrchestratorError> {
+    pub(crate) async fn admin_commit_via_channel(
+        &self,
+        index: String,
+    ) -> Result<(), OrchestratorError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.send_write_command(StorageCommand::Commit { index, reply: tx })
             .await?;
@@ -1504,7 +1513,7 @@ impl MicroshardActor {
             .map_err(OrchestratorError::Storage)
     }
 
-    pub async fn admin_evict_writer_via_channel(
+    pub(crate) async fn admin_evict_writer_via_channel(
         &self,
         index: String,
     ) -> Result<bool, OrchestratorError> {
@@ -1518,7 +1527,7 @@ impl MicroshardActor {
     /// Gracefully stop the writer thread with timeout.
     /// Clears supervisors, sends shutdown command, and waits for completion.
     /// If timeout expires, abandons the thread (OS cleanup on process exit).
-    pub(crate) async fn shutdown_writer(&mut self) {
+    pub(super) async fn shutdown_writer(&mut self) {
         use tokio::time::{Duration, timeout};
 
         // Clear supervisors (they hold cloned writer_tx)
@@ -1583,7 +1592,7 @@ impl MicroshardActor {
 
     /// Dispatch a blocking closure to the dedicated read pool if available,
     /// falling back to tokio's generic blocking pool otherwise.
-    pub(crate) async fn spawn_on_read_pool<F, R>(&self, f: F) -> Result<R, OrchestratorError>
+    pub(super) async fn spawn_on_read_pool<F, R>(&self, f: F) -> Result<R, OrchestratorError>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
@@ -1598,7 +1607,7 @@ impl MicroshardActor {
     }
 
     /// Handles search requests on the dedicated read thread pool.
-    pub async fn handle_search(
+    pub(super) async fn handle_search(
         &self,
         request: SearchRequest,
     ) -> Result<SearchReply, OrchestratorError> {
@@ -1649,7 +1658,7 @@ impl MicroshardActor {
     }
 
     /// Handles shard statistics requests on the dedicated read thread pool.
-    pub async fn handle_get_stats(
+    pub(super) async fn handle_get_stats(
         &self,
         msg: GetShardStats,
     ) -> Result<storage::ShardStatsSnapshot, OrchestratorError> {
@@ -1672,7 +1681,7 @@ impl MicroshardActor {
     /// Spawns a new supervisor if one doesn't exist.
     /// The supervisor's role is idle-timeout commit: if no writes arrive for N seconds,
     /// it sends a Commit to the writer thread to flush any remaining uncommitted data.
-    pub(crate) async fn signal_supervisor(&self, index: String) {
+    pub(super) async fn signal_supervisor(&self, index: String) {
         // Snapshot the current sender for this supervisor's idle commits. If the writer is later
         // replaced, this snapshot's channel closes; the supervisor's send then fails and it exits,
         // and the next write re-arms a fresh supervisor with the new sender.
@@ -1781,7 +1790,10 @@ impl MicroshardActor {
     /// document written in the documented shape, which leaves `id` out of `doc` because the key
     /// is already beside it, had no key here at all and was refused. The body is still read as a
     /// fallback, for a request from a peer whose build predates `WriteRequest::id`.
-    pub async fn handle_write(&self, request: WriteRequest) -> Result<u64, OrchestratorError> {
+    pub(super) async fn handle_write(
+        &self,
+        request: WriteRequest,
+    ) -> Result<u64, OrchestratorError> {
         // OPTIMIZATION: Take ownership of doc from request immediately
         let doc = request.doc;
 
@@ -1830,7 +1842,11 @@ impl MicroshardActor {
     /// an `id:VALUE` lookup stops finding it immediately, but the Tantivy `delete_term` only takes
     /// effect at the next commit — without this signal a single delete on an otherwise idle index
     /// would wait for unrelated traffic to trigger one.
-    pub async fn handle_delete(&self, index: String, id: String) -> Result<u64, OrchestratorError> {
+    pub(super) async fn handle_delete(
+        &self,
+        index: String,
+        id: String,
+    ) -> Result<u64, OrchestratorError> {
         let sequence = self
             .handle_write_via_channel(index.clone(), WalOp::Delete { id })
             .await?;
@@ -1845,7 +1861,7 @@ impl MicroshardActor {
     /// One `StorageCommand::BatchWrite` of `WalOp::Delete`s, so the whole batch is one redb
     /// transaction and one set of Tantivy term deletes — the same path a bulk write takes, which
     /// is why nothing here is specific to deletion beyond the ops it carries.
-    pub async fn handle_batch_delete(
+    pub(super) async fn handle_batch_delete(
         &self,
         index: String,
         ids: Vec<String>,
@@ -1870,7 +1886,7 @@ impl MicroshardActor {
     }
 
     /// Handles batch write requests via the dedicated writer thread.
-    pub async fn handle_batch_write(
+    pub(super) async fn handle_batch_write(
         &self,
         request: BatchWriteRequest,
     ) -> Result<Vec<u64>, OrchestratorError> {
@@ -1944,7 +1960,7 @@ impl MicroshardActor {
     /// Dispatched to the shard's writer thread so it is serialized against writes to the
     /// same index — deletion tears down the writer, sequence counter and redb tables that
     /// an in-flight write is using.
-    pub async fn delete_index(
+    pub(super) async fn delete_index(
         &self,
         index: &str,
         delete_schema: bool,

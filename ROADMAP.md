@@ -51,7 +51,8 @@ on one.
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
-| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items (L5–L10 all done), three decompositions (L11–L13 done), six simplifications (L14–L19 done), and the retrospective itself |
+| L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
+| M — The 0.3.5 goal set: multi-tenant exposure | 📋 Planned | M0 (the architecture review and the order of work) plus eight items — M0's steps 1–3 come first, M1 (capping a *whole index*, not its writer) is the blocker, M6 and M0-f are the measured runs |
 
 ## Reconciliation, 2026-08-26
 
@@ -164,7 +165,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F5](#f5--concurrency-sweep-measured-2026-09-02) | Concurrency sweep on the release build — the operating point, and bulk's serialization measured | — | 2026-09-02 | ✅ |
 | [F6](#f6--what-fsync-actually-costs-measured-2026-09-02) | What fsync actually costs — and why turning it off is a reallocation, not a speedup | — | 2026-09-02 | ✅ |
 | [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) | The request timeout sheds the client, not the work — measured: goodput goes to zero, not down | — | 2026-09-15 | ✅ |
-| [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — health fixed, the lane gated, and admission on both lanes predicts against a measured spread | — | 2026-09-16 | ✅ |
+| [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — health fixed, the lane gated, and admission on both lanes predicts against a measured spread; item 3 (bulk in the service estimate) open under [M6](#m6--close-and-re-measure-the-bulk-lane) | — | 2026-09-16 | ◐ |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items — CH1 done | — | 2026-08-16 | 📋 |
 | [CH11](#ch11--routing-key-derivation-is-written-four-times-with-two-algorithms) | Routing-key derivation, four spellings and two hashes — closed ahead of the split | — | 2026-09-01 | ✅ |
 | [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — all done | — | 2026-09-01 | ✅ |
@@ -177,7 +178,8 @@ first written down here, so the chronology stays visible under the cost ordering
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
-| [L1](#l1--size-cache-invalidation-by-substring-evicts-neighbouring-indexes) … [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | Post-0.3.4 review group — defects first, then the mechanical splits, then the structural corrections; sequenced inside [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | — | 2026-09-08 | 📋 |
+| [L1](#l1--size-cache-invalidation-by-substring-evicts-neighbouring-indexes) … [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | Post-0.3.4 review group — all twenty closed; the retrospective's output is [M](#m-the-035-goal-set--multi-tenant-exposure--planned) | — | 2026-09-19 | ✅ |
+| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 holds the architecture review and the order of work, M1 is the blocker | — | 2026-09-19 | 📋 |
 
 ---
 
@@ -1528,7 +1530,8 @@ OB13 reopening on a second mechanism. Filed as
 
 ### F8 — The overload gates do not cover the bulk write path
 
-📋 **Planned, and measured before it was planned** 2026-09-16, on the M5 Pro against `beab920` —
+◐ **Partial — items 1 and 2 closed and measured, item 3 open.** Measured before it was
+planned, 2026-09-16, on the M5 Pro against `beab920` —
 the binary that closed [F7](#f7--the-request-timeout-sheds-the-client-not-the-work), with all
 three of its fixes in.
 
@@ -1801,7 +1804,7 @@ cure — the sorted-collector logic, query preparation and schema description ar
 which is the case for this item rather than against it: every fix in the 0.3.3 review had to be
 made inside one of these two files.
 
-**2026-09-09:** the server half is done — [L11](#l11--node_orchestratorrs-is-13669-lines-and-holds-four-actors)
+**2026-09-17:** the server half is done — [L11](#l11--node_orchestratorrs-is-13669-lines-and-holds-four-actors)
 landed the split, and the merge primitives, sort keys and validation live in
 `node/search.rs` as this item always wanted. `storage/src/lib.rs` keeps the same
 disease; its cure is [L12](#l12--storagesrclibrs-is-9961-lines-of-which-one-impl-block-is-4460).
@@ -1844,6 +1847,11 @@ the shape.
 `_index_source` on the copy. Taking the array with `as_array_mut` + `std::mem::take` stamps in
 place. Bounded by page size rather than corpus size, so this is the hot line of the federated
 path being untidy rather than slow — worth doing when the function is next open.
+
+**2026-09-19, re-read by [M0](#m0--the-architecture-review-and-the-order-of-work) (M0-e):**
+"untidy rather than slow" understates it on the surface that matters. On the MCP path the hits
+*are* the documents an agent asked for, so the clone doubles peak memory of every federated
+response rather than costing a pointer copy. Carried in M0's step 7.
 
 ### CH7 — The string-fast collector repeats the macro's body
 
@@ -2466,14 +2474,14 @@ samples — `ClientOp::{Write, BulkWrite}::carried_schema`, defaulted so a share
 reads as "nothing carried" and takes the lookup as before. This is what the gate was arguing for:
 one schema decision per index, not one per node.
 
-**What travels is one bit, and no schema.** Three cuts, and only the third is right — see
-[3e](#3e-what-a-forwarded-write-carries--reviewed-2026-09-02) for the measurements. The first sent
-the whole `IndexSchema` on every forward: 602 bytes for three fields, 3,478 for twenty, against a
-49-byte document. The second sent a 61-byte stamp, which is nothing on a batch and more than the
-payload on a single write. Neither needed to be sent, because the question was wrong: a forwarded
-write is a *share of a decision another node already made*, so the receiver only needs to know
-that inventing one is not its job — and can then **ask**. `ClientOp::Write` already carried
-`forwarded` for OB3's hop limit, so a single write costs nothing extra; `BulkWrite` gained it.
+**What travels is one bit, and no schema.** Three cuts, and only the third is right. The first
+sent the whole `IndexSchema` on every forward: 602 bytes for three fields, 3,478 for twenty,
+against a 49-byte document. The second sent a 61-byte stamp, which is nothing on a batch and more
+than the payload on a single write. Neither needed to be sent, because the question was wrong: a
+forwarded write is a *share of a decision another node already made*, so the receiver only needs
+to know that inventing one is not its job — and can then **ask**. `ClientOp::Write` already
+carried `forwarded` for OB3's hop limit, so a single write costs nothing extra; `BulkWrite` gained
+it.
 
 The receiver *answers* rather than asking, which is what keeps the deadlock closed: it cannot
 canvass peers from inside a write without waiting on the mailbox those peers are using to run the
@@ -3155,7 +3163,7 @@ anonymous-listener count.
 
 ### L7 — MCP tool errors leak what HTTP deliberately masks
 
-**Security, medium.** ✅ **Done** 2026-10-06. Tool failures now travel as a typed
+**Security, medium.** ✅ **Done** 2026-09-19. Tool failures now travel as a typed
 `ToolError{Caller, Internal}` end to end — `McpBackend`'s every method returns it, the tool
 dispatcher raises `Caller` for the refusals it owns (arguments, bounds, scope, unsupported
 names), and `server/mcp/diagnostics.rs::tool_error` classifies a routing error by
@@ -3263,7 +3271,7 @@ panic isolation), `cargo test -p cameodb_mcp`, and `cargo check --workspace --al
 
 ### L11 — `node_orchestrator.rs` is 13,669 lines and holds four actors
 
-**Decomposition.** ✅ **Done 2026-09-09.** One module containing four actors, a worker pool, an
+**Decomposition.** ✅ **Done 2026-09-17.** One module containing four actors, a worker pool, an
 engine, ~60 free helpers, ~25 wire types and ~90 tests, split by the layout below. The landed
 sizes: `mod.rs` 1,131 (module doc, consts, wire and error types, re-exports), `search.rs`
 1,373, `shard.rs` 2,096, `router.rs` 1,686, `orchestrator.rs` 6,643, `tests.rs` 3,161. Two
@@ -3301,6 +3309,16 @@ growing *after* the L15/L16 dedup shrinks it, the engine and the worker pool are
 next extraction — not a first move. Longest functions to break while there: `handle_broadcast`
 (568 lines), `spawn_writer_thread` (350), `orch_bulk_write` (318). Move only, first — the dedup
 passes are L15 and L16.
+
+**Amended 2026-09-19 by [M0](#m0--the-architecture-review-and-the-order-of-work).** Two claims
+above have since been corrected in place. The flattening to `pub(crate)` was *not* "the
+visibility the code already relied on": it was true of the 15 names that cross the boundary and
+false of the other ~129, which had been visible to nothing inside the single file — O1 put them
+back behind `pub(super)` and named the 15 in `node/mod.rs`. And the next extraction was not the
+engine or the worker pool but **admission**, on a different test: not that `orchestrator.rs` had
+grown — it had not, 6,649 against the 6,643 it landed at — but that admission is a subsystem
+whose invariants are properties of the whole set, which is what F8 cost a production-shaped bug
+to establish. The file is 5,782 lines now, beside `admission.rs` (783) and `routing.rs` (172).
 
 ### L12 — `storage/src/lib.rs` is 9,961 lines, of which one impl block is 4,460
 
@@ -3396,7 +3414,7 @@ arrived as a `500`. A genuine `io::Error` still keeps its kind through the same 
 
 ### L15 — The schema-cache machinery exists three times
 
-**Simplification.** ✅ **Done 2026-09-09.** `get`/`put`/`put_arc` had already become free
+**Simplification.** ✅ **Done 2026-09-17.** `get`/`put`/`put_arc` had already become free
 functions under CH10; they are now the methods of `SchemaCache`, the `ArcSwap` map behind a
 newtype both `OrchestratorEngine` and `NodeOrchestrator` hold as `Arc<SchemaCache>` — so the
 version-ordering rule and the delete-path `remove` have one home. "Load schema from the first
@@ -3406,7 +3424,7 @@ delegations to `SchemaCache::schema_for`/`durable`.
 
 ### L16 — `handle_broadcast` and `handle_broadcast_streaming` are one fan-out written twice
 
-**Simplification.** ✅ **Done 2026-09-09.** The shared phase is `broadcast_fanout`: the
+**Simplification.** ✅ **Done 2026-09-17.** The shared phase is `broadcast_fanout`: the
 counter, `GetKnownPeers`, window widening (`widen_broadcast_op`), the per-peer timeout, the
 concurrency cap, dispatch-ordinal tagging and the local+remote join return a
 `BroadcastFanout` — the local result and every peer's `(node_id, answer-or-timeout)` in
@@ -3418,7 +3436,7 @@ round-trips scores through `f32`.
 
 ### L17 — Dead code and stale suppressions
 
-**Simplification.** ✅ **Done** 2026-10-12. Each named item resolved, and the sweep found more
+**Simplification.** ✅ **Done** 2026-09-17. Each named item resolved, and the sweep found more
 of the same kind along the way:
 
 - `StreamingSearchResult::Local.{shard_id, took_ms}` are gone — `shard_id` was always
@@ -3438,7 +3456,7 @@ of the same kind along the way:
 
 ### L18 — `cli.rs` says the same thing three ways
 
-**Simplification.** ✅ **Done 2026-10-26.** One `JsonIngestPipeline` runs the single-pass
+**Simplification.** ✅ **Done 2026-09-18.** One `JsonIngestPipeline` runs the single-pass
 protocol — buffer the sample, name the id field, emit the schema, replay, then batch —
 and reports readiness as `JsonIngestEvent`s; the HTTP loader awaits them inline, the
 reader loader's blocking producer sends them down a channel to the same
@@ -3454,7 +3472,7 @@ documents instead of erroring — the reader path's existing leniency, unified.
 
 ### L19 — `config.rs` validates by repetition
 
-**Simplification.** ✅ **Done 2026-10-26.** `validate` is five `validate_*` methods —
+**Simplification.** ✅ **Done 2026-09-18.** `validate` is five `validate_*` methods —
 `security`, `mcp`, `network`, `storage`, `memory` — called in the same order the checks
 always ran in, with their rationale comments moved verbatim (the checks are bespoke and
 cross-field, so per-section split won over table-driving). `adopt_moved_settings` writes
@@ -3466,11 +3484,104 @@ replacement — the comment that promised per-key merging was the false abstract
 
 ### L20 — The retrospective, and the sequence into the next cycle
 
-📋 **Planned, and the gate on everything above.** Once 0.3.4 is delivered and settled, run the
-retrospective over the 0.3.3/0.3.4 cycle — what the stability-and-security posture bought, what
-it cost in review surface (every fix inside one of five files), and what the fault-injection
-feature should become (kept test-only, promoted, or removed — a decision, not a default). Its
-output is this group's sequencing and the next cycle's goals:
+✅ **Run 2026-09-19**, against the 52 commits since the 0.3.4 cut (`433f8b9`): 96 files,
++40,139/−31,629, of which the moves are the bulk. The first thing the retrospective has to
+record is that it did not gate anything — L1–L19 were all delivered before it ran. L1–L4, L8
+and L10 landed 2026-09-08; L11–L19, then L5–L7 and L9, landed 2026-09-17 → 09-19. The sequence
+below was followed in substance and not in order: L17 went first, and L14, L18 and L19
+(simplifications, step 4) landed before L12 and L13 (splits, step 3). Nothing broke because of
+it, and the gate should be read for what it turned out to be — a plan that was correct enough
+to execute without being consulted.
+
+**What the stability-and-security posture bought.** Two things that are visible in the tree
+rather than in the release notes. The first is that the defect class changed: L1–L4 were four
+defects *adjacent* to 0.3.4's changes rather than in them, and each was the kind that no test
+catches — a cache that evicts too much still answers correctly, an `Ok` carrying a number its
+own comment calls wrong is still an `Ok`, a poisoned-mutex panic only appears after another
+panic, and a redundant `unsafe impl` is indistinguishable from a load-bearing one until it is
+deleted. Finding them needed a read, not a suite. The second is that the security remainder
+(L5–L10) closed the surface the hardening phase had reached past: the MCP transport now bounds
+what a session holds, refuses what it cannot serve, and masks what HTTP already masked. Both
+groups were bounded, and both landed in a working week.
+
+**What it cost in review surface.** The review's own framing — *every 0.3.3 and 0.3.4 fix had
+to be made inside one of five files* — is no longer true, and the four fixes that landed after
+the splits are the first evidence. [L6](#l6--a-get-mcp-listening-stream-without-a-session-is-unbounded)
+touched one production file; [L5](#l5--legacy-sse-work-outlives-its-request-and-bypasses-the-guards)
+touched two plus its config; [L7](#l7--mcp-tool-errors-leak-what-http-deliberately-masks)
+spanned the `mcp` crate and `server/src/mcp/`, which is a crate boundary and the shape the
+change actually has; [L9](#l9--a-writer-key-can-mint-indexes)'s gate touched its config, its
+enforcement point and the orchestrator that consults it. None of them reopened a 13,000-line
+file. That is four commits over two days, so it is a signal and not yet a result — the measure
+is whether it survives a feature phase.
+
+**Decision — the fault-injection feature stays test-only.** It is a cargo feature with nine
+`cfg` sites across `main.rs`, `http_server/routes.rs` and `node/shard.rs`, off in every shipped
+build, and a `+fault-injection` marker in `--version` that `panic_isolation.rs` asserts in both
+directions: a seam build must declare itself, an ordinary build must not claim the marker.
+Those two assertions are what make a test-only seam safe to keep, and they already exist.
+Promoting it would put panic seams in a shipped binary for no stated caller; removing it would
+delete the only thing that tests panic containment against a real built binary, which this
+review called the strongest part of 0.3.4. Kept, unchanged, and recorded here so it is not
+re-opened as an open question.
+
+**Decision — CI is deliberately not the next step.** [L10](#l10--the-low-findings-in-one-place)'s
+sixth finding is confirmed and stands: `.github/` holds six templates and no workflows, so
+`cargo deny check` and `cargo audit` run only through `scripts/validate/deps.sh`, which `skip`s
+both when the tools are not installed and still passes, and the `review-by` dates in
+`deny.toml` are enforced only by that same manual script. The cost is now measured rather than
+argued: RUSTSEC-2026-0285 (rustls, medium) was published 2026-09-14 and was found on 2026-09-19
+by running the gate by hand, five days later. **The project stays on manual testing and
+deployment through 0.3.5 regardless** — that is a deliberate choice about where effort goes
+before 0.4.0, not an oversight, and automating the gate is deferred to the 0.4.0 cleanup where
+it belongs beside the rest of the release machinery. What the choice obliges instead is a
+standing rule: `scripts/validate/all.sh` runs at every release cut with `cargo-audit` and
+`cargo-deny` installed, and a `skip` line in its output is a failed gate, not a pass.
+
+**The measures, answered.**
+
+1. **Four to six production files apiece — met, with one exception named.** `node/` is five
+   (`orchestrator` 6,649, `shard` 2,085, `router` 1,671, `search` 1,373, `mod` 1,163);
+   `storage/src/` is five (`store` 3,372, `schema` 1,689, `search` 1,615, `query` 973, `lib`
+   463); `cli/` is three, `config` is two — both below the band, which the coarse rule permits.
+   `cluster_coordinator/` is the exception: `coordinator.rs` is 2,376 of the original 2,840,
+   so 84% of the file moved intact and what landed was a tests-and-wire-types extraction rather
+   than a decomposition. Recorded as such rather than counted as an equal fifth.
+2. **One architectural concern touches one file — holding, on four data points.** See the
+   review-surface paragraph above. Re-check after the next feature phase, not before.
+3. **CH2's two tracked sizes stop growing between releases — not yet answerable.** No release
+   has been cut since the splits. Since they landed, `node/` is +41 lines and `storage/src/` is
+   +0, which is two days of evidence and not a trend. The measure also needs its baseline
+   restated now that both units are directories and the old single-file figures counted tests
+   that are siblings today: the comparison at 0.3.5 is `node/` 16,131 and `storage/src/` 10,273,
+   totals including tests.
+4. **The 0.4.0 cleanup list — unmet, all four, and now re-dated.** None were done and none
+   carried a date. They are `adopt_moved_settings` (`config.rs` 883), the `max_response_bytes`
+   migration (`config.rs` 912), `RouteShard`'s stub (`cluster_coordinator/coordinator.rs` 2150,
+   still logging its own deprecation) and the coordinator's shard-query TODO (`coordinator.rs`
+   1564 — the ~1794 this list recorded was the pre-split line). All four are re-dated to the
+   0.4.0 cut and are not 0.3.5 work; automating the dependency gate joins them there.
+
+**Bookkeeping the retrospective had to correct.** The `Done` stamps in this group had drifted
+badly enough to be worth naming, in a document whose dependency exceptions are enforced by
+date. L7 read 2026-10-06, L17 read 2026-10-12, and L18 and L19 read 2026-10-26 — all dates in
+the future when written. L11, L15 and L16 read 2026-09-09 against commits of 2026-09-17. All
+seven are corrected to their commit dates above. L1–L4, L8 and L10 check out exactly; L12 and
+L13 read 2026-09-19 against commits made late on 2026-09-18, a night's drift, left as
+recorded. Separately, [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) is
+was headed 📋 while two of its three items were ✅ and measured; its marker is corrected to ◐.
+
+**Output — the goal set for 0.3.5.** The next release is a stability-and-performance patch, and
+its target is a node that can be exposed on the internet as a shared, multi-tenant test
+deployment: many keys, index-scoped, in one process. That target is what orders the list, and
+it is narrower than "everything open". Full statement in
+[M — The 0.3.5 goal set](#m-the-035-goal-set--multi-tenant-exposure--planned).
+
+**Original entry.** 📋 Planned, and the gate on everything above. Once 0.3.4 is delivered and
+settled, run the retrospective over the 0.3.3/0.3.4 cycle — what the stability-and-security
+posture bought, what it cost in review surface (every fix inside one of five files), and what
+the fault-injection feature should become (kept test-only, promoted, or removed — a decision,
+not a default). Its output is this group's sequencing and the next cycle's goals:
 
 1. **L1–L4 now**, small and independent — they are defects on today's code.
 2. **L8 and the L10 bundle next**, same shape: small, bounded, security-adjacent.
@@ -3487,6 +3598,369 @@ architectural concern touches one file; CH2's two tracked sizes stop growing bet
 and the 0.4.0 cleanup list
 (`adopt_moved_settings`, the `max_response_bytes` migration, `RouteShard`'s stub, the
 coordinator's shard-query TODO at ~1794) is either done or re-dated.
+
+---
+
+## M. The 0.3.5 goal set — multi-tenant exposure 📋 Planned
+
+Set by the [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) retrospective,
+2026-09-19. **0.3.5 is a stability-and-performance patch whose target is one concrete
+deployment: a node reachable from the internet, serving several tenants out of a single
+process, used to try real workloads.** Every item below is here because that deployment is
+unsafe or unmeasured without it; everything else open in this document is deliberately not
+0.3.5 work.
+
+**[M0](#m0--the-architecture-review-and-the-order-of-work) comes first and is not one of the
+eight.** It is the 2026-09-19 architecture review — organization, dependencies and exposure,
+then the CPU, memory and disk paths — and it carries the order of work for this whole group.
+Three of its steps precede M1–M8 outright, and one of them re-scopes what M1 *is*.
+
+**What isolation the design can and cannot give, stated before the list.** A key carries a role
+and an `allowed_indexes` allow-list, and listings are filtered through the same predicate
+(`authz.rs` `retain_indexes`), so one tenant cannot read, write or enumerate another's indexes.
+That is isolation of *data and capability*, and it already works. What a single process cannot
+give is isolation of *resources*: tenants share the read pool, the writer arenas, the admission
+gates and one disk. 0.3.5's job is therefore not to pretend otherwise but to put a ceiling on
+what any one key can consume, so that a noisy tenant is refused rather than absorbed. A tenant
+who needs a guaranteed share needs their own node, and that should be said in the deployment
+docs rather than engineered around.
+
+**The patch-release constraint, from [C3](#c3--fail-closed-on-unauthenticated-internal)'s
+lesson.** *A patch release must not stop a working deployment over a value nobody wrote.* Every
+limit below therefore ships defaulted to its current behaviour — unlimited, or off — exactly as
+`security.implicit_index_creation` shipped defaulted to `true`. An operator opts into the
+ceiling; an upgrade changes nothing until they do.
+
+### M0 — The architecture review, and the order of work
+
+✅ **Reviewed 2026-09-19** — the crate graph, the module boundaries left by
+[L11](#l11--node_orchestratorrs-is-13669-lines-and-holds-four-actors)–[L13](#l13--clirs-configrs-and-cluster_coordinatorrs-5387--2955--2840-lines),
+and all four operation paths — single write, bulk write, the search fan-out, streaming ingest —
+read end to end from the HTTP handler down through `storage` into redb and tantivy.
+
+**Nothing below was measured.** The findings divide in two, and the division is load-bearing:
+those where the code either does the thing or does not, stated as fact and quoted by function;
+and those whose *size* depends on the workload, marked ⏱ and owed a run before any number is
+claimed. [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) and
+[F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) are why that line is drawn: this
+node has twice behaved differently from how the reasoning predicted. Line numbers were read on
+2026-09-19 and will drift; the named functions are the durable part.
+
+**The verdict on the engine.** It is in good shape, and the bulk write path is the best of it —
+`apply_batch` hoists every CPU pass out of the redb transaction, the writer loop reuses its
+buffers across drains, the tantivy pass is id-deduped so a batch naming an id twice ends with
+one document, and a drain is one transaction. None of what follows is a defect in an algorithm.
+What the review found is a dimension: **several things scale with the number of distinct index
+names a node has touched, and that is precisely the dimension
+[M](#m-the-035-goal-set--multi-tenant-exposure--planned) grows.**
+
+#### Organization, dependencies and exposure
+
+- **O1 — the privacy flattening overshot, and it is the main cost of the split.**
+  `node/orchestrator.rs` carries **234 `pub(crate)` markers over 144 distinct items**. What
+  `node/` actually needs to export is **~18 names** — `ClientOp`, `NodeOrchestrator`,
+  `OrchestratorError`, `OpClass`, `QueueLoad`, `SearchWindow`, `RouterActor`, `RemoteVerdict`,
+  `ReadPoolHealth`, `DocPayload`, `order_hit_blocks` and a few more. Inside the single file
+  none of the other ~126 was visible to anything; the split made them crate-visible in one
+  sweep, and nothing now stops `http_server/` reaching into orchestrator internals. L11 and
+  L12 both describe this as "the visibility the code already relied on", which is true of the
+  handful that cross the boundary and false of the rest. `pub(super)` confines an item to
+  `node/` and restores what one file gave for free.
+
+  ✅ **Done 2026-09-19.** The estimate was close: **15** names, not ~18. The compiler
+  enumerated them rather than a judgement call — scope the globs to `node`, flip every marker
+  to `pub(super)`, build, and widen back exactly what breaks. `node/mod.rs` now carries the
+  whole boundary as one named `pub(crate) use` list, and the globs the submodules reach each
+  other through are `pub(in crate::node)`, so a new `pub(super)` item cannot escape by being
+  swept up in one. `orchestrator.rs` went from **233 `pub(crate)` declarations to 20**, with
+  184 now `pub(super)` and the rest gone to the two extractions; across `node/` the names
+  reachable as `crate::node::*` went from **162 to 48**, and 33 of those 48 are declared in
+  `mod.rs` itself, which is the boundary file. What still crosses from the submodules is 22
+  top-level items — the 15 named, plus 7 that appear
+  only as the *type* of something in the list (`OrchestratorWorkerTx`, `ShardPlacement`,
+  `MailboxLane`, `MicroshardActor` and the three `/_admin/workers` report structs) — and 48
+  methods or fields on them. Two widenings carry a written reason at the declaration rather
+  than a marker on its own: `NodeOrchestrator::shards`, because `crate::admin::memory`
+  implements the admin-memory messages for the actor from outside `node/`, and
+  `QueueLoad::refuse`, because the HTTP front door has to refuse with the same error and the
+  same counter. Those two are the honest residue of the review's "nothing stops `http_server/`
+  reaching into orchestrator internals": now two things can, each named and each for a reason.
+- **O2 — `orchestrator.rs` is five concerns, and one of them should leave.** The dispatch core
+  (`OrchestratorEngine`, `NodeOrchestrator`, the worker loop, the `Message` impls, ~3,900
+  lines) is what L11 defends and it is right to. Beside it sit the admission and load
+  accounting (`OpClass`, `WorkerCounters`, `ServiceHistogram`, `DispatchCounters`, `QueueLoad`,
+  `MailboxLane`, `MailboxSlot` and the stats structs, ~700 lines), the schema machinery
+  (`SchemaCache`, sampling, evolution, `staged_schema_validation`, `parallel_validate_schema`,
+  ~600 lines) and placement and pinning (`CoreLayout`, `ShardPlacement`, `WriterPin`, ~220).
+  **Admission is the one to extract first**: it is the whole F7/F8 machinery, it carries
+  invariants of its own, and F8's worst bug — the lane counter decremented after the `await`,
+  so a cancelled request leaked its slot and an *idle* node read `mailbox_depth 63` and refused
+  everything for good — was an invariant-locality failure. Those invariants want one file.
+  This is not L11's growth trigger firing (`orchestrator.rs` is 6,649 against the 6,643 it
+  landed at, so it has not grown); it is the coherence question, which answers differently.
+
+  ✅ **Done 2026-09-19.** `node/admission.rs`, 783 lines: `OpClass`, `WorkerCounters`, the
+  `SERVICE_*` constants, `ServiceHistogram`, `DispatchCounters`, `QueueLoad`, `MailboxLane`,
+  `MailboxSlot` and the four `/_admin/workers` report structs. `orchestrator.rs` is **5,782
+  lines**, down from 6,649. The module doc states the invariant that had no home — every
+  increment matched by exactly one decrement on every exit path, cancellation included — and
+  names F8 as what it cost to learn, so the next reader meets the rule beside the counters
+  rather than in a retrospective. The schema machinery and the placement types stay where they
+  are: they are the next candidates, not this cut.
+- **O3 — the split scattered one family.** Five routing-key functions sit together around
+  `orchestrator.rs` 1192–1360; `derive_routing_key_from_doc` sits at ~6493, five thousand
+  lines from its siblings. [CH11](#ch11--routing-key-derivation-is-written-four-times-with-two-algorithms)
+  consolidated the *algorithms*; the move re-scattered the *family*.
+
+  ✅ **Done 2026-09-19.** `node/routing.rs`, 172 lines, holds the whole ladder — a module
+  rather than an adjacency, so the next split moves the file instead of scattering the members
+  again. Two defects surfaced in the move: `derive_routing_key_from_doc`'s doc claimed a rung
+  it does not implement ("if the document has an `id` field, use that directly" — that is the
+  ladder's rung 3, one level up), and it declared its own prefix bound `pub(crate)` inside a
+  function body, where the marker means nothing. Both corrected; the doc now says what the
+  function does and why a truncated prefix costs placement skew and never correctness.
+- **O4 — `storage`'s glob re-exports are an ungated public API.** `lib.rs` does
+  `pub use query::*`, `pub use schema::*`, `pub use store::*` — 74 public items, and a new
+  `pub` in any of those modules silently widens the crate's public API with no review step.
+  (`search.rs` is correctly `pub(crate) use`, as L12 intended.) Named re-export lists make each
+  widening deliberate; the glob makes it invisible.
+- **O5 — the `server → client` edge is deliberate and should stay recorded as such.** The
+  binary is one artifact: `main.rs` dispatches to `client::run_cli()`, so the server links the
+  whole CLI — clap, the interactive shell, the CSV and compression paths. It costs binary size
+  and link surface and nothing on a request path. Recorded here so the edge is not mistaken for
+  a layering accident by the next reader.
+
+#### Memory — the index dimension is unbounded in eleven places
+
+- **M0-a — the eviction unit is wrong, and this rewrites [M1](#m1--bound-resident-memory-against-index-count).**
+  `store.rs` declares **eleven per-index maps**, each keyed by index name and each unbounded:
+  `writers`, `readers`, `current_seq`, `operations_counter`, `read_cache`, `budget_cache`,
+  `schema_cache`, `fields_cache`, `index_init_locks`, `warmed_generations`, `warmup_states`,
+  plus `index_size_cache` under a `Mutex`. [E5](#e5--a-cap-on-open-index-writers) caps one of
+  them. Evicting a writer leaves the other ten resident — `readers` holds an `IndexReader` with
+  its segment readers and fast-field caches, `read_cache` holds document bodies. **Cap the
+  index, not the writer.**
+- **M0-b — threads scale with open indexes too, and E5 does not say so.** Each `IndexWriter` is
+  built with `indexer_num_threads` (default 1) plus `merge_num_threads` (default 2): **three OS
+  threads per open index**, on top of the arena. The thread-topology essay in `node/mod.rs`
+  states this correctly and E5 does not. Two hundred tenant indexes is ~600 threads and
+  ≥12.8 GiB of arenas before a document is served.
+- **M0-c — the read cache is bounded per index and evicts arbitrarily.**
+  `MAX_CACHE_ENTRIES_PER_INDEX` is 1024 in `search.rs::insert_into_cache`, so the real ceiling
+  is 1024 × index count. Eviction takes `entries.keys().next()` — arbitrary `HashMap` order,
+  neither LRU nor FIFO — so under pressure the hot set can go while cold entries stay.
+- **M0-d — a deep clone per bulk batch that an `Arc` already covers.**
+  `parallel_validate_schema` takes `&IndexSchema` and clones it whole for the rayon path, while
+  its caller holds the `Arc<IndexSchema>` that `load_schema` returned. Taking the `Arc` removes
+  a field-map clone from every batch above 64 documents. The comment defending the clone as
+  "bounded by field count" is true and beside the point.
+- **M0-e — [CH6](#ch6--the-federated-merge-clones-every-hit) is worse than its own entry says.**
+  `mcp/search.rs` deep-clones every hit to stamp `_index_source` on the copy, out of a response
+  it already owns. On the MCP surface the hits *are* the documents, so it doubles peak memory of
+  every federated response. `as_array_mut` + `mem::take` is the whole fix. Re-read CH6's
+  "untidy rather than slow" against that.
+
+#### CPU — the search path repeats per-request work once per shard
+
+- **M0-f ⏱ — query preparation is shard-independent and runs per shard.**
+  `prepare_query_parser` runs the whitespace fold, the shadow rewrite, the date and facet
+  normalisations, then the prefix pass, then rebuilds `default_query_fields` by walking every
+  indexed field and checking its tantivy `FieldType`, then constructs a `QueryParser` — and
+  every shard does all of it against the same query and the same schema. The gather loop
+  already knows: its own comment reads *"Every shard parses the same query string"*, and it
+  fans out `query.to_string()` per shard regardless. Only the final `parse_query_lenient` needs
+  the per-shard index. The normalisations are schema-only work that belongs once in
+  `ScatterCtx::gather`; `default_query_fields` belongs in `SchemaFields`, which is already
+  cached per index. **The waste grows with the shard count added to buy parallelism**, which is
+  what makes it worth doing — but how much of a search it is depends on query shape and field
+  count, so it is owed an arm before any figure is claimed.
+
+#### Disk
+
+- **M0-g — every commit stats the whole index directory.** `commit_index` calls
+  `get_optimal_memory_budget`, which calls `index_size_bytes` — a `read_dir` plus a
+  `metadata()` per file. A fifty-segment tantivy index is some three hundred files, so that is
+  ~300 `stat` syscalls per commit, on the writer thread, in the window between the tantivy
+  commit and the checkpoint transaction. It feeds a commit-*cadence* heuristic that needs no
+  per-commit precision: recompute on a TTL or every N commits. The cheapest item in this
+  review.
+- **M0-h — dead code that documents behaviour the engine does not have, and the decision it
+  needs.** `StorageConfig::get_bulk_operation_budget` is called by nothing in production —
+  its only caller is `crates/storage/tests/bulk_memory_budget_test.rs`. Its doc describes bulk
+  writes receiving 1.5× and 2× arenas; they do not, because the writer's
+  `memory_budget_per_thread` is fixed when the writer is built. Being `pub` on a library type,
+  no dead-code lint ever saw it, which is how [L17](#l17--dead-code-and-stale-suppressions)'s
+  sweep missed it. **This is a decision, and both branches are cheap:** either *activate* it —
+  wire the batch-size scaling into the bulk path so the documented behaviour becomes real, and
+  keep the test as its proof — or *delete* it together with `bulk_memory_budget_test.rs`, since
+  a test whose only subject is an uncalled function pins nothing the product does. What it must
+  not stay is what it is: a documented, tested claim about an engine that behaves otherwise.
+
+#### The differentiator, and where it actually costs
+
+Schema evolution and stream-correctness detection are the differentiation and are not up for
+trade. Having traced them: **the validation is not the cost.** It is already tiered — inline at
+or below 64 documents, rayon above, one validator so a document gets the same verdict at any
+batch size, which is the disagreement L-group work already closed. The cost is structural:
+
+- **M0-i — every evolving write pays two transactions and two fsyncs.** In `apply_write`, the
+  data transaction commits, and *then* `persist_schema_evolution` opens a second `begin_write`
+  with `Durability::Immediate` and commits again. The code knows the seam it leaves: the error
+  arm logs `CRITICAL: Schema evolution failed after data commit. Data was saved but schema may
+  be inconsistent.` So on the workload that *is* the differentiation — a stream teaching an
+  index its own shape — every field-introducing write costs two fsyncs and carries an
+  acknowledged inconsistency window. **Folding the schema row into the same redb transaction as
+  the WAL and data inserts closes both at once**: one fsync instead of two, and redb makes the
+  pair atomic so the window cannot exist. `apply_batch` already proves the pattern — it opens
+  one transaction for everything that has to be atomic. This makes the differentiating feature
+  cheaper *and* stronger, which is the rare direction and the reason it leads the list.
+
+#### The order of work
+
+Ranked by impact × certainty ÷ effort. Items 1–3 and 7 are mechanically verifiable — the code
+either does the thing or it does not. Item 6 is ⏱ and is owed a run.
+
+| # | Step | Lands in |
+|---|---|---|
+| 1 | Fold schema evolution into the data transaction (**M0-i**) | new work under this group |
+| 2 | Re-scope the cap to the *index* — all eleven maps — and record the three-threads-per-index fact (**M0-a**, **M0-b**) | [M1](#m1--bound-resident-memory-against-index-count) |
+| 3 | Stop the per-commit directory walk (**M0-g**) | new work under this group |
+| 4 | ✅ `pub(crate)` → `pub(super)` across `node/`, and one named boundary list in `node/mod.rs` (**O1**) — done 2026-09-19 | this group |
+| 5 | ◐ Extract the admission subsystem from `orchestrator.rs` (**O2** ✅); re-unite the routing-key family (**O3** ✅); replace `storage`'s glob re-exports with named lists (**O4**, outstanding) | this group |
+| 6 | ⏱ Hoist shard-independent query preparation out of the fan-out, and cache `default_query_fields` in `SchemaFields` — **measure before claiming** (**M0-f**) | this group, beside [M6](#m6--close-and-re-measure-the-bulk-lane) |
+| 7 | The cheap and certain set: the `Arc` in `parallel_validate_schema`, CH6's per-hit clone, the read cache's arbitrary eviction, and the delete-or-activate decision on `get_bulk_operation_budget` and its test (**M0-d**, **M0-e**, **M0-c**, **M0-h**) | this group, [CH6](#ch6--the-federated-merge-clones-every-hit) |
+
+Steps 1–3 come before [M1](#m1--bound-resident-memory-against-index-count)–[M8](#m8--re-decide-the-query-complexity-caps) start, because 2 changes what M1 is and 1 and 3 touch the
+paths M6 will measure. Steps 4 and 5 come before the next feature phase, for
+[L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle)'s reason: a review should
+not have to read around an avoidable surface twice.
+
+**Steps 4 and 5 ran first, on 2026-09-19**, out of the ranked order and deliberately: they are
+the only steps that change where the other five are *read*, and every one of them lands in
+`node/` or in files the boundary now fences. Doing them after would have meant writing the M0-a
+through M0-i work against a module layout that was about to move under it. O4 is what is left of
+step 5; it is in `storage`, touches no `node/` path, and can ride with whichever storage-side
+step reaches it first. `cargo clippy --workspace --all-targets` is clean and
+`scripts/validate/unit.sh` reports 826 tests across 43 targets, 0 skipped — the refactor is
+behaviour-preserving by construction (visibility narrowing and code motion, no logic edited) and
+the suite is the evidence, not the argument.
+
+### M1 — Bound resident memory against index count
+
+📋 **Planned**, and the blocker for the deployment rather than one item among several. This is
+[E5](#e5--a-cap-on-open-index-writers), promoted: `writers` is a `DashMap` that grows with the
+number of distinct index names written to, every entry holds a live Tantivy `IndexWriter` with
+its own arena (`indexer_memory_budget`, default 64 MiB, scaled further by the optimal-budget
+calculation), and nothing evicts by count or by total budget. E5 already names the exact pattern
+this release is built for — *"a tenant-per-index or date-partitioned pattern reaches an
+uncomfortable footprint quickly"* — which stops being a hypothetical the moment tenants pick
+their own index names.
+
+**Re-scoped 2026-09-19 by [M0](#m0--the-architecture-review-and-the-order-of-work), and the
+change is not a detail — it is what this item is.** Capping `writers` caps one of *eleven*
+per-index maps (**M0-a**). The other ten stay resident behind an evicted writer, and two of
+them are the large ones: `readers` holds an `IndexReader` with its segment readers and
+fast-field caches, `read_cache` holds document bodies at 1024 entries *per index* (**M0-c**).
+**The unit of eviction is the index, not the writer** — one closing path that drops the whole
+per-index set, with the admin endpoint's drop-and-rebuild as its inner step rather than its
+whole extent. Two consequences to write into the design before it starts:
+
+- **The budget being capped is threads as well as bytes (M0-b).** Every open `IndexWriter`
+  carries `indexer_num_threads` (default 1) plus `merge_num_threads` (default 2) — three OS
+  threads per open index, which the thread-topology essay in `node/mod.rs` states and E5 does
+  not. A cap expressed only in megabytes leaves the thread count uncapped, and at two hundred
+  tenant indexes that is the ~600 threads before the ~12.8 GiB.
+- **`read_cache` needs its eviction fixed in the same pass (M0-c).** Its per-index bound takes
+  `entries.keys().next()` — arbitrary `HashMap` order, neither LRU nor FIFO — so under the
+  pressure this item exists to create, it can drop the hot set and keep cold entries. A cap
+  whose victim is chosen at random is not a cap on the thing that matters.
+
+### M2 — Cap decompressed bytes on the streaming ingest path
+
+📋 **Planned.** [C5](#c5--a-decompression-cap-on-the-streaming-ingest-path) unchanged, and it
+changes category on an internet-facing node: `POST /api/{index}/document/stream` takes a raw
+`Body`, so `DefaultBodyLimit` never applies and `RequestBodyLimitLayer` counts compressed wire
+bytes. A gzip stream under the wire limit expands without bound, held only by the request
+timeout and the concurrency guard. Count decompressed bytes as the handler drains, and refuse
+past the cap.
+
+### M3 — Meter the write surface, and give anonymous callers their own bucket
+
+📋 **Planned.** The remainder of [C8](#c8--rest-has-no-rate-limit-and-anonymous-mcp-callers-share-one-bucket).
+[L10](#l10--the-low-findings-in-one-place) wired `tool_limiter.check` into the two search
+handlers; every write route — `write_handler`, `bulk_write_handler`, `delete_document_handler`,
+`bulk_delete_handler`, `write_stream_handler` — is still governed only by
+`max_concurrent_requests` and body size, which bound instantaneous concurrency and place no
+ceiling on sustained rate. Writes are the expensive direction and the one that grows the disk,
+so metering search and not writes is the wrong half. The second half stands too: within MCP
+every unidentified caller shares one bucket, so one anonymous client can spend the budget for
+all of them — a per-address dimension is what an exposed node needs.
+
+### M4 — Per-key resource quotas
+
+📋 **Planned**, and new — nothing in `config.rs` caps anything per key today. With M1 bounding
+the node and M3 bounding the rate, what remains unbounded is the total a single tenant
+accumulates: index count, document count, bytes on disk. The minimum useful set is a cap on
+indexes per key and a cap on bytes per key, refused at the same ingress chokepoint B1's
+allow-list uses, with `security.implicit_index_creation` as the precedent for the shape — a
+refusal that names the remedy, not a silent truncation. Unlimited by default.
+
+### M5 — Per-index capability subtraction
+
+📋 **Planned.** [C1](#c1--per-index-role-overrides) promoted, and its own entry already names
+the reason: *risk if unfixed: multi-tenant isolation*. A key with `role = "writer"` granted
+read-only on one named index — subtraction from the allow-list rather than a second allow-list.
+Estimated at ~2 days there, enforced at B1's chokepoint and not at the `RouterActor` boundary,
+for the trust-boundary reason B1 records.
+
+### M6 — Close and re-measure the bulk lane
+
+📋 **Planned.** [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) item 3 is the
+only one of its three still open — feed bulk service times into the blended estimate the door
+judges on, which is the workload with by far the largest per-request cost and currently
+contributes nothing to it. F8's own caveats then name what was never measured and should be
+before a shared node is exposed: the single-write path under overload (`Write` *is*
+worker-eligible, so it should be covered — an assumption until an arm says so), and whether a
+retrying client deepens any of it. **M0-f rides the same session**: the read lane's
+shard-independent query preparation is repeated per shard, and its size is owed an arm rather
+than an estimate — the same standard, and the same harness. The F7/F8 precedent is the standard here: this lane's
+behaviour has twice been worse than the reasoning predicted, and only a run has ever settled it.
+
+### M7 — Redact the cluster PSK in `Debug`
+
+📋 **Planned.** [C6](#c6--redact-the-cluster-psk-in-debug), unchanged and cheap — minutes of
+work, and the kind of latent leak that an exposed node is the wrong place to discover.
+
+### M8 — Re-decide the query complexity caps
+
+📋 **A decision, not necessarily code.** [C2](#c2--query-complexity-caps) was deferred on the
+reasoning that *rate limiting already bounds what a key costs the node per unit time*. That
+reasoning is sound and its premise is currently false on the write surface, which M3 fixes. Once
+the surface is metered, re-read C2 against a multi-tenant node and either re-affirm the deferral
+with the premise now true, or take it up. The two `parse_query_lenient` call sites are where a
+cap would go.
+
+**Deliberately not in 0.3.5:** [D1–D3](#d-phase-15--high-availability-reindex-replication--migration--planned)
+(reindex, replication, migration), [A1](#a1--mcp-streaming) and [A5](#a5--semantic-routing),
+[J2](#j2--a-json-field-should-mean-subfield-addressing)/[J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly),
+[K1–K3](#k-phase-19--field-metrics-min-and-max--planned),
+[B1](#b1--2f2--cpu-arenas-for-write--read--merge)/[B2](#b2--2f3--per-arena-jemalloc-stats),
+and the four 0.4.0 cleanup items together with automating the dependency gate — all of which
+are 0.4.0 or later. [CH3](#ch3--cursor-paging-search_after) is the closest call: deep paging is
+a per-tenant cost multiplier and cursor paging is the fix, but it is a feature with a surface
+change and it does not belong in a patch.
+
+**Exit criteria for 0.3.5.** Resident memory is a function of data held rather than of index
+names touched (M1, shown by a run that opens far more indexes than the cap); a compressed
+ingest cannot expand past a stated ceiling (M2); every write route refuses past a per-key rate
+(M3) and past a per-key total (M4); one key can be granted read-only on one index while keeping
+write elsewhere (M5); an open-loop arm on the bulk lane and on the single-write lane both show
+goodput that degrades rather than collapsing (M6); an evolving write costs one transaction and
+one fsync rather than two, with no window between the document and the schema that made it
+valid (M0-i); `node/` exports the ~18 names it is used for rather than 144 (M0 step 4);
+`get_bulk_operation_budget` is either wired to the bulk path or deleted with its test, and not
+both documented and dead (M0-h); and `scripts/validate/all.sh` runs clean at the cut, with
+`cargo-audit` and `cargo-deny` installed and no `skip` line in its output.
 
 ---
 

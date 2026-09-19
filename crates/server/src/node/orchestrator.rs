@@ -1,5 +1,9 @@
 //! The dispatch core: NodeOrchestrator, the worker engine and pool, and the write-path
-//! machinery — routing, grouping, forwarding and the borrowed-ctx bodies the two lanes share.
+//! machinery — grouping, forwarding and the borrowed-ctx bodies the two lanes share.
+//!
+//! Two things a reader might expect here are deliberately elsewhere, each because it is a
+//! subsystem with invariants of its own rather than a step of dispatch: admission and load
+//! accounting in [`super::admission`], and the routing-key ladder in [`super::routing`].
 
 use super::*;
 
@@ -10,7 +14,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+    atomic::{AtomicI64, AtomicUsize, Ordering as AtomicOrdering},
 };
 use std::time::{Duration, Instant};
 
@@ -19,7 +23,6 @@ use arc_swap::ArcSwap;
 use kameo::actor::ActorRef;
 use kameo::message::{Context, Message};
 use kameo::{Actor, RemoteActor, remote_message};
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -40,39 +43,6 @@ use storage::{
     StoreError, TantivyFieldType,
 };
 
-/// The kind of work a [`ClientOp`] implies, for the admission-time service estimate.
-///
-/// One EWMA for every op would blend a point search's milliseconds with a bulk write's, and
-/// the reserve computed from the blend is wrong for both — over-reserving the cheap op and
-/// under-reserving the expensive one. `Any` is the door's view: the admission guard runs
-/// before the body is read, so it cannot know which the request is and uses the blended
-/// estimate — the honest answer to "what does a request cost" before the request is known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpClass {
-    /// Op not yet known (the admission guard runs before parsing) or outside the split.
-    Any,
-    /// `Search`, `Stream` — work that lands on the read pool.
-    Read,
-    /// `Write`, `Delete` — work that lands on a shard's writer thread.
-    Write,
-    /// `BulkWrite`, `BulkDelete` — a fan-out over writer threads and peers whose service is
-    /// orders above a single write's. Folded into the write estimate it would poison it:
-    /// one 300ms bulk sample outweighs a hundred 2ms writes, and single writes would be
-    /// reserved — and refused — against a cost they never pay.
-    Bulk,
-}
-
-impl OpClass {
-    pub(crate) fn of(op: &ClientOp) -> Self {
-        match op {
-            ClientOp::Search { .. } | ClientOp::Stream { .. } => OpClass::Read,
-            ClientOp::Write { .. } | ClientOp::Delete { .. } => OpClass::Write,
-            ClientOp::BulkWrite { .. } | ClientOp::BulkDelete { .. } => OpClass::Bulk,
-            _ => OpClass::Any,
-        }
-    }
-}
-
 /// A document on its way to a shard, still carrying where it sat in the batch that arrived.
 ///
 /// The position is what lets every reason name the document it is about. It used to be dropped
@@ -81,14 +51,14 @@ impl OpClass {
 /// response reporting fewer documents written than it received with nothing to explain the
 /// difference.
 #[derive(Debug, Clone)]
-pub(crate) struct Placed {
-    pub(crate) position: usize,
-    pub(crate) doc: DocPayload,
-    pub(crate) routing_key: Option<String>,
+pub(super) struct Placed {
+    pub(super) position: usize,
+    pub(super) doc: DocPayload,
+    pub(super) routing_key: Option<String>,
 }
 
 /// Where one document is going, or why it is going nowhere.
-pub(crate) type RoutingResult = Result<(Placed, Uuid), (usize, String)>;
+pub(super) type RoutingResult = Result<(Placed, Uuid), (usize, String)>;
 
 /// Everything a bulk fan-out reads, borrowed off whichever side of the orchestrator/engine
 /// split is running it.
@@ -100,7 +70,7 @@ pub(crate) type RoutingResult = Result<(Placed, Uuid), (usize, String)>;
 /// one-hop forwarding bound, same per-item accounting. What is *not* here is schema
 /// authority — that stays on the actor, which is why the engine's bulk write defers the
 /// moment a batch needs one written.
-pub(crate) struct BulkCtx<'a> {
+pub(super) struct BulkCtx<'a> {
     shards: &'a HashMap<Uuid, MicroshardActor>,
     ring: &'a ConsistentRing,
     coordinator: Option<&'a ActorRef<ClusterCoordinator>>,
@@ -108,7 +78,7 @@ pub(crate) struct BulkCtx<'a> {
 }
 
 impl BulkCtx<'_> {
-    pub(crate) fn first_shard_id(&self) -> Option<Uuid> {
+    pub(super) fn first_shard_id(&self) -> Option<Uuid> {
         self.shards.keys().copied().next()
     }
 
@@ -120,7 +90,7 @@ impl BulkCtx<'_> {
     /// for the rest — one per position, which is what makes the accounting anchor derivable:
     /// the batch arrived as `pending + rejections` and every path below either writes a
     /// document or adds a reason.
-    pub(crate) async fn apply_bulk_write(
+    pub(super) async fn apply_bulk_write(
         &self,
         index: &str,
         pending: Vec<Placed>,
@@ -398,7 +368,7 @@ impl BulkCtx<'_> {
     /// A delete can never need a schema written — it carries no document that could present
     /// a field the schema does not know — so unlike [`apply_bulk_write`](Self::apply_bulk_write)
     /// there is no slow path behind this.
-    pub(crate) async fn apply_bulk_delete(
+    pub(super) async fn apply_bulk_delete(
         &self,
         index: &str,
         docs: Vec<DeletePayload>,
@@ -618,7 +588,7 @@ impl BulkCtx<'_> {
     }
 
     /// Process one batch per local shard, all of them in parallel.
-    pub(crate) async fn local_shard_writes(
+    pub(super) async fn local_shard_writes(
         &self,
         index: &str,
         local_batches: HashMap<Uuid, Vec<Placed>>,
@@ -737,7 +707,7 @@ impl BulkCtx<'_> {
     /// node answered 200 with a shortfall it could not explain.
     ///
     /// Uses the cached RemotePeerPool to avoid repeated swarm registry lookups.
-    pub(crate) async fn forward_write(
+    pub(super) async fn forward_write(
         &self,
         node_id: Uuid,
         peer_addr: &str,
@@ -828,7 +798,7 @@ impl BulkCtx<'_> {
     }
 
     /// Hand a peer the part of a bulk delete its shards own.
-    pub(crate) async fn forward_delete(
+    pub(super) async fn forward_delete(
         &self,
         node_id: Uuid,
         peer_addr: &str,
@@ -908,19 +878,19 @@ impl BulkCtx<'_> {
 /// `Arc<SchemaCache>`; a hit is the cached `Arc`, so no caller pays a deep clone of the field
 /// map per request. Callers that mutate the schema clone out of the `Arc` themselves.
 #[derive(Debug)]
-pub(crate) struct SchemaCache {
+pub(super) struct SchemaCache {
     map: ArcSwap<HashMap<String, Arc<IndexSchema>>>,
 }
 
 impl SchemaCache {
-    pub(crate) fn new() -> Self {
+    pub(super) fn new() -> Self {
         SchemaCache {
             map: ArcSwap::from_pointee(HashMap::new()),
         }
     }
 
     /// The cached schema for `index`, or `None` on a miss. Shared, not owned.
-    pub(crate) fn get(&self, index: &str) -> Option<Arc<IndexSchema>> {
+    pub(super) fn get(&self, index: &str) -> Option<Arc<IndexSchema>> {
         self.map.load().get(index).cloned()
     }
 
@@ -930,13 +900,13 @@ impl SchemaCache {
     /// it was dropped cannot put that schema back over the record of the deletion. Ordering
     /// by version costs a comparison and needs nothing coordinated between concurrent
     /// writers.
-    pub(crate) fn put(&self, index: &str, schema: &IndexSchema) {
+    pub(super) fn put(&self, index: &str, schema: &IndexSchema) {
         self.put_arc(index, Arc::new(schema.clone()));
     }
 
     /// [`put`](Self::put) for a caller that already holds the `Arc` — the store's own read of
     /// a schema is shared rather than cloned a second time.
-    pub(crate) fn put_arc(&self, index: &str, schema: Arc<IndexSchema>) {
+    pub(super) fn put_arc(&self, index: &str, schema: Arc<IndexSchema>) {
         let index_str = index.to_string();
 
         self.map.rcu(|old| {
@@ -954,7 +924,7 @@ impl SchemaCache {
     /// Drop the cached entry outright. Deletion uses this before caching the record of the
     /// drop — an empty entry gives [`put`](Self::put) nothing to compare against, so a write
     /// in flight that resolved against the old schema would install it again.
-    pub(crate) fn remove(&self, index: &str) {
+    pub(super) fn remove(&self, index: &str) {
         let index = index.to_string();
         self.map.rcu(|old| {
             let mut new = (**old).clone();
@@ -975,7 +945,7 @@ impl SchemaCache {
     /// exists to prevent. `get_schema_cached` rather than `get_schema` because it is what the
     /// write path resolves against — a schema derived from Tantivy and merged with the stored
     /// metadata, so validation and writing agree on the types.
-    pub(crate) async fn durable(
+    pub(super) async fn durable(
         &self,
         shards: &HashMap<Uuid, MicroshardActor>,
         index: &str,
@@ -992,7 +962,7 @@ impl SchemaCache {
 
     /// [`durable`](Self::durable) plus the empty-schema answer a miss means on the write
     /// path: an index this node has never seen starts with no declared fields.
-    pub(crate) async fn schema_for(
+    pub(super) async fn schema_for(
         &self,
         shards: &HashMap<Uuid, MicroshardActor>,
         index: &str,
@@ -1006,7 +976,7 @@ impl SchemaCache {
 
 /// The schema the first shard's store holds for `index`, or `None` when no shard has a store
 /// or none holds one — the read every load-from-store path used to spell out for itself.
-pub(crate) async fn schema_from_shards(
+pub(super) async fn schema_from_shards(
     shards: &HashMap<Uuid, MicroshardActor>,
     index: &str,
 ) -> Result<Option<Arc<IndexSchema>>, OrchestratorError> {
@@ -1022,7 +992,7 @@ pub(crate) async fn schema_from_shards(
 /// One store's answer for `index`, off the async runtime — `get_schema_cached` is a blocking
 /// read. The double `map_err` is the join failure and the store error, collapsed into the
 /// same `Io` verdict every caller used to spell out twice.
-pub(crate) async fn schema_from_store(
+pub(super) async fn schema_from_store(
     store: &Arc<HybridStore>,
     index: &str,
 ) -> Result<Option<Arc<IndexSchema>>, OrchestratorError> {
@@ -1036,7 +1006,7 @@ pub(crate) async fn schema_from_store(
 
 /// What the write gate settled. `Routed` carries what dispatch needs; `Grow` means the schema
 /// is empty or must evolve — only the actor can do that, under the mailbox's serialisation.
-pub(crate) enum WriteGate {
+pub(super) enum WriteGate {
     Routed {
         target: Uuid,
         effective_routing_key: Option<String>,
@@ -1047,7 +1017,7 @@ pub(crate) enum WriteGate {
 /// A dispatched write, or its parts back when the ring's target is not on this node. What
 /// `Elsewhere` means is the lane's call: the actor forwards to the owning node, a worker hands
 /// the op back for the mailbox to retry.
-pub(crate) enum WriteDispatch {
+pub(super) enum WriteDispatch {
     Done(JsonValue),
     Elsewhere {
         id: String,
@@ -1059,7 +1029,7 @@ pub(crate) enum WriteDispatch {
 /// The borrowed view a single write or delete routes and dispatches against — shard map, ring,
 /// schema cache — identical on both lanes: the actor reads its own fields, a worker reads the
 /// engine's `ArcSwap` snapshots. The shape `BulkCtx` established for the bulk fan-out.
-pub(crate) struct WriteCtx<'a> {
+pub(super) struct WriteCtx<'a> {
     shards: &'a HashMap<Uuid, MicroshardActor>,
     ring: &'a ConsistentRing,
     schema_cache: &'a SchemaCache,
@@ -1080,7 +1050,7 @@ impl WriteCtx<'_> {
     /// `try_send_affine`: same dense shard ordinal, same co-located writer thread, same saved
     /// cross-core wakeup. This lookup is an xxh3 and a `BTreeMap` range descent, which is not
     /// a saving worth a class of divergence in front of a redb transaction.
-    pub(crate) fn route_write(
+    pub(super) fn route_write(
         &self,
         routing_key: &Option<String>,
     ) -> Result<Uuid, OrchestratorError> {
@@ -1099,7 +1069,7 @@ impl WriteCtx<'_> {
     /// Validate `doc` against `schema` and, when the schema already covers every field, cache
     /// the schema and route the write. Anything else — an empty schema, a field the schema
     /// does not describe — is [`WriteGate::Grow`], the actor's to settle.
-    pub(crate) fn gate(
+    pub(super) fn gate(
         &self,
         index: &str,
         id: &str,
@@ -1134,7 +1104,7 @@ impl WriteCtx<'_> {
 
     /// Dispatch a routed write to its shard. `Elsewhere` hands the parts back — the ring's
     /// target is not on this node, and what that means is the lane's call.
-    pub(crate) async fn dispatch(
+    pub(super) async fn dispatch(
         &self,
         target: Uuid,
         index: &str,
@@ -1166,7 +1136,7 @@ impl WriteCtx<'_> {
 
     /// Same shape for a delete: the shard answers, or `None` says the target is not local and
     /// the lane decides between forwarding and deferring.
-    pub(crate) async fn dispatch_delete(
+    pub(super) async fn dispatch_delete(
         &self,
         target: Uuid,
         index: &str,
@@ -1188,27 +1158,16 @@ impl WriteCtx<'_> {
     }
 }
 
-/// Extract routing key value from JSON document using field name
-pub fn extract_routing_value(doc: &JsonValue, field_name: &str) -> Option<String> {
-    let obj = doc.as_object()?;
-    match obj.get(field_name)? {
-        JsonValue::String(s) => Some(s.clone()),
-        JsonValue::Number(n) => Some(n.to_string()),
-        JsonValue::Bool(b) => Some(b.to_string()),
-        _ => None,
-    }
-}
-
 /// Accumulator for broadcast search statistics across local and remote results.
-pub(crate) struct BroadcastStats {
-    pub(crate) total_shards_queried: usize,
-    pub(crate) nodes_contacted: usize,
-    pub(crate) max_took_ms: Option<u64>,
-    pub(crate) total_hits_sum: usize,
+pub(super) struct BroadcastStats {
+    pub(super) total_shards_queried: usize,
+    pub(super) nodes_contacted: usize,
+    pub(super) max_took_ms: Option<u64>,
+    pub(super) total_hits_sum: usize,
     /// Distinct dropped clauses across the nodes that answered.
-    pub(crate) discarded: Vec<String>,
+    pub(super) discarded: Vec<String>,
     /// The approximated sort field, if any node reported one; see [`APPROXIMATE_SORT_FIELD`].
-    pub(crate) approximate_sort: Option<String>,
+    pub(super) approximate_sort: Option<String>,
 }
 
 /// Whether a shard's failure is the request's fault rather than this node's.
@@ -1218,7 +1177,7 @@ pub(crate) struct BroadcastStats {
 /// `InvalidInput` and `InvalidData` are what the engine raises for a query or a field the index
 /// cannot answer; anything else is this node failing to read data it owns, which says nothing
 /// about what was asked.
-pub(crate) fn is_caller_error(err: &OrchestratorError) -> bool {
+pub(super) fn is_caller_error(err: &OrchestratorError) -> bool {
     match err {
         // `Validation` is the dedicated form; the `Io` arm stays because a genuine
         // `io::Error` can still arrive with the same kind from the `#[from]` conversion.
@@ -1235,49 +1194,12 @@ pub(crate) fn is_caller_error(err: &OrchestratorError) -> bool {
     }
 }
 
-/// The key a write is routed by, in the order of precedence that decides it.
-///
-/// Written out identically in three places before this existed — the engine fast path and both
-/// halves of the actor path — which is a rule that has to agree with itself to be a rule at all.
-/// Whatever routes a document has to reach the same shard every time, or the same id lands in
-/// two places and a search returns it twice.
-///
-/// 1. **The document's own routing field.** The schema names it, and it is the authority: a
-///    shadow index routes by the source's name for the key, a tenant index by the tenant.
-/// 2. **What the caller asked for.** Honoured only where the document does not answer, so a
-///    caller cannot move a document off the shard its schema puts it on.
-/// 3. **The id**, which is what the routing field resolves to on a default index anyway.
-/// 4. **A hash of the document**, so an unkeyed write is still deterministic rather than random.
-pub(crate) fn effective_routing_key(
-    schema: &IndexSchema,
-    id: &str,
-    routing_key: Option<String>,
-    doc: &JsonValue,
-) -> Option<String> {
-    routing_key_for(schema.get_routing_field(), routing_key, id, doc)
-}
-
-/// The whole routing ladder, for callers that hold the routing field rather than the schema.
-///
-/// The bulk router resolves the field once and then routes thousands of documents against it, so
-/// it cannot take a schema per document — which is how it came to spell the ladder out a fourth
-/// time. Same rungs, one place.
-pub(crate) fn routing_key_for(
-    routing_field: &str,
-    routing_key: Option<String>,
-    id: &str,
-    doc: &JsonValue,
-) -> Option<String> {
-    extract_routing_value(doc, routing_field)
-        .or_else(|| routing_key_without_schema(routing_key, id, doc))
-}
-
 /// Who this node is, and how many shards it holds.
 ///
 /// A free function because both the actor and the worker engine answer it, and the answer is
 /// two fields and a length — the one metadata read with nothing behind it worth serialising
 /// against a write. See [`OrchestratorEngine::execute`].
-pub(crate) fn identity_json(identity: &NodeIdentity, total_shards: usize) -> JsonValue {
+pub(super) fn identity_json(identity: &NodeIdentity, total_shards: usize) -> JsonValue {
     serde_json::json!({
         "node_id": identity.uuid.to_string(),
         "node_name": identity.name.clone(),
@@ -1285,76 +1207,8 @@ pub(crate) fn identity_json(identity: &NodeIdentity, total_shards: usize) -> Jso
     })
 }
 
-/// The rungs of the routing precedence that need no schema: the caller's key, then the id, then
-/// a hash of the document.
-///
-/// Split out because the HTTP layer has to pick a *node* for a request before anyone has
-/// resolved the index's schema, so it can only climb from here down — where
-/// [`effective_routing_key`] starts one rung higher, at the schema's routing field. Two callers,
-/// one ladder: they were written out separately and had drifted into using different hashes of
-/// different byte ranges, so a hint and the key it was standing in for could disagree.
-///
-/// A disagreement costs a forwarding hop rather than a misplaced document — per-document shard
-/// placement is decided by `effective_routing_key` alone, and a hint that points at the wrong
-/// node is corrected by the forward OB3 bounded. That is why this unifies on the orchestrator's
-/// existing derivation rather than the HTTP layer's: the hint is free to change, and the shard a
-/// document lands on is not.
-pub(crate) fn routing_key_without_schema(
-    routing_key: Option<String>,
-    id: &str,
-    doc: &JsonValue,
-) -> Option<String> {
-    routing_key
-        .or_else(|| (!id.is_empty()).then(|| id.to_string()))
-        .or_else(|| derive_routing_key_from_doc(doc))
-}
-
-/// The key a delete is routed by, or the reason it cannot be routed.
-///
-/// A write reads its routing key out of the document, which outranks everything the caller sent.
-/// A delete has no document, so only two of those four rungs are left — and which of them applies
-/// is decided entirely by the schema:
-///
-/// - **The routing field is the key.** `id` by default, or a shadow field, whose value *is* the
-///   document key by definition. The id routes, exactly as the original write did.
-/// - **The routing field is some other field**, a tenant or a customer. The id says nothing about
-///   which shard holds the row, so the caller has to supply the same key the write used.
-///
-/// The refusal in that second case is deliberate and recorded as a non-goal: fanning a keyless
-/// delete out to every shard on every node is *correct*, since a shard without the id removes
-/// nothing, but it costs `shards × nodes` writer transactions to remove one row and the code
-/// already refuses to broadcast a write. The error names the field so the caller knows what to
-/// send, which it can read off the document with one search.
-pub(crate) fn effective_delete_routing_key(
-    schema: &IndexSchema,
-    id: &str,
-    routing_key: Option<String>,
-) -> Result<String, OrchestratorError> {
-    let routing_field = schema.get_routing_field();
-
-    // The routing field is the key — `id`, or a shadow field whose value *is* the key — so the
-    // id names the shard the write used, and a caller-supplied `routing_key` cannot retarget it.
-    // Accepting one here let a wrong key route a delete to a shard that holds no such row, where
-    // it removed nothing and still answered "deleted".
-    if routing_field == "id" || schema.is_shadow_field(routing_field) {
-        return Ok(id.to_string());
-    }
-
-    // The routing field is a real field, so the id says nothing about the shard. The caller
-    // must supply the same key the write used; an empty one is as useless as none.
-    match routing_key {
-        Some(key) if !key.is_empty() => Ok(key),
-        _ => Err(OrchestratorError::Validation(format!(
-            "index routes by '{routing_field}', which is not the document key, so a delete \
-                 must carry the same routing_key the write used — read it off the document with \
-                 a search for id:{id}"
-        ))),
-    }
-}
-
 /// Helper function to detect if an operation is a write operation
-/// Helper function to detect if an operation is a write operation
-pub(crate) fn is_write_operation(op: &ClientOp) -> bool {
+pub(super) fn is_write_operation(op: &ClientOp) -> bool {
     matches!(
         op,
         ClientOp::Write { .. }
@@ -1389,7 +1243,7 @@ pub(crate) fn is_write_operation(op: &ClientOp) -> bool {
 /// Usage:
 /// - Only used during initial schema creation (empty schema)
 /// - Existing schema evolution continues to use current logic
-pub(crate) fn enhanced_schema_sampling(docs: &[DocPayload], sample_limit: usize) -> IndexSchema {
+pub(super) fn enhanced_schema_sampling(docs: &[DocPayload], sample_limit: usize) -> IndexSchema {
     let mut schema = IndexSchema::default();
     let mut sampled = 0usize;
 
@@ -1434,7 +1288,7 @@ pub(crate) fn enhanced_schema_sampling(docs: &[DocPayload], sample_limit: usize)
 ///
 /// This is the same rule the bundled client applies before it PUTs a detected schema, which
 /// is why `cameodb data load` produces searchable indexes and a plain HTTP write did not.
-pub(crate) fn mark_initial_fields_indexed(schema: &mut IndexSchema) {
+pub(super) fn mark_initial_fields_indexed(schema: &mut IndexSchema) {
     for (name, field_def) in schema.fields.iter_mut() {
         // Shadow fields preserve an original field name for query mapping and are never
         // indexed or stored — leave them exactly as they are.
@@ -1447,13 +1301,13 @@ pub(crate) fn mark_initial_fields_indexed(schema: &mut IndexSchema) {
 }
 
 /// Type alias for shard hydration task results
-pub(crate) type ShardTaskResult = Result<(Uuid, Option<MicroshardActor>), OrchestratorError>;
+pub(super) type ShardTaskResult = Result<(Uuid, Option<MicroshardActor>), OrchestratorError>;
 
 /// Append names not already present, keeping the list sorted and free of duplicates.
 ///
 /// Shard verdicts on a schema update overlap almost entirely — they are reading copies of the
 /// same schema — so merging them is a union, not a concatenation.
-pub(crate) fn merge_names(into: &mut Vec<String>, from: Vec<String>) {
+pub(super) fn merge_names(into: &mut Vec<String>, from: Vec<String>) {
     for name in from {
         if !into.contains(&name) {
             into.push(name);
@@ -1466,7 +1320,7 @@ pub(crate) fn merge_names(into: &mut Vec<String>, from: Vec<String>) {
 ///
 /// Only an unknown field gets here. A field whose flag cannot take effect until the index is
 /// rebuilt is applied and reported through `pending_reindex`, not refused.
-pub(crate) fn describe_schema_refusal(outcome: &SchemaFieldUpdate) -> String {
+pub(super) fn describe_schema_refusal(outcome: &SchemaFieldUpdate) -> String {
     format!(
         "Schema update refused, nothing was changed: no such field in this schema: {}",
         outcome.unknown.join(", ")
@@ -1474,7 +1328,7 @@ pub(crate) fn describe_schema_refusal(outcome: &SchemaFieldUpdate) -> String {
 }
 
 /// What a caller has to do about a flag that cannot take effect yet.
-pub(crate) fn describe_pending_reindex(outcome: &SchemaFieldUpdate) -> String {
+pub(super) fn describe_pending_reindex(outcome: &SchemaFieldUpdate) -> String {
     format!(
         "Marked indexed and saved, but not searchable yet: {}. The index was built before these \
          fields were declared, so it has no column for them. Rebuilding the index data from the \
@@ -1493,14 +1347,14 @@ pub(crate) fn describe_pending_reindex(outcome: &SchemaFieldUpdate) -> String {
 /// there is a reason to tune it, which a metadata read of a few hundred bytes is unlikely to
 /// give. A peer that misses this window counts as unreachable, which refuses the write rather
 /// than letting it invent a schema.
-pub(crate) const PEER_SCHEMA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const PEER_SCHEMA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schema body to send after a receiver asked for it, or `None` if there is none to send.
 ///
 /// **An empty schema is never sent.** A receiver adopts what it is handed and then treats the
 /// index as one that already exists, so every field of the document arriving with it would
 /// become an *addition* to a known schema — recorded but not searchable, pending a rebuild.
-pub(crate) fn schema_to_carry(schema: &IndexSchema) -> Option<Box<IndexSchema>> {
+pub(super) fn schema_to_carry(schema: &IndexSchema) -> Option<Box<IndexSchema>> {
     (!schema.fields.is_empty()).then(|| Box::new(schema.clone()))
 }
 
@@ -1509,7 +1363,7 @@ pub(crate) fn schema_to_carry(schema: &IndexSchema) -> Option<Box<IndexSchema>> 
 /// The clone here is the one place a forward copies a schema, and it is on the cold path only:
 /// a peer asks once per index, the first time a document for it lands there. Every other forward
 /// carries **nothing** — see [`ClientOp::BulkWrite::forwarded`].
-pub(crate) fn with_schema_body(op: &ClientOp, schema: &IndexSchema) -> Option<ClientOp> {
+pub(super) fn with_schema_body(op: &ClientOp, schema: &IndexSchema) -> Option<ClientOp> {
     let body = schema_to_carry(schema)?;
     let mut resend = op.clone();
     match &mut resend {
@@ -1526,7 +1380,7 @@ pub(crate) fn with_schema_body(op: &ClientOp, schema: &IndexSchema) -> Option<Cl
 ///
 /// See [`OrchestratorEngine::peer_schema_for`]. `NoneHeld` and `Unreachable` are kept apart
 /// deliberately: only the first licenses this node to build a schema from the documents.
-pub(crate) enum PeerSchemaLookup {
+pub(super) enum PeerSchemaLookup {
     /// A peer holds a schema for this index, and this is the one to adopt.
     Found(Box<IndexSchema>),
     /// Every peer answered and none holds a schema, so this index is genuinely new.
@@ -1542,7 +1396,7 @@ pub(crate) enum PeerSchemaLookup {
 /// caller holding nothing to retry with, [`WorkerOutcome::UseActor`] sends the op itself
 /// home. The caller moved the op into the job, so this is the only way it can get it back
 /// without cloning every document on the way in.
-pub enum WorkerOutcome {
+pub(super) enum WorkerOutcome {
     /// The engine handled it. Success or failure, this is the client's answer.
     Done(Result<JsonValue, OrchestratorError>),
     /// The engine declined; retry this op on the actor mailbox.
@@ -1550,7 +1404,7 @@ pub enum WorkerOutcome {
 }
 
 /// The engine's verdict on a single write, before it becomes a [`WorkerOutcome`].
-pub(crate) enum WriteOutcome {
+pub(super) enum WriteOutcome {
     Done(JsonValue),
     /// The schema has to grow, or the shard the write routes to is on another node. Carries back
     /// the parts of `ClientOp::Write` that `engine_write` consumed, so `execute` can rebuild the
@@ -1563,7 +1417,7 @@ pub(crate) enum WriteOutcome {
 }
 
 /// The engine's verdict on a single delete, before it becomes a [`WorkerOutcome`].
-pub(crate) enum DeleteOutcome {
+pub(super) enum DeleteOutcome {
     Done(JsonValue),
     /// The shard the delete routes to is on another node. Carries back the parts of
     /// `ClientOp::Delete` that `engine_delete` consumed, so `execute` can rebuild the op.
@@ -1574,7 +1428,7 @@ pub(crate) enum DeleteOutcome {
 }
 
 /// The engine's verdict on a bulk write, before it becomes a [`WorkerOutcome`].
-pub(crate) enum BulkOutcome {
+pub(super) enum BulkOutcome {
     Done(JsonValue),
     /// The schema has to be written — the index is still unsettled, or a document carries a
     /// field it does not know. Writing a schema is the actor's, serially: two bulks evolving
@@ -1588,7 +1442,7 @@ pub(crate) enum BulkOutcome {
 /// A job dispatched to the orchestrator worker pool.
 /// Workers execute the operation on shared state and send the result
 /// back via the oneshot channel, bypassing the actor mailbox.
-pub enum OrchestratorJob {
+pub(super) enum OrchestratorJob {
     Execute {
         /// When the request that produced this job reached the node.
         ///
@@ -1618,17 +1472,17 @@ pub enum OrchestratorJob {
 /// indexed into the other, so the co-location the whole design exists for quietly stopped
 /// holding. Resolving both here once means every placement decision counts the same cores.
 #[derive(Clone, Debug)]
-pub struct CoreLayout {
+pub(super) struct CoreLayout {
     /// How many cores this process may use. Sizes the worker pool, and is meaningful even
     /// where pinning is unsupported.
-    pub(crate) budget: usize,
+    pub(super) budget: usize,
     /// Cores that can actually be pinned to, capped to `budget`. Empty when the platform
     /// cannot enumerate them, in which case every pinning path degrades to unpinned.
-    pub(crate) cores: Vec<core_affinity::CoreId>,
+    pub(super) cores: Vec<core_affinity::CoreId>,
 }
 
 impl CoreLayout {
-    pub(crate) fn detect() -> Self {
+    pub(super) fn detect() -> Self {
         let budget = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -1642,12 +1496,12 @@ impl CoreLayout {
     }
 
     /// Cores available for sizing decisions.
-    pub(crate) fn budget(&self) -> usize {
+    pub(super) fn budget(&self) -> usize {
         self.budget
     }
 
     /// The core an ordinal maps to, or `None` when pinning is unavailable here.
-    pub(crate) fn core_for(&self, ordinal: usize) -> Option<core_affinity::CoreId> {
+    pub(super) fn core_for(&self, ordinal: usize) -> Option<core_affinity::CoreId> {
         if self.cores.is_empty() {
             None
         } else {
@@ -1655,7 +1509,7 @@ impl CoreLayout {
         }
     }
 
-    pub(crate) fn pinning_available(&self) -> bool {
+    pub(super) fn pinning_available(&self) -> bool {
         !self.cores.is_empty()
     }
 }
@@ -1678,44 +1532,46 @@ impl CoreLayout {
 /// a writer thread pins itself when its shard starts. Re-sorting on every membership change
 /// would leave already-pinned writers on cores that no longer match their worker.
 #[derive(Clone, Debug, Default)]
-pub struct ShardPlacement {
-    pub(crate) slots: HashMap<Uuid, ShardSlot>,
+/// `pub(crate)` for the same reason as [`OrchestratorWorkerTx`]: it crosses the boundary as
+/// the return of [`NodeOrchestrator::shard_placement`], not as a name anyone writes.
+pub(crate) struct ShardPlacement {
+    pub(super) slots: HashMap<Uuid, ShardSlot>,
     /// Shards actually serving on this node. A superset relationship with `slots` is the
     /// point: an ordinal is handed out before a shard starts, because its writer thread pins
     /// itself as it spawns, but the shard only becomes routable once it is in the shard map.
     /// A shard that fails to hydrate, or that the `max_shards` cap turns away, keeps its
     /// ordinal and never becomes live — claiming it locally would route writes to a shard
     /// this node cannot serve.
-    pub(crate) live: HashSet<Uuid>,
-    pub(crate) next: usize,
+    pub(super) live: HashSet<Uuid>,
+    pub(super) next: usize,
 }
 
 /// A shard's place in the pool, and where its writer thread actually ended up.
 #[derive(Clone, Debug)]
-pub(crate) struct ShardSlot {
-    pub(crate) ordinal: usize,
+pub(super) struct ShardSlot {
+    pub(super) ordinal: usize,
     /// Core the writer thread was asked to take. `None` when pinning is off or the platform
     /// cannot enumerate cores.
-    pub(crate) target_core: Option<usize>,
+    pub(super) target_core: Option<usize>,
     /// Core the writer thread reports it is running on, or [`UNPINNED`] if the request was
     /// refused. Shared with the thread, which writes it once at startup — a request is not
     /// an outcome, and on macOS every request is refused.
-    pub(crate) pinned_core: Arc<AtomicI64>,
+    pub(super) pinned_core: Arc<AtomicI64>,
 }
 
 /// `pinned_core` sentinel: this thread is not pinned to anything.
-pub(crate) const UNPINNED: i64 = -1;
+pub(super) const UNPINNED: i64 = -1;
 
 /// What a shard's writer thread should pin to, and where it reports what happened.
 #[derive(Clone, Debug)]
-pub struct WriterPin {
-    pub(crate) target: Option<core_affinity::CoreId>,
-    pub(crate) outcome: Arc<AtomicI64>,
+pub(super) struct WriterPin {
+    pub(super) target: Option<core_affinity::CoreId>,
+    pub(super) outcome: Arc<AtomicI64>,
 }
 
 impl WriterPin {
     /// Pin the calling thread, and record where it actually landed.
-    pub(crate) fn apply(&self, shard_id: Uuid) {
+    pub(super) fn apply(&self, shard_id: Uuid) {
         let Some(target) = self.target else {
             return;
         };
@@ -1749,7 +1605,7 @@ impl ShardPlacement {
     ///
     /// Idempotent on purpose: a shard that starts twice keeps the core its writer already
     /// pinned to, and keeps reporting through the same cell.
-    pub(crate) fn assign(
+    pub(super) fn assign(
         &mut self,
         shard: Uuid,
         layout: &CoreLayout,
@@ -1771,24 +1627,24 @@ impl ShardPlacement {
     }
 
     /// Mark a shard as serving. Called once it is in the shard map and can take work.
-    pub(crate) fn activate(&mut self, shard: Uuid) {
+    pub(super) fn activate(&mut self, shard: Uuid) {
         self.live.insert(shard);
     }
 
-    pub(crate) fn ordinal(&self, shard: &Uuid) -> Option<usize> {
+    pub(super) fn ordinal(&self, shard: &Uuid) -> Option<usize> {
         self.slots.get(shard).map(|slot| slot.ordinal)
     }
 
     /// Whether this node serves the shard. The routing ring names a shard for a key; this
     /// answers whether that shard lives here, which is the whole of a local routing
     /// decision.
-    pub(crate) fn is_local(&self, shard: &Uuid) -> bool {
+    pub(super) fn is_local(&self, shard: &Uuid) -> bool {
         self.live.contains(shard)
     }
 
     /// Per-shard placement for `/_admin/workers`, ordered by ordinal so the report reads as
     /// the pool is laid out.
-    pub(crate) fn report(&self) -> Vec<ShardPlacementStats> {
+    pub(super) fn report(&self) -> Vec<ShardPlacementStats> {
         let mut shards: Vec<ShardPlacementStats> = self
             .slots
             .iter()
@@ -1836,7 +1692,7 @@ impl ShardPlacement {
 /// [`OrchestratorEngine::execute`]. It is a parameter rather than the engine itself so the
 /// properties above can be tested against an operation whose timing the test controls;
 /// nothing here depends on what the operation does, only on how many may run at once.
-pub(crate) async fn orchestrator_worker_loop<F, Fut>(
+pub(super) async fn orchestrator_worker_loop<F, Fut>(
     mut rx: mpsc::Receiver<OrchestratorJob>,
     run_op: F,
     worker_id: usize,
@@ -1972,739 +1828,35 @@ pub(crate) async fn orchestrator_worker_loop<F, Fut>(
     );
 }
 
-/// Per-worker atomic counters — updated on the send and receive hot paths.
-#[derive(Debug)]
-pub(crate) struct WorkerCounters {
-    /// Jobs sitting in this worker's mpsc channel, not yet started. Incremented on send,
-    /// decremented when the worker picks the job up — so it is queueing against
-    /// `queue_capacity`, and `in_flight` is the work actually running.
-    pub(crate) queue_depth: AtomicUsize,
-    /// Operations this worker has started and not yet answered, bounded by the worker's
-    /// in-flight limit. The pair (`queue_depth`, `in_flight`) separates "waiting for a
-    /// worker" from "waiting on a shard" — a deep queue beside a low `in_flight` means the
-    /// limit is too tight, the reverse means the shards are the constraint.
-    pub(crate) in_flight: AtomicUsize,
-    /// Total jobs completed by this worker since startup.
-    pub(crate) jobs_completed: AtomicU64,
-    /// Core this worker is actually pinned to, or [`UNPINNED`]. Written once by the worker
-    /// thread itself, because only it can find out whether the pin was accepted.
-    pub(crate) pinned_core: AtomicI64,
-}
-
-impl Default for WorkerCounters {
-    fn default() -> Self {
-        Self {
-            queue_depth: AtomicUsize::new(0),
-            in_flight: AtomicUsize::new(0),
-            jobs_completed: AtomicU64::new(0),
-            pinned_core: AtomicI64::new(UNPINNED),
-        }
-    }
-}
-
-/// Number of buckets: 16 linear (0..15µs) then four per octave up to 2^63µs.
-pub(crate) const SERVICE_BUCKETS: usize = 256;
-
-/// How long one generation of the histogram collects before it is rotated out.
-///
-/// The EWMA this sits beside decays continuously; a histogram does not, so without rotation it
-/// would answer for every sample the node ever took and could not track load that changed. Two
-/// generations: one collecting, one complete and readable.
-pub(crate) const SERVICE_WINDOW: Duration = Duration::from_secs(2);
-
-/// Quantile reported for monitoring. Not what admission predicts against — see
-/// [`SERVICE_ADMISSION_SIGMAS`].
-pub(crate) const SERVICE_REPORTED_QUANTILE: f64 = 0.90;
-
-/// How many standard deviations of the *queue's* service sum the wait prediction allows for.
-///
-/// A queue of `d` jobs has a wait whose mean is `d × µ` and whose standard deviation is `σ√d`,
-/// because variances add and deviations do not. So the honest bound on what a job joining at
-/// depth `d` will wait is `d·µ + k·σ√d`, and `k` is a confidence level rather than a fudge: at
-/// 2 it covers about 98% of arrivals on a normal sum, which is the right shape for a deadline.
-///
-/// The first cut multiplied a per-request p90 by the depth instead. That is the same mistake in
-/// reverse — it grows the spread as `d` rather than `√d`, so it over-predicts deep queues and
-/// admits a shallower one than the budget can actually carry. It worked (goodput went flat), and
-/// it left throughput on the table and a tail of timeouts at the far end; this is the form that
-/// has both.
-pub(crate) const SERVICE_ADMISSION_SIGMAS: f64 = 3.0;
-
-/// A decaying log-bucketed histogram of service times.
-///
-/// Recording is one `fetch_add` on an atomic counter — cheaper than the `fetch_update` CAS loop
-/// the EWMA beside it uses, and it never retries under contention. Reading a quantile means
-/// walking the buckets, which is far too much for an admission check that runs on every request,
-/// so the quantile is computed once per rotation and cached in a single atomic. The admission
-/// path therefore stays one load, which is what F7's door was built to cost.
-pub(crate) struct ServiceHistogram {
-    /// Two generations. `active` selects the one being recorded into; the other is complete and
-    /// is what a quantile is computed from.
-    pub(crate) generations: [Box<[AtomicU64]>; 2],
-    pub(crate) active: AtomicUsize,
-    /// Microseconds since `base`, when the active generation started.
-    pub(crate) rotated_at_us: AtomicU64,
-    pub(crate) base: Instant,
-    /// Last computed quantile, in microseconds. Zero until a full generation has been seen.
-    /// Reported rather than predicted against.
-    pub(crate) cached_us: AtomicU64,
-    /// Mean and standard deviation of the closed generation, in microseconds. The pair the wait
-    /// prediction is built from; zero until a full generation has been seen.
-    pub(crate) cached_mean_us: AtomicU64,
-    pub(crate) cached_sigma_us: AtomicU64,
-}
-
-impl ServiceHistogram {
-    pub(crate) fn new() -> Self {
-        let generation = || {
-            (0..SERVICE_BUCKETS)
-                .map(|_| AtomicU64::new(0))
-                .collect::<Box<[_]>>()
-        };
-        Self {
-            generations: [generation(), generation()],
-            active: AtomicUsize::new(0),
-            rotated_at_us: AtomicU64::new(0),
-            base: Instant::now(),
-            cached_us: AtomicU64::new(0),
-            cached_mean_us: AtomicU64::new(0),
-            cached_sigma_us: AtomicU64::new(0),
-        }
-    }
-
-    /// Bucket a sample falls in: linear below 16µs, then four buckets per octave, so the
-    /// quantile is never more than ~25% above the value it stands for.
-    pub(crate) fn bucket_of(sample_us: u64) -> usize {
-        if sample_us < 16 {
-            return sample_us as usize;
-        }
-        let exponent = 63 - sample_us.leading_zeros() as usize;
-        let sub = ((sample_us >> (exponent - 2)) & 0b11) as usize;
-        (16 + (exponent - 4) * 4 + sub).min(SERVICE_BUCKETS - 1)
-    }
-
-    /// The upper edge of a bucket — what a quantile landing in it reports, so the answer errs
-    /// high rather than low. Under-reporting a service time admits work that cannot finish.
-    pub(crate) fn bucket_upper_us(bucket: usize) -> u64 {
-        if bucket < 16 {
-            return bucket as u64;
-        }
-        let exponent = 4 + (bucket - 16) / 4;
-        let sub = ((bucket - 16) % 4) as u64;
-        (5 + sub) << (exponent - 2)
-    }
-
-    pub(crate) fn record(&self, sample: Duration) {
-        let index = self.active.load(AtomicOrdering::Relaxed) & 1;
-        self.generations[index][Self::bucket_of(sample.as_micros() as u64)]
-            .fetch_add(1, AtomicOrdering::Relaxed);
-        self.maybe_rotate();
-    }
-
-    /// Rotate if the window has elapsed, and fold the generation that just closed into the
-    /// cached quantile. Exactly one caller wins the swap; the rest return immediately.
-    pub(crate) fn maybe_rotate(&self) {
-        let now_us = self.base.elapsed().as_micros() as u64;
-        let started = self.rotated_at_us.load(AtomicOrdering::Relaxed);
-        if now_us.saturating_sub(started) < SERVICE_WINDOW.as_micros() as u64 {
-            return;
-        }
-        if self
-            .rotated_at_us
-            .compare_exchange(
-                started,
-                now_us,
-                AtomicOrdering::Relaxed,
-                AtomicOrdering::Relaxed,
-            )
-            .is_err()
-        {
-            return;
-        }
-        let closing = self.active.fetch_xor(1, AtomicOrdering::Relaxed) & 1;
-        if let Some(value) = self.quantile_of(closing, SERVICE_REPORTED_QUANTILE) {
-            self.cached_us.store(value, AtomicOrdering::Relaxed);
-        }
-        if let Some((mean_us, sigma_us)) = self.moments_of(closing) {
-            self.cached_mean_us.store(mean_us, AtomicOrdering::Relaxed);
-            self.cached_sigma_us
-                .store(sigma_us, AtomicOrdering::Relaxed);
-        }
-        // Zero it so it is clean when it becomes active again one window from now.
-        for slot in self.generations[closing].iter() {
-            slot.store(0, AtomicOrdering::Relaxed);
-        }
-    }
-
-    /// `None` when the generation holds no samples, which is what keeps a quiet window from
-    /// resetting the estimate to zero and admitting everything.
-    pub(crate) fn quantile_of(&self, generation: usize, quantile: f64) -> Option<u64> {
-        let counts = &self.generations[generation];
-        let total: u64 = counts.iter().map(|c| c.load(AtomicOrdering::Relaxed)).sum();
-        if total == 0 {
-            return None;
-        }
-        let target = ((total as f64) * quantile).ceil() as u64;
-        let mut seen = 0u64;
-        for (bucket, count) in counts.iter().enumerate() {
-            seen += count.load(AtomicOrdering::Relaxed);
-            if seen >= target {
-                return Some(Self::bucket_upper_us(bucket));
-            }
-        }
-        None
-    }
-
-    /// Mean and standard deviation of one generation, in microseconds.
-    ///
-    /// Accumulated in `f64`: a bucket's upper edge squared overflows `u64` at the top of the
-    /// range, and this runs once per rotation rather than per request, so the cost is irrelevant.
-    pub(crate) fn moments_of(&self, generation: usize) -> Option<(u64, u64)> {
-        let counts = &self.generations[generation];
-        let (mut n, mut sum, mut sum_sq) = (0f64, 0f64, 0f64);
-        for (bucket, count) in counts.iter().enumerate() {
-            let c = count.load(AtomicOrdering::Relaxed) as f64;
-            if c == 0.0 {
-                continue;
-            }
-            let value = Self::bucket_upper_us(bucket) as f64;
-            n += c;
-            sum += c * value;
-            sum_sq += c * value * value;
-        }
-        if n == 0.0 {
-            return None;
-        }
-        let mean = sum / n;
-        // Clamped at zero: floating-point cancellation can make this very slightly negative
-        // when every sample landed in one bucket, and a NaN here would disable the gate.
-        let variance = (sum_sq / n - mean * mean).max(0.0);
-        Some((mean as u64, variance.sqrt() as u64))
-    }
-
-    /// The cached mean and standard deviation, or `None` before a full window has closed.
-    pub(crate) fn moments(&self) -> Option<(u64, u64)> {
-        let mean = self.cached_mean_us.load(AtomicOrdering::Relaxed);
-        (mean != 0).then(|| (mean, self.cached_sigma_us.load(AtomicOrdering::Relaxed)))
-    }
-
-    /// The cached reported quantile in microseconds, or zero before a full window has closed.
-    pub(crate) fn estimate_us(&self) -> u64 {
-        self.cached_us.load(AtomicOrdering::Relaxed)
-    }
-}
-
-impl std::fmt::Debug for ServiceHistogram {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServiceHistogram")
-            .field("estimate_us", &self.estimate_us())
-            .finish()
-    }
-}
-
-/// Dispatch-level counters across the entire worker pool.
-#[derive(Debug)]
-pub(crate) struct DispatchCounters {
-    /// Jobs sent directly to the affinity-assigned worker.
-    pub(crate) affine_sends: AtomicU64,
-    /// Jobs where the affinity-assigned worker was full and fell through to a neighbor.
-    pub(crate) affine_full_fallbacks: AtomicU64,
-    /// Jobs sent via round-robin (no affinity hint or affine dispatch disabled).
-    pub(crate) round_robin_sends: AtomicU64,
-    /// Jobs that fell all the way back to the actor mailbox (all workers full/closed).
-    pub(crate) actor_mailbox_fallbacks: AtomicU64,
-    /// Jobs refused at dequeue because the budget left could not cover the work.
-    ///
-    /// The shed is otherwise invisible — the work never runs, so it lands in no latency sample
-    /// and no `jobs_completed` tally, and a node shedding hard reads as one that is idle.
-    pub(crate) abandoned: AtomicU64,
-    /// Requests refused before they were queued, because the backlog already in front of them
-    /// could not clear inside their budget.
-    ///
-    /// Read beside `abandoned`, which is the same decision taken too late. Once the gate is
-    /// working this one carries the refusals and `abandoned` becomes the measure of how often
-    /// the prediction was wrong — so the split between them, not either count alone, is what
-    /// says whether admission control is doing its job.
-    pub(crate) refused_at_admission: AtomicU64,
-    /// Jobs anywhere in the pool — queued or running — across all workers.
-    ///
-    /// This is the depth [`QueueLoad`] predicts wait from. It is one atomic rather than a sum
-    /// over the per-worker `queue_depth` + `in_flight` pairs because the admission guard reads
-    /// it on every request and the sum is information this counter already carries — the
-    /// per-worker gauges stay, but their job is the `/_admin/workers` report, not the gate.
-    pub(crate) outstanding: AtomicUsize,
-    /// Exponentially-weighted mean of how long a job takes once admitted, in microseconds —
-    /// every op class folded together.
-    ///
-    /// Dequeue-to-answer, so it covers everything downstream — the shard hop, the read-pool
-    /// queue and the search itself — which is exactly what a job needs to have left when it is
-    /// admitted. Measured rather than configured because it moves with index size, shard count
-    /// and load, and a number an operator has to keep in step with those is one that will be
-    /// wrong.
-    ///
-    /// This is the blend the admission door refuses against: the guard runs before the body
-    /// is read, so the op's class is not yet knowable there. The two per-class estimates
-    /// beside it are what a dequeue or dispatch check reserves against, since there the op
-    /// is in hand — see [`OpClass`].
-    ///
-    /// Starts at zero, so a node under no load admits everything and the estimate only becomes
-    /// restrictive once there is evidence to be restrictive about. It cannot go stale while
-    /// shedding: a queue that drains admits jobs, and those jobs update it.
-    pub(crate) service_ewma_us: AtomicU64,
-    /// Dequeue-to-answer EWMA for reads (`Search`, `Stream`). See `service_ewma_us`.
-    pub(crate) service_ewma_read_us: AtomicU64,
-    /// Dequeue-to-answer EWMA for writes (`Write`, `Delete`). See `service_ewma_us`.
-    pub(crate) service_ewma_write_us: AtomicU64,
-    /// Dequeue-to-answer EWMA for bulk ops (`BulkWrite`, `BulkDelete`). See `OpClass::Bulk`.
-    pub(crate) service_ewma_bulk_us: AtomicU64,
-    /// Dequeue-to-answer distribution, for lanes that admit against a tail rather than a mean.
-    /// Fed by the same samples as the EWMAs above; read only where `tail_aware` is set.
-    pub(crate) service_hist: ServiceHistogram,
-}
-
-impl Default for DispatchCounters {
-    fn default() -> Self {
-        Self {
-            affine_sends: AtomicU64::new(0),
-            affine_full_fallbacks: AtomicU64::new(0),
-            round_robin_sends: AtomicU64::new(0),
-            actor_mailbox_fallbacks: AtomicU64::new(0),
-            abandoned: AtomicU64::new(0),
-            refused_at_admission: AtomicU64::new(0),
-            outstanding: AtomicUsize::new(0),
-            service_ewma_us: AtomicU64::new(0),
-            service_ewma_read_us: AtomicU64::new(0),
-            service_ewma_write_us: AtomicU64::new(0),
-            service_ewma_bulk_us: AtomicU64::new(0),
-            service_hist: ServiceHistogram::new(),
-        }
-    }
-}
-
-impl DispatchCounters {
-    /// Fold one dequeue-to-answer sample into the estimates: the blend, and the class the job
-    /// belonged to when it has one.
-    pub(crate) fn record_service(&self, class: OpClass, sample: Duration) {
-        let sample_us = sample.as_micros() as u64;
-        self.service_hist.record(sample);
-        Self::fold_ewma(&self.service_ewma_us, sample_us);
-        match class {
-            OpClass::Read => Self::fold_ewma(&self.service_ewma_read_us, sample_us),
-            OpClass::Write => Self::fold_ewma(&self.service_ewma_write_us, sample_us),
-            OpClass::Bulk => Self::fold_ewma(&self.service_ewma_bulk_us, sample_us),
-            OpClass::Any => {}
-        }
-    }
-
-    /// 1/8 weight — slow enough not to chase a single slow query, fast enough to track a node
-    /// whose load has changed.
-    ///
-    /// Read-modify-write under `fetch_update` rather than load-then-store: every worker folds
-    /// into these values, and a lost update is a sample the estimate never saw.
-    pub(crate) fn fold_ewma(slot: &AtomicU64, sample_us: u64) {
-        let _ = slot.fetch_update(
-            AtomicOrdering::Relaxed,
-            AtomicOrdering::Relaxed,
-            |previous| {
-                Some(if previous == 0 {
-                    sample_us
-                } else {
-                    (previous.saturating_mul(7).saturating_add(sample_us)) / 8
-                })
-            },
-        );
-    }
-
-    /// A job left the pool — refused at dequeue, or answered. Saturating rather than
-    /// `fetch_sub`: an increment that was somehow missed (a sender that is not `try_send`,
-    /// which is what the tests use) must underflow to zero rather than wrap to `usize::MAX`
-    /// and wedge the gate into refusing everything.
-    pub(crate) fn job_left_pool(&self) {
-        let _ =
-            self.outstanding
-                .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                });
-    }
-
-    /// The estimate a reserve should be computed from for `class`: the class's own EWMA, or
-    /// the blend when the class has no samples yet — a node that has only ever served searches
-    /// still knows what *a* job costs, and zero would reserve nothing at all.
-    pub(crate) fn service_estimate_for(&self, class: OpClass) -> u64 {
-        let class_estimate = match class {
-            OpClass::Read => self.service_ewma_read_us.load(AtomicOrdering::Relaxed),
-            OpClass::Write => self.service_ewma_write_us.load(AtomicOrdering::Relaxed),
-            OpClass::Bulk => self.service_ewma_bulk_us.load(AtomicOrdering::Relaxed),
-            OpClass::Any => 0,
-        };
-        if class_estimate != 0 {
-            class_estimate
-        } else {
-            self.service_ewma_us.load(AtomicOrdering::Relaxed)
-        }
-    }
-
-    /// What a job should still have left to be worth admitting, given the budget it is measured
-    /// against.
-    ///
-    /// Twice the estimate, so the margin survives the spread rather than only the mean. At one
-    /// times the estimate the queue settles exactly on the deadline and about half of what is
-    /// admitted still misses it — which is the state this whole check exists to leave.
-    ///
-    /// **Capped at half the budget, and that cap is load-bearing rather than tidy.** Uncapped,
-    /// an estimate above half the budget makes the reserve exceed the budget outright, so every
-    /// job is refused — including one that has waited no time at all. Nothing then completes,
-    /// no sample ever updates the estimate, and the node refuses everything forever: the same
-    /// metastable shape F7 is about, reintroduced by its own fix. The cap guarantees a freshly
-    /// arrived job is always admitted, which guarantees the estimate keeps being measured.
-    pub(crate) fn service_reserve_for(&self, class: OpClass, budget: Duration) -> Duration {
-        let reserve = Duration::from_micros(self.service_estimate_for(class).saturating_mul(2));
-        reserve.min(budget / 2)
-    }
-}
-
-/// The node's own estimate of how long a request arriving right now would wait before it starts.
-///
-/// [`OrchestratorError::ReadDeadlineExpired`] refuses work that cannot meet its deadline, but
-/// only once a worker has reached it — after the request has already paid for decompression,
-/// the body limit, a concurrency permit, JSON parsing, a job allocation and a channel round
-/// trip. Under overload nearly every request pays that and is then refused, and it is where
-/// most of the gap between the ~555/s the node serves and the ~730/s it is capable of goes
-/// (ROADMAP F7).
-///
-/// Admission counts requests, not the work they imply: `max_concurrent_requests` permits at
-/// 3,000 against ~730 searches/s is about four seconds of backlog against a one-second budget.
-/// This turns the gauges the pool already keeps into the number the semaphore is missing, so
-/// the same refusal can be made at the door for the price of a few atomic loads.
-///
-/// Nothing new is measured. `outstanding` is maintained on the dispatch path already — one
-/// increment where a send lands and one decrement where a job leaves the pool — and the
-/// service estimate is [`DispatchCounters::service_ewma_us`].
-pub struct QueueLoad {
-    pub(crate) dispatch_stats: Arc<DispatchCounters>,
-    /// Jobs the whole pool can have running at once — `worker_count × in-flight limit`. The
-    /// divisor in Little's law, and the depth below which the gate never refuses.
-    pub(crate) width: usize,
-    /// Whether the wait prediction uses a measured tail rather than the mean. See
-    /// [`QueueLoad::tail_aware`].
-    pub(crate) tail_aware: bool,
-    /// The node's request timeout. `None` disables the gate, matching a node whose timeout is
-    /// disabled: there is no deadline to predict against.
-    pub(crate) budget: Option<Duration>,
-}
-
-impl QueueLoad {
-    pub(crate) fn new(
-        dispatch_stats: Arc<DispatchCounters>,
-        width: usize,
-        budget: Option<Duration>,
-    ) -> Self {
-        Self {
-            dispatch_stats,
-            width: width.max(1),
-            budget,
-            tail_aware: false,
-        }
-    }
-
-    /// Predict against a measured tail of the service distribution rather than its mean.
-    ///
-    /// Set for the mailbox lane and deliberately **not** for the worker pool. The pool's
-    /// behaviour under overload is the measured result F7 recorded, and changing what it admits
-    /// on would invalidate those arms without a run of its own — worth doing, separately, with
-    /// its own before and after.
-    pub(crate) fn tail_aware(mut self) -> Self {
-        self.tail_aware = true;
-        self
-    }
-
-    /// The service figure the wait prediction multiplies out.
-    ///
-    /// A mean says what a typical request costs; admission needs to know whether the *last*
-    /// request in the queue it is about to join will still make its deadline, and that is a
-    /// question about the slow ones. Falls back to the mean until a full window has closed, so
-    /// a node that has just started admits on the same basis it always did.
-    pub(crate) fn admission_service_us(&self) -> u64 {
-        if self.tail_aware {
-            let tail = self.dispatch_stats.service_hist.estimate_us();
-            if tail != 0 {
-                return tail;
-            }
-        }
-        self.dispatch_stats
-            .service_ewma_us
-            .load(AtomicOrdering::Relaxed)
-    }
-
-    /// Jobs queued or running across the pool — everything a new arrival waits behind.
-    pub fn depth(&self) -> usize {
-        self.dispatch_stats
-            .outstanding
-            .load(AtomicOrdering::Relaxed)
-    }
-
-    /// Little's law over the gauges above: work ahead, divided by how much of it runs at once,
-    /// times what one job costs.
-    ///
-    /// `div_ceil` because a partly-filled round still has to finish before the next one starts,
-    /// and `saturating_sub` because a pool with a free slot imposes no wait at all.
-    pub(crate) fn predicted_wait_at(&self, depth: usize) -> Duration {
-        let rounds = depth.saturating_sub(self.width).div_ceil(self.width) as u64;
-        if self.tail_aware
-            && let Some((mean_us, sigma_us)) = self.dispatch_stats.service_hist.moments()
-        {
-            // d·µ + k·σ√d — the wait ahead is a *sum* of service times, so its mean scales
-            // with the depth and its spread only with the root of it.
-            let rounds_f = rounds as f64;
-            let predicted = mean_us as f64 * rounds_f
-                + SERVICE_ADMISSION_SIGMAS * sigma_us as f64 * rounds_f.sqrt();
-            return Duration::from_micros(predicted as u64);
-        }
-        Duration::from_micros(self.admission_service_us().saturating_mul(rounds))
-    }
-
-    /// What a request arriving now would wait before a worker starts it.
-    pub fn predicted_wait(&self) -> Duration {
-        self.predicted_wait_at(self.depth())
-    }
-
-    /// The part of the request budget not yet spent — the full timeout minus whatever the
-    /// request already cost being received, parsed and routed. `None` when the gate is off
-    /// (no configured deadline to measure against).
-    ///
-    /// The same quantity the dequeue check computes as `budget − waited`: a request admitted
-    /// here and judged again at a worker is judged against one deadline either way.
-    pub(crate) fn remaining_budget(&self) -> Option<Duration> {
-        self.budget
-            .map(|b| b.saturating_sub(request_started_at().elapsed()))
-    }
-
-    /// Whether a request of `class` arriving now should be refused rather than queued, and
-    /// the wait that decided it.
-    ///
-    /// **A pool with a free slot always admits, whatever the estimate says.** That is not an
-    /// optimisation, it is the invariant that keeps this from becoming the failure it prevents:
-    /// the estimate is only updated by jobs that complete, so a gate that can refuse an arrival
-    /// into an empty pool can stop every job, stop every sample, and refuse forever on a number
-    /// nothing will ever correct. F7's reserve had exactly this shape before it was capped —
-    /// see [`DispatchCounters::service_reserve_for`] — and it is the same mistake one layer out.
-    pub fn would_refuse(&self, class: OpClass) -> Option<Duration> {
-        let remaining = self.remaining_budget()?;
-        let depth = self.depth();
-        if depth < self.width {
-            return None;
-        }
-        let predicted = self.predicted_wait_at(depth);
-        // The same margin the dequeue check reserves, and the door has to apply it too. A
-        // weaker door was measured — refusing only at `predicted > budget`, on the theory that
-        // the door should catch the certainly-doomed and leave anything marginal to the worker
-        // — and it was 20% slower (424/s against 521/s at 1,000/s offered), because letting
-        // the queue grow past the point the worker will accept just means refusing the same
-        // requests later, after they have been queued rather than before.
-        let reserve = self.dispatch_stats.service_reserve_for(class, remaining);
-        (predicted + reserve > remaining).then_some(predicted)
-    }
-
-    /// The budget refusals are measured against, for the error a refusal answers with.
-    pub fn budget(&self) -> Option<Duration> {
-        self.budget
-    }
-
-    /// Seconds until the refused backlog is predicted to clear — the `Retry-After` a refusal
-    /// should carry. The number the refusal was made on, so the answer is the advice rather
-    /// than a fixed delay that could send a client back into the same backlog.
-    pub fn retry_after_secs(&self, predicted: Duration) -> u64 {
-        (predicted.as_millis() as u64).div_ceil(1000).max(1)
-    }
-
-    /// Count a request refused at the door. See [`DispatchCounters::refused_at_admission`].
-    pub fn record_refused(&self) {
-        self.dispatch_stats
-            .refused_at_admission
-            .fetch_add(1, AtomicOrdering::Relaxed);
-    }
-
-    /// Build the error a refused request answers with, and count it.
-    pub(crate) fn refuse(&self, predicted: Duration) -> OrchestratorError {
-        self.record_refused();
-        OrchestratorError::Overloaded {
-            predicted_wait_ms: predicted.as_millis() as u64,
-            budget_ms: self.budget.unwrap_or_default().as_millis() as u64,
-        }
-    }
-}
-
-/// A shared handle to the actor-mailbox lane's counters.
-///
-/// Both ends need the same instance: [`RouterActor`] predicts and refuses against it, and
-/// [`NodeOrchestrator`] folds each op's *true* dequeue-to-answer into it. Measuring at the
-/// caller instead was tried and is wrong in a way that only shows up under load — the caller's
-/// clock spans queue *and* service, so the only samples that are pure service are the
-/// uncontended ones, which are also the fastest. The estimate then sits near the idle p50 (32ms
-/// measured, against a p90 of 152ms), the gate admits a queue far deeper than the budget can
-/// drain, and the back of it times out. The actor handles one op at a time, so start-to-finish
-/// there *is* the service time.
 #[derive(Clone, Debug)]
-pub struct MailboxLane(pub(crate) Arc<DispatchCounters>);
-
-impl MailboxLane {
-    pub fn new() -> Self {
-        Self(Arc::new(DispatchCounters::default()))
-    }
-
-    /// Fold one op's dequeue-to-answer into the lane's estimate.
-    pub(crate) fn record_service(&self, class: OpClass, sample: Duration) {
-        self.0.record_service(class, sample);
-    }
-}
-
-impl Default for MailboxLane {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// One in-flight ask on the actor-mailbox lane, counted for as long as this value lives.
-///
-/// The decrement is in `Drop` rather than after the `await`, and that is load-bearing. A request
-/// whose budget expires has its future dropped by `TimeoutLayer` mid-await, which under overload
-/// is most of them; a decrement written after the await never runs for any of those, so every
-/// abandoned request leaves its increment behind. The depth then only climbs, the gate refuses
-/// everything, nothing completes, and no sample ever corrects the estimate — F7's metastable
-/// shape rebuilt inside the fix meant to prevent it.
-///
-/// Measured with the plain decrement, on an **idle** node after one 120/s bulk arm:
-/// `mailbox_depth` 63, every subsequent request refused. With the guard: back to 0.
-pub(crate) struct MailboxSlot {
-    pub(crate) stats: Arc<DispatchCounters>,
-}
-
-impl MailboxSlot {
-    pub(crate) fn enter(stats: Arc<DispatchCounters>) -> Self {
-        stats.outstanding.fetch_add(1, AtomicOrdering::Relaxed);
-        Self { stats }
-    }
-}
-
-impl Drop for MailboxSlot {
-    fn drop(&mut self) {
-        self.stats.job_left_pool();
-    }
-}
-
-impl std::fmt::Debug for QueueLoad {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QueueLoad")
-            .field("depth", &self.depth())
-            .field("width", &self.width)
-            .field("predicted_wait", &self.predicted_wait())
-            .field("budget", &self.budget)
-            .finish()
-    }
-}
-
-/// Snapshot of a single worker's stats for the `/_admin/workers` endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerStats {
-    pub id: usize,
-    /// Core this worker was asked to pin to.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_core_id: Option<usize>,
-    /// Core it is actually pinned to. Absent when the pin was refused or never requested —
-    /// the two are not the same thing, and only this one is evidence.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub core_id: Option<usize>,
-    pub queue_depth: usize,
-    pub queue_capacity: usize,
-    /// Operations started and not yet answered. Sits against `in_flight_capacity`.
-    #[serde(default)]
-    pub in_flight: usize,
-    #[serde(default)]
-    pub in_flight_capacity: usize,
-    pub jobs_completed: u64,
-}
-
-/// Where one shard sits in the pool, for the `/_admin/workers` endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShardPlacementStats {
-    pub shard_id: String,
-    /// Dense ordinal. `ordinal % worker_count` is the worker that handles this shard's
-    /// writes, which is what makes worker and writer land together.
-    pub ordinal: usize,
-    /// Whether the shard started and is taking work. False means it holds an ordinal but
-    /// failed to hydrate.
-    pub serving: bool,
-    /// Core this shard's writer thread was asked to pin to.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_core_id: Option<usize>,
-    /// Core the writer thread is actually pinned to.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub core_id: Option<usize>,
-}
-
-/// Snapshot of the dispatch counters for the `/_admin/workers` endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DispatchStats {
-    pub affine_sends: u64,
-    pub affine_full_fallbacks: u64,
-    pub round_robin_sends: u64,
-    pub actor_mailbox_fallbacks: u64,
-    /// Jobs refused at dequeue for having outlived their request. Defaulted so an older peer's
-    /// report still deserializes.
-    #[serde(default)]
-    pub abandoned: u64,
-    /// Requests refused before being queued, because the backlog could not clear in time.
-    /// Defaulted for the same reason `abandoned` is.
-    #[serde(default)]
-    pub refused_at_admission: u64,
-}
-
-/// Full worker pool report returned by `GET /_admin/workers`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerPoolReport {
-    /// Config asked for pinned worker threads and the platform could enumerate cores.
-    pub pinning_requested: bool,
-    /// Workers whose pin actually took. Zero alongside `pinning_requested` means the
-    /// platform refused every one — macOS, or a cpuset that excludes the target cores.
-    /// This field, not `pinning_requested`, is the evidence that pinning is in effect.
-    pub pinned_workers: usize,
-    /// `worker_count` was aligned to the core budget so worker `i` and the writer for the
-    /// shard with ordinal `i` share a core.
-    pub core_aligned: bool,
-    pub worker_count: usize,
-    pub workers: Vec<WorkerStats>,
-    /// Per-shard placement: ordinal, requested core, and the core actually taken.
-    pub shards: Vec<ShardPlacementStats>,
-    pub dispatch: DispatchStats,
-}
-
-#[derive(Clone, Debug)]
-pub struct OrchestratorWorkerTx {
-    pub(crate) workers: Arc<Vec<mpsc::Sender<OrchestratorJob>>>,
-    pub(crate) next_worker: Arc<AtomicUsize>,
+/// `pub(crate)`: returned by [`NodeOrchestrator::worker_tx`], which `main.rs` calls when it
+/// wires the router. Named nowhere outside `node/` — the callers bind it by inference.
+pub(crate) struct OrchestratorWorkerTx {
+    pub(super) workers: Arc<Vec<mpsc::Sender<OrchestratorJob>>>,
+    pub(super) next_worker: Arc<AtomicUsize>,
     /// Per-worker atomic counters for observability.
-    pub(crate) worker_stats: Arc<Vec<Arc<WorkerCounters>>>,
+    pub(super) worker_stats: Arc<Vec<Arc<WorkerCounters>>>,
     /// Dispatch-level counters across all workers.
-    pub(crate) dispatch_stats: Arc<DispatchCounters>,
+    pub(super) dispatch_stats: Arc<DispatchCounters>,
     /// The backlog estimate the send path refuses against, shared with the HTTP front door so
     /// both refuse on one number.
-    pub(crate) queue_load: Arc<QueueLoad>,
+    pub(super) queue_load: Arc<QueueLoad>,
     /// Per-worker channel capacity (same for all workers).
-    pub(crate) per_worker_queue_capacity: usize,
+    pub(super) per_worker_queue_capacity: usize,
     /// Whether pinned worker threads were requested and the platform could enumerate
     /// cores. Whether they took is per-thread, and lives in `WorkerCounters::pinned_core`.
-    pub(crate) pinning_requested: bool,
+    pub(super) pinning_requested: bool,
     /// Whether worker_count was aligned to the core budget for writer co-location.
-    pub(crate) core_aligned: bool,
+    pub(super) core_aligned: bool,
     /// Core layout used for pinning and for reporting which core a worker sits on.
-    pub(crate) core_layout: CoreLayout,
+    pub(super) core_layout: CoreLayout,
     /// Shard ordinals — the map from a shard to the worker that owns its writes.
-    pub(crate) placement: Arc<ArcSwap<ShardPlacement>>,
+    pub(super) placement: Arc<ArcSwap<ShardPlacement>>,
 }
 
 impl OrchestratorWorkerTx {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_with_stats(
+    pub(super) fn new_with_stats(
         workers: Vec<mpsc::Sender<OrchestratorJob>>,
         worker_stats: Arc<Vec<Arc<WorkerCounters>>>,
         dispatch_stats: Arc<DispatchCounters>,
@@ -2737,22 +1889,22 @@ impl OrchestratorWorkerTx {
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.workers.len()
     }
 
     /// The backlog estimate this pool refuses against. Borrowed, because the dispatch path
     /// consults it on every request and an `Arc` bump per request is a cost with no purpose.
-    pub(crate) fn load(&self) -> &QueueLoad {
+    pub(super) fn load(&self) -> &QueueLoad {
         &self.queue_load
     }
 
     /// The same estimate as a handle, for the HTTP front door to hold. Called once at startup.
-    pub fn queue_load(&self) -> Arc<QueueLoad> {
+    pub(super) fn queue_load(&self) -> Arc<QueueLoad> {
         Arc::clone(&self.queue_load)
     }
 
-    pub(crate) fn try_send(
+    pub(super) fn try_send(
         &self,
         mut job: OrchestratorJob,
     ) -> Result<(), Box<mpsc::error::TrySendError<OrchestratorJob>>> {
@@ -2801,7 +1953,7 @@ impl OrchestratorWorkerTx {
     /// Shard-affine dispatch: route the job to the worker that "owns" the given
     /// shard, falling through to neighboring workers on `Full` to preserve
     /// throughput. When `shard_id` is `None`, falls back to round-robin.
-    pub(crate) fn try_send_affine(
+    pub(super) fn try_send_affine(
         &self,
         mut job: OrchestratorJob,
         shard_id: Option<Uuid>,
@@ -2878,7 +2030,7 @@ impl OrchestratorWorkerTx {
         }
     }
 
-    pub(crate) async fn send_shutdown(&self) {
+    pub(super) async fn send_shutdown(&self) {
         for worker in self.workers.iter() {
             if worker.send(OrchestratorJob::Shutdown).await.is_err() {
                 break;
@@ -2887,7 +2039,7 @@ impl OrchestratorWorkerTx {
     }
 
     /// Produce a snapshot of all worker and dispatch counters for `/_admin/workers`.
-    pub fn snapshot(&self) -> WorkerPoolReport {
+    pub(super) fn snapshot(&self) -> WorkerPoolReport {
         let workers: Vec<WorkerStats> = self
             .worker_stats
             .iter()
@@ -2965,28 +2117,28 @@ impl OrchestratorWorkerTx {
 /// The `shards` and `routing_ring` fields use `ArcSwap` so that topology
 /// updates from the actor can be published without locking, and workers
 /// always read the latest snapshot.
-pub struct OrchestratorEngine {
+pub(super) struct OrchestratorEngine {
     /// Shard map — updated atomically on topology changes via ArcSwap.
-    pub shards: ArcSwap<HashMap<Uuid, MicroshardActor>>,
+    pub(super) shards: ArcSwap<HashMap<Uuid, MicroshardActor>>,
     /// Consistent hash ring — single shared instance across the engine and
     /// the `RouterActor` (shard-affine dispatch). Updated atomically via
     /// `ArcSwap::store` on topology changes; readers always see the latest snapshot.
-    pub routing_ring: Arc<ArcSwap<ConsistentRing>>,
+    pub(super) routing_ring: Arc<ArcSwap<ConsistentRing>>,
     /// Per-index schema cache (lock-free via ArcSwap).
     ///
     /// Keyed by index name, which is the only thing that identifies an index. A reverse
     /// lookup keyed by a hash of the field names used to sit in front of this and answered
     /// with whichever index of that shape was cached last — see `IndexSchema::calculate_fingerprint`.
-    pub schema_cache: Arc<SchemaCache>,
+    pub(super) schema_cache: Arc<SchemaCache>,
     /// Coordinator actor reference for shard assignments and peer lookups.
-    pub coordinator: Option<ActorRef<ClusterCoordinator>>,
+    pub(super) coordinator: Option<ActorRef<ClusterCoordinator>>,
     /// Node identity for response metadata, and the answer to `GetIdentity`.
-    pub identity: NodeIdentity,
+    pub(super) identity: NodeIdentity,
     /// Default search result limit.
-    pub default_search_limit: usize,
-    pub max_concurrent_shard_searches: usize,
+    pub(super) default_search_limit: usize,
+    pub(super) max_concurrent_shard_searches: usize,
     /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups.
-    pub remote_peer_pool: Arc<RemotePeerPool>,
+    pub(super) remote_peer_pool: Arc<RemotePeerPool>,
 }
 
 impl std::fmt::Debug for OrchestratorEngine {
@@ -3000,7 +2152,7 @@ impl std::fmt::Debug for OrchestratorEngine {
 impl OrchestratorEngine {
     /// Load schema from first shard's storage — [`SchemaCache::schema_for`] against the
     /// engine's snapshot of the shard map.
-    pub(crate) async fn load_schema(
+    pub(super) async fn load_schema(
         &self,
         index: &str,
     ) -> Result<Arc<IndexSchema>, OrchestratorError> {
@@ -3022,7 +2174,7 @@ impl OrchestratorEngine {
     /// The shard-affine hint deliberately does not reach here. It picked the *worker* in
     /// `try_send_affine`, which is what it is for; letting it also pick the *shard* let a write
     /// land somewhere the ring disagreed with. See the routing comment in `engine_write`.
-    pub async fn execute(&self, op: ClientOp) -> WorkerOutcome {
+    pub(super) async fn execute(&self, op: ClientOp) -> WorkerOutcome {
         match op {
             ClientOp::Write {
                 index,
@@ -3166,7 +2318,7 @@ impl OrchestratorEngine {
     /// a new index, or a document carrying a field the schema does not know — returns
     /// [`WriteOutcome::NeedsActor`] holding the parts of the op back, since evolution needs
     /// `staged_schema_validation` and therefore `&mut NodeOrchestrator`.
-    pub(crate) async fn engine_write(
+    pub(super) async fn engine_write(
         &self,
         index: &str,
         id: String,
@@ -3231,7 +2383,7 @@ impl OrchestratorEngine {
     /// The schema is still needed, to decide what the id says about routing. It is read from the
     /// engine's snapshot caches and only loaded through the shard as a last resort, exactly as
     /// `engine_write` does.
-    pub(crate) async fn engine_delete(
+    pub(super) async fn engine_delete(
         &self,
         index: &str,
         id: String,
@@ -3278,7 +2430,7 @@ impl OrchestratorEngine {
     /// Everything past validation — routing, grouping, the one-hop forwarding bound, per-item
     /// accounting — is [`BulkCtx::apply_bulk_write`], the body the actor runs on the same
     /// terms, so the mailbox path and this one cannot drift.
-    pub(crate) async fn engine_bulk_write(
+    pub(super) async fn engine_bulk_write(
         &self,
         index: &str,
         docs: Vec<DocPayload>,
@@ -3348,7 +2500,7 @@ impl OrchestratorEngine {
     /// Bulk delete. Nothing on this path can change a schema — a delete carries no document
     /// that could present a field the schema does not know — so unlike the bulk write there
     /// is no slow path behind it at all: the same shape `engine_delete` already has.
-    pub(crate) async fn engine_bulk_delete(
+    pub(super) async fn engine_bulk_delete(
         &self,
         index: &str,
         docs: Vec<DeletePayload>,
@@ -3373,7 +2525,7 @@ impl OrchestratorEngine {
     }
 
     /// Parallel scatter-gather search across all local shards.
-    pub(crate) async fn engine_search(
+    pub(super) async fn engine_search(
         &self,
         index: &str,
         query: &str,
@@ -3405,67 +2557,72 @@ impl OrchestratorEngine {
 }
 
 #[derive(Debug, Actor, RemoteActor)]
-pub struct NodeOrchestrator {
+pub(crate) struct NodeOrchestrator {
     /// The mailbox lane's service estimate, shared with the [`RouterActor`] that gates it.
     ///
     /// Written here rather than at the caller because this actor handles one op at a time, so
     /// the time around `handle` is service with no queue in it. See [`MailboxLane`].
-    pub(crate) mailbox_lane: MailboxLane,
-    /// Map of shard UUIDs to their microshard actors
+    pub(super) mailbox_lane: MailboxLane,
+    /// Map of shard UUIDs to their microshard actors.
+    ///
+    /// `pub(crate)` rather than `pub(super)`, and the only field of this actor that is: the
+    /// admin-memory messages are implemented for `NodeOrchestrator` in `crate::admin::memory`,
+    /// outside `node/`, and walk the shard map to size and evict writers. A named widening of
+    /// one field, not of the actor.
     pub(crate) shards: HashMap<Uuid, MicroshardActor>,
     /// Node-wide writer-thread liveness, shared with every shard's writer thread and read by
     /// the health endpoint so a dead writer stops the node reporting green.
-    pub(crate) writer_liveness: Arc<WriterLiveness>,
+    pub(super) writer_liveness: Arc<WriterLiveness>,
     /// This node's identity (UUID, name, virtual tokens)
-    pub(crate) identity: NodeIdentity,
+    pub(super) identity: NodeIdentity,
     /// Node configuration  
-    pub(crate) config: NodeConfig,
+    pub(super) config: NodeConfig,
     /// Consistent hash ring for routing writes based on routing keys
-    pub(crate) routing_ring: ConsistentRing,
+    pub(super) routing_ring: ConsistentRing,
     /// Optional coordinator reference for shard registration
-    pub(crate) coordinator: Option<ActorRef<ClusterCoordinator>>,
+    pub(super) coordinator: Option<ActorRef<ClusterCoordinator>>,
     /// Shared routing ring snapshot (lock-free via ArcSwap).
     /// Wrapped in Arc so it can be shared with the OrchestratorEngine worker pool
     /// and the RouterActor for shard-affine dispatch.
-    pub(crate) shared_routing_ring: Arc<ArcSwap<ConsistentRing>>,
+    pub(super) shared_routing_ring: Arc<ArcSwap<ConsistentRing>>,
     /// Cores this process may use, resolved once. Sizes the worker pool and places both
     /// workers and writer threads, so all of them count the same cores.
-    pub(crate) core_layout: CoreLayout,
+    pub(super) core_layout: CoreLayout,
     /// Shard ordinals, published lock-free. Read by the dispatcher to pick a shard's worker
     /// and by the router to answer "is this shard mine?" without a coordinator round trip.
-    pub(crate) placement: Arc<ArcSwap<ShardPlacement>>,
+    pub(super) placement: Arc<ArcSwap<ShardPlacement>>,
     /// Per-index schema cache to avoid repeated metadata reads (lock-free via ArcSwap).
     /// Wrapped in Arc so it can be shared with the OrchestratorEngine worker pool.
-    pub(crate) schema_cache: Arc<SchemaCache>,
+    pub(super) schema_cache: Arc<SchemaCache>,
     /// Default search result limit when not specified in request
-    pub(crate) default_search_limit: usize,
-    pub(crate) max_concurrent_shard_searches: usize,
+    pub(super) default_search_limit: usize,
+    pub(super) max_concurrent_shard_searches: usize,
     /// Shared engine state for the worker pool (Arc-wrapped, lock-free).
     /// Workers operate on this concurrently without going through the actor mailbox.
-    pub(crate) engine: Option<Arc<OrchestratorEngine>>,
+    pub(super) engine: Option<Arc<OrchestratorEngine>>,
     /// Channel sender for dispatching jobs to the worker pool.
     /// Workers pull jobs from the receiver and execute on the shared engine.
-    pub(crate) worker_tx: Option<OrchestratorWorkerTx>,
+    pub(super) worker_tx: Option<OrchestratorWorkerTx>,
     /// Number of worker tasks spawned in the pool.
     /// Used to signal explicit worker shutdown.
-    pub(crate) worker_count: usize,
+    pub(super) worker_count: usize,
     /// Handles for pinned worker OS threads (Stage 2e). Empty when running in the
     /// default unpinned tokio-task mode. Joined during shutdown to ensure clean
     /// teardown of per-worker `current_thread` runtimes.
-    pub(crate) worker_threads: Vec<std::thread::JoinHandle<()>>,
+    pub(super) worker_threads: Vec<std::thread::JoinHandle<()>>,
     /// Dedicated tokio runtime for read operations (search, stats).
     /// Isolates read I/O from the writer threads and tokio's generic blocking pool.
     /// Arc-wrapped so the runtime outlives shard clones that hold its Handle.
-    pub(crate) read_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    pub(super) read_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Node-wide read-pool health, its capacity the read runtime's blocking width. Handed to every
     /// shard so each read brackets it, and to the health endpoint so it can see the pool saturate
     /// or wedge.
-    pub(crate) read_pool_health: Arc<ReadPoolHealth>,
+    pub(super) read_pool_health: Arc<ReadPoolHealth>,
     /// How long a read may wait for a pool thread before it is refused instead of run. The
     /// node's request timeout, handed to every shard. `None` when no timeout is configured.
-    pub(crate) read_budget: Option<Duration>,
+    pub(super) read_budget: Option<Duration>,
     /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups.
-    pub(crate) remote_peer_pool: Option<Arc<RemotePeerPool>>,
+    pub(super) remote_peer_pool: Option<Arc<RemotePeerPool>>,
 }
 
 impl NodeOrchestrator {
@@ -3473,11 +2630,11 @@ impl NodeOrchestrator {
     ///
     /// Taken before the actor is spawned and handed to [`RouterActor::with_config`], so the end
     /// that predicts and the end that measures share one instance.
-    pub fn mailbox_lane(&self) -> MailboxLane {
+    pub(crate) fn mailbox_lane(&self) -> MailboxLane {
         self.mailbox_lane.clone()
     }
 
-    pub(crate) fn storage_path_candidates(&self) -> Cow<'_, [PathBuf]> {
+    pub(super) fn storage_path_candidates(&self) -> Cow<'_, [PathBuf]> {
         if self.config.storage_paths.is_empty() {
             Cow::Owned(vec![self.config.storage_path.clone()])
         } else {
@@ -3485,7 +2642,7 @@ impl NodeOrchestrator {
         }
     }
 
-    pub(crate) fn deterministic_shard_directory(&self, shard_id: Uuid) -> PathBuf {
+    pub(super) fn deterministic_shard_directory(&self, shard_id: Uuid) -> PathBuf {
         let paths_cow = self.storage_path_candidates();
 
         // Ensure paths are sorted for deterministic distribution
@@ -3520,7 +2677,7 @@ impl NodeOrchestrator {
     /// 3. Generate random UUIDs until one hashes to the target directory
     ///
     /// Performance: Average iterations = number of directories (e.g., 6 attempts for 6 dirs)
-    pub fn generate_balanced_shard_id(&self) -> Uuid {
+    pub(crate) fn generate_balanced_shard_id(&self) -> Uuid {
         let paths_cow = self.storage_path_candidates();
         let mut sorted_paths: Vec<PathBuf> = paths_cow.as_ref().to_vec();
         sorted_paths.sort();
@@ -3571,7 +2728,7 @@ impl NodeOrchestrator {
     /// Three outcomes, and the difference between the last two is the whole point: "nobody has
     /// one" licenses this node to build a schema by sampling, while "I could not ask everybody"
     /// does not, and they are indistinguishable if unreachable peers are counted as silent.
-    pub(crate) async fn peer_schema_for(&self, index: &str) -> PeerSchemaLookup {
+    pub(super) async fn peer_schema_for(&self, index: &str) -> PeerSchemaLookup {
         use crate::cluster_coordinator::{GetKnownPeers, GetStatus, KnownPeer};
 
         // The standalone arm, taken before anything is asked of anyone. A node with clustering
@@ -3694,7 +2851,7 @@ impl NodeOrchestrator {
     /// communication and is a pure function of the two candidates, so every node reaches the
     /// same verdict without anyone deciding it — which is what lets schemas converge with no
     /// leader and no consensus round.
-    pub(crate) fn preferred_schema(a: IndexSchema, b: IndexSchema) -> IndexSchema {
+    pub(super) fn preferred_schema(a: IndexSchema, b: IndexSchema) -> IndexSchema {
         match a.version.cmp(&b.version) {
             std::cmp::Ordering::Greater => a,
             std::cmp::Ordering::Less => b,
@@ -3720,7 +2877,7 @@ impl NodeOrchestrator {
     /// Validate a batch against the index's schema, growing the schema first where the batch
     /// needs it. The batch travels in and back out again — see `parallel_validate_schema` for
     /// why owning it is what lets the fan-out avoid copying it.
-    pub(crate) async fn staged_schema_validation(
+    pub(super) async fn staged_schema_validation(
         &self,
         index: &str,
         docs: Vec<DocPayload>,
@@ -3943,7 +3100,7 @@ impl NodeOrchestrator {
     /// document — a second copy of the whole request body, allocated and dropped per bulk
     /// write, to run read-only checks over it. Moving it in and out costs a `Vec` of pointers
     /// either way and copies nothing.
-    pub(crate) async fn parallel_validate_schema(
+    pub(super) async fn parallel_validate_schema(
         docs: Vec<DocPayload>,
         schema_cache: &IndexSchema,
     ) -> Result<(Vec<SchemaValidationResult>, Vec<DocPayload>), OrchestratorError> {
@@ -3956,7 +3113,7 @@ impl NodeOrchestrator {
         // worker's blocking pool, then a rayon fan-out onto the global rayon pool, which is
         // unpinned and competes with the writer threads) — all to run a handful of cheap
         // per-document checks. Both hops are pure overhead below this size.
-        pub(crate) const INLINE_VALIDATION_MAX_DOCS: usize = 64;
+        pub(super) const INLINE_VALIDATION_MAX_DOCS: usize = 64;
         if docs.len() <= INLINE_VALIDATION_MAX_DOCS {
             let results = docs
                 .iter()
@@ -4005,7 +3162,7 @@ impl NodeOrchestrator {
     /// rather than from `schema_cache.fields.is_empty()` — by the time this runs, sampling
     /// may already have populated the cache. See [`mark_initial_fields_indexed`] for why the
     /// two cases differ.
-    pub(crate) async fn evolve_schema_sequential(
+    pub(super) async fn evolve_schema_sequential(
         &self,
         index: &str,
         schema_cache: &mut IndexSchema,
@@ -4075,7 +3232,7 @@ impl NodeOrchestrator {
     /// first write, which is what creates the tantivy index. Persisting here first means
     /// storage finds the fields already described and evolves types against them instead of
     /// inventing its own definitions.
-    pub(crate) async fn persist_schema_to_stores(
+    pub(super) async fn persist_schema_to_stores(
         index: &str,
         schema: &IndexSchema,
         shards: &HashMap<Uuid, MicroshardActor>,
@@ -4129,7 +3286,7 @@ impl NodeOrchestrator {
     /// — and because the schema it is handed has just been through
     /// `normalize_after_deserialization`, which inserts `_seq`. Without this, creating an index
     /// answers with a field that every other endpoint hides.
-    pub(crate) fn sorted_field_names(schema: &IndexSchema) -> Vec<String> {
+    pub(super) fn sorted_field_names(schema: &IndexSchema) -> Vec<String> {
         let mut names: Vec<String> = schema
             .fields
             .keys()
@@ -4183,7 +3340,7 @@ impl NodeOrchestrator {
     /// `_seq` is omitted everywhere. It is WAL bookkeeping, and offering it as a queryable field
     /// invites a query that cannot mean anything. Filtering it in one place also settles an
     /// inconsistency where one response reported two different field counts.
-    pub(crate) fn describe_fields(
+    pub(super) fn describe_fields(
         schema: &IndexSchema,
         searchable: &HashSet<String>,
         sortable: &HashSet<String>,
@@ -4242,7 +3399,7 @@ impl NodeOrchestrator {
     /// Everything the schema carries belongs here, not only its fields. This response is not just
     /// read: `PATCH /_schema` decodes it, edits what it was asked to change and writes the whole
     /// thing back, so a property omitted here is a property erased by an unrelated edit.
-    pub(crate) fn schema_response(
+    pub(super) fn schema_response(
         index: &str,
         schema: &IndexSchema,
         searchable: &HashSet<String>,
@@ -4282,7 +3439,7 @@ impl NodeOrchestrator {
     /// A union in both cases: a shard that has not built this index yet reports neither set, and
     /// describing the field as unsearchable because one shard is empty would be a worse answer
     /// than the one every populated shard gives.
-    pub(crate) async fn field_capabilities_across_shards(
+    pub(super) async fn field_capabilities_across_shards(
         &self,
         index: &str,
     ) -> (HashSet<String>, HashSet<String>) {
@@ -4309,7 +3466,7 @@ impl NodeOrchestrator {
     }
 
     /// Creates a new NodeOrchestrator with the given configuration and identity.
-    pub async fn new(
+    pub(crate) async fn new(
         config: NodeConfig,
         identity: NodeIdentity,
         default_search_limit: usize,
@@ -4393,27 +3550,27 @@ impl NodeOrchestrator {
     }
 
     /// Set the coordinator ActorRef after it is spawned (used for shard registration).
-    pub fn set_coordinator(&mut self, coordinator: ActorRef<ClusterCoordinator>) {
+    pub(crate) fn set_coordinator(&mut self, coordinator: ActorRef<ClusterCoordinator>) {
         self.coordinator = Some(coordinator);
     }
 
     /// Set the shared remote peer pool for cached actor ref lookups.
-    pub fn set_remote_peer_pool(&mut self, pool: Arc<RemotePeerPool>) {
+    pub(crate) fn set_remote_peer_pool(&mut self, pool: Arc<RemotePeerPool>) {
         self.remote_peer_pool = Some(pool);
     }
 
     /// Returns a clone of the worker pool sender, if the pool has been spawned.
-    pub fn worker_tx(&self) -> Option<OrchestratorWorkerTx> {
+    pub(crate) fn worker_tx(&self) -> Option<OrchestratorWorkerTx> {
         self.worker_tx.clone()
     }
 
     /// Returns a clone of the shared routing ring for shard-affine dispatch.
-    pub fn shared_routing_ring(&self) -> Arc<ArcSwap<ConsistentRing>> {
+    pub(crate) fn shared_routing_ring(&self) -> Arc<ArcSwap<ConsistentRing>> {
         Arc::clone(&self.shared_routing_ring)
     }
 
     /// Returns a clone of the published shard placement, for dispatch and local routing.
-    pub fn shard_placement(&self) -> Arc<ArcSwap<ShardPlacement>> {
+    pub(crate) fn shard_placement(&self) -> Arc<ArcSwap<ShardPlacement>> {
         Arc::clone(&self.placement)
     }
 
@@ -4423,7 +3580,7 @@ impl NodeOrchestrator {
     /// so that shards, routing ring, and coordinator are fully initialized.
     ///
     /// Worker count formula: `min(local_shards * 2, cpu_cores * 2)`, minimum 1.
-    pub fn spawn_worker_pool(&mut self) {
+    pub(crate) fn spawn_worker_pool(&mut self) {
         // Share the same ArcSwap instances so cache writes from the actor
         // are immediately visible to workers (no duplication).
         // Ensure remote_peer_pool is set before spawning workers.
@@ -4622,7 +3779,7 @@ impl NodeOrchestrator {
     /// Uses one shutdown message per worker for deterministic teardown.
     /// For Stage 2e pinned workers, also joins their OS threads so the per-worker
     /// `current_thread` runtimes are dropped before this returns.
-    pub(crate) async fn shutdown_worker_pool(&mut self) {
+    pub(super) async fn shutdown_worker_pool(&mut self) {
         let Some(tx) = &self.worker_tx else {
             return;
         };
@@ -4656,7 +3813,7 @@ impl NodeOrchestrator {
     /// Publish updated shard map and routing ring to the engine's ArcSwap fields.
     /// Called after topology changes (new shards, topology updates) so workers
     /// see the latest state without restart.
-    pub(crate) fn publish_engine_state(&self) {
+    pub(super) fn publish_engine_state(&self) {
         // Single source of truth: `shared_routing_ring` is the same Arc held by
         // both the engine and the RouterActor, so one store fans out to everyone.
         self.shared_routing_ring
@@ -4674,7 +3831,7 @@ impl NodeOrchestrator {
     ///
     /// Returns where the shard's writer thread should pin, and the cell it reports back
     /// through.
-    pub(crate) fn place_shard(&mut self, shard_id: Uuid) -> WriterPin {
+    pub(super) fn place_shard(&mut self, shard_id: Uuid) -> WriterPin {
         let mut placement = (**self.placement.load()).clone();
         let slot = placement.assign(
             shard_id,
@@ -4694,7 +3851,7 @@ impl NodeOrchestrator {
     /// Separate from [`Self::place_shard`] because the two happen at different moments: the
     /// ordinal is needed before the shard starts, to pin its writer thread, but routing must
     /// not claim the shard until it can actually take work.
-    pub(crate) fn activate_shard(&mut self, shard_id: Uuid) {
+    pub(super) fn activate_shard(&mut self, shard_id: Uuid) {
         let mut placement = (**self.placement.load()).clone();
         placement.activate(shard_id);
         self.placement.store(Arc::new(placement));
@@ -4705,7 +3862,7 @@ impl NodeOrchestrator {
     /// disk I/O (WAL replay, compaction). Running all shards simultaneously causes I/O
     /// contention that makes each open 10-100× slower. A semaphore limits how many shards
     /// open their redb databases concurrently.
-    pub(crate) async fn hydrate_existing_shards(&mut self) -> Result<(), OrchestratorError> {
+    pub(super) async fn hydrate_existing_shards(&mut self) -> Result<(), OrchestratorError> {
         let mut existing_shards = self.discover_existing_shards()?;
         // Sorted so ordinals — and therefore worker and core placement — come out the same
         // on every restart. Directory order does not promise that, and a benchmark that
@@ -4868,7 +4025,7 @@ impl NodeOrchestrator {
     }
 
     /// Scans all configured storage directories for existing shard folders.
-    pub(crate) fn discover_existing_shards(&self) -> Result<Vec<Uuid>, OrchestratorError> {
+    pub(super) fn discover_existing_shards(&self) -> Result<Vec<Uuid>, OrchestratorError> {
         let mut shard_ids = Vec::new();
         let mut seen = HashSet::new();
         let paths_cow = self.storage_path_candidates();
@@ -4902,7 +4059,7 @@ impl NodeOrchestrator {
     }
 
     /// Creates a storage configuration for a specific shard.
-    pub(crate) fn create_shard_storage_config(
+    pub(super) fn create_shard_storage_config(
         &self,
         _shard_id: Uuid,
         shard_path: PathBuf,
@@ -4931,7 +4088,7 @@ impl NodeOrchestrator {
     }
 
     /// Handles a ProposeShard message to create a new shard.
-    pub async fn handle_propose_shard(
+    pub(crate) async fn handle_propose_shard(
         &mut self,
         msg: ProposeShard,
     ) -> Result<Uuid, OrchestratorError> {
@@ -4997,12 +4154,12 @@ impl NodeOrchestrator {
     }
 
     /// Gets the node identity.
-    pub fn identity(&self) -> &NodeIdentity {
+    pub(crate) fn identity(&self) -> &NodeIdentity {
         &self.identity
     }
 
     /// Builds ShardMetadata for a given shard id (storage stats currently stubbed).
-    pub(crate) fn shard_metadata(&self, shard_id: Uuid) -> ShardMetadata {
+    pub(super) fn shard_metadata(&self, shard_id: Uuid) -> ShardMetadata {
         ShardMetadata {
             shard_id,
             node_id: self.identity.uuid,
@@ -5013,7 +4170,7 @@ impl NodeOrchestrator {
     }
 
     /// Registers a single shard with the coordinator if available.
-    pub(crate) async fn register_shard_with_coordinator(
+    pub(super) async fn register_shard_with_coordinator(
         &self,
         shard_id: Uuid,
     ) -> Result<(), OrchestratorError> {
@@ -5033,7 +4190,9 @@ impl NodeOrchestrator {
     }
 
     /// Registers all known shards with the coordinator (called on startup after coordinator set).
-    pub async fn register_all_shards_with_coordinator(&self) -> Result<(), OrchestratorError> {
+    pub(crate) async fn register_all_shards_with_coordinator(
+        &self,
+    ) -> Result<(), OrchestratorError> {
         if let Some(coordinator) = &self.coordinator {
             let shards: Vec<ShardMetadata> = self
                 .shards
@@ -5067,7 +4226,7 @@ impl NodeOrchestrator {
     ///    writers and flushes redb WAL.
     /// 4. Explicitly `drop(store)` inside the blocking task so redb file handles
     ///    are released deterministically before the task completes.
-    pub async fn shutdown_all_shards(&mut self) -> Result<(), OrchestratorError> {
+    pub(super) async fn shutdown_all_shards(&mut self) -> Result<(), OrchestratorError> {
         tracing::info!("NodeOrchestrator: Shutting down all shards");
 
         self.shutdown_worker_pool().await;
@@ -5180,7 +4339,7 @@ impl NodeOrchestrator {
     }
 
     /// Registers a shard with the routing ring for consistent hashing.
-    pub(crate) fn register_shard_for_routing(&mut self, shard_id: Uuid) {
+    pub(super) fn register_shard_for_routing(&mut self, shard_id: Uuid) {
         let simple = shard_id.simple().to_string();
         let name: String = simple.chars().take(3).collect();
         let identity = NodeIdentity {
@@ -5194,20 +4353,20 @@ impl NodeOrchestrator {
     }
 
     /// Gets the number of active shards.
-    pub fn shard_count(&self) -> usize {
+    pub(crate) fn shard_count(&self) -> usize {
         self.shards.len()
     }
 
     /// A handle to this node's writer-thread liveness, for the health endpoint to read. Taken
     /// before the orchestrator is moved into its actor, so health can probe it without a message.
-    pub fn writer_liveness(&self) -> Arc<WriterLiveness> {
+    pub(crate) fn writer_liveness(&self) -> Arc<WriterLiveness> {
         Arc::clone(&self.writer_liveness)
     }
 
     /// A handle to this node's read-pool health, for the health endpoint to read its saturation
     /// gauge and wedge state. Taken before the orchestrator is moved into its actor, like
     /// [`writer_liveness`](Self::writer_liveness), so health can probe it without a message.
-    pub fn read_pool_health(&self) -> Arc<ReadPoolHealth> {
+    pub(crate) fn read_pool_health(&self) -> Arc<ReadPoolHealth> {
         Arc::clone(&self.read_pool_health)
     }
 
@@ -5216,7 +4375,7 @@ impl NodeOrchestrator {
     ///
     /// `None` before the worker pool exists — a node running everything through the actor
     /// mailbox has no worker queue to predict, and the guard stays out of the way.
-    pub fn queue_load(&self) -> Option<Arc<QueueLoad>> {
+    pub(crate) fn queue_load(&self) -> Option<Arc<QueueLoad>> {
         self.worker_tx.as_ref().map(|tx| tx.queue_load())
     }
 
@@ -5225,7 +4384,10 @@ impl NodeOrchestrator {
     // ========================================================================
 
     /// Handles client operations. Called from Message<ClientOp> handler.
-    pub async fn handle_client_op(&mut self, op: ClientOp) -> Result<JsonValue, OrchestratorError> {
+    pub(super) async fn handle_client_op(
+        &mut self,
+        op: ClientOp,
+    ) -> Result<JsonValue, OrchestratorError> {
         match op {
             ClientOp::Search {
                 index,
@@ -5351,7 +4513,7 @@ impl NodeOrchestrator {
     }
 
     /// Delete an index and all its data from all local shards (parallel)
-    pub(crate) async fn orch_delete_index(
+    pub(super) async fn orch_delete_index(
         &self,
         index: &str,
         delete_schema: bool,
@@ -5433,7 +4595,7 @@ impl NodeOrchestrator {
         }))
     }
 
-    pub(crate) async fn orch_write(
+    pub(super) async fn orch_write(
         &self,
         index: &str,
         id: String,
@@ -5575,7 +4737,7 @@ impl NodeOrchestrator {
     /// mailbox fallback when a worker queue is full. Neither is the hot path, and both have to
     /// route a delete the same way the engine does or the same id would resolve to two shards
     /// depending on how busy the node was.
-    pub(crate) async fn orch_delete(
+    pub(super) async fn orch_delete(
         &self,
         index: &str,
         id: String,
@@ -5625,7 +4787,7 @@ impl NodeOrchestrator {
     /// nothing that could grow it. That is what lets the same body run on a worker: this head
     /// loads the schema and builds the borrowed view, and [`BulkCtx::apply_bulk_delete`] is
     /// the routing, grouping, forwarding and accounting the worker lane runs unchanged.
-    pub(crate) async fn orch_bulk_delete(
+    pub(super) async fn orch_bulk_delete(
         &self,
         index: &str,
         docs: Vec<DeletePayload>,
@@ -5660,7 +4822,7 @@ impl NodeOrchestrator {
     /// owns the shard would otherwise pass one write between them until something timed out,
     /// once per write. Refusing states the disagreement instead, and the caller's retry lands
     /// after the views have converged.
-    pub(crate) async fn forward_op_to_owner(
+    pub(super) async fn forward_op_to_owner(
         &self,
         target: Uuid,
         already_forwarded: bool,
@@ -5737,7 +4899,7 @@ impl NodeOrchestrator {
     ///
     /// Once validation is settled the fan-out is [`BulkCtx::apply_bulk_write`], the same body
     /// the worker lane runs.
-    pub(crate) async fn orch_bulk_write(
+    pub(super) async fn orch_bulk_write(
         &self,
         index: &str,
         docs: Vec<DocPayload>,
@@ -5824,7 +4986,7 @@ impl NodeOrchestrator {
     }
 
     /// Helper method to group local documents by shard
-    pub(crate) fn group_local_documents(
+    pub(super) fn group_local_documents(
         local_docs: Vec<(Placed, Uuid)>,
     ) -> HashMap<Uuid, Vec<Placed>> {
         let mut batches: HashMap<Uuid, Vec<Placed>> = HashMap::new();
@@ -5836,7 +4998,7 @@ impl NodeOrchestrator {
         batches
     }
 
-    pub(crate) async fn orch_search(
+    pub(super) async fn orch_search(
         &self,
         index: &str,
         query: &str,
@@ -5865,7 +5027,7 @@ impl NodeOrchestrator {
         .await
     }
 
-    pub(crate) async fn orch_create_config(
+    pub(super) async fn orch_create_config(
         &self,
         index: &str,
         mut schema: IndexSchema,
@@ -5984,7 +5146,7 @@ impl NodeOrchestrator {
     /// shards — never a shard that wrote something it had already judged impossible. Schema
     /// edits are rare administrative operations against a rare competing writer, which is why
     /// this is a documented bound rather than a lock.
-    pub(crate) async fn orch_update_schema(
+    pub(super) async fn orch_update_schema(
         &self,
         index: &str,
         field_updates: &BTreeMap<String, bool>,
@@ -6032,7 +5194,7 @@ impl NodeOrchestrator {
     }
 
     /// Run the plan or apply half of a schema update on every shard and merge the verdicts.
-    pub(crate) async fn fan_out_schema_update(
+    pub(super) async fn fan_out_schema_update(
         &self,
         stores: &[Arc<HybridStore>],
         index: &str,
@@ -6103,7 +5265,7 @@ impl NodeOrchestrator {
     }
 
     /// The body describing a schema update, whether it was accepted or refused.
-    pub(crate) fn schema_update_response(index: &str, outcome: &SchemaFieldUpdate) -> JsonValue {
+    pub(super) fn schema_update_response(index: &str, outcome: &SchemaFieldUpdate) -> JsonValue {
         let mut body = serde_json::json!({
             "acknowledged": !outcome.is_rejected(),
             "index": index,
@@ -6124,7 +5286,7 @@ impl NodeOrchestrator {
         body
     }
 
-    pub(crate) async fn orch_get_config(
+    pub(super) async fn orch_get_config(
         &self,
         index: &str,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -6189,7 +5351,7 @@ impl NodeOrchestrator {
     /// Resolving a field name needs a built Tantivy index, and a shard that holds the schema but
     /// has never been written to has none — so this asks each shard in turn and takes the first
     /// real verdict. Shards share a schema, so the first answer is every shard's answer.
-    pub(crate) async fn orch_validate_query(
+    pub(super) async fn orch_validate_query(
         &self,
         index: &str,
         query: &str,
@@ -6243,7 +5405,7 @@ impl NodeOrchestrator {
     /// is the fallback for callers that never met the worker pool; the answer itself is
     /// computed from `&self` state, so the engine answers the same question from a snapshot
     /// without queueing behind whatever the mailbox is holding.
-    pub(crate) async fn orch_list_indexes(
+    pub(super) async fn orch_list_indexes(
         &self,
         include_data_size: bool,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -6264,7 +5426,7 @@ impl NodeOrchestrator {
 /// Shared by `NodeOrchestrator::orch_list_indexes` and `OrchestratorEngine` — every input
 /// is a borrow (`&HashMap` of shards, the cache, the identity), so a worker holding the
 /// `ArcSwap` snapshots computes the identical answer.
-pub(crate) async fn list_indexes(
+pub(super) async fn list_indexes(
     shards: &HashMap<Uuid, MicroshardActor>,
     schema_cache: &SchemaCache,
     identity: &NodeIdentity,
@@ -6283,22 +5445,22 @@ pub(crate) async fn list_indexes(
     /// Per-index totals accumulated across this node's shards.
     #[derive(Default)]
     struct IndexTotals {
-        pub(crate) document_count: u64,
-        pub(crate) redb_bytes: u64,
-        pub(crate) tantivy_bytes: u64,
+        pub(super) document_count: u64,
+        pub(super) redb_bytes: u64,
+        pub(super) tantivy_bytes: u64,
         /// Shards that hold data for this index.
-        pub(crate) shard_count: usize,
+        pub(super) shard_count: usize,
         /// Of those, how many have finished warming their reader.
-        pub(crate) warm_shards: usize,
+        pub(super) warm_shards: usize,
         /// Union of the fields the built index can actually search, across shards.
         ///
         /// A union rather than an intersection: a shard that has the column can answer a
         /// query on that field, and a scatter-gather asks every shard. Reporting the
         /// intersection would call a field unsearchable because one empty shard lacks it.
-        pub(crate) searchable: HashSet<String>,
+        pub(super) searchable: HashSet<String>,
         /// Union of the fields the built index can sort exactly, across shards, on the same
         /// reasoning.
-        pub(crate) sortable: HashSet<String>,
+        pub(super) sortable: HashSet<String>,
     }
 
     let mut all: HashMap<String, IndexTotals> = HashMap::new();
@@ -6461,13 +5623,13 @@ pub(crate) async fn list_indexes(
 
 impl NodeOrchestrator {
     /// Get node identity information
-    pub(crate) async fn orch_get_identity(&self) -> Result<JsonValue, OrchestratorError> {
+    pub(super) async fn orch_get_identity(&self) -> Result<JsonValue, OrchestratorError> {
         Ok(identity_json(&self.identity, self.shards.len()))
     }
 
     /// The schema this node holds for `index`, or `None` if it holds none —
     /// [`SchemaCache::durable`] against the actor's own shard map.
-    pub(crate) async fn durable_schema(
+    pub(super) async fn durable_schema(
         &self,
         index: &str,
     ) -> Result<Option<Arc<IndexSchema>>, OrchestratorError> {
@@ -6476,41 +5638,12 @@ impl NodeOrchestrator {
 
     /// Helper: Load schema from first shard, empty when this node holds none —
     /// [`SchemaCache::schema_for`] against the actor's own shard map.
-    pub(crate) async fn load_schema(
+    pub(super) async fn load_schema(
         &self,
         index: &str,
     ) -> Result<Arc<IndexSchema>, OrchestratorError> {
         self.schema_cache.schema_for(&self.shards, index).await
     }
-}
-
-/// Derive a deterministic routing key from document content.
-///
-/// Preference order:
-/// 1. If the document has an "id" field (string), use that directly.
-/// 2. Otherwise, serialize the document to JSON bytes, take a prefix,
-///    and hex-encode it to produce a stable routing key string.
-pub(crate) fn derive_routing_key_from_doc(doc: &JsonValue) -> Option<String> {
-    // Fallback: derive from JSON bytes (deterministic for same document)
-    let mut bytes = serde_json::to_vec(doc).ok()?;
-    if bytes.is_empty() {
-        // Use a fixed token to remain deterministic for empty objects
-        return Some("empty-doc".to_string());
-    }
-
-    // Limit the number of bytes used to keep the key reasonably sized
-    pub(crate) const MAX_PREFIX_LEN: usize = 64;
-    if bytes.len() > MAX_PREFIX_LEN {
-        bytes.truncate(MAX_PREFIX_LEN);
-    }
-
-    // Hex-encode the prefix to a string key; ConsistentRing will hash it again
-    let mut key = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut key, "{:02x}", b);
-    }
-    Some(key)
 }
 
 #[remote_message("cameo.orchestrator.client_op")]
