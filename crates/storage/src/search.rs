@@ -1,11 +1,18 @@
-//! The read side of `HybridStore`: reader pool, read caches, query validation,
-//! `search_documents`, key lookups and index statistics.
+//! The read side of `HybridStore`: reader pool, query validation, `search_documents`, key
+//! lookups and index statistics.
+//!
+//! There is no cache of document bodies here. There used to be — 1024 per index, mirroring rows
+//! of `data_<index>` — and it was removed on 2026-09-19 because it was a third caching layer
+//! over two that already work: redb's page cache (32 MB per shard at the floor, tiered by
+//! database size) and the operating system's. Measured, a point read costs 0.62 µs without it,
+//! and what it removed from that was one B-tree descent — the body is copied out either way.
+//! What it cost was a generation protocol whose only purpose was to stop it serving a body a
+//! write had superseded. `get_by_key` reads redb and is right by construction.
 use crate::*;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -103,105 +110,6 @@ pub(crate) struct IndexSizeCache {
     pub(crate) timestamp: Instant,
 }
 
-/// One index's cached document bodies, and the generation that says whether they are current.
-///
-/// The bodies mirror rows in `data_<index>`, so any write to that table makes the entries for
-/// the ids it touched wrong. Removing those entries is not enough on its own: a reader that
-/// began its redb transaction before the write commits legitimately sees the pre-write row, and
-/// if it caches that body *after* the write has invalidated it, the stale value is back and
-/// nothing will remove it again.
-///
-/// `generation` closes that window. A reader reads it before opening its transaction and passes
-/// it back to `insert_into_cache`, which declines to cache anything if a write has bumped it
-/// since. Reader and writer both hold the same `DashMap` entry guard while they touch this
-/// struct, so the check and the insert cannot interleave with a bump and a removal — whichever
-/// side takes the guard first, the outcome is a cache without a stale body in it.
-#[derive(Default)]
-pub(crate) struct IndexReadCache {
-    pub(crate) entries: HashMap<String, CachedBody>,
-    /// The clock hand's ring: cached keys, oldest first. It may hold names whose body an
-    /// invalidation has already removed — dropping those here as they are invalidated would put
-    /// an O(ring) scan on the writer thread for every id a batch touches, so the sweep drops
-    /// them as it reaches them and [`IndexReadCache::compact_ring`] drops them in bulk if they
-    /// pile up faster than eviction consumes them.
-    order: VecDeque<String>,
-    pub(crate) generation: u64,
-}
-
-/// One cached document body, and whether anyone has read it since the clock hand last passed.
-///
-/// `referenced` is an atomic so that a cache *hit* can set it through the shared `DashMap` guard
-/// [`HybridStore::get_from_cache`] already holds. Recording a hit any other way would make every
-/// read take the entry exclusively, which costs more than the eviction policy is worth.
-pub(crate) struct CachedBody {
-    bytes: Vec<u8>,
-    referenced: AtomicBool,
-}
-
-impl CachedBody {
-    /// A new body starts its first round **unreferenced**, and that is deliberate.
-    ///
-    /// A body is only cached because a read just missed and went to redb, so marking it
-    /// referenced would be defensible — and would make the cache defenceless against a scan.
-    /// Every body a sequential pass touches would arrive protected, the hand would wrap
-    /// clearing bits it had just set, and the entries evicted would be whichever the scan had
-    /// not reached yet, including the genuinely hot ones. Starting cold means a body has to be
-    /// asked for a *second* time to earn its second chance, which is the difference between a
-    /// cache and a buffer of the most recent misses.
-    fn new(bytes: Vec<u8>) -> Self {
-        Self {
-            bytes,
-            referenced: AtomicBool::new(false),
-        }
-    }
-}
-
-impl IndexReadCache {
-    /// Evict one body, choosing the victim by CLOCK.
-    ///
-    /// Walk the ring from the oldest key. A body read since the hand last passed gets a second
-    /// chance: its bit is cleared and it goes to the back. The first body whose bit is already
-    /// clear is evicted.
-    ///
-    /// The policy this replaces was `entries.keys().next()` — arbitrary `HashMap` order, which
-    /// is neither LRU nor FIFO however it is described. A bounded cache under pressure could
-    /// therefore drop the hot set and keep bodies nobody had asked for since they were stored,
-    /// which is the one behaviour a cache must not have.
-    ///
-    /// Terminates: every iteration either removes an entry, drops a stale name, or clears a
-    /// bit, and once a full pass has cleared every bit the next candidate is evicted.
-    fn evict_one(&mut self) {
-        if self.order.is_empty() {
-            // The ring is rebuilt rather than trusted, so a bookkeeping slip degrades the
-            // policy to arbitrary instead of silently leaving the cache unbounded.
-            self.order.extend(self.entries.keys().cloned());
-        }
-
-        while let Some(key) = self.order.pop_front() {
-            match self.entries.get(&key) {
-                // A name left behind by an invalidation. Drop it and keep walking.
-                None => continue,
-                Some(body) if body.referenced.swap(false, AtomicOrdering::Relaxed) => {
-                    self.order.push_back(key);
-                }
-                Some(_) => {
-                    self.entries.remove(&key);
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Drop ring entries whose bodies are gone, when they have outnumbered the live ones.
-    fn compact_ring(&mut self, bound: usize) {
-        if self.order.len() <= bound * 2 {
-            return;
-        }
-        let entries = &self.entries;
-        self.order.retain(|key| entries.contains_key(key));
-    }
-}
-
 /// Result of batch index size measurement
 pub(crate) struct IndexSizes {
     pub(crate) tantivy_bytes: u64,
@@ -210,99 +118,6 @@ pub(crate) struct IndexSizes {
 }
 
 impl HybridStore {
-    /// Get a value from the read cache if present.
-    pub(crate) fn get_from_cache(&self, index: &str, key: &str) -> Option<Vec<u8>> {
-        let index_cache = self.read_cache.get(index)?;
-        let body = index_cache.entries.get(key)?;
-        // The hit itself is what keeps this body alive past the next sweep. See
-        // [`IndexReadCache::evict_one`].
-        body.referenced.store(true, AtomicOrdering::Relaxed);
-        Some(body.bytes.clone())
-    }
-
-    /// The generation a reader must quote back to `insert_into_cache`.
-    ///
-    /// Read *before* the redb transaction the body will come out of, so that a write landing in
-    /// between is detectable. An index with no cache yet reads as 0, which the first write to it
-    /// bumps like any other — see [`IndexReadCache`].
-    pub(crate) fn cache_generation(&self, index: &str) -> u64 {
-        self.read_cache
-            .get(index)
-            .map(|cache| cache.generation)
-            .unwrap_or(0)
-    }
-
-    /// Insert a value into the read cache, under a per-index bound with a CLOCK victim.
-    ///
-    /// The bound is per index, so the real ceiling is `MAX_CACHE_ENTRIES_PER_INDEX` × the number
-    /// of indexes this node has touched — one of the unbounded index-count dimensions M1 is
-    /// about. What is fixed here is only *which* body goes when the bound bites; see
-    /// [`IndexReadCache::evict_one`].
-    ///
-    /// `seen_generation` is what [`cache_generation`](Self::cache_generation) returned before the
-    /// read that produced `value`. A mismatch means a write committed in between, so `value` is a
-    /// pre-write body and caching it would reinstate exactly the staleness the write removed.
-    /// Dropping it costs one cache miss; keeping it costs a wrong answer until something evicts
-    /// it, which nothing is guaranteed to do.
-    pub(crate) fn insert_into_cache(
-        &self,
-        index: &str,
-        key: &str,
-        value: Vec<u8>,
-        seen_generation: u64,
-    ) {
-        const MAX_CACHE_ENTRIES_PER_INDEX: usize = 1024;
-
-        let mut index_cache = self.read_cache.entry(index.to_string()).or_default();
-
-        if index_cache.generation != seen_generation {
-            return;
-        }
-
-        if index_cache.entries.len() >= MAX_CACHE_ENTRIES_PER_INDEX {
-            index_cache.evict_one();
-        }
-        index_cache.compact_ring(MAX_CACHE_ENTRIES_PER_INDEX);
-
-        // A key already in `entries` is already in the ring, and keeps its place there: a
-        // re-read that refreshes a body is not a reason to move it to the back of the queue.
-        if index_cache
-            .entries
-            .insert(key.to_string(), CachedBody::new(value))
-            .is_none()
-        {
-            index_cache.order.push_back(key.to_string());
-        }
-    }
-
-    /// Drop the cached bodies for ids a write has just changed, and bump the generation.
-    ///
-    /// **Call after the redb transaction commits, never before.** Invalidating first leaves a
-    /// window in which a reader still sees the pre-write row and can cache it again; the
-    /// generation bump is what makes such a reader decline to.
-    ///
-    /// The generation is bumped even when nothing was cached, because a reader that found no
-    /// cache read generation 0 and would otherwise be free to install a body this write has
-    /// already superseded.
-    pub(crate) fn invalidate_read_cache<'a, I>(&self, index: &str, ids: I)
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
-        let mut index_cache = self.read_cache.entry(index.to_string()).or_default();
-        index_cache.generation = index_cache.generation.wrapping_add(1);
-        for id in ids {
-            index_cache.entries.remove(id);
-        }
-    }
-
-    /// [`invalidate_read_cache`](Self::invalidate_read_cache) for a change that touched every id.
-    pub(crate) fn invalidate_read_cache_all(&self, index: &str) {
-        let mut index_cache = self.read_cache.entry(index.to_string()).or_default();
-        index_cache.generation = index_cache.generation.wrapping_add(1);
-        index_cache.entries.clear();
-        index_cache.order.clear();
-    }
-
     /// Smart refresh strategy for reader cache
     /// Tries fast reload first, falls back to remove + recreate if reload fails
     /// This preserves cache when possible while ensuring data freshness
@@ -328,25 +143,14 @@ impl HybridStore {
 
     /// Get document by key from specific index
     pub fn get_by_key(&self, index: &str, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        if let Some(cached) = self.get_from_cache(index, key) {
-            return Ok(Some(cached));
-        }
-
         let data_table_name = format!("data_{}", index);
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
 
-        // Read before the transaction opens: the snapshot this returns may predate a write that
-        // is committing right now, and the generation is how `insert_into_cache` finds out.
-        let seen_generation = self.cache_generation(index);
         let read_txn = self.kv.begin_read()?;
 
         match read_txn.open_table(data_table_def) {
             Ok(data_table) => match data_table.get(key)? {
-                Some(value) => {
-                    let bytes = value.value().to_vec();
-                    self.insert_into_cache(index, key, bytes.clone(), seen_generation);
-                    Ok(Some(bytes))
-                }
+                Some(value) => Ok(Some(value.value().to_vec())),
                 None => Ok(None),
             },
             Err(_) => Ok(None), // Table doesn't exist (index was deleted)
@@ -367,9 +171,7 @@ impl HybridStore {
         let data_table_name = format!("data_{}", index);
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
 
-        // Single read transaction for all keys. The generation is read first, for the reason
-        // given in `get_by_key`.
-        let seen_generation = self.cache_generation(index);
+        // Single read transaction for all keys.
         let read_txn = self.kv.begin_read()?;
         let data_table = match read_txn.open_table(data_table_def) {
             Ok(table) => table,
@@ -379,17 +181,8 @@ impl HybridStore {
         let mut results = Vec::with_capacity(keys.len());
 
         for key in keys {
-            // Check cache first
-            if let Some(cached) = self.get_from_cache(index, key) {
-                results.push((key.clone(), cached));
-                continue;
-            }
-
-            // Fetch from redb
             if let Some(value) = data_table.get(key.as_str())? {
-                let bytes = value.value().to_vec();
-                self.insert_into_cache(index, key, bytes.clone(), seen_generation);
-                results.push((key.clone(), bytes));
+                results.push((key.clone(), value.value().to_vec()));
             }
             // Skip keys that don't exist (document may have been deleted)
         }

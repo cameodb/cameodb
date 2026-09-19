@@ -3742,6 +3742,10 @@ names a node has touched, and that is precisely the dimension
   them. Evicting a writer leaves the other ten resident — `readers` holds an `IndexReader` with
   its segment readers and fast-field caches, `read_cache` holds document bodies. **Cap the
   index, not the writer.**
+
+  **Ten as of 2026-09-19**: `read_cache` is gone, deleted rather than capped — see **M0-k**.
+  It was one of the two large ones, so the extent M1 has to bound is smaller than this entry
+  describes, and the large one that remains is `readers`.
 - **M0-b — threads scale with open indexes too, and E5 does not say so.** Each `IndexWriter` is
   built with `indexer_num_threads` (default 1) plus `merge_num_threads` (default 2): **three OS
   threads per open index**, on top of the arena. The thread-topology essay in `node/mod.rs`
@@ -3765,6 +3769,15 @@ names a node has touched, and that is precisely the dimension
   live ones. The test fills the cache twice over with cold traffic while re-reading one key;
   under the old policy it fails on every run, at a different insert each time, which is the
   arbitrariness stated as evidence.
+
+  ⚠️ **Superseded the same day, and the work deleted with it.** **M0-k** removed the cache
+  outright, which takes the CLOCK policy, its test and the fixed defect with it. The finding was
+  correct — the eviction *was* arbitrary — and fixing it was the wrong move, because it
+  answered "which body should go" without first asking whether the cache should exist.
+  Recorded rather than quietly dropped: one of the four items in step 7's "cheap and certain
+  set" turned out to be maintenance on something that should not have been there, and a review
+  that ranks fixes should be read as also asking, of each one, whether the thing being fixed
+  earns its place.
 - **M0-d — a deep clone per bulk batch that an `Arc` already covers.**
   `parallel_validate_schema` takes `&IndexSchema` and clones it whole for the rayon path, while
   its caller holds the `Arc<IndexSchema>` that `load_schema` returned. Taking the `Arc` removes
@@ -3853,6 +3866,45 @@ names a node has touched, and that is precisely the dimension
   width, and takes `SEARCHES` and `FIELDS` from the environment so a single cell can be run with
   ten times the samples.
 
+- **M0-k — the document read cache was a third layer over two that already work, and is
+  deleted.** Raised on review of the measurements above: redb has its own page cache, sized by
+  `calculate_cache_size` at 32 MB per shard on the floor and tiered up by database size, and the
+  operating system's page cache sits under that. `read_cache` held 1024 document bodies per index
+  on top of both, mirroring rows of `data_<index>`. Two details decided it. `get_from_cache`
+  returned `bytes.clone()` — the same memcpy redb's `to_vec` performs from a page it already
+  holds — so the only work it removed was one B-tree descent. And `get_batch_by_keys`, the path
+  a search takes to fetch its hits, opened the redb read transaction *and* the table before
+  consulting the cache, so a total hit still paid for the transaction the cache existed to avoid.
+
+  Measured with `cargo run -p storage --release --example read_cache_value`, 20 000 documents,
+  50 000 reads per workload, three runs each side:
+
+  | workload | with the cache | without |
+  |---|---|---|
+  | hot — 100 keys, every read hits | 0.11 µs | 0.45–0.50 µs |
+  | uniform — all 20 000 keys, nothing hits twice | 0.73 µs | **0.47–0.49 µs** |
+  | search, top 10 | 86.5–87.9 µs | 88.5–90.8 µs |
+
+  The uniform row is the finding: a scanning read got **35% faster** by deleting the cache,
+  because every one of them was paying a miss, an insert and an eviction. Against that, a hot
+  key set loses 0.34 µs per read — under 1% of an HTTP request — and a search loses ~2.5 µs
+  of 88. The underlying read with no cache of ours is 0.47 µs, which is redb and the OS doing
+  their job.
+
+  **The performance is not the main argument.** `read_cache` is why `cache_generation` existed:
+  a protocol whose whole purpose was to stop the cache serving a body a write had superseded,
+  guarding a race the code documented at length. Deleting the cache deletes that surface —
+  `get_by_key` reads redb and is right by construction. It also removes one of the two large
+  per-index maps **M0-a** counts, and moots **M0-c**. The rule this settles on, and the one
+  worth carrying into M1: *cache our own objects and derived metadata — schemas, field maps,
+  budgets, counters, handles — and do not cache what redb and tantivy are already caching.* By
+  that rule `read_cache` was the only offender of the thirteen maps in `store.rs`.
+
+  One methodological note, because it changes a number reported earlier in the day. The first
+  A/B was run through a `NO_READ_CACHE` environment switch checked inside `get_from_cache`, and
+  `std::env::var` on every read is not free: it put the "without" side at 0.60–0.63 µs rather
+  than 0.47. The figures above are from the real removal. An instrument in the hot path is part
+  of the measurement.
 - **M0-j — a wide schema makes an *unqualified* query expensive, and nothing bounds that.**
   Found while measuring M0-f, and the one real result of that run. Every indexed text field is a
   default search field, so a bare term is expanded into a disjunction across all of them: at two
@@ -4056,13 +4108,13 @@ whole extent. Two consequences to write into the design before it starts:
   threads per open index, which the thread-topology essay in `node/mod.rs` states and E5 does
   not. A cap expressed only in megabytes leaves the thread count uncapped, and at two hundred
   tenant indexes that is the ~600 threads before the ~12.8 GiB.
-- **`read_cache`'s eviction is fixed, ahead of this item (M0-c, done 2026-09-19).** Its
-  per-index bound took `entries.keys().next()` — arbitrary `HashMap` order, neither LRU nor
-  FIFO — so under the pressure this item exists to create, it could drop the hot set and keep
-  cold entries. A cap whose victim is chosen at random is not a cap on the thing that matters.
-  It is CLOCK now, with a scan-resistant insert. What remains for this item is the ceiling
-  itself: the bound is still per index, so 1024 × index count, which is the dimension being
-  capped here.
+- **`read_cache` is gone, so this item has one fewer extent to bound (M0-k, 2026-09-19).** It
+  held 1024 document bodies per index — one of the two large maps, and 1024 × index count of
+  resident memory that this item would otherwise have had to cap. It was deleted rather than
+  capped, because it was a third caching layer over redb's page cache and the operating
+  system's, and measured net-negative on any access pattern that is not a small hot set. The
+  large map that remains is `readers`, which holds a tantivy `IndexReader` with its segment
+  readers and fast-field caches, and that one is not duplicating anything: it *is* the object.
 
 ### M2 — Cap decompressed bytes on the streaming ingest path
 
