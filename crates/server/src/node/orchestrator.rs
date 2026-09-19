@@ -2881,7 +2881,7 @@ impl NodeOrchestrator {
         &self,
         index: &str,
         docs: Vec<DocPayload>,
-        schema_cache: &mut IndexSchema,
+        schema_cache: &mut Arc<IndexSchema>,
         forwarded: bool,
         schema_body: Option<&IndexSchema>,
     ) -> Result<(SchemaValidationSummary, Vec<DocPayload>), OrchestratorError> {
@@ -2921,7 +2921,7 @@ impl NodeOrchestrator {
             // to invent. Adopted exactly as a peer's answer is below, for the same reason: this
             // node is applying an agreed schema rather than making a change, so the version
             // travels with it and `mark_modified` must not advance it.
-            *schema_cache = body.clone();
+            *schema_cache = Arc::new(body.clone());
             Self::persist_schema_to_stores(index, schema_cache, &self.shards).await?;
             tracing::info!(
                 index = %index,
@@ -2953,7 +2953,7 @@ impl NodeOrchestrator {
                     // Adopted verbatim, version included: this node is applying a declaration
                     // that already exists, not making a change, so `mark_modified` must not run
                     // and advance a version the rest of the cluster has agreed on.
-                    *schema_cache = *declared;
+                    *schema_cache = Arc::new(*declared);
                     Self::persist_schema_to_stores(index, schema_cache, &self.shards).await?;
                     tracing::info!(
                         index = %index,
@@ -3000,12 +3000,12 @@ impl NodeOrchestrator {
 
             // Whatever this settles on describes a live index. Set before the merge so the
             // schema persisted below never carries a deletion it has just undone.
-            schema_cache.state = storage::SchemaState::Active;
+            Arc::make_mut(schema_cache).state = storage::SchemaState::Active;
 
             // Merge sampled schema into cache for better type detection
             for (field_name, field_def) in &sampled_schema.fields {
                 if !schema_cache.fields.contains_key(field_name) {
-                    schema_cache
+                    Arc::make_mut(schema_cache)
                         .fields
                         .insert(field_name.clone(), field_def.clone());
                 }
@@ -3068,7 +3068,7 @@ impl NodeOrchestrator {
         if summary.evolution_needed && !summary.all_new_fields.is_empty() {
             self.evolve_schema_sequential(
                 index,
-                schema_cache,
+                Arc::make_mut(schema_cache),
                 &summary.all_new_fields,
                 &self.shards,
                 is_initial_creation,
@@ -3102,7 +3102,7 @@ impl NodeOrchestrator {
     /// either way and copies nothing.
     pub(super) async fn parallel_validate_schema(
         docs: Vec<DocPayload>,
-        schema_cache: &IndexSchema,
+        schema: &Arc<IndexSchema>,
     ) -> Result<(Vec<SchemaValidationResult>, Vec<DocPayload>), OrchestratorError> {
         tracing::debug!(
             "Using parallel Rayon validation for {} documents",
@@ -3117,24 +3117,23 @@ impl NodeOrchestrator {
         if docs.len() <= INLINE_VALIDATION_MAX_DOCS {
             let results = docs
                 .iter()
-                .map(|doc_payload| {
-                    validate_document(&doc_payload.id, &doc_payload.doc, schema_cache)
-                })
+                .map(|doc_payload| validate_document(&doc_payload.id, &doc_payload.doc, schema))
                 .collect();
             return Ok((results, docs));
         }
 
-        // The schema is still cloned, and stays cloned: it is one field map, bounded by how
-        // many fields the index declares rather than by how many documents the batch carries,
-        // so it does not grow with the thing being optimised here.
-        let schema_clone = schema_cache.clone();
+        // `spawn_blocking` needs a `'static` handle, which used to mean deep-cloning the whole
+        // field map out of the caller's `Arc` on every batch above the inline threshold. Both
+        // callers hold that `Arc` already — the bulk fast lane straight out of `load_schema` —
+        // so a refcount bump is the whole cost now. The comment this replaces argued the clone
+        // was bounded by field count and so not worth removing; that is true and beside the
+        // point, since it was never necessary in the first place.
+        let schema = Arc::clone(schema);
 
         let (results, docs) = tokio::task::spawn_blocking(move || {
             let results = docs
                 .par_iter()
-                .map(|doc_payload| {
-                    validate_document(&doc_payload.id, &doc_payload.doc, &schema_clone)
-                })
+                .map(|doc_payload| validate_document(&doc_payload.id, &doc_payload.doc, &schema))
                 .collect::<Vec<SchemaValidationResult>>();
             (results, docs)
         })
@@ -4668,7 +4667,9 @@ impl NodeOrchestrator {
             routing_key: routing_key.clone(),
             doc: doc.clone(),
         };
-        let mut schema_mut = (*schema).clone();
+        // A refcount bump, not a copy. Copy-on-write inside staged validation means a single
+        // write that turns out to need no schema change pays nothing for the possibility.
+        let mut schema_mut = Arc::clone(&schema);
 
         let (validation_summary, _docs) = self
             .staged_schema_validation(
@@ -4681,7 +4682,9 @@ impl NodeOrchestrator {
             .await?;
 
         if validation_summary.evolution_needed || self.schema_cache.get(index).is_none() {
-            self.schema_cache.put(index, &schema_mut);
+            // `put_arc`, not `put`: the handle is already an `Arc`, and `put` would deep-copy
+            // the field map to build one.
+            self.schema_cache.put_arc(index, Arc::clone(&schema_mut));
         }
 
         if !validation_summary.errors.is_empty() {
@@ -4912,8 +4915,10 @@ impl NodeOrchestrator {
         }
 
         // `load_schema` answers from the cache when it can, and reads a shard when it cannot.
-        // Owned, unlike the read paths: staged validation evolves this copy.
-        let mut schema_mut = Arc::unwrap_or_clone(self.load_schema(index).await?);
+        // The handle is shared, not owned: staged validation takes `&mut Arc` and reaches for
+        // `Arc::make_mut`, so the field map is deep-copied only if this write actually changes
+        // it — which most writes do not. It used to be unconditionally unwrapped or cloned here.
+        let mut schema_mut = self.load_schema(index).await?;
 
         // Use staged schema validation: parallel validation + sequential evolution. The batch
         // is handed over and handed back so the fan-out never has to copy it.
@@ -4928,7 +4933,9 @@ impl NodeOrchestrator {
             .await?;
 
         if validation_summary.evolution_needed || self.schema_cache.get(index).is_none() {
-            self.schema_cache.put(index, &schema_mut);
+            // `put_arc`, not `put`: the handle is already an `Arc`, and `put` would deep-copy
+            // the field map to build one.
+            self.schema_cache.put_arc(index, Arc::clone(&schema_mut));
         }
 
         // Documents that failed validation are dropped, and their reasons travel to the caller

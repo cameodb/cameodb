@@ -1843,7 +1843,7 @@ the shape.
 
 ### CH6 — The federated merge clones every hit
 
-📋 `search_across_indexes` clones each hit out of the response it already owns in order to stamp
+✅ **Done 2026-09-19.** `search_across_indexes` clones each hit out of the response it already owns in order to stamp
 `_index_source` on the copy. Taking the array with `as_array_mut` + `std::mem::take` stamps in
 place. Bounded by page size rather than corpus size, so this is the hot line of the federated
 path being untidy rather than slow — worth doing when the function is next open.
@@ -1851,7 +1851,9 @@ path being untidy rather than slow — worth doing when the function is next ope
 **2026-09-19, re-read by [M0](#m0--the-architecture-review-and-the-order-of-work) (M0-e):**
 "untidy rather than slow" understates it on the surface that matters. On the MCP path the hits
 *are* the documents an agent asked for, so the clone doubles peak memory of every federated
-response rather than costing a pointer copy. Carried in M0's step 7.
+response rather than costing a pointer copy. Carried in M0's step 7, and **done the same day**:
+`get_mut("hits")`, `std::mem::take`, stamp in place. The response is owned by the merge loop and
+dropped at the end of the iteration, so the hits move out of it for a pointer swap.
 
 ### CH7 — The string-fast collector repeats the macro's body
 
@@ -3749,16 +3751,46 @@ names a node has touched, and that is precisely the dimension
   `MAX_CACHE_ENTRIES_PER_INDEX` is 1024 in `search.rs::insert_into_cache`, so the real ceiling
   is 1024 × index count. Eviction takes `entries.keys().next()` — arbitrary `HashMap` order,
   neither LRU nor FIFO — so under pressure the hot set can go while cold entries stay.
+
+  ✅ **Done 2026-09-19.** CLOCK, with the reference bit an `AtomicBool` inside the cached body
+  so a *hit* can set it through the shared `DashMap` guard `get_from_cache` already takes —
+  recording a hit any other way would make every read acquire the entry exclusively, which
+  costs more than the policy is worth. A body starts its first round **unreferenced**, which is
+  the part worth writing down: marking a freshly cached body as referenced is defensible, and
+  would leave the cache defenceless against a scan, since every body a sequential pass touched
+  would arrive protected and the hand would evict whatever the scan had not reached yet. A body
+  now has to be asked for a second time to earn its second chance. The ring carries names an
+  invalidation has emptied rather than paying an O(ring) scan per invalidated id on the writer
+  thread; the sweep drops them as it reaches them and compacts in bulk if they outnumber the
+  live ones. The test fills the cache twice over with cold traffic while re-reading one key;
+  under the old policy it fails on every run, at a different insert each time, which is the
+  arbitrariness stated as evidence.
 - **M0-d — a deep clone per bulk batch that an `Arc` already covers.**
   `parallel_validate_schema` takes `&IndexSchema` and clones it whole for the rayon path, while
   its caller holds the `Arc<IndexSchema>` that `load_schema` returned. Taking the `Arc` removes
   a field-map clone from every batch above 64 documents. The comment defending the clone as
   "bounded by field count" is true and beside the point.
+
+  ✅ **Done 2026-09-19**, and wider than the entry proposed. `parallel_validate_schema` takes
+  `&Arc<IndexSchema>` and bumps a refcount where it deep-copied a field map. Following it up
+  the call chain, `staged_schema_validation` now takes `&mut Arc<IndexSchema>` and mutates
+  through `Arc::make_mut`, which removed two more clones neither this entry nor the review had
+  named: the actor-path single write did `(*schema).clone()` unconditionally before asking
+  whether anything needed changing, and the actor-path bulk write did `Arc::unwrap_or_clone`.
+  Both are copy-on-write now, so a write that turns out not to evolve the schema — the large
+  majority — pays nothing at all for the possibility. Two more fell out at the other end: both
+  call sites wrote the result back with `SchemaCache::put`, which deep-copies its argument to
+  build an `Arc`, where `put_arc` was already there for exactly the caller that has one. Five
+  schema clones removed from the write path, from an entry that named one.
 - **M0-e — [CH6](#ch6--the-federated-merge-clones-every-hit) is worse than its own entry says.**
   `mcp/search.rs` deep-clones every hit to stamp `_index_source` on the copy, out of a response
   it already owns. On the MCP surface the hits *are* the documents, so it doubles peak memory of
   every federated response. `as_array_mut` + `mem::take` is the whole fix. Re-read CH6's
   "untidy rather than slow" against that.
+
+  ✅ **Done 2026-09-19.** Exactly that: `get_mut("hits")`, `mem::take`, stamp in place. The
+  response is owned by the merge loop and dropped at the end of the iteration, so the hits move
+  out of it for the price of a pointer swap.
 
 #### CPU — the search path repeats per-request work once per shard
 
@@ -3784,6 +3816,13 @@ names a node has touched, and that is precisely the dimension
   commit and the checkpoint transaction. It feeds a commit-*cadence* heuristic that needs no
   per-commit precision: recompute on a TTL or every N commits. The cheapest item in this
   review.
+
+  ✅ **Done 2026-09-19.** `commit_index` no longer measures at all; `should_commit_writer` is
+  the one place that does, behind a 30-second TTL carried on the cache entry itself rather than
+  in a twelfth per-index map. Cheapest, and it also removed a *second* measuring path — the
+  fallback inside `should_commit_writer` — leaving one. The regression guard is the timestamp:
+  it is stamped when the budget is measured, so an unchanged one after three commits is proof
+  no walk happened.
 - **M0-h — dead code that documents behaviour the engine does not have, and the decision it
   needs.** `StorageConfig::get_bulk_operation_budget` is called by nothing in production —
   its only caller is `crates/storage/tests/bulk_memory_budget_test.rs`. Its doc describes bulk
@@ -3795,6 +3834,18 @@ names a node has touched, and that is precisely the dimension
   keep the test as its proof — or *delete* it together with `bulk_memory_budget_test.rs`, since
   a test whose only subject is an uncalled function pins nothing the product does. What it must
   not stay is what it is: a documented, tested claim about an engine that behaves otherwise.
+
+  ✅ **Decided and done 2026-09-19 — deleted.** Activating it means making a writer's arena
+  depend on batch size, and `memory_budget_per_thread` is fixed when the writer is built, so
+  the only honest implementation rebuilds the writer per batch — which discards what it has
+  buffered and forces a commit. That is not the cheap branch the entry assumed, and the
+  direction is wrong besides: [M1](#m1--bound-resident-memory-against-index-count) is about
+  *bounding* writer arenas against index count, and this would inflate them 2× on the bulk
+  path, unmeasured. Deleted with its test. `bulk_memory_budget_test.rs` was **not** deleted
+  whole, as the entry proposed: two of its three tests cover `get_optimal_memory_budget`, which
+  is live and which M0-g has just made more load-bearing, so the file is renamed
+  `memory_budget_test.rs` and keeps them. Its header now records what was removed and why, so
+  the deletion is discoverable from the place someone would look for the behaviour.
 
 #### The differentiator, and where it actually costs
 
@@ -3815,6 +3866,27 @@ batch size, which is the disagreement L-group work already closed. The cost is s
   one transaction for everything that has to be atomic. This makes the differentiating feature
   cheaper *and* stronger, which is the rare direction and the reason it leads the list.
 
+  ✅ **Done 2026-09-19.** The schema row is written into the document's own transaction, its
+  bytes serialised outside it like `doc_bytes` already were. `persist_schema_evolution` stays
+  for `update_field_indexing`, which is a metadata-only change with no document to ride along
+  with, and its doc now says so. One consequence had to be decided rather than inherited: a
+  schema row was always `Durability::Immediate`, and the data transaction is `Immediate` only
+  when `wal_sync` is on, so the folded transaction commits durably whenever it carries a
+  schema — which is the *same* single fsync the separate schema transaction was already paying,
+  now covering the document as well rather than in addition to it.
+
+  A third defect turned up in the fold, unnamed by the review. The evolved schema was written
+  into `schema_cache` **before** the transaction opened, optimistically, and again after
+  `persist_schema_evolution` returned. So any failure between those two points left the cache
+  holding a field the store had never been told about — and one such failure is ordinary, not
+  exotic: a document that introduces a new field *and* carries a bad value for an indexed one
+  evolves the schema and then fails while its Tantivy document is built. The cache moves only
+  after the commit now. That is what the new
+  `crates/storage/tests/schema_evolution_atomicity_test.rs` pins, and it fails against the old
+  ordering with the cache reporting `["note", "id", "payload"]` against a store that has two.
+  What no in-process test can show is the atomicity itself — that needs a crash between two
+  commits, and there is now no between.
+
 #### The order of work
 
 Ranked by impact × certainty ÷ effort. Items 1–3 and 7 are mechanically verifiable — the code
@@ -3822,18 +3894,28 @@ either does the thing or it does not. Item 6 is ⏱ and is owed a run.
 
 | # | Step | Lands in |
 |---|---|---|
-| 1 | Fold schema evolution into the data transaction (**M0-i**) | new work under this group |
+| 1 | ✅ Fold schema evolution into the data transaction (**M0-i**) — done 2026-09-19 | this group |
 | 2 | Re-scope the cap to the *index* — all eleven maps — and record the three-threads-per-index fact (**M0-a**, **M0-b**) | [M1](#m1--bound-resident-memory-against-index-count) |
-| 3 | Stop the per-commit directory walk (**M0-g**) | new work under this group |
+| 3 | ✅ Stop the per-commit directory walk (**M0-g**) — done 2026-09-19 | this group |
 | 4 | ✅ `pub(crate)` → `pub(super)` across `node/`, and one named boundary list in `node/mod.rs` (**O1**) — done 2026-09-19 | this group |
 | 5 | ◐ Extract the admission subsystem from `orchestrator.rs` (**O2** ✅); re-unite the routing-key family (**O3** ✅); replace `storage`'s glob re-exports with named lists (**O4**, outstanding) | this group |
 | 6 | ⏱ Hoist shard-independent query preparation out of the fan-out, and cache `default_query_fields` in `SchemaFields` — **measure before claiming** (**M0-f**) | this group, beside [M6](#m6--close-and-re-measure-the-bulk-lane) |
-| 7 | The cheap and certain set: the `Arc` in `parallel_validate_schema`, CH6's per-hit clone, the read cache's arbitrary eviction, and the delete-or-activate decision on `get_bulk_operation_budget` and its test (**M0-d**, **M0-e**, **M0-c**, **M0-h**) | this group, [CH6](#ch6--the-federated-merge-clones-every-hit) |
+| 7 | ✅ The cheap and certain set: the `Arc` in `parallel_validate_schema`, CH6's per-hit clone, the read cache's arbitrary eviction, and the delete-or-activate decision on `get_bulk_operation_budget` and its test (**M0-d**, **M0-e**, **M0-c**, **M0-h**) — done 2026-09-19 | this group, [CH6](#ch6--the-federated-merge-clones-every-hit) |
 
 Steps 1–3 come before [M1](#m1--bound-resident-memory-against-index-count)–[M8](#m8--re-decide-the-query-complexity-caps) start, because 2 changes what M1 is and 1 and 3 touch the
 paths M6 will measure. Steps 4 and 5 come before the next feature phase, for
 [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle)'s reason: a review should
 not have to read around an avoidable surface twice.
+
+**Where this stands.** Six of the seven steps are done, all on 2026-09-19: 4 and 5 first (see
+below), then 1, 3 and 7 in their ranked order. Step 2 was a re-scoping of
+[M1](#m1--bound-resident-memory-against-index-count)'s own entry rather than code, and is
+recorded there. What is left is **step 6**, which is ⏱ and owed a measured run before anything
+is claimed, and **O4** from step 5. Together the finished steps removed two fsyncs' worth of
+work and a window from every evolving write, ~300 `stat` syscalls from every commit, three
+schema deep-copies from the write path, a deep copy of every hit from every federated MCP
+response, and a documented claim the engine never implemented; they added four regression tests,
+three of which fail against the code they replaced.
 
 **Steps 4 and 5 ran first, on 2026-09-19**, out of the ranked order and deliberately: they are
 the only steps that change where the other five are *read*, and every one of them lands in
@@ -3841,9 +3923,11 @@ the only steps that change where the other five are *read*, and every one of the
 through M0-i work against a module layout that was about to move under it. O4 is what is left of
 step 5; it is in `storage`, touches no `node/` path, and can ride with whichever storage-side
 step reaches it first. `cargo clippy --workspace --all-targets` is clean and
-`scripts/validate/unit.sh` reports 826 tests across 43 targets, 0 skipped — the refactor is
-behaviour-preserving by construction (visibility narrowing and code motion, no logic edited) and
-the suite is the evidence, not the argument.
+`scripts/validate/unit.sh` reports 829 tests across 44 targets, 0 skipped. Steps 4 and 5 are
+behaviour-preserving by construction — visibility narrowing and code motion, no logic edited —
+and the suite is the evidence, not the argument; steps 1, 3 and 7 do change behaviour, and each
+carries a test that fails against what it replaced, except M0-e, whose change is a move of a
+value this code already owns.
 
 ### M1 — Bound resident memory against index count
 
@@ -3870,10 +3954,13 @@ whole extent. Two consequences to write into the design before it starts:
   threads per open index, which the thread-topology essay in `node/mod.rs` states and E5 does
   not. A cap expressed only in megabytes leaves the thread count uncapped, and at two hundred
   tenant indexes that is the ~600 threads before the ~12.8 GiB.
-- **`read_cache` needs its eviction fixed in the same pass (M0-c).** Its per-index bound takes
-  `entries.keys().next()` — arbitrary `HashMap` order, neither LRU nor FIFO — so under the
-  pressure this item exists to create, it can drop the hot set and keep cold entries. A cap
-  whose victim is chosen at random is not a cap on the thing that matters.
+- **`read_cache`'s eviction is fixed, ahead of this item (M0-c, done 2026-09-19).** Its
+  per-index bound took `entries.keys().next()` — arbitrary `HashMap` order, neither LRU nor
+  FIFO — so under the pressure this item exists to create, it could drop the hot set and keep
+  cold entries. A cap whose victim is chosen at random is not a cap on the thing that matters.
+  It is CLOCK now, with a scan-resistant insert. What remains for this item is the ceiling
+  itself: the bound is still per index, so 1024 × index count, which is the dimension being
+  capped here.
 
 ### M2 — Cap decompressed bytes on the streaming ingest path
 

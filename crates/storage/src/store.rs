@@ -277,8 +277,9 @@ pub struct HybridStore {
     pub(crate) operations_counter: Arc<DashMap<String, AtomicU64>>,
     /// Simple per-index read cache for frequently accessed documents
     pub(crate) read_cache: Arc<DashMap<String, IndexReadCache>>,
-    /// Cache of optimal memory budgets per index to avoid frequent syscalls
-    pub(crate) budget_cache: Arc<DashMap<String, usize>>,
+    /// Cache of optimal memory budgets per index to avoid frequent syscalls.
+    /// See [`BudgetCacheEntry`] for why it carries a timestamp rather than a bare number.
+    pub(crate) budget_cache: Arc<DashMap<String, BudgetCacheEntry>>,
     /// Cache of schemas per index to avoid repeated redb reads
     pub(crate) schema_cache: Arc<DashMap<String, Arc<IndexSchema>>>,
     /// Cache of Tantivy field mappings per index
@@ -1475,8 +1476,10 @@ impl HybridStore {
             .config
             .get_optimal_memory_budget(&index_path, field_count);
 
-        // Cache the budget
-        self.budget_cache.insert(index.to_string(), optimal_budget);
+        // Cache the budget, stamped: this is the measurement the TTL in
+        // `should_commit_writer` ages out.
+        self.budget_cache
+            .insert(index.to_string(), BudgetCacheEntry::now(optimal_budget));
 
         let num_worker_threads = self.config.indexer_num_threads.max(1);
         let num_merge_threads = self.config.merge_num_threads.max(1);
@@ -1609,19 +1612,24 @@ impl HybridStore {
     /// ACID-compliant commit threshold with optimized batching to reduce transaction overhead.
     /// Larger batches mean fewer commits and less fsync overhead while maintaining Durability::Immediate.
     pub(crate) fn should_commit_writer(&self, index: &str, operations_since_commit: u64) -> bool {
-        // Get dynamic memory budget for this specific index
-        // Use cached budget if available to avoid syscalls on every write
-        let budget = if let Some(b) = self.budget_cache.get(index) {
-            *b.value()
-        } else {
-            // Fallback: calculate and cache. Measurement only, but the path is still
-            // built by `index_dir` so no caller-supplied name is ever joined by hand.
-            let b = match self.index_dir(index) {
-                Ok(index_path) => self.config.get_optimal_memory_budget(&index_path, None),
-                Err(_) => self.config.indexer_memory_budget,
-            };
-            self.budget_cache.insert(index.to_string(), b);
-            b
+        // The budget for this index, measured at most once per `BUDGET_CACHE_TTL`. This is
+        // the only place the measurement is taken: `commit_index` used to re-take it after
+        // every single commit, which is ~300 `stat` calls on a fifty-segment index, on the
+        // writer thread, to refresh a five-bucket size class whose boundaries are hundreds of
+        // megabytes apart.
+        let budget = match self.budget_cache.get(index) {
+            Some(entry) if !entry.value().is_stale() => entry.value().budget,
+            _ => {
+                // Measurement only, but the path is still built by `index_dir` so no
+                // caller-supplied name is ever joined by hand.
+                let b = match self.index_dir(index) {
+                    Ok(index_path) => self.config.get_optimal_memory_budget(&index_path, None),
+                    Err(_) => self.config.indexer_memory_budget,
+                };
+                self.budget_cache
+                    .insert(index.to_string(), BudgetCacheEntry::now(b));
+                b
+            }
         };
 
         // ACID-safe optimization: Scale commit frequency with memory budget
@@ -1766,10 +1774,12 @@ impl HybridStore {
         // CRITICAL: Smart refresh reader cache after commit to ensure search sees latest data
         self.smart_refresh_reader(index)?;
 
-        // Refresh budget cache after commit since index size likely changed
-        let index_path = self.index_dir(index)?;
-        let new_budget = self.config.get_optimal_memory_budget(&index_path, None);
-        self.budget_cache.insert(index.to_string(), new_budget);
+        // The budget is deliberately *not* re-measured here. It used to be, on the grounds
+        // that a commit changes the index size — true, and it changes it by far less than the
+        // size class it feeds can notice. `should_commit_writer` re-measures on its own TTL,
+        // which bounds the directory walk to twice a minute per index however hard the index
+        // is written, instead of once per commit on the writer thread between the Tantivy
+        // commit and the checkpoint transaction.
 
         // AFTER the Tantivy commit succeeds: record the durable sequence and drop the WAL
         // entries it covers. Both happen in one redb transaction so a crash can never leave
@@ -2001,11 +2011,9 @@ impl HybridStore {
                             tracing::debug!(
                                 index = %index,
                                 evolved_fields = ?evolved_fields,
-                                "Evolved schema with new non-indexed fields (will persist in separate transaction)"
+                                "Evolved schema with new non-indexed fields (persists in the data transaction)"
                             );
-                            evolved_schema = Some(schema_mut.clone());
-                            self.schema_cache
-                                .insert(index.to_string(), Arc::new(schema_mut));
+                            evolved_schema = Some(schema_mut);
                         }
                     }
                 }
@@ -2056,14 +2064,38 @@ impl HybridStore {
                 })
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-                // redb commits the WAL entry and the row before Tantivy sees either. A failed
-                // commit can therefore never leave a document buffered in the writer that redb
-                // does not have — the invariant that keeps the search index from running ahead
-                // of the document store.
+                // Serialised out here for the same reason `doc_bytes` is: it walks the field map
+                // and touches no table, so it does not belong inside the transaction.
+                let evolved_schema_bytes = evolved_schema
+                    .as_ref()
+                    .map(serde_json::to_vec)
+                    .transpose()
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+                // redb commits the WAL entry, the document row, and any schema the document
+                // evolved, before Tantivy sees any of them. Two invariants come out of that.
+                //
+                // The search index cannot run ahead of the document store: a failed commit can
+                // never leave a document buffered in the writer that redb does not have.
+                //
+                // And a document that introduces a field cannot become durable without the
+                // schema that names it. This used to be two transactions — the data commit, then
+                // `persist_schema_evolution` — with a window between them the code could only
+                // acknowledge, logging `CRITICAL: Schema evolution failed after data commit` and
+                // returning an error that said the data was already saved. A stream teaching an
+                // index its own shape is the workload this engine exists for, so that window sat
+                // on the hot path of the differentiating feature and cost it a second fsync
+                // besides. One transaction removes both: redb makes the pair atomic, so there is
+                // nothing left to reconcile, and a failure now writes nothing at all.
                 let is_new_document = {
                     let mut write_txn = self.kv.begin_write()?;
                     let is_new = {
-                        let durability = if self.config.wal_sync {
+                        // A schema row is metadata and was always written with `Immediate`;
+                        // folding it in must not quietly downgrade that. An evolving write
+                        // therefore commits durably whatever `wal_sync` says — which is the one
+                        // fsync the separate schema transaction was already paying, now covering
+                        // the document as well rather than in addition to it.
+                        let durability = if self.config.wal_sync || evolved_schema_bytes.is_some() {
                             Durability::Immediate
                         } else {
                             Durability::None
@@ -2075,8 +2107,16 @@ impl HybridStore {
                         wal_table.insert(seq_id, wal_data.as_slice())?;
 
                         let mut data_table = write_txn.open_table(data_table_def)?;
-                        let old_value = data_table.insert(id.as_str(), doc_bytes.as_slice())?;
-                        old_value.is_none()
+                        let is_new = data_table
+                            .insert(id.as_str(), doc_bytes.as_slice())?
+                            .is_none();
+
+                        if let Some(schema_bytes) = &evolved_schema_bytes {
+                            let mut schema_table = write_txn.open_table(TABLE_SCHEMA)?;
+                            schema_table.insert(index, schema_bytes.as_slice())?;
+                        }
+
+                        is_new
                     };
                     write_txn.commit()?;
                     is_new
@@ -2085,6 +2125,15 @@ impl HybridStore {
                 // The cached body for this id is now the previous one. Removing it after the
                 // commit rather than before is what makes the removal stick.
                 self.invalidate_read_cache(index, [id.as_str()]);
+
+                // The schema cache moves only once the row it describes is durable. It used to
+                // be written optimistically before the transaction and again after it, so a
+                // failure anywhere in between left the cache ahead of the store.
+                if let Some(evolved) = evolved_schema {
+                    tracing::debug!(index = %index, "Schema evolution committed with the document");
+                    self.schema_cache
+                        .insert(index.to_string(), Arc::new(evolved));
+                }
 
                 // Tantivy, after redb is durable.
                 {
@@ -2097,27 +2146,6 @@ impl HybridStore {
                         writer.delete_term(term);
                     }
                     writer.add_document(tantivy_doc)?;
-                }
-
-                if let Some(evolved) = evolved_schema {
-                    match self.persist_schema_evolution(index, &evolved) {
-                        Ok(()) => {
-                            self.schema_cache
-                                .insert(index.to_string(), Arc::new(evolved));
-                            tracing::info!(index = %index, "Schema evolution persisted successfully");
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                index = %index,
-                                error = %e,
-                                "CRITICAL: Schema evolution failed after data commit. Data was saved but schema may be inconsistent."
-                            );
-                            return Err(StoreError::Serialization(format!(
-                                "Schema evolution failed for index {}: {}. Data was committed but schema may be inconsistent.",
-                                index, e
-                            )));
-                        }
-                    }
                 }
 
                 self.increment_operations(index);
@@ -2290,7 +2318,12 @@ impl HybridStore {
         Ok(())
     }
 
-    /// Persist schema evolution with Immediate durability (critical metadata)
+    /// Persist a schema on its own, with `Immediate` durability (critical metadata).
+    ///
+    /// For metadata-only changes, where there is no document for the schema row to ride along
+    /// with — `update_field_indexing` is the one caller. The write path does *not* use this: a
+    /// schema a document evolved is written into that document's own transaction by
+    /// [`HybridStore::apply_write`], so the pair is atomic and costs one fsync rather than two.
     pub(crate) fn persist_schema_evolution(
         &self,
         index_name: &str,
