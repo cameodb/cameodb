@@ -3807,6 +3807,65 @@ names a node has touched, and that is precisely the dimension
   what makes it worth doing — but how much of a search it is depends on query shape and field
   count, so it is owed an arm before any figure is claimed.
 
+  ✅ **Measured 2026-09-19 — and the premise does not hold, so this is declined.**
+  `cargo run -p storage --release --example query_prep_cost`: 500 documents of *fixed* width,
+  2 000 searches per cell, schema width the only variable, best of three.
+
+  | indexed fields | `alpha`, top 10 | `f0:alpha`, top 10 | `f0:alpha`, count only |
+  |---|---|---|---|
+  | 5 | 20.0 µs | 14.9 µs | 2.5 µs |
+  | 25 | 37.8 µs | 12.0 µs | 2.9 µs |
+  | 100 | 90.4 µs | 14.6 µs | 5.1 µs |
+  | 200 | 160.0 µs (**8.0×**) | 17.2 µs (**1.15×**) | 8.1 µs (**3.2×**) |
+
+  The field-qualified columns are the measurement, because a qualified query never touches the
+  default-field set and so separates preparation from execution. The count-only column is the
+  sharp instrument: no documents are fetched, so it is preparation, parsing and counting and
+  little else. Preparation does scale with schema width — about **30 ns per indexed field**, so
+  some 5.6 µs at two hundred fields — and that is the whole of what hoisting could recover, per
+  extra shard. Against a search that costs 17 µs qualified and 160 µs unqualified at that width,
+  and against paying for it by moving schema-dependent rewriting to a level where shard schemas
+  are documented as legitimately divergent, it is not worth it.
+
+  **Two candidate changes were implemented, measured and reverted**, which is the point of the
+  ⏱ marker and the reason this entry is longer than a "done" would be.
+
+  - *Make the date and facet passes read the query for field names instead of scanning the whole
+    schema.* Genuine algorithmic improvement — O(query) rather than O(schema width), and it
+    would have made the three rewrite passes agree on what counts as naming a field. Measured
+    **identical**: 19.0 µs against 18.8 µs at two hundred fields. Reverted.
+  - *Cache `default_query_fields` on `SchemaFields`*, which this entry proposed by name. Safe —
+    a Tantivy schema is fixed when its index is created, so the derivation cannot go stale — and
+    it does measure, at 20 000 searches per cell where noise is small enough to see it:
+    **5.53 µs against 5.77 µs**, tight both sides. That is 0.24 µs at two hundred fields, about
+    1 ns per field, and roughly 7% of the field-dependent cost; the other 93% is
+    `QueryParser::for_index` and the parse themselves being handed two hundred default fields,
+    which no cache reaches. A new invariant across two construction sites for 0.24 µs is the
+    same trade [M0-h](#m0--the-architecture-review-and-the-order-of-work) refused, so it was
+    refused here too. Reverted.
+
+  **And the harness was wrong first.** Its first version declared wide schemas *and* wrote wide
+  documents, so a top-10 search deserialised ten documents of N values each and the run reported
+  a 10× "preparation" slope that was nothing of the kind. A second version plumbed a `limit`
+  argument that never reached the call sites, so the count column silently measured the same
+  thing as the column beside it. Both are recorded because this entry is the one that claims a
+  negative, and a negative is only as good as the instrument: the harness now fixes document
+  width, and takes `SEARCHES` and `FIELDS` from the environment so a single cell can be run with
+  ten times the samples.
+
+- **M0-j — a wide schema makes an *unqualified* query expensive, and nothing bounds that.**
+  Found while measuring M0-f, and the one real result of that run. Every indexed text field is a
+  default search field, so a bare term is expanded into a disjunction across all of them: at two
+  hundred fields `alpha` costs **160.0 µs against 20.0 µs at five** — 8.0×, close to linear
+  in field count. That is genuine execution, not preparation — the posting lists are really read
+  — so it cannot be hoisted or cached away; the query is simply doing what it was asked to do.
+  It matters here because schema width is the *tenant's* choice while the cost lands on the
+  node, and [M](#m-the-035-goal-set--multi-tenant-exposure--planned) is about putting a
+  multi-tenant node on the internet. It belongs with
+  [M8](#m8--re-decide-the-query-complexity-caps), whose subject is exactly what a single query
+  may cost, and it gives that decision the number it did not have. ⏱ for the *fan-out* multiple:
+  this is one shard, and a broadcast search multiplies it.
+
 #### Disk
 
 - **M0-g — every commit stats the whole index directory.** `commit_index` calls
@@ -3930,7 +3989,7 @@ either does the thing or it does not. Item 6 is ⏱ and is owed a run.
 | 3 | ✅ Stop the per-commit directory walk (**M0-g**) — done 2026-09-19 | this group |
 | 4 | ✅ `pub(crate)` → `pub(super)` across `node/`, and one named boundary list in `node/mod.rs` (**O1**) — done 2026-09-19 | this group |
 | 5 | ◐ Extract the admission subsystem from `orchestrator.rs` (**O2** ✅); re-unite the routing-key family (**O3** ✅); replace `storage`'s glob re-exports with named lists (**O4**, outstanding) | this group |
-| 6 | ⏱ Hoist shard-independent query preparation out of the fan-out, and cache `default_query_fields` in `SchemaFields` — **measure before claiming** (**M0-f**) | this group, beside [M6](#m6--close-and-re-measure-the-bulk-lane) |
+| 6 | ✅ ⏱ Hoist shard-independent query preparation out of the fan-out (**M0-f**) — measured 2026-09-19 and **declined**; the measurement instead found **M0-j** | this group, beside [M6](#m6--close-and-re-measure-the-bulk-lane) |
 | 7 | ✅ The cheap and certain set: the `Arc` in `parallel_validate_schema`, CH6's per-hit clone, the read cache's arbitrary eviction, and the delete-or-activate decision on `get_bulk_operation_budget` and its test (**M0-d**, **M0-e**, **M0-c**, **M0-h**) — done 2026-09-19 | this group, [CH6](#ch6--the-federated-merge-clones-every-hit) |
 
 Steps 1–3 come before [M1](#m1--bound-resident-memory-against-index-count)–[M8](#m8--re-decide-the-query-complexity-caps) start, because 2 changes what M1 is and 1 and 3 touch the
@@ -3938,15 +3997,18 @@ paths M6 will measure. Steps 4 and 5 come before the next feature phase, for
 [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle)'s reason: a review should
 not have to read around an avoidable surface twice.
 
-**Where this stands.** Six of the seven steps are done, all on 2026-09-19: 4 and 5 first (see
-below), then 1, 3 and 7 in their ranked order. Step 2 was a re-scoping of
+**Where this stands.** All seven steps are closed, on 2026-09-19: 4 and 5 first (see below),
+then 1, 3 and 7 in their ranked order, then 6. Step 2 was a re-scoping of
 [M1](#m1--bound-resident-memory-against-index-count)'s own entry rather than code, and is
-recorded there. What is left is **step 6**, which is ⏱ and owed a measured run before anything
-is claimed, and **O4** from step 5. Together the finished steps removed two fsyncs' worth of
+recorded there. Step 6 closed by being **declined on its measurement** rather than done, which
+is what ⏱ is for; it left **M0-j** behind, for
+[M8](#m8--re-decide-the-query-complexity-caps). What is left of this group is **O4** from
+step 5. Together the finished steps removed two fsyncs' worth of
 work and a window from every evolving write, ~300 `stat` syscalls from every commit, three
 schema deep-copies from the write path, a deep copy of every hit from every federated MCP
 response, and a documented claim the engine never implemented; they added four regression tests,
-three of which fail against the code they replaced.
+three of which fail against the code they replaced. Step 6 removed nothing, and that is its
+result: it was declined on its own measurement.
 
 **Steps 4 and 5 ran first, on 2026-09-19**, out of the ranked order and deliberately: they are
 the only steps that change where the other five are *read*, and every one of them lands in
@@ -4066,6 +4128,14 @@ reasoning is sound and its premise is currently false on the write surface, whic
 the surface is metered, re-read C2 against a multi-tenant node and either re-affirm the deferral
 with the premise now true, or take it up. The two `parse_query_lenient` call sites are where a
 cap would go.
+
+**2026-09-19 — [M0-j](#m0--the-architecture-review-and-the-order-of-work) gives this a number.**
+An unqualified term is expanded across every indexed text field, so on a two-hundred-field index
+`alpha` costs 160 µs against 20 µs on a five-field one — 8×, close to linear, and that is
+real execution rather than overhead. Schema width is the tenant's choice and the cost is the
+node's, which is the shape of problem a complexity cap exists for. Re-reading C2 now has this to
+read against, and a cap on the *default-field count a bare term may expand to* is a candidate the
+original entry did not consider, alongside the ones it did.
 
 **Deliberately not in 0.3.5:** [D1–D3](#d-phase-15--high-availability-reindex-replication--migration--planned)
 (reindex, replication, migration), [A1](#a1--mcp-streaming) and [A5](#a5--semantic-routing),
