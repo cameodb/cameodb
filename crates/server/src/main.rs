@@ -391,6 +391,7 @@ async fn main() -> Result<()> {
         shard_affine_dispatch: cameodb_config.storage.shard_affine_dispatch,
         worker_core_affinity: cameodb_config.storage.worker_core_affinity,
         clustered: cameodb_config.network.cluster.enabled,
+        implicit_index_creation: cameodb_config.security.implicit_index_creation,
     };
 
     // Create the NodeOrchestrator actor

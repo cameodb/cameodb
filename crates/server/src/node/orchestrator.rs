@@ -3825,6 +3825,19 @@ impl NodeOrchestrator {
         }
 
         if is_initial_creation {
+            // Reaching here means no schema exists anywhere this node can see — a peer's
+            // declaration or a carried body would have settled `is_initial_creation` above —
+            // so this write is the index's mint: the sampled schema creates a tantivy index
+            // that is built once. Where minting is an explicit decision rather than a side
+            // effect of a write, refuse: the caller's remedy is `PUT /api/{index}/_config`,
+            // which is the `IndexAdmin` capability this setting exists to hand the decision
+            // back to.
+            if !self.config.implicit_index_creation {
+                return Err(OrchestratorError::Validation(format!(
+                    "index '{index}' does not exist and this node does not create indexes \
+                     implicitly; create it with PUT /api/{index}/_config before writing"
+                )));
+            }
             let sampled_schema = enhanced_schema_sampling(&docs, SCHEMA_SAMPLE_LIMIT);
             let sampled_field_count = sampled_schema.fields.len();
 

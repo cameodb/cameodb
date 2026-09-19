@@ -51,7 +51,7 @@ on one.
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
-| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items, three decompositions (L11–L13 done), six simplifications (L14–L19 done), and the retrospective itself |
+| L — Post-0.3.4 review: the refactor cycle | ◐ Partial | Twenty items in five groups — four defects, six security remainder items (L5–L10 all done), three decompositions (L11–L13 done), six simplifications (L14–L19 done), and the retrospective itself |
 
 ## Reconciliation, 2026-08-26
 
@@ -3195,12 +3195,19 @@ error-reporting contract survives that. Sits beside
 
 ### L9 — A `Writer` key can mint indexes
 
-**Security, medium.** 📋 **Planned.** A write to an unknown index triggers schema sampling and
-creates the index (`node_orchestrator.rs` ~7442–7514), requiring only `Capability::Write` — so a
-writer key (or anyone, in the default posture) can grow the node's disk with arbitrarily many
-indexes, which is the resource decision `IndexAdmin` exists to own. Either config-gate implicit
-creation or write down, in the capability reference, that minting indexes is an intended part of
-`Writer`.
+**Security, medium.** ✅ **Done.** Posture decided: implicit creation is now a config gate —
+`security.implicit_index_creation`, default `true`, so upgrades keep today's behavior. The
+refusal sits at the one place minting is decided: the `NoneHeld` arm of
+`staged_schema_validation`, where sampling has confirmed no schema exists anywhere — a
+`Validation` error naming the remedy (`PUT /api/{index}/_config`, the `index-admin` route).
+Adopting a peer's schema or applying a forwarded `schema_body` is *not* gated: those apply an
+existing declaration rather than mint one. `SecurityConfig` lost its derived `Default` for a
+manual one (`derive` would have defaulted the bool `false`, silently inverting the gate on
+`..Default::default()`); the plumbing is `CameoDbConfig → NodeConfig → engine`, the same route
+`default_search_limit` takes. The capability reference now documents both postures: `write`
+includes minting indexes unless the gate is off. Tests: parse/default test in `config/tests`,
+and an end-to-end test proving a write to an unknown index is refused `400` with the gate off,
+that explicit `_config` creation still succeeds, and that the subsequent write lands.
 
 ### L10 — The low findings, in one place
 
@@ -3471,10 +3478,8 @@ output is this group's sequencing and the next cycle's goals:
    each item names) *before* the next feature phase starts, so the next review does not read a
    13k-line diff context again.
 4. **L14–L19 after the splits**, each with the per-module tests that the split creates.
-5. **L5, L6, L7 are done** — the decisions landed as bound, refuse, classify respectively.
-   **L9 remains a posture change, not a fix** — it needs an explicit decision in the
-   retrospective (gate implicit index creation, or document it as `Writer`'s to make) before
-   it is coded.
+5. **L5–L7 and L9 are done** — the decisions landed as bound, refuse, classify, and gate
+   (`security.implicit_index_creation`, default on) respectively.
 
 Measures of success for the group: the five tracked files each become a small set of
 feature-grouped files (four to six production files apiece, not fifteen); a change of one
