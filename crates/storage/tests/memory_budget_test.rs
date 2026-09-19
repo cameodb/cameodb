@@ -1,3 +1,18 @@
+//! What `get_optimal_memory_budget` reads off disk, and the size classes it maps that to.
+//!
+//! The budget it returns is the tantivy arena an index's writer is built with, and — through
+//! `should_commit_writer` — how many operations accumulate before the next commit. It is
+//! measured by walking the index directory, which is why `commit_index` no longer does it per
+//! commit and a TTL governs it instead (M0-g): these tests pin the answer, not its cadence.
+//!
+//! This file used to also test `StorageConfig::get_bulk_operation_budget`, which documented
+//! bulk writes receiving 1.5× and 2× arenas. They never did: a writer's
+//! `memory_budget_per_thread` is fixed when the writer is built, and nothing in the bulk path
+//! ever called the function. Being `pub` on a library type, no dead-code lint saw it, which is
+//! how L17's sweep missed it. It has been deleted rather than wired up, because making the
+//! documented behaviour real means rebuilding a writer per batch, and inflating writer arenas
+//! is the opposite direction from M1 — which is about bounding them (M0-h).
+
 use std::path::Path;
 use storage::StorageConfig;
 use tempfile::TempDir;
@@ -9,78 +24,6 @@ use tempfile::TempDir;
 fn create_sized_file(path: &Path, len_bytes: u64) {
     let file = std::fs::File::create(path).expect("Failed to create file");
     file.set_len(len_bytes).expect("Failed to size file");
-}
-
-#[test]
-fn test_bulk_memory_budget_scaling() {
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-
-    let config = StorageConfig {
-        shard_path: temp_dir.path().to_path_buf(),
-
-        // Memory Budget Configuration
-        indexer_memory_budget: 64 * 1024 * 1024,
-        indexer_memory_min_mb: 32,
-        indexer_memory_max_mb: 512,
-        total_memory_limit_bytes: 4 * 1024 * 1024 * 1024, // 4GB budget for tests
-        memory_pressure_threshold_percent: 80,
-
-        // Thread Configuration
-        indexer_num_threads: 1,
-        merge_num_threads: 2,
-
-        // Other Configuration
-        default_batch_size: 1000,
-        wal_sync: true,
-    };
-
-    // Create a fake index path for testing
-    let index_path = temp_dir.path().join("test_index");
-    std::fs::create_dir_all(&index_path).expect("Failed to create index directory");
-
-    // Create a larger fake index (> 500MB to trigger max budget)
-    let large_index_path = temp_dir.path().join("large_index");
-    std::fs::create_dir_all(&large_index_path).expect("Failed to create large index directory");
-
-    // Pre-populate with a large file to simulate big index
-    let large_file = large_index_path.join("large_file.bin");
-    create_sized_file(&large_file, 600 * 1024 * 1024); // 600MB
-
-    // Test base budget (small batch)
-    let base_budget = config.get_bulk_operation_budget(&index_path, 500);
-    let min_budget = config.indexer_memory_min_mb * 1024 * 1024;
-    assert_eq!(
-        base_budget, min_budget,
-        "Small batch should use minimum budget"
-    );
-
-    // Test medium batch (1.5x scaling)
-    let medium_budget = config.get_bulk_operation_budget(&index_path, 2000);
-    let expected_medium = min_budget * 3 / 2;
-    assert_eq!(
-        medium_budget, expected_medium,
-        "Medium batch should use 1.5x budget"
-    );
-
-    // Test large batch (2x scaling)
-    let large_budget = config.get_bulk_operation_budget(&index_path, 10000);
-    let expected_large = min_budget * 2;
-    assert_eq!(
-        large_budget, expected_large,
-        "Large batch should use 2x budget"
-    );
-
-    // Verify scaling is capped at max budget
-    let max_budget = config.indexer_memory_max_mb * 1024 * 1024;
-    assert!(
-        large_budget <= max_budget,
-        "Budget should not exceed maximum"
-    );
-
-    println!("✅ Bulk memory budget scaling works correctly!");
-    println!("   Base (500):   {}MB", base_budget / (1024 * 1024));
-    println!("   Medium (2000): {}MB", medium_budget / (1024 * 1024));
-    println!("   Large (10000): {}MB", large_budget / (1024 * 1024));
 }
 
 #[test]

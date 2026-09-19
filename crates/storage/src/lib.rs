@@ -266,27 +266,6 @@ impl StorageConfig {
             size_based_budget
         }
     }
-
-    /// Calculate memory budget for bulk operations with size-based scaling.
-    ///
-    /// Increases budget for large bulk operations to reduce segment flushing:
-    /// - batch_size > 5000: 2x base budget
-    /// - batch_size > 1000: 1.5x base budget
-    /// - otherwise: base budget
-    pub fn get_bulk_operation_budget(&self, index_path: &Path, batch_size: usize) -> usize {
-        let base_budget = self.get_optimal_memory_budget(index_path, None);
-
-        // Scale budget based on batch size to optimize indexing throughput
-        let scaled_budget = match batch_size {
-            0..=1000 => base_budget,
-            1001..=5000 => base_budget * 3 / 2, // 1.5x for medium batches
-            _ => base_budget * 2,               // 2x for large batches (>5000)
-        };
-
-        // Cap at maximum budget
-        let max_budget = self.indexer_memory_max_mb * 1024 * 1024;
-        scaled_budget.min(max_budget)
-    }
 }
 
 /// Statistics for an index.

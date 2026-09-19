@@ -1,11 +1,12 @@
 //! The read side of `HybridStore`: reader pool, read caches, query validation,
 //! `search_documents`, key lookups and index statistics.
 use crate::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant};
 
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde_json::Value as JsonValue;
@@ -56,6 +57,43 @@ pub(crate) fn index_size_bytes(index_path: &Path) -> Option<u64> {
     Some(total)
 }
 
+/// A commit-cadence memory budget, and when it was measured.
+///
+/// The budget comes from [`index_size_bytes`], which is a `read_dir` plus a `stat` per file —
+/// some three hundred syscalls on a fifty-segment index. What it buys is a five-bucket size
+/// class (100MB / 500MB / 2GB / 8GB) that scales how many operations accumulate before the next
+/// commit. `commit_index` used to re-measure it after *every* commit, on the writer thread, in
+/// the window between the Tantivy commit and the checkpoint transaction — precision nobody
+/// could use, since an index crosses one of those boundaries after hundreds of megabytes of
+/// writing. The timestamp is what lets one measurement stand for many commits.
+#[derive(Clone, Copy)]
+pub(crate) struct BudgetCacheEntry {
+    pub(crate) budget: usize,
+    pub(crate) measured_at: Instant,
+}
+
+/// How long a measured budget stands before the index directory is walked again.
+///
+/// Bounds the walk at two per index per minute however hard the index is being written, against
+/// one per commit before. A budget this stale is still right: crossing a size class takes orders
+/// of magnitude longer than 30s of writing at any rate this engine sustains, and being one
+/// bucket behind for a few seconds costs a commit cadence slightly off its optimum, not
+/// correctness.
+pub(crate) const BUDGET_CACHE_TTL: Duration = Duration::from_secs(30);
+
+impl BudgetCacheEntry {
+    pub(crate) fn now(budget: usize) -> Self {
+        Self {
+            budget,
+            measured_at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn is_stale(&self) -> bool {
+        self.measured_at.elapsed() >= BUDGET_CACHE_TTL
+    }
+}
+
 /// Unified cache entry for index sizes (both Tantivy directory and Redb table) with timestamp
 #[derive(Clone)]
 pub(crate) struct IndexSizeCache {
@@ -80,8 +118,88 @@ pub(crate) struct IndexSizeCache {
 /// side takes the guard first, the outcome is a cache without a stale body in it.
 #[derive(Default)]
 pub(crate) struct IndexReadCache {
-    pub(crate) entries: HashMap<String, Vec<u8>>,
+    pub(crate) entries: HashMap<String, CachedBody>,
+    /// The clock hand's ring: cached keys, oldest first. It may hold names whose body an
+    /// invalidation has already removed — dropping those here as they are invalidated would put
+    /// an O(ring) scan on the writer thread for every id a batch touches, so the sweep drops
+    /// them as it reaches them and [`IndexReadCache::compact_ring`] drops them in bulk if they
+    /// pile up faster than eviction consumes them.
+    order: VecDeque<String>,
     pub(crate) generation: u64,
+}
+
+/// One cached document body, and whether anyone has read it since the clock hand last passed.
+///
+/// `referenced` is an atomic so that a cache *hit* can set it through the shared `DashMap` guard
+/// [`HybridStore::get_from_cache`] already holds. Recording a hit any other way would make every
+/// read take the entry exclusively, which costs more than the eviction policy is worth.
+pub(crate) struct CachedBody {
+    bytes: Vec<u8>,
+    referenced: AtomicBool,
+}
+
+impl CachedBody {
+    /// A new body starts its first round **unreferenced**, and that is deliberate.
+    ///
+    /// A body is only cached because a read just missed and went to redb, so marking it
+    /// referenced would be defensible — and would make the cache defenceless against a scan.
+    /// Every body a sequential pass touches would arrive protected, the hand would wrap
+    /// clearing bits it had just set, and the entries evicted would be whichever the scan had
+    /// not reached yet, including the genuinely hot ones. Starting cold means a body has to be
+    /// asked for a *second* time to earn its second chance, which is the difference between a
+    /// cache and a buffer of the most recent misses.
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            referenced: AtomicBool::new(false),
+        }
+    }
+}
+
+impl IndexReadCache {
+    /// Evict one body, choosing the victim by CLOCK.
+    ///
+    /// Walk the ring from the oldest key. A body read since the hand last passed gets a second
+    /// chance: its bit is cleared and it goes to the back. The first body whose bit is already
+    /// clear is evicted.
+    ///
+    /// The policy this replaces was `entries.keys().next()` — arbitrary `HashMap` order, which
+    /// is neither LRU nor FIFO however it is described. A bounded cache under pressure could
+    /// therefore drop the hot set and keep bodies nobody had asked for since they were stored,
+    /// which is the one behaviour a cache must not have.
+    ///
+    /// Terminates: every iteration either removes an entry, drops a stale name, or clears a
+    /// bit, and once a full pass has cleared every bit the next candidate is evicted.
+    fn evict_one(&mut self) {
+        if self.order.is_empty() {
+            // The ring is rebuilt rather than trusted, so a bookkeeping slip degrades the
+            // policy to arbitrary instead of silently leaving the cache unbounded.
+            self.order.extend(self.entries.keys().cloned());
+        }
+
+        while let Some(key) = self.order.pop_front() {
+            match self.entries.get(&key) {
+                // A name left behind by an invalidation. Drop it and keep walking.
+                None => continue,
+                Some(body) if body.referenced.swap(false, AtomicOrdering::Relaxed) => {
+                    self.order.push_back(key);
+                }
+                Some(_) => {
+                    self.entries.remove(&key);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Drop ring entries whose bodies are gone, when they have outnumbered the live ones.
+    fn compact_ring(&mut self, bound: usize) {
+        if self.order.len() <= bound * 2 {
+            return;
+        }
+        let entries = &self.entries;
+        self.order.retain(|key| entries.contains_key(key));
+    }
 }
 
 /// Result of batch index size measurement
@@ -94,7 +212,12 @@ pub(crate) struct IndexSizes {
 impl HybridStore {
     /// Get a value from the read cache if present.
     pub(crate) fn get_from_cache(&self, index: &str, key: &str) -> Option<Vec<u8>> {
-        self.read_cache.get(index)?.entries.get(key).cloned()
+        let index_cache = self.read_cache.get(index)?;
+        let body = index_cache.entries.get(key)?;
+        // The hit itself is what keeps this body alive past the next sweep. See
+        // [`IndexReadCache::evict_one`].
+        body.referenced.store(true, AtomicOrdering::Relaxed);
+        Some(body.bytes.clone())
     }
 
     /// The generation a reader must quote back to `insert_into_cache`.
@@ -109,12 +232,18 @@ impl HybridStore {
             .unwrap_or(0)
     }
 
-    /// Insert a value into the read cache with a simple per-index size bound.
+    /// Insert a value into the read cache, under a per-index bound with a CLOCK victim.
+    ///
+    /// The bound is per index, so the real ceiling is `MAX_CACHE_ENTRIES_PER_INDEX` × the number
+    /// of indexes this node has touched — one of the unbounded index-count dimensions M1 is
+    /// about. What is fixed here is only *which* body goes when the bound bites; see
+    /// [`IndexReadCache::evict_one`].
     ///
     /// `seen_generation` is what [`cache_generation`](Self::cache_generation) returned before the
     /// read that produced `value`. A mismatch means a write committed in between, so `value` is a
     /// pre-write body and caching it would reinstate exactly the staleness the write removed.
-    /// Dropping it costs one cache miss; keeping it costs a wrong answer until the FIFO evicts it.
+    /// Dropping it costs one cache miss; keeping it costs a wrong answer until something evicts
+    /// it, which nothing is guaranteed to do.
     pub(crate) fn insert_into_cache(
         &self,
         index: &str,
@@ -130,13 +259,20 @@ impl HybridStore {
             return;
         }
 
-        if index_cache.entries.len() >= MAX_CACHE_ENTRIES_PER_INDEX
-            && let Some(first_key) = index_cache.entries.keys().next().cloned()
-        {
-            index_cache.entries.remove(&first_key);
+        if index_cache.entries.len() >= MAX_CACHE_ENTRIES_PER_INDEX {
+            index_cache.evict_one();
         }
+        index_cache.compact_ring(MAX_CACHE_ENTRIES_PER_INDEX);
 
-        index_cache.entries.insert(key.to_string(), value);
+        // A key already in `entries` is already in the ring, and keeps its place there: a
+        // re-read that refreshes a body is not a reason to move it to the back of the queue.
+        if index_cache
+            .entries
+            .insert(key.to_string(), CachedBody::new(value))
+            .is_none()
+        {
+            index_cache.order.push_back(key.to_string());
+        }
     }
 
     /// Drop the cached bodies for ids a write has just changed, and bump the generation.
@@ -164,6 +300,7 @@ impl HybridStore {
         let mut index_cache = self.read_cache.entry(index.to_string()).or_default();
         index_cache.generation = index_cache.generation.wrapping_add(1);
         index_cache.entries.clear();
+        index_cache.order.clear();
     }
 
     /// Smart refresh strategy for reader cache

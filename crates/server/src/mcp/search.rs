@@ -407,7 +407,7 @@ pub(super) fn search_across_indexes(
 
         while let Some((named_at, index_name, result)) = search_futures.next().await {
             // Schema-aware error handling
-            let result = match result {
+            let mut result = match result {
                 Ok(r) => r,
                 Err(err) => {
                     let err_str = err.to_string();
@@ -466,20 +466,25 @@ pub(super) fn search_across_indexes(
                     .map(str::to_string)
             });
 
-            if let Some(hits) = result.get("hits").and_then(|value| value.as_array()) {
-                let block: Vec<JsonValue> = hits
-                    .iter()
-                    .map(|hit| {
-                        let mut hit_value = hit.clone();
-                        if let Some(hit_obj) = hit_value.as_object_mut() {
-                            hit_obj.insert(
-                                "_index_source".to_string(),
-                                JsonValue::String(index_name.clone()),
-                            );
-                        }
-                        hit_value
-                    })
-                    .collect();
+            // The hits move out of the response rather than being copied out of it. On this
+            // surface a hit *is* the document — MCP answers with bodies, not with references —
+            // so deep-cloning every one of them to stamp `_index_source` on the copy doubled the
+            // peak memory of every federated response, out of a value this function already
+            // owns and drops at the end of the iteration. Taking the array costs a pointer
+            // swap, and the stamp then happens in place.
+            if let Some(hits) = result
+                .get_mut("hits")
+                .and_then(|value| value.as_array_mut())
+            {
+                let mut block = std::mem::take(hits);
+                for hit in &mut block {
+                    if let Some(hit_obj) = hit.as_object_mut() {
+                        hit_obj.insert(
+                            "_index_source".to_string(),
+                            JsonValue::String(index_name.clone()),
+                        );
+                    }
+                }
                 blocks.push((named_at, block));
             }
         }

@@ -728,6 +728,133 @@ mod tests {
         assert!(!cache.contains_key(&(true, "a".to_string())));
     }
 
+    /// A full read cache evicts a body nobody has read, not whichever one the hash map named
+    /// first.
+    ///
+    /// The bound bit with `entries.keys().next()` as the victim — arbitrary `HashMap` order,
+    /// neither LRU nor FIFO however the surrounding comments described it — so a cache under
+    /// pressure could drop the hot set and keep bodies nothing had asked for since they were
+    /// stored. CLOCK gives a read since the last sweep a second chance, which is the property
+    /// this pins: fill the cache past its bound, reading one key throughout, and that key must
+    /// still be there.
+    #[test]
+    fn the_read_cache_evicts_what_nobody_is_reading() {
+        const BOUND: usize = 1024;
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(read_cache_config(&temp_dir), 1).expect("store");
+        let index = "hot";
+
+        let generation = store.cache_generation(index);
+        store.insert_into_cache(index, "hot-key", b"hot body".to_vec(), generation);
+
+        // Two full turns of cold traffic, re-reading the hot key each time round. Two, because
+        // one pass only clears every bit; the pass after it is the one that evicts.
+        for round in 0..2 {
+            for n in 0..BOUND {
+                assert_eq!(
+                    store.get_from_cache(index, "hot-key").as_deref(),
+                    Some(&b"hot body"[..]),
+                    "the hot key must survive round {round}, insert {n}"
+                );
+                store.insert_into_cache(
+                    index,
+                    &format!("cold-{round}-{n}"),
+                    b"cold body".to_vec(),
+                    generation,
+                );
+            }
+        }
+
+        assert_eq!(
+            store.get_from_cache(index, "hot-key").as_deref(),
+            Some(&b"hot body"[..]),
+            "a body read on every round must outlive {BOUND} bodies read once"
+        );
+
+        // And the bound still holds: the cache is capped, it just chose better.
+        assert!(
+            store.read_cache.get(index).expect("cache").entries.len() <= BOUND,
+            "the per-index bound must still be enforced"
+        );
+
+        // The earliest cold bodies are what went.
+        assert!(
+            store.get_from_cache(index, "cold-0-0").is_none(),
+            "a body stored first and never read again is the one to evict"
+        );
+    }
+
+    /// A commit does not re-walk the index directory to refresh the memory budget.
+    ///
+    /// `commit_index` used to call `get_optimal_memory_budget` on every commit, which is a
+    /// `read_dir` plus a `stat` per file — some three hundred syscalls on a fifty-segment index
+    /// — on the writer thread, in the window between the Tantivy commit and the checkpoint
+    /// transaction. It fed one thing: the five-bucket size class that scales how many
+    /// operations accumulate before the *next* commit, whose boundaries are 100MB, 500MB, 2GB
+    /// and 8GB apart. A commit cannot move an index across one of those, so the measurement was
+    /// precision nobody could use.
+    ///
+    /// The timestamp is the evidence: it is stamped when the budget is measured, so an
+    /// unchanged one means no walk happened. `should_commit_writer` ages it out on its own TTL,
+    /// which bounds the walk per index rather than per commit.
+    #[test]
+    fn a_commit_does_not_re_measure_the_memory_budget() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(read_cache_config(&temp_dir), 1).expect("store");
+        let index = "cadence";
+
+        store
+            .store_schema_and_cache(index, &IndexSchema::default())
+            .expect("store schema");
+        store
+            .apply_write(
+                index,
+                WalOp::Put {
+                    id: "d1".to_string(),
+                    json_blob: Some(serde_json::json!({ "title": "one" })),
+                },
+            )
+            .expect("write");
+
+        let measured_at = store
+            .budget_cache
+            .get(index)
+            .expect("opening the index measures the budget once")
+            .value()
+            .measured_at;
+
+        for _ in 0..3 {
+            store.commit_index(index).expect("commit");
+        }
+
+        let after = store
+            .budget_cache
+            .get(index)
+            .expect("the entry must still be there")
+            .value()
+            .measured_at;
+        assert_eq!(
+            measured_at, after,
+            "a commit must not re-measure the budget; the TTL decides when that happens"
+        );
+
+        // And the heuristic the budget feeds still answers, from the entry that stood.
+        assert!(
+            !store.should_commit_writer(index, 0),
+            "nothing pending, so no commit is due"
+        );
+        assert_eq!(
+            store
+                .budget_cache
+                .get(index)
+                .expect("entry")
+                .value()
+                .measured_at,
+            measured_at,
+            "a fresh entry must be used as-is rather than re-measured"
+        );
+    }
+
     /// A WAL entry written by the previous build still decodes.
     ///
     /// Those entries are whole `WalOp` JSON values, and an upgrade can find a tail of them left
