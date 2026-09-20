@@ -58,6 +58,16 @@ pub trait McpAuthz: Send + Sync + 'static {
 
     /// Whether this caller holds `capability`.
     fn has(&self, capability: McpCapability) -> bool;
+
+    /// The address the request arrived from, where the host knows one.
+    ///
+    /// Only useful when [`McpAuthz::key_id`] is `None`: it is what a host meters an
+    /// unidentified caller by, so that one anonymous client cannot spend the allowance of
+    /// every other. Defaulted to `None` — a host with no socket behind its transport, or no
+    /// wish to distinguish callers that way, is not made to invent an answer.
+    fn peer_addr(&self) -> Option<std::net::IpAddr> {
+        None
+    }
 }
 
 /// How identity is carried through the transport. Cheap to clone into a spawned task.

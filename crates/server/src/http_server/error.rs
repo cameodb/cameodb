@@ -57,12 +57,22 @@ impl AppError {
         }
     }
 
-    /// 429 with an explicit, client-safe message, for a caller that has spent its rate budget.
-    pub fn too_many_requests(msg: impl Into<String>) -> Self {
+    /// 429 for a caller that has spent its rate budget, with the wait the limiter computed.
+    ///
+    /// The wait goes in both the message and the `Retry-After` header. The header is what a
+    /// client library obeys without being written to understand this node's prose, and the
+    /// limiter's whole contract is that obeying it works — `waiting_the_advertised_time_earns_
+    /// another_call` in `ratelimit` is the arithmetic, and it is worth nothing to a caller that
+    /// was never told the number in a form it reads.
+    ///
+    /// There is no variant without a wait: every refusal this node raises comes from a token
+    /// bucket, and a bucket always knows when its next token lands.
+    pub fn too_many_requests_in(msg: impl Into<String>, retry_after_secs: u64) -> Self {
+        let msg = msg.into();
         Self {
-            error: anyhow::anyhow!("{}", msg.into()),
+            error: anyhow::anyhow!("{msg} Retry after {retry_after_secs}s."),
             status: Some(StatusCode::TOO_MANY_REQUESTS),
-            retry_after_secs: None,
+            retry_after_secs: Some(retry_after_secs),
         }
     }
 
@@ -146,7 +156,10 @@ impl IntoResponse for AppError {
         // that retries immediately deepens the overload it is retrying into. The refusal
         // carries the backlog it was decided on when it has one (`Overloaded` sets
         // `retry_after_secs` from the predicted wait); anything else retries in a second.
-        if status == StatusCode::SERVICE_UNAVAILABLE {
+        //
+        // A 429 is the same bargain made by the rate limiter, which always knows its number:
+        // `too_many_requests_in` carries it, and a client that obeys the header is admitted.
+        if status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::TOO_MANY_REQUESTS {
             let retry_after = self.retry_after_secs.unwrap_or(1).to_string();
             return (
                 status,
