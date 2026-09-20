@@ -4,7 +4,7 @@ use axum::{
     Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderValue, header},
+    http::{HeaderValue, StatusCode, header},
     response::Response,
 };
 use bytes::BytesMut;
@@ -289,6 +289,16 @@ pub(super) async fn write_stream_handler(
 
     let batch_size = state.stream_batch_size.max(1);
     let max_record_size_bytes = state.max_record_size_bytes;
+    // The same allowance every other route gets, counted where this one can see it. See
+    // `AppState::max_body_size_bytes`: a raw-`Body` handler is outside every extractor limit,
+    // and the wire limit that does cover it counts bytes before `RequestDecompressionLayer`
+    // inflates them — so without this, compressing a request bought more allowance than
+    // sending it plain, without bound.
+    let max_body_size_bytes = state.max_body_size_bytes;
+    let mut body_bytes: usize = 0;
+    // Set when the body has passed the ceiling. What has been written stays written and is
+    // reported; nothing further is read.
+    let mut over_limit = false;
 
     let mut written: u64 = 0;
     let mut errors = BoundedErrors::default();
@@ -313,6 +323,16 @@ pub(super) async fn write_stream_handler(
         let chunk = chunk.map_err(|e| {
             AppError::bad_request(format!("Failed to read request body chunk: {e}"))
         })?;
+
+        // Counted before the chunk is parsed, and decisive: the stream stops here rather than
+        // finishing the lines already buffered, because the point is to stop doing work for a
+        // body that has already had more than its allowance.
+        body_bytes = body_bytes.saturating_add(chunk.len());
+        if body_bytes > max_body_size_bytes {
+            over_limit = true;
+            break;
+        }
+
         buf.extend_from_slice(&chunk);
 
         loop {
@@ -387,8 +407,10 @@ pub(super) async fn write_stream_handler(
     }
 
     // A trailing line with no newline of its own. One that outgrew the limit was already refused
-    // above, when the buffer passed it.
-    if !discarding && !buf.is_empty() {
+    // above, when the buffer passed it. Skipped when the body was cut at the ceiling, because
+    // what is left in the buffer is then the front of a line whose remainder never arrived —
+    // parsing it would report a truncated document as a malformed one.
+    if !over_limit && !discarding && !buf.is_empty() {
         line_number += 1;
         documents += 1;
         let line = buf.freeze();
@@ -406,6 +428,33 @@ pub(super) async fn write_stream_handler(
         batches += 1;
         written += batch_written;
         errors.extend(batch_errors);
+    }
+
+    // Refused, and the refusal reports what landed before it. A 413 alone would leave the
+    // caller unable to tell whether the documents it sent are in the index, which on a
+    // partially-consumed stream is the one thing it cannot work out for itself. The status is
+    // the same one `RequestBodyLimitLayer` gives an uncompressed body of the same size, so a
+    // caller cannot tell from the code whether it compressed.
+    if over_limit {
+        warn!(
+            index = %index,
+            limit_bytes = max_body_size_bytes,
+            items_written = written,
+            "Write stream refused: body exceeded the decompressed size limit"
+        );
+        let result = serde_json::json!({
+            "status": "refused",
+            "error": format!(
+                "request body exceeded the {max_body_size_bytes}-byte limit after decompression; \
+                 the stream was stopped and the documents already written are reported below"
+            ),
+            "items_written": written,
+            "lines_received": documents,
+            "batches": batches,
+            "errors": errors.listed,
+            "suppressed_errors": errors.suppressed,
+        });
+        return Ok(json_response(StatusCode::PAYLOAD_TOO_LARGE, &result));
     }
 
     if documents == 0 {
@@ -462,19 +511,25 @@ pub(super) async fn write_stream_handler(
         "suppressed_errors": errors.suppressed,
     });
 
-    let bytes = serde_json::to_vec(&result).map_err(|e| {
-        AppError::from(anyhow::anyhow!(
-            "Failed to serialize write stream result: {}",
-            e
-        ))
-    })?;
+    Ok(json_response(StatusCode::OK, &result))
+}
 
+/// A JSON response at a given status.
+///
+/// Shared by the stream handler's two exits — the summary it answers with, and the refusal it
+/// answers with when the body passed its ceiling — because those two differ in status and in
+/// one field, and should not differ in anything else.
+fn json_response(status: StatusCode, body: &JsonValue) -> Response {
+    // Serialising a `serde_json::Value` cannot fail, so the fallible form this replaces was
+    // carrying an error arm nothing could reach.
+    let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     let mut resp = Response::new(Body::from(bytes));
+    *resp.status_mut() = status;
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    Ok(resp)
+    resp
 }
 
 /// The one wording for a line larger than a single record may be.

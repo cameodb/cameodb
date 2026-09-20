@@ -25,6 +25,18 @@ pub struct AppState {
     /// the request as a whole, but one unterminated line could still buffer the entire
     /// allowance in memory, so the per-record cap is what keeps peak memory bounded.
     pub max_record_size_bytes: usize,
+    /// Largest accepted request body *after decompression*, in bytes (from
+    /// `max_body_size_mb`).
+    ///
+    /// Everywhere else this setting already means decompressed bytes: `DefaultBodyLimit` sits
+    /// inside `RequestDecompressionLayer`, so a `Json` or `Bytes` extractor measures a gzip bomb
+    /// expanded. The NDJSON stream handler takes a raw `Body`, which no extractor limit
+    /// reaches, and the only guard that did reach it — `RequestBodyLimitLayer` — counts bytes
+    /// off the socket, before they are inflated. So a compressed stream under the wire limit
+    /// could expand without bound, and compressing a request bought a caller more allowance
+    /// than sending it plain. The handler counts what it drains against this, so the setting
+    /// means one thing on every route.
+    pub max_body_size_bytes: usize,
     /// Per-key budget for MCP tool calls. Shared across every request, because a rate limit
     /// that reset per connection would not be one.
     pub tool_limiter: Arc<ToolRateLimiter>,
