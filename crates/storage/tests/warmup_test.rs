@@ -11,6 +11,7 @@ use tempfile::TempDir;
 
 fn test_config(shard_path: &std::path::Path) -> StorageConfig {
     StorageConfig {
+        max_open_indexes: 0,
         shard_path: shard_path.to_path_buf(),
         indexer_memory_budget: 32 * 1024 * 1024,
         indexer_memory_min_mb: 16,

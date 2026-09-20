@@ -53,6 +53,27 @@ pub struct JemallocStats {
     pub retained: Option<u64>,
 }
 
+/// What one shard is holding open, against what it is allowed to hold.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShardOpenIndexes {
+    pub shard_id: String,
+    pub open: usize,
+    /// This shard's share of the node-wide cap; `0` when uncapped.
+    pub cap: usize,
+}
+
+/// The open-index set across the node — the extent `limits.max_open_indexes` bounds.
+///
+/// Reported per shard as well as summed, because a node evicting hard on one shard while
+/// another sits idle has a routing problem rather than a capacity one, and the sum is exactly
+/// what hides that.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpenIndexStats {
+    pub open: usize,
+    pub cap: usize,
+    pub per_shard: Vec<ShardOpenIndexes>,
+}
+
 /// Report returned by GET /_admin/memory and POST /_admin/memory/purge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminMemoryReport {
@@ -63,6 +84,8 @@ pub struct AdminMemoryReport {
     pub jemalloc: Option<JemallocStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub purge_result: Option<i32>,
+    /// Open indexes, per shard and in total. The one number here that a caller can move.
+    pub indexes: OpenIndexStats,
 }
 
 // ── Index admin report structs ──
@@ -289,7 +312,7 @@ impl Message<GetAdminMemory> for NodeOrchestrator {
         _msg: GetAdminMemory,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let report = tokio::task::spawn_blocking(|| {
+        let mut report = tokio::task::spawn_blocking(|| {
             #[cfg(target_os = "linux")]
             let jemalloc = Some(read_jemalloc_stats());
             #[cfg(not(target_os = "linux"))]
@@ -300,11 +323,13 @@ impl Message<GetAdminMemory> for NodeOrchestrator {
                 process_after_purge: None,
                 jemalloc,
                 purge_result: None,
+                indexes: OpenIndexStats::default(),
             }
         })
         .await
         .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
 
+        report.indexes = self.open_index_stats();
         Ok(report)
     }
 }
@@ -319,7 +344,7 @@ impl Message<PurgeAdminMemory> for NodeOrchestrator {
     ) -> Self::Reply {
         #[allow(unused_variables)]
         let force = msg.force;
-        let report = tokio::task::spawn_blocking(move || {
+        let mut report = tokio::task::spawn_blocking(move || {
             let process = read_process_memory_stats();
             #[cfg(target_os = "linux")]
             let purge_result = Some(call_memory_purge(force));
@@ -337,11 +362,13 @@ impl Message<PurgeAdminMemory> for NodeOrchestrator {
                 process_after_purge: Some(process_after_purge),
                 jemalloc,
                 purge_result,
+                indexes: OpenIndexStats::default(),
             }
         })
         .await
         .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
 
+        report.indexes = self.open_index_stats();
         Ok(report)
     }
 }
@@ -373,6 +400,26 @@ impl Message<EvictAdminIndexWriter> for NodeOrchestrator {
 // ── NodeOrchestrator helper methods for admin operations ──
 
 impl NodeOrchestrator {
+    /// The open-index set, read straight off each shard's store.
+    ///
+    /// No channel: the count is the length of a `DashMap`, so asking the writer thread for it
+    /// would queue an observation behind whatever writes are in flight — and the moment an
+    /// operator most wants this number is the moment that queue is longest.
+    fn open_index_stats(&self) -> OpenIndexStats {
+        let mut stats = OpenIndexStats::default();
+        for (shard_id, shard) in &self.shards {
+            let (open, cap) = shard.open_index_counts();
+            stats.open += open;
+            stats.cap += cap;
+            stats.per_shard.push(ShardOpenIndexes {
+                shard_id: shard_id.to_string(),
+                open,
+                cap,
+            });
+        }
+        stats
+    }
+
     pub(crate) async fn orch_admin_commit_index(
         &self,
         index: String,

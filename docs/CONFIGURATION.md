@@ -116,6 +116,9 @@ max_body_size_mb = 0
 # The node's memory budget in MB (default: 2048).
 total_memory_limit_mb = 2048
 
+# Largest number of indexes held open at once. 0 (default) derives it from the memory budget.
+max_open_indexes = 0
+
 # Largest MCP search response in bytes. Unset, it follows the HTTP body ceiling.
 # max_response_bytes = 16777216
 ```
@@ -129,10 +132,11 @@ from it:
 | Inter-node message max | `max_record_size_mb × 1.25` | 80 MB |
 | HTTP request timeout | `max(60, max_record_size_mb / 10)` s | 60 s |
 | Largest MCP search response | the HTTP body size | 128 MB |
+| Open indexes | `total_memory_limit_mb / indexer_memory_min_mb`, clamped to 8–256 | 32 |
 
 Each derived value can be pinned on its own — `limits.max_body_size_mb`,
-`limits.max_response_bytes`, `network.http.request_timeout_secs` — and a written value always
-wins, whatever it says. Because most of them are *not* written in the file, `cameodb
+`limits.max_response_bytes`, `limits.max_open_indexes`, `network.http.request_timeout_secs` —
+and a written value always wins, whatever it says. Because most of them are *not* written in the file, `cameodb
 check-config` prints what the node resolved, and says of the timeout which of the two it is:
 
 ```
@@ -152,6 +156,21 @@ trying something rather than while writing a file.
 Inter-node forwarding has its own deadline, `network.cluster.messaging.request_timeout_secs`.
 Unset, it follows the HTTP timeout, so that a forwarded request is not abandoned while the
 client that triggered it is still waiting; set it shorter only deliberately.
+
+**`limits.max_open_indexes` bounds what the node holds open, not what it stores.** Every open
+index costs an indexing arena and `indexer_num_threads + merge_num_threads` OS threads — three
+at the defaults — and none of that is proportional to how much data the index holds. On a node
+where callers create their own indexes, that makes resident memory a function of how many index
+*names* have been touched. Past the cap the least recently used index is committed and closed;
+its data is untouched and the next request for it reopens it, paying one reopen. Startup and
+`check-config` print what a given cap implies in both currencies:
+
+```text
+  limits           PASS  32 indexes open at once = 2048 MB of arenas and 96 writer threads worst case
+```
+
+There is no setting for "unbounded" — `0` derives rather than disables. A deployment that
+genuinely wants every index resident sets a number past its index count.
 
 **`max_body_size_mb × network.http.max_concurrent_requests` has to fit inside
 `total_memory_limit_mb`.** In-flight request bodies are held in memory, so a large body ceiling

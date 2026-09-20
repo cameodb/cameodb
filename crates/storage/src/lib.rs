@@ -70,6 +70,20 @@ pub struct StorageConfig {
     /// The root folder for this shard's data files.
     pub shard_path: PathBuf,
 
+    /// Largest number of indexes this **node** may hold open at once; `0` means no cap.
+    ///
+    /// Divided by the shard count in `HybridStore::new`, the same way
+    /// `total_memory_limit_bytes` is, because the number that matters to an operator is the
+    /// node's and the number that matters to a shard is its share.
+    ///
+    /// A count rather than a byte budget, and that is the whole point. An open index costs an
+    /// indexing arena *and* `indexer_num_threads + merge_num_threads` OS threads — three, at
+    /// the defaults. A cap expressed in megabytes would bound the first and leave the second
+    /// growing with however many index names the workload touches, which on a node whose
+    /// tenants choose their own names is not a number this process gets to pick. Capping the
+    /// count bounds both.
+    pub max_open_indexes: usize,
+
     // Memory Budget Configuration
     /// Default memory budget for each tantivy IndexWriter in bytes.
     pub indexer_memory_budget: usize,
@@ -192,6 +206,7 @@ impl Default for StorageConfig {
         const DEFAULT_MEMORY_PRESSURE_THRESHOLD_PERCENT: u8 = 80;
         Self {
             shard_path: PathBuf::from("/var/tmp/cameodb"),
+            max_open_indexes: 0,
 
             // Memory Budget Configuration
             indexer_memory_budget: 64 * 1024 * 1024,

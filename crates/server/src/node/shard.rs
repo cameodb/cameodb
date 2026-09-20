@@ -1513,6 +1513,18 @@ impl MicroshardActor {
             .map_err(OrchestratorError::Storage)
     }
 
+    /// Indexes this shard holds open, and its share of the node-wide cap (`0` when uncapped).
+    ///
+    /// Synchronous on purpose: both are lock-free reads off the store, so this does not join
+    /// the writer thread's queue to answer a question about how full that queue's shard is.
+    pub(crate) fn open_index_counts(&self) -> (usize, usize) {
+        // A shard whose store is not attached yet holds nothing open, which is the honest
+        // answer rather than a missing one.
+        self.store
+            .as_ref()
+            .map_or((0, 0), |s| (s.open_index_count(), s.open_index_cap()))
+    }
+
     pub(crate) async fn admin_evict_writer_via_channel(
         &self,
         index: String,

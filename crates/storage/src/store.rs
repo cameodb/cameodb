@@ -263,6 +263,11 @@ pub(crate) fn warm_segment(index: &str, segment_reader: &tantivy::SegmentReader)
     }
 }
 
+/// An index this shard is holding open, and the tick at which it was last used.
+pub struct OpenIndex {
+    last_used: AtomicU64,
+}
+
 /// Multi-tenant hybrid storage engine combining redb and tantivy.
 pub struct HybridStore {
     /// Shared redb database across all indices
@@ -298,6 +303,24 @@ pub struct HybridStore {
     /// redundant, and the string form made invalidation a substring match — evicting index
     /// `"a"` also evicted `"ab"` and `"aa"`. The tuple key makes invalidation exact.
     pub(crate) index_size_cache: Arc<Mutex<HashMap<(bool, String), IndexSizeCache>>>,
+    /// The indexes this shard currently holds open, and when each was last used.
+    ///
+    /// The eleventh map, and the one that bounds the other ten. An index earns an entry when
+    /// something opens a writer or a reader for it and loses it when [`Self::close_index`]
+    /// drops the set, so `len()` is the open-index count and the entry is where LRU reads its
+    /// ordering from. Bounded by construction: `max_open_indexes` is what it is a count of.
+    pub(crate) open_indexes: Arc<DashMap<String, OpenIndex>>,
+    /// Monotonic counter stamped onto an index each time it is used.
+    ///
+    /// A counter and not a clock. LRU needs an ordering and nothing more, and an atomic
+    /// increment is free next to the work it is ordering, while `Instant::now` on the hot read
+    /// path is the mistake M0-j already caught once.
+    pub(crate) open_tick: Arc<AtomicU64>,
+    /// Largest number of indexes *this shard* may hold open; `0` means no cap.
+    ///
+    /// The node-level `StorageConfig::max_open_indexes` divided by the shard count, so the
+    /// figure an operator sets is the one the node obeys.
+    pub(crate) max_open_indexes: usize,
     /// Cache expiration duration for index sizes (1 hour)
     pub(crate) index_cache_expiry: Duration,
     /// Storage configuration
@@ -463,6 +486,9 @@ impl HybridStore {
             warmed_generations: Arc::new(DashMap::new()),
             warmup_states: Arc::new(DashMap::new()),
             index_size_cache: Arc::new(Mutex::new(HashMap::new())),
+            open_indexes: Arc::new(DashMap::new()),
+            open_tick: Arc::new(AtomicU64::new(0)),
+            max_open_indexes: Self::per_shard_open_index_cap(config.max_open_indexes, total_shards),
             index_cache_expiry: Duration::from_secs(3600), // 1 hour
             config: config.clone(),
         })
@@ -620,6 +646,189 @@ impl HybridStore {
             tracing::debug!(index = %index, "No writer to force-remove");
             false
         }
+    }
+
+    /// Drop every in-memory structure this shard holds for `index`, leaving the disk alone.
+    ///
+    /// **This is the unit of eviction, and the reason it is a method rather than a line.**
+    /// `writers` is the entry worth evicting — it owns the indexing arena and the
+    /// `indexer_num_threads + merge_num_threads` OS threads that come with it — but it is one
+    /// of ten maps keyed by index name. Dropping it alone leaves the other nine resident, and
+    /// `readers` is not a small one: it holds an `IndexReader` with its segment readers and
+    /// their fast-field caches. An index is closed when its whole set is, or it is not closed.
+    ///
+    /// Nine of the ten go here, along with the size cache and this shard's record that the
+    /// index is open. `index_init_locks` is the deliberate exception, for the reason stated
+    /// inline — it is a lock, not a cache, and dropping it would unserialize the thing it
+    /// serializes.
+    ///
+    /// Callers that are *evicting* must commit first — see `close_index`. Callers that are
+    /// *deleting* must not, and call this directly.
+    fn drop_index_caches(&self, index: &str) {
+        self.writers.remove(index);
+        self.readers.remove(index);
+        self.current_seq.remove(index);
+        self.schema_cache.remove(index);
+        self.fields_cache.remove(index);
+        self.budget_cache.remove(index);
+        // The operations counter tracks documents buffered in the writer we just dropped.
+        // Leaving it non-zero makes the next commit_index for this name believe there is
+        // unflushed data.
+        self.operations_counter.remove(index);
+        // Warmup is invalidated by generation equality, and this name's next reader starts
+        // its generation counter from zero. Dropping both entries is what makes the next
+        // warm actually run, and stops the name reporting warm while it holds no data.
+        self.warmed_generations.remove(index);
+        self.warmup_states.remove(index);
+        // Note: index_init_locks is deliberately not cleared. A concurrent
+        // get_or_create_index may be holding the lock, and replacing it here would let a
+        // later caller initialize the same index in parallel with that holder.
+        self.open_indexes.remove(index);
+
+        self.invalidate_size_cache(index);
+    }
+
+    /// This shard's share of the node-wide open-index cap.
+    ///
+    /// Rounded *up*, and never to zero: a node configured for fewer open indexes than it has
+    /// shards would otherwise give each shard a cap of zero, and a cap of zero reads as "no
+    /// cap" everywhere else in this file. One per shard is the smallest honest answer.
+    fn per_shard_open_index_cap(node_cap: usize, total_shards: usize) -> usize {
+        if node_cap == 0 {
+            return 0;
+        }
+        let shards = total_shards.max(1);
+        node_cap.div_ceil(shards).max(1)
+    }
+
+    /// Record that `index` was used, if this shard is holding it open.
+    ///
+    /// Takes the map's shared guard rather than an exclusive one: the stamp is an atomic store
+    /// through `&OpenIndex`, so concurrent readers of different indexes never queue behind each
+    /// other, and two uses of the same index racing to stamp it is a race whose outcome is
+    /// "recently used" either way.
+    pub(crate) fn touch_open_index(&self, index: &str) {
+        if let Some(entry) = self.open_indexes.get(index) {
+            let tick = self.open_tick.fetch_add(1, Ordering::Relaxed);
+            entry.value().last_used.store(tick, Ordering::Relaxed);
+        }
+    }
+
+    /// Admit `index` to the open set, closing colder indexes first if it is full.
+    ///
+    /// Called on the path that is *about to* open a writer or a reader, so the admission and
+    /// the work it accounts for cannot drift apart.
+    ///
+    /// **The cap is enforced, not guaranteed, and the difference is deliberate.** A victim is
+    /// skipped when its writer mutex is not free, because taking it here would mean blocking
+    /// an opener on somebody else's commit — and, in the one case that matters, blocking it on
+    /// a lock the *calling thread* already holds, which is a deadlock rather than a delay.
+    /// When no victim can be closed the index is admitted anyway and the overshoot is logged:
+    /// exceeding the cap is recoverable and the next admission will try again, while a
+    /// deadlocked writer thread is not.
+    pub(crate) fn admit_open_index(&self, index: &str) {
+        let tick = self.open_tick.fetch_add(1, Ordering::Relaxed);
+
+        if let Some(entry) = self.open_indexes.get(index) {
+            entry.value().last_used.store(tick, Ordering::Relaxed);
+            return;
+        }
+
+        if self.max_open_indexes > 0 {
+            // `>=` because this call is about to add one.
+            while self.open_indexes.len() >= self.max_open_indexes {
+                match self.coldest_closable_index(index) {
+                    Some(victim) => self.close_index(&victim),
+                    None => {
+                        tracing::warn!(
+                            index = %index,
+                            open = self.open_indexes.len(),
+                            cap = self.max_open_indexes,
+                            "Open-index cap exceeded: every colder index is busy"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.open_indexes.insert(
+            index.to_string(),
+            OpenIndex {
+                last_used: AtomicU64::new(tick),
+            },
+        );
+    }
+
+    /// The least recently used open index that can be closed without waiting on anyone.
+    ///
+    /// `exclude` is the index being admitted, which must never be its own victim. An index
+    /// whose writer mutex is held is passed over rather than waited for; see
+    /// [`Self::admit_open_index`] for why that is the whole point.
+    fn coldest_closable_index(&self, exclude: &str) -> Option<String> {
+        let mut coldest: Option<(u64, String)> = None;
+        for entry in self.open_indexes.iter() {
+            let name = entry.key();
+            if name == exclude {
+                continue;
+            }
+            if let Some(writer) = self.writers.get(name)
+                && writer.value().try_lock().is_err()
+            {
+                continue;
+            }
+            // And not one that is being opened right now. `get_or_create_index` admits its
+            // index to the open set before it finishes building the writer, so closing a name
+            // whose init lock is held would drop caches the holder is about to repopulate and
+            // leave it open but unaccounted — a hole in the very count this cap is of.
+            if let Some(init) = self.index_init_locks.get(name)
+                && init.value().try_lock().is_err()
+            {
+                continue;
+            }
+            let used = entry.value().last_used.load(Ordering::Relaxed);
+            if coldest.as_ref().is_none_or(|(best, _)| used < *best) {
+                coldest = Some((used, name.clone()));
+            }
+        }
+        coldest.map(|(_, name)| name)
+    }
+
+    /// How many indexes this shard is holding open — the number `max_open_indexes` bounds.
+    pub fn open_index_count(&self) -> usize {
+        self.open_indexes.len()
+    }
+
+    /// This shard's share of the open-index cap; `0` when uncapped.
+    pub fn open_index_cap(&self) -> usize {
+        self.max_open_indexes
+    }
+
+    /// Whether this shard currently holds `index` open. Says nothing about whether the index
+    /// exists: a closed index and an absent one look the same from memory, which is the point.
+    pub fn is_index_open(&self, index: &str) -> bool {
+        self.open_indexes.contains_key(index)
+    }
+
+    /// Commit what `index` holds and drop every structure this shard keeps for it.
+    ///
+    /// The eviction path, and the inverse of opening one. The data on disk is untouched: the
+    /// next reference to this name reopens it and replays whatever the commit did not capture.
+    ///
+    /// A failed commit evicts anyway, which is the behaviour the admin eviction endpoint
+    /// already has and `writer_eviction_test` already pins: the documents are in redb's WAL
+    /// until a commit checkpoints past them, so dropping an uncommitted writer costs a replay
+    /// on reopen rather than the documents.
+    pub fn close_index(&self, index: &str) {
+        if let Err(e) = self.commit_index(index) {
+            tracing::warn!(
+                index = %index,
+                error = %e,
+                "Close: commit failed, closing anyway; the WAL still holds what it buffered"
+            );
+        }
+        self.drop_index_caches(index);
+        tracing::debug!(index = %index, "Index closed");
     }
 
     /// Highest `_seq` present in the index, found by ordering on the `_seq` fast field.
@@ -1329,6 +1538,10 @@ impl HybridStore {
         &self,
         index: &str,
     ) -> Result<(Arc<Mutex<IndexWriter>>, SchemaFields), StoreError> {
+        // Any return from here marks this index as used, so the LRU ordering reflects every
+        // reference and not only the ones that had to open something.
+        self.touch_open_index(index);
+
         // Fast path: Check writers cache first
         if let Some(writer) = self.writers.get(index)
             && let Some(fields) = self.fields_cache.get(index)
@@ -1562,6 +1775,10 @@ impl HybridStore {
         );
 
         let writer_arc = Arc::new(Mutex::new(writer));
+
+        // Admitted here rather than on the way in: immediately before the insert it accounts
+        // for, so a failure anywhere above leaves nothing counted as open that is not.
+        self.admit_open_index(index);
 
         // Store in cache
         self.writers
@@ -2186,28 +2403,9 @@ impl HybridStore {
         // invalid name cannot drop caches or redb tables on its way to failing.
         let index_path = self.index_dir(index)?;
 
-        // Remove from caches first
-        self.writers.remove(index);
-        self.readers.remove(index);
-        self.current_seq.remove(index);
-        self.schema_cache.remove(index);
-        self.fields_cache.remove(index);
-        self.budget_cache.remove(index);
-        // The operations counter tracks documents buffered in the writer we just dropped.
-        // Leaving it non-zero makes the next commit_index for this name believe there is
-        // unflushed data.
-        self.operations_counter.remove(index);
-        // Warmup is invalidated by generation equality, and this name's next reader starts
-        // its generation counter from zero. Dropping both entries is what makes the next
-        // warm actually run, and stops the name reporting warm while it holds no data.
-        self.warmed_generations.remove(index);
-        self.warmup_states.remove(index);
-        // Note: index_init_locks is deliberately not cleared. A concurrent
-        // get_or_create_index may be holding the lock, and replacing it here would let a
-        // later caller initialize the same index in parallel with that holder.
-
-        // Invalidate size cache entries for this index
-        self.invalidate_size_cache(index);
+        // Remove from caches first — the same ten maps an eviction drops, and deliberately
+        // without the commit that precedes one: this data is about to stop existing.
+        self.drop_index_caches(index);
 
         // Held past the transaction so the cache can take it, which is what lets
         // `index_was_dropped` answer from memory.

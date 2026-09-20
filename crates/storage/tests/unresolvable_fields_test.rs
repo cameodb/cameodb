@@ -14,6 +14,7 @@ use tempfile::TempDir;
 
 fn config(path: std::path::PathBuf) -> StorageConfig {
     StorageConfig {
+        max_open_indexes: 0,
         shard_path: path,
         indexer_memory_budget: 32 * 1024 * 1024,
         indexer_memory_min_mb: 16,

@@ -4067,6 +4067,8 @@ impl NodeOrchestrator {
         let indexer_memory_mb = self.config.indexer_memory_min_mb;
 
         StorageConfig {
+            // The node-wide figure; `HybridStore::new` takes this shard's share of it.
+            max_open_indexes: self.config.max_open_indexes,
             shard_path,
 
             // Memory Budget Configuration

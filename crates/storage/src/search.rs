@@ -143,6 +143,14 @@ impl HybridStore {
 
     /// Get document by key from specific index
     pub fn get_by_key(&self, index: &str, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        // A key lookup opens nothing — redb's tables are shared and this reads one directly —
+        // but it is still a reference to this index, and the eviction order is "least recently
+        // used", not "least recently opened". An index answering lookups all day would
+        // otherwise read as the coldest thing on the shard and be evicted out from under a
+        // tenant who is plainly using it. `touch_open_index` only stamps an index that is
+        // already open, so this cannot admit one.
+        self.touch_open_index(index);
+
         let data_table_name = format!("data_{}", index);
         let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
 
@@ -214,6 +222,8 @@ impl HybridStore {
         &self,
         index: &str,
     ) -> Result<Option<(IndexReader, SchemaFields)>, StoreError> {
+        self.touch_open_index(index);
+
         // Fast path: Zero-lock retrieval from cache
         if let Some(reader_ref) = self.readers.get(index) {
             let reader = reader_ref.value();
@@ -232,6 +242,12 @@ impl HybridStore {
         if !index_path.exists() || !index_path.join("meta.json").exists() {
             return Ok(None);
         }
+
+        // A reader is an open index too. `readers` holds an `IndexReader` with its segment
+        // readers and their fast-field caches, which is the largest of the ten per-index
+        // structures now that the document cache is gone — counting only writers would leave
+        // a search-only workload unbounded.
+        self.admit_open_index(index);
 
         // Use DashMap entry API for concurrent-safe creation
         let reader = self

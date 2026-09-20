@@ -45,14 +45,14 @@ on one.
 | 13 — Thread-per-core & memory operations | ◐ Partial | Stage 2f.2 (CPU arenas) and 2f.3 (per-arena jemalloc stats) — both with the evidence against 2f.2 |
 | 14 — Security hardening | ◐ Partial | Stage C3 only (per-index role overrides); complexity caps deferred |
 | 15 — HA: reindex, replication, migration | 📋 Planned | All three stages |
-| 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 4.2, Stage 3's deeper warming options, the measurement on the reporting node, and a cap on open index writers (E5) |
+| 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 4.2, Stage 3's deeper warming options, and the measurement on the reporting node; E5 (a cap on open indexes) done by M1 |
 | 17 — Record deletion | ✅ Done | — |
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
 | 14 — Security hardening (posture items C3–C8) | ◐ Partial | C8 (REST rate limit) open; C3–C7 done |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
-| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed, M2 and M7 done; M1 (capping a *whole index*, not its writer) is the blocker, then M3–M6 and the M8 decision |
+| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2 and M7 done — the blocker is cleared. M3–M6 and the M8 decision remain |
 
 ## Reconciliation, 2026-08-26
 
@@ -179,7 +179,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
 | [L1](#l1--size-cache-invalidation-by-substring-evicts-neighbouring-indexes) … [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | Post-0.3.4 review group — all twenty closed; the retrospective's output is [M](#m-the-035-goal-set--multi-tenant-exposure--planned) | — | 2026-09-19 | ✅ |
-| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed, M2 and M7 done, M1 is the blocker | — | 2026-09-20 | ◐ |
+| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed and the M1 blocker cleared, with M2 and M7 done | — | 2026-09-20 | ◐ |
 
 ---
 
@@ -759,7 +759,9 @@ Nothing else in this phase should be called finished before this runs.
 
 ### E5 — A cap on open index writers
 
-📋 **Planned** (0.3.3 stability audit, finding 07). `writers` is a `DashMap` that grows with the
+✅ **Done 2026-09-20** by [M1](#m1--bound-resident-memory-against-index-count), which caps
+the *index* rather than the writer this entry names — see **M0-a** for why one of ten maps was
+the wrong unit. The original finding (07, 0.3.3 stability audit): `writers` is a `DashMap` that grows with the
 number of distinct indexes written to (`storage/src/lib.rs` 3410), and every entry is a live
 Tantivy `IndexWriter` holding its own indexing arena — `indexer_memory_budget`, default 64 MiB
 (1432), scaled up further by the optimal-budget calculation. Nothing evicts by count or by total
@@ -4096,7 +4098,57 @@ value this code already owns.
 
 ### M1 — Bound resident memory against index count
 
-📋 **Planned**, and the blocker for the deployment rather than one item among several. This is
+✅ **Done 2026-09-20**, and it was the blocker for the deployment rather than one item among
+several.
+
+`limits.max_open_indexes` bounds how many indexes a node holds open at once. Past it, the least
+recently used index is committed and closed; its data is untouched and the next reference
+reopens it. Unset, it is derived from `limits.total_memory_limit_mb` divided by the smallest
+writer arena and clamped to `[8, 256]` — 32 at the defaults — for the reason
+`effective_max_body_size_mb` is derived rather than chosen: an operator who has said how much
+memory the node may use has already said most of it, and a second number to keep in step with
+the first is a number that drifts.
+
+**The unit is the index.** `close_index` commits the writer and drops all ten maps keyed by that
+name; `delete_index_data` now calls the same cache-drop rather than carrying its own copy of
+the list. Evicting the writer alone — which is what [E5](#e5--a-cap-on-open-index-writers)
+asked for and what the admin endpoint still does — would leave `readers` resident, and that is
+the largest of the ten now that the document cache is gone.
+
+**The cap is a count, not a byte budget, and that is **M0-b** cashed in.** An open index costs
+an arena *and* `indexer_num_threads + merge_num_threads` OS threads. Megabytes bound the first
+and leave the second to grow with however many names the workload touches, which on a node
+whose tenants choose their own names is not a number this process picks. A count bounds both,
+and the posture line prints what a given cap implies in each currency.
+
+**Enforced, not guaranteed — deliberately.** A victim whose writer mutex or init lock is not
+free is passed over rather than waited for. Waiting would mean blocking an opener on someone
+else's commit and, in the case that actually matters, on a lock the calling thread already
+holds, which is a deadlock rather than a delay. When nothing can be closed the index is
+admitted over the cap and the overshoot is logged: exceeding a cap is recoverable and the next
+admission tries again, while a deadlocked writer thread is not. Skipping an index that is being
+*opened* closes the other hole — `get_or_create_index` admits before the writer exists, so
+closing that name would drop caches its opener is about to repopulate and leave it open but
+uncounted, a hole in the very count the cap is of.
+
+**"Recently used" means used, not opened.** `get_by_key` reads redb directly and opens nothing,
+and the first version of the LRU therefore did not count it — so an index answering key lookups
+all day read as the coldest thing on the shard. `the_coldest_index_is_the_one_evicted` is what
+caught it; a search-only tenant would have hit the same thing through a different door.
+
+**A behaviour change, and worth saying plainly:** every release before this one held indexes
+open without limit. A node with more live indexes than the derived cap will now evict and
+reopen, which costs a reopen on the next reference and nothing else. An operator who wants the
+old behaviour sets a number past their index count and owns the arithmetic; there is no setting
+for "unbounded", because unbounded here is what this release exists to stop.
+
+Three tests, each failing against the uncapped build: the open set stays within its cap across
+forty names, an evicted index still has its documents, and the index that goes is the coldest.
+`/_admin/memory` reports the open count and cap per shard as well as summed — a node evicting
+hard on one shard while another idles has a routing problem, not a capacity one, and the sum is
+what hides that.
+
+**The original finding.** This is
 [E5](#e5--a-cap-on-open-index-writers), promoted: `writers` is a `DashMap` that grows with the
 number of distinct index names written to, every entry holds a live Tantivy `IndexWriter` with
 its own arena (`indexer_memory_budget`, default 64 MiB, scaled further by the optimal-budget

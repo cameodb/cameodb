@@ -31,6 +31,7 @@ fn test_optimal_memory_budget_by_index_size() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
 
     let config = StorageConfig {
+        max_open_indexes: 0,
         shard_path: temp_dir.path().to_path_buf(),
 
         // Memory Budget Configuration
@@ -93,6 +94,7 @@ fn test_optimal_memory_budget_sums_directory_contents() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
 
     let config = StorageConfig {
+        max_open_indexes: 0,
         shard_path: temp_dir.path().to_path_buf(),
         indexer_memory_budget: 64 * 1024 * 1024,
         indexer_memory_min_mb: 32,
