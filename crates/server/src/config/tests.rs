@@ -970,6 +970,41 @@ max_response_bytes = 16777216
         );
     }
 
+    /// A rejected PSK must not appear in the reason it was rejected.
+    ///
+    /// The refusal in `load_psk` is the one place a malformed secret would otherwise reach a
+    /// log: it is raised before anything else looks at the value, and it is the only thing the
+    /// operator sees. The code says so in a comment; this is what holds it to it. Both shapes
+    /// of refusal are covered, because they are two different messages — a value of the wrong
+    /// length, and one of the right length that is not hex.
+    #[test]
+    fn a_refused_psk_does_not_appear_in_its_own_error() {
+        for bad in [
+            // Wrong length, and long enough that a message echoing it would be obvious.
+            "sekrit-cluster-key-do-not-log-this".to_string(),
+            // Right length, wrong alphabet: the other arm of the same check.
+            "z".repeat(64),
+        ] {
+            let mut config = CameoDbConfig::default();
+            config.network.cluster.psk = Some(bad.clone());
+
+            let err = config
+                .network
+                .cluster
+                .load_psk()
+                .expect_err("a malformed psk must be refused");
+            let message = format!("{err:#}");
+            assert!(
+                !message.contains(&bad),
+                "a refused psk leaked into its own error: {message}"
+            );
+            assert!(
+                message.contains("64 hex characters"),
+                "the refusal should still say what a valid key looks like: {message}"
+            );
+        }
+    }
+
     /// pnet disables QUIC, so a QUIC address alongside a PSK can never connect. Catching
     /// it here beats a dial-time warning nobody reads.
     #[test]
