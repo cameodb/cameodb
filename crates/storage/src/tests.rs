@@ -628,6 +628,7 @@ mod tests {
 
     fn small_store_config(temp_dir: &TempDir) -> StorageConfig {
         StorageConfig {
+            max_open_indexes: 0,
             shard_path: temp_dir.path().to_path_buf(),
             indexer_memory_budget: 32 * 1024 * 1024,
             indexer_memory_min_mb: 16,
@@ -868,6 +869,7 @@ mod tests {
     fn warm_index_fills_caches_and_skips_warm_generations() {
         let temp_dir = TempDir::new().unwrap();
         let config = StorageConfig {
+            max_open_indexes: 0,
             shard_path: temp_dir.path().to_path_buf(),
             indexer_memory_budget: 32 * 1024 * 1024,
             indexer_memory_min_mb: 16,
@@ -960,6 +962,7 @@ mod tests {
     fn overridden_tokenizers_keep_tokens_up_to_the_cap() {
         let temp_dir = TempDir::new().unwrap();
         let config = StorageConfig {
+            max_open_indexes: 0,
             shard_path: temp_dir.path().to_path_buf(),
             indexer_memory_budget: 32 * 1024 * 1024,
             indexer_memory_min_mb: 16,
@@ -1063,6 +1066,7 @@ mod tests {
         std::fs::write(victim.join("keep.txt"), b"precious").unwrap();
 
         let config = StorageConfig {
+            max_open_indexes: 0,
             shard_path: shard_path.clone(),
             indexer_memory_budget: 32 * 1024 * 1024,
             indexer_memory_min_mb: 16,
@@ -1118,6 +1122,7 @@ mod tests {
     fn test_multi_tenant_storage() {
         let temp_dir = TempDir::new().unwrap();
         let config = StorageConfig {
+            max_open_indexes: 0,
             shard_path: temp_dir.path().to_path_buf(),
 
             // Memory Budget Configuration

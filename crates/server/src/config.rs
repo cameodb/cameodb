@@ -231,6 +231,22 @@ pub struct LimitsConfig {
     #[serde(default)]
     pub max_response_bytes: Option<usize>,
 
+    /// Largest number of indexes held open at once. `0` derives it from the memory budget.
+    ///
+    /// An open index costs an indexing arena and, with it, `indexer_num_threads +
+    /// merge_num_threads` OS threads. None of that is proportional to how much data the index
+    /// holds, so a node whose callers choose their own index names — a tenant-per-index or
+    /// date-partitioned layout — has a footprint set by a number it does not control. Past
+    /// this many, the least recently used index is committed and closed; its data is untouched
+    /// and the next reference to it reopens it.
+    ///
+    /// `0` derives rather than disables, the same way `max_body_size_mb` does: there is no
+    /// setting for "unbounded", because a node that was unbounded here is what this release
+    /// exists to stop. An operator who wants the old behaviour sets a number larger than the
+    /// index count they expect, and owns the arithmetic.
+    #[serde(default)]
+    pub max_open_indexes: usize,
+
     /// The node's memory budget, in MB (default: 2048).
     ///
     /// Sizes the indexer pool and is what `max_body_size_mb × max_concurrent_requests` is
@@ -246,6 +262,7 @@ impl Default for LimitsConfig {
         Self {
             max_record_size_mb: default_max_record_size_mb(),
             max_body_size_mb: 0,
+            max_open_indexes: 0,
             max_response_bytes: None,
             total_memory_limit_mb: default_total_memory_limit_mb(),
         }
@@ -672,6 +689,29 @@ impl CameoDbConfig {
         } else {
             self.limits.max_record_size_mb + 64
         }
+    }
+
+    /// Largest number of indexes held open at once, across the node.
+    ///
+    /// Derived from the memory budget when unset, for the same reason the body ceiling is
+    /// derived from the record size: an operator who has already told the node how much memory
+    /// it may use has said most of what is needed, and a second unrelated number to keep in
+    /// step with the first is a number that drifts. One writer arena per open index, at the
+    /// smallest size an arena is ever given, is the worst case this divides out.
+    ///
+    /// Clamped at both ends. The floor keeps a node with a small budget usable — below a
+    /// handful of indexes the cap would be evicting on nearly every request. The ceiling is
+    /// about the *other* resource an open index costs: at three OS threads apiece, a derived
+    /// cap in the thousands would bound the megabytes and let the thread count be the thing
+    /// that takes the node down.
+    pub fn effective_max_open_indexes(&self) -> usize {
+        if self.limits.max_open_indexes > 0 {
+            return self.limits.max_open_indexes;
+        }
+        const FLOOR: usize = 8;
+        const CEILING: usize = 256;
+        let arena_mb = self.search.indexer_memory_min_mb.max(1);
+        (self.limits.total_memory_limit_mb / arena_mb).clamp(FLOOR, CEILING)
     }
 
     /// Largest MCP search response in **bytes**.

@@ -75,6 +75,11 @@ pub(crate) const OVERRIDES: &[Override] = &[
         apply: |c, v| { c.limits.max_body_size_mb = v.parse()?; Ok(()) },
     },
     Override {
+        flag: "--max-open-indexes", env: "CAMEODB_MAX_OPEN_INDEXES", kind: FlagKind::Value,
+        placeholder: "<N>", help: "Indexes held open at once (defaults to derived from memory budget)",
+        apply: |c, v| { c.limits.max_open_indexes = v.parse()?; Ok(()) },
+    },
+    Override {
         flag: "--max-concurrent-requests", env: "CAMEODB_MAX_CONCURRENT_REQUESTS", kind: FlagKind::Value,
         placeholder: "<N>", help: "Max concurrent in-flight HTTP requests (default: 128)",
         apply: |c, v| { c.network.http.max_concurrent_requests = v.parse()?; Ok(()) },

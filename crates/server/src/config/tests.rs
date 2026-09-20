@@ -970,6 +970,45 @@ max_response_bytes = 16777216
         );
     }
 
+    /// The open-index cap follows the memory budget unless it is set outright.
+    ///
+    /// Two numbers that must stay in step, so only one of them is written down. The clamps are
+    /// the part worth pinning: without the floor a small node caps itself at one or two indexes
+    /// and evicts on nearly every request, and without the ceiling a large budget derives a cap
+    /// in the thousands — bounding the megabytes while leaving the three OS threads per open
+    /// index to be what takes the node down.
+    #[test]
+    fn the_open_index_cap_follows_the_memory_budget_until_it_is_set() {
+        let mut config = CameoDbConfig::default();
+        config.limits.total_memory_limit_mb = 2048;
+        config.search.indexer_memory_min_mb = 64;
+        assert_eq!(
+            config.effective_max_open_indexes(),
+            32,
+            "one smallest-size arena per open index is what the budget divides into"
+        );
+
+        // A budget too small to derive a workable cap from still gets the floor.
+        config.limits.total_memory_limit_mb = 64;
+        assert_eq!(config.effective_max_open_indexes(), 8, "the floor holds");
+
+        // And a large one does not derive a cap the thread count could not survive.
+        config.limits.total_memory_limit_mb = 1024 * 1024;
+        assert_eq!(
+            config.effective_max_open_indexes(),
+            256,
+            "the ceiling holds"
+        );
+
+        // Set outright, it is taken as written — including past the derived ceiling.
+        config.limits.max_open_indexes = 4000;
+        assert_eq!(
+            config.effective_max_open_indexes(),
+            4000,
+            "an operator who names the number means it"
+        );
+    }
+
     /// A rejected PSK must not appear in the reason it was rejected.
     ///
     /// The refusal in `load_psk` is the one place a malformed secret would otherwise reach a

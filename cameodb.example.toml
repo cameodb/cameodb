@@ -68,6 +68,12 @@ max_body_size_mb = 0
 # The node's memory budget: the indexer pool is sized from it and startup weighs the body
 # ceiling against it.
 total_memory_limit_mb = 4096
+# Largest number of indexes held open at once. An open index costs a writer arena and three OS
+# threads whatever it holds, so on a node where callers name their own indexes this is what
+# keeps resident memory tied to the data rather than to the name count. 0 derives it from
+# total_memory_limit_mb; past it the least recently used index is committed and closed, and the
+# next request for it reopens it.
+max_open_indexes = 0
 # Largest MCP search response in bytes. Unset it follows the body ceiling; set it below that
 # where the callers are agents whose context is smaller than what the node can send.
 # max_response_bytes = 16777216

@@ -7,6 +7,7 @@ fn test_storage_engine_basics() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
 
     let config = StorageConfig {
+        max_open_indexes: 0,
         shard_path: temp_dir.path().to_path_buf(),
 
         // Memory Budget Configuration
@@ -107,6 +108,7 @@ fn test_storage_configuration() {
 
     // Test different configurations
     let config = StorageConfig {
+        max_open_indexes: 0,
         shard_path: temp_dir.path().to_path_buf(),
 
         // Memory Budget Configuration

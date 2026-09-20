@@ -541,6 +541,36 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
         },
     );
 
+    // --- Open indexes -------------------------------------------------------------
+    // The other thing that grows with a number the node does not choose. An open index costs
+    // an arena and `indexer_num_threads + merge_num_threads` OS threads, neither proportional
+    // to the data it holds, so on a node where callers name their own indexes the footprint
+    // follows the name count. The cap bounds it; this says what the operator's cap implies.
+    let open_cap = config.effective_max_open_indexes();
+    let arena_mb = config.search.indexer_memory_min_mb.max(1);
+    let arenas_mb = open_cap.saturating_mul(arena_mb);
+    let threads_per_index = config
+        .search
+        .indexer_num_threads
+        .saturating_add(config.search.merge_num_threads);
+    let open_threads = open_cap.saturating_mul(threads_per_index);
+    push(
+        "limits",
+        if arenas_mb > memory_budget_mb {
+            Outcome::Warn(format!(
+                "max_open_indexes ({open_cap}) × smallest writer arena ({arena_mb} MB) allows \
+                 {arenas_mb} MB of indexing arenas, over this node's \
+                 limits.total_memory_limit_mb ({memory_budget_mb} MB). Lower \
+                 limits.max_open_indexes, or raise the memory limit"
+            ))
+        } else {
+            Outcome::Pass(format!(
+                "{open_cap} indexes open at once = {arenas_mb} MB of arenas and {open_threads} \
+                 writer threads worst case"
+            ))
+        },
+    );
+
     // --- Overload regime --------------------------------------------------------
     // ROADMAP F7's condition, which the two fixes to it mitigate but do not remove: when
     // `max_concurrent_requests / service_rate > request_timeout_secs`, admission lets in more

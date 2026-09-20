@@ -259,6 +259,8 @@ pub struct NodeConfig {
     pub indexer_memory_max_mb: usize,
     /// Total memory limit (in MB) for coordinating per-shard cache sizing
     pub total_memory_limit_mb: usize,
+    /// Largest number of indexes held open at once across the node; `0` means no cap.
+    pub max_open_indexes: usize,
     /// Memory pressure threshold used for deriving usable cache capacity
     pub memory_pressure_threshold_percent: u8,
     /// Number of threads for the dedicated read (search/stats) runtime
@@ -329,6 +331,7 @@ impl Default for NodeConfig {
             indexer_memory_min_mb: 16,
             indexer_memory_max_mb: 256,
             total_memory_limit_mb: 2048,
+            max_open_indexes: 0,
             memory_pressure_threshold_percent: 80,
             search_threads: 8,
             wal_sync: true,
