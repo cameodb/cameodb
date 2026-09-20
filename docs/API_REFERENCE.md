@@ -100,7 +100,13 @@ sooner puts the request back into the backlog it was shed from.
 |--------|---------------|-------------------------|
 | `503` + `Retry-After` | The node refused the work up front; nothing was executed | Retry after the header says, ideally with jitter |
 | `408` | The request timeout fired on work already in progress | Treat as unknown: a write may or may not have landed |
-| `429` | A rate limit, not a capacity limit — the per-key token bucket in [`[security.limits]`](CONFIGURATION.md#rate-limiting-mcp-tool-calls-and-http-search-securitylimits), which meters MCP tool calls and both search routes, and is off by default | Slow down; the node is not overloaded |
+| `429` + `Retry-After` | A rate limit, not a capacity limit — the per-caller token buckets in [`[security.limits]`](CONFIGURATION.md#rate-limiting-tool-calls-search-and-writes-securitylimits). One meters MCP tool calls and both search routes; the other meters the five write routes, in documents. Both off by default | Wait what the header says; the node is not overloaded |
+
+A `429` on the write routes is refused **before** any of the request is applied, so nothing
+landed and it is safe to resend whole. The one exception is `POST /api/{index}/document/stream`,
+whose total is not known until the body has been read: it stops mid-file and answers `429` with
+the same summary the size limit gives — `items_written`, `lines_received`, `batches` and
+`retry_after_secs` — so a client knows where to resume.
 
 `408` under load is the outcome worth alerting on: a `503` costs the node almost nothing, while
 a `408` means a client waited its whole budget. `/_cluster/health` and `/_admin/*` are exempt

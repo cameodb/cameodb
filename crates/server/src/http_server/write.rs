@@ -1,7 +1,7 @@
 //! Getting documents in: one at a time, in bulk, and as an NDJSON stream — and taking one out.
 
 use axum::{
-    Json,
+    Extension, Json,
     body::Body,
     extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
@@ -14,9 +14,47 @@ use serde_json::Value as JsonValue;
 use tracing::{debug, info, warn};
 
 use crate::cluster_coordinator::OperationType;
+use crate::http_server::caller_of;
 use crate::http_server::error::AppError;
 use crate::node::{ClientOp, DeletePayload, DocPayload};
+use crate::ratelimit::{Caller, Verdict};
 use crate::state::AppState;
+
+/// Charge a write of `documents` against this caller's allowance, before any of it happens.
+///
+/// Metered in documents rather than requests, because one request is not one unit of work on
+/// this surface: `_bulk` carries thousands, and charging it the single token a search costs
+/// would leave the expensive direction — the one that also grows the disk — effectively
+/// unmetered. `[security.limits] write_documents_per_minute` is the allowance, and it is `0`,
+/// meaning off, unless an operator sets it.
+///
+/// Charged up front, so a refusal leaves the index untouched and the caller has nothing to
+/// reconcile. [`write_stream_handler`] is the one route that cannot do this — its total is not
+/// known until the body has been read — and charges a micro-batch at a time instead.
+fn check_write_rate(state: &AppState, caller: &Caller, documents: usize) -> Result<(), AppError> {
+    // Saturating rather than wrapping: a count past `u32::MAX` is charged the largest cost
+    // there is, which the limiter reads as "everything the bucket holds". Wrapping would charge
+    // such a request almost nothing, which is the one outcome that must not be possible.
+    let cost = u32::try_from(documents).unwrap_or(u32::MAX);
+    match state.rate_limiter.check_write(caller, cost) {
+        Verdict::Allow => Ok(()),
+        Verdict::Deny { retry_after_secs } => Err(refuse_write_rate(documents, retry_after_secs)),
+    }
+}
+
+/// The refusal a spent write allowance answers with, in one place so every write route says the
+/// same thing — including the streaming one, which answers it inside a summary rather than as an
+/// error and would otherwise word it differently.
+fn write_rate_message(documents: usize) -> String {
+    format!(
+        "write rate limit exceeded: another {documents} document(s) is past this caller's \
+         allowance. See [security.limits] write_documents_per_minute."
+    )
+}
+
+fn refuse_write_rate(documents: usize, retry_after_secs: u64) -> AppError {
+    AppError::too_many_requests_in(write_rate_message(documents), retry_after_secs)
+}
 
 /// The most reasons a streaming-ingest response will list before it counts the rest.
 ///
@@ -62,9 +100,12 @@ impl BoundedErrors {
 pub(super) async fn write_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
+    caller: Option<Extension<Caller>>,
     Json(payload): Json<DocPayload>,
 ) -> Result<Json<JsonValue>, AppError> {
     debug!("Write request - index: {}, doc_id: {}", index, payload.id);
+
+    check_write_rate(&state, &caller_of(caller), 1)?;
 
     let DocPayload {
         id,
@@ -117,10 +158,15 @@ pub(super) struct DeleteDocumentParams {
 pub(super) async fn delete_document_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
+    caller: Option<Extension<Caller>>,
     Query(params): Query<DeleteDocumentParams>,
 ) -> Result<Json<JsonValue>, AppError> {
     let DeleteDocumentParams { id, routing_key } = params;
     debug!("Delete request - index: {}, doc_id: {}", index, id);
+
+    // A removal is charged like a write, and for the same reason: it is a document through the
+    // writer, a commit and a merge. Cheaper to send than a write, not cheaper to serve.
+    check_write_rate(&state, &caller_of(caller), 1)?;
 
     if id.trim().is_empty() {
         return Err(AppError::bad_request(
@@ -157,6 +203,7 @@ pub(super) async fn delete_document_handler(
 pub(super) async fn bulk_delete_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
+    caller: Option<Extension<Caller>>,
     Json(docs): Json<Vec<DeletePayload>>,
 ) -> Result<Json<JsonValue>, AppError> {
     info!(
@@ -170,6 +217,8 @@ pub(super) async fn bulk_delete_handler(
             "no ids to delete: the body must be a non-empty array",
         ));
     }
+
+    check_write_rate(&state, &caller_of(caller), docs.len())?;
 
     // The first id keeps the request unicast where the whole batch belongs to one shard, which
     // is the common case; anything else is grouped and forwarded by the orchestrator.
@@ -196,6 +245,7 @@ pub(super) async fn bulk_delete_handler(
 pub(super) async fn bulk_write_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
+    caller: Option<Extension<Caller>>,
     Json(docs): Json<Vec<DocPayload>>,
 ) -> Result<Json<JsonValue>, AppError> {
     info!(
@@ -203,6 +253,8 @@ pub(super) async fn bulk_write_handler(
         index,
         docs.len()
     );
+
+    check_write_rate(&state, &caller_of(caller), docs.len())?;
 
     // Derive a routing hint from the first document to avoid a cluster-wide broadcast. The
     // schema is not resolved yet at this layer, so this climbs the same ladder the orchestrator
@@ -283,9 +335,17 @@ pub(super) async fn bulk_write_handler(
 pub(super) async fn write_stream_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
+    caller: Option<Extension<Caller>>,
     body: Body,
 ) -> Result<Response, AppError> {
     info!("Write stream request - index: {}", index);
+
+    // Charged a micro-batch at a time, because how many documents this request carries is not
+    // knowable until it has been read — the one route where the allowance cannot be taken up
+    // front. So a caller that runs out mid-file gets the same answer the body limit gives: the
+    // stream stops, what was written stays written and is reported, and the summary says why.
+    let caller = caller_of(caller);
+    let mut rate_limited: Option<u64> = None;
 
     let batch_size = state.stream_batch_size.max(1);
     let max_record_size_bytes = state.max_record_size_bytes;
@@ -317,7 +377,7 @@ pub(super) async fn write_stream_handler(
 
     let mut body_stream = body.into_data_stream();
 
-    while let Some(chunk) = body_stream.next().await {
+    'body: while let Some(chunk) = body_stream.next().await {
         // The body itself failed, so there is no answer to give: what was written cannot be
         // reported to a caller whose request did not finish arriving.
         let chunk = chunk.map_err(|e| {
@@ -397,6 +457,15 @@ pub(super) async fn write_stream_handler(
             }
 
             if batch.len() >= batch_size {
+                // Before the batch is dispatched, not after: a refusal must mean these
+                // documents were not written, or the count the summary reports would not be
+                // what the index holds.
+                if let Verdict::Deny { retry_after_secs } =
+                    state.rate_limiter.check_write(&caller, batch.len() as u32)
+                {
+                    rate_limited = Some(retry_after_secs);
+                    break 'body;
+                }
                 let flushed = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
                 let (batch_written, batch_errors) = flush_lines(&state, &index, flushed).await;
                 batches += 1;
@@ -410,7 +479,7 @@ pub(super) async fn write_stream_handler(
     // above, when the buffer passed it. Skipped when the body was cut at the ceiling, because
     // what is left in the buffer is then the front of a line whose remainder never arrived —
     // parsing it would report a truncated document as a malformed one.
-    if !over_limit && !discarding && !buf.is_empty() {
+    if !over_limit && rate_limited.is_none() && !discarding && !buf.is_empty() {
         line_number += 1;
         documents += 1;
         let line = buf.freeze();
@@ -424,10 +493,15 @@ pub(super) async fn write_stream_handler(
     }
 
     if !batch.is_empty() {
-        let (batch_written, batch_errors) = flush_lines(&state, &index, batch).await;
-        batches += 1;
-        written += batch_written;
-        errors.extend(batch_errors);
+        match state.rate_limiter.check_write(&caller, batch.len() as u32) {
+            Verdict::Deny { retry_after_secs } => rate_limited = Some(retry_after_secs),
+            Verdict::Allow => {
+                let (batch_written, batch_errors) = flush_lines(&state, &index, batch).await;
+                batches += 1;
+                written += batch_written;
+                errors.extend(batch_errors);
+            }
+        }
     }
 
     // Refused, and the refusal reports what landed before it. A 413 alone would leave the
@@ -455,6 +529,36 @@ pub(super) async fn write_stream_handler(
             "suppressed_errors": errors.suppressed,
         });
         return Ok(json_response(StatusCode::PAYLOAD_TOO_LARGE, &result));
+    }
+
+    // The same bargain the 413 above makes, for the other reason a stream can be cut short.
+    // The status differs and the rest does not: a caller that is told only "too many requests"
+    // cannot tell which half of its file is in the index, and it is the one thing it has no way
+    // to work out. `Retry-After` carries the wait, so a client that obeys it can resume.
+    if let Some(retry_after_secs) = rate_limited {
+        warn!(
+            index = %index,
+            retry_after_secs,
+            items_written = written,
+            "Write stream refused: the caller's write allowance is spent"
+        );
+        let result = serde_json::json!({
+            "status": "refused",
+            "error": write_rate_message(batch_size),
+            "retry_after_secs": retry_after_secs,
+            "items_written": written,
+            "lines_received": documents,
+            "batches": batches,
+            "errors": errors.listed,
+            "suppressed_errors": errors.suppressed,
+        });
+        let mut response = json_response(StatusCode::TOO_MANY_REQUESTS, &result);
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_str(&retry_after_secs.to_string())
+                .unwrap_or(HeaderValue::from_static("1")),
+        );
+        return Ok(response);
     }
 
     if documents == 0 {

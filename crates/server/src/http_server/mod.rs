@@ -13,6 +13,19 @@ mod routes;
 mod search;
 mod write;
 
+use crate::ratelimit::Caller;
+
 pub(crate) use catalogue::validate_index_name;
 pub(crate) use health::HEALTH_PATH;
 pub(crate) use routes::{RouterConfig, create_router};
+
+/// Who the rate limiter charges for this request.
+///
+/// The authorization gate attaches a [`Caller`] to everything it admits, deciding once — from
+/// the key and the socket together — what a handler would otherwise have to work out
+/// identically on every route. `None` means the handler was reached without passing the gate,
+/// which happens only where a test mounts one directly; such a request is metered as
+/// unattributable rather than exempt, because "no subject" must never read as "no limit".
+fn caller_of(caller: Option<axum::Extension<Caller>>) -> Caller {
+    caller.map_or(Caller::Unattributed, |axum::Extension(caller)| caller)
+}

@@ -571,6 +571,47 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
         },
     );
 
+    // --- Rate metering ------------------------------------------------------------
+    // What bounds a caller per unit time, as opposed to per request. `max_concurrent_requests`
+    // bounds how many requests are in flight and says nothing about how many arrive in an hour,
+    // so on a node reachable by more than one tenant the token buckets are the only ceiling on
+    // sustained cost — and the write side is the expensive direction, since it is the one that
+    // also grows the disk.
+    //
+    // A warning rather than a failure, and only off `local`: an unmetered node is the right
+    // configuration for a single trusted client, and was the only configuration this project
+    // shipped until now. What it is not is safe to expose.
+    let limits = &config.security.limits;
+    push(
+        "rate",
+        match (limits.enabled(), limits.writes_metered()) {
+            (true, true) => Outcome::Pass(format!(
+                "{} tool calls and {} documents per minute per caller",
+                limits.tool_calls_per_minute, limits.write_documents_per_minute
+            )),
+            _ if profile == Profile::Local => {
+                Outcome::Pass("unmetered, which a local node does not need".to_string())
+            }
+            (false, false) => Outcome::Warn(
+                "no rate limit on either surface: one caller can spend this node's whole \
+                 capacity, and its disk. Set security.limits.tool_calls_per_minute and \
+                 security.limits.write_documents_per_minute"
+                    .to_string(),
+            ),
+            (true, false) => Outcome::Warn(
+                "reads are metered and writes are not, which is the wrong half: a write costs \
+                 more than a search and it is the direction that grows the disk. Set \
+                 security.limits.write_documents_per_minute"
+                    .to_string(),
+            ),
+            (false, true) => Outcome::Warn(
+                "writes are metered and reads are not: one caller can hold every search thread \
+                 this node has. Set security.limits.tool_calls_per_minute"
+                    .to_string(),
+            ),
+        },
+    );
+
     // --- Overload regime --------------------------------------------------------
     // ROADMAP F7's condition, which the two fixes to it mitigate but do not remove: when
     // `max_concurrent_requests / service_rate > request_timeout_secs`, admission lets in more
@@ -777,6 +818,50 @@ mod tests {
             .find(|c| c.rule == rule)
             .unwrap_or_else(|| panic!("no rule named {rule}"))
             .outcome
+    }
+
+    /// A local node is not told to meter anything. Unmetered is the right configuration for a
+    /// single trusted client, and was the only configuration this project shipped until 0.3.5 —
+    /// a warning every developer sees on every start is a warning nobody reads.
+    #[test]
+    fn a_local_node_is_not_asked_to_meter_itself() {
+        let config = config_for(Some(Profile::Local), "127.0.0.1");
+        assert!(
+            matches!(outcome_for(&config, "rate"), Outcome::Pass(_)),
+            "a loopback node should pass the rate check unmetered"
+        );
+    }
+
+    /// Metering reads and leaving writes open is the state C8 left this node in, and M3's own
+    /// entry calls it the wrong half: a write costs more than a search and grows the disk.
+    /// A reachable node in that state should be told so by name.
+    #[test]
+    fn metering_reads_alone_is_called_out_on_a_reachable_node() {
+        let mut config = config_for(Some(Profile::Internal), "0.0.0.0");
+        config.security.limits.tool_calls_per_minute = 120;
+        match outcome_for(&config, "rate") {
+            Outcome::Warn(message) => assert!(
+                message.contains("write_documents_per_minute"),
+                "the warning must name the setting that fixes it: {message}"
+            ),
+            other => panic!("reads metered and writes open should warn: {other:?}"),
+        }
+    }
+
+    /// And both metered is the state the check exists to reach, reported with the operator's
+    /// own numbers rather than a bare "ok".
+    #[test]
+    fn metering_both_surfaces_passes_with_the_numbers() {
+        let mut config = config_for(Some(Profile::Internal), "0.0.0.0");
+        config.security.limits.tool_calls_per_minute = 120;
+        config.security.limits.write_documents_per_minute = 5_000;
+        match outcome_for(&config, "rate") {
+            Outcome::Pass(message) => assert!(
+                message.contains("120") && message.contains("5000"),
+                "the pass should report what was configured: {message}"
+            ),
+            other => panic!("both surfaces metered should pass: {other:?}"),
+        }
     }
 
     /// ROADMAP F7's regime condition, as `check-config` can see it.

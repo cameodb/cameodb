@@ -3,13 +3,17 @@
 use cameodb_mcp::{McpAuthzRef, RateLimitVerdict};
 use tracing::warn;
 
+use crate::ratelimit::Caller;
 use crate::state::AppState;
 
 /// Charge `cost` tokens against the calling key's budget.
 ///
 /// Attributed by `key_id`, not by session: a session id is chosen by the caller's host
 /// and a new one is a header away, so metering per session would let an agent reset its
-/// own limit by reconnecting. The key is the thing an operator issued and can revoke.
+/// own limit by reconnecting. The key is the thing an operator issued and can revoke. Where
+/// there is no key — `[security]` off, which is the default — the caller's address stands in,
+/// so that one anonymous client cannot spend the budget of every other. That is C8's second
+/// half; see [`crate::ratelimit::Caller`].
 ///
 /// The cost is the fan-out the protocol layer read off the call, so a search naming ten
 /// indexes is charged as ten searches. Which is what it is: ten scatter-gathers across ten
@@ -20,7 +24,8 @@ pub(super) fn check_tool_rate(
     tool: &str,
     cost: u32,
 ) -> RateLimitVerdict {
-    match state.tool_limiter.check(authz.key_id().as_deref(), cost) {
+    let caller = Caller::of(authz.key_id(), authz.peer_addr());
+    match state.rate_limiter.check(&caller, cost) {
         crate::ratelimit::Verdict::Allow => RateLimitVerdict::Allow,
         crate::ratelimit::Verdict::Deny { retry_after_secs } => {
             // Worth a line each: this needs a valid key, so its volume is bounded by

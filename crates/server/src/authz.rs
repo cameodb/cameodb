@@ -33,6 +33,7 @@ use cameodb_mcp::{McpAuthz, McpAuthzRef, McpCapability};
 use crate::audit::{AuditRecord, AuditSink};
 use crate::auth::{Capability, KeyEntry, KeyRing};
 use crate::http_server::validate_index_name;
+use crate::ratelimit::Caller;
 
 /// What the gate needs: the keys it checks against, and the trail it writes to.
 ///
@@ -289,6 +290,44 @@ impl McpAuthz for Authz {
             Authz::Anonymous => false,
             Authz::Key(entry) => entry.has(capability),
         }
+    }
+}
+
+/// An MCP caller: who they are, and where they connected from.
+///
+/// The address is here rather than on [`Authz`] because only one consumer needs it — the rate
+/// limiter, deciding which bucket an *unidentified* caller is metered in. `/mcp` is a single
+/// JSON-RPC path, so the dispatcher below it sees nothing but the identity handle the gate
+/// attached; anything it must know has to travel inside that handle. Every other method
+/// delegates, so identity itself has exactly one definition.
+struct McpCaller {
+    authz: Authz,
+    peer: Option<std::net::IpAddr>,
+}
+
+impl McpAuthz for McpCaller {
+    fn key_id(&self) -> Option<String> {
+        McpAuthz::key_id(&self.authz)
+    }
+
+    fn allows_index(&self, index: &str) -> bool {
+        McpAuthz::allows_index(&self.authz, index)
+    }
+
+    fn label(&self) -> Option<String> {
+        McpAuthz::label(&self.authz)
+    }
+
+    fn role(&self) -> Option<String> {
+        McpAuthz::role(&self.authz)
+    }
+
+    fn has(&self, capability: McpCapability) -> bool {
+        McpAuthz::has(&self.authz, capability)
+    }
+
+    fn peer_addr(&self) -> Option<std::net::IpAddr> {
+        self.peer
     }
 }
 
@@ -575,12 +614,21 @@ pub async fn authorize(State(gate): State<GateState>, mut req: Request, next: Ne
     let path = req.uri().path().to_string();
     // Read off the socket, not off a header. `X-Forwarded-For` is written by the client, so
     // a caller who could set what the audit log says about them could also set it to
-    // somebody else — behind a proxy this records the proxy, which is at least true.
-    let peer = gate.audit.is_enabled().then(|| {
-        req.extensions()
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .map(|info| info.0.ip().to_string())
-    });
+    // somebody else — behind a proxy this records the proxy, which is at least true. The same
+    // reasoning decides the rate limiter's bucket for a caller with no key: a header-derived
+    // address would let one client mint as many buckets as it liked.
+    //
+    // Read unconditionally now. It used to be gathered only when the audit trail was on, and
+    // the limiter needs it whether or not anything is being recorded — it is one extension
+    // lookup either way.
+    let peer_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip());
+    let peer = gate
+        .audit
+        .is_enabled()
+        .then(|| peer_ip.map(|ip| ip.to_string()));
     match decide(&gate.keyring, &method, &path, req.headers()) {
         Ok(authz) => {
             // Off at the default level, and the first thing worth turning on when an
@@ -595,7 +643,10 @@ pub async fn authorize(State(gate): State<GateState>, mut req: Request, next: Ne
             // MCP needs the same identity behind a trait the mcp crate owns, since it cannot
             // see this one. Allocated only for the routes that can use it.
             if matches!(classified.as_ref().map(|c| c.access), Some(Access::Mcp)) {
-                let handle: McpAuthzRef = Arc::new(authz.clone());
+                let handle: McpAuthzRef = Arc::new(McpCaller {
+                    authz: authz.clone(),
+                    peer: peer_ip,
+                });
                 req.extensions_mut().insert(handle);
             }
             let identity = authz.identity();
@@ -628,6 +679,11 @@ pub async fn authorize(State(gate): State<GateState>, mut req: Request, next: Ne
                 return response;
             }
 
+            // Who the rate limiter charges, settled in the one place that can see both the
+            // key and the socket. A handler asking for it gets a decision rather than two
+            // half-answers it would have to combine identically on every route.
+            req.extensions_mut()
+                .insert(Caller::of(authz.key_id(), peer_ip));
             req.extensions_mut().insert(authz);
 
             let response = next.run(req).await;
@@ -1472,5 +1528,121 @@ mod tests {
         filter_index_listing(&mut listing, &scoped_as(Some(vec!["docs"])));
         assert_eq!(listing["indexes"].as_array().unwrap().len(), 1);
         assert_eq!(listing["total_indexes"], 1);
+    }
+
+    /// The gate settles who the rate limiter charges, and for a caller with no key that is the
+    /// address it connected from.
+    ///
+    /// `ratelimit`'s own tests prove two addresses are metered in two buckets. Only this proves
+    /// an address ever reaches one: the subject is decided here, from the socket, and a wire
+    /// that never carried it would leave every anonymous caller back in the single shared
+    /// bucket that [C8] is about — with every unit test still passing.
+    ///
+    /// [C8]: ../../../ROADMAP.md
+    #[tokio::test]
+    async fn an_unidentified_caller_is_metered_by_its_address() {
+        let subject = metered_subject(None, Some("198.51.100.7:4242".parse().unwrap())).await;
+        assert_eq!(
+            subject,
+            Some(Caller::Address("198.51.100.7".parse().unwrap())),
+            "a caller with no key should be told apart by where it connected from"
+        );
+    }
+
+    /// With no socket behind the request there is nothing to tell callers apart by, and the
+    /// gate says so rather than inventing a distinction — which is still a subject, so the
+    /// caller is metered rather than exempt.
+    #[tokio::test]
+    async fn a_caller_with_no_address_is_still_a_subject() {
+        assert_eq!(
+            metered_subject(None, None).await,
+            Some(Caller::Unattributed)
+        );
+    }
+
+    /// A key outranks the address. Two keys behind one NAT are two tenants, and metering them
+    /// as one would make an operator's own key allocation mean nothing.
+    #[tokio::test]
+    async fn a_key_outranks_the_address_it_connected_from() {
+        let (key, config) = key_for(Role::Reader, None);
+        let ring = ring(vec![config]);
+        let expected = ring
+            .authenticate(key.expose())
+            .expect("the key just added should authenticate")
+            .key_id();
+
+        let subject = subject_through_gate(
+            Arc::new(ring),
+            headers_with(Some(&key)),
+            Some("198.51.100.7:4242".parse().unwrap()),
+        )
+        .await;
+        assert_eq!(subject, Some(Caller::Key(expected)));
+    }
+
+    /// Run a request through the real gate on a node that identifies nobody, and report the
+    /// subject it attached.
+    async fn metered_subject(
+        key: Option<&ApiKey>,
+        peer: Option<std::net::SocketAddr>,
+    ) -> Option<Caller> {
+        let ring = Arc::new(SecurityConfig::default().load_keyring().unwrap());
+        subject_through_gate(ring, headers_with(key), peer).await
+    }
+
+    /// The same, against a given key ring: mount the gate over a handler that reports what
+    /// reached it, and answer with the `Caller` extension the middleware inserted.
+    async fn subject_through_gate(
+        keyring: Arc<KeyRing>,
+        headers: HeaderMap,
+        peer: Option<std::net::SocketAddr>,
+    ) -> Option<Caller> {
+        use tower::ServiceExt as _;
+
+        /// Report the subject as the handler sees it. A `Mutex` rather than a response body
+        /// because `Caller` is not a wire type and round-tripping it through one would test
+        /// the formatting rather than the plumbing.
+        async fn report(
+            axum::Extension(seen): axum::Extension<Arc<std::sync::Mutex<Option<Caller>>>>,
+            caller: Option<axum::Extension<Caller>>,
+        ) -> StatusCode {
+            *seen.lock().expect("the test's own lock") =
+                caller.map(|axum::Extension(caller)| caller);
+            StatusCode::OK
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let app = axum::Router::new()
+            // A route `ROUTES` classifies, so the gate admits it rather than refusing an
+            // unclassified path before it ever attaches a subject.
+            .route("/_indexes", axum::routing::get(report))
+            .layer(axum::Extension(Arc::clone(&seen)))
+            .layer(axum::middleware::from_fn_with_state(
+                GateState {
+                    keyring,
+                    audit: crate::audit::AuditSink::disabled(),
+                },
+                authorize,
+            ));
+
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/_indexes")
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        *request.headers_mut() = headers;
+        if let Some(peer) = peer {
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+        }
+
+        let response = app.oneshot(request).await.expect("gate ran");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the gate should have admitted this request"
+        );
+        seen.lock().expect("the test's own lock").clone()
     }
 }

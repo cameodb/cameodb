@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::cluster_coordinator::ClusterCoordinator;
 use crate::node::{QueueLoad, ReadPoolHealth, RouterActor, WriterLiveness};
-use crate::ratelimit::ToolRateLimiter;
+use crate::ratelimit::RateLimiter;
 
 /// Application state shared across handlers
 #[derive(Clone)]
@@ -37,9 +37,9 @@ pub struct AppState {
     /// than sending it plain. The handler counts what it drains against this, so the setting
     /// means one thing on every route.
     pub max_body_size_bytes: usize,
-    /// Per-key budget for MCP tool calls. Shared across every request, because a rate limit
-    /// that reset per connection would not be one.
-    pub tool_limiter: Arc<ToolRateLimiter>,
+    /// Per-caller budgets for tool calls, searches and writes. Shared across every request,
+    /// because a rate limit that reset per connection would not be one.
+    pub rate_limiter: Arc<RateLimiter>,
     /// Largest `limit` an MCP search may ask for, from `[security.limits]`.
     ///
     /// Both advertised and enforced: the tool schemas render it as their `maximum`, so a

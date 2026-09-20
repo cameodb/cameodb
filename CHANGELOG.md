@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Compressed request bodies are decompressed — they never were.** The router mounted
+  tower-http's `DecompressionLayer`, which decompresses *responses*, so no request body was ever
+  inflated, for any codec: a `content-encoding: gzip` body reached the handler as compressed
+  bytes and failed to parse. `RequestDecompressionLayer` replaces it, gzip and deflate join
+  brotli, and an encoding outside that set is refused `415` rather than read as text.
+
+  Two things follow. A body is now measured **after** it inflates, so a compression bomb is
+  charged its real size — the NDJSON stream handler takes a raw `Body` that no extractor limit
+  reaches, and counts what it drains against `limits.max_body_size_mb`, refusing past it with
+  `413` reporting what it had already written. And `CompressionLayer` reaches the wire for the
+  first time: the old layer had been filling in `accept-encoding: br` on every request and
+  inflating the response again on the way out, so nothing compressed ever left the process.
+
 - **`security.implicit_index_creation` gates whether a write may mint an index.** A write to
   an index that does not exist samples the documents into a schema and creates it — so any
   caller with `write` (or anyone, when authentication is off) could grow the node's disk
@@ -140,6 +153,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `500`: it round-trips as the `400` it was raised as.
 
 ### Changed
+
+- **The per-index document read cache is gone.** It held 1024 document bodies per index,
+  mirroring rows of `data_<index>` on top of redb's page cache and the OS page cache below that,
+  and served them as a clone — the same memcpy redb makes from a page it already holds, so the
+  only work it removed was one B-tree descent. The path a search takes to fetch hits opened the
+  read transaction and the table *before* consulting it, so a hit still paid for the transaction
+  the cache existed to avoid. Measured, a scanning read is 35% faster without it; a hot key set
+  loses 0.34 µs. The `cache_generation` counter goes with it, and with it the write-visibility
+  race it existed to guard.
 
 - **`cli.rs`, `config.rs` and `cluster_coordinator.rs` are directories now** (L13). The
   client's 5,100-line `cli.rs` split by surface: `cli/mod.rs` keeps the clap grammar,
@@ -420,6 +442,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remote deadline now follows the HTTP one as it was always documented to.
 
 ### Added
+
+- **Per-caller rate limiting on the write surface, and a bucket of their own for anonymous
+  callers.** Every write route — `PUT /api/{index}/document`, `DELETE .../document`,
+  `POST .../_bulk`, `POST .../_bulk/delete` and `POST .../document/stream` — was governed only
+  by `max_concurrent_requests` and body size, which bound how many requests are in flight and
+  place no ceiling on how many arrive. `[security.limits] write_documents_per_minute` and
+  `write_burst` (both `0`, meaning off) meter them in **documents** rather than requests: a
+  `_bulk` body may carry thousands, so charging it the single token a search costs would leave
+  the expensive direction — the one that also grows the disk — bounded by nothing. The charge is
+  taken before any of the work happens, so a refusal leaves the index untouched; the streaming
+  route, whose total is not known until the body has been read, charges per micro-batch and
+  answers `429` with the counts it had already written. Deliberately separate from
+  `tool_calls_per_minute`, so an upgrade cannot start refusing ingest.
+
+  Callers with no key are metered per IPv4 address or IPv6 /64 instead of sharing a single
+  bucket, so one anonymous client can no longer spend everybody's allowance on a node with
+  `[security]` off. That map is bounded and spills back to the shared bucket under an address
+  flood rather than growing. Every `429` now carries `Retry-After`, and `cameodb check-config`
+  reports both meters under a new `rate` rule, warning off-`local` when either is open.
+
+- **`limits.max_open_indexes` bounds how many indexes a node holds open.** An open index costs a
+  writer arena and three OS threads whatever it holds, so resident memory tracked how many index
+  names a workload had touched rather than how much data it stored — and on a node where callers
+  name their own indexes, that is a number the operator does not choose. Past the cap the least
+  recently used index is committed and closed, and the next reference reopens it. A count rather
+  than a byte budget, because a megabyte ceiling leaves the thread count uncapped. `0`, the
+  default, derives it from `limits.total_memory_limit_mb` and the smallest writer arena, clamped
+  to 8–256; `GET /_admin/memory` reports the open set per shard, and `check-config` reports what
+  the cap implies in arenas and writer threads.
 
 - **`--request-timeout-secs` / `CAMEODB_REQUEST_TIMEOUT_SECS`.** The timeout was reachable only
   by editing a config file, while the limit it interacts with most —

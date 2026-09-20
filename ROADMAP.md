@@ -49,10 +49,10 @@ on one.
 | 17 — Record deletion | ✅ Done | — |
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
-| 14 — Security hardening (posture items C3–C8) | ◐ Partial | C8 (REST rate limit) open; C3–C7 done |
+| 14 — Security hardening (posture items C3–C8) | ✅ Done | C3–C8 all closed; C8 by M3 on 2026-09-20 |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
-| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2 and M7 done — the blocker is cleared. M3–M6 and the M8 decision remain |
+| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3 and M7 done — the blocker is cleared and the surface is metered. M4, M5, M6 and the M8 decision remain |
 
 ## Reconciliation, 2026-08-26
 
@@ -645,14 +645,18 @@ corrected seven dates for.
 
 ### C8 — REST has no rate limit, and anonymous MCP callers share one bucket
 
-📋 **Planned** (0.3.3 stability audit, finding 09). The token-bucket limiter is wired into exactly
-one place — `tool_limiter.check(...)` in `mcp/governance.rs` (23) — so the REST read and write API
-is governed only by `max_concurrent_requests` and body size, which bound instantaneous concurrency
-but place no ceiling on sustained request rate from one caller. Separately, within MCP every
-unidentified caller shares a single bucket (`ratelimit.rs` 141, 182): one anonymous client can
-spend that budget and deny it to the rest, with no per-address dimension to fall back on. Both may
-be intentional for a node expected to sit behind a gateway — if so, that expectation belongs in the
-deployment docs; otherwise meter the REST surface and give anonymous callers a per-address bucket.
+✅ **Done 2026-09-20 by [M3](#m3--meter-the-write-surface-and-give-anonymous-callers-their-own-bucket)**,
+in two halves a year and a release apart. [L10](#l10--the-low-findings-in-one-place) metered the
+two HTTP search handlers; M3 metered the five write routes and gave an unidentified caller a
+bucket of its own. Both recommendations in the original finding were taken rather than the
+deployment-docs alternative it offered.
+
+The finding as filed (0.3.3 stability audit, finding 09): the token-bucket limiter was wired into
+exactly one place — `tool_limiter.check(...)` in `mcp/governance.rs` (23) — so the REST read and
+write API was governed only by `max_concurrent_requests` and body size, which bound instantaneous
+concurrency and place no ceiling on sustained request rate from one caller. Separately, within MCP
+every unidentified caller shared a single bucket (`ratelimit.rs` 141, 182): one anonymous client
+could spend that budget and deny it to the rest, with no per-address dimension to fall back on.
 
 ---
 
@@ -4226,15 +4230,71 @@ documents, which is C5's threat made visible), `a_write_stream_takes_a_deflate_b
 
 ### M3 — Meter the write surface, and give anonymous callers their own bucket
 
-📋 **Planned.** The remainder of [C8](#c8--rest-has-no-rate-limit-and-anonymous-mcp-callers-share-one-bucket).
-[L10](#l10--the-low-findings-in-one-place) wired `tool_limiter.check` into the two search
-handlers; every write route — `write_handler`, `bulk_write_handler`, `delete_document_handler`,
-`bulk_delete_handler`, `write_stream_handler` — is still governed only by
-`max_concurrent_requests` and body size, which bound instantaneous concurrency and place no
-ceiling on sustained rate. Writes are the expensive direction and the one that grows the disk,
-so metering search and not writes is the wrong half. The second half stands too: within MCP
-every unidentified caller shares one bucket, so one anonymous client can spend the budget for
-all of them — a per-address dimension is what an exposed node needs.
+✅ **Done 2026-09-20.** The remainder of
+[C8](#c8--rest-has-no-rate-limit-and-anonymous-mcp-callers-share-one-bucket), which closes with
+it. Both halves, and a third thing the first half turned out to need.
+
+**The write surface is metered in documents, not requests.** All five routes —
+`write_handler`, `delete_document_handler`, `bulk_write_handler`, `bulk_delete_handler`,
+`write_stream_handler` — now charge before they do any of the work. The unit is the point: a
+`_bulk` body may carry thousands of documents, and charging it the single token a search costs
+would have left the expensive direction — the one that also grows the disk — bounded by nothing
+but `max_concurrent_requests`, which is a bound on instantaneous concurrency and not on rate.
+So the charge is what the request asks the node to index or remove: one for a single write or
+delete, the array length for the two bulk routes, and one charge per micro-batch for the NDJSON
+stream. A delete costs what a write costs, because it is a document through the writer, a commit
+and a merge.
+
+**A second setting rather than a second use of the first.** `[security.limits]
+write_documents_per_minute` and `write_burst`, both `0` — off — by default, and deliberately
+*not* falling back to `tool_calls_per_minute`. An operator who set that chose a number for tool
+calls; charging their bulk imports against it on upgrade would be a release that broke ingest
+for everyone who had taken the earlier advice. The two meters are separate budgets end to end,
+which `a_spent_write_allowance_does_not_refuse_a_search` pins.
+
+**The streaming route is the one that cannot charge up front**, because how many documents the
+body holds is not knowable until it has been read. It charges a micro-batch at a time and, when
+the allowance runs out, stops and answers `429` carrying the same summary the decompressed-size
+refusal from [M2](#m2--cap-decompressed-bytes-on-the-streaming-ingest-path) gives — `items_written`,
+`lines_received`, `batches`, plus `retry_after_secs`. A bare 429 would leave the caller unable
+to tell which half of its file is in the index, which on a partially-consumed stream is the one
+thing it cannot work out for itself.
+
+**Anonymous callers get their own bucket, and the map stays bounded.** Where there is no
+`key_id` the caller's address is the subject: an IPv4 address, or an IPv6 **/64**, since a
+single host is routinely handed a whole one and metering per address would let one machine mint
+2^64 buckets — the unbounded-map problem that keying by `key_id` exists to avoid. An IPv4-mapped
+address folds back to its IPv4 form, so a dual-stack listener does not hand one caller two
+allowances. Past 4096 groups per meter, buckets that have refilled to capacity are dropped: a
+full bucket and an absent one admit exactly the same next request, so nothing is given away.
+If every tracked group is still spending, further addresses share the old single bucket — which
+is to say the worst case under an address flood is exactly the behaviour this node had before,
+and no worse. A key always outranks the address it connected from; two keys behind one NAT are
+two tenants.
+
+**What the first half needed.** The subject is decided once, in `authorize`, where the key and
+the socket are both in hand, and travels to handlers as a `Caller` extension and to the MCP
+dispatcher inside the identity handle — `McpAuthz` gained a defaulted `peer_addr()`, since
+`/mcp` is one JSON-RPC path and everything below it sees only what the gate attached. The peer
+address is now read on every request rather than only when the audit trail is on; it is one
+extension lookup either way. `ToolRateLimiter` became `RateLimiter` because it no longer meters
+only tools, and a 429 now carries `Retry-After` — the limiter always knows its number, and the
+bucket's whole contract is that obeying it works, which is worth nothing to a caller never told
+the number in a form a client library reads.
+
+**`check-config` reports it.** A new `rate` rule names which meters are set, and warns on any
+non-`local` profile when either is open — including the case M3 itself is about, reads metered
+and writes not, which it calls the wrong half.
+
+Nineteen tests. Thirteen in `ratelimit.rs` for the buckets (separation of the two meters, the
+per-document charge, per-address metering, the /64, the mapped address, the bound on the map,
+and that a full bucket is the only thing forgotten); three in `authz.rs` for the wire, which is
+what a bucket test structurally cannot see — an address that never reaches the limiter leaves
+every unit test passing; and six end-to-end in `tests/write_rate_limit.rs` against the real
+binary, for the status codes and the `Retry-After` header an SDK is built to hide. All four
+enforcement tests were run against the code with the charge removed and fail there; the two
+that assert the surface stays *open* — unmetered by default, and unmetered by a tool rate alone
+— pass either way, which is what they are for.
 
 ### M4 — Per-key resource quotas
 
@@ -4287,12 +4347,15 @@ read the code before scheduling the work.
 
 ### M8 — Re-decide the query complexity caps
 
-📋 **A decision, not necessarily code.** [C2](#c2--query-complexity-caps) was deferred on the
-reasoning that *rate limiting already bounds what a key costs the node per unit time*. That
-reasoning is sound and its premise is currently false on the write surface, which M3 fixes. Once
-the surface is metered, re-read C2 against a multi-tenant node and either re-affirm the deferral
-with the premise now true, or take it up. The two `parse_query_lenient` call sites are where a
-cap would go.
+📋 **A decision, not necessarily code — and its premise is now true.** [C2](#c2--query-complexity-caps)
+was deferred on the reasoning that *rate limiting already bounds what a key costs the node per
+unit time*. That reasoning is sound, and the premise was false on the write surface until
+[M3](#m3--meter-the-write-surface-and-give-anonymous-callers-their-own-bucket) closed it on
+2026-09-20. What is left is to re-read C2 against a multi-tenant node and either re-affirm the
+deferral, or take it up. The two `parse_query_lenient` call sites are where a cap would go.
+
+One thing M3 changed that bears on the decision: the rate limiter now meters an *unidentified*
+caller too, so the deferral no longer rests on a node having issued keys.
 
 **2026-09-19 — [M0-j](#m0--the-architecture-review-and-the-order-of-work) gives this a number.**
 An unqualified term is expanded across every indexed text field, so on a two-hundred-field index

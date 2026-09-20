@@ -208,7 +208,7 @@ at a cost of one comparison; widening admission does not create capacity, it con
 refusals into expensive timeouts. If a node is shedding, either give it more capacity or
 lengthen the budget its callers allow.
 
-`[limits]` is what this node can hold; [`[security.limits]`](#rate-limiting-mcp-tool-calls-and-http-search-securitylimits)
+`[limits]` is what this node can hold; [`[security.limits]`](#rate-limiting-tool-calls-search-and-writes-securitylimits)
 is what one caller may ask of it. Unknown keys inside `[limits]` are refused at startup rather
 than ignored, so a typo cannot leave a limit silently at its default.
 
@@ -279,7 +279,7 @@ max_in_flight_per_session = 32     # requests one session may hold in flight on 
 ```
 
 The transport itself, as opposed to what a caller may spend on it — that is
-[`[security.limits]`](#rate-limiting-mcp-tool-calls-and-http-search-securitylimits), which meters a *key*.
+[`[security.limits]`](#rate-limiting-tool-calls-search-and-writes-securitylimits), which meters a *key*.
 Nothing here changes what a client is told; the protocol is the same either way.
 
 #### `session_idle_timeout_secs` — how long a paused client keeps its session
@@ -661,15 +661,21 @@ you only discover on the day you turn authentication on. These all refuse to sta
 - two entries with the same hash — one key cannot hold two roles
 - `allowed_indexes = []`, which reads as "no restriction" but means "no index at all"
 
-### Rate limiting MCP tool calls and HTTP search (`[security.limits]`)
+### Rate limiting tool calls, search and writes (`[security.limits]`)
 
 ```toml
 [security.limits]
-tool_calls_per_minute = 120   # 0 (the default) disables limiting entirely
-tool_call_burst = 30          # spendable at once; 0 means one minute's worth
-max_search_limit = 10000      # largest `limit` an MCP search may ask for
-max_federated_indexes = 20    # most indexes one `search_across_indexes` may name
+tool_calls_per_minute = 120       # 0 (the default) disables limiting entirely
+tool_call_burst = 30              # spendable at once; 0 means one minute's worth
+write_documents_per_minute = 5000 # the write surface, metered in documents; 0 disables it
+write_burst = 20000               # spendable at once; 0 means one minute's worth
+max_search_limit = 10000          # largest `limit` an MCP search may ask for
+max_federated_indexes = 20        # most indexes one `search_across_indexes` may name
 ```
+
+**Two meters, and both are off until you set them.** The first pair meters *calls* — MCP tools
+and HTTP search. The second meters *documents* through the write routes. They are separate
+settings because they are separate units, and setting one does not set the other.
 
 The companion size ceiling, `max_response_bytes`, lives in [`[limits]`](#size-and-memory-limits)
 with the other message sizes it derives from.
@@ -694,7 +700,15 @@ so loose it never bites. The bucket lets the burst through and meters the sustai
 Points worth knowing:
 
 - **Metered per key**, so one noisy agent cannot refuse another. With `[security]` off there
-  is no identity to meter, and every caller shares a single bucket.
+  is no key to meter, and the caller's **address** is used instead — an IPv4 address, or an
+  IPv6 /64, since a single host is routinely given a whole one. So one anonymous client cannot
+  spend everybody's allowance on an unauthenticated node either. A key always outranks the
+  address it connected from: two keys behind one NAT are two tenants.
+- **The address map is bounded.** Past 4096 address groups per meter, buckets that have
+  refilled to full are dropped (a full bucket and an absent one admit exactly the same next
+  request, so nothing is given away), and if every tracked group is still spending, further
+  addresses share one bucket. A limiter must not become the memory-exhaustion lever it exists
+  to prevent.
 - **Charged before the tool runs**, and before the per-tool capability check — so being rate
   limited never reveals which tools a key would otherwise be allowed to call.
 - **The budget is shared across tools.** It bounds what a key costs the node, not how often
@@ -710,6 +724,45 @@ Points worth knowing:
 
 Off by default: an upgrade must not start refusing calls a deployment used to serve.
 
+#### `write_documents_per_minute` — metering the write surface
+
+```toml
+[security.limits]
+write_documents_per_minute = 5000
+write_burst = 20000
+```
+
+Writes are the expensive direction and the one that grows the disk, so a node that meters
+search and not writes has metered the wrong half. This is the ceiling on sustained ingest from
+one caller; `network.http.max_concurrent_requests` bounds how many requests are in flight at
+one instant and says nothing about how many arrive in an hour.
+
+- **Counted in documents, not requests.** A `_bulk` body may carry thousands, and charging it
+  the single token a search costs would leave the budget bounding nothing that matters. The
+  charge is what the request asks the node to index or remove: **1** for `PUT
+  /api/{index}/document` and `DELETE /api/{index}/document`, the array length for
+  `POST /api/{index}/_bulk` and `POST /api/{index}/_bulk/delete`, and one charge per
+  micro-batch (`search.stream_batch_size`) for `POST /api/{index}/document/stream`.
+- **A delete costs what a write costs.** It is a document through the writer, a commit and a
+  merge — cheaper to send, not cheaper to serve.
+- **Charged before any of the work happens**, so a refused request leaves the index untouched
+  and there is nothing for the caller to reconcile. The streaming route is the one exception
+  and cannot be otherwise: how many documents the body holds is not known until it has been
+  read. When a stream runs out mid-file it stops, and answers `429` with the same summary the
+  size limit gives — `items_written`, `lines_received`, `batches` and `retry_after_secs` — so
+  the caller knows exactly where to resume.
+- **Set the burst above the sustained rate** more readily than on the read side. An import is
+  one burst of many documents and then nothing; a burst equal to a minute's sustained rate
+  refuses the second half of a file that a burst of twice that accepts whole.
+- **Refusals carry `Retry-After`.** Every 429 from either meter does, and obeying it works —
+  that is the bucket's contract, and it is pinned by a test.
+- **It does not inherit `tool_calls_per_minute`.** An operator who metered tool calls chose a
+  number for tool calls; charging their bulk imports against it on upgrade would be a release
+  that broke ingest. Writes stay unmetered until this setting says otherwise.
+
+`check-config` reports the state of both meters under the `rate` rule, and warns on a
+non-`local` profile when either one is open.
+
 #### `max_search_limit` — how much one search may ask for
 
 The rate above is off by default; this one is not. There is no reading of "no ceiling" that is
@@ -718,9 +771,9 @@ serializes for a single request. It defaults to **10000**, which is where one re
 being one request for this architecture: a search fans out across every shard of an index, and
 each hit is a redb lookup, a merge entry and a serialized document.
 
-- **Applies to the MCP tools, not to `POST /api/{index}/search`.** The HTTP API is an
-  operator's own client asking a considered question; the ceiling exists for an agent choosing
-  its own limit, which is why it sits with the other MCP limits rather than under `[search]`.
+- **Enforced on `POST /api/{index}/search` too**, though it lives with the MCP limits because
+  that is the caller it was written for — an agent choosing its own limit. The HTTP surface can
+  ask for exactly the same work, so a ceiling only one door honours is not a ceiling.
 - **Advertised as well as enforced.** Both search tools render it as their `inputSchema`
   `maximum`, so a schema-driven client never constructs a call that will be refused — and a
   caller is never refused for exceeding a bound it was not shown.

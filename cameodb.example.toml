@@ -107,15 +107,22 @@ enabled = false
 # label = "team-a"
 # allowed_indexes = ["docs", "wiki"]    # honored for every role; omit to allow all
 
-# What one caller may spend on MCP tool calls. Off by default.
+# What one caller may spend per minute. Both meters off by default.
 #
 # Aimed at a legitimate key held by an AI agent that loops: every call is authorized, and
 # the capability model has nothing to say about how often. A token bucket, so a burst is
 # allowed through and the sustained rate is metered — which is the shape agent traffic
-# actually has. Metered per key, so one noisy agent cannot refuse another.
+# actually has. Metered per key, so one noisy agent cannot refuse another; with [security]
+# off there is no key, and the caller's address is used instead.
+#
+# Two meters because there are two units. Tool calls and searches are requests; writes are
+# documents — one _bulk body may carry thousands, and charging it the single token a search
+# costs would leave the expensive direction unmetered. Setting one does not set the other.
 # [security.limits]
 # tool_calls_per_minute = 120           # 0 (default) disables limiting entirely
 # tool_call_burst = 30                  # spendable at once; 0 means one minute's worth
+# write_documents_per_minute = 5000     # the write routes, charged per document; 0 disables
+# write_burst = 20000                   # an import is one burst; set this above the rate
 # max_search_limit = 10000              # largest `limit` an MCP search may ask for
 # max_federated_indexes = 20            # most indexes one search_across_indexes may name
 

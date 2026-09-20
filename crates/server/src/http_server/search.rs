@@ -10,12 +10,12 @@ use axum::{
 use serde::Deserialize;
 use tracing::{debug, info};
 
-use crate::authz::Authz;
 use crate::cluster_coordinator::OperationType;
+use crate::http_server::caller_of;
 use crate::http_server::error::AppError;
 use crate::node::{ClientOp, SearchWindow};
 use crate::query::parse_query_keywords;
-use crate::ratelimit::Verdict;
+use crate::ratelimit::{Caller, Verdict};
 use crate::state::AppState;
 use storage::SortSpec;
 
@@ -39,17 +39,18 @@ pub struct SearchPayload {
 pub(super) async fn search_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
-    authz: Option<Extension<Authz>>,
+    caller: Option<Extension<Caller>>,
     Json(payload): Json<SearchPayload>,
 ) -> Result<Response, AppError> {
-    // The same per-key token bucket the MCP surface has, keyed by the same `key_id`, off by
-    // the same default (`tool_calls_per_minute: 0` means `Verdict::Allow`). A search is one
-    // unit of work, so the cost is one — matching what the MCP `search` tool charges.
-    let key_id = authz.as_ref().and_then(|Extension(a)| a.key_id());
-    if let Verdict::Deny { retry_after_secs } = state.tool_limiter.check(key_id.as_deref(), 1) {
-        return Err(AppError::too_many_requests(format!(
-            "Search rate limit exceeded. Retry after {retry_after_secs}s."
-        )));
+    // The same token bucket the MCP surface has, charged to the same subject the gate decided
+    // on, off by the same default (`tool_calls_per_minute: 0` means `Verdict::Allow`). A search
+    // is one unit of work, so the cost is one — matching what the MCP `search` tool charges.
+    let caller = caller_of(caller);
+    if let Verdict::Deny { retry_after_secs } = state.rate_limiter.check(&caller, 1) {
+        return Err(AppError::too_many_requests_in(
+            "Search rate limit exceeded.",
+            retry_after_secs,
+        ));
     }
 
     // Parse query string for embedded limit/offset/return/sort keywords
@@ -132,15 +133,16 @@ pub(super) async fn search_handler(
 pub(super) async fn search_stream_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
-    authz: Option<Extension<Authz>>,
+    caller: Option<Extension<Caller>>,
     Json(payload): Json<SearchPayload>,
 ) -> Result<Response, AppError> {
-    // Same per-key rate limit as the non-streaming search, for the same reason.
-    let key_id = authz.as_ref().and_then(|Extension(a)| a.key_id());
-    if let Verdict::Deny { retry_after_secs } = state.tool_limiter.check(key_id.as_deref(), 1) {
-        return Err(AppError::too_many_requests(format!(
-            "Search rate limit exceeded. Retry after {retry_after_secs}s."
-        )));
+    // Same rate limit as the non-streaming search, for the same reason.
+    let caller = caller_of(caller);
+    if let Verdict::Deny { retry_after_secs } = state.rate_limiter.check(&caller, 1) {
+        return Err(AppError::too_many_requests_in(
+            "Search rate limit exceeded.",
+            retry_after_secs,
+        ));
     }
 
     // Parse query string for embedded limit/return/sort keywords

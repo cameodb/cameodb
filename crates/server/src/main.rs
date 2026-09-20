@@ -638,7 +638,7 @@ async fn main() -> Result<()> {
         stream_batch_size: cameodb_config.search.stream_batch_size,
         max_record_size_bytes: cameodb_config.limits.max_record_size_mb * 1024 * 1024,
         max_body_size_bytes: cameodb_config.effective_max_body_size_mb() * 1024 * 1024,
-        tool_limiter: std::sync::Arc::new(ratelimit::ToolRateLimiter::new(
+        rate_limiter: std::sync::Arc::new(ratelimit::RateLimiter::new(
             cameodb_config.security.limits.clone(),
         )),
         max_search_limit: cameodb_config.security.limits.max_search_limit,
