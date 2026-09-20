@@ -3390,6 +3390,198 @@ async fn a_stream_of_bad_lines_reports_a_bounded_number_of_reasons() {
     );
 }
 
+/// A gzip stream that inflates past the body ceiling is refused, and says what it wrote.
+///
+/// `max_body_size_mb` means *decompressed* bytes on every other route: `DefaultBodyLimit` sits
+/// inside `RequestDecompressionLayer`, so a `Json` extractor measures a bomb expanded. The NDJSON
+/// stream handler takes a raw `Body`, which no extractor limit reaches, and the only guard that
+/// did reach it — `RequestBodyLimitLayer` — counts bytes off the socket before they are
+/// inflated. So compressing a request bought a caller allowance without bound.
+///
+/// The body here is ~8 MB of NDJSON against a 1 MB ceiling, and compresses to a few kilobytes,
+/// so it passes the wire limit comfortably and only the handler's own count can refuse it.
+#[tokio::test]
+async fn a_write_stream_refuses_a_body_that_inflates_past_the_limit() {
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write as _;
+
+    let node = TestNode::start("[limits]\nmax_body_size_mb = 1\n").await;
+
+    // Highly compressible and many lines, so the refusal lands mid-stream with documents
+    // already written rather than on the first chunk.
+    let filler = "y".repeat(400);
+    let mut ndjson = String::new();
+    for i in 0..20_000 {
+        ndjson.push_str(&format!(
+            "{{\"id\":\"d{i}\",\"doc\":{{\"t\":\"{filler}\"}}}}\n"
+        ));
+    }
+    assert!(
+        ndjson.len() > 4 * 1024 * 1024,
+        "the body must exceed the ceiling once inflated"
+    );
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(ndjson.as_bytes()).expect("compress");
+    let gzipped = encoder.finish().expect("finish");
+    assert!(
+        gzipped.len() < 1024 * 1024,
+        "and must fit under the wire limit compressed, or this tests the wrong guard: {} bytes",
+        gzipped.len()
+    );
+
+    with_tls_provider();
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/bomb/document/stream", node.url))
+        .header("content-type", "application/x-ndjson")
+        .header("content-encoding", "gzip")
+        .body(gzipped)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap_or(json!(null));
+
+    assert_eq!(
+        status, 413,
+        "an inflating body is refused with the same status an uncompressed one of that size \
+         gets from the wire limit: {body}"
+    );
+    assert_eq!(body["status"], "refused", "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("after decompression")),
+        "the refusal names what was measured: {body}"
+    );
+    // The stream is stopped mid-body, so some documents landed. The caller cannot work that
+    // out for itself, which is why the refusal reports it rather than answering 413 alone.
+    assert!(
+        body["items_written"].as_u64().is_some(),
+        "the refusal reports what was written before it: {body}"
+    );
+}
+
+/// A deflate-compressed stream is ingested, so gzip is not the only codec that works.
+///
+/// The request-side decompression layer carries one codec per cargo feature, which makes
+/// "compressed ingest works" a separate claim about each. gzip is covered by the refusal above
+/// — that assertion is only reachable because the body was inflated — and this covers deflate
+/// on the success path. Note `deflate` on the wire means zlib-wrapped, not raw.
+#[tokio::test]
+async fn a_write_stream_takes_a_deflate_body() {
+    use flate2::{Compression, write::ZlibEncoder};
+    use std::io::Write as _;
+
+    let node = TestNode::start("").await;
+
+    let ndjson: String = (0..3)
+        .map(|i| format!("{{\"id\":\"d{i}\",\"doc\":{{\"t\":\"row {i}\"}}}}\n"))
+        .collect();
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(ndjson.as_bytes()).expect("compress");
+    let deflated = encoder.finish().expect("finish");
+
+    with_tls_provider();
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/deflated/document/stream", node.url))
+        .header("content-type", "application/x-ndjson")
+        .header("content-encoding", "deflate")
+        .body(deflated)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap_or(json!(null));
+
+    assert_eq!(status, 200, "a deflate body is ingested: {body}");
+    assert_eq!(body["items_written"], 3, "{body}");
+}
+
+/// An encoding the server cannot inflate is refused as such, not handed to the NDJSON parser.
+///
+/// While the response-side layer stood here, `content-encoding` was ignored and the compressed
+/// bytes reached the parser, which answered 400 "No documents found in request body" — a
+/// complaint about the caller's documents for what is really a codec the server does not have.
+/// 415 names the actual problem, and the `accept-encoding` header on the refusal says what
+/// would have worked.
+#[tokio::test]
+async fn an_unsupported_content_encoding_is_refused_as_unsupported() {
+    let node = TestNode::start("").await;
+
+    with_tls_provider();
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/zstd/document/stream", node.url))
+        .header("content-type", "application/x-ndjson")
+        .header("content-encoding", "zstd")
+        .body(vec![0x28, 0xb5, 0x2f, 0xfd])
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(
+        resp.status().as_u16(),
+        415,
+        "a codec the server does not carry is named as the problem"
+    );
+    let accepted = resp
+        .headers()
+        .get("accept-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    for codec in ["gzip", "deflate", "br"] {
+        assert!(
+            accepted.contains(codec),
+            "the refusal lists what would work, but {codec} is missing: {accepted:?}"
+        );
+    }
+}
+
+/// A client that asks for a compressed response gets one, and one that does not is not charged
+/// for compressing it anyway.
+///
+/// `CompressionLayer` was configured but unreachable. The response-side `DecompressionLayer`
+/// that used to stand outside it filled in `accept-encoding: br` on any request lacking one,
+/// then decompressed on the way out whatever `CompressionLayer` had just compressed — so every
+/// response was compressed and immediately inflated again inside the process, and no client
+/// ever received a compressed body. Removing that layer is what makes the configured
+/// compression reach the wire, so it is worth an assertion rather than an assumption.
+#[tokio::test]
+async fn a_response_is_compressed_only_when_the_client_asks() {
+    let node = TestNode::start("").await;
+    with_tls_provider();
+
+    // `reqwest` is built without its own compression features here, so it neither adds an
+    // `accept-encoding` of its own nor decodes the reply — the header arrives as sent.
+    let asked = reqwest::Client::new()
+        .get(format!("{}{}", node.url, "/_cluster/health"))
+        .header("accept-encoding", "br")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        asked
+            .headers()
+            .get("content-encoding")
+            .map(|v| v.as_bytes()),
+        Some(&b"br"[..]),
+        "a client asking for brotli gets it: {:?}",
+        asked.headers()
+    );
+
+    let silent = reqwest::Client::new()
+        .get(format!("{}{}", node.url, "/_cluster/health"))
+        .send()
+        .await
+        .expect("request");
+    assert!(
+        silent.headers().get("content-encoding").is_none(),
+        "a client that asked for nothing is sent an identity body: {:?}",
+        silent.headers()
+    );
+}
+
 /// POST a raw NDJSON body, returning the status and the decoded response.
 async fn post_ndjson(node: &TestNode, path: &str, body: &str) -> (u16, serde_json::Value) {
     with_tls_provider();

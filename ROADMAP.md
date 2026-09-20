@@ -49,10 +49,10 @@ on one.
 | 17 — Record deletion | ✅ Done | — |
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
-| 14 — Security hardening (posture items C3–C8) | ◐ Partial | C5, C6 and C8 (REST rate limit) open; C3, C4 and C7 done |
+| 14 — Security hardening (posture items C3–C8) | ◐ Partial | C8 (REST rate limit) open; C3–C7 done |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
-| M — The 0.3.5 goal set: multi-tenant exposure | 📋 Planned | M0 (the architecture review and the order of work) plus eight items — M0's steps 1–3 come first, M1 (capping a *whole index*, not its writer) is the blocker, M6 and M0-f are the measured runs |
+| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed, M2 and M7 done; M1 (capping a *whole index*, not its writer) is the blocker, then M3–M6 and the M8 decision |
 
 ## Reconciliation, 2026-08-26
 
@@ -179,7 +179,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
 | [L1](#l1--size-cache-invalidation-by-substring-evicts-neighbouring-indexes) … [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | Post-0.3.4 review group — all twenty closed; the retrospective's output is [M](#m-the-035-goal-set--multi-tenant-exposure--planned) | — | 2026-09-19 | ✅ |
-| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 holds the architecture review and the order of work, M1 is the blocker | — | 2026-09-19 | 📋 |
+| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed, M2 and M7 done, M1 is the blocker | — | 2026-09-20 | ◐ |
 
 ---
 
@@ -608,13 +608,11 @@ Pinned by `an_admin_api_with_no_admin_key_is_closed_rather_than_open`, which ass
 
 ### C5 — A decompression cap on the streaming ingest path
 
-📋 **Planned** (finding H3). `POST /api/{index}/document/stream` takes a raw `Body`, so
-`DefaultBodyLimit` (which measures the *expanded* size for `Json`/`Bytes` extractors) never
-applies to it, and `RequestBodyLimitLayer` counts compressed wire bytes before
-`DecompressionLayer` inflates them. A gzip stream under the wire limit can expand without
-bound; it is bounded only by the request timeout and the concurrency guard. Cap total
-decompressed bytes on the streaming path — count as the handler drains the body, or make the
-wire-limit apply post-decompression for raw-body handlers.
+✅ **Done 2026-09-20** (finding H3), by
+[M2](#m2--cap-decompressed-bytes-on-the-streaming-ingest-path). The cap the finding asked for
+is there. What the finding assumed — and what the router's own comments asserted — was that
+`DecompressionLayer` inflated request bodies. It decompresses *responses*, so the threat was
+unreachable and two neighbouring bugs were not. M2 has the account.
 
 ### C7 — A `500` printed the node's internal error text
 
@@ -627,10 +625,23 @@ on, and six tests read it.
 
 ### C6 — Redact the cluster PSK in `Debug`
 
-📋 **Planned** (finding H4). `ClusterConfig` derives `Debug` while holding `psk: Option<String>`
-(`config.rs` 728–731, 767–782). Nothing `Debug`-prints the config today, but any future
-`debug!("{:?}", config)` leaks the PSK. Hand-implement `Debug` for `ClusterConfig` (or wrap the
-field in a redacting type), the way `ClusterPsk` and `ApiKey` already do.
+✅ **Done 2026-09-07**, in `33399d6` — and carried as 📋 until **2026-09-19**, when
+[M7](#m7--redact-the-cluster-psk-in-debug) went to do it and found it already done. The original
+finding (H4): `ClusterConfig` derived `Debug` while holding `psk: Option<String>`, so any future
+`debug!("{:?}", config)` would have leaked the key.
+
+What is actually there now is more than the entry asked for. `ClusterConfig` has a hand-written
+`Debug` that prints `<redacted>` in place of the key; `psk` is `#[serde(default,
+skip_serializing)]`, so no config dump can carry it, which is why `overrides.rs` needs a
+`NEVER_SERIALIZED_SETTINGS` list for it; `ClusterPsk` — the resolved 32 bytes — has its own
+redacting `Debug` that prints a non-reversible fingerprint, and a `Drop` that scrubs the bytes
+with `write_volatile`; the swarm logs that fingerprint rather than the key; and `load_psk`'s
+refusal reports only the *length* of a malformed value, deliberately, because an error message
+is the one place a bad secret would otherwise reach a log.
+
+The stale marker is the lesson, not the code: this sat ✅-in-fact and 📋-on-paper for twelve
+days, which is the same bookkeeping failure [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle)
+corrected seven dates for.
 
 ### C8 — REST has no rate limit, and anonymous MCP callers share one bucket
 
@@ -4118,12 +4129,48 @@ whole extent. Two consequences to write into the design before it starts:
 
 ### M2 — Cap decompressed bytes on the streaming ingest path
 
-📋 **Planned.** [C5](#c5--a-decompression-cap-on-the-streaming-ingest-path) unchanged, and it
-changes category on an internet-facing node: `POST /api/{index}/document/stream` takes a raw
-`Body`, so `DefaultBodyLimit` never applies and `RequestBodyLimitLayer` counts compressed wire
-bytes. A gzip stream under the wire limit expands without bound, held only by the request
-timeout and the concurrency guard. Count decompressed bytes as the handler drains, and refuse
-past the cap.
+✅ **Done 2026-09-20.** The cap is in, and getting there turned up two bugs the finding had
+not suspected.
+
+The cap itself is what [C5](#c5--a-decompression-cap-on-the-streaming-ingest-path) asked for.
+`write_stream_handler` takes a raw `Body`, which no extractor limit reaches, so it counts each
+chunk against `AppState::max_body_size_bytes` and stops the moment the total passes it. The
+refusal is a 413 carrying the same summary the success path returns, with `"status":
+"refused"` — because a stream cut mid-body leaves documents written, and whether those are in
+the index is the one thing the caller cannot work out for itself.
+
+**The threat was unreachable, for a reason worth recording.** The first run of the new test
+sent a gzip body and got back 400 *"expected value at line 1 column 1"*: the NDJSON parser had
+been handed raw gzip. `routes.rs` used `tower_http::decompression::DecompressionLayer`, whose
+own documentation opens *"Decompresses **response** bodies of the underlying service"*. The
+request-side layer is `RequestDecompressionLayer` — a different type in the same module, one
+word apart. No request body was ever inflated, for any codec, and both comments in the layer
+stack said otherwise: *"Allow compressed requests — decompresses before the body limit above"*
+and *"a compression bomb is measured expanded, not compressed"*. Two confident comments stood
+in for the one test that would have caught it. Had the cap gone in alone, it would have been
+unreachable code asserted by a test passing for the wrong reason — the shape
+[M0-h](#m0--the-architecture-review-and-the-order-of-work) had just finished deleting.
+
+**The layer was not merely absent; it was costing.** It sat *outside* `CompressionLayer`, and
+it fills in `accept-encoding: br` on any request lacking one. So a response to a client that
+sent no `accept-encoding` was brotli-compressed by the inner layer and brotli-*de*compressed by
+the outer one before it left the process. `CompressionLayer` has been configured and
+unreachable since it went in: no client ever received a compressed body, and every response
+paid to produce one. Measured both ways against the old stack and the new before it was
+believed, and pinned by `a_response_is_compressed_only_when_the_client_asks`.
+
+With the swap to `RequestDecompressionLayer` making compressed ingest real, the codec set
+became a decision rather than an inheritance: `decompression-gzip` and `decompression-deflate`
+join the `decompression-br` that was already there, because brotli alone is not what an ingest
+client sends. An encoding outside that set now gets 415 with an `accept-encoding` list, where
+before it got a 400 complaining about the caller's documents.
+
+Four tests, one claim each:
+`a_write_stream_refuses_a_body_that_inflates_past_the_limit` (8 MB of NDJSON, a few kB on the
+wire, against a 1 MB ceiling — with the cap disabled it answers 200 having written all 20,000
+documents, which is C5's threat made visible), `a_write_stream_takes_a_deflate_body`,
+`an_unsupported_content_encoding_is_refused_as_unsupported`, and
+`a_response_is_compressed_only_when_the_client_asks`.
 
 ### M3 — Meter the write surface, and give anonymous callers their own bucket
 
@@ -4169,8 +4216,22 @@ behaviour has twice been worse than the reasoning predicted, and only a run has 
 
 ### M7 — Redact the cluster PSK in `Debug`
 
-📋 **Planned.** [C6](#c6--redact-the-cluster-psk-in-debug), unchanged and cheap — minutes of
-work, and the kind of latent leak that an exposed node is the wrong place to discover.
+✅ **Done 2026-09-19 — by discovering it had been done on 2026-09-07.**
+[C6](#c6--redact-the-cluster-psk-in-debug) carries the detail. Every route the key could take
+out of the process was already closed: redacted `Debug` on both the config and the resolved key,
+`skip_serializing` on the field, a fingerprint in the swarm's log, a scrubbing `Drop`, and a
+refusal that reports a malformed key's length and nothing else.
+
+One gap was real and is now closed. `psk_is_not_printable_or_serializable` pinned the `Debug` and
+serialization routes, but nothing pinned the refusal — `load_psk`'s error message is the one
+place a malformed secret reaches an operator's log, and a comment claiming it is safe is not a
+test. `a_refused_psk_does_not_appear_in_its_own_error` covers both arms of that check, a value of
+the wrong length and one of the right length that is not hex, and it fails when the message is
+made to echo the value.
+
+**Cost of the item as planned: zero. Cost of not checking first: the twelve days C6 spent
+marked planned.** Worth remembering before the next "cheap and unchanged" item is picked up —
+read the code before scheduling the work.
 
 ### M8 — Re-decide the query complexity caps
 

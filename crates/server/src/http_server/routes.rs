@@ -21,7 +21,7 @@ use cameodb_mcp::{MCP_SESSION_ID_HEADER, McpShutdownHandle, mcp_router};
 use tokio::sync::Semaphore;
 use tower_http::{
     catch_panic::CatchPanicLayer, compression::CompressionLayer, cors::CorsLayer,
-    decompression::DecompressionLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
+    decompression::RequestDecompressionLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 use tracing::{info, warn};
@@ -254,15 +254,25 @@ pub fn create_router(
 
     let router = router
         .with_state(state)
-        // Response compression (outermost for responses)
+        // Response compression (outermost for responses) — and reachable only since the
+        // response-side decompression layer that used to sit outside it came out. That one
+        // filled in `accept-encoding: br` on any request lacking one and then inflated the
+        // reply again on the way out, so this layer compressed every response and nothing
+        // compressed ever left the process.
         .layer(CompressionLayer::new())
-        // Decompressed-size limit for body *extractors* (Json/Bytes/String). Applied
-        // after DecompressionLayer so a compression bomb is measured expanded, not
-        // compressed. Note this is an extractor-level limit only — it does not count
-        // bytes off the socket, which is what RequestBodyLimitLayer below does.
+        // Decompressed-size limit for body *extractors* (Json/Bytes/String). Sits inside the
+        // decompression layer below, so a compression bomb is measured expanded rather than
+        // compressed. An extractor-level limit only: it does not count bytes off the socket,
+        // which is what RequestBodyLimitLayer does, and it never reaches a handler taking a
+        // raw `Body`. The NDJSON stream handler is that handler, and counts its own
+        // decompressed bytes against the same allowance — see `AppState::max_body_size_bytes`.
         .layer(DefaultBodyLimit::max(body_limit_bytes))
-        // Allow compressed requests — decompresses before the body limit above
-        .layer(DecompressionLayer::new())
+        // Inflate compressed request bodies: gzip, deflate and brotli. This is the
+        // request-side layer; `DecompressionLayer`, which stood here before, is the
+        // response-side one. A compressed request body therefore reached the handler as bytes,
+        // for every codec, and the two comments here that said otherwise were simply wrong. An
+        // encoding outside the set above is refused with 415 rather than parsed as text.
+        .layer(RequestDecompressionLayer::new())
         // Wire-level limit: counts bytes as they arrive and returns 413 once the cap is
         // passed, regardless of how the handler consumes the body. This is the only guard
         // that covers handlers taking a raw `Body` (the streaming ingest path), which

@@ -79,6 +79,12 @@ tempfile = "3.27.0"
 # Integration tests drive the built binary over HTTP. The SDK covers the REST surface, but
 # MCP is JSON-RPC over POST and has no SDK method, so those tests speak it directly.
 reqwest = { workspace = true }
+# To build a compressed request body. The decompression cap on the streaming ingest path
+# can only be exercised by a body that is small on the wire and large once inflated, which
+# means a test has to compress one. Already in the lockfile — `tower-http`'s decompression
+# pulls it in through `async-compression` — so it adds nothing to the dependency or
+# advisory surface, and being a dev-dependency it is not in the shipped binary at all.
+flate2 = "1.1"
 
 [package.metadata.generate-rpm]
 release = "1"
