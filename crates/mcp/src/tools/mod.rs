@@ -6,7 +6,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
-    authz::{McpAuthzRef, tool_capability},
+    authz::{McpAuthzRef, McpCapability, tool_capability},
     backend::{McpBackend, McpIndexSearchRequest, ToolError},
     tools::schema::{
         DescribeIndexArgs, GetCatalogStatsArgs, ListIndexesArgs, SearchAcrossIndexesArgs,
@@ -156,7 +156,7 @@ where
                 backend.default_search_limit(),
                 backend.max_search_limit(),
             )?;
-            check_index(authz, &args.index)?;
+            check_index(authz, &args.index, required)?;
             backend
                 .search_index(
                     McpIndexSearchRequest {
@@ -184,7 +184,7 @@ where
             // Refuse the whole call rather than quietly dropping the indexes this key may
             // not read: partial results that look complete are worse than an error.
             for request in &args.indexes {
-                check_index(authz, &request.index)?;
+                check_index(authz, &request.index, required)?;
             }
             backend
                 .search_across_indexes(args.indexes, args.query, args.limit, args.offset)
@@ -192,7 +192,7 @@ where
         }
         "describe_index" => {
             let args: DescribeIndexArgs = decode_args("describe_index", params.arguments)?;
-            check_index(authz, &args.index)?;
+            check_index(authz, &args.index, required)?;
             backend.describe_index(args.index).await
         }
         "list_indexes" => {
@@ -203,7 +203,7 @@ where
             let args: ValidateQueryArgs = decode_args("validate_query", params.arguments)?;
             // Validation reports an index's field names, so it is a read of that index.
             if let Some(index) = &args.index {
-                check_index(authz, index)?;
+                check_index(authz, index, required)?;
             }
             backend
                 .validate_query(args.index, args.partial_field, args.query)
@@ -279,15 +279,28 @@ pub(crate) fn tool_cost(arguments: &JsonValue, max_federated_indexes: usize) -> 
     entries.len().clamp(1, max_federated_indexes) as u32
 }
 
-/// Refuse a tool call that names an index outside the caller's scope.
-fn check_index(authz: &McpAuthzRef, index: &str) -> Result<(), ToolError> {
-    if authz.allows_index(index) {
-        Ok(())
-    } else {
-        Err(ToolError::caller(format!(
+/// Refuse a tool call that names an index the caller may not reach, or may not use this way.
+///
+/// Two questions, deliberately asked in one place. Scope — may this key touch the index at all
+/// — and authority *on* that index, which a host may reduce below the key's general role. The
+/// capability check at dispatch cannot answer the second: it runs before any argument is
+/// decoded, so it does not yet know which index is in play.
+///
+/// Every tool that names an index passes through here, which is what makes that guarantee
+/// checkable rather than a convention each new tool has to remember.
+fn check_index(authz: &McpAuthzRef, index: &str, required: McpCapability) -> Result<(), ToolError> {
+    if !authz.allows_index(index) {
+        return Err(ToolError::caller(format!(
             "this key is not permitted on index '{index}'"
-        )))
+        )));
     }
+    if !authz.has_on(required, index) {
+        return Err(ToolError::caller(format!(
+            "this key does not hold the '{}' capability on index '{index}'",
+            required.as_str()
+        )));
+    }
+    Ok(())
 }
 
 /// What `search_index` does, plus the query reference rendered from [`crate::syntax`].
@@ -417,7 +430,7 @@ mod tests {
 
     use super::*;
     use crate::authz::{
-        McpCapability,
+        McpAuthz, McpCapability,
         testing::{NoCapabilities, Scoped},
     };
     use crate::backend::testing::StubBackend;
@@ -555,9 +568,53 @@ mod tests {
     #[test]
     fn a_named_index_outside_the_scope_is_refused() {
         let authz: McpAuthzRef = Arc::new(Scoped("docs"));
-        assert!(check_index(&authz, "docs").is_ok());
-        let err = check_index(&authz, "payroll").unwrap_err();
+        assert!(check_index(&authz, "docs", McpCapability::Read).is_ok());
+        let err = check_index(&authz, "payroll", McpCapability::Read).unwrap_err();
         assert!(err.detail().contains("payroll"), "{err}");
+    }
+
+    /// A caller inside the scope can still be refused *on that index*.
+    ///
+    /// The capability check at dispatch runs before any argument is decoded, so it cannot know
+    /// which index is in play and answers about the key in general. A host that reduces a key's
+    /// authority on one index is invisible to it — which is the whole failure this test exists
+    /// to rule out, since a tool asking `has` and `allows_index` separately would let the call
+    /// through.
+    #[test]
+    fn a_capability_withheld_on_one_index_is_refused_there() {
+        /// Reachable everywhere and writable everywhere *except* `audit`.
+        struct SubtractedOnAudit;
+        impl McpAuthz for SubtractedOnAudit {
+            fn key_id(&self) -> Option<String> {
+                Some("k".to_string())
+            }
+            fn allows_index(&self, _index: &str) -> bool {
+                true
+            }
+            fn has(&self, _capability: McpCapability) -> bool {
+                true
+            }
+            fn has_on(&self, capability: McpCapability, index: &str) -> bool {
+                !(index == "audit" && capability == McpCapability::Write)
+            }
+        }
+
+        let authz: McpAuthzRef = Arc::new(SubtractedOnAudit);
+        assert!(
+            check_index(&authz, "audit", McpCapability::Read).is_ok(),
+            "the subtraction takes write, not read"
+        );
+        assert!(
+            check_index(&authz, "docs", McpCapability::Write).is_ok(),
+            "the subtraction is scoped to one index, not to the key"
+        );
+
+        let err = check_index(&authz, "audit", McpCapability::Write).unwrap_err();
+        assert!(err.detail().contains("audit"), "{err}");
+        assert!(
+            err.detail().contains("write"),
+            "the refusal has to name the capability that was withheld: {err}"
+        );
     }
 
     /// A tool whose parameters are all optional is callable with none of them.

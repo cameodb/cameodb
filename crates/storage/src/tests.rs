@@ -830,6 +830,60 @@ mod tests {
         );
     }
 
+    /// The tenant stamp survives the schema Tantivy is merged into.
+    ///
+    /// `get_schema_cached` prefers Tantivy as the source of truth for *fields*, and the tempting
+    /// reading of that is that the returned schema is the derived one. It is not: the stored
+    /// schema is the base and Tantivy's fields are merged onto it, which is the only reason
+    /// `tenant` — and `description`, and the timestamps — survive a read at all.
+    ///
+    /// Worth pinning because the failure is silent and expensive. `derive_index_schema_from_tantivy`
+    /// builds its value with `tenant: None`, since Tantivy stores fields and not ownership. If
+    /// that value ever became the base rather than the field source, every index would read back
+    /// unowned, every tenant's usage would drop to zero, and the quota would stop bounding
+    /// anything without a single error anywhere.
+    #[test]
+    fn the_tenant_stamp_survives_a_schema_read() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(small_store_config(&temp_dir), 1).expect("store");
+        let index = "owned";
+
+        let mut schema = IndexSchema {
+            tenant: Some("acme".to_string()),
+            ..IndexSchema::default()
+        };
+        schema.fields.insert(
+            "title".to_string(),
+            FieldDef::new("title".to_string(), TantivyFieldType::Text),
+        );
+        store
+            .store_schema_and_cache(index, &schema)
+            .expect("store schema");
+
+        // A write builds the Tantivy index, so the read below takes the merge path rather than
+        // the stored-only fallback.
+        store
+            .apply_write(
+                index,
+                WalOp::Put {
+                    id: "d1".to_string(),
+                    json_blob: Some(serde_json::json!({ "title": "one" })),
+                },
+            )
+            .expect("write");
+        store.invalidate_schema_cache(index);
+
+        let read = store
+            .get_schema_cached(index)
+            .expect("read schema")
+            .expect("the index has one");
+        assert_eq!(
+            read.tenant.as_deref(),
+            Some("acme"),
+            "the stamp was lost on the way back out; every index would read as unowned"
+        );
+    }
+
     /// A WAL entry written by the previous build still decodes.
     ///
     /// Those entries are whole `WalOp` JSON values, and an upgrade can find a tail of them left

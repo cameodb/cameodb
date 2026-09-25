@@ -628,6 +628,9 @@ role = "writer"
 label = "team-a"
 # Optional: restrict this key to these indexes, for any role
 allowed_indexes = ["docs", "wiki"]
+# Optional: hold a reduced role on a named index. This key writes to "wiki" and
+# reads "docs", with one key rather than two.
+index_overrides = { docs = "reader" }
 
 [[security.api_keys]]
 # Or keep the digest out of the config file entirely
@@ -656,6 +659,32 @@ Roles bundle four capabilities:
 another index is refused, and `/_indexes`, the MCP catalog and the MCP resource list return
 only the indexes that key may see.
 
+**`index_overrides` reduces a key on one index.** The case it exists for is a `writer` that
+must be read-only on a single sensitive index while keeping write everywhere else — one key
+instead of two, and no fourth role:
+
+```toml
+role = "writer"
+index_overrides = { audit = "reader" }
+```
+
+A write to `audit` is then refused `403` naming the effective role, while a write anywhere else
+succeeds and a read of `audit` still works. The two refusals stay distinguishable on purpose:
+*"this key is not permitted on index 'x'"* means the index is outside `allowed_indexes`, while
+*"this key is restricted to role 'reader' on index 'x'"* means it may reach the index but not
+that way. They send you to different parts of the stanza.
+
+**It can only subtract.** An override naming a role that holds a capability the key's own role
+does not is refused at startup, naming the capabilities it would have added — this is a
+mechanism for reducing a key's reach, never for widening it, and a config that reads as if it
+widens one is a mistake worth stopping rather than honouring. An override naming an index that
+is not in `allowed_indexes` is refused too: the key cannot reach that index at all, so the
+override would read as protection and provide none.
+
+Enforced on REST and on `/mcp` alike. That is worth stating because the two check in different
+places — the HTTP gate classifies a path, while an MCP tool is checked after its arguments are
+decoded, since a single JSON-RPC path cannot be classified from the outside.
+
 **`implicit_index_creation`** decides whether a write may mint an index. On by default: a write
 to an index that does not exist samples the documents into a schema and creates it, which is
 what makes semi-structured input work — and what lets any caller with `write` grow the node's
@@ -673,6 +702,8 @@ you only discover on the day you turn authentication on. These all refuse to sta
 - a hash that is not `sha256:<64 hex>`
 - two entries with the same hash — one key cannot hold two roles
 - `allowed_indexes = []`, which reads as "no restriction" but means "no index at all"
+- an `index_overrides` entry that grants more than the key's own role
+- an `index_overrides` entry naming an index outside `allowed_indexes`
 
 ### Rate limiting tool calls, search and writes (`[security.limits]`)
 

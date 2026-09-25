@@ -4502,11 +4502,36 @@ refusal that names the remedy, not a silent truncation. Unlimited by default.
 
 ### M5 — Per-index capability subtraction
 
-📋 **Planned.** [C1](#c1--per-index-role-overrides) promoted, and its own entry already names
-the reason: *risk if unfixed: multi-tenant isolation*. A key with `role = "writer"` granted
-read-only on one named index — subtraction from the allow-list rather than a second allow-list.
-Estimated at ~2 days there, enforced at B1's chokepoint and not at the `RouterActor` boundary,
-for the trust-boundary reason B1 records.
+✅ **Done 2026-09-25.** [C1](#c1--per-index-role-overrides) promoted, and its own entry already
+named the reason: *risk if unfixed: multi-tenant isolation*.
+
+`index_overrides = { audit = "reader" }` on a key stanza: on the named index the key holds that
+role instead of its own. Written as a role rather than a capability list because a key's
+authority has to stay legible at a glance, and because an override that can only name an
+existing role cannot invent an authority the vocabulary does not have.
+
+**Subtraction is enforced at load, not assumed.** An override holding a capability the key's own
+role does not is refused at startup, naming the capabilities it would have added — the failure
+worth preventing is an operator writing an override believing it restricts a key and it quietly
+granting instead. Silently clamping was the other candidate and is worse: it honours a config
+nobody wrote. An override naming an index outside `allowed_indexes` is refused too, because it
+reads as protection and provides none.
+
+**Both surfaces, which was the part that could have been a fiction.** The HTTP gate checks at
+`decide`, after scope and separately from the role check, so *"your role cannot do this anywhere"*
+and *"your role cannot do this here"* stay distinguishable to the caller and in the log. `/mcp`
+could not reuse that: a single JSON-RPC path cannot be classified from the outside, so the
+dispatcher checks capability before any argument is decoded and cannot know which index is in
+play. `McpAuthz` therefore gained `has_on(capability, index)` — defaulted to the
+index-independent answer so a host without the notion is unaffected — and `check_index`, which
+every index-naming tool already passes through, now asks it. Enforcing on REST alone would have
+left the surface where an agent does the writing unguarded.
+
+Seven tests: the subtraction withholding write on one index and nowhere else, read surviving it,
+the refusal naming role/index/capability, escalation refused at load, an out-of-scope override
+refused at load, scope refused before the subtraction is consulted, and the MCP identity
+honouring it. Verified live: `403 this key is restricted to role 'reader' on index 'audit',
+which does not hold the 'write' capability`, with writes elsewhere still `200`.
 
 ### M6 — Close and re-measure the bulk lane
 

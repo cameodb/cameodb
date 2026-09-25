@@ -756,6 +756,9 @@ impl BulkCtx<'_> {
             docs,
             forwarded: true,
             schema_body: None,
+            // A forwarded share never decides a schema, so it never stamps one. The stamp was
+            // written by whichever node minted the index.
+            tenant: None,
         };
 
         let answer = match remote_answer(remote.ask(&op).await) {
@@ -2345,6 +2348,7 @@ impl OrchestratorEngine {
                 doc,
                 forwarded,
                 schema_body,
+                tenant,
             } => match self.engine_write(&index, id, routing_key, doc).await {
                 Ok(WriteOutcome::Done(value)) => WorkerOutcome::Done(Ok(value)),
                 Ok(WriteOutcome::NeedsActor {
@@ -2360,6 +2364,9 @@ impl OrchestratorEngine {
                     forwarded,
                     // Nor does it change what the forwarding node had settled.
                     schema_body,
+                    // The actor is where the mint happens, so the stamp has to survive the
+                    // hand-off: dropping it here is how a tenanted write lands unstamped.
+                    tenant,
                 })),
                 Err(err) => WorkerOutcome::Done(Err(err)),
             },
@@ -2426,6 +2433,7 @@ impl OrchestratorEngine {
                 docs,
                 forwarded,
                 schema_body,
+                tenant,
             } => match self.engine_bulk_write(&index, docs, forwarded).await {
                 Ok(BulkOutcome::Done(value)) => WorkerOutcome::Done(Ok(value)),
                 Ok(BulkOutcome::NeedsActor { docs }) => {
@@ -2436,6 +2444,8 @@ impl OrchestratorEngine {
                         // and the actor re-decides the schema on the terms it arrived with.
                         forwarded,
                         schema_body,
+                        // The actor mints, so the stamp travels with the hand-off.
+                        tenant,
                     }))
                 }
                 Err(err) => WorkerOutcome::Done(Err(err)),
@@ -3046,6 +3056,9 @@ impl NodeOrchestrator {
         schema_cache: &mut Arc<IndexSchema>,
         forwarded: bool,
         schema_body: Option<&IndexSchema>,
+        // Stamped onto the schema only if this call is the index's mint; see
+        // `ClientOp::Write::tenant`.
+        tenant: Option<&str>,
     ) -> Result<(SchemaValidationSummary, Vec<DocPayload>), OrchestratorError> {
         if docs.is_empty() {
             return Ok((
@@ -3163,6 +3176,14 @@ impl NodeOrchestrator {
             // Whatever this settles on describes a live index. Set before the merge so the
             // schema persisted below never carries a deletion it has just undone.
             Arc::make_mut(schema_cache).state = storage::SchemaState::Active;
+
+            // The index's mint is the one moment ownership is decided, so it is the one place
+            // the stamp is written. Not refreshed on later writes: whoever created the index
+            // owns it, and a stamp that followed the last writer would let a tenant shed their
+            // own usage by having another key write once.
+            if let Some(tenant) = tenant {
+                Arc::make_mut(schema_cache).tenant = Some(tenant.to_string());
+            }
 
             // Merge sampled schema into cache for better type detection
             for (field_name, field_def) in &sampled_schema.fields {
@@ -4597,17 +4618,27 @@ impl NodeOrchestrator {
                 doc,
                 forwarded,
                 schema_body,
+                tenant,
             } => {
-                self.orch_write(&index, id, routing_key, doc, forwarded, schema_body)
-                    .await
+                self.orch_write(
+                    &index,
+                    id,
+                    routing_key,
+                    doc,
+                    forwarded,
+                    schema_body,
+                    tenant.as_deref(),
+                )
+                .await
             }
             ClientOp::BulkWrite {
                 index,
                 docs,
                 forwarded,
                 schema_body,
+                tenant,
             } => {
-                self.orch_bulk_write(&index, docs, forwarded, schema_body)
+                self.orch_bulk_write(&index, docs, forwarded, schema_body, tenant.as_deref())
                     .await
             }
             ClientOp::Delete {
@@ -4758,6 +4789,11 @@ impl NodeOrchestrator {
         }))
     }
 
+    // Eight parameters, and each one is a decision the caller has already made: which index,
+    // which document, where it routes, whether this is a forward, what schema came with it, and
+    // whose quota it stamps. Bundling them into a struct would move the argument list rather
+    // than shorten it, and the op they are destructured from is that struct.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn orch_write(
         &self,
         index: &str,
@@ -4766,6 +4802,7 @@ impl NodeOrchestrator {
         doc: JsonValue,
         forwarded: bool,
         schema_body: Option<Box<IndexSchema>>,
+        tenant: Option<&str>,
     ) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
             return Err(OrchestratorError::NotReady("No shards".to_string()));
@@ -4815,6 +4852,8 @@ impl NodeOrchestrator {
                                 // needs to know not to invent one: it asks, and the resend
                                 // below carries the body. Nothing speculative on the wire.
                                 schema_body: None,
+                                // Forwarded, so it mints nothing and stamps nothing.
+                                tenant: None,
                             },
                             Some(&schema),
                         )
@@ -4842,6 +4881,7 @@ impl NodeOrchestrator {
                 &mut schema_mut,
                 forwarded,
                 schema_body.as_deref(),
+                tenant,
             )
             .await?;
 
@@ -4890,6 +4930,8 @@ impl NodeOrchestrator {
                         // asks for the body if it needs one.
                         schema_body: None,
                         forwarded: true,
+                        // Forwarded, so it mints nothing and stamps nothing.
+                        tenant: None,
                     },
                     Some(&schema_mut),
                 )
@@ -5072,6 +5114,7 @@ impl NodeOrchestrator {
         docs: Vec<DocPayload>,
         forwarded: bool,
         schema_body: Option<Box<IndexSchema>>,
+        tenant: Option<&str>,
     ) -> Result<JsonValue, OrchestratorError> {
         let start = std::time::Instant::now();
         if self.shards.is_empty() {
@@ -5093,6 +5136,7 @@ impl NodeOrchestrator {
                 &mut schema_mut,
                 forwarded,
                 schema_body.as_deref(),
+                tenant,
             )
             .await?;
 
@@ -5220,10 +5264,23 @@ impl NodeOrchestrator {
         // the cluster orders two schemas for the same index (`preferred_schema`), so a v1
         // stamped over a v3 does not merely lose the increment: the node holding it is behind
         // for good, and its declaration is the one discarded.
-        schema.version = self
-            .durable_schema(index)
-            .await?
+        let current = self.durable_schema(index).await?;
+        schema.version = current
+            .as_ref()
             .map_or(1, |current| current.version.saturating_add(1));
+
+        // Ownership follows `version`'s rule, and for the same reason: a field the caller can
+        // set is a field the caller can lie about. `tenant` arrives here already overwritten
+        // with the calling key's own — the handler does that, so a body naming someone else's
+        // tenant, or none, buys nothing.
+        //
+        // What is decided *here* is create-versus-update. A re-declaration keeps whatever the
+        // mint decided, so updating a schema with an admin key (which carries no tenant) cannot
+        // silently unstamp an index and hand its owner their quota back. The stamp is written
+        // once, by whoever created the index.
+        if let Some(current) = &current {
+            schema.tenant = current.tenant.clone();
+        }
 
         // Ensure 'id' field is explicitly in the schema for visibility
         if !schema.fields.contains_key("id") {

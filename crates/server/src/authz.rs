@@ -229,6 +229,17 @@ impl Authz {
         }
     }
 
+    /// The tenant whose budget this caller spends, if their key names one.
+    ///
+    /// `None` for an anonymous caller, for a node with authentication off, and for any key
+    /// whose stanza has no `tenant` — all of which spend against no budget.
+    pub fn tenant(&self) -> Option<&str> {
+        match self {
+            Authz::Key(entry) => entry.tenant(),
+            _ => None,
+        }
+    }
+
     /// Everything about the caller the audit trail is allowed to keep.
     ///
     /// Empty for `Disabled` and `Anonymous`, which is the honest answer: on a node that
@@ -278,18 +289,40 @@ impl McpAuthz for Authz {
     }
 
     fn has(&self, capability: McpCapability) -> bool {
-        let capability = match capability {
-            McpCapability::Read => Capability::Read,
-            McpCapability::Write => Capability::Write,
-            McpCapability::IndexAdmin => Capability::IndexAdmin,
-            McpCapability::NodeAdmin => Capability::NodeAdmin,
-        };
+        let capability = translate(capability);
         match self {
             // Auth off: nothing to enforce.
             Authz::Disabled => true,
             Authz::Anonymous => false,
             Authz::Key(entry) => entry.has(capability),
         }
+    }
+
+    /// The per-index answer, which is the one every index-naming tool asks.
+    ///
+    /// Without this the trait's default would answer from [`McpAuthz::has`], and a key
+    /// restricted to read-only on one index would still write to it through `/mcp` — the HTTP
+    /// gate enforcing a subtraction the tool dispatcher could not see.
+    fn has_on(&self, capability: McpCapability, index: &str) -> bool {
+        let capability = translate(capability);
+        match self {
+            Authz::Disabled => true,
+            Authz::Anonymous => false,
+            Authz::Key(entry) => entry.has_on(capability, index),
+        }
+    }
+}
+
+/// The one place the two capability vocabularies meet.
+///
+/// Exhaustive rather than a catch-all so a capability added to either side has to be mapped
+/// here to compile.
+fn translate(capability: McpCapability) -> Capability {
+    match capability {
+        McpCapability::Read => Capability::Read,
+        McpCapability::Write => Capability::Write,
+        McpCapability::IndexAdmin => Capability::IndexAdmin,
+        McpCapability::NodeAdmin => Capability::NodeAdmin,
     }
 }
 
@@ -324,6 +357,10 @@ impl McpAuthz for McpCaller {
 
     fn has(&self, capability: McpCapability) -> bool {
         McpAuthz::has(&self.authz, capability)
+    }
+
+    fn has_on(&self, capability: McpCapability, index: &str) -> bool {
+        McpAuthz::has_on(&self.authz, capability, index)
     }
 
     fn peer_addr(&self) -> Option<std::net::IpAddr> {
@@ -598,6 +635,32 @@ fn decide(
             Refusal::forbidden(format!("this key is not permitted on index '{}'", index))
                 .by(&entry),
         );
+    }
+
+    // Per-index subtraction, checked after scope and separately from the capability check
+    // above. The two refusals stay distinguishable on purpose: "your role cannot do this
+    // anywhere" and "your role cannot do this *here*" are different answers, and an operator
+    // debugging a key needs to know which one they got. Folding them into one check would
+    // also mean a key with no overrides — nearly all of them — paying for a lookup it never
+    // needs.
+    if let Some(index) = classified.index
+        && !entry.has_on(required, index)
+    {
+        let effective = entry.role_on(index);
+        warn!(
+            key_id = %entry.key_id(), label = %entry.label(), role = %entry.role(),
+            %method, %path, %index, effective_role = effective.as_str(),
+            required = required.as_str(),
+            "auth: refused, a per-index override withholds the required capability"
+        );
+        return Err(Refusal::forbidden(format!(
+            "this key is restricted to role '{}' on index '{}', which does not hold the \
+             '{}' capability",
+            effective.as_str(),
+            index,
+            required.as_str()
+        ))
+        .by(&entry));
     }
 
     Ok(Authz::Key(entry))
@@ -1102,7 +1165,25 @@ mod tests {
             allowed_indexes: indexes
                 .map(|list| list.into_iter().map(str::to_string).collect::<Vec<_>>()),
             key_hash_file: None,
+            index_overrides: None,
+            tenant: None,
         };
+        (key, config)
+    }
+
+    /// The same, with a per-index role subtraction applied.
+    fn key_with_override(
+        role: Role,
+        indexes: Option<Vec<&str>>,
+        overrides: &[(&str, Role)],
+    ) -> (ApiKey, ApiKeyConfig) {
+        let (key, mut config) = key_for(role, indexes);
+        config.index_overrides = Some(
+            overrides
+                .iter()
+                .map(|(index, role)| (index.to_string(), *role))
+                .collect(),
+        );
         (key, config)
     }
 
@@ -1119,6 +1200,148 @@ mod tests {
 
     fn status_of(result: &Result<Authz, Refusal>) -> Option<StatusCode> {
         result.as_ref().err().map(|r| r.status)
+    }
+
+    /// A writer held read-only on one index keeps write everywhere else.
+    ///
+    /// This is the whole of C1 in one assertion pair: multi-tenant isolation needs a key to be
+    /// reducible on a named index without minting a second key or a fourth role. Both halves
+    /// matter — a subtraction that also removed write elsewhere would be a scoping mechanism,
+    /// which the allow-list already is.
+    #[test]
+    fn an_override_withholds_write_on_one_index_and_nowhere_else() {
+        let (key, config) = key_with_override(Role::Writer, None, &[("audit", Role::Reader)]);
+        let ring = ring(vec![config]);
+        let headers = headers_with(Some(&key));
+
+        // Write is refused on the overridden index...
+        assert_eq!(
+            status_of(&decide(&ring, "POST", "/api/audit/_bulk", &headers)),
+            Some(StatusCode::FORBIDDEN),
+            "the override has to withhold write on the index it names"
+        );
+        // ...and nowhere else.
+        assert!(
+            decide(&ring, "POST", "/api/docs/_bulk", &headers).is_ok(),
+            "the subtraction is scoped to one index, not to the key"
+        );
+        // Read survives on the overridden index: reader still holds it.
+        assert!(
+            decide(&ring, "POST", "/api/audit/search", &headers).is_ok(),
+            "a reader override keeps read on the index it names"
+        );
+    }
+
+    /// The refusal says which of the two reasons it was.
+    ///
+    /// "Your role cannot do this anywhere" and "your role cannot do this *here*" send an
+    /// operator to different places — the key's role, or its overrides — and a single
+    /// undifferentiated 403 sends them to both.
+    #[test]
+    fn an_override_refusal_names_the_effective_role_and_the_index() {
+        let (key, config) = key_with_override(Role::Writer, None, &[("audit", Role::Reader)]);
+        let ring = ring(vec![config]);
+        let refusal = decide(&ring, "POST", "/api/audit/_bulk", &headers_with(Some(&key)))
+            .expect_err("write on the overridden index must be refused");
+        let body = refusal.message.clone();
+        assert!(body.contains("audit"), "must name the index: {body}");
+        assert!(
+            body.contains("reader"),
+            "must name the effective role: {body}"
+        );
+        assert!(body.contains("write"), "must name the capability: {body}");
+    }
+
+    /// An override may only subtract, and a config that reads as if it adds is refused.
+    ///
+    /// The failure this prevents is the one that matters most for a security mechanism: an
+    /// operator writing an override believing it restricts a key, and it quietly granting
+    /// instead. Silently clamping would be the other tempting answer and is worse — it honors
+    /// a config nobody wrote.
+    #[test]
+    fn an_override_that_would_widen_a_key_is_refused_at_load() {
+        let (_key, config) = key_with_override(Role::Reader, None, &[("docs", Role::Admin)]);
+        let err = SecurityConfig {
+            enabled: true,
+            api_keys: vec![config],
+            ..Default::default()
+        }
+        .load_keyring()
+        .expect_err("an escalating override must not load");
+        let err = format!("{err:#}");
+        assert!(err.contains("docs"), "{err}");
+        assert!(
+            err.contains("subtract") || err.contains("never add"),
+            "the refusal has to say which direction is allowed: {err}"
+        );
+    }
+
+    /// An override for an index the key cannot reach is dead config, and reads as protection.
+    #[test]
+    fn an_override_outside_the_allow_list_is_refused_at_load() {
+        let (_key, config) =
+            key_with_override(Role::Writer, Some(vec!["docs"]), &[("audit", Role::Reader)]);
+        let err = SecurityConfig {
+            enabled: true,
+            api_keys: vec![config],
+            ..Default::default()
+        }
+        .load_keyring()
+        .expect_err("an override outside allowed_indexes must not load");
+        let err = format!("{err:#}");
+        assert!(err.contains("audit"), "{err}");
+        assert!(err.contains("allowed_indexes"), "{err}");
+    }
+
+    /// The subtraction reaches `/mcp`, not only the REST surface.
+    ///
+    /// The two enforce through different code: the gate classifies a path and checks there,
+    /// while the tool dispatcher asks the identity it was handed, after arguments are decoded.
+    /// A subtraction honoured by one and not the other is not isolation — and `/mcp` is the
+    /// surface where an agent does the writing, so it is the one that matters most.
+    #[test]
+    fn an_override_reaches_the_mcp_identity_too() {
+        let (key, config) = key_with_override(Role::Writer, None, &[("audit", Role::Reader)]);
+        let ring = ring(vec![config]);
+        let authz =
+            decide(&ring, "POST", "/mcp", &headers_with(Some(&key))).expect("the door needs read");
+
+        assert!(
+            McpAuthz::has(&authz, McpCapability::Write),
+            "the key holds write in general, which is what the dispatch-time check sees"
+        );
+        assert!(
+            !McpAuthz::has_on(&authz, McpCapability::Write, "audit"),
+            "and must not hold it on the overridden index"
+        );
+        assert!(
+            McpAuthz::has_on(&authz, McpCapability::Write, "docs"),
+            "the subtraction is scoped to one index"
+        );
+        assert!(
+            McpAuthz::has_on(&authz, McpCapability::Read, "audit"),
+            "a reader override keeps read"
+        );
+    }
+
+    /// Scope and subtraction are different refusals, and stay so.
+    #[test]
+    fn scope_is_refused_before_a_subtraction_is_consulted() {
+        let (key, config) =
+            key_with_override(Role::Writer, Some(vec!["docs"]), &[("docs", Role::Reader)]);
+        let ring = ring(vec![config]);
+        let refusal = decide(
+            &ring,
+            "POST",
+            "/api/elsewhere/_bulk",
+            &headers_with(Some(&key)),
+        )
+        .expect_err("an index outside the allow-list is refused");
+        let body = refusal.message.clone();
+        assert!(
+            body.contains("not permitted on index"),
+            "an out-of-scope index must give the scope refusal, not the override one: {body}"
+        );
     }
 
     #[test]
