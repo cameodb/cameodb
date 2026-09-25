@@ -52,7 +52,7 @@ on one.
 | 14 — Security hardening (posture items C3–C8) | ✅ Done | C3–C8 all closed; C8 by M3 on 2026-09-20 |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
-| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed but for O4; M1, M2, M3 and M7 done — the blocker is cleared and the surface is metered. M4 and M5 are the two remaining builds and the M8 decision is owed. M6 is measurement only, and its first arm found [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), which blocks the rest of it |
+| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed but for O4; M1, M2, M3 and M7 done — the blocker is cleared and the surface is metered. M4 and M5 are the two remaining builds and the M8 decision is owed. M6 is measurement only; its first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), and the arms themselves are still owed |
 
 ## Reconciliation, 2026-08-26
 
@@ -175,12 +175,12 @@ first written down here, so the chronology stays visible under the cost ordering
 | [J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly) | The flattening lane, and the reference that describes neither | 18 | 2026-08-27 | 📋 |
 | [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to — the evidence behind J1 | 18 | 2026-08-27 | ✅ |
 | [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB12](#ob12--the-schema-gate-deadlocked-a-fan-out-against-itself) | Correctness, ten items from the 2026-09-01 review, the re-read of its own fixes, and the 0.3.3 release check — OB3–OB12 all done | — | 2026-09-01 | ✅ |
-| [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) | **A timed-out request never leaves the worker pool** — one slot lost per `408`, writes stop node-wide, `SIGTERM` will not stop the process. Found by the first [M6](#m6--close-and-re-measure-the-bulk-lane) arm and blocking it | — | 2026-09-25 | 🔴 |
+| [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) | **A timed-out request never leaves the worker pool** — a `DashMap` self-deadlock in `should_commit_writer` parked every shard writer thread past a 30s TTL. Found by the first [M6](#m6--close-and-re-measure-the-bulk-lane) arm, fixed and pinned the same day | — | 2026-09-25 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
 | [L1](#l1--size-cache-invalidation-by-substring-evicts-neighbouring-indexes) … [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | Post-0.3.4 review group — all twenty closed; the retrospective's output is [M](#m-the-035-goal-set--multi-tenant-exposure--planned) | — | 2026-09-19 | ✅ |
-| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed but for O4, the M1 blocker cleared, and M2, M3 and M7 done; M6 reduced to measurement, whose first arm found [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and stopped there | — | 2026-09-25 | ◐ |
+| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed but for O4, the M1 blocker cleared, and M2, M3 and M7 done; M6 reduced to measurement, whose first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) | — | 2026-09-25 | ◐ |
 
 ---
 
@@ -2668,7 +2668,7 @@ row is worth having on record: it is the evidence that the exemption works where
 
 ### OB14 — A timed-out request never leaves the worker pool, and the node degrades until it is restarted
 
-🔴 **Found 2026-09-25, by the first [M6](#m6--close-and-re-measure-the-bulk-lane) arm**, on the
+✅ **Found and fixed 2026-09-25**, by the first [M6](#m6--close-and-re-measure-the-bulk-lane) arm, on the
 M5 Pro against `91fc382`, release build, harness co-located. This is the run F8's re-measurement
 was owed, and it did not get as far as an open-loop arm: the closed-loop capacity probe wedged the
 node.
@@ -2737,6 +2737,104 @@ timeouts degrade every other tenant on the process, and the only recovery is a h
 1s timeout used here makes it fast to reproduce; a 60s production timeout makes it slower, not
 absent. [M4](#m4--per-key-resource-quotas) and [M5](#m5--per-index-capability-subtraction) bound
 what a tenant may *ask for* and neither touches this.
+
+**Narrowed 2026-09-25, same session.** Four further arms, and three things are now settled.
+
+*The tasks park; they do not panic.* At 240 timeouts the per-worker `in_flight` gauge pins at
+**64 — exactly `8 workers × 8`, the full width** — and stays there while `round_robin_sends`
+keeps climbing and `jobs_completed` is frozen. New work is dispatched and never runs, so the
+semaphore permits are still held. A panic would have run `permit`'s destructor and freed the
+pool; there are **zero panics in any of the four node logs**, and CPU sits at 0.0%. The tasks are
+alive and parked on a waker that never fires.
+
+*The gap and the gauge measure different things once the pool is full.* `in_flight` is capped by
+the width, so at 240 timeouts the other 176 are jobs sitting in per-worker channels that will
+never be dequeued. Below the width the two agree, which is why the first three arms read equal.
+
+*F7's dequeue check is unreachable exactly when it is needed.* `abandoned` stayed **0** through
+every arm, including one where jobs waited many seconds against a 1s budget. The loop takes its
+permit **before** `rx.recv()`, so once the width is held by parked tasks no worker ever reaches
+the deadline comparison that exists to shed stale work. The protection is upstream of the thing
+that breaks it.
+
+*Still open: the await itself.* Every runtime thread is idle, and the four `writer-shard-*`
+threads are parked on their own command channel rather than inside a write — so the parked tasks
+are not blocked behind the writers. Thread sampling cannot see a parked future, and the release
+binary carries no symbols, so naming the await needs instrumentation rather than another arm.
+
+**Root cause: `should_commit_writer` deadlocks the shard writer thread against itself.**
+Named by symbolising a sample of the wedged process — which needed an unstripped build, because
+`[profile.release]` sets `strip = true` and `debug = false`, so every earlier sample resolved to
+raw offsets. The stack is unambiguous:
+
+```
+spawn_writer_thread (shard.rs)
+ → HybridStore::apply_batch_and_maybe_commit
+   → HybridStore::maybe_commit_writer        (should_commit_writer, inlined)
+     → DashMap<String, BudgetCacheEntry>::insert
+       → dashmap RawRwLock::lock_exclusive_slow → pthread_cond_wait, forever
+```
+
+The budget read was written as a `match` over `DashMap::get`:
+
+```rust
+let budget = match self.budget_cache.get(index) {          // Ref = read guard on the shard
+    Some(entry) if !entry.value().is_stale() => entry.value().budget,
+    _ => { ...; self.budget_cache.insert(...); b }         // write lock on the SAME shard
+};
+```
+
+A match scrutinee's temporary lives to the end of the match, so the `_` arm asks the shard for
+its write lock while this thread still holds the shard's read lock. dashmap's `RwLock` is not
+reentrant — the writer waits for a reader that is itself, on the one thread that serves every
+write for that shard.
+
+**Why it survived review, a release, and every test.** Two conditions have to coincide. The arm
+is only reachable when the entry is **stale**, and `BUDGET_CACHE_TTL` is **30 seconds** — so an
+index younger than that always takes the fresh arm, which is every unit test and every short
+bench run. And the entry has to be **present**: a missing one makes `get` return `None`, which
+holds no guard, so the insert goes through. *Present-but-stale* is the only state that hangs, and
+it is the state every index older than thirty seconds is in. `get_or_create_index` inserts the
+entry when the writer opens, so the clock starts there. That is why arm A (10s on a fresh index)
+was clean and everything past the half-minute mark wedged.
+
+**The fix** reads the entry through `and_then`, which consumes the `Ref` and drops it before the
+decision is made, so the write lock is taken on an unlocked shard. Four lines, and the comment
+records the rule rather than the symptom.
+
+**Pinned by `a_stale_budget_entry_does_not_deadlock_the_writer`**, which ages an entry past the
+TTL in place and calls `should_commit_writer` on another thread against a deadline — because the
+regression is a hang, and an assertion on a return value cannot fail if the call never returns.
+It fails on the old code with `Timeout` after 10s and passes on the new.
+
+**Verified end to end.** The arm pair that wedged the node now runs clean, and faster:
+
+| | before | after |
+|---|---|---|
+| arm 1 | 50 ok/s | 52 ok/s, **26,049 docs/s** |
+| arm 2 | 36 ok/s, **32 × 408, gap 32** | 53 ok/s, **26,419 docs/s, 0 × 408, gap 0** |
+
+Four further 15s arms back to back, well past the TTL and on an index grown past a million
+documents: **gap 0 and `green` on every one**, 16,959–25,885 docs/s as merges come and go, zero
+timeouts. `SIGTERM` stops the node cleanly again. `cargo test -p storage -p server` is green — 36
+suites, no failures.
+
+**What this does *not* close, and should not be read as closing.** Three things the run exposed
+stand on their own merits, because a node should survive a stuck operation rather than depend on
+there never being one:
+
+- **The accounting is not RAII.** `in_flight`, `outstanding` and the worker permit are released
+  at the tail of the spawned task, so any future that parks or is dropped leaks all three. This
+  deadlock was one way to reach that; it is not the only one.
+- **F7's dequeue check is unreachable under saturation.** The loop takes its permit *before*
+  `rx.recv()`, so once parked tasks hold the width no worker reaches the deadline comparison.
+  `abandoned` stayed 0 through every wedged arm, which is the evidence.
+- **Nothing bounds a worker task.** A write that never returns had no upper bound anywhere on the
+  path, and the request timeout sheds the client rather than the work — [F7](#f7--the-request-timeout-sheds-the-client-not-the-work)'s
+  original finding, still true for anything downstream of the dequeue.
+
+Filed together as the follow-up in [M6](#m6--close-and-re-measure-the-bulk-lane); none of them
+blocks the re-measurement now that the lane stays up.
 
 **Reproduction, from a wiped volume**: start a node with the config above; run
 `cameodb-bench --mode bulk --batch-size 100 --concurrency 1 --duration 10 --seed-docs 5000
@@ -4473,17 +4571,22 @@ work reached the worker pool at all. Bulk is served on the pool, `OpClass::Bulk`
 samples, and `0836df2` does what its message says. The third time this lane has been measured is
 the first time the gates can see it.
 
-*Not expected.* The capacity probe wedged the node, and the cause is a defect that makes the
-exit-criterion question unanswerable until it is fixed —
+*Not expected.* The capacity probe wedged the node. Root-caused and fixed the same day as
 [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted):
-every `408` permanently consumes a worker-pool slot, reads stay healthy, writes stop node-wide,
-and `SIGTERM` will not stop the process. Filed with its arms, its counters and a reproduction.
+a `DashMap` self-deadlock in `should_commit_writer` parked every shard's writer thread once its
+budget entry passed a 30s TTL, and each write that then timed out left a worker slot behind. With
+it fixed the same arm pair runs clean at 26,000 docs/s, four arms back to back hold `gap 0` and
+`green`, and `SIGTERM` stops the node again.
 
-**So the exit criterion — goodput that degrades rather than collapses — is still unmeasured**, and
-saying otherwise from these arms would be the mistake this entry was just corrected for. A node
-that loses a slot per timeout cannot be asked what its overload curve looks like, because the
-answer changes with every arm and never comes back. OB14 first; then the three arms, from a wiped
-volume, in one session.
+**The exit criterion — goodput that degrades rather than collapses — is still unmeasured**, and
+saying otherwise from these arms would be the mistake this entry was just corrected for: they are
+closed-loop, and the criterion is an open-loop statement. What changed is that the lane now stays
+up long enough to ask. The three arms, from a wiped volume, in one session, are still owed.
+
+**Three weaknesses OB14 exposed are not closed by its fix** and belong to this item: the worker
+pool's accounting is not RAII, F7's dequeue check is unreachable once the width is held, and
+nothing bounds a worker task. Each is a way for one stuck operation to take the pool down; none
+blocks the arms.
 
 **Capacity is not comparable to F8's tables and should not be read against them.** The probe
 measured 11 bulk req/s at concurrency 4 against F8's 56, but the binary, the batch size, the seed

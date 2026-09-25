@@ -1831,9 +1831,27 @@ impl HybridStore {
         // every single commit, which is ~300 `stat` calls on a fifty-segment index, on the
         // writer thread, to refresh a five-bucket size class whose boundaries are hundreds of
         // megabytes apart.
-        let budget = match self.budget_cache.get(index) {
-            Some(entry) if !entry.value().is_stale() => entry.value().budget,
-            _ => {
+        // Read the cached budget and *release the guard* before deciding anything.
+        //
+        // `DashMap::get` returns a `Ref` holding a read lock on the map's shard, and a match
+        // scrutinee's temporary lives to the end of the match — so an arm that calls `insert`
+        // asks the same shard for its write lock while this thread still holds the read lock.
+        // dashmap's `RwLock` is not reentrant: the writer waits for a reader that is itself,
+        // on the shard writer thread, forever. It survived review because the deadlock needs
+        // the *stale* arm, which cannot be reached until `BUDGET_CACHE_TTL` has passed since
+        // this index's writer was opened — so every short test hit the fresh arm and passed.
+        // See ROADMAP OB14 for what it did to a node under load.
+        //
+        // `and_then` consumes the `Ref` and drops it when the closure returns, so the lock is
+        // gone before the `match` below can take the write path.
+        let cached = self
+            .budget_cache
+            .get(index)
+            .and_then(|entry| (!entry.value().is_stale()).then(|| entry.value().budget));
+
+        let budget = match cached {
+            Some(budget) => budget,
+            None => {
                 // Measurement only, but the path is still built by `index_dir` so no
                 // caller-supplied name is ever joined by hand.
                 let b = match self.index_dir(index) {

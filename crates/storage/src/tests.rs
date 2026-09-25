@@ -1,7 +1,8 @@
 //! Unit tests for the storage engine, kept beside the modules they exercise.
+use crate::search::{BUDGET_CACHE_TTL, BudgetCacheEntry};
 use crate::*;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::Value as JsonValue;
 use tantivy::schema::{FAST, Schema};
@@ -745,6 +746,87 @@ mod tests {
                 .measured_at,
             measured_at,
             "a fresh entry must be used as-is rather than re-measured"
+        );
+    }
+
+    /// A budget entry past its TTL does not deadlock the writer thread.
+    ///
+    /// `should_commit_writer` reads the cached budget and, when it is stale, re-measures and
+    /// writes the result back. `DashMap::get` hands back a `Ref` holding a read lock on the
+    /// map's shard, and a match scrutinee's temporary lives to the end of the match — so the
+    /// original form asked that same shard for its write lock from inside an arm, while this
+    /// thread still held the read lock. dashmap's `RwLock` is not reentrant, so the thread
+    /// waited for itself, on the shard's writer thread, forever.
+    ///
+    /// Two details are why it survived review and every test above. It needs the *stale* arm,
+    /// unreachable until `BUDGET_CACHE_TTL` has passed since the index's writer was opened, so
+    /// short tests all took the fresh arm — [`a_commit_does_not_re_measure_the_memory_budget`]
+    /// included. And it needs the entry to be *present*: a missing one makes `get` return
+    /// `None`, which holds no guard, so the insert goes through. Present-but-stale is the only
+    /// state that hangs, and it is the state every long-lived index reaches.
+    ///
+    /// Asserted with a deadline on another thread, because the regression is a hang and an
+    /// assertion on a return value cannot fail if the call never returns. ROADMAP OB14.
+    #[test]
+    fn a_stale_budget_entry_does_not_deadlock_the_writer() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(HybridStore::new(small_store_config(&temp_dir), 1).expect("store"));
+        let index = "stale";
+
+        store
+            .store_schema_and_cache(index, &IndexSchema::default())
+            .expect("store schema");
+        store
+            .apply_write(
+                index,
+                WalOp::Put {
+                    id: "d1".to_string(),
+                    json_blob: Some(serde_json::json!({ "title": "one" })),
+                },
+            )
+            .expect("write");
+
+        // Age the entry past the TTL in place, so the stale arm is taken without waiting out
+        // `BUDGET_CACHE_TTL` in real time. The entry stays present, which is the state that hangs.
+        let aged = Instant::now()
+            .checked_sub(BUDGET_CACHE_TTL + Duration::from_secs(1))
+            .expect("clock far enough from its origin to age an entry");
+        store.budget_cache.insert(
+            index.to_string(),
+            BudgetCacheEntry {
+                budget: 32 * 1024 * 1024,
+                measured_at: aged,
+            },
+        );
+        assert!(
+            store
+                .budget_cache
+                .get(index)
+                .expect("entry")
+                .value()
+                .is_stale(),
+            "the entry has to be stale for this test to exercise anything"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = Arc::clone(&store);
+        std::thread::spawn(move || {
+            let _ = probe.should_commit_writer(index, 0);
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(Duration::from_secs(10)).expect(
+            "should_commit_writer must return on a stale entry, not deadlock on its own shard",
+        );
+
+        assert!(
+            !store
+                .budget_cache
+                .get(index)
+                .expect("entry")
+                .value()
+                .is_stale(),
+            "the stale entry must have been replaced by a fresh measurement"
         );
     }
 
