@@ -1692,6 +1692,111 @@ impl ShardPlacement {
 /// [`OrchestratorEngine::execute`]. It is a parameter rather than the engine itself so the
 /// properties above can be tested against an operation whose timing the test controls;
 /// nothing here depends on what the operation does, only on how many may run at once.
+/// How far past its request budget an admitted operation may run before the pool takes its slot
+/// back, and the absolute ceiling on that however large the budget is.
+///
+/// **This is a liveness backstop, not a deadline.** [F7] deliberately lets admitted work finish:
+/// a cap tight enough to act as a deadline would shed work that was about to succeed, which is
+/// the failure F7 was written to remove. The multiple is therefore generous — an operation this
+/// far past its budget is not slow, it is stuck — and the point is only that one such operation
+/// costs one slot instead of the whole pool. [OB14] is the case in hand: four parked writes took
+/// the width, and with the width gone the node could not serve a search or answer its own health
+/// probe.
+///
+/// Firing this is a defect report. It logs at error and increments `jobs_dropped`; neither is a
+/// normal shedding path, and a node showing either has a bug to find rather than a knob to turn.
+///
+/// [F7]: the request timeout shedding the client rather than the work.
+/// [OB14]: the shard-writer deadlock found by the first M6 arm, 2026-09-25.
+pub(super) const WORKER_LIVENESS_MULTIPLE: u32 = 20;
+const WORKER_LIVENESS_CEILING: Duration = Duration::from_secs(300);
+
+/// Everything an admitted job holds in the pool, released on drop however the job ends.
+///
+/// The two gauges and the permit used to be released by statements at the tail of the spawned
+/// task, so a future that parked, was dropped or panicked kept all three — and a pool that has
+/// lost its width serves nothing at all, reads included. [OB14] reached that state one slot per
+/// timed-out request. Tying the release to a scope instead of to the task reaching its last line
+/// makes the accounting true by construction rather than by the happy path being taken.
+///
+/// `jobs_completed` counts operations that ran to their own conclusion; one that leaves without
+/// finishing — dropped, panicked, or stopped by the liveness cap — increments `jobs_dropped`
+/// instead. That is a defect report and is expected to read zero. Note the two are about the
+/// *work*, not about the caller: a capped job still answers, with an error, so nobody is left
+/// waiting on a channel that will never be written.
+///
+/// [OB14]: the shard-writer deadlock found by the first M6 arm, 2026-09-25.
+struct PoolSlot {
+    counters: Option<Arc<WorkerCounters>>,
+    stats: Option<Arc<DispatchCounters>>,
+    finished: bool,
+    /// Held for the lifetime of the guard; released by its destructor.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl PoolSlot {
+    fn enter(
+        counters: Option<Arc<WorkerCounters>>,
+        stats: Option<Arc<DispatchCounters>>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
+        if let Some(c) = &counters {
+            c.in_flight.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        Self {
+            counters,
+            stats,
+            finished: false,
+            _permit: permit,
+        }
+    }
+
+    /// Record that the operation ran to its own conclusion, so the drop counts it as completed
+    /// rather than dropped.
+    fn finished(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for PoolSlot {
+    fn drop(&mut self) {
+        if let Some(c) = &self.counters {
+            c.in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
+            if self.finished {
+                c.jobs_completed.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        if let Some(s) = &self.stats {
+            s.job_left_pool();
+            if !self.finished {
+                s.jobs_dropped.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Refuse a job that has outlived its request, and account for it leaving the pool.
+///
+/// Split out because the decision is taken twice — once before waiting for a permit and once
+/// after one is in hand — and the two must agree on what they count and what they answer.
+fn shed_stale_job(
+    dispatch_stats: &Option<Arc<DispatchCounters>>,
+    reply: tokio::sync::oneshot::Sender<WorkerOutcome>,
+    waited: Duration,
+    budget: Duration,
+) {
+    if let Some(stats) = dispatch_stats {
+        stats.abandoned.fetch_add(1, AtomicOrdering::Relaxed);
+        stats.job_left_pool();
+    }
+    let _ = reply.send(WorkerOutcome::Done(Err(
+        OrchestratorError::ReadDeadlineExpired {
+            waited_ms: waited.as_millis() as u64,
+            budget_ms: budget.as_millis() as u64,
+        },
+    )));
+}
+
 pub(super) async fn orchestrator_worker_loop<F, Fut>(
     mut rx: mpsc::Receiver<OrchestratorJob>,
     run_op: F,
@@ -1709,11 +1814,6 @@ pub(super) async fn orchestrator_worker_loop<F, Fut>(
     let width = max_in_flight.max(1);
     let in_flight = Arc::new(tokio::sync::Semaphore::new(width));
     loop {
-        // Never closed while the loop runs, so this only fails if the semaphore is dropped.
-        let Ok(permit) = Arc::clone(&in_flight).acquire_owned().await else {
-            break;
-        };
-
         match rx.recv().await {
             Some(OrchestratorJob::Execute {
                 arrived_at,
@@ -1742,63 +1842,121 @@ pub(super) async fn orchestrator_worker_loop<F, Fut>(
                 // request that arrived expired — a max-size record at the derived timeout is
                 // the standing example — is refused here rather than run for nobody.
                 let service_class = OpClass::of(&op);
-                if let Some(budget) = budget {
-                    let waited = arrived_at.elapsed();
-                    // Not `waited > budget`. Admitting a job with barely any budget left is a
-                    // slower way of wasting the work: the queue settles exactly on the
-                    // deadline, every job that passes spends its remaining microseconds being
-                    // searched for, and the answer still lands after the client has gone.
-                    // Measured: 11,656 jobs shed and goodput still zero, because the 13,363
-                    // that passed all finished late. A job is worth starting only if what is
-                    // left can cover what the work takes.
-                    let reserve = dispatch_stats
+
+                // How much budget a job of this class needs left over to be worth starting.
+                // Not `waited > budget`: admitting a job with barely any budget left is a
+                // slower way of wasting the work — the queue settles exactly on the deadline,
+                // every job that passes spends its remaining microseconds being searched for,
+                // and the answer still lands after the client has gone. Measured: 11,656 jobs
+                // shed and goodput still zero, because the 13,363 that passed all finished late.
+                let reserve_for = |budget: Duration| {
+                    dispatch_stats
                         .as_ref()
                         .map(|s| s.service_reserve_for(service_class, budget))
-                        .unwrap_or_default();
-                    if waited + reserve > budget {
-                        if let Some(stats) = &dispatch_stats {
-                            stats.abandoned.fetch_add(1, AtomicOrdering::Relaxed);
-                            stats.job_left_pool();
-                        }
-                        let _ = reply.send(WorkerOutcome::Done(Err(
-                            OrchestratorError::ReadDeadlineExpired {
-                                waited_ms: waited.as_millis() as u64,
-                                budget_ms: budget.as_millis() as u64,
-                            },
-                        )));
-                        drop(permit);
+                        .unwrap_or_default()
+                };
+
+                // **Before** waiting for capacity, not after. The loop used to take a permit and
+                // then receive, which meant that once parked jobs held the width no worker ever
+                // reached this comparison — the one guard that sheds stale work was unreachable
+                // in precisely the state it exists for. OB14 measured that: `abandoned` stayed 0
+                // through arms where every job waited seconds against a 1s budget. Checking here
+                // also means an already-dead job never occupies a slot a live one could use.
+                if let Some(budget) = budget {
+                    let waited = arrived_at.elapsed();
+                    if waited + reserve_for(budget) > budget {
+                        shed_stale_job(&dispatch_stats, reply, waited, budget);
                         continue;
                     }
                 }
 
-                if let Some(c) = &counters {
-                    c.in_flight.fetch_add(1, AtomicOrdering::Relaxed);
+                // Capacity, waited for only by a job that still has budget to spend.
+                // Never closed while the loop runs, so this only fails if the semaphore is dropped.
+                let Ok(permit) = Arc::clone(&in_flight).acquire_owned().await else {
+                    break;
+                };
+
+                // The wait for a permit is itself spent budget, and under saturation it is most
+                // of it. A job that was worth starting a moment ago may not be now.
+                if let Some(budget) = budget {
+                    let waited = arrived_at.elapsed();
+                    if waited + reserve_for(budget) > budget {
+                        drop(permit);
+                        shed_stale_job(&dispatch_stats, reply, waited, budget);
+                        continue;
+                    }
                 }
+
                 // On the pinned path this spawns onto the worker's own current_thread
                 // runtime, so the operation stays on that core and pinning still means what
                 // it says. On the default path it spawns onto the shared multi-threaded
                 // runtime, where a worker is an admission-control unit rather than a place.
                 let service_stats = dispatch_stats.clone();
+                // No budget means the pre-F7 contract — every job runs, however long it takes —
+                // and that is left reachable rather than quietly capped.
+                let liveness_cap =
+                    budget.map(|b| (b * WORKER_LIVENESS_MULTIPLE).min(WORKER_LIVENESS_CEILING));
                 // Run the op inside the request's arrival scope: `request_started_at` is
                 // inherited by `spawn`, so deadline checks reached from inside the op — the
                 // read pool's, or a re-dispatch's — measure against the same clock this
                 // dequeue check did rather than a fresh one.
                 tokio::spawn(REQUEST_STARTED_AT.scope(arrived_at, async move {
+                    // Everything this job holds — both gauges, the completion tally and the
+                    // permit — is released by this guard, so it is released however the job
+                    // ends. The releases used to be statements at the tail of this task, which
+                    // meant a future that parked or was dropped kept all four forever: OB14 lost
+                    // one slot per timed-out request that way, until the width was gone and with
+                    // it every worker-eligible operation on the node.
+                    let mut slot = PoolSlot::enter(counters, service_stats.clone(), permit);
+
                     let started = Instant::now();
-                    let result = run_op(op, affinity_shard).await;
+                    // `finished` is whether the operation ran to its own conclusion, which is a
+                    // different question from whether the caller got an answer. A capped job
+                    // answers — with an error, so nobody is left hanging — but it did not finish,
+                    // so it is counted as dropped and its duration is not folded into the service
+                    // estimate. A stuck operation's elapsed time is not a service time, and
+                    // admitting the next job against it would spread the damage.
+                    let (result, finished) = match liveness_cap {
+                        Some(cap) => match tokio::time::timeout(cap, run_op(op, affinity_shard))
+                            .await
+                        {
+                            Ok(result) => (result, true),
+                            Err(_) => {
+                                // The operation is abandoned, not cancelled: anything it handed
+                                // to a blocking pool or a writer thread runs on and replies into
+                                // a dropped receiver. What is reclaimed here is the pool slot,
+                                // which is the resource whose loss takes the node down.
+                                error!(
+                                    worker_id = worker_id,
+                                    class = ?service_class,
+                                    cap_ms = cap.as_millis() as u64,
+                                    "Worker operation passed the liveness cap and was abandoned; \
+                                     its pool slot has been reclaimed so the node keeps serving. \
+                                     This is a defect — an operation should not reach this."
+                                );
+                                (
+                                    WorkerOutcome::Done(Err(OrchestratorError::Io(
+                                        std::io::Error::other(
+                                            "operation exceeded the worker liveness cap",
+                                        ),
+                                    ))),
+                                    false,
+                                )
+                            }
+                        },
+                        None => (run_op(op, affinity_shard).await, true),
+                    };
+
                     // What this job actually cost once admitted, which is what the next job's
                     // admission decision is measured against.
-                    if let Some(stats) = &service_stats {
-                        stats.record_service(service_class, started.elapsed());
-                        stats.job_left_pool();
+                    if finished {
+                        if let Some(stats) = &service_stats {
+                            stats.record_service(service_class, started.elapsed());
+                        }
+                        slot.finished();
                     }
                     // Ignore the error: the caller may have given up and dropped the receiver.
                     let _ = reply.send(result);
-                    if let Some(c) = &counters {
-                        c.in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
-                        c.jobs_completed.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    drop(permit);
                 }));
             }
             Some(OrchestratorJob::Shutdown) => {
@@ -2093,6 +2251,10 @@ impl OrchestratorWorkerTx {
             refused_at_admission: self
                 .dispatch_stats
                 .refused_at_admission
+                .load(AtomicOrdering::Relaxed),
+            jobs_dropped: self
+                .dispatch_stats
+                .jobs_dropped
                 .load(AtomicOrdering::Relaxed),
         };
 

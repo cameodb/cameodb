@@ -325,6 +325,17 @@ pub(super) struct DispatchCounters {
     /// the prediction was wrong — so the split between them, not either count alone, is what
     /// says whether admission control is doing its job.
     pub(super) refused_at_admission: AtomicU64,
+    /// Jobs that left the pool without producing an answer — the future was dropped, or it
+    /// panicked, rather than returning.
+    ///
+    /// Zero is the expected reading, and a non-zero one is a defect report: a job that reaches
+    /// a worker either answers or is counted here. It exists because the alternative to
+    /// counting these is what [OB14] did, which is to lose a pool slot per occurrence with
+    /// nothing anywhere saying so until the node stopped serving. The gauges below it are
+    /// restored either way; this is the count that makes the silence audible.
+    ///
+    /// [OB14]: the shard-writer deadlock found by the first M6 arm, 2026-09-25.
+    pub(super) jobs_dropped: AtomicU64,
     /// Jobs anywhere in the pool — queued or running — across all workers.
     ///
     /// This is the depth [`QueueLoad`] predicts wait from. It is one atomic rather than a sum
@@ -370,6 +381,7 @@ impl Default for DispatchCounters {
             actor_mailbox_fallbacks: AtomicU64::new(0),
             abandoned: AtomicU64::new(0),
             refused_at_admission: AtomicU64::new(0),
+            jobs_dropped: AtomicU64::new(0),
             outstanding: AtomicUsize::new(0),
             service_ewma_us: AtomicU64::new(0),
             service_ewma_read_us: AtomicU64::new(0),
@@ -761,6 +773,10 @@ pub(crate) struct DispatchStats {
     /// Defaulted for the same reason `abandoned` is.
     #[serde(default)]
     pub(super) refused_at_admission: u64,
+    /// Jobs that left the pool without answering. Expected to be `0`; anything else is a
+    /// defect. Defaulted for the same reason `abandoned` is.
+    #[serde(default)]
+    pub(super) jobs_dropped: u64,
 }
 
 /// Full worker pool report returned by `GET /_admin/workers`.

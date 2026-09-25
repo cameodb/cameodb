@@ -1394,6 +1394,187 @@ fn recording_runner(
     }
 }
 
+/// A runner whose operation never returns, for the two properties that are only observable
+/// when one does not.
+fn parking_runner() -> impl Fn(Box<ClientOp>, Option<Uuid>) -> TestOp + Clone {
+    move |_op, _shard| Box::pin(async move { std::future::pending::<WorkerOutcome>().await })
+}
+
+async fn submit_aged(
+    tx: &mpsc::Sender<OrchestratorJob>,
+    age: Duration,
+) -> tokio::sync::oneshot::Receiver<WorkerOutcome> {
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    tx.send(OrchestratorJob::Execute {
+        arrived_at: Instant::now() - age,
+        op: placeholder_op(),
+        affinity_shard: None,
+        reply,
+    })
+    .await
+    .expect("the worker channel is open");
+    answer
+}
+
+/// An operation that never returns costs one slot, not the pool.
+///
+/// This is [OB14]'s shape reduced to its mechanism. There, four writer threads deadlocked and
+/// every request behind them parked; each one kept its `in_flight` count, its `outstanding`
+/// count and its semaphore permit, because all three were released by statements at the tail of
+/// a task that never reached its tail. At the width the pool was gone — searches, metadata reads
+/// and the node's own health probe with it.
+///
+/// Two guarantees are asserted together because either alone is worthless. The gauges must come
+/// back, so the admission gate is predicting against a number that means something; and the
+/// worker must serve the next job, so the pool is genuinely usable rather than merely
+/// well-reported.
+///
+/// [OB14]: the shard-writer deadlock found by the first M6 arm, 2026-09-25.
+#[tokio::test]
+async fn an_operation_that_never_returns_costs_one_slot_not_the_pool() {
+    let (tx, rx) = mpsc::channel::<OrchestratorJob>(8);
+    let stats = Arc::new(DispatchCounters::default());
+    let counters = Arc::new(WorkerCounters::default());
+    // Small, so twenty budgets is a wall-clock fraction of a second.
+    let budget = Duration::from_millis(20);
+
+    tokio::spawn(orchestrator_worker_loop(
+        rx,
+        parking_runner(),
+        0,
+        Some(Arc::clone(&counters)),
+        2, // width 2, so two parked jobs would have been the whole pool
+        Some(budget),
+        Some(Arc::clone(&stats)),
+    ));
+
+    // Fill the width with operations that will never return.
+    stats.outstanding.fetch_add(2, AtomicOrdering::Relaxed);
+    let first = submit_aged(&tx, Duration::ZERO).await;
+    let second = submit_aged(&tx, Duration::ZERO).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        counters.in_flight.load(AtomicOrdering::Relaxed),
+        2,
+        "both jobs should be running"
+    );
+
+    // Past the liveness cap — twenty budgets, so a second here against 50ms — the slots are
+    // reclaimed and both callers are answered rather than left hanging.
+    tokio::time::sleep(budget * WORKER_LIVENESS_MULTIPLE + Duration::from_millis(50)).await;
+
+    // Awaited against a deadline, not bare: without the cap these never resolve, and a test
+    // that hangs reports nothing. The regression has to be a failure, not a stall.
+    for answer in [first, second] {
+        match tokio::time::timeout(Duration::from_millis(500), answer).await {
+            Ok(Ok(WorkerOutcome::Done(Err(_)))) => {}
+            Ok(Ok(_)) => panic!("a job past the liveness cap must answer with an error"),
+            Ok(Err(_)) => panic!("a job past the liveness cap dropped its reply channel"),
+            Err(_) => panic!(
+                "a parked job was never answered — its slot is still held and the pool is short one"
+            ),
+        }
+    }
+    assert_eq!(
+        counters.in_flight.load(AtomicOrdering::Relaxed),
+        0,
+        "in_flight must return to zero — this is the gauge OB14 left permanently inflated"
+    );
+    assert_eq!(
+        stats.outstanding.load(AtomicOrdering::Relaxed),
+        0,
+        "outstanding is what the admission gate predicts against, so it must return too"
+    );
+    assert_eq!(
+        stats.jobs_dropped.load(AtomicOrdering::Relaxed),
+        2,
+        "a job that left without answering has to be counted, or the next leak is silent too"
+    );
+    assert_eq!(
+        counters.jobs_completed.load(AtomicOrdering::Relaxed),
+        0,
+        "nothing answered, so nothing may be tallied as completed"
+    );
+
+    // The pool is usable, which is the claim that matters.
+    stats.outstanding.fetch_add(1, AtomicOrdering::Relaxed);
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    tx.send(OrchestratorJob::Execute {
+        arrived_at: Instant::now(),
+        op: placeholder_op(),
+        affinity_shard: None,
+        reply,
+    })
+    .await
+    .expect("the worker channel is open");
+    drop(answer);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        counters.in_flight.load(AtomicOrdering::Relaxed),
+        1,
+        "the worker has to accept new work after reclaiming the parked slots"
+    );
+}
+
+/// A stale job is shed even when every permit is held.
+///
+/// The loop used to acquire a permit and *then* receive, so a pool whose width was held could
+/// not reach the deadline comparison at all — the guard that sheds stale work was unreachable in
+/// exactly the state it exists for. OB14 measured the consequence: `abandoned` stayed at 0
+/// through arms where every job waited seconds against a one-second budget, while the queue grew
+/// without bound behind permits nothing would return.
+///
+/// Receiving first and checking before the wait also means a job that is already dead never
+/// occupies a slot a live job could have used.
+#[tokio::test]
+async fn a_stale_job_is_shed_even_when_every_permit_is_held() {
+    let (tx, rx) = mpsc::channel::<OrchestratorJob>(8);
+    let stats = Arc::new(DispatchCounters::default());
+    // Deliberately long enough that the liveness cap — twenty budgets, so four seconds here —
+    // cannot fire inside this test. Otherwise the cap would release the parked job's permit and
+    // the shed would happen for the wrong reason, which is exactly what an earlier draft of this
+    // test measured: it passed against the old ordering because the cap masked it.
+    let budget = Duration::from_millis(200);
+
+    tokio::spawn(orchestrator_worker_loop(
+        rx,
+        parking_runner(),
+        0,
+        None,
+        1, // width 1: one parked job is the whole pool
+        Some(budget),
+        Some(Arc::clone(&stats)),
+    ));
+
+    // Take the only permit with an operation that will not give it back.
+    stats.outstanding.fetch_add(1, AtomicOrdering::Relaxed);
+    let _parked = submit_aged(&tx, Duration::ZERO).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    // A job that arrived long before its budget allowed. With the width held, the old order
+    // never looked at it.
+    stats.outstanding.fetch_add(1, AtomicOrdering::Relaxed);
+    let stale = submit_aged(&tx, Duration::from_secs(5)).await;
+
+    match tokio::time::timeout(Duration::from_millis(500), stale).await {
+        Ok(Ok(WorkerOutcome::Done(Err(OrchestratorError::ReadDeadlineExpired {
+            waited_ms,
+            budget_ms,
+        })))) => {
+            assert!(waited_ms >= 5_000, "got {waited_ms}ms");
+            assert_eq!(budget_ms, 200);
+        }
+        Ok(Ok(_)) => panic!("expected the stale job to be shed, got an answer"),
+        Ok(Err(_)) => panic!("the stale job's reply channel was dropped"),
+        Err(_) => panic!("the stale job was never answered, so it was never shed"),
+    }
+    assert_eq!(
+        stats.abandoned.load(AtomicOrdering::Relaxed),
+        1,
+        "the shed has to be counted; a silent one reads as an idle node"
+    );
+}
+
 async fn submit(
     tx: &mpsc::Sender<OrchestratorJob>,
 ) -> tokio::sync::oneshot::Receiver<WorkerOutcome> {
