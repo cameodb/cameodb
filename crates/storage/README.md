@@ -80,12 +80,12 @@ All write operations follow a strict sequence to ensure atomicity across both st
 
 7. Increment Operations
    ├─ increment_operations(index) - Track operation count
-   └─ Tantivy commit deferred via Supervised Smart Commits:
-      ├─ Smart Commit: when the operation count reaches the adaptive threshold
-      │   (1×–20× default_batch_size, scaled by the index's memory budget; ×1.5 more
-      │   during a sustained bulk burst)
-      └─ Supervised Commit: after supervisor_timeout_secs of write inactivity
-          (5 s by default), enforced by the idle-commit supervisor in the server crate
+   └─ Tantivy commit deferred (see "Commit policy"):
+      ├─ Interval: once the oldest uncommitted write has waited commit_interval_ms
+      │   (2 s on a node), checked by the writer thread after each drain, after replying
+      ├─ Backstop: 20× the count threshold derived from default_batch_size
+      └─ Idle: supervisor_timeout_secs after the last write (3 s by default),
+          enforced by the idle-commit supervisor in the server crate
 ```
 
 ### Storage Optimization: Index-Only Tantivy Strategy
@@ -389,7 +389,7 @@ let config = StorageConfig {
     indexer_memory_max_mb: 512,              // 512MB maximum
     total_memory_limit_bytes: 2048 * 1024 * 1024, // 2GB total memory budget
     memory_pressure_threshold_percent: 80,   // Use 80% of configured limit for cache
-    default_batch_size: 1000,                // Supervised Smart Commits threshold
+    default_batch_size: 1000,                // Base of the commit count (see "Commit policy")
     wal_sync: true,                          // Maximum durability
 };
 
@@ -558,109 +558,69 @@ let low_memory_config = StorageConfig {
 };
 ```
 
-## Supervised Smart Commits
+## Commit policy
 
-CameoDB implements sophisticated **Supervised Smart Commits** that provide both high performance and strong durability guarantees for Tantivy search indices.
+A write is **durable** once its redb transaction commits — before the caller is answered,
+whatever the settings below say. A Tantivy **commit** is what makes it **searchable**, and it
+is the expensive half of a write: the indexer flushes its segment, every file of it is synced,
+the reader reloads, and a checkpoint transaction truncates the WAL it covers.
 
-### Architecture Overview
+### When an index commits
 
-The system combines two complementary commit mechanisms:
+| Trigger | Where | Rule |
+|---|---|---|
+| **Interval** | writer thread, after each drain | the oldest uncommitted write has waited `commit_interval_ms` |
+| **Backstop** | writer thread, after each drain | pending operations reach 20× the count threshold |
+| **Idle** | server crate's per-index supervisor | `supervisor_timeout_secs` with no writes to the index |
+| **Explicit** | writer thread | admin commit, eviction, the recovered tail at boot, shutdown |
 
-#### 1. Smart Commits (Immediate Performance)
-- **Trigger**: Operation count threshold reached (adaptive based on memory budget)
-- **Behavior**: Immediate Tantivy commit during write operations
-- **Purpose**: Memory management and performance optimization
-- **Adaptive Threshold**: 1×–20× `default_batch_size`, scaling with the index's memory
-  budget — with the default batch size of 1000 that is 1000 operations at the minimum
-  budget up to 20000 at the maximum. A sustained burst past 5× `default_batch_size`
-  stretches the threshold by a further ×1.5.
+The count threshold is `default_batch_size` × (1 + 19 × budget ratio): 1,000 operations for a
+new index up to 20,000 at the maximum memory budget, so the backstop runs from 20,000 to
+400,000. It bounds the WAL tail a restart replays when writes arrive faster than an interval
+covers.
 
-#### 2. Supervised Eventual Commits (Durability Guarantee)
-- **Trigger**: `supervisor_timeout_secs` of inactivity after the last write
-  (`[search] supervisor_timeout_secs`, 5 s by default)
-- **Behavior**: The per-shard writer thread in the server crate commits the idle index
-- **Purpose**: Data durability guarantee for low-volume write patterns
+The interval runs from the **oldest pending** write, not from the last commit, so an index
+that has been idle takes a write, waits an interval, and commits once — rather than committing
+on its first write and every write after it. The writer thread decides once per index per
+drain, **after every caller in that drain has been answered**, so no write waits for a commit,
+and a failed commit is logged and retried by the next trigger instead of failing a write that
+is already durable.
 
-### Implementation Details
+`commit_interval_ms = 0` is the count-only policy — commit at the threshold itself — which the
+tests in this crate are written against and which the library default keeps. A node sets
+`[search] commit_interval_ms`, 2000 by default.
 
-#### Smart Commit Algorithm
-```rust
-// Adaptive threshold calculation:
-let budget_ratio = (budget - min_budget) as f64 / (max_budget - min_budget) as f64;
-let base_ops = (default_batch_size * (1.0 + budget_ratio * 19.0)) as u64;
-// Result with default_batch_size = 1000: 1000 ops (min budget) -> 20000 ops (max budget)
-// A burst already 5x default_batch_size deep stretches the threshold by x1.5.
-```
+### Why time and not count
 
-The idle-timeout half lives in the server crate rather than here: each shard's dedicated
-writer thread (`crates/server/src/node.rs`) watches its own command channel and
-commits an index that has seen no writes for `supervisor_timeout_secs`.
+By count alone, a bulk load crossed the 1,000-operation threshold on nearly every drain, so the
+writer thread and Tantivy's indexer took turns instead of working at once, and a steady trickle
+that never reached the threshold — and never paused long enough for the idle commit — was not
+searchable until it did: about 17 minutes at one write per second. Measured against the default
+2 s interval (4 shards, `wal_sync = true`, release build):
 
-### Behavior Scenarios
+| Load | By count (1,000) | 2 s interval |
+|---|---|---|
+| bulk, 5,000-doc batches, 32 clients | 184k docs/s | 328k docs/s |
+| bulk, 500-doc batches, 16 clients | 20k docs/s, p50 420 ms | 130k docs/s, p50 53 ms |
+| single writes, 16 / 64 clients | 611 / 1,734 per s | 588 / 1,836 per s |
 
-#### High-Volume Workloads
-```
-Write 1 → operation counter incremented
-Write 2 → operation counter incremented
-... (smart commit fires once the adaptive threshold — 1×–20× default_batch_size — is crossed)
-```
+### What a caller can rely on
 
-#### Low-Volume Workloads
-```
-Write 1
-... (no more writes)
-supervisor_timeout_secs pass → the shard writer's idle timeout fires → commit
-```
-
-### Benefits
-
-#### Performance Benefits
-- **High-Volume**: Smart commits reduce commit overhead during bursts
-- **Low-Volume**: Eventual commits prevent unnecessary commits
-- **Memory Efficiency**: Adaptive thresholds based on index size
-- **Multi-Tenant**: Per-index supervision and commit strategies
-
-#### Durability Guarantees
-- **Bounded invisibility window**: an uncommitted write becomes searchable at the latest
-  `supervisor_timeout_secs` (5 s by default) after it landed
-- **Large batches commit promptly**: a batch counts its full size against the threshold, so
-  one large enough batch crosses it and commits as soon as it returns
-- **Consistency**: All writes eventually become searchable
-- **Crash Safety**: uncommitted writes are replayed from the WAL on startup
-
-#### Operational Simplicity
-- **Zero Configuration**: Works out of the box with sensible defaults
-- **Resource Efficient**: idle supervision carries no background task per index — the shard's
-  own writer thread notices the lull
-- **Async/Sync Safe**: Proper isolation between async actors and sync storage operations
+- `id:VALUE` lookups see a write as soon as it is acknowledged (redb answers them).
+- A content query sees it within `commit_interval_ms` while writes to the index keep arriving,
+  and within `supervisor_timeout_secs` after the last one.
+- A crash loses nothing acknowledged: uncommitted writes are replayed from the WAL on startup.
 
 ### Configuration
 
 ```toml
 [search]
-indexer_memory_min_mb = 64      # Minimum memory budget
-indexer_memory_max_mb = 512     # Maximum memory budget
-supervisor_timeout_secs = 5     # Idle timeout before the supervised commit fires
+commit_interval_ms = 2000       # longest a write waits to become searchable under load
+supervisor_timeout_secs = 3     # idle commit after the last write; keep >= the interval
 
 [storage]
-default_batch_size = 1000       # Base smart commit threshold
+default_batch_size = 1000       # base of the count threshold (and of the 20x backstop)
 ```
-
-### Environment Variables
-
-You can also configure the batch size via environment variable:
-
-```bash
-# Set default batch size to 500 operations
-export CAMEODB_STORAGE_DEFAULT_BATCH_SIZE=500
-
-# Set default batch size to 2000 operations for high-throughput workloads
-export CAMEODB_STORAGE_DEFAULT_BATCH_SIZE=2000
-```
-
-**Priority Order**: Environment variables override TOML configuration values.
-
-This supervised strategy ensures optimal performance across all write patterns while maintaining strong data durability guarantees.
 
 ## Tiered Cache Sizing for redb
 

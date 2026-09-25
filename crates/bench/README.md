@@ -62,38 +62,31 @@ run there shows the latter.
 
 ## Commits, and why they shape the numbers
 
-A commit is not per document. Two things trigger one, per `(shard, index)`:
+A commit is not per document, and it is what makes a write searchable. Per `(shard, index)`:
 
-1. **An operation-count threshold.** `should_commit_writer` commits once operations since the
-   last commit reach `default_batch_size × (1 + budget_ratio × 19)` — 1 000 ops at the
-   minimum indexer memory budget, up to 20 000 at the maximum, with a further ×1.5 once a
-   burst exceeds 5× `default_batch_size`.
-2. **A 5-second idle timeout** (`[search] supervisor_timeout_secs`). The safety net: a
-   trickle that never reaches the threshold would otherwise sit uncommitted, and therefore
-   unsearchable, until the next write arrived.
+1. **The commit interval** (`[search] commit_interval_ms`, 2 s by default). The writer thread
+   commits once the oldest uncommitted write has waited that long, checked after each batch of
+   writes it drains — after it has answered them, so no write's latency includes a commit.
+2. **A count backstop.** Twenty times `default_batch_size × (1 + budget_ratio × 19)` — 20 000
+   ops at the minimum indexer memory budget — commits regardless of the clock, bounding what a
+   restart replays.
+3. **The idle commit** (`[search] supervisor_timeout_secs`, 3 s by default), for the writes that
+   end a burst and have nothing after them to trigger the interval.
 
-Which of the two fires changes what a run means, and at bench-scale traffic it is usually the
-second. Measured on a 4-shard node:
+Before 0.3.5 the count alone triggered a commit, at 1 000 ops on a new index, and that decided
+what a run measured: a bulk load committed on nearly every batch, and a single-write run of a
+few thousand documents never committed at all until it stopped. Now a run of any shape commits
+about once per interval per shard, so:
 
-| Run | Documents | Threshold commits | Idle commits |
-|---|---|---|---|
-| `--mode write`, 10s | 2 250 | **0** | 4 (one per shard, after writes stopped) |
-| `--mode bulk --batch-size 500`, 10s | 52 000 | **48** | — |
-
-2 250 single writes spread over 4 shards is ~560 per shard, which never reaches the 1 000-op
-threshold — so nothing committed during the run, and those documents were not searchable
-until 5 seconds after the last write. Two consequences for reading results:
-
-- **Single-write latency mostly excludes commit cost** at this scale. It is WAL plus redb
-  plus the tantivy in-memory add. Push a run past the threshold and roughly one write in a
-  thousand also pays for a commit, which is where the p99.9 tail comes from.
-- **Search freshness lags writes** by up to the idle timeout, but only for queries that go
-  through tantivy. An `id:` lookup is answered without a committed segment and is visible
-  within milliseconds; a query on an ordinary indexed field waits for the commit. Measured
-  with a 5s timeout: `id:i4` visible in 0.05s, `title:zebracrossing` for the same document in
-  5.35s. `--mode mixed` therefore searches an index whose most recent writes are not yet
-  matchable by content — real behaviour, not an artifact, but do not read it as a
-  search-recall measurement.
+- **Commit cost shows up as throughput, not latency.** A commit occupies the shard's writer
+  thread, so the batches behind it wait; where a sync is expensive (macOS, where it is a
+  full-device flush) that is visible in single-write ok/s at low concurrency.
+- **Search freshness lags writes** by up to the interval while writes keep arriving, and up to
+  the idle timeout after the last one — but only for queries that go through tantivy. An `id:`
+  lookup is answered without a committed segment and is visible within milliseconds; a query on
+  an ordinary indexed field waits for the commit. `--mode mixed` therefore searches an index
+  whose most recent writes are not yet matchable by content — real behaviour, not an artifact,
+  but do not read it as a search-recall measurement.
 
 ## What it was first used for
 

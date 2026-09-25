@@ -257,5 +257,6 @@ max_concurrent_remote_searches = 8
 # so any search whose limit was below the match count lost a whole node from both its count and
 # its merge. Setting it either way changes nothing now.
 enable_early_termination = true
-supervisor_timeout_secs = 5
+commit_interval_ms = 2000
+supervisor_timeout_secs = 3
 default_search_limit = 10

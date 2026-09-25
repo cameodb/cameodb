@@ -640,6 +640,7 @@ mod tests {
             merge_num_threads: 1,
             default_batch_size: 100_000,
             wal_sync: true,
+            commit_interval_ms: 0,
             query: Default::default(),
         }
     }
@@ -1017,6 +1018,7 @@ mod tests {
             merge_num_threads: 1,
             default_batch_size: 100_000,
             wal_sync: true,
+            commit_interval_ms: 0,
             query: Default::default(),
         };
 
@@ -1111,6 +1113,7 @@ mod tests {
             merge_num_threads: 1,
             default_batch_size: 100_000,
             wal_sync: true,
+            commit_interval_ms: 0,
             query: Default::default(),
         };
 
@@ -1216,6 +1219,7 @@ mod tests {
             merge_num_threads: 1,
             default_batch_size: 100,
             wal_sync: true,
+            commit_interval_ms: 0,
             query: Default::default(),
         };
         let store = HybridStore::new(config, 1).unwrap();
@@ -1279,6 +1283,7 @@ mod tests {
             // Other Configuration
             default_batch_size: 1000,
             wal_sync: true,
+            commit_interval_ms: 0,
             query: Default::default(),
         };
 
@@ -2321,6 +2326,181 @@ mod tests {
         assert_eq!(
             normalize_date_comparisons("created:>=2026-01-14 AND status:active", "created"),
             "created:>=2026-01-14T00:00:00Z AND status:active"
+        );
+    }
+}
+
+/// The commit policy with `commit_interval_ms` set: time decides, the count is a backstop, and
+/// the interval runs from the oldest write still waiting.
+#[cfg(test)]
+mod commit_interval_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const BATCH: usize = 100;
+    const INTERVAL_MS: u64 = 150;
+
+    /// A count threshold of exactly `BATCH`: every name here is new, so its budget is the
+    /// minimum and the budget-scaled threshold is the batch size itself.
+    fn config(temp_dir: &TempDir, commit_interval_ms: u64) -> StorageConfig {
+        StorageConfig {
+            max_open_indexes: 0,
+            shard_path: temp_dir.path().to_path_buf(),
+            indexer_memory_budget: 32 * 1024 * 1024,
+            indexer_memory_min_mb: 16,
+            indexer_memory_max_mb: 256,
+            total_memory_limit_bytes: 2048 * 1024 * 1024,
+            memory_pressure_threshold_percent: 80,
+            indexer_num_threads: 1,
+            merge_num_threads: 1,
+            default_batch_size: BATCH,
+            wal_sync: false,
+            commit_interval_ms,
+            query: Default::default(),
+        }
+    }
+
+    fn put(id: &str) -> WalOp {
+        WalOp::Put {
+            id: id.to_string(),
+            json_blob: Some(serde_json::json!({"id": id, "title": "commit cadence"})),
+        }
+    }
+
+    fn past_the_interval() {
+        std::thread::sleep(Duration::from_millis(INTERVAL_MS + 50));
+    }
+
+    /// Crossing the count no longer commits: that is what made a bulk load commit on nearly
+    /// every drain. Waiting out the interval does, with any amount pending — which is what
+    /// bounds a trickle that would never have reached the count.
+    #[test]
+    fn with_an_interval_time_commits_and_the_count_does_not() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(config(&temp_dir, INTERVAL_MS), 1).expect("store");
+
+        assert!(
+            !store.should_commit_writer("cadence", 1),
+            "the first pending operation starts the clock; it does not commit"
+        );
+        assert!(
+            !store.should_commit_writer("cadence", BATCH as u64 * 5),
+            "past the count but inside the interval: not yet"
+        );
+        past_the_interval();
+        assert!(
+            store.should_commit_writer("cadence", 1),
+            "an interval has passed since the oldest pending operation"
+        );
+        assert!(
+            !store.should_commit_writer("cadence", 0),
+            "nothing pending is never a commit, however long it has been"
+        );
+    }
+
+    /// The backstop: twenty times the count commits at once, so a load faster than one interval
+    /// can cover still bounds the WAL tail a restart would replay.
+    #[test]
+    fn the_backstop_commits_without_waiting_for_the_clock() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(config(&temp_dir, INTERVAL_MS), 1).expect("store");
+        let backstop = BATCH as u64 * COMMIT_BACKSTOP_MULTIPLE;
+
+        assert!(!store.should_commit_writer("burst", backstop - 1));
+        assert!(store.should_commit_writer("burst", backstop));
+    }
+
+    /// `0` is the count-only policy, unchanged: the threshold commits and the clock is not read.
+    #[test]
+    fn a_zero_interval_keeps_the_count_only_policy() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(config(&temp_dir, 0), 1).expect("store");
+
+        assert!(!store.should_commit_writer("count", BATCH as u64 - 1));
+        assert!(store.should_commit_writer("count", BATCH as u64));
+        assert!(
+            store.pending_since.is_empty(),
+            "the count-only policy keeps no clock"
+        );
+    }
+
+    /// End to end through the write path: a write waits, a write an interval later commits both
+    /// and makes them searchable, and the commit restarts the clock for the next one — so a
+    /// steady trickle commits about once an interval, not once per write.
+    #[test]
+    fn a_trickle_is_committed_once_an_interval_has_passed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(config(&temp_dir, INTERVAL_MS), 1).expect("store");
+        let index = "trickle";
+
+        let (_, committed) = store
+            .apply_write_and_maybe_commit(index, put("a"))
+            .expect("write a");
+        assert!(
+            !committed,
+            "one write, far below the count, inside the interval"
+        );
+
+        past_the_interval();
+        let (_, committed) = store
+            .apply_write_and_maybe_commit(index, put("b"))
+            .expect("write b");
+        assert!(committed, "the oldest pending write has waited an interval");
+        assert_eq!(store.get_operations_count(index), 0);
+        assert_eq!(
+            store
+                .get_document_count_from_tantivy(index)
+                .expect("count from the index"),
+            2,
+            "the commit made both writes searchable"
+        );
+
+        let (_, committed) = store
+            .apply_write_and_maybe_commit(index, put("c"))
+            .expect("write c");
+        assert!(
+            !committed,
+            "the commit restarted the clock; a write right after it waits its own interval"
+        );
+    }
+}
+
+#[cfg(test)]
+mod schema_cache_tests {
+    use super::*;
+
+    /// A schema loaded on a cache miss never replaces one a committed write cached while the
+    /// load was running: the loaded one read the row before that write, so it is the older.
+    #[test]
+    fn a_loaded_schema_does_not_overwrite_one_cached_meanwhile() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = StorageConfig {
+            shard_path: temp_dir.path().to_path_buf(),
+            ..StorageConfig::default()
+        };
+        let store = HybridStore::new(config, 1).expect("store");
+
+        let newer = IndexSchema {
+            version: 5,
+            ..IndexSchema::default()
+        };
+        store
+            .schema_cache
+            .insert("idx".to_string(), Arc::new(newer));
+
+        let stale = IndexSchema {
+            version: 1,
+            ..IndexSchema::default()
+        };
+        let cached = store.cache_loaded_schema("idx", stale);
+        assert_eq!(
+            cached.version, 5,
+            "the load returns what is cached, not what it read"
+        );
+        assert_eq!(
+            store.schema_cache.get("idx").expect("entry").version,
+            5,
+            "and leaves the newer schema in place"
         );
     }
 }

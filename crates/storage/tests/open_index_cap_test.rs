@@ -10,6 +10,8 @@
 //! bounded, the index that goes is the coldest one, and an evicted index loses nothing.
 
 use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use storage::{FieldDef, HybridStore, IndexSchema, StorageConfig, TantivyFieldType, WalOp};
 use tempfile::TempDir;
 
@@ -27,6 +29,7 @@ fn capped_config(shard_path: &std::path::Path, cap: usize) -> StorageConfig {
         merge_num_threads: 1,
         default_batch_size: 100_000,
         wal_sync: true,
+        commit_interval_ms: 0,
         query: Default::default(),
     }
 }
@@ -144,5 +147,71 @@ fn the_coldest_index_is_the_one_evicted() {
     assert!(
         !store.is_index_open("doomed"),
         "the index used least recently should have been the one to go"
+    );
+}
+
+/// An index closed by another thread's admission loses none of the writes in flight on it.
+///
+/// The close runs on whichever thread admits the next index — here a search, as on the read
+/// pool — and it used to find the writer mutex free for most of a write, which took it only
+/// around `add_document`. A close landing between a batch reserving its sequences and adding its
+/// documents committed without them, checkpointed their sequences as durable, truncated their
+/// WAL entries, and dropped the writer they were then added to. The documents stayed in redb —
+/// which is why `an_evicted_index_keeps_its_documents`, reading by key, never saw it — and were
+/// gone from the search index for good: the replay that should have restored them had had its
+/// WAL truncated. So this counts what a *search* finds.
+#[test]
+fn closing_an_index_from_another_thread_loses_no_write_in_flight() {
+    const BATCHES: usize = 150;
+    const PER_BATCH: usize = 4;
+
+    let dir = TempDir::new().unwrap();
+    // A cap of one: every search of `other` closes `busy`, and every write to `busy` closes
+    // `other`, so the two threads contend for the open set on every operation.
+    let store = Arc::new(HybridStore::new(capped_config(dir.path(), 1), 1).expect("store"));
+    store
+        .store_schema_and_cache("busy", &schema())
+        .expect("schema");
+    write_one(&store, "other", "doc-1");
+    store.commit_index("other").expect("commit");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let searcher = {
+        let (store, stop) = (Arc::clone(&store), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let mut searches = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                store
+                    .search_documents("other", "title:other", 1, None)
+                    .expect("search other");
+                searches += 1;
+            }
+            searches
+        })
+    };
+
+    for batch in 0..BATCHES {
+        let ops = (0..PER_BATCH)
+            .map(|i| WalOp::Put {
+                id: format!("b{batch}-{i}"),
+                json_blob: Some(json!({ "title": "in busy" })),
+            })
+            .collect();
+        store.apply_batch("busy", ops).expect("batch");
+    }
+    stop.store(true, Ordering::Relaxed);
+    let searches = searcher.join().expect("searcher thread");
+    assert!(searches > 0, "the searcher never ran, so nothing contended");
+
+    // Whatever is still buffered, committed; an index already closed has nothing pending.
+    store.commit_index("busy").expect("final commit");
+    let found = store
+        .search_documents("busy", "title:busy", 0, None)
+        .expect("search busy")
+        .total_hits;
+    assert_eq!(
+        found,
+        BATCHES * PER_BATCH,
+        "every acknowledged write must be searchable after closes from another thread"
     );
 }

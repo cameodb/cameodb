@@ -132,6 +132,22 @@ pub struct StorageConfig {
     pub default_batch_size: usize,
     /// Whether to call fsync() on every redb commit.
     pub wal_sync: bool,
+    /// How long, in milliseconds, an index's oldest uncommitted write may wait for the commit
+    /// that makes it searchable, while writes keep arriving; `0` commits by count alone.
+    ///
+    /// A commit is what makes a write visible to search, and it is the expensive half of a
+    /// write: Tantivy waits for its indexer to flush a segment and syncs every file of it. By
+    /// count alone — the threshold derived from `default_batch_size` — a bulk load crosses the
+    /// threshold on nearly every drain and pays that on every one, while a steady trickle that
+    /// never reaches it is not searchable until it does. Measured by time, the first costs one
+    /// commit per interval however fast documents arrive, and the second is bounded too.
+    ///
+    /// With an interval the count still applies, twenty times higher, as a backstop bounding
+    /// the WAL tail a restart replays. The idle commit after the last write is the node's, not
+    /// this crate's: see `supervisor_timeout_secs`. `0` here is the count-only policy the
+    /// library's own tests are written against; the node sets `[search] commit_interval_ms`.
+    #[serde(default)]
+    pub commit_interval_ms: u64,
 
     /// How much one query may ask of the index: the node's query-cost policy, grouped so a new
     /// bound is one field here rather than one more line in every place a config is built.
@@ -302,6 +318,7 @@ impl Default for StorageConfig {
             // Other Configuration
             default_batch_size: 1000,
             wal_sync: true,
+            commit_interval_ms: 0,
             query: QueryPolicy::default(),
         }
     }
@@ -477,6 +494,13 @@ pub enum StoreError {
     /// thread, and so the HTTP layer can answer a retriable failure rather than a bad request.
     #[error("index writer for '{0}' panicked and was reset; retry the write")]
     WriterPanicked(String),
+
+    /// A write whose index was closed by eviction every time it was reopened for it. Nothing
+    /// was applied — the writer is confirmed live before a sequence is reserved — so the
+    /// operation is safe to retry. Needs the open-index cap to evict this index repeatedly
+    /// within one write, so it is a busy shard's answer rather than a fault.
+    #[error("index '{0}' was closed while a write was opening it; retry the write")]
+    WriterClosed(String),
 
     #[error("invalid index name: {0}")]
     InvalidIndexName(String),

@@ -30,8 +30,8 @@ impl Node {
 
         // One shard, so every document lands in the index this test reasons about. The
         // commit threshold and the supervisor timeout are both set far above the test's
-        // lifetime, so nothing commits unless the test asks for it — which is exactly the
-        // state a crash between writes leaves behind.
+        // lifetime, and the commit interval is off, so nothing commits unless the test asks
+        // for it — which is exactly the state a crash between writes leaves behind.
         let config = format!(
             r#"
 [node]
@@ -54,6 +54,7 @@ wal_sync = true
 
 [search]
 supervisor_timeout_secs = 3600
+commit_interval_ms = 0
 "#,
             data = data.display().to_string().replace('\\', "/"),
         );

@@ -524,7 +524,7 @@ An id that cannot be routed is reported in `errors` against that id; the rest of
 | Query | When the delete shows |
 |---|---|
 | `id:VALUE` | **Immediately.** An exact key lookup is answered from the key-value store without consulting the search index. |
-| Any content query | **At the next commit** — the idle-commit timeout (`supervisor_timeout_secs`, 5 s by default), sooner under load, or at once via `POST /_admin/index/{index}/commit`. |
+| Any content query | **At the next commit** — within `commit_interval_ms` (2 s by default) while writes to the index keep arriving, within the idle-commit timeout (`supervisor_timeout_secs`, 3 s by default) after the last one, or at once via `POST /_admin/index/{index}/commit`. |
 
 Until that commit, a deleted document is counted in `total_hits` but absent from `hits`: the count comes from the search index while the bodies come from the key-value store. This is the honest reading of a mid-flight delete — reducing the count instead would break the arithmetic that pages through results.
 

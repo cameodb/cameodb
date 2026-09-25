@@ -369,15 +369,20 @@ impl ClusterCoordinator {
     }
 
     /// Intelligently exchange shard metadata with remote node using deduplication
+    ///
+    /// Takes what it reads of the coordinator as `local` rather than `&self`, because it must
+    /// not run inside the coordinator's handler: it waits on the peer's coordinator, and the
+    /// peer runs the same exchange on the same timer. Two coordinators each waiting on the
+    /// other's mailbox from inside their own is a deadlock with no timeout to end it.
     async fn exchange_shards_with_peer(
-        &self,
+        local: &LocalShardExchange,
         peer_id: Uuid,
         local_generation: u64,
         local_checksum: u64,
         all_shards: HashMap<Uuid, ShardMetadata>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // First, query remote node's state — use pool if available, fallback to direct lookup
-        let remote_coord = if let Some(pool) = &self.remote_peer_pool {
+        let remote_coord = if let Some(pool) = &local.pool {
             pool.get_coordinator(peer_id)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
@@ -394,7 +399,7 @@ impl ClusterCoordinator {
         };
 
         let query_msg = QueryClusterState {
-            node_id: self.cluster.local_node_id,
+            node_id: local.node_id,
             generation: local_generation,
             shard_checksum: local_checksum,
         };
@@ -412,8 +417,8 @@ impl ClusterCoordinator {
 
             let shard_count = all_shards.len();
             let push_msg = MergeRemoteShards {
-                node_id: self.cluster.local_node_id,
-                node_name: self.cluster.local_node_name.clone(),
+                node_id: local.node_id,
+                node_name: local.node_name.clone(),
                 shards: all_shards,
                 generation: local_generation,
                 shard_checksum: local_checksum,
@@ -1593,215 +1598,232 @@ impl Message<SetLocalOrchestrator> for ClusterCoordinator {
     }
 }
 
-impl Message<DeleteIndexCluster> for ClusterCoordinator {
-    /// An `OrchestratorError` rather than a `String`, so the outcome keeps its verdict.
-    ///
-    /// A delete that could not reach one node leaves the index alive there and is worth
-    /// retrying; a delete the local node could not perform at all is not. Collapsed into one
-    /// string both arrived at the HTTP boundary as `500`, which reads as "this failed, and not
-    /// because of you" for the one case where a retry is exactly what the caller should do.
-    type Reply = Result<JsonValue, crate::node::OrchestratorError>;
+impl Message<GetDeleteTargets> for ClusterCoordinator {
+    type Reply = DeleteTargets;
 
     async fn handle(
         &mut self,
-        msg: DeleteIndexCluster,
+        _msg: GetDeleteTargets,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        info!(
-            index = %msg.index,
-            delete_schema = %msg.delete_schema,
-            "ClusterCoordinator: coordinating index deletion across cluster"
-        );
-
-        // 1. Delete from local node first
-        let local_result = if let Some(local_orchestrator) = &self.local_orchestrator {
-            local_orchestrator
-                .ask(crate::node::ClientOp::DeleteIndex {
-                    index: msg.index.clone(),
-                    delete_schema: msg.delete_schema,
+        DeleteTargets {
+            local_orchestrator: self.local_orchestrator.clone(),
+            peers: self
+                .cluster
+                .peer_nodes
+                .values()
+                .map(|info| KnownPeer {
+                    node_id: info.node_id,
+                    node_name: info.node_name.clone(),
+                    address: info.address.clone(),
                 })
-                .await
-                // The orchestrator's own error, when it produced one, rather than a description
-                // of it: it already carries the verdict the caller's status is read from.
-                .map_err(|e| match e {
-                    kameo::error::SendError::HandlerError(err) => err,
-                    other => crate::node::OrchestratorError::NotReady(format!(
-                        "Failed to communicate with local orchestrator: {}",
-                        other
-                    )),
-                })
-        } else {
-            Err(crate::node::OrchestratorError::NotReady(
-                "Local orchestrator not available".to_string(),
-            ))
-        };
+                .collect(),
+            pool: self.remote_peer_pool.clone(),
+        }
+    }
+}
 
-        // 2. Forward delete request to all remote nodes in parallel
-        let known_peers: Vec<KnownPeer> = self
-            .cluster
-            .peer_nodes
-            .values()
-            .map(|info| KnownPeer {
-                node_id: info.node_id,
-                node_name: info.node_name.clone(),
-                address: info.address.clone(),
+/// Delete an index on this node and on every peer, from the caller's task.
+///
+/// **Not a coordinator handler, and that is the point.** It was one, and it awaited the local
+/// orchestrator's delete from inside the coordinator's mailbox — while the orchestrator's own
+/// handlers ask the coordinator (for peers, for shard assignments, to register a shard). A
+/// delete arriving while the orchestrator was inside one of those left each actor waiting on the
+/// other, permanently: neither ask has a timeout. The coordinator now only hands over who to
+/// ask ([`GetDeleteTargets`]), which it answers without waiting on anyone.
+///
+/// Returns an `OrchestratorError` rather than a `String`, so the outcome keeps its verdict. A
+/// delete that could not reach one node leaves the index alive there and is worth retrying; a
+/// delete the local node could not perform at all is not. Collapsed into one string both
+/// arrived at the HTTP boundary as `500`, which reads as "this failed, and not because of you"
+/// for the one case where a retry is exactly what the caller should do.
+pub(crate) async fn delete_index_cluster(
+    targets: DeleteTargets,
+    msg: DeleteIndexCluster,
+) -> Result<JsonValue, crate::node::OrchestratorError> {
+    info!(
+        index = %msg.index,
+        delete_schema = %msg.delete_schema,
+        "ClusterCoordinator: coordinating index deletion across cluster"
+    );
+
+    // 1. Delete from local node first
+    let local_result = if let Some(local_orchestrator) = &targets.local_orchestrator {
+        local_orchestrator
+            .ask(crate::node::ClientOp::DeleteIndex {
+                index: msg.index.clone(),
+                delete_schema: msg.delete_schema,
             })
-            .collect();
+            .await
+            // The orchestrator's own error, when it produced one, rather than a description
+            // of it: it already carries the verdict the caller's status is read from.
+            .map_err(|e| match e {
+                kameo::error::SendError::HandlerError(err) => err,
+                other => crate::node::OrchestratorError::NotReady(format!(
+                    "Failed to communicate with local orchestrator: {}",
+                    other
+                )),
+            })
+    } else {
+        Err(crate::node::OrchestratorError::NotReady(
+            "Local orchestrator not available".to_string(),
+        ))
+    };
 
-        let pool = self.remote_peer_pool.clone();
-        let remote_delete_futures: Vec<_> = known_peers
-            .into_iter()
-            .map(|peer| {
-                let index = msg.index.clone();
-                let delete_schema = msg.delete_schema;
-                let pool = pool.clone();
-                async move {
-                    // Lookup via pool if available, fallback to direct lookup
-                    let lookup_result = if let Some(pool) = &pool {
-                        use crate::remote_peer_pool::ConnectionChannel;
-                        pool.get_orchestrator(peer.node_id, ConnectionChannel::Operations)
-                            .await
-                            .map_err(|e| format!("Lookup failed for node {}: {}", peer.node_id, e))
-                    } else {
-                        let remote_orchestrator_name =
-                            crate::node::orchestrator_remote_name(&peer.node_id);
-                        kameo::actor::RemoteActorRef::<crate::node::NodeOrchestrator>::lookup(
-                            remote_orchestrator_name.as_str(),
-                        )
+    // 2. Forward delete request to all remote nodes in parallel
+    let known_peers = targets.peers;
+    let pool = targets.pool;
+    let remote_delete_futures: Vec<_> = known_peers
+        .into_iter()
+        .map(|peer| {
+            let index = msg.index.clone();
+            let delete_schema = msg.delete_schema;
+            let pool = pool.clone();
+            async move {
+                // Lookup via pool if available, fallback to direct lookup
+                let lookup_result = if let Some(pool) = &pool {
+                    use crate::remote_peer_pool::ConnectionChannel;
+                    pool.get_orchestrator(peer.node_id, ConnectionChannel::Operations)
                         .await
                         .map_err(|e| format!("Lookup failed for node {}: {}", peer.node_id, e))
-                    };
+                } else {
+                    let remote_orchestrator_name =
+                        crate::node::orchestrator_remote_name(&peer.node_id);
+                    kameo::actor::RemoteActorRef::<crate::node::NodeOrchestrator>::lookup(
+                        remote_orchestrator_name.as_str(),
+                    )
+                    .await
+                    .map_err(|e| format!("Lookup failed for node {}: {}", peer.node_id, e))
+                };
 
-                    let result = match lookup_result {
-                        Ok(Some(remote_orchestrator)) => {
-                            let delete_msg = crate::node::ClientOp::DeleteIndex {
-                                index: index.clone(),
-                                delete_schema,
-                            };
+                let result = match lookup_result {
+                    Ok(Some(remote_orchestrator)) => {
+                        let delete_msg = crate::node::ClientOp::DeleteIndex {
+                            index: index.clone(),
+                            delete_schema,
+                        };
 
-                            // `remote_answer` so a peer that ran the delete and refused it
-                            // keeps its own verdict, instead of it being flattened into the
-                            // same string as a peer that never received the message.
-                            match crate::node::remote_answer(
-                                remote_orchestrator.ask(&delete_msg).await,
-                            ) {
-                                Ok(result) => {
-                                    info!(
-                                        node_id = %peer.node_id,
-                                        address = %peer.address,
-                                        "Successfully deleted index from remote node"
-                                    );
-                                    Ok(result)
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        node_id = %peer.node_id,
-                                        address = %peer.address,
-                                        error = %e,
-                                        "Failed to delete index from remote node"
-                                    );
-                                    Err(format!("node {}: {}", peer.node_id, e))
-                                }
+                        // `remote_answer` so a peer that ran the delete and refused it
+                        // keeps its own verdict, instead of it being flattened into the
+                        // same string as a peer that never received the message.
+                        match crate::node::remote_answer(remote_orchestrator.ask(&delete_msg).await)
+                        {
+                            Ok(result) => {
+                                info!(
+                                    node_id = %peer.node_id,
+                                    address = %peer.address,
+                                    "Successfully deleted index from remote node"
+                                );
+                                Ok(result)
+                            }
+                            Err(e) => {
+                                warn!(
+                                    node_id = %peer.node_id,
+                                    address = %peer.address,
+                                    error = %e,
+                                    "Failed to delete index from remote node"
+                                );
+                                Err(format!("node {}: {}", peer.node_id, e))
                             }
                         }
-                        Ok(None) => {
-                            warn!(
-                                node_id = %peer.node_id,
-                                address = %peer.address,
-                                "Remote orchestrator not found for index deletion"
-                            );
-                            Err(format!(
-                                "Remote orchestrator not found for node {}",
-                                peer.node_id
-                            ))
-                        }
-                        Err(e) => {
-                            warn!(
-                                node_id = %peer.node_id,
-                                address = %peer.address,
-                                error = %e,
-                                "Failed to lookup remote orchestrator for index deletion"
-                            );
-                            Err(e)
-                        }
-                    };
-                    (peer, result)
-                }
-            })
-            .collect();
+                    }
+                    Ok(None) => {
+                        warn!(
+                            node_id = %peer.node_id,
+                            address = %peer.address,
+                            "Remote orchestrator not found for index deletion"
+                        );
+                        Err(format!(
+                            "Remote orchestrator not found for node {}",
+                            peer.node_id
+                        ))
+                    }
+                    Err(e) => {
+                        warn!(
+                            node_id = %peer.node_id,
+                            address = %peer.address,
+                            error = %e,
+                            "Failed to lookup remote orchestrator for index deletion"
+                        );
+                        Err(e)
+                    }
+                };
+                (peer, result)
+            }
+        })
+        .collect();
 
-        let remote_results: Vec<_> = futures::future::join_all(remote_delete_futures)
-            .await
-            .into_iter()
-            .map(|(_peer, result)| result)
-            .collect();
+    let remote_results: Vec<_> = futures::future::join_all(remote_delete_futures)
+        .await
+        .into_iter()
+        .map(|(_peer, result)| result)
+        .collect();
 
-        // Combine local and remote results
-        let mut all_errors = Vec::new();
+    // Combine local and remote results
+    let mut all_errors = Vec::new();
 
-        // The local node's failure is returned as its own error, verdict intact: the caller
-        // asked *this* node to delete an index and it could not, which is not a matter of
-        // reaching anyone else. It is checked first for the same reason — a local fault is the
-        // caller's answer even when every peer succeeded.
-        if let Err(err) = local_result {
-            error!(error = %err, "Index deletion failed on local node");
-            return Err(err);
-        }
-        info!("Index deletion succeeded on local node");
+    // The local node's failure is returned as its own error, verdict intact: the caller
+    // asked *this* node to delete an index and it could not, which is not a matter of
+    // reaching anyone else. It is checked first for the same reason — a local fault is the
+    // caller's answer even when every peer succeeded.
+    if let Err(err) = local_result {
+        error!(error = %err, "Index deletion failed on local node");
+        return Err(err);
+    }
+    info!("Index deletion succeeded on local node");
 
-        for (i, result) in remote_results.into_iter().enumerate() {
-            match result {
-                Ok(_) => {
-                    info!("Index deletion succeeded on remote node {}", i + 1);
-                }
-                Err(e) => {
-                    warn!(error = %e, "Index deletion failed on remote node {}", i + 1);
-                    all_errors.push(e);
-                }
+    for (i, result) in remote_results.into_iter().enumerate() {
+        match result {
+            Ok(_) => {
+                info!("Index deletion succeeded on remote node {}", i + 1);
+            }
+            Err(e) => {
+                warn!(error = %e, "Index deletion failed on remote node {}", i + 1);
+                all_errors.push(e);
             }
         }
+    }
 
-        // Return overall result
-        if all_errors.is_empty() {
-            return Ok(serde_json::json!({
-                "status": "success",
-                // "across all nodes" read as a boast on a standalone node, which has one.
-                // This says the same thing and stays true whatever the node count is.
-                "message": "Index deleted everywhere it was held",
-                "index": msg.index,
-                "delete_schema": msg.delete_schema
-            }));
-        }
+    // Return overall result
+    if all_errors.is_empty() {
+        return Ok(serde_json::json!({
+            "status": "success",
+            // "across all nodes" read as a boast on a standalone node, which has one.
+            // This says the same thing and stays true whatever the node count is.
+            "message": "Index deleted everywhere it was held",
+            "index": msg.index,
+            "delete_schema": msg.delete_schema
+        }));
+    }
 
-        // Deleted here, and not confirmed on a node that did not answer. Reported as
-        // unavailable rather than as a server fault because the caller's next move is to retry:
-        // the delete is idempotent, the existence check ahead of it looks cluster-wide, and once
-        // the node is back the retry finishes the job. A `500` would have said the opposite.
-        //
-        // Deliberately conservative, and it cannot be otherwise: a node that did not answer
-        // cannot be asked whether it held this index, so "unreachable" and "unreachable and
-        // holding it" are one case here. Announcing success while a possible holder was never
-        // contacted is the worse mistake. The retry then ends in a `404` when nothing is left,
-        // which is why the message says so — being told to retry and then getting a `404` reads
-        // as a failure otherwise, when it is the confirmation.
-        //
-        // A peer that ran the delete and refused it for its own reasons is folded in here too.
-        // Its verdict is not carried through: what the caller needs to know is that the index
-        // may survive somewhere, and that is the same either way. The reason is preserved in the
-        // message and in the warning logged above.
-        Err(crate::node::OrchestratorError::PeerUnreachable {
-            // The reasons go last: each one is already a sentence about a node, so any
-            // phrasing that reads them as a noun ("but <reason> could not be reached")
-            // comes out mangled.
-            message: format!(
-                "index '{}' was deleted here, but the cluster could not confirm it is gone \
+    // Deleted here, and not confirmed on a node that did not answer. Reported as
+    // unavailable rather than as a server fault because the caller's next move is to retry:
+    // the delete is idempotent, the existence check ahead of it looks cluster-wide, and once
+    // the node is back the retry finishes the job. A `500` would have said the opposite.
+    //
+    // Deliberately conservative, and it cannot be otherwise: a node that did not answer
+    // cannot be asked whether it held this index, so "unreachable" and "unreachable and
+    // holding it" are one case here. Announcing success while a possible holder was never
+    // contacted is the worse mistake. The retry then ends in a `404` when nothing is left,
+    // which is why the message says so — being told to retry and then getting a `404` reads
+    // as a failure otherwise, when it is the confirmation.
+    //
+    // A peer that ran the delete and refused it for its own reasons is folded in here too.
+    // Its verdict is not carried through: what the caller needs to know is that the index
+    // may survive somewhere, and that is the same either way. The reason is preserved in the
+    // message and in the warning logged above.
+    Err(crate::node::OrchestratorError::PeerUnreachable {
+        // The reasons go last: each one is already a sentence about a node, so any
+        // phrasing that reads them as a noun ("but <reason> could not be reached")
+        // comes out mangled.
+        message: format!(
+            "index '{}' was deleted here, but the cluster could not confirm it is gone \
                      everywhere; retry once the cluster is whole, and a 404 then means nothing \
                      is left to delete. Unconfirmed: {}",
-                msg.index,
-                all_errors.join("; ")
-            ),
-        })
-    }
+            msg.index,
+            all_errors.join("; ")
+        ),
+    })
 }
 
 impl Message<PeerShardDiscovered> for ClusterCoordinator {
@@ -2178,46 +2200,70 @@ impl Message<RouteOperation> for ClusterCoordinator {
 impl Message<ExchangeShardsWithPeer> for ClusterCoordinator {
     type Reply = ();
 
+    /// Snapshots what the exchange reads and runs it in a task of its own: the exchange waits
+    /// on the peer's coordinator, which is running this same exchange against this node. Awaited
+    /// here, each held its own mailbox while waiting on the other's — see
+    /// `exchange_shards_with_peer`. What comes back arrives as messages (`MergeRemoteShards`),
+    /// so nothing needs the coordinator's state after the snapshot.
     async fn handle(
         &mut self,
         msg: ExchangeShardsWithPeer,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // Clone shards for fallback in case the main exchange fails
-        let fallback_shards = msg.shards.clone();
+        let local = LocalShardExchange {
+            pool: self.remote_peer_pool.clone(),
+            node_id: self.cluster.local_node_id,
+            node_name: self.cluster.local_node_name.clone(),
+        };
+        task::spawn(async move {
+            // Clone shards for fallback in case the main exchange fails
+            let fallback_shards = msg.shards.clone();
 
-        match self
-            .exchange_shards_with_peer(msg.peer_id, msg.generation, msg.checksum, msg.shards)
+            match Self::exchange_shards_with_peer(
+                &local,
+                msg.peer_id,
+                msg.generation,
+                msg.checksum,
+                msg.shards,
+            )
             .await
-        {
-            Ok(_) => {
-                // Success logged in exchange_shards_with_peer
-            }
-            Err(e) => {
-                warn!(peer = %msg.peer_id, error = %e, "Failed to exchange shards with peer");
-                // Fall back to traditional push for reliability
-                let fallback_coord = if let Some(pool) = &self.remote_peer_pool {
-                    pool.get_coordinator(msg.peer_id).await.ok().flatten()
-                } else {
-                    let remote_coord_name = format!("coordinator-{}", msg.peer_id);
-                    RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name)
-                        .await
-                        .ok()
-                        .flatten()
-                };
-                if let Some(remote_coord) = fallback_coord {
-                    let fallback_msg = MergeRemoteShards {
-                        node_id: self.cluster.local_node_id,
-                        node_name: self.cluster.local_node_name.clone(),
-                        shards: fallback_shards,
-                        generation: msg.generation,
-                        shard_checksum: msg.checksum,
+            {
+                Ok(_) => {
+                    // Success logged in exchange_shards_with_peer
+                }
+                Err(e) => {
+                    warn!(peer = %msg.peer_id, error = %e, "Failed to exchange shards with peer");
+                    // Fall back to traditional push for reliability
+                    let fallback_coord = if let Some(pool) = &local.pool {
+                        pool.get_coordinator(msg.peer_id).await.ok().flatten()
+                    } else {
+                        let remote_coord_name = format!("coordinator-{}", msg.peer_id);
+                        RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name)
+                            .await
+                            .ok()
+                            .flatten()
                     };
-                    let _ = remote_coord.tell(&fallback_msg).send();
+                    if let Some(remote_coord) = fallback_coord {
+                        let fallback_msg = MergeRemoteShards {
+                            node_id: local.node_id,
+                            node_name: local.node_name.clone(),
+                            shards: fallback_shards,
+                            generation: msg.generation,
+                            shard_checksum: msg.checksum,
+                        };
+                        let _ = remote_coord.tell(&fallback_msg).send();
+                    }
                 }
             }
-        }
+        });
     }
+}
+
+/// What a shard exchange reads of this coordinator, taken before it leaves the actor.
+struct LocalShardExchange {
+    pool: Option<Arc<RemotePeerPool>>,
+    node_id: Uuid,
+    node_name: String,
 }
 
 // EvaluateClusterState message removed - state evaluation now happens inline

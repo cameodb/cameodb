@@ -687,8 +687,8 @@ impl BulkCtx<'_> {
         );
 
         // Commit strategy: rely on the two existing commit mechanisms:
-        //   1. Threshold-based commit inside apply_batch_and_maybe_commit (writer thread)
-        //      — fires during the batch if enough ops accumulate.
+        //   1. The writer thread's commit after each drain, once the interval since the oldest
+        //      uncommitted write has passed (or the count backstop is reached).
         //   2. Supervisor idle-timeout commit (signal_supervisor called by handle_batch_write)
         //      — fires after the batch completes and no more writes arrive.
         //
@@ -4351,6 +4351,7 @@ impl NodeOrchestrator {
             // Other Configuration
             default_batch_size: self.config.default_batch_size,
             wal_sync: self.config.wal_sync,
+            commit_interval_ms: self.config.commit_interval_ms,
             query: self.config.query_policy.clone(),
         }
     }

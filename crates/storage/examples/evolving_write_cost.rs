@@ -37,6 +37,7 @@ fn config(shard_path: &std::path::Path, wal_sync: bool) -> StorageConfig {
         merge_num_threads: 1,
         default_batch_size: 100_000,
         wal_sync,
+        commit_interval_ms: 0,
         query: Default::default(),
     }
 }

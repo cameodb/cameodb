@@ -381,7 +381,7 @@ section "idle-commit timeout is configurable"
 # the --supervisor-timeout-secs flag did nothing. A unit test on the config cannot catch that
 # — only starting a node and watching when the document appears can.
 sed -i.bak 's/^admin_enabled = false/admin_enabled = true/' "$WORK/node.toml"
-printf '\n[search]\nsupervisor_timeout_secs = 1\n' >> "$WORK/node.toml"
+printf '\n[search]\ncommit_interval_ms = 1000\nsupervisor_timeout_secs = 1\n' >> "$WORK/node.toml"
 "$BIN" --config "$WORK/node.toml" > "$WORK/server3.log" 2>&1 &
 SERVER_PID=$!
 if wait_for_http "$BASE/_cluster/health" 40; then

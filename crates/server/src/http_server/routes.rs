@@ -14,10 +14,11 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{HeaderName, HeaderValue, StatusCode, header},
     middleware::{Next, from_fn},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
 use cameodb_mcp::{MCP_SESSION_ID_HEADER, McpShutdownHandle, mcp_router};
+use futures::StreamExt;
 use tokio::sync::Semaphore;
 use tower_http::{
     catch_panic::CatchPanicLayer, compression::CompressionLayer, cors::CorsLayer,
@@ -141,8 +142,8 @@ pub fn create_router(
                 )
                     .into_response();
             }
-            match sem.try_acquire() {
-                Ok(_permit) => next.run(req).await,
+            match sem.try_acquire_owned() {
+                Ok(permit) => hold_permit_for_streamed_body(next.run(req).await, permit),
                 Err(_) => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     // Without this, clients retry immediately and deepen the overload.
@@ -342,6 +343,34 @@ async fn fault_panic_handler() -> axum::response::Response {
 /// carry internals, and the caller can act on none of it. A JSON `{"error":"Internal server
 /// error"}` matches what [`crate::http_server::error::AppError`] returns for a server fault, so a
 /// panicked request is indistinguishable on the wire from any other 500.
+/// Marks a response whose body is produced after the handler returns — a streaming search —
+/// so the concurrency guard keeps the request's permit until the body ends.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamedBody;
+
+/// Release `permit` with `response`, or, for a [`StreamedBody`], only once its body is done.
+///
+/// A permit held by the guard ends when the handler returns, which for an ordinary response
+/// is when the work is done. A streaming search returns a body that has not been produced yet,
+/// and the search and the sending run after that — so its work ran outside the one bound on
+/// how many requests may be in flight, and a caller could open streams without limit. Moved
+/// into the body, the permit lasts as long as the stream: to its end, to the client leaving,
+/// or to the search giving up on a client that stopped reading.
+fn hold_permit_for_streamed_body(
+    response: Response,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    if response.extensions().get::<StreamedBody>().is_none() {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let body = axum::body::Body::from_stream(body.into_data_stream().map(move |chunk| {
+        let _held = &permit;
+        chunk
+    }));
+    Response::from_parts(parts, body)
+}
+
 fn handle_panic(panic: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
     let detail = panic
         .downcast_ref::<String>()
@@ -403,5 +432,59 @@ mod tests {
     fn a_non_string_panic_is_still_a_500() {
         let response = handle_panic(Box::new(42u32));
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A streamed body holds the request's concurrency permit until the body ends; any other
+    /// response gives it back with the response. Without this a streaming search released its
+    /// permit before running, so the node's in-flight bound did not count it.
+    #[tokio::test]
+    async fn a_streamed_body_holds_its_permit_until_it_ends() {
+        use super::{StreamedBody, hold_permit_for_streamed_body};
+        use axum::body::Body;
+        use axum::response::Response;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let sem = Arc::new(Semaphore::new(1));
+
+        let plain = hold_permit_for_streamed_body(
+            Response::new(Body::from("done")),
+            sem.clone().try_acquire_owned().expect("permit"),
+        );
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "an ordinary response releases at once"
+        );
+        drop(plain);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+        let mut response = Response::new(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ));
+        response.extensions_mut().insert(StreamedBody);
+        let streamed = hold_permit_for_streamed_body(
+            response,
+            sem.clone().try_acquire_owned().expect("permit"),
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the handler has returned, but the stream is still being produced"
+        );
+
+        tx.send(Ok(bytes::Bytes::from_static(b"{}\n")))
+            .await
+            .expect("send");
+        drop(tx);
+        let body = axum::body::to_bytes(streamed.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(&body[..], b"{}\n");
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the stream ended, so the permit is back"
+        );
     }
 }

@@ -162,10 +162,10 @@ Each book is indexed with the following fields:
 - **Memory Management**: 16MB cap per batch
 - **Smart Batching**: Automatic batch size adjustment based on document size
 - **Error Handling**: Detailed error reporting with failed operation counts
-- **Supervised Smart Commits** (server side): the adaptive commit threshold (1×–20×
-  `default_batch_size`, scaled by the index's memory budget) plus the idle-commit timeout
-  (`[search] supervisor_timeout_secs`, 5 s default) — batches sized below the threshold mean
-  rows become searchable at the latest a few seconds after ingestion finishes
+- **Commits on a clock** (server side): an index commits once its oldest uncommitted write has
+  waited `[search] commit_interval_ms` (2 s default), and `supervisor_timeout_secs` (3 s default)
+  after its last write — rows become searchable at the latest a few seconds after ingestion
+  finishes
 - **Parallel Sharding**: Automatic document distribution across multiple shards
 - **Cluster-Aware**: Real-time cluster health monitoring and accurate shard reporting
 

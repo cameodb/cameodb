@@ -198,5 +198,8 @@ pub(super) async fn search_stream_handler(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/x-ndjson"),
     );
+    // The search runs after this returns, so the request's concurrency permit has to outlive
+    // the handler: see `hold_permit_for_streamed_body`.
+    resp.extensions_mut().insert(super::routes::StreamedBody);
     Ok(resp)
 }

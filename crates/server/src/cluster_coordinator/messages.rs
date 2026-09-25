@@ -148,11 +148,26 @@ pub struct SetLocalOrchestrator {
     pub orchestrator: kameo::actor::ActorRef<crate::node::NodeOrchestrator>,
 }
 
-/// Message to coordinate index deletion across all nodes
+/// An index deletion across all nodes: what [`delete_index_cluster`](super::delete_index_cluster)
+/// is asked to do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteIndexCluster {
     pub index: String,
     pub delete_schema: bool,
+}
+
+/// Ask the coordinator who a cluster-wide delete has to reach. Answered from its own state,
+/// without waiting on anyone — see `delete_index_cluster` for why that matters.
+#[derive(Debug, Clone)]
+pub struct GetDeleteTargets;
+
+/// The local orchestrator, the known peers and the pool to reach them, as the coordinator held
+/// them when asked.
+#[derive(Clone, Reply)]
+pub struct DeleteTargets {
+    pub local_orchestrator: Option<kameo::actor::ActorRef<crate::node::NodeOrchestrator>>,
+    pub peers: Vec<KnownPeer>,
+    pub pool: Option<std::sync::Arc<crate::remote_peer_pool::RemotePeerPool>>,
 }
 
 /// Message when a single shard is discovered via DHT.

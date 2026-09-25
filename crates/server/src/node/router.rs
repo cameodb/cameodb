@@ -30,6 +30,10 @@ use crate::remote_peer_pool::{ConnectionChannel, RemotePeerPool};
 use cluster::ConsistentRing;
 use serde_json::Value as JsonValue;
 
+/// How long a streaming search waits for its client to take the next line before abandoning
+/// the stream. See `RouterActor::send_or_abandon`.
+pub(crate) const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Router actor that forwards client operations to NodeOrchestrator via actor messaging.
 /// Uses actor messaging instead of Arc<RwLock> - no locks needed.
 #[derive(Clone, Actor)]
@@ -714,7 +718,12 @@ impl RouterActor {
             mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(STREAM_CHANNEL_CAPACITY);
         let router = self.clone();
 
-        tokio::spawn(async move {
+        // Carried across the spawn by hand. A task-local is not inherited by `tokio::spawn`, so
+        // inside the task `request_started_at()` would read the moment it ran rather than the
+        // moment the request arrived, and every deadline check downstream would grant this
+        // search a fresh budget however long it had already waited.
+        let started = super::request_started_at();
+        tokio::spawn(super::REQUEST_STARTED_AT.scope(started, async move {
             let result = router
                 .route_and_handle(op, routing_key, operation_type)
                 .await;
@@ -730,14 +739,43 @@ impl RouterActor {
                     });
                     if let Ok(mut bytes) = serde_json::to_vec(&error_line) {
                         bytes.push(b'\n');
-                        let _ = tx.send(Ok(bytes::Bytes::from(bytes))).await;
+                        let _ = Self::send_or_abandon(
+                            &tx,
+                            bytes::Bytes::from(bytes),
+                            STREAM_STALL_TIMEOUT,
+                        )
+                        .await;
                     }
                 }
             }
             // tx dropped here → channel closes → stream ends
-        });
+        }));
 
         rx
+    }
+
+    /// Send one line of a streamed result, or give up on a client that has stopped reading.
+    ///
+    /// A client that disconnects closes the channel and the send fails at once. One that keeps
+    /// the connection open and stops reading does not: the channel fills, and a plain `send`
+    /// parks this task — holding the whole result in memory — for as long as the connection
+    /// lives, outside the request timeout, which ends when the response headers go. Waiting
+    /// [`STREAM_STALL_TIMEOUT`] for room bounds that: long enough for a slow reader, not
+    /// forever for a stalled one. `false` means stop sending. `stall` is a parameter only so a
+    /// test need not wait out the real bound.
+    pub(super) async fn send_or_abandon(
+        tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+        line: bytes::Bytes,
+        stall: Duration,
+    ) -> bool {
+        match tx.send_timeout(Ok(line), stall).await {
+            Ok(()) => true,
+            Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
+                debug!("Streaming search abandoned: the client stopped reading");
+                false
+            }
+            Err(mpsc::error::SendTimeoutError::Closed(_)) => false,
+        }
     }
 
     /// Serialize a search result as incremental NDJSON lines into a channel.
@@ -765,8 +803,8 @@ impl RouterActor {
                 Err(_) => continue,
             };
             bytes.push(b'\n');
-            if tx.send(Ok(bytes::Bytes::from(bytes))).await.is_err() {
-                return; // Client disconnected
+            if !Self::send_or_abandon(tx, bytes::Bytes::from(bytes), STREAM_STALL_TIMEOUT).await {
+                return; // Client disconnected or stopped reading
             }
         }
 
@@ -783,7 +821,9 @@ impl RouterActor {
         }
         if let Ok(mut footer_bytes) = serde_json::to_vec(&val) {
             footer_bytes.push(b'\n');
-            let _ = tx.send(Ok(bytes::Bytes::from(footer_bytes))).await;
+            let _ =
+                Self::send_or_abandon(tx, bytes::Bytes::from(footer_bytes), STREAM_STALL_TIMEOUT)
+                    .await;
         }
     }
 
