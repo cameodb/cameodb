@@ -177,6 +177,8 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB12](#ob12--the-schema-gate-deadlocked-a-fan-out-against-itself) | Correctness, ten items from the 2026-09-01 review, the re-read of its own fixes, and the 0.3.3 release check — OB3–OB12 all done | — | 2026-09-01 | ✅ |
 | [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) | **A timed-out request never leaves the worker pool** — a `DashMap` self-deadlock in `should_commit_writer` parked every shard writer thread past a 30s TTL. Found by the first [M6](#m6--close-and-re-measure-the-bulk-lane) arm, fixed and pinned the same day | — | 2026-09-25 | ✅ |
 | [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput) | **Every refused request was an `ERROR` line** — synchronous on the write path's runtime, it halved single-write goodput under overload and failed health. Refusals are now counted into one periodic summary. Found by the M6 single-write arm, fixed the same day | — | 2026-09-25 | ✅ |
+| [OB16](#ob16--closing-an-index-from-another-thread-lost-the-writes-in-flight-on-it) … [OB19](#ob19--two-clustered-deadlocks-through-the-coordinators-mailbox) | **The pre-release concurrency audit** — eviction from another thread lost in-flight writes from search (464 of 600 in the test), schema edits and evolution overwrote each other, streaming search ran outside the concurrency limit, and two clustered mailbox deadlocks. All fixed and, where a test can force it, pinned | — | 2026-09-26 | ✅ |
+| [F9](#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
@@ -2898,6 +2900,121 @@ unreachable anonymously once authentication is on, so left alone. And the writer
 synchronous `stderr`/`stdout` write on the runtime: a non-blocking appender would stop *any*
 future burst from stalling it, at the price of dropping lines when its buffer fills. That is a
 separate decision and not taken here.
+
+---
+
+### OB16 — Closing an index from another thread lost the writes in flight on it
+
+✅ **Found and fixed 2026-09-26**, by the pre-release concurrency audit (two static audits of
+`storage` and `server`, verified against the code, then a regression test run on both trees).
+
+**The shape.** Past the open-index cap ([M1](#m1--bound-resident-memory-against-index-count)),
+admitting an index closes a colder one from whichever thread is opening — a search on the read
+pool, `get_or_create_index` from the blocking pool — and closing commits. `apply_write` and
+`apply_batch` reserved their sequences, committed redb, and only then took the writer mutex, for
+the Tantivy add. A close landing in that window found the mutex free, read `current_seq` —
+including the reserved, unadded sequences — committed without them, checkpointed them as
+durable, truncated their WAL entries and dropped the writer. The writer thread then added the
+documents to the detached writer. They stayed in redb, so every `id:` lookup found them, and were
+gone from the search index permanently: the replay that should have restored them had had its WAL
+truncated. `an_evicted_index_keeps_its_documents` read by key and could not see it. The cap
+defaults to 8–256 per node, so this is the multi-tenant case 0.3.5 exists for.
+
+**The fix.** A write holds its writer from before it reserves a sequence until the document is
+added and counted (`lock_live_writer`), and confirms after locking that the writer is still the
+one the shard holds, reopening if a close got in first (`WriterClosed`, retriable, after three).
+`close_index` only `try_lock`s, skips a busy index, and holds the writer through the commit, the
+checkpoint and the teardown. `commit_index` reads the sequence to stamp under the lock, where it
+is now exact, and no longer holds the `writers` shard guard across the commit — the OB14 shape.
+Lock order: writer mutex → schema lock → redb write slot; nothing holding a later one waits on an
+earlier one.
+
+**Pinned by** `closing_an_index_from_another_thread_loses_no_write_in_flight` (cap 1, a search
+thread contending with a writing thread, counting what a *search* finds): **464 of 600** on the
+old tree, 600 on the new.
+
+### OB17 — A schema edit and an evolving write overwrote each other
+
+✅ **Found and fixed 2026-09-26**, same audit. The writer thread evolves the schema row when a
+document brings a new field; `set_default_fields`, `update_field_indexing` and
+`store_schema_and_cache` edit it from the blocking pool. Each read the schema, changed a copy and
+wrote it back with nothing serializing them, so either could erase the other — a field, or the
+operator's `default_fields` — in redb and in the cache. Separately, `get_schema_cached` loaded a
+schema on a miss (slow: a redb read and a Tantivy open) and `insert`ed it over whatever a
+committed write had cached meanwhile, so the cache went backwards and the next evolving write
+wrote a row without the newer field. A per-index schema lock (`lock_schema`) now spans every
+read-modify-write, and the loader only fills a vacant entry. **Pinned by**
+`a_schema_edit_and_an_evolving_write_lose_neither_change` (fails on the old tree) and
+`a_loaded_schema_does_not_overwrite_one_cached_meanwhile`.
+
+### OB18 — A streaming search ran outside the concurrency limit, and waited forever on a stalled client
+
+✅ **Found and fixed 2026-09-26**, same audit. `route_and_handle_stream` spawns the search and
+returns a body; the semaphore permit and the request timeout both ended when the handler
+returned, so the search held no permit, and a client that kept its connection open without
+reading parked the task on `send().await` — holding the whole result — for as long as the
+connection lived. And the node's own comment said `tokio::spawn` inherits the
+`REQUEST_STARTED_AT` task-local; it does not, so the task's deadline checks started from zero.
+The permit now moves into the body for a response marked `StreamedBody`, a line the client has not
+taken within `STREAM_STALL_TIMEOUT` (30 s) ends the stream, and the stamp is carried across the
+spawn by hand. **Pinned by** `a_streamed_body_holds_its_permit_until_it_ends` and
+`a_stream_abandons_a_client_that_stops_reading`.
+
+### OB19 — Two clustered deadlocks through the coordinator's mailbox
+
+✅ **Found and fixed 2026-09-26**, same audit; the second while fixing the first. Standalone nodes
+were not affected. (1) `DeleteIndexCluster` awaited the local orchestrator's `DeleteIndex` from
+inside the coordinator's handler, while orchestrator handlers ask the coordinator
+(`peer_schema_for`, `forward_op_to_owner`, shard registration) — no timeout on either side. (2)
+`ExchangeShardsWithPeer` awaited the peer coordinator's `QueryClusterState` from inside its own
+handler, and the peer runs the same exchange on the same timer; kameo remote asks carry no reply
+timeout by default. The coordinator now answers `GetDeleteTargets` from its own state and the HTTP
+task runs `delete_index_cluster`; the exchange snapshots what it reads and runs in a spawned task,
+its results arriving as `MergeRemoteShards` messages. Not pinned by a test: reproducing either
+needs a two-node cluster and an interleaving the suite cannot force.
+
+### F9 — Commit on a clock, not a count
+
+✅ **Done 2026-09-26.** Found by the same pre-release profiling session: stack samples of bulk at
+saturation (release build with symbols, `sample` on macOS) showed each shard writer **41%** of its
+time in `join` — `prepare_commit` waiting for the indexer to flush — while the indexer sat **46%**
+idle waiting for documents. A commit was triggered at `default_batch_size` operations (1,000 on a
+new index), so bulk committed on nearly every drain and the two threads took turns. Raising the
+threshold to 50,000 as a probe took 500-document batches from 21k to 151k docs/s.
+
+The same rule left a trickle unsearchable: the idle commit fires only after a pause, so writes
+arriving steadily below 1,000 waited for the thousandth — about 17 minutes at one per second.
+
+**The policy now.** An index commits once its oldest uncommitted write has waited
+`[search] commit_interval_ms` (2,000 by default); 20× the old count is a backstop bounding the WAL
+tail; the idle commit (`supervisor_timeout_secs`, now 3 s, a second above the interval) takes the
+tail of a burst. The writer answers a drain's callers first and commits once per index at the end of the
+drain, so no write waits for a commit and a failed commit no longer fails a durable write. The
+idle supervisor also no longer drops a nudge that arrives while its own commit runs. `0` keeps the
+count-only policy, which the storage tests are written against.
+
+**Measured**, release build, 4 shards, `wal_sync = true`, M5 Pro, back to back:
+
+| load | before | 1 s interval | **2 s interval (default)** |
+|---|---|---|---|
+| bulk, batch 5,000, concurrency 32 | 183,528 docs/s, p50 845 ms | 344,668, p50 437 ms | **327,691**, p50 446 ms |
+| bulk, batch 500, concurrency 16 | 19,746 docs/s, p50 420 ms | 130,595, p50 45 ms | **129,674**, p50 53 ms |
+| single writes, concurrency 16 | 611 ok/s | 521 | **588** |
+| single writes, concurrency 64 | 1,734 ok/s | 1,672 | **1,836** |
+
+With `commit_interval_ms = 0` the new build does 627 and 1,710 single writes/s, so the other fixes
+in this session cost nothing, and what moves single writes is the cadence. At 400–1,700
+writes/s the count committed each shard every 2.4–6.6 s; at 1 s the clock committed every second
+and 16 concurrent writers lost 15%, because on this machine every sync is `F_FULLFSYNC`, a
+full-device flush (measured 297/s from one thread, 631/s from eight; plain `fsync`
+15,000–31,000/s). At 2 s single writes are back inside run-to-run noise and bulk keeps its gain,
+so 2 s with a 3 s idle commit is the default. A Linux host pays far less per commit.
+
+**What the profile also settled.** The idle CPU on this box is not lock contention: with
+`wal_sync = false` the same node did **65,285 single writes/s on 9.5 cores**, and reads scaled
+linearly with `search_threads` to **11,593 searches/s on 12.8 cores** — which is why
+`search_threads` now defaults to the available cores rather than a fixed 8. Durable single writes
+on macOS are bound by the flush rate. Write-scaling claims should be confirmed on Linux.
 
 ---
 
