@@ -52,7 +52,7 @@ on one.
 | 14 — Security hardening (posture items C3–C8) | ✅ Done | C3–C8 all closed; C8 by M3 on 2026-09-20 |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
-| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 is measurement only; its first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), and the arms themselves are still owed |
+| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput). What is left is the release cut |
 
 ## Reconciliation, 2026-08-26
 
@@ -181,7 +181,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
 | [L1](#l1--size-cache-invalidation-by-substring-evicts-neighbouring-indexes) … [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | Post-0.3.4 review group — all twenty closed; the retrospective's output is [M](#m-the-035-goal-set--multi-tenant-exposure--planned) | — | 2026-09-19 | ✅ |
-| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed, the M1 blocker cleared, and M2, M3, M4, M5, M7 and M8 done; M6 reduced to measurement, whose first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) | — | 2026-09-25 | ◐ |
+| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed, the M1 blocker cleared, and M2–M8 done; M6's open-loop arms found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput). The release cut remains | — | 2026-09-25 | ◐ |
 
 ---
 
@@ -4654,7 +4654,8 @@ which does not hold the 'write' capability`, with writes elsewhere still `200`.
 
 ### M6 — Close and re-measure the bulk lane
 
-◐ **In progress — measurement only, and the first session found a blocker. Corrected 2026-09-25.**
+✅ **Done 2026-09-25 — the exit criterion is met; see session 3 below.** ◐ until then: measurement
+only, and the first session found a blocker. Corrected 2026-09-25.
 This entry was written on
 2026-09-19 claiming [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) item 3 as the
 last of its three still open. It was already closed: `0836df2` landed it on 2026-09-17, two days
@@ -4858,6 +4859,48 @@ above.
 measured 11 bulk req/s at concurrency 4 against F8's 56, but the binary, the batch size, the seed
 and the machine all differ, and the probe was itself degrading as it ran. It is a number for
 choosing open-loop rates, not a regression.
+
+**Session 3, 2026-09-25 — the three open-loop arms, and the exit criterion.** From a wiped volume
+per arm, in one session: F8 protocol (4 shards, `search_threads = 2`,
+`max_concurrent_requests = 3000`, `request_timeout_secs = 1`, `wal_sync = true`), 200,000
+documents seeded, Poisson arrivals, 20s steps, release build, harness co-located. Every arm ran
+on `c54ae33` and on `079ad0b` — the build session 2 measured, before M5, M4, M8 and O4 — back to
+back, so drift lands on both. Harness lag p99 stayed under 1.5ms and no arm dropped an arrival.
+
+| lane | offered | `c54ae33` ok/s | `079ad0b` ok/s | refused, `c54ae33` |
+|---|---|---|---|---|
+| bulk, batch 500 | 60/s | 59, sustained | 59 | — |
+| | 120/s | **105** (52,419 docs/s) | 104 | 275 × 503, **0 × 408** |
+| | 300/s | **116** (57,754 docs/s) | 108 | 3,724 × 503, **0 × 408** |
+| single write | 2,000/s | 1,987, sustained | 1,987 | — |
+| | 4,000/s | 1,116 | 1,290 | 46,455 × 503, **10,218 × 408** |
+| | 8,000/s | 951 | 1,045 | 132,520 × 503, 8,325 × 408 |
+| read | 1,000 / 2,000 / 4,000/s | **836 / 852 / 847** | 876 / 876 / 860 | 503 only, 0 × 408 |
+
+*Bulk and read meet the criterion outright.* Goodput is flat from 2× to 5× overload with the
+excess refused as `503` — F8 measured **0 ok/s and 100% `408`** at the same bulk rates — health
+answered `200` throughout, and an overload-then-relief ramp (300 → 15 bulk/s, 4,000 → 300
+searches/s) served the full offered rate from the first second of relief, where F7 measured
+4–12s of zero. `jobs_dropped` read 0 on every arm of both binaries; the pool's `gap` equals
+`abandoned` exactly, which is the dequeue check shedding, not a leak.
+
+*The single-write lane did not*, on either binary: at 2× it kept about half its capacity, 15% of
+requests timed out, and health failed. That was
+[OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput)
+— one `ERROR` line per refusal, written synchronously on the runtime the write path runs on —
+found, isolated and fixed in this session. On the fixed binary the lane holds **2,621 ok/s at
+2× and 2,541 at 4×**, zero `408`, health ≤ 518ms, full rate from the first second of relief; bulk
+and read did not move.
+
+*M4, M5, M8 and O4 cost nothing measurable.* Every pair is inside run-to-run noise, closed-loop
+probes included (bulk 27 req/s on both, writes 643 against 645/s). Reads read ~3% lower on
+`c54ae33` in this session and higher than both on the fixed binary (884/872/871) in the next, so
+that difference is noise and not M8's query preparation.
+
+**The criterion is met** on the binary that carries the OB15 fix: goodput that degrades rather
+than collapsing, on the bulk lane and the single-write lane, with the read lane holding too. What
+remains is the short confirmation arm at the cut, which is release mechanics rather than this
+item.
 
 ### M7 — Redact the cluster PSK in `Debug`
 
