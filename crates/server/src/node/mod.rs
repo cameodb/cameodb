@@ -1015,6 +1015,21 @@ pub enum ClientOp {
         /// See [`ClientOp::BulkWrite::schema_body`].
         #[serde(default)]
         schema_body: Option<Box<IndexSchema>>,
+        /// The tenant to stamp on this index if the write creates it, from the key that sent
+        /// it.
+        ///
+        /// Carried on the op rather than read from ambient state because the decision is made
+        /// deep inside the orchestrator — implicit creation samples the first documents into a
+        /// schema there — while the only place the tenant is known is the HTTP gate. A
+        /// task-local would not survive the actor mailbox, and an unstamped index counts
+        /// against nobody's quota, which is the one outcome that makes the quota pointless.
+        ///
+        /// Read **only** when the write creates the index. It never rewrites an existing
+        /// stamp: ownership is a fact about who made the index, not who last wrote to it.
+        ///
+        /// Defaulted, so an op from an older peer stamps nothing.
+        #[serde(default)]
+        tenant: Option<String>,
     },
     /// Bulk write operation to insert/update multiple documents
     BulkWrite {
@@ -1051,6 +1066,10 @@ pub enum ClientOp {
         /// [`schema_to_carry`].
         #[serde(default)]
         schema_body: Option<Box<IndexSchema>>,
+        /// The tenant to stamp on this index if this batch creates it. See
+        /// [`ClientOp::Write::tenant`].
+        #[serde(default)]
+        tenant: Option<String>,
     },
     /// Remove many documents by key, in one request.
     ///

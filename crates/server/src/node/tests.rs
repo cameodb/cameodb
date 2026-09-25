@@ -735,6 +735,7 @@ async fn an_op_the_engine_declines_comes_back_whole() {
             }],
             forwarded: false,
             schema_body: None,
+            tenant: None,
         })
         .await;
 
@@ -769,6 +770,7 @@ fn placeholder_op() -> Box<ClientOp> {
         doc: json!({"title": "Dune"}),
         forwarded: false,
         schema_body: None,
+        tenant: None,
     })
 }
 
@@ -2135,6 +2137,7 @@ fn an_ordinary_forward_carries_no_schema_at_all() {
         }],
         forwarded: true,
         schema_body: None,
+        tenant: None,
     };
     let wire = serde_json::to_string(&forward).unwrap();
     assert!(
@@ -2177,6 +2180,7 @@ fn a_resend_attaches_the_body_the_peer_asked_for() {
         doc: json!({"title": "Dune"}),
         forwarded: true,
         schema_body: None,
+        tenant: None,
     };
 
     match with_schema_body(&forwarded, &settled).expect("a write can carry a schema") {

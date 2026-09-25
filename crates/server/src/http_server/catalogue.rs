@@ -108,9 +108,18 @@ pub(super) async fn list_cluster_indexes_handler(
 pub(super) async fn create_config_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
-    Json(schema): Json<IndexSchema>,
+    authz: Option<Extension<crate::authz::Authz>>,
+    Json(mut schema): Json<IndexSchema>,
 ) -> Result<Json<JsonValue>, AppError> {
     validate_index_name(&index)?;
+
+    // Ownership is decided by who is calling, never by what they sent. `tenant` is a
+    // deserialized field, so a body can carry one — naming another tenant, or `null` to escape
+    // a quota entirely. Overwritten here, before the op is built, so nothing downstream has to
+    // wonder whether this value came from a key or from a request body. Whether it is then
+    // *used* is `orch_create_config`'s decision: it keeps the existing stamp on a
+    // re-declaration and takes this one only when the index is being created.
+    schema.tenant = crate::http_server::tenant_of(authz);
     // Checked here rather than in the engine so that an over-long description is a 400 naming
     // the offender, instead of a write that half-succeeds across shards.
     schema

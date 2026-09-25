@@ -106,6 +106,15 @@ enabled = false
 # role = "writer"
 # label = "team-a"
 # allowed_indexes = ["docs", "wiki"]    # honored for every role; omit to allow all
+#
+# Per-index role subtraction: on a named index this key holds the role named here instead
+# of its own. The case it exists for is a writer that must be read-only on one sensitive
+# index while keeping write everywhere else — one key, not two, and no fourth role.
+#
+# Subtraction only. An override granting more than the key's own role is refused at
+# startup, as is one naming an index outside allowed_indexes (which would read as
+# protection and provide none). Enforced on REST and on /mcp alike.
+# index_overrides = { audit = "reader" }
 
 # What one caller may spend per minute. Both meters off by default.
 #

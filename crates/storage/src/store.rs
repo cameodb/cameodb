@@ -1516,6 +1516,12 @@ impl HybridStore {
             created_at: now,
             updated_at: now,
             description: None,
+            // Tantivy stores fields, not ownership, so there is nothing to recover here. Safe
+            // because this value is only ever used for its `fields`: `get_schema_cached` merges
+            // them onto the *stored* schema, which is where `tenant` — and `description`, and
+            // the timestamps — come from. A caller that used this whole value as a schema would
+            // silently unstamp the index.
+            tenant: None,
             routing_field_name: "id".to_string(),
             shadow_fields: HashSet::new(),
         }

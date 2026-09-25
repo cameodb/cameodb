@@ -59,6 +59,22 @@ pub trait McpAuthz: Send + Sync + 'static {
     /// Whether this caller holds `capability`.
     fn has(&self, capability: McpCapability) -> bool;
 
+    /// Whether this caller holds `capability` **on `index`**.
+    ///
+    /// The question every tool that names an index must ask. [`McpAuthz::has`] answers about
+    /// the caller's authority in general and cannot see a host that reduces it on one index —
+    /// so a key restricted to read-only on a single index would, asked that way, still be
+    /// allowed to write to it.
+    ///
+    /// Defaulted to the index-independent answer so a host with no such notion is unaffected
+    /// and need not implement it. A host that does subtract per index overrides this, and
+    /// because [`check_index`](crate::tools) is the one place every index-naming tool passes
+    /// through, overriding it is enough to cover all of them.
+    fn has_on(&self, capability: McpCapability, index: &str) -> bool {
+        let _ = index;
+        self.has(capability)
+    }
+
     /// The address the request arrived from, where the host knows one.
     ///
     /// Only useful when [`McpAuthz::key_id`] is `None`: it is what a host meters an

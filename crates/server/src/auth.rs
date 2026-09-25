@@ -282,6 +282,34 @@ impl fmt::Debug for KeyDigest {
     }
 }
 
+/// What one tenant's data may add up to on this node.
+///
+/// Both ceilings are `0` — unlimited — by default, for the reason every limit in this file is:
+/// *a patch release must not stop a working deployment over a value nobody wrote.* An operator
+/// opts into a ceiling; an upgrade changes nothing until they do.
+///
+/// The two bound different things and neither implies the other. `max_indexes` bounds the
+/// *count*, which is what costs resident memory — an open index is a writer arena and three OS
+/// threads whatever it holds. `max_bytes` bounds the *size*, which is what costs disk. A tenant
+/// with one enormous index and a tenant with a thousand empty ones are both problems, and they
+/// are different problems.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TenantQuota {
+    /// Most indexes this tenant may own. `0` (the default) is unlimited.
+    #[serde(default)]
+    pub max_indexes: usize,
+
+    /// Most bytes this tenant's indexes may occupy in total. `0` (the default) is unlimited.
+    ///
+    /// Measured from a cached reading rather than a fresh walk of every index directory, so a
+    /// tenant can overshoot by up to one refresh interval's worth of ingest. That is the honest
+    /// trade and it is stated in the docs: the alternative is a directory walk on the write
+    /// path, which is the cost `commit_index` had removed from it earlier in this cycle.
+    #[serde(default)]
+    pub max_bytes: u64,
+}
+
 /// `[security]` — authentication for the HTTP and MCP surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -306,6 +334,14 @@ pub struct SecurityConfig {
 
     /// `[[security.api_keys]]` entries.
     pub api_keys: Vec<ApiKeyConfig>,
+
+    /// `[security.tenants.<name>]` — what one tenant's indexes may add up to.
+    ///
+    /// Keyed by the name keys carry in [`ApiKeyConfig::tenant`]. A tenant with no entry here
+    /// has no ceiling, and so does every tenant on a node whose operator has not written one:
+    /// this bounds what a tenant accumulates only once someone decides what the bound is.
+    #[serde(default)]
+    pub tenants: std::collections::HashMap<String, TenantQuota>,
 
     /// The single key assembled from `--api-key-hash` and `--api-key-role`.
     ///
@@ -338,6 +374,7 @@ impl Default for SecurityConfig {
             enabled: false,
             implicit_index_creation: true,
             api_keys: Vec::new(),
+            tenants: std::collections::HashMap::new(),
             override_key: None,
             limits: crate::ratelimit::McpLimitsConfig::default(),
             audit: crate::audit::AuditConfig::default(),
@@ -371,6 +408,38 @@ pub struct ApiKeyConfig {
     /// Honored for every role, not just readers: an ingest key for one tenant has no
     /// business writing to another tenant's index.
     pub allowed_indexes: Option<Vec<String>>,
+
+    /// Per-index role **subtraction**: on a named index this key holds the listed role
+    /// instead of its own.
+    ///
+    /// The case this exists for is a `writer` that must be read-only on one sensitive index
+    /// while keeping write elsewhere. Written as a role rather than a capability list because
+    /// a key's authority has to stay legible at a glance, and because an override that can
+    /// only name an existing role cannot invent an authority the role vocabulary does not
+    /// have.
+    ///
+    /// **Subtraction only.** An override that grants more than the key's own role is refused
+    /// at load: this is a mechanism for reducing a key's reach on one index, never for
+    /// widening it, and a config that reads as if it widens one is a mistake worth stopping
+    /// at startup rather than honoring.
+    ///
+    /// ```toml
+    /// role = "writer"
+    /// index_overrides = { audit = "reader" }
+    /// ```
+    #[serde(default)]
+    pub index_overrides: Option<std::collections::HashMap<String, Role>>,
+
+    /// Which tenant's budget this key spends against.
+    ///
+    /// Quotas are per *tenant* rather than per key because a tenant is rarely one key: an
+    /// importer, a read-only dashboard key and a rotation spare are three credentials and one
+    /// customer. Metering them separately would let a tenant multiply their allowance by
+    /// issuing keys, and would reset their usage every time one was rotated.
+    ///
+    /// Omitted means this key belongs to no tenant and spends against no budget — which is the
+    /// default, and what every key on an upgraded node reads as.
+    pub tenant: Option<String>,
 }
 
 impl SecurityConfig {
@@ -448,6 +517,56 @@ impl SecurityConfig {
                 }
             };
 
+            // Per-index overrides, validated hard because a mistake here is a silent grant.
+            let mut index_overrides = std::collections::HashMap::new();
+            for (index, override_role) in entry.index_overrides.iter().flatten() {
+                let index = index.trim();
+                if index.is_empty() {
+                    bail!("{origin}: index_overrides has an entry with an empty index name");
+                }
+
+                // Subtraction only. An override that holds a capability the key's own role
+                // does not is an escalation, and the whole point of this mechanism is that it
+                // cannot be one. Refused at startup rather than honored or silently clamped:
+                // an operator who wrote it meant something, and neither of the other two
+                // outcomes tells them it was impossible.
+                let widened: Vec<&str> = override_role
+                    .capabilities()
+                    .iter()
+                    .filter(|capability| !role.has(**capability))
+                    .map(|capability| capability.as_str())
+                    .collect();
+                if !widened.is_empty() {
+                    bail!(
+                        "{origin}: index_overrides for '{index}' grants '{}', which holds {} \
+                         that the key's own role '{}' does not. An override may only subtract \
+                         from a key's authority, never add to it",
+                        override_role.as_str(),
+                        widened.join(" and "),
+                        role.as_str()
+                    );
+                }
+
+                // An override for an index the key cannot reach at all is dead config. It
+                // reads as protection and provides none, which is worse than absent.
+                if let Some(allowed) = &allowed_indexes
+                    && !allowed.iter().any(|permitted| permitted == index)
+                {
+                    bail!(
+                        "{origin}: index_overrides names '{index}', which is not in \
+                         allowed_indexes. The key cannot reach that index at all, so the \
+                         override protects nothing — add it to allowed_indexes, or remove it"
+                    );
+                }
+
+                if index_overrides
+                    .insert(index.to_string(), *override_role)
+                    .is_some()
+                {
+                    bail!("{origin}: index_overrides names '{index}' twice");
+                }
+            }
+
             // Two entries with one digest is a config that cannot mean what it says: the
             // same key would map to two roles, decided by ordering.
             if let Some(existing) = resolved.iter().find(|k| k.digest == digest) {
@@ -467,11 +586,22 @@ impl SecurityConfig {
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("key-{}", digest.key_id()));
 
+            let tenant = match entry.tenant.as_deref().map(str::trim) {
+                None => None,
+                Some("") => bail!(
+                    "{origin}: tenant is empty. Name the tenant, or remove the field so this \
+                     key spends against no budget"
+                ),
+                Some(tenant) => Some(tenant.to_string()),
+            };
+
             resolved.push(Arc::new(KeyEntry {
                 digest,
                 role,
                 label,
                 allowed_indexes,
+                index_overrides,
+                tenant,
             }));
         }
 
@@ -574,6 +704,11 @@ pub struct KeyEntry {
     role: Role,
     label: String,
     allowed_indexes: Option<Vec<String>>,
+    /// Per-index role subtraction; see [`ApiKeyConfig::index_overrides`]. Empty for the
+    /// overwhelming majority of keys, so the lookup below is skipped entirely for them.
+    index_overrides: std::collections::HashMap<String, Role>,
+    /// The tenant whose quota this key spends; see [`ApiKeyConfig::tenant`].
+    tenant: Option<String>,
 }
 
 impl KeyEntry {
@@ -591,6 +726,36 @@ impl KeyEntry {
 
     pub fn has(&self, capability: Capability) -> bool {
         self.role.has(capability)
+    }
+
+    /// Whether this key holds `capability` **on `index`**.
+    ///
+    /// This is the question every index-naming route must ask, and [`KeyEntry::has`] is the
+    /// question everything else asks. Asking `has` where an index is in play is the bug this
+    /// method exists to prevent: it answers about the key's own role and cannot see a
+    /// subtraction, so a `writer` restricted to read-only on one index would still write to it.
+    ///
+    /// Scope is a separate question — [`KeyEntry::allows_index`] — and is checked alongside
+    /// this one rather than folded into it, so the two refusals stay distinguishable to the
+    /// caller and in the log.
+    pub fn has_on(&self, capability: Capability, index: &str) -> bool {
+        match self.index_overrides.get(index) {
+            Some(role) => role.has(capability),
+            None => self.role.has(capability),
+        }
+    }
+
+    /// The tenant this key spends against, if it was given one.
+    pub fn tenant(&self) -> Option<&str> {
+        self.tenant.as_deref()
+    }
+
+    /// The role this key holds on `index`, which is its own unless an override subtracts.
+    pub fn role_on(&self, index: &str) -> Role {
+        self.index_overrides
+            .get(index)
+            .copied()
+            .unwrap_or(self.role)
     }
 
     /// True when this key is restricted to a named set of indexes.
@@ -784,6 +949,11 @@ is how a working node stops working.";
             role,
             label: label.clone().unwrap_or_else(|| "keygen".to_string()),
             allowed_indexes: allowed_indexes.clone(),
+            // `keygen` mints a key, it does not configure one. Overrides and tenancy are
+            // written by hand into the stanza afterwards, so the round-trip check below proves
+            // the key, not a policy it does not yet carry.
+            index_overrides: std::collections::HashMap::new(),
+            tenant: None,
         })],
     };
     if ring.authenticate(key.expose()).is_none() {
@@ -1185,5 +1355,79 @@ mod tests {
         let ring = config.load_keyring().unwrap();
         assert_eq!(ring.entries().len(), 1);
         assert_eq!(ring.entries()[0].role(), Role::Admin);
+    }
+
+    /// A key carries its tenant through to the entry that quotas are charged against.
+    ///
+    /// Keys are the only place a tenant is named, so a tenant that does not survive
+    /// `load_keyring` is a quota charged to nobody — which reads as "unlimited" rather than as
+    /// a misconfiguration, and is the failure mode worth a test of its own.
+    #[test]
+    fn a_key_carries_its_tenant_and_a_blank_one_is_refused() {
+        let with_tenant = ApiKeyConfig {
+            key_hash: Some(KeyDigest::of_token("t").to_config_value()),
+            role: Some(Role::Writer),
+            label: Some("acme-writer".to_string()),
+            tenant: Some("  acme  ".to_string()),
+            ..blank_key()
+        };
+        let ring = SecurityConfig {
+            enabled: true,
+            api_keys: vec![with_tenant],
+            ..Default::default()
+        }
+        .load_keyring()
+        .expect("a tenanted key loads");
+        assert_eq!(
+            ring.entries()[0].tenant(),
+            Some("acme"),
+            "the tenant is trimmed, so trailing whitespace in a config cannot split one \
+             tenant's budget in two"
+        );
+
+        // A key with no tenant spends against no budget, which is every key on an upgraded node.
+        let untenanted = ApiKeyConfig {
+            key_hash: Some(KeyDigest::of_token("u").to_config_value()),
+            role: Some(Role::Writer),
+            ..blank_key()
+        };
+        let ring = SecurityConfig {
+            enabled: true,
+            api_keys: vec![untenanted],
+            ..Default::default()
+        }
+        .load_keyring()
+        .expect("an untenanted key loads");
+        assert_eq!(ring.entries()[0].tenant(), None);
+
+        // An empty one is neither, so it is refused rather than read as either.
+        let blank = ApiKeyConfig {
+            key_hash: Some(KeyDigest::of_token("b").to_config_value()),
+            role: Some(Role::Writer),
+            tenant: Some("   ".to_string()),
+            ..blank_key()
+        };
+        let err = SecurityConfig {
+            enabled: true,
+            api_keys: vec![blank],
+            ..Default::default()
+        }
+        .load_keyring()
+        .expect_err("a blank tenant must not load")
+        .to_string();
+        assert!(err.contains("tenant"), "{err}");
+    }
+
+    /// Every optional field unset, so a test names only what it is about.
+    fn blank_key() -> ApiKeyConfig {
+        ApiKeyConfig {
+            key_hash: None,
+            key_hash_file: None,
+            role: None,
+            label: None,
+            allowed_indexes: None,
+            index_overrides: None,
+            tenant: None,
+        }
     }
 }

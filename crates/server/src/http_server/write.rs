@@ -14,8 +14,8 @@ use serde_json::Value as JsonValue;
 use tracing::{debug, info, warn};
 
 use crate::cluster_coordinator::OperationType;
-use crate::http_server::caller_of;
 use crate::http_server::error::AppError;
+use crate::http_server::{caller_of, tenant_of};
 use crate::node::{ClientOp, DeletePayload, DocPayload};
 use crate::ratelimit::{Caller, Verdict};
 use crate::state::AppState;
@@ -101,11 +101,13 @@ pub(super) async fn write_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
     caller: Option<Extension<Caller>>,
+    authz: Option<Extension<crate::authz::Authz>>,
     Json(payload): Json<DocPayload>,
 ) -> Result<Json<JsonValue>, AppError> {
     debug!("Write request - index: {}, doc_id: {}", index, payload.id);
 
     check_write_rate(&state, &caller_of(caller), 1)?;
+    let tenant = tenant_of(authz);
 
     let DocPayload {
         id,
@@ -126,6 +128,8 @@ pub(super) async fn write_handler(
         forwarded: false,
         // And decides its own schema: nothing was settled upstream to carry.
         schema_body: None,
+        // Read only if this write creates the index; an existing stamp is never rewritten.
+        tenant,
     };
 
     let result = state
@@ -246,6 +250,7 @@ pub(super) async fn bulk_write_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
     caller: Option<Extension<Caller>>,
+    authz: Option<Extension<crate::authz::Authz>>,
     Json(docs): Json<Vec<DocPayload>>,
 ) -> Result<Json<JsonValue>, AppError> {
     info!(
@@ -255,6 +260,7 @@ pub(super) async fn bulk_write_handler(
     );
 
     check_write_rate(&state, &caller_of(caller), docs.len())?;
+    let tenant = tenant_of(authz);
 
     // Derive a routing hint from the first document to avoid a cluster-wide broadcast. The
     // schema is not resolved yet at this layer, so this climbs the same ladder the orchestrator
@@ -267,6 +273,7 @@ pub(super) async fn bulk_write_handler(
         // A request off the wire is the first hop, and decides its own schema.
         forwarded: false,
         schema_body: None,
+        tenant,
     };
 
     let result = state
@@ -336,9 +343,12 @@ pub(super) async fn write_stream_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
     caller: Option<Extension<Caller>>,
+    authz: Option<Extension<crate::authz::Authz>>,
     body: Body,
 ) -> Result<Response, AppError> {
     info!("Write stream request - index: {}", index);
+
+    let tenant = tenant_of(authz);
 
     // Charged a micro-batch at a time, because how many documents this request carries is not
     // knowable until it has been read — the one route where the allowance cannot be taken up
@@ -467,7 +477,8 @@ pub(super) async fn write_stream_handler(
                     break 'body;
                 }
                 let flushed = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
-                let (batch_written, batch_errors) = flush_lines(&state, &index, flushed).await;
+                let (batch_written, batch_errors) =
+                    flush_lines(&state, &index, flushed, tenant.as_deref()).await;
                 batches += 1;
                 written += batch_written;
                 errors.extend(batch_errors);
@@ -496,7 +507,8 @@ pub(super) async fn write_stream_handler(
         match state.rate_limiter.check_write(&caller, batch.len() as u32) {
             Verdict::Deny { retry_after_secs } => rate_limited = Some(retry_after_secs),
             Verdict::Allow => {
-                let (batch_written, batch_errors) = flush_lines(&state, &index, batch).await;
+                let (batch_written, batch_errors) =
+                    flush_lines(&state, &index, batch, tenant.as_deref()).await;
                 batches += 1;
                 written += batch_written;
                 errors.extend(batch_errors);
@@ -656,11 +668,12 @@ async fn flush_lines(
     state: &AppState,
     index: &str,
     batch: Vec<(usize, DocPayload)>,
+    tenant: Option<&str>,
 ) -> (u64, Vec<String>) {
     let lines: Vec<usize> = batch.iter().map(|(line, _)| *line).collect();
     let docs: Vec<DocPayload> = batch.into_iter().map(|(_, doc)| doc).collect();
 
-    match flush_write_batch(state, index, docs).await {
+    match flush_write_batch(state, index, docs, tenant).await {
         Ok(answer) => {
             let written = answer
                 .get("items_written")
@@ -714,6 +727,7 @@ pub(super) async fn flush_write_batch(
     state: &AppState,
     index: &str,
     docs: Vec<DocPayload>,
+    tenant: Option<&str>,
 ) -> Result<JsonValue, crate::node::OrchestratorError> {
     let routing_hint = derive_routing_hint(&docs);
     let client_op = ClientOp::BulkWrite {
@@ -721,6 +735,7 @@ pub(super) async fn flush_write_batch(
         docs,
         forwarded: false,
         schema_body: None,
+        tenant: tenant.map(str::to_string),
     };
     state
         .router

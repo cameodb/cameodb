@@ -29,3 +29,14 @@ pub(crate) use routes::{RouterConfig, create_router};
 fn caller_of(caller: Option<axum::Extension<Caller>>) -> Caller {
     caller.map_or(Caller::Unattributed, |axum::Extension(caller)| caller)
 }
+
+/// Whose budget this request spends, if the caller's key names a tenant.
+///
+/// Read from the same [`Authz`](crate::authz::Authz) the gate already attaches, rather than a
+/// second extension, so there is one answer to "who is this" and the quota cannot end up
+/// disagreeing with the audit trail about it. `None` — an anonymous caller, a node with
+/// authentication off, or a key with no tenant — spends against no budget and is never refused
+/// by one.
+fn tenant_of(authz: Option<axum::Extension<crate::authz::Authz>>) -> Option<String> {
+    authz.and_then(|axum::Extension(authz)| authz.tenant().map(str::to_string))
+}

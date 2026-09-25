@@ -948,6 +948,19 @@ pub struct IndexSchema {
     /// shape of the data, not which dataset it is. Absent unless someone wrote one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Which tenant owns this index, for quota accounting.
+    ///
+    /// Stamped from the creating key's `tenant` when the index is created, and never rewritten
+    /// afterwards: ownership is a fact about who made the index, not about who last wrote to
+    /// it, and a field that moved with the last writer would let a tenant shed their own usage
+    /// by having someone else write once.
+    ///
+    /// `None` on every index created before this field existed, and on every index created by a
+    /// key with no tenant. Those count against nobody's budget, which is what makes this
+    /// upgrade-safe: a node that gains the field does not suddenly find its existing indexes
+    /// over a ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
     /// Field name to use for routing/sharding (default: "id")
     #[serde(default = "default_routing_field")]
     pub routing_field_name: String,
@@ -967,6 +980,7 @@ impl Default for IndexSchema {
             created_at: now,
             updated_at: now,
             description: None,
+            tenant: None,
             routing_field_name: "id".to_string(),
             shadow_fields: HashSet::new(),
         }
