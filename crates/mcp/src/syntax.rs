@@ -117,9 +117,11 @@ pub const OPERATORS: &[Operator] = &[
         types: &[TYPE_TEXT, TYPE_STRING],
         caveat: Some(
             "Runs as a lexicographic range, so a short prefix scans a wide slice of the term \
-             dictionary. On a stemmed field the prefix is stemmed too, which can move where it \
-             lands. A value the analyzer cannot reduce to one term is matched as that term \
-             exactly instead, and reported.",
+             dictionary. A prefix shorter than the node's `min_prefix_length` (2 characters by \
+             default) is not expanded: it is matched as that term exactly, and reported. On a \
+             stemmed field the prefix is stemmed too, which can move where it lands. A value the \
+             analyzer cannot reduce to one term is matched as that term exactly instead, and \
+             reported.",
         ),
     },
     Operator {
@@ -260,8 +262,15 @@ pub const NOT_SUPPORTED: &[NotSupported] = &[
     },
     NotSupported {
         syntax: "pre*",
-        detail: "A prefix needs a field name; without one the `*` is dropped and `pre` is matched \
-                 as a whole term. Name the field, or OR one clause per field.",
+        detail: "A prefix needs a field name unless the node enables `expand_unqualified_prefix`; \
+                 otherwise the `*` is dropped, `pre` is matched as a whole term, and reported. \
+                 Name the field, or OR one clause per field.",
+    },
+    NotSupported {
+        syntax: "field:*suffix",
+        detail: "Leading and inner wildcards (`*fix`, `pre*fix`) are not supported. The `*` is \
+                 dropped, the rest is matched as written, and reported. Only a trailing `*` on \
+                 a field-qualified term is a prefix.",
     },
     NotSupported {
         syntax: "field.subfield:value",
@@ -759,7 +768,7 @@ mod tests {
     /// dropped clause, so the reference has to say so rather than stay silent.
     #[test]
     fn the_known_broken_forms_are_listed_as_unsupported() {
-        for syntax in ["field:*", "pre*", "field.subfield:value"] {
+        for syntax in ["field:*", "pre*", "field:*suffix", "field.subfield:value"] {
             assert!(
                 NOT_SUPPORTED.iter().any(|form| form.syntax == syntax),
                 "{syntax} must be listed as unsupported"

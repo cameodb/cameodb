@@ -24,6 +24,7 @@ fn test_storage_engine_basics() {
         // Other Configuration
         default_batch_size: 1000, // 1000 operations default
         wal_sync: true,
+        query: Default::default(),
     };
 
     // Test store creation (single shard for test)
@@ -125,6 +126,7 @@ fn test_storage_configuration() {
         // Other Configuration
         default_batch_size: 500,
         wal_sync: false,
+        query: Default::default(),
     };
 
     // Test store creation with custom config (single shard for test)

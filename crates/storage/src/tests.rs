@@ -640,6 +640,7 @@ mod tests {
             merge_num_threads: 1,
             default_batch_size: 100_000,
             wal_sync: true,
+            query: Default::default(),
         }
     }
 
@@ -1016,6 +1017,7 @@ mod tests {
             merge_num_threads: 1,
             default_batch_size: 100_000,
             wal_sync: true,
+            query: Default::default(),
         };
 
         let store = HybridStore::new(config, 1).unwrap();
@@ -1109,6 +1111,7 @@ mod tests {
             merge_num_threads: 1,
             default_batch_size: 100_000,
             wal_sync: true,
+            query: Default::default(),
         };
 
         let store = HybridStore::new(config, 1).unwrap();
@@ -1213,6 +1216,7 @@ mod tests {
             merge_num_threads: 1,
             default_batch_size: 100,
             wal_sync: true,
+            query: Default::default(),
         };
         let store = HybridStore::new(config, 1).unwrap();
 
@@ -1275,6 +1279,7 @@ mod tests {
             // Other Configuration
             default_batch_size: 1000,
             wal_sync: true,
+            query: Default::default(),
         };
 
         let store = HybridStore::new(config, 1).unwrap();

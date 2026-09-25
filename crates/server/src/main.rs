@@ -394,6 +394,7 @@ async fn main() -> Result<()> {
         clustered: cameodb_config.network.cluster.enabled,
         implicit_index_creation: cameodb_config.security.implicit_index_creation,
         tenant_quotas: cameodb_config.security.tenants.clone(),
+        query_policy: cameodb_config.security.limits.query_policy(),
     };
 
     // Create the NodeOrchestrator actor

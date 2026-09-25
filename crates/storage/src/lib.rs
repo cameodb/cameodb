@@ -114,6 +114,34 @@ pub struct StorageConfig {
     pub default_batch_size: usize,
     /// Whether to call fsync() on every redb commit.
     pub wal_sync: bool,
+
+    /// How much one query may ask of the index: the node's query-cost policy, grouped so a new
+    /// bound is one field here rather than one more line in every place a config is built.
+    #[serde(default)]
+    pub query: QueryPolicy,
+}
+
+/// What a query may cost, decided by the node and applied where the query is rewritten.
+///
+/// The library default imposes nothing — every bound `0`, every expansion off — because policy is
+/// the node's to set; `[security.limits]` supplies the defaults a deployment actually runs with.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueryPolicy {
+    /// Shortest prefix a `field:pre*` clause is expanded for, in characters; `0` expands any.
+    ///
+    /// A prefix is rewritten into a range over the term dictionary, and the range's cost is the
+    /// number of distinct terms it covers, with no ceiling: one character on a field of hashes
+    /// covers a sixteenth of every term the field holds. A shorter prefix is not expanded — it
+    /// matches the term as written, with a note saying so.
+    pub min_prefix_length: usize,
+
+    /// Whether a prefix naming no field — a bare `pre*` — is expanded across the default fields.
+    ///
+    /// Off, tantivy drops the `*` and matches `pre` as a term, and the caller is told. On, it
+    /// becomes one prefix range per text default field, OR'd — the same fields an unqualified term
+    /// searches, so its cost is a prefix's cost times their number.
+    pub expand_unqualified_prefix: bool,
 }
 
 /// The results of a search, and the clauses that did not survive parsing.
@@ -222,6 +250,7 @@ impl Default for StorageConfig {
             // Other Configuration
             default_batch_size: 1000,
             wal_sync: true,
+            query: QueryPolicy::default(),
         }
     }
 }

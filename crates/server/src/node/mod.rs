@@ -329,6 +329,13 @@ pub struct NodeConfig {
     /// never sees the file-level config. Empty by default, which is no ceiling for anyone.
     #[serde(default)]
     pub tenant_quotas: std::collections::HashMap<String, crate::auth::TenantQuota>,
+
+    /// What one query may cost (`[security.limits]`: `min_prefix_length`,
+    /// `expand_unqualified_prefix`).
+    ///
+    /// Carried to every shard's `StorageConfig`, since the rewrites that apply it run in storage.
+    #[serde(default = "crate::ratelimit::default_query_policy")]
+    pub query_policy: storage::QueryPolicy,
 }
 
 impl Default for NodeConfig {
@@ -358,6 +365,7 @@ impl Default for NodeConfig {
             clustered: false,
             implicit_index_creation: true,
             tenant_quotas: std::collections::HashMap::new(),
+            query_policy: crate::ratelimit::default_query_policy(),
         }
     }
 }

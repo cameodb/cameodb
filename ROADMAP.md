@@ -52,7 +52,7 @@ on one.
 | 14 — Security hardening (posture items C3–C8) | ✅ Done | C3–C8 all closed; C8 by M3 on 2026-09-20 |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
-| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed but for O4; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; the M8 decision is owed. M6 is measurement only; its first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), and the arms themselves are still owed |
+| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed but for O4; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8's prefix floor has shipped and its clause-cap decision is owed. M6 is measurement only; its first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), and the arms themselves are still owed |
 
 ## Reconciliation, 2026-08-26
 
@@ -4802,7 +4802,8 @@ read the code before scheduling the work.
 
 ### M8 — Re-decide the query complexity caps
 
-📋 **A decision, not necessarily code — and its premise is now true.** [C2](#c2--query-complexity-caps)
+◐ **In progress — prefix floor shipped 2026-09-25; clause cap still to decide.** Originally
+📋 **a decision, not necessarily code — and its premise is now true.** [C2](#c2--query-complexity-caps)
 was deferred on the reasoning that *rate limiting already bounds what a key costs the node per
 unit time*. That reasoning is sound, and the premise was false on the write surface until
 [M3](#m3--meter-the-write-surface-and-give-anonymous-callers-their-own-bucket) closed it on
@@ -4829,6 +4830,42 @@ real execution rather than overhead. Schema width is the tenant's choice and the
 node's, which is the shape of problem a complexity cap exists for. Re-reading C2 now has this to
 read against, and a cap on the *default-field count a bare term may expand to* is a candidate the
 original entry did not consider, alongside the ones it did.
+
+**2026-09-25 — the prefix half is taken up; the clause cap is still to decide.** Reading C2
+against the code found what M0-j had not measured: tantivy's only built-in expansion cap is its
+*phrase* prefix's `max_expansions = 50`, applied per segment (verified — one segment returned 50,
+several returned all 100). An unquoted `field:pre*` is not a prefix to tantivy at all: the `*`
+is dropped and `pre` matched as a term. CameoDB's rewrite into a range is what makes it a
+prefix — and a range has no limit (`range_query.rs:116` passes `None`). Measured on a 10M-document
+shard, a one-character prefix covered 625k terms on a hash field and cost **164.7 ms**; two cost
+10.6 ms, three 0.7 ms; it scales with the shard (the 1M run was 8–13× smaller).
+
+Shipped: **`[security.limits] min_prefix_length`, default 2** (`0` expands any). A shorter prefix
+is matched as the literal term and noted, not refused — the treatment an unrewritable prefix
+already had, so one short clause does not cost the caller the rest of the query. Two was chosen
+over three because it removes the row that grows unbounded while keeping the two-character
+prefixes people actually type. And the silent cases were closed while in the function: a prefix
+with no field, a leading or inner wildcard, and a prefix inside a field group each matched a
+literal term with no word to the caller, and each is now reported. Detected from tantivy's own
+grammar parse rather than a text scan, and only where the field's analyzer really drops the `*`
+— a raw field keeps it in the term, so `id:a*b` is an exact match and says nothing.
+
+Then, the same day: **`expand_unqualified_prefix`** (off by default) turns a bare `pre*` from a
+reported literal into one prefix range per text default field. Off because its cost is one range
+per default field, and nothing yet bounds how many default fields there are — which is the next
+item. The rewrite is placed by a text scan (it has to know *where* to write) but licensed by the
+grammar: it runs only when the scan and tantivy's parse agree on which bare prefixes the query
+holds, and declines to a note otherwise. The query settings also moved into one
+`storage::QueryPolicy` on `StorageConfig`, so the next bound is a field there rather than
+another edit to every place a config is built.
+
+**Next: B — cap how many default fields an unqualified term searches**, with a generous default.
+It bounds M0-j's multiplier directly, and it is what would let `expand_unqualified_prefix` default
+on.
+
+Still open here: a cap on clauses after expansion (terms × default fields), which is what bounds
+M0-j's multiplier and a long query together; a cap on the default fields themselves; and
+cancelling a search already running on a read thread, which is 0.4.0 work.
 
 **Deliberately not in 0.3.5:** [D1–D3](#d-phase-15--high-availability-reindex-replication--migration--planned)
 (reindex, replication, migration), [A1](#a1--mcp-streaming) and [A5](#a5--semantic-routing),

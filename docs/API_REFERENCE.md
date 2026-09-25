@@ -264,6 +264,14 @@ curl -s -X POST http://localhost:9480/api/books/search \
 > where the keyword was meant, and an inline `return` or `sort` naming a field the index does not
 > have.
 >
+> Wildcards are reported too, since tantivy drops a `*` it cannot use without an error and
+> matches what is left: a prefix shorter than `[security.limits] min_prefix_length` (default 2),
+> a prefix that names no field (`pre*`, unless `expand_unqualified_prefix` is on, in which case it
+> searches the default fields), a leading or inner wildcard (`*fix`, `pre*fix`), and a
+> prefix inside a field group (`title:(pre*)`). Each is matched as the literal term, and the note
+> names the form that works — `title:pre*`. A quoted phrase prefix (`"big bad wo"*`) is tantivy's
+> own and is not reported.
+>
 > **Keyword case:** `AND`, `OR`, `NOT`, `TO` and `IN` are keywords in uppercase only, and lowercase
 > is query text. `to` and `in` break the clause around them, so they surface as dropped clauses
 > above. `and`, `or` and `not` do not: they are searched for as ordinary words, which widens a query

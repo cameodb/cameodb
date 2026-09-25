@@ -443,6 +443,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[security.limits] min_prefix_length` puts a floor under prefix queries, default 2.**
+  `field:pre*` runs as a range over the term dictionary, and a range has no ceiling: its cost is
+  the number of distinct terms it covers. Measured on a 10M-document shard, one character on a
+  hash field covered 625k terms and held a read thread for 165 ms; two cost 11 ms, three under
+  1 ms. A prefix shorter than the floor is no longer expanded — it matches the literal term and
+  is reported in `_discarded_clauses`, so the rest of the query still runs (the MCP search
+  tools refuse it, as they refuse every reported clause). `0` expands every prefix. **This
+  changes results** for one-character prefixes, which previously expanded.
+
+- **Every wildcard tantivy silently ignores is now reported.** The grammar drops a `*` it
+  cannot use without raising an error and matches what is left, so these answered a wildcard
+  search the caller never got: a prefix naming no field (`pre*` matched the term `pre`), a
+  leading or inner wildcard (`*fix`, `pre*fix`), and a prefix inside a field group
+  (`title:(pre*)`). Each now carries a note in `_discarded_clauses` naming the form that works.
+  A quoted phrase prefix (`"big bad wo"*`) and a `*` a raw field keeps inside its term are
+  unaffected.
+
+- **`[security.limits] expand_unqualified_prefix` lets a bare `pre*` search the default
+  fields.** Off by default. On, `qui*` is rewritten into one prefix range per text default field,
+  OR'd, with `min_prefix_length` applied to each — the fields an unqualified term already
+  searches. A prefix inside a field group stays that field's. The rewrite runs only when the
+  node's reading of the query agrees with tantivy's own parse; otherwise it declines and reports
+  the prefix, rather than risk rewriting it into something that matches differently.
+
 - **Tenant quotas: a key may carry a `tenant`, and `[security.tenants.<name>]` bounds what that
   tenant's indexes add up to.** The index a tenanted key creates is stamped with its tenant at
   creation — from the key, never the request body, and never moved afterwards, so re-declaring

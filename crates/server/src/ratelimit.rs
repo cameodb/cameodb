@@ -96,6 +96,28 @@ pub struct McpLimitsConfig {
     #[serde(default = "default_max_federated_indexes")]
     pub max_federated_indexes: usize,
 
+    /// Shortest prefix, in characters, that `field:pre*` is expanded for. `0` expands any.
+    ///
+    /// A prefix becomes a range over the term dictionary, and a range walks every term it covers
+    /// with no ceiling. Measured on 10M documents per shard (ROADMAP M8): on a field of hashes
+    /// one character covered 625k terms and cost 165 ms of a read thread per shard, two cost
+    /// 11 ms, three under 1 ms — each character divides the cost by the size of the field's
+    /// alphabet, and nothing else bounds it. A shorter prefix is not refused; it matches the term
+    /// as written and the response says so. Unlike the two ceilings above, `0` is honoured as
+    /// unlimited: nothing about "expand every prefix" is incoherent, it is only expensive.
+    #[serde(default = "default_min_prefix_length")]
+    pub min_prefix_length: usize,
+
+    /// Whether a prefix naming no field — a bare `pre*` — searches the default fields.
+    ///
+    /// Off by default. Tantivy's grammar has no unqualified prefix: it drops the `*` and matches
+    /// `pre` as a term, which the response reports. On, the node rewrites it into one prefix range
+    /// per text field that an unqualified term would search, OR'd together, with
+    /// `min_prefix_length` applied to each. The cost is one prefix per field, so on a wide index
+    /// it is that many ranges — off until the cap on default fields bounds how many that can be.
+    #[serde(default)]
+    pub expand_unqualified_prefix: bool,
+
     /// Moved to `[limits] max_response_bytes`. Read from here until 0.4.0.
     ///
     /// Kept as a field rather than left to fall through as an unknown key, because this
@@ -112,6 +134,23 @@ pub struct McpLimitsConfig {
 /// lookup, a merge entry and a serialized document.
 fn default_max_search_limit() -> usize {
     cameodb_mcp::DEFAULT_MAX_SEARCH_LIMIT
+}
+
+/// The prefix floor when an operator sets none.
+///
+/// Two, because one character is where the cost stops being a function of the query and starts
+/// being a function of the field: 165 ms per shard against 11 ms for two on the measured hash
+/// field, and it grows with the shard. Two still serves the short prefixes people type — `en*`,
+/// an id's first pair — which three would take away.
+pub const DEFAULT_MIN_PREFIX_LENGTH: usize = 2;
+
+fn default_min_prefix_length() -> usize {
+    DEFAULT_MIN_PREFIX_LENGTH
+}
+
+/// The query policy a node runs with when `[security.limits]` says nothing.
+pub(crate) fn default_query_policy() -> storage::QueryPolicy {
+    McpLimitsConfig::default().query_policy()
 }
 
 /// The fan-out bound when an operator sets none.
@@ -135,12 +174,22 @@ impl Default for McpLimitsConfig {
             write_burst: 0,
             max_search_limit: default_max_search_limit(),
             max_federated_indexes: default_max_federated_indexes(),
+            min_prefix_length: default_min_prefix_length(),
+            expand_unqualified_prefix: false,
             max_response_bytes: None,
         }
     }
 }
 
 impl McpLimitsConfig {
+    /// The part of this section that storage applies to every query.
+    pub fn query_policy(&self) -> storage::QueryPolicy {
+        storage::QueryPolicy {
+            min_prefix_length: self.min_prefix_length,
+            expand_unqualified_prefix: self.expand_unqualified_prefix,
+        }
+    }
+
     /// Whether tool calls and searches are metered.
     pub fn enabled(&self) -> bool {
         self.tool_calls_per_minute > 0

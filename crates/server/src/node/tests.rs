@@ -392,6 +392,7 @@ fn writer_test_config(path: std::path::PathBuf) -> StorageConfig {
         merge_num_threads: 1,
         default_batch_size: 1000,
         wal_sync: true,
+        query: Default::default(),
     }
 }
 
