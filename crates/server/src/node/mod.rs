@@ -76,6 +76,7 @@ use storage::{IndexSchema, StoreError, TantivyFieldType, WalOp};
 
 mod admission;
 mod orchestrator;
+mod quota;
 mod router;
 mod routing;
 mod search;
@@ -89,6 +90,7 @@ mod shard;
 // submodule items crate-wide, of which 15 are ever used outside `node/` (O1).
 pub(in crate::node) use admission::*;
 pub(in crate::node) use orchestrator::*;
+pub(in crate::node) use quota::*;
 pub(in crate::node) use routing::*;
 pub(in crate::node) use search::*;
 pub(in crate::node) use shard::*;
@@ -98,6 +100,7 @@ pub(in crate::node) use shard::*;
 // `crate::node::*` unless it is declared in this file.
 pub(crate) use admission::{OpClass, QueueLoad, WorkerPoolReport};
 pub(crate) use orchestrator::NodeOrchestrator;
+pub(crate) use quota::TenantQuotas;
 pub(crate) use router::{RouterActor, ShardAffineConfig, StreamingSearchConfig};
 pub(crate) use routing::routing_key_without_schema;
 pub(crate) use search::{
@@ -318,6 +321,14 @@ pub struct NodeConfig {
     /// that types an index from its first documents is refused and the index has to be
     /// created explicitly.
     pub implicit_index_creation: bool,
+
+    /// What each tenant's indexes may add up to (`security.tenants`).
+    ///
+    /// Carried here for `implicit_index_creation`'s reason: both ceilings are decided inside the
+    /// orchestrator — the index count at the mint, bytes on the write — and the orchestrator
+    /// never sees the file-level config. Empty by default, which is no ceiling for anyone.
+    #[serde(default)]
+    pub tenant_quotas: std::collections::HashMap<String, crate::auth::TenantQuota>,
 }
 
 impl Default for NodeConfig {
@@ -346,6 +357,7 @@ impl Default for NodeConfig {
             // Standalone by default, matching `network.cluster.enabled`.
             clustered: false,
             implicit_index_creation: true,
+            tenant_quotas: std::collections::HashMap::new(),
         }
     }
 }
@@ -502,6 +514,16 @@ pub enum OrchestratorError {
     #[error("no schema for '{index}' on this node; resend the write carrying the schema body")]
     SchemaBodyRequired { index: String },
 
+    /// A tenant's quota refuses what this request would add — another index past
+    /// `max_indexes`, or more data once their indexes occupy `max_bytes`.
+    ///
+    /// Its own verdict and a `403`, not a `400`: nothing about the request is malformed, and the
+    /// same request succeeds once the tenant frees room or the operator raises the ceiling. Not a
+    /// `503` either, because retrying unchanged will not help — that is what separates it from
+    /// every "not now" above.
+    #[error("quota exceeded for tenant '{tenant}': {detail}")]
+    QuotaExceeded { tenant: String, detail: String },
+
     /// The node that owns this operation could not be reached.
     ///
     /// Not a fault here and not the caller's mistake: a peer is down or has not finished
@@ -547,6 +569,9 @@ pub enum RemoteVerdict {
     /// [`OrchestratorError::SchemaBodyRequired`]. Retryable, and only by a caller that resends
     /// with the body attached, which is why it is not `Unavailable`.
     SchemaRequired,
+    /// A tenant quota refuses the request — see [`OrchestratorError::QuotaExceeded`]. Not the
+    /// caller's mistake and not retryable as sent; room has to be made first.
+    QuotaExceeded,
 }
 
 impl RemoteVerdict {
@@ -558,6 +583,7 @@ impl RemoteVerdict {
             RemoteVerdict::Unavailable => "unavailable",
             RemoteVerdict::ServerFault => "server-fault",
             RemoteVerdict::SchemaRequired => "schema-required",
+            RemoteVerdict::QuotaExceeded => "quota-exceeded",
         }
     }
 
@@ -568,6 +594,7 @@ impl RemoteVerdict {
             "unavailable" => Some(RemoteVerdict::Unavailable),
             "server-fault" => Some(RemoteVerdict::ServerFault),
             "schema-required" => Some(RemoteVerdict::SchemaRequired),
+            "quota-exceeded" => Some(RemoteVerdict::QuotaExceeded),
             _ => None,
         }
     }
@@ -597,6 +624,8 @@ impl OrchestratorError {
             | Self::Storage(StoreError::WriterPanicked(_)) => RemoteVerdict::Unavailable,
 
             Self::Validation(_) => RemoteVerdict::BadRequest,
+
+            Self::QuotaExceeded { .. } => RemoteVerdict::QuotaExceeded,
 
             // Its own verdict because the forwarding node has to act on it and must not confuse
             // it with any other "not now": the retry that answers it carries something extra,
@@ -905,8 +934,15 @@ impl From<OrchestratorError> for RemoteError {
             } => RemoteError::Io(format!(
                 "overloaded: a {predicted_wait_ms}ms backlog against a {budget_ms}ms request"
             )),
+            // Decided by the orchestrator, never a microshard, so this path does not produce it.
+            // If it ever crosses here, a refusal is the kind that keeps it out of the 500s.
+            err @ OrchestratorError::QuotaExceeded { .. } => {
+                RemoteError::InvalidInput(err.to_string())
+            }
             OrchestratorError::Remote { verdict, message } => match verdict {
-                RemoteVerdict::BadRequest => RemoteError::InvalidInput(message),
+                RemoteVerdict::BadRequest | RemoteVerdict::QuotaExceeded => {
+                    RemoteError::InvalidInput(message)
+                }
                 RemoteVerdict::NotFound => RemoteError::NotFound(message),
                 RemoteVerdict::Unavailable
                 | RemoteVerdict::ServerFault

@@ -18,7 +18,7 @@ refused. Refusals are:
 | Status | Meaning |
 |--------|---------|
 | `401 Unauthorized` | No key, or a key this node does not know. Carries `WWW-Authenticate: Bearer realm="cameodb"` |
-| `403 Forbidden` | Authenticated, but the role or `allowed_indexes` do not cover this request |
+| `403 Forbidden` | Authenticated, but the role, `allowed_indexes` or `index_overrides` do not cover this request — or the request would take the index owner's tenant past a quota ([Tenant quotas](CONFIGURATION.md#tenant-quotas-securitytenants)) |
 
 Both return `{"error": …, "message": …}`. An unknown path answers `401` without a key and
 `404` with one, so path probing tells an unauthenticated caller nothing.

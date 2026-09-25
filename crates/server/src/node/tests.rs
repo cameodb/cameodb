@@ -455,6 +455,7 @@ fn bare_engine() -> OrchestratorEngine {
         shards: ArcSwap::from_pointee(HashMap::new()),
         routing_ring: Arc::new(ArcSwap::from_pointee(ConsistentRing::new())),
         schema_cache: Arc::new(SchemaCache::new()),
+        quotas: Arc::new(TenantQuotas::new(HashMap::new())),
         coordinator: None,
         identity: NodeIdentity::new(),
         default_search_limit: 10,
@@ -2937,6 +2938,15 @@ fn a_verdict_survives_the_wire() {
         (
             OrchestratorError::Io(std::io::Error::other("a disk gave up")),
             RemoteVerdict::ServerFault,
+        ),
+        // A peer's quota refusal must stay a refusal: read as a fault, a forwarded write to a
+        // tenant at its ceiling would answer 500 and invite the retry that cannot succeed.
+        (
+            OrchestratorError::QuotaExceeded {
+                tenant: "acme".into(),
+                detail: "tenant already owns 2 of 2 permitted indexes".into(),
+            },
+            RemoteVerdict::QuotaExceeded,
         ),
     ];
 
