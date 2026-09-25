@@ -450,8 +450,12 @@ pub enum OrchestratorError {
     /// `Unavailable` rather than a fault: nothing about the request is wrong, the node was
     /// simply behind, and a retry is the right move. That also makes it the same `503` the
     /// admission guard already answers, so a client under overload sees one behaviour.
+    ///
+    /// Named for the read pool, where it was first raised, but the worker pool's dequeue check
+    /// raises it for every op it sheds — a single write included — so the message names the
+    /// request rather than claiming every one was a read.
     #[error(
-        "read abandoned: spent {waited_ms}ms of a {budget_ms}ms request before a worker could start it"
+        "request abandoned: spent {waited_ms}ms of a {budget_ms}ms budget before a worker could start it"
     )]
     ReadDeadlineExpired { waited_ms: u64, budget_ms: u64 },
 
@@ -930,7 +934,7 @@ impl From<OrchestratorError> for RemoteError {
                 waited_ms,
                 budget_ms,
             } => RemoteError::Io(format!(
-                "read abandoned: spent {waited_ms}ms of a {budget_ms}ms request before a \
+                "request abandoned: spent {waited_ms}ms of a {budget_ms}ms budget before a \
                  worker could start it"
             )),
             // Travels like the dequeue refusal above, and for the same reason: a peer that

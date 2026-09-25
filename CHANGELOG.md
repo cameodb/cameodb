@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A refused request no longer costs a log line, and single-write overload no longer halves
+  goodput.** Every `503` was logged at `ERROR` — twice, by the trace layer and by the error
+  handler — synchronously on the runtime the write path shares. A default node filters at
+  `ERROR`, so these were the only lines it wrote and no ordinary `RUST_LOG` setting silenced
+  them. At twice its write capacity a node kept 1,116 of ~2,000 writes/s, timed out 15% of
+  requests, and failed its health probe; with the fix it serves 2,621 writes/s at 2× and 2,541
+  at 4×, every refusal a `503` and none a `408`. Refusals — `503`, `408` and `429` — are now
+  counted and summarised in one `WARN` per 10 seconds, the first at once; exact counts remain
+  `refused_at_admission` and `abandoned` on `/_admin/workers`. A `503` that is not load shedding,
+  such as an unreachable peer, still logs at `ERROR`. A write refused at dequeue now says
+  `request abandoned` rather than `read abandoned`, and three per-shard `INFO` lines per bulk
+  request are `DEBUG`.
+
 - **Compressed request bodies are decompressed — they never were.** The router mounted
   tower-http's `DecompressionLayer`, which decompresses *responses*, so no request body was ever
   inflated, for any codec: a `content-encoding: gzip` body reached the handler as compressed

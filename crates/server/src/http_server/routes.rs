@@ -37,6 +37,7 @@ use crate::http_server::catalogue::{
 };
 use crate::http_server::health::health_handler;
 use crate::http_server::search::{search_handler, search_stream_handler};
+use crate::http_server::shed::{self, ShedLog};
 use crate::http_server::write::{
     bulk_delete_handler, bulk_write_handler, delete_document_handler, write_handler,
     write_stream_handler,
@@ -315,7 +316,15 @@ pub fn create_router(
         // at the read pool; this covers the async handlers that never reach it. It relies on the
         // release profile unwinding — under the old `panic = "abort"` there was nothing to catch.
         .layer(CatchPanicLayer::custom(handle_panic))
-        .layer(TraceLayer::new_for_http());
+        // Outermost, so it sees every response — the door's and the concurrency guard's 503s,
+        // the timeout's 408s and the limiter's 429s included — and counts refusals into one
+        // periodic summary instead of logging each one. See `shed`.
+        .layer({
+            let shed = ShedLog::new(shed::REPORT_INTERVAL);
+            TraceLayer::new_for_http()
+                .on_response(shed.clone())
+                .on_failure(shed)
+        });
 
     (router, mcp_handle)
 }

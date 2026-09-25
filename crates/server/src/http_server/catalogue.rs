@@ -238,6 +238,7 @@ pub(super) async fn update_schema_handler(
             error: anyhow::anyhow!("{}", reason),
             status: Some(StatusCode::CONFLICT),
             retry_after_secs: None,
+            shed: false,
         });
     }
 
