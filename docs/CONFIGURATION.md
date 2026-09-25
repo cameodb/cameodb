@@ -776,6 +776,8 @@ write_documents_per_minute = 5000 # the write surface, metered in documents; 0 d
 write_burst = 20000               # spendable at once; 0 means one minute's worth
 max_search_limit = 10000          # largest `limit` an MCP search may ask for
 max_federated_indexes = 20        # most indexes one `search_across_indexes` may name
+min_prefix_length = 2             # shortest `field:pre*` expanded; 0 expands any
+expand_unqualified_prefix = false # let a bare `pre*` search the default fields
 ```
 
 **Two meters, and both are off until you set them.** The first pair meters *calls* — MCP tools
@@ -907,6 +909,61 @@ than per call.
 - **A caller that wants the whole catalogue is asking a different question.** `list_indexes`
   answers it in one request.
 - **`0` is refused**, not read as unlimited.
+
+#### `min_prefix_length` — how short a prefix query may be
+
+`field:pre*` runs as a range over the field's term dictionary: every term starting with `pre` is
+visited and its postings read. Tantivy caps its own phrase prefix (`"big bad wo"*`) at 50 terms
+per segment, but puts no cap on a range, so the cost of a prefix is the number of distinct terms
+it covers — a property of the field, not of the query. It defaults to **2**.
+
+Measured on one shard of 10M documents, one distinct term per document (ROADMAP M8):
+
+| Prefix length | Hash field (16 hex chars) | | Base36 id (10 chars) | | Text (20 words/doc) | |
+|---|---:|---:|---:|---:|---:|---:|
+| | terms | ms | terms | ms | terms | ms |
+| 1 | 625,427 | **164.7** | 277,783 | **57.8** | 44,404 | 31.4 |
+| 2 | 38,929 | 10.6 | 7,729 | 1.8 | 1,738 | 1.6 |
+| 3 | 2,458 | 0.7 | 216 | 0.1 | 70 | 0.1 |
+| 4 | 146 | 0.1 | 4 | 0.06 | 0 | 0.06 |
+
+Each character divides the cost by the size of the field's alphabet, and the whole table scales
+with the shard — the same measurement at 1M documents came in at roughly a tenth of these figures
+(8–13×). Identifier
+fields (hashes, UUIDs, URLs, emails) are where it bites: one character on a hash field holds a read
+thread for 165 ms per shard, and a search fans out to every shard. On natural text a one-character
+prefix costs about the same as searching its most common word, because the vocabulary is small.
+
+- **A shorter prefix is not refused.** It is matched as the literal term, like any prefix the
+  rewrite cannot expand, and reported in `_discarded_clauses`, so the rest of the query still runs.
+  The MCP search tools refuse a search with a reported clause, as they do for every such note.
+- **`0` expands every prefix**, and is accepted: unlike `max_search_limit`, nothing about "no
+  floor" is incoherent, only expensive. Raise it to `3` where a shard's identifier fields hold
+  hundreds of millions of values: at 160M hex values per shard, two characters costs what one
+  does at 10M.
+- **Characters, not bytes**, counted after the field's analyzer has run.
+
+#### `expand_unqualified_prefix` — whether `pre*` needs a field
+
+Off by default. Tantivy's grammar has no unqualified prefix: a bare `pre*` has its `*` dropped
+and matches the term `pre`, and the response reports that in `_discarded_clauses`. Turn this on
+and the node rewrites it into one prefix range per text field an unqualified term searches, OR'd
+together — `qui*` becomes `(body:[qui TO quj} OR title:[qui TO quj})` — so it finds what it
+looks like it should.
+
+- **It costs one prefix per default field.** Every indexed text field is a default field, so on
+  a wide index one bare prefix is that many ranges. `min_prefix_length` applies to each, which
+  is what keeps any single one of them cheap; the number of them is what the planned cap on
+  default fields (ROADMAP M8) will bound. That is why this is off by default.
+- **Only unqualified prefixes.** `title:pre*` is rewritten as before; a prefix inside a field
+  group — `title:(pre*)` — belongs to that field and is never sent to the others. It is still
+  reported rather than expanded.
+- **Text fields only.** A JSON field supports a range only as a fast column, so it is left out of
+  the expansion.
+- **Declined rather than guessed.** The node rewrites only when its reading of where the bare
+  prefixes are agrees with tantivy's own parse of the query. If they ever disagree — an escape or
+  nesting read differently — the query is left as written and each prefix is reported, rather
+  than rewritten into something that matches differently without saying so.
 
 #### `limits.max_response_bytes` — how large one response may be
 

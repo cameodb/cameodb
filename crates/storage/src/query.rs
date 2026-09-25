@@ -273,6 +273,8 @@ pub(crate) fn prepare_query_parser(
     fields: &SchemaFields,
     schema: &IndexSchema,
     query: &str,
+    // `StorageConfig::query`; see `normalize_prefix_query`.
+    policy: &QueryPolicy,
 ) -> (String, Vec<String>, tantivy::query::QueryParser) {
     // Fold whitespace the grammar's set parser cannot skip down to an ASCII space first, so no
     // later pass — and above all `parse_query_lenient` — is handed a character that makes its
@@ -284,16 +286,10 @@ pub(crate) fn prepare_query_parser(
     // Tantivy schema actually carries.
     let query = rewrite_shadow_fields(query, schema);
 
-    // Normalize date literals against the schema so naive inputs match indexed Date fields,
-    // then facets, then rewrite single-term prefixes into ranges.
-    let (normalized_query, prefix_notes) = normalize_prefix_query(
-        &normalize_facet_query(&normalize_date_query(&query, schema), schema),
-        tantivy_index,
-    );
-
     // Only text and JSON fields are default search fields, so an unqualified term is never
     // attempted against a numeric or date field — which the parser reports as a type error
-    // rather than as a non-match.
+    // rather than as a non-match. Computed first, because an unqualified prefix is expanded
+    // across exactly these fields and must not disagree with where an unqualified term goes.
     let tantivy_schema = tantivy_index.schema();
     let default_query_fields: Vec<Field> = fields
         .indexed_fields
@@ -306,6 +302,15 @@ pub(crate) fn prepare_query_parser(
         })
         .cloned()
         .collect();
+
+    // Normalize date literals against the schema so naive inputs match indexed Date fields,
+    // then facets, then rewrite single-term prefixes into ranges.
+    let (normalized_query, prefix_notes) = normalize_prefix_query(
+        &normalize_facet_query(&normalize_date_query(&query, schema), schema),
+        tantivy_index,
+        policy,
+        &default_query_fields,
+    );
 
     let parser = tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
     (normalized_query, prefix_notes, parser)
@@ -811,14 +816,167 @@ pub(crate) fn unrewritable_prefix_note(field: &str, value: &str) -> String {
     )
 }
 
+/// Note for a prefix clause left as the bare term because it is shorter than the node expands.
+pub(crate) fn short_prefix_note(
+    field: Option<&str>,
+    value: &str,
+    min_prefix_length: usize,
+) -> String {
+    let written = match field {
+        Some(field) => format!("{field}:{value}"),
+        None => value.to_string(),
+    };
+    let unit = if min_prefix_length == 1 {
+        "character"
+    } else {
+        "characters"
+    };
+    format!(
+        "'{written}' was not expanded as a prefix: this node expands prefixes of at least \
+         {min_prefix_length} {unit}, so it matched the term '{}' exactly; lengthen the prefix",
+        value.trim_end_matches('*')
+    )
+}
+
+/// Note for a `*` the grammar dropped without a word: a prefix that names no field, a leading or
+/// inner wildcard, or a prefix inside a field group. Tantivy matches what is left as written.
+pub(crate) fn ignored_wildcard_note(
+    field: Option<&str>,
+    phrase: &str,
+    unqualified_expansion: bool,
+) -> String {
+    let written = match field {
+        Some(field) => format!("{field}:{phrase}"),
+        None => phrase.to_string(),
+    };
+    let literal = phrase.replace('*', " ");
+    let literal = literal.split_whitespace().collect::<Vec<_>>().join(" ");
+    let remedy = match field {
+        _ if phrase.trim_end_matches('*').contains('*') => {
+            "only a trailing '*' is supported, as field:prefix*".to_string()
+        }
+        None if unqualified_expansion => format!(
+            "it could not be expanded across the default fields; name the field, as \
+             field:{phrase}"
+        ),
+        None => format!(
+            "name the field to search a prefix, as field:{phrase}, or enable \
+             expand_unqualified_prefix to search the default fields"
+        ),
+        Some(field) => format!("write it as {field}:{phrase} outside any group"),
+    };
+    format!(
+        "the '*' in '{written}' was ignored, so it matched '{literal}' exactly rather than as a \
+         wildcard; {remedy}"
+    )
+}
+
+/// Whether `analyzer` keeps a `*` in any token it makes from `phrase`.
+fn analyzer_keeps_star(analyzer: &mut tantivy::tokenizer::TextAnalyzer, phrase: &str) -> bool {
+    use tantivy::tokenizer::TokenStream;
+
+    let mut kept = false;
+    analyzer
+        .token_stream(phrase)
+        .process(&mut |token| kept |= token.text.contains('*'));
+    kept
+}
+
+/// Every unquoted literal in `query` still carrying a `*` that tantivy will silently drop.
+///
+/// Read from the grammar's own parse rather than scanned from the text, so a group, a boost or a
+/// quoted phrase is seen exactly as the parser will see it. A phrase in quotes is left alone —
+/// `"big bad wo"*` is tantivy's phrase prefix and works — as is a literal on a field that is not
+/// text, where the parser reports the value itself as an error and a note here would be a second
+/// account of one clause. `already` holds the `(field, phrase)` pairs the rewrite has noted.
+fn ignored_wildcards(
+    query: &str,
+    tantivy_index: &Index,
+    already: &HashSet<(Option<String>, String)>,
+    unqualified_expansion: bool,
+) -> Vec<String> {
+    use tantivy::query_grammar::{Delimiter, UserInputAst, UserInputLeaf};
+    use tantivy::schema::FieldType;
+
+    fn walk<'a>(ast: &'a UserInputAst, out: &mut Vec<(Option<&'a str>, &'a str)>) {
+        match ast {
+            UserInputAst::Clause(clauses) => clauses.iter().for_each(|(_, child)| walk(child, out)),
+            UserInputAst::Boost(child, _) => walk(child, out),
+            UserInputAst::Leaf(leaf) => {
+                if let UserInputLeaf::Literal(literal) = leaf.as_ref()
+                    && literal.delimiter == Delimiter::None
+                    && literal.phrase.contains('*')
+                {
+                    out.push((literal.field_name.as_deref(), literal.phrase.as_str()));
+                }
+            }
+        }
+    }
+
+    let (ast, _) = tantivy::query_grammar::parse_query_lenient(query);
+    let mut found = Vec::new();
+    walk(&ast, &mut found);
+
+    let tantivy_schema = tantivy_index.schema();
+    let mut notes = Vec::new();
+    for (field, phrase) in found {
+        if already.contains(&(field.map(str::to_string), phrase.to_string())) {
+            continue;
+        }
+        let dropped = match field {
+            // Unqualified terms reach the text default fields, whose analyzers drop a `*`.
+            None => true,
+            Some(name) => tantivy_schema
+                .find_field(name)
+                .and_then(|(field, _)| {
+                    let indexing = match tantivy_schema.get_field_entry(field).field_type() {
+                        FieldType::Str(options) => options.get_indexing_options(),
+                        FieldType::JsonObject(options) => options.get_text_indexing_options(),
+                        _ => None,
+                    }?;
+                    tantivy_index.tokenizers().get(indexing.tokenizer())
+                })
+                // A `raw` field keeps the `*` inside its one term, so `id:a*b` matches the term
+                // `a*b` exactly as written and there is nothing to report.
+                .is_some_and(|mut analyzer| !analyzer_keeps_star(&mut analyzer, phrase)),
+        };
+        if dropped {
+            let note = ignored_wildcard_note(field, phrase, unqualified_expansion);
+            if !notes.contains(&note) {
+                notes.push(note);
+            }
+        }
+    }
+    notes
+}
+
 /// Rewrite a single-term prefix — `field:pre*` — into the equivalent lexicographic range, on text
 /// and string fields.
 ///
 /// The grammar has no prefix operator: it drops the `*` and matches `pre` as a whole term without
 /// raising an error. Tantivy tokenizes the bounds, so the prefix may be written in any case.
 ///
+/// **A prefix shorter than `min_prefix_length` characters is not expanded** (`0` expands any).
+/// The range this builds walks every term it covers and reads each one's postings, with no ceiling
+/// — tantivy caps its own phrase prefix at 50 terms per segment and puts no cap on a range. Measured
+/// on 10M single-term documents per shard (ROADMAP M8), one hex character covered 625k terms and
+/// cost 165 ms; two cost 11 ms and three under 1 ms. So a short prefix is left as written and
+/// matches the term exactly, with a note, rather than refused: the same treatment an unrewritable
+/// prefix already gets, and a query with one short clause still runs the rest.
+///
+/// **Every other `*` the grammar would drop silently is noted too** — a prefix that names no
+/// field, a leading or inner wildcard, a prefix inside a field group. Tantivy matches the text
+/// with the `*` removed and raises no error, so without a note the caller reads a near-empty result
+/// as the answer to a wildcard search they never actually ran.
+///
 /// Returns the query with a note per prefix clause left unrewritten.
-pub(crate) fn normalize_prefix_query(query: &str, tantivy_index: &Index) -> (String, Vec<String>) {
+pub(crate) fn normalize_prefix_query(
+    query: &str,
+    tantivy_index: &Index,
+    policy: &QueryPolicy,
+    default_fields: &[Field],
+) -> (String, Vec<String>) {
+    let min_prefix_length = policy.min_prefix_length;
     use tantivy::schema::FieldType;
 
     if !query.contains('*') {
@@ -828,6 +986,8 @@ pub(crate) fn normalize_prefix_query(query: &str, tantivy_index: &Index) -> (Str
     let tantivy_schema = tantivy_index.schema();
     let mut normalized = query.to_string();
     let mut notes = Vec::new();
+    // What the loop below has already accounted for, so the wildcard pass does not note it twice.
+    let mut noted: HashSet<(Option<String>, String)> = HashSet::new();
 
     for (_, entry) in tantivy_schema.fields() {
         let FieldType::Str(ref options) = *entry.field_type() else {
@@ -859,19 +1019,42 @@ pub(crate) fn normalize_prefix_query(query: &str, tantivy_index: &Index) -> (Str
                 .unwrap_or(normalized.len());
             let value = &normalized[value_start..value_end];
 
-            let range = single_term_prefix(value).map(|(term, boost)| {
-                single_token(&mut analyzer, term)
-                    .and_then(|lower| {
-                        let upper = prefix_upper_bound(&lower, &mut analyzer)?;
-                        Some(format!("{name}:[{lower} TO {upper}}}{boost}"))
-                    })
-                    .ok_or(value)
+            enum Prefix {
+                Range(String),
+                TooShort(String),
+                Unrewritable,
+            }
+            let prefix_clause = single_term_prefix(value).map(|(term, boost)| {
+                noted.insert((Some(name.to_string()), format!("{term}*")));
+                match single_token(&mut analyzer, term) {
+                    // Counted after analysis, in characters: what the range walks is terms.
+                    Some(lower)
+                        if min_prefix_length > 0 && lower.chars().count() < min_prefix_length =>
+                    {
+                        Prefix::TooShort(format!("{term}*"))
+                    }
+                    Some(lower) => match prefix_upper_bound(&lower, &mut analyzer) {
+                        Some(upper) => {
+                            Prefix::Range(format!("{name}:[{lower} TO {upper}}}{boost}"))
+                        }
+                        None => Prefix::Unrewritable,
+                    },
+                    None => Prefix::Unrewritable,
+                }
             });
 
-            match range {
-                Some(Ok(rewritten)) => out.push_str(&rewritten),
-                Some(Err(unrewritable)) => {
-                    notes.push(unrewritable_prefix_note(name, unrewritable));
+            match prefix_clause {
+                Some(Prefix::Range(rewritten)) => out.push_str(&rewritten),
+                Some(Prefix::TooShort(prefix)) => {
+                    notes.push(short_prefix_note(
+                        Some(name),
+                        &prefix,
+                        policy.min_prefix_length,
+                    ));
+                    out.push_str(&normalized[start..value_end]);
+                }
+                Some(Prefix::Unrewritable) => {
+                    notes.push(unrewritable_prefix_note(name, value));
                     out.push_str(&normalized[start..value_end]);
                 }
                 None => out.push_str(&normalized[start..value_end]),
@@ -882,7 +1065,260 @@ pub(crate) fn normalize_prefix_query(query: &str, tantivy_index: &Index) -> (Str
         normalized = out;
     }
 
+    if policy.expand_unqualified_prefix {
+        normalized = expand_unqualified_prefixes(
+            &normalized,
+            tantivy_index,
+            default_fields,
+            min_prefix_length,
+            &mut notes,
+            &mut noted,
+        );
+    }
+
+    notes.extend(ignored_wildcards(
+        &normalized,
+        tantivy_index,
+        &noted,
+        policy.expand_unqualified_prefix,
+    ));
     (normalized, notes)
+}
+
+/// A bare prefix found in the query text: `pre*`, with its byte span and any boost.
+#[derive(Debug)]
+struct BarePrefix<'a> {
+    /// Covers the term, its `*` and its boost — everything the rewrite replaces. A leading `+`
+    /// or `-` is outside it and stays where it is.
+    start: usize,
+    end: usize,
+    term: &'a str,
+    /// `^2`, or empty.
+    boost: &'a str,
+}
+
+/// The unquoted, unqualified single-term prefixes in `query`, in order.
+///
+/// A prefix is *qualified* by a `field:` in front of it or by an enclosing `field:( … )` group,
+/// and both are skipped: the first is the field-qualified rewrite's, the second belongs to the
+/// group's field and must not be sent to the default fields. Quotes, range and set brackets, and
+/// anything escaped are skipped too. This is a scan of the text, which is what the rewrite needs
+/// to know *where* to write; [`expand_unqualified_prefixes`] checks it against the grammar's own
+/// parse before trusting it.
+fn bare_prefixes(query: &str) -> Vec<BarePrefix<'_>> {
+    const STOPS: &[char] = &['(', ')', '[', ']', '{', '}', '"', '\''];
+
+    let mut found = Vec::new();
+    // One entry per open parenthesis: whether it opened a `field:( … )` group.
+    let mut groups: Vec<bool> = Vec::new();
+    let mut brackets = 0usize;
+    let mut chars = query.char_indices().peekable();
+
+    while let Some(&(at, ch)) = chars.peek() {
+        match ch {
+            '"' | '\'' => {
+                chars.next();
+                let mut escaped = false;
+                for (_, inner) in chars.by_ref() {
+                    match inner {
+                        _ if escaped => escaped = false,
+                        '\\' => escaped = true,
+                        _ if inner == ch => break,
+                        _ => {}
+                    }
+                }
+            }
+            '(' => {
+                groups.push(false);
+                chars.next();
+            }
+            ')' => {
+                groups.pop();
+                chars.next();
+            }
+            '[' | '{' => {
+                brackets += 1;
+                chars.next();
+            }
+            ']' | '}' => {
+                brackets = brackets.saturating_sub(1);
+                chars.next();
+            }
+            _ if ch.is_whitespace() => {
+                chars.next();
+            }
+            _ => {
+                let mut end = at;
+                while let Some(&(pos, next)) = chars.peek() {
+                    if next.is_whitespace() || STOPS.contains(&next) {
+                        break;
+                    }
+                    end = pos + next.len_utf8();
+                    chars.next();
+                }
+                let token = &query[at..end];
+
+                // `field:(` opens a group whose field every literal inside it belongs to.
+                if token.ends_with(':') && query[end..].starts_with('(') {
+                    groups.push(true);
+                    chars.next();
+                    continue;
+                }
+                if brackets > 0 || groups.contains(&true) {
+                    continue;
+                }
+
+                let sign = usize::from(token.starts_with(['+', '-']));
+                let body = &token[sign..];
+                let (core, boost) = match body.find('^') {
+                    Some(caret) => body.split_at(caret),
+                    None => (body, ""),
+                };
+                let Some(term) = core.strip_suffix('*') else {
+                    continue;
+                };
+                if term.is_empty()
+                    || term.contains(['*', ':', '\\'])
+                    || term.starts_with(['!', '~', '^'])
+                {
+                    continue;
+                }
+                found.push(BarePrefix {
+                    start: at + sign,
+                    end,
+                    term,
+                    boost,
+                });
+            }
+        }
+    }
+    found
+}
+
+/// The unqualified prefixes tantivy's grammar sees in `query`, as the phrases it holds them by.
+fn grammar_bare_prefixes(query: &str) -> Vec<String> {
+    use tantivy::query_grammar::{Delimiter, UserInputAst, UserInputLeaf};
+
+    fn walk(ast: &UserInputAst, out: &mut Vec<String>) {
+        match ast {
+            UserInputAst::Clause(clauses) => clauses.iter().for_each(|(_, child)| walk(child, out)),
+            UserInputAst::Boost(child, _) => walk(child, out),
+            UserInputAst::Leaf(leaf) => {
+                if let UserInputLeaf::Literal(literal) = leaf.as_ref()
+                    && literal.field_name.is_none()
+                    && literal.delimiter == Delimiter::None
+                    && literal.phrase.len() > 1
+                    && literal.phrase.ends_with('*')
+                    && literal.phrase.matches('*').count() == 1
+                {
+                    out.push(literal.phrase.clone());
+                }
+            }
+        }
+    }
+
+    let (ast, _) = tantivy::query_grammar::parse_query_lenient(query);
+    let mut found = Vec::new();
+    walk(&ast, &mut found);
+    found
+}
+
+/// Rewrite each bare `pre*` into one prefix range per text default field, OR'd.
+///
+/// Tantivy's grammar has no unqualified prefix — it drops the `*` and matches `pre` as a term — so
+/// this is the only way `pre*` can mean what it looks like. It sends the prefix exactly where an
+/// unqualified term goes: the default fields, less those that cannot hold a range (a JSON field
+/// supports one only as a fast column). `min_prefix_length` applies per field, after that field's
+/// analyzer, as it does to a qualified prefix.
+///
+/// **Trusted only when the text scan agrees with the grammar.** [`bare_prefixes`] finds where to
+/// write; the grammar decides what the query means. If they disagree on which bare prefixes exist
+/// — an escape or nesting the scan reads differently — nothing is rewritten, and each prefix is
+/// reported by the ignored-wildcard pass instead. A wrong rewrite would change what a query
+/// matches silently; declining changes nothing and says so.
+fn expand_unqualified_prefixes(
+    query: &str,
+    tantivy_index: &Index,
+    default_fields: &[Field],
+    min_prefix_length: usize,
+    notes: &mut Vec<String>,
+    noted: &mut HashSet<(Option<String>, String)>,
+) -> String {
+    use tantivy::schema::FieldType;
+
+    let spans = bare_prefixes(query);
+    if spans.is_empty() {
+        return query.to_string();
+    }
+    let mut scanned: Vec<String> = spans.iter().map(|span| format!("{}*", span.term)).collect();
+    let mut parsed = grammar_bare_prefixes(query);
+    scanned.sort();
+    parsed.sort();
+    if scanned != parsed {
+        tracing::debug!(
+            query = %query,
+            ?scanned,
+            ?parsed,
+            "Unqualified prefixes left unexpanded: the text scan and the grammar disagree"
+        );
+        return query.to_string();
+    }
+
+    // Sorted by name, so one query always expands to the same text.
+    let tantivy_schema = tantivy_index.schema();
+    let mut targets: Vec<(String, tantivy::tokenizer::TextAnalyzer)> = default_fields
+        .iter()
+        .filter_map(|&field| {
+            let entry = tantivy_schema.get_field_entry(field);
+            let FieldType::Str(options) = entry.field_type() else {
+                return None;
+            };
+            let indexing = options.get_indexing_options()?;
+            let analyzer = tantivy_index.tokenizers().get(indexing.tokenizer())?;
+            Some((entry.name().to_string(), analyzer))
+        })
+        .collect();
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = String::with_capacity(query.len() * 2);
+    let mut cursor = 0;
+    for span in spans {
+        out.push_str(&query[cursor..span.start]);
+        cursor = span.end;
+
+        let mut clauses = Vec::new();
+        let mut too_short = false;
+        for (name, analyzer) in targets.iter_mut() {
+            let Some(lower) = single_token(analyzer, span.term) else {
+                continue;
+            };
+            if min_prefix_length > 0 && lower.chars().count() < min_prefix_length {
+                too_short = true;
+                continue;
+            }
+            if let Some(upper) = prefix_upper_bound(&lower, analyzer) {
+                clauses.push(format!("{name}:[{lower} TO {upper}}}"));
+            }
+        }
+
+        if clauses.is_empty() {
+            // Left as written. A short prefix is reported here; anything else falls to the
+            // ignored-wildcard pass, which says it could not be expanded.
+            if too_short {
+                let prefix = format!("{}*", span.term);
+                notes.push(short_prefix_note(None, &prefix, min_prefix_length));
+                noted.insert((None, prefix));
+            }
+            out.push_str(&query[span.start..span.end]);
+        } else {
+            out.push('(');
+            out.push_str(&clauses.join(" OR "));
+            out.push(')');
+            out.push_str(span.boost);
+        }
+    }
+    out.push_str(&query[cursor..]);
+    out
 }
 
 /// Quote facet path values so the parser resolves them to facet terms.
@@ -970,4 +1406,69 @@ pub(crate) fn normalize_date_query(query: &str, schema: &IndexSchema) -> String 
     }
 
     normalized
+}
+
+#[cfg(test)]
+mod bare_prefix_tests {
+    use super::*;
+
+    fn terms(query: &str) -> Vec<&str> {
+        bare_prefixes(query).iter().map(|span| span.term).collect()
+    }
+
+    /// Bare prefixes in every position a clause can take, with signs and boosts outside the term.
+    #[test]
+    fn the_scan_finds_bare_prefixes_wherever_a_clause_can_sit() {
+        assert_eq!(terms("qui*"), ["qui"]);
+        assert_eq!(terms("a qui* b"), ["qui"]);
+        assert_eq!(terms("(qui* OR zeb*)"), ["qui", "zeb"]);
+        assert_eq!(terms("+qui* -zeb*"), ["qui", "zeb"]);
+
+        let spans = bare_prefixes("x -qui*^2 y");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&"x -qui*^2 y"[spans[0].start..spans[0].end], "qui*^2");
+        assert_eq!(spans[0].boost, "^2");
+    }
+
+    /// Everything that is not an unqualified single-term prefix is left alone.
+    #[test]
+    fn the_scan_skips_qualified_quoted_bracketed_and_wildcard_forms() {
+        for query in [
+            "title:qui*",             // qualified
+            "title:(qui* zeb*)",      // inside a field group
+            "title:(a OR (qui*))",    // nested inside a field group
+            "\"big bad wo\"*",        // phrase prefix
+            "\"qui* inside quotes\"", // quoted
+            "title:[a* TO b]",        // range bound
+            "*",                      // match all
+            "*uick",                  // leading wildcard
+            "q*ck",                   // inner wildcard
+            "qu\\*i*",                // escaped
+            "title:*",                // presence
+        ] {
+            assert!(terms(query).is_empty(), "{query:?} -> {:?}", terms(query));
+        }
+        // A field group closes, and what follows it is bare again.
+        assert_eq!(terms("title:(a b) qui*"), ["qui"]);
+    }
+
+    /// The scan and the grammar agree on the forms the rewrite is used for — which is what licenses
+    /// the rewrite — and where they would not, the rewrite declines.
+    #[test]
+    fn the_scan_agrees_with_the_grammar() {
+        for query in [
+            "qui*",
+            "(qui* OR zeb*) title:x",
+            "+qui* -zeb*^2",
+            "title:(a qui*) zeb*",
+            "\"big bad wo\"* qui*",
+        ] {
+            let mut scanned: Vec<String> =
+                terms(query).iter().map(|term| format!("{term}*")).collect();
+            let mut parsed = grammar_bare_prefixes(query);
+            scanned.sort();
+            parsed.sort();
+            assert_eq!(scanned, parsed, "{query:?}");
+        }
+    }
 }

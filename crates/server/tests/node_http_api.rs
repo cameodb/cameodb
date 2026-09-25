@@ -3884,3 +3884,87 @@ async fn a_write_to_an_unknown_index_is_refused_when_implicit_creation_is_off() 
         "the gate must hold for every index a write would mint: {body}"
     );
 }
+
+/// The prefix floor reaches storage from the config file, with the shipped default.
+///
+/// Storage's own tests prove the rewrite; this proves the wiring: `[security.limits]` →
+/// `NodeConfig` → every shard's `StorageConfig`. A node started with no setting expands two
+/// characters and reports one, and `min_prefix_length = 0` expands one again.
+#[tokio::test]
+async fn the_prefix_floor_is_the_configured_one() {
+    async fn seeded(extra: &str) -> TestNode {
+        let node = TestNode::start(extra).await;
+        let client = node.client();
+        for (id, title) in [("q1", "quick"), ("q2", "quiet")] {
+            client
+                .write_document("prefixes", id, &json!({"id": id, "title": title}), None)
+                .await
+                .expect("write");
+        }
+        client.admin_index_commit("prefixes").await.expect("commit");
+        node
+    }
+
+    let node = seeded("").await;
+    let (status, body) = post_json(
+        &node,
+        "/api/prefixes/search",
+        json!({"query": "title:q*", "limit": 10}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a short prefix is reported, not refused: {body}"
+    );
+    assert_eq!(body["total_hits"], 0, "not expanded: {body}");
+    let notes = body["_discarded_clauses"].to_string();
+    assert!(
+        notes.contains("at least 2 characters"),
+        "the default floor must be named: {body}"
+    );
+
+    let (_, body) = post_json(
+        &node,
+        "/api/prefixes/search",
+        json!({"query": "title:qu*", "limit": 10}),
+    )
+    .await;
+    assert_eq!(body["total_hits"], 2, "two characters expand: {body}");
+    assert!(body.get("_discarded_clauses").is_none(), "{body}");
+
+    // A bare prefix is reported by default, naming the setting that would expand it ...
+    let (_, body) = post_json(
+        &node,
+        "/api/prefixes/search",
+        json!({"query": "qu*", "limit": 10}),
+    )
+    .await;
+    assert!(
+        body["_discarded_clauses"]
+            .to_string()
+            .contains("expand_unqualified_prefix"),
+        "{body}"
+    );
+    drop(node);
+
+    let node = seeded("[security.limits]\nmin_prefix_length = 0").await;
+    let (_, body) = post_json(
+        &node,
+        "/api/prefixes/search",
+        json!({"query": "title:q*", "limit": 10}),
+    )
+    .await;
+    assert_eq!(body["total_hits"], 2, "0 turns the floor off: {body}");
+    drop(node);
+
+    // ... and with it enabled, searches the default fields.
+    let node = seeded("[security.limits]\nexpand_unqualified_prefix = true").await;
+    let (_, body) = post_json(
+        &node,
+        "/api/prefixes/search",
+        json!({"query": "qu*", "limit": 10}),
+    )
+    .await;
+    assert_eq!(body["total_hits"], 2, "the bare prefix expanded: {body}");
+    assert!(body.get("_discarded_clauses").is_none(), "{body}");
+}

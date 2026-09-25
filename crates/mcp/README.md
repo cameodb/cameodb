@@ -454,7 +454,8 @@ schema, and the table below, which is generated and checked against the tables b
 **Not supported**
 
 - `field:*` — Field-presence tests are not supported for any field type. The clause is dropped and reported. Use a bounded range, or match an explicit value.
-- `pre*` — A prefix needs a field name; without one the `*` is dropped and `pre` is matched as a whole term. Name the field, or OR one clause per field.
+- `pre*` — A prefix needs a field name unless the node enables `expand_unqualified_prefix`; otherwise the `*` is dropped, `pre` is matched as a whole term, and reported. Name the field, or OR one clause per field.
+- `field:*suffix` — Leading and inner wildcards (`*fix`, `pre*fix`) are not supported. The `*` is dropped, the rest is matched as written, and reported. Only a trailing `*` on a field-qualified term is a prefix.
 - `field.subfield:value` — Paths into a json field are not queryable. A json field is searchable only as unstructured text, so `field:value` matches any key or value inside it.
 - `field:/regex/` — Regular expressions are disabled.
 

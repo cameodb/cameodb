@@ -145,6 +145,9 @@ enabled = false
 # write_burst = 20000                   # an import is one burst; set this above the rate
 # max_search_limit = 10000              # largest `limit` an MCP search may ask for
 # max_federated_indexes = 20            # most indexes one search_across_indexes may name
+# min_prefix_length = 2                 # shortest field:pre* expanded (0 = any); shorter
+#                                       # prefixes match the literal term and are reported
+# expand_unqualified_prefix = false     # true: a bare pre* searches every default text field
 
 # The MCP endpoint itself: which of it is mounted, and how long a conversation with it lives.
 #

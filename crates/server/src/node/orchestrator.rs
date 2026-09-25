@@ -4288,6 +4288,7 @@ impl NodeOrchestrator {
             // Other Configuration
             default_batch_size: self.config.default_batch_size,
             wal_sync: self.config.wal_sync,
+            query: self.config.query_policy.clone(),
         }
     }
 

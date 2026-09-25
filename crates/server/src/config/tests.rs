@@ -736,6 +736,51 @@ max_response_bytes = 16777216
         );
     }
 
+    /// The prefix floor defaults to two, whether the section is absent or built in code, and an
+    /// operator's `0` is read as "expand every prefix" rather than refused.
+    #[test]
+    fn the_prefix_floor_defaults_to_two_and_zero_turns_it_off() {
+        let config: CameoDbConfig = toml::from_str("").expect("empty config must parse");
+        assert_eq!(
+            config.security.limits.min_prefix_length,
+            crate::ratelimit::DEFAULT_MIN_PREFIX_LENGTH
+        );
+        assert_eq!(crate::ratelimit::DEFAULT_MIN_PREFIX_LENGTH, 2);
+        assert_eq!(
+            CameoDbConfig::default().security.limits.min_prefix_length,
+            config.security.limits.min_prefix_length
+        );
+
+        let off = CameoDbConfig::parse_config_content(
+            "[security.limits]\nmin_prefix_length = 0\n",
+            "off.toml",
+        )
+        .expect("zero is a valid floor");
+        assert_eq!(off.security.limits.min_prefix_length, 0);
+        assert!(off.validate().is_ok());
+    }
+
+    /// Expanding a bare `pre*` across the default fields is opt-in, and reaches storage's policy.
+    #[test]
+    fn unqualified_prefix_expansion_is_off_until_enabled() {
+        let config: CameoDbConfig = toml::from_str("").expect("empty config must parse");
+        assert!(!config.security.limits.expand_unqualified_prefix);
+        assert_eq!(
+            config.security.limits.query_policy(),
+            storage::QueryPolicy {
+                min_prefix_length: 2,
+                expand_unqualified_prefix: false,
+            }
+        );
+
+        let on = CameoDbConfig::parse_config_content(
+            "[security.limits]\nexpand_unqualified_prefix = true\n",
+            "on.toml",
+        )
+        .expect("parses");
+        assert!(on.security.limits.query_policy().expand_unqualified_prefix);
+    }
+
     #[test]
     fn test_derived_limits_defaults() {
         let config = CameoDbConfig::default();
