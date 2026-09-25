@@ -60,7 +60,12 @@ pub(crate) fn validate_index_name(index: &str) -> Result<(), AppError> {
 #[derive(Debug, Deserialize)]
 pub struct SchemaUpdatePayload {
     /// Map of field_name -> indexed (true/false)
+    #[serde(default)]
     pub field_updates: std::collections::HashMap<String, bool>,
+    /// The fields an unqualified term searches, in priority order. `[]` clears the declaration,
+    /// so every text field is searched again; absent leaves it as it is.
+    #[serde(default)]
+    pub default_fields: Option<Vec<String>>,
 }
 
 /// Query parameters for the list indexes endpoint
@@ -199,10 +204,11 @@ pub(super) async fn update_schema_handler(
         "Schema update request"
     );
 
-    if payload.field_updates.is_empty() {
+    if payload.field_updates.is_empty() && payload.default_fields.is_none() {
         return Err(AppError::bad_request(
-            "No field updates supplied. Provide `field_updates` as a map of field name to the \
-             desired `indexed` flag.",
+            "Nothing to update. Provide `field_updates` as a map of field name to the desired \
+             `indexed` flag, and/or `default_fields` as the list of fields an unqualified term \
+             searches (`[]` to clear it).",
         ));
     }
 
@@ -212,6 +218,7 @@ pub(super) async fn update_schema_handler(
             ClientOp::UpdateSchema {
                 index: index.clone(),
                 field_updates: payload.field_updates.into_iter().collect(),
+                default_fields: payload.default_fields,
             },
             None,
             OperationType::Write,

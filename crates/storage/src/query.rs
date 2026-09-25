@@ -275,7 +275,12 @@ pub(crate) fn prepare_query_parser(
     query: &str,
     // `StorageConfig::query`; see `normalize_prefix_query`.
     policy: &QueryPolicy,
-) -> (String, Vec<String>, tantivy::query::QueryParser) {
+) -> (
+    String,
+    Vec<String>,
+    tantivy::query::QueryParser,
+    Option<NarrowedDefaultFields>,
+) {
     // Fold whitespace the grammar's set parser cannot skip down to an ASCII space first, so no
     // later pass — and above all `parse_query_lenient` — is handed a character that makes its
     // element loop spin without consuming input.
@@ -291,16 +296,39 @@ pub(crate) fn prepare_query_parser(
     // rather than as a non-match. Computed first, because an unqualified prefix is expanded
     // across exactly these fields and must not disagree with where an unqualified term goes.
     let tantivy_schema = tantivy_index.schema();
-    let default_query_fields: Vec<Field> = fields
+    let candidates = fields
         .indexed_fields
-        .values()
-        .filter(|field| {
+        .iter()
+        .filter(|(_, field)| {
             matches!(
                 tantivy_schema.get_field_entry(**field).field_type(),
                 tantivy::schema::FieldType::Str(_) | tantivy::schema::FieldType::JsonObject(_)
             )
         })
-        .cloned()
+        .map(|(name, _)| name.clone());
+    // Capped by the node and ordered by the index's declared list, if it has one — the one
+    // definition the listing also reports, so what a caller is told a bare term searches is what
+    // it does search.
+    let candidates: Vec<String> = candidates.collect();
+    let available = match schema.default_fields.as_deref() {
+        Some(declared) => declared.iter().filter(|n| candidates.contains(n)).count(),
+        None => candidates.len(),
+    };
+    let (selected, truncated) = select_default_fields(
+        candidates,
+        schema.default_fields.as_deref(),
+        policy.max_default_fields,
+    );
+    // Reported only when it made a difference to *this* query. The grammar is consulted only
+    // then, so an index under the cap pays nothing for the check.
+    let narrowed = (truncated && has_unqualified_clause(&query)).then(|| NarrowedDefaultFields {
+        searched: selected.clone(),
+        available,
+        declared: schema.default_fields.is_some(),
+    });
+    let default_query_fields: Vec<Field> = selected
+        .iter()
+        .filter_map(|name| fields.indexed_fields.get(name).copied())
         .collect();
 
     // Normalize date literals against the schema so naive inputs match indexed Date fields,
@@ -313,7 +341,32 @@ pub(crate) fn prepare_query_parser(
     );
 
     let parser = tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
-    (normalized_query, prefix_notes, parser)
+    (normalized_query, prefix_notes, parser, narrowed)
+}
+
+/// Whether any clause of `query` names no field, and so goes to the default fields.
+///
+/// Read from tantivy's own parse, so a group's field, a quoted phrase and a range are seen as the
+/// parser sees them: `title:(a b)` is qualified throughout, `"a b"` and `[a TO b]` with no field
+/// are not.
+fn has_unqualified_clause(query: &str) -> bool {
+    use tantivy::query_grammar::{UserInputAst, UserInputLeaf};
+
+    fn walk(ast: &UserInputAst) -> bool {
+        match ast {
+            UserInputAst::Clause(clauses) => clauses.iter().any(|(_, child)| walk(child)),
+            UserInputAst::Boost(child, _) => walk(child),
+            UserInputAst::Leaf(leaf) => match leaf.as_ref() {
+                UserInputLeaf::Literal(literal) => literal.field_name.is_none(),
+                UserInputLeaf::Range { field, .. } | UserInputLeaf::Set { field, .. } => {
+                    field.is_none()
+                }
+                _ => false,
+            },
+        }
+    }
+
+    walk(&tantivy::query_grammar::parse_query_lenient(query).0)
 }
 
 /// Whether the parser resolved this ambiguity and ran the clause anyway.

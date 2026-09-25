@@ -330,7 +330,7 @@ impl HybridStore {
             }));
         }
 
-        let (normalized_query, prefix_notes, query_parser) =
+        let (normalized_query, prefix_notes, query_parser, _) =
             prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query);
 
         // The query itself is discarded: what is wanted is the error list, which is the half a
@@ -403,7 +403,7 @@ impl HybridStore {
                 return Ok(SearchOutcome::counted(total_hits, Vec::new(), false));
             }
 
-            let (normalized_query, prefix_notes, query_parser) =
+            let (normalized_query, prefix_notes, query_parser, narrowed_default_fields) =
                 prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query);
             let (parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
             let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
@@ -438,7 +438,10 @@ impl HybridStore {
                 "Count-only search completed (limit=0)"
             );
 
-            return Ok(SearchOutcome::counted(total_hits, discarded, emptied));
+            return Ok(SearchOutcome {
+                narrowed_default_fields,
+                ..SearchOutcome::counted(total_hits, discarded, emptied)
+            });
         }
 
         // Check if this is an exact ID lookup (id:field or shadow field) that can bypass Tantivy
@@ -510,11 +513,12 @@ impl HybridStore {
                 total_hits,
                 discarded: Vec::new(),
                 approximate_sort: None,
+                narrowed_default_fields: None,
                 emptied: false,
             });
         }
 
-        let (normalized_query, prefix_notes, query_parser) =
+        let (normalized_query, prefix_notes, query_parser, narrowed_default_fields) =
             prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query);
 
         // Lenient, so one bad clause does not fail the whole query; what it drops is reported
@@ -761,7 +765,10 @@ impl HybridStore {
         };
 
         if is_empty {
-            return Ok(SearchOutcome::counted(total_hits, discarded, emptied));
+            return Ok(SearchOutcome {
+                narrowed_default_fields,
+                ..SearchOutcome::counted(total_hits, discarded, emptied)
+            });
         }
 
         // Step 1: Extract document IDs from Tantivy results. `id` carries a fast column on
@@ -1003,6 +1010,7 @@ impl HybridStore {
             total_hits,
             discarded,
             approximate_sort,
+            narrowed_default_fields,
             emptied,
         })
     }

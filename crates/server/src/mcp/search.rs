@@ -1,17 +1,20 @@
 //! The two search tools, and the merge that makes a federated one answerable.
 
 use futures::{StreamExt, future::BoxFuture, stream};
-use serde_json::Value as JsonValue;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use cameodb_mcp::{McpIndexSearchRequest, ToolError};
 
 use crate::cluster_coordinator::OperationType;
 use crate::mcp::diagnostics::{
-    approximate_sort_note, names_a_missing_field, paged_past_the_end, refuse_if_clauses_discarded,
-    short_page_note, tool_error, with_valid_fields, zero_results_advice,
+    approximate_sort_note, names_a_missing_field, narrowed_default_fields_note, paged_past_the_end,
+    refuse_if_clauses_discarded, short_page_note, tool_error, with_valid_fields,
+    zero_results_advice,
 };
 use crate::mcp::schema::absent_index_reason;
-use crate::node::{APPROXIMATE_SORT_FIELD, ClientOp, SearchWindow, order_hit_blocks};
+use crate::node::{
+    APPROXIMATE_SORT_FIELD, ClientOp, NARROWED_DEFAULT_FIELDS, SearchWindow, order_hit_blocks,
+};
 use crate::query::parse_query_keywords;
 use crate::state::AppState;
 
@@ -171,6 +174,23 @@ fn annotate_search_response(
         .and_then(|value| value.as_str())
     {
         notes.push(approximate_sort_note(field));
+    }
+
+    // One index's account is the value itself; a federated search keys one per index narrowed.
+    match response.get(NARROWED_DEFAULT_FIELDS) {
+        Some(value) if value.get("searched").is_some() => {
+            if let Ok(narrowed) = serde_json::from_value(value.clone()) {
+                notes.push(narrowed_default_fields_note(None, &narrowed));
+            }
+        }
+        Some(JsonValue::Object(per_index)) => {
+            for (index, value) in per_index {
+                if let Ok(narrowed) = serde_json::from_value(value.clone()) {
+                    notes.push(narrowed_default_fields_note(Some(index), &narrowed));
+                }
+            }
+        }
+        _ => {}
     }
 
     if notes.is_empty() {
@@ -404,6 +424,9 @@ pub(super) fn search_across_indexes(
         // where a failed call throws away work that succeeded.
         let mut errors: Vec<JsonValue> = Vec::new();
         let mut approximate_sort: Option<String> = None;
+        // Per index, unlike the approximate sort: each index has its own schema and its own
+        // declared list, so which default fields a bare term reached differs between them.
+        let mut narrowed_default_fields = JsonMap::new();
 
         while let Some((named_at, index_name, result)) = search_futures.next().await {
             // Schema-aware error handling
@@ -465,6 +488,9 @@ pub(super) fn search_across_indexes(
                     .and_then(|value| value.as_str())
                     .map(str::to_string)
             });
+            if let Some(narrowed) = result.get(NARROWED_DEFAULT_FIELDS) {
+                narrowed_default_fields.insert(index_name.clone(), narrowed.clone());
+            }
 
             // The hits move out of the response rather than being copied out of it. On this
             // surface a hit *is* the document — MCP answers with bodies, not with references —
@@ -551,6 +577,14 @@ pub(super) fn search_across_indexes(
             && let Some(obj) = response.as_object_mut()
         {
             obj.insert(APPROXIMATE_SORT_FIELD.to_string(), JsonValue::String(field));
+        }
+        if !narrowed_default_fields.is_empty()
+            && let Some(obj) = response.as_object_mut()
+        {
+            obj.insert(
+                NARROWED_DEFAULT_FIELDS.to_string(),
+                JsonValue::Object(narrowed_default_fields),
+            );
         }
 
         annotate_search_response(&mut response, &query, window, total_hits as usize);

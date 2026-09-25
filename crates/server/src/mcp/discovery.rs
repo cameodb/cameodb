@@ -176,6 +176,7 @@ pub(super) fn validate_query(
                     "shadow": info.is_shadow,
                     "searchable": info.searchable,
                     "queryable": info.is_queryable(),
+                    "default_search": info.default_search,
                     "query_hint": field_query_hint(info),
                 });
                 if let Some(text) = &info.description

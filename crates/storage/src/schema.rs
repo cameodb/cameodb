@@ -139,6 +139,15 @@ impl Serialize for TantivyFieldType {
 }
 
 impl TantivyFieldType {
+    /// Whether an unqualified term can be searched against a field of this type — the types
+    /// that make up the default search fields.
+    pub fn is_default_searchable(&self) -> bool {
+        matches!(
+            self,
+            TantivyFieldType::Text | TantivyFieldType::String | TantivyFieldType::Json
+        )
+    }
+
     /// Convert to string representation (for serialization)
     pub fn to_string(&self) -> &'static str {
         match self {
@@ -961,6 +970,15 @@ pub struct IndexSchema {
     /// over a ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// The fields an unqualified term searches, in priority order. `None` searches every
+    /// indexed text, string and JSON field.
+    ///
+    /// Query-time only: the tantivy index is built the same whichever fields are listed, so
+    /// declaring or changing this needs no reindex and takes effect on the next search. The
+    /// node's `max_default_fields` still applies — a list longer than the cap is cut to its
+    /// first entries — and so does the list's order when it is. See [`select_default_fields`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_fields: Option<Vec<String>>,
     /// Field name to use for routing/sharding (default: "id")
     #[serde(default = "default_routing_field")]
     pub routing_field_name: String,
@@ -981,6 +999,7 @@ impl Default for IndexSchema {
             updated_at: now,
             description: None,
             tenant: None,
+            default_fields: None,
             routing_field_name: "id".to_string(),
             shadow_fields: HashSet::new(),
         }
@@ -1194,8 +1213,55 @@ impl IndexSchema {
         // does: two nodes that disagree about it route the same document to different shards.
         push_str(&mut combined, &self.routing_field_name);
         push_opt(&mut combined, self.description.as_deref());
+        // Hashed only when declared, so every schema written before the field existed keeps the
+        // fingerprint it had: an absent list adding a byte would read as a divergence between
+        // an upgraded node and one that has not been, for a schema neither of them changed.
+        if let Some(default_fields) = &self.default_fields {
+            combined.push(0xD5);
+            combined.extend_from_slice(&(default_fields.len() as u64).to_le_bytes());
+            for name in default_fields {
+                push_str(&mut combined, name);
+            }
+        }
 
         xxh3_64(&combined)
+    }
+
+    /// Check a declared `default_fields` list against this schema.
+    ///
+    /// Every name must be a field this schema indexes as text, string or JSON — the types an
+    /// unqualified term can match — and not a shadow. Refused rather than filtered: a list
+    /// with a typo in it would otherwise quietly search fewer fields than the caller wrote. An
+    /// empty list is refused too, since it reads as "search nothing" and would mean "search
+    /// everything"; omitting the key is how to ask for every field.
+    pub fn validate_default_fields(&self) -> Result<(), String> {
+        let Some(list) = &self.default_fields else {
+            return Ok(());
+        };
+        if list.is_empty() {
+            return Err(
+                "default_fields is empty; omit it to search every text field, or name at least one"
+                    .to_string(),
+            );
+        }
+        let mut seen = HashSet::new();
+        for name in list {
+            if !seen.insert(name.as_str()) {
+                return Err(format!("default_fields names '{name}' twice"));
+            }
+            let Some(field) = self.fields.get(name) else {
+                return Err(format!(
+                    "default_fields names '{name}', which is not a field of this index"
+                ));
+            };
+            if field.is_shadow || !field.indexed || !field.field_type.is_default_searchable() {
+                return Err(format!(
+                    "default_fields names '{name}', which an unqualified term cannot search: \
+                     it must be an indexed text, string or json field"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Check operator-supplied descriptions against their limits.
@@ -1700,4 +1766,40 @@ pub struct SchemaFields {
     pub(crate) seq: Option<Field>,
     /// Map of schema field name -> Tantivy field (only indexed fields are present)
     pub(crate) indexed_fields: HashMap<String, Field>,
+}
+
+/// The fields an unqualified term searches, and whether the cap cut the set short.
+///
+/// `candidates` are the fields the built index can search this way. With a declared list, it is
+/// the list's names that are among them, in the list's order. Without one, it is every candidate
+/// **sorted by name**. Then, when `max` is non-zero, the first `max`.
+///
+/// By name because every shard must pick the same fields: a shard's own field order comes from
+/// iterating a hash map when its index was built, so two shards of one index can hold them in
+/// different orders, and taking "the first 64" in that order would have each shard search a
+/// different 64. Alphabetical is arbitrary, but it is the same arbitrary everywhere and a caller
+/// can predict it. A declared list is how to choose instead.
+pub fn select_default_fields(
+    candidates: impl IntoIterator<Item = String>,
+    declared: Option<&[String]>,
+    max: usize,
+) -> (Vec<String>, bool) {
+    let candidates: HashSet<String> = candidates.into_iter().collect();
+    let mut selected: Vec<String> = match declared {
+        Some(list) => list
+            .iter()
+            .filter(|name| candidates.contains(*name))
+            .cloned()
+            .collect(),
+        None => {
+            let mut all: Vec<String> = candidates.into_iter().collect();
+            all.sort();
+            all
+        }
+    };
+    let truncated = max > 0 && selected.len() > max;
+    if truncated {
+        selected.truncate(max);
+    }
+    (selected, truncated)
 }

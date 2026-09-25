@@ -148,6 +148,8 @@ enabled = false
 # min_prefix_length = 2                 # shortest field:pre* expanded (0 = any); shorter
 #                                       # prefixes match the literal term and are reported
 # expand_unqualified_prefix = false     # true: a bare pre* searches every default text field
+# max_default_fields = 64               # most fields an unqualified term searches (0 = all);
+#                                       # past it, an index's default_fields or its fields by name
 
 # The MCP endpoint itself: which of it is mounted, and how long a conversation with it lives.
 #

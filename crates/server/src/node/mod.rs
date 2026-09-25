@@ -104,8 +104,8 @@ pub(crate) use quota::TenantQuotas;
 pub(crate) use router::{RouterActor, ShardAffineConfig, StreamingSearchConfig};
 pub(crate) use routing::routing_key_without_schema;
 pub(crate) use search::{
-    APPROXIMATE_SORT_FIELD, DISCARDED_CLAUSES_FIELD, SearchWindow, order_hit_blocks,
-    renumber_reasons,
+    APPROXIMATE_SORT_FIELD, DISCARDED_CLAUSES_FIELD, NARROWED_DEFAULT_FIELDS, SearchWindow,
+    order_hit_blocks, renumber_reasons,
 };
 pub(crate) use shard::{ReadPoolHealth, WriterLiveness};
 
@@ -1002,6 +1002,13 @@ pub struct SearchReply {
     /// the same either way.
     #[serde(default)]
     pub approximate_sort: Option<String>,
+    /// The default fields an unqualified term searched, when the node's cap narrowed them; see
+    /// [`storage::SearchOutcome::narrowed_default_fields`].
+    ///
+    /// Defaulted for the same reason as `approximate_sort`, and advisory in the same way: a peer
+    /// that does not send it reads as "not narrowed", and the hits are the same either way.
+    #[serde(default)]
+    pub narrowed_default_fields: Option<storage::NarrowedDefaultFields>,
     /// Nothing survived the parse on this shard; see [`storage::SearchOutcome::emptied`].
     ///
     /// Defaulted for the same reason as `discarded`. A peer that does not send it reads as
@@ -1165,6 +1172,10 @@ pub enum ClientOp {
     UpdateSchema {
         index: String,
         field_updates: BTreeMap<String, bool>,
+        /// `Some(list)` declares the fields an unqualified term searches; `Some([])` clears the
+        /// declaration; `None` leaves it alone. Defaulted so an older peer's op still decodes.
+        #[serde(default)]
+        default_fields: Option<Vec<String>>,
     },
     /// Get index configuration/schema
     GetConfig { index: String },

@@ -3968,3 +3968,191 @@ async fn the_prefix_floor_is_the_configured_one() {
     assert_eq!(body["total_hits"], 2, "the bare prefix expanded: {body}");
     assert!(body.get("_discarded_clauses").is_none(), "{body}");
 }
+
+/// A PATCH of `/_schema` with a raw body, for the requests `patch_schema` does not shape.
+async fn patch_schema_body(
+    node: &TestNode,
+    index: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    with_tls_provider();
+    let response = reqwest::Client::new()
+        .patch(format!("{}/api/{index}/_schema", node.url))
+        .json(&body)
+        .send()
+        .await
+        .expect("patch request");
+    let status = response.status().as_u16();
+    (
+        status,
+        response.json().await.unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// Default search fields through the whole surface: the node's cap, a declared list set by
+/// `PUT /_config` and by `PATCH /_schema`, and what `GET /_config` and the listing report.
+///
+/// Three text fields `a`, `b`, `c`, each holding a word found nowhere else, on a node capped at
+/// two — so whether a bare word matches says which fields it was sent to.
+#[tokio::test]
+async fn default_fields_are_capped_declared_and_reported() {
+    let node = TestNode::start("[security.limits]\nmax_default_fields = 2").await;
+    let text = |name: &str| json!({"name": name, "field_type": "text", "indexed": true});
+    let (status, body) = put_config(
+        &node,
+        "wide",
+        &json!({"fields": {"id": {"name": "id", "field_type": "text", "indexed": true},
+                           "a": text("a"), "b": text("b"), "c": text("c")}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let client = node.client();
+    client
+        .write_document(
+            "wide",
+            "d1",
+            &json!({"id": "d1", "a": "wa", "b": "wb", "c": "wc"}),
+            None,
+        )
+        .await
+        .expect("write");
+    client.admin_index_commit("wide").await.expect("commit");
+
+    let hits = |node: &TestNode, query: &'static str| {
+        let node_url = node.url.clone();
+        async move {
+            with_tls_provider();
+            let body: serde_json::Value = reqwest::Client::new()
+                .post(format!("{node_url}/api/wide/search"))
+                .json(&json!({"query": query, "limit": 10}))
+                .send()
+                .await
+                .expect("search")
+                .json()
+                .await
+                .expect("json");
+            assert!(
+                body.get("_discarded_clauses").is_none(),
+                "narrowing is not a dropped clause: {body}"
+            );
+            body["total_hits"].as_u64().unwrap_or(0)
+        }
+    };
+
+    // Undeclared, past the cap: the first two by name, narrowed rather than refused.
+    assert_eq!(hits(&node, "wa").await, 1);
+    assert_eq!(hits(&node, "wc").await, 0);
+    assert_eq!(
+        hits(&node, "c:wc").await,
+        1,
+        "a named field is always reached"
+    );
+
+    // The response says it was narrowed, beside the hits — and only for a bare term.
+    let (_, body) = post_json(
+        &node,
+        "/api/wide/search",
+        json!({"query": "wa", "limit": 10}),
+    )
+    .await;
+    assert_eq!(
+        body["_narrowed_default_fields"],
+        json!({"searched": ["a", "b"], "available": 3, "declared": false}),
+        "{body}"
+    );
+    let (_, body) = post_json(
+        &node,
+        "/api/wide/search",
+        json!({"query": "c:wc", "limit": 10}),
+    )
+    .await;
+    assert!(body.get("_narrowed_default_fields").is_none(), "{body}");
+
+    let config = get_json(&node, "/api/wide/_config").await;
+    assert_eq!(config["searched_by_default"], json!(["a", "b"]), "{config}");
+    assert_eq!(config["default_fields_truncated"], true, "{config}");
+    assert!(
+        config.get("default_fields").is_none(),
+        "nothing declared: {config}"
+    );
+
+    // Declared by PATCH, no rebuild: the next search follows it.
+    let (status, body) = patch_schema_body(&node, "wide", json!({"default_fields": ["c"]})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hits(&node, "wc").await, 1);
+    assert_eq!(hits(&node, "wa").await, 0);
+    // A declared list within the cap narrowed nothing, so nothing is reported.
+    let (_, body) = post_json(
+        &node,
+        "/api/wide/search",
+        json!({"query": "wc", "limit": 10}),
+    )
+    .await;
+    assert!(body.get("_narrowed_default_fields").is_none(), "{body}");
+
+    let config = get_json(&node, "/api/wide/_config").await;
+    assert_eq!(
+        config["default_fields"],
+        json!(["c"]),
+        "declared, for PUT to round-trip"
+    );
+    assert_eq!(config["searched_by_default"], json!(["c"]));
+    assert!(config.get("default_fields_truncated").is_none(), "{config}");
+    let default_search: Vec<(String, bool)> = config["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["name"].as_str().unwrap().to_string(),
+                f["default_search"].as_bool().unwrap(),
+            )
+        })
+        .filter(|(name, _)| ["a", "b", "c"].contains(&name.as_str()))
+        .collect();
+    assert_eq!(
+        default_search,
+        [
+            ("a".to_string(), false),
+            ("b".to_string(), false),
+            ("c".to_string(), true)
+        ]
+    );
+
+    // The listing reports the same.
+    let listing = get_json(&node, "/_indexes").await;
+    let entry = listing["indexes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["name"] == "wide")
+        .expect("listed")
+        .clone();
+    assert_eq!(entry["searched_by_default"], json!(["c"]), "{entry}");
+
+    // Refused: a name that is not a field, and un-indexing a listed field.
+    let (status, body) =
+        patch_schema_body(&node, "wide", json!({"default_fields": ["nope"]})).await;
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = patch_schema(&node, "wide", &json!({"c": false})).await;
+    assert_eq!(
+        status, 400,
+        "un-indexing a listed field must be refused: {body}"
+    );
+    assert!(body.to_string().contains("default_fields"), "{body}");
+
+    // A PUT naming a field that is not in its own schema is refused too.
+    let (status, body) = put_config(
+        &node,
+        "other",
+        &json!({"fields": {"a": text("a")}, "default_fields": ["zz"]}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+
+    // Cleared with an empty list: back to the capped default.
+    let (status, body) = patch_schema_body(&node, "wide", json!({"default_fields": []})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hits(&node, "wa").await, 1);
+    assert_eq!(hits(&node, "wc").await, 0);
+}

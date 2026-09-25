@@ -118,6 +118,18 @@ pub struct McpLimitsConfig {
     #[serde(default)]
     pub expand_unqualified_prefix: bool,
 
+    /// Most fields an unqualified term searches. `0` searches every one.
+    ///
+    /// An unqualified term is one clause per default field — every indexed text, string and
+    /// JSON field — and its cost grows worse than linearly with their number. Measured on one
+    /// shard (ROADMAP M8), where the fields share a vocabulary: at 1M documents a 5-term query
+    /// cost 120 ms across 32 fields and 513 ms across 64; at 200k documents it cost 5.2 s across
+    /// 400. A query that names its field is unaffected at any width. Past the cap the index's
+    /// declared `default_fields`, in order, or else its fields by name, are searched up to the
+    /// cap — narrowed, not refused.
+    #[serde(default = "default_max_default_fields")]
+    pub max_default_fields: usize,
+
     /// Moved to `[limits] max_response_bytes`. Read from here until 0.4.0.
     ///
     /// Kept as a field rather than left to fall through as an unknown key, because this
@@ -148,6 +160,17 @@ fn default_min_prefix_length() -> usize {
     DEFAULT_MIN_PREFIX_LENGTH
 }
 
+/// The default-field cap when an operator sets none.
+///
+/// Generous on purpose: a handful of text fields is the ordinary schema and even a wide CSV or
+/// log import rarely reaches this many. What it stops is the far end of the curve, where one
+/// unqualified query costs seconds per shard.
+pub const DEFAULT_MAX_DEFAULT_FIELDS: usize = 64;
+
+fn default_max_default_fields() -> usize {
+    DEFAULT_MAX_DEFAULT_FIELDS
+}
+
 /// The query policy a node runs with when `[security.limits]` says nothing.
 pub(crate) fn default_query_policy() -> storage::QueryPolicy {
     McpLimitsConfig::default().query_policy()
@@ -176,6 +199,7 @@ impl Default for McpLimitsConfig {
             max_federated_indexes: default_max_federated_indexes(),
             min_prefix_length: default_min_prefix_length(),
             expand_unqualified_prefix: false,
+            max_default_fields: default_max_default_fields(),
             max_response_bytes: None,
         }
     }
@@ -187,6 +211,7 @@ impl McpLimitsConfig {
         storage::QueryPolicy {
             min_prefix_length: self.min_prefix_length,
             expand_unqualified_prefix: self.expand_unqualified_prefix,
+            max_default_fields: self.max_default_fields,
         }
     }
 

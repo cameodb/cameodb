@@ -142,6 +142,16 @@ pub struct QueryPolicy {
     /// becomes one prefix range per text default field, OR'd — the same fields an unqualified term
     /// searches, so its cost is a prefix's cost times their number.
     pub expand_unqualified_prefix: bool,
+
+    /// Most fields an unqualified term searches; `0` searches every one.
+    ///
+    /// Every indexed text, string and JSON field is a default field, and an unqualified term is
+    /// one clause per default field — so its cost grows with the schema's width, which the
+    /// tenant chooses. Measured (ROADMAP M8), worse than linearly: when the fields share a
+    /// vocabulary, doubling them multiplies the cost by about four. Past the cap the first
+    /// `max_default_fields` are searched, by name, or by the index's declared `default_fields`
+    /// order; see [`select_default_fields`].
+    pub max_default_fields: usize,
 }
 
 /// The results of a search, and the clauses that did not survive parsing.
@@ -169,6 +179,16 @@ pub struct SearchOutcome {
     ///
     /// `None` whenever the order is exact, which is every other sort and every unsorted search.
     pub approximate_sort: Option<String>,
+    /// The default fields a term with no field in front of it searched, when the node's
+    /// `max_default_fields` cut them short.
+    ///
+    /// Set only when both hold: the cap narrowed this index's default fields, and the query
+    /// actually had an unqualified clause — a query naming every field it searches reached them
+    /// all, and saying otherwise would be noise. Separate from [`Self::discarded`] for the
+    /// reason [`Self::approximate_sort`] is: nothing was dropped, the query ran as the node's
+    /// policy defines it, and a caller that reads a discarded clause as "this is not the query I
+    /// wrote" — as the MCP tools do, refusing the search — would be wrong to here.
+    pub narrowed_default_fields: Option<NarrowedDefaultFields>,
     /// Every clause was discarded, so the query that ran was empty and matched nothing.
     ///
     /// Distinct from a `discarded` list that still left something to run: those hits answer a
@@ -193,9 +213,23 @@ impl SearchOutcome {
             total_hits,
             discarded,
             approximate_sort: None,
+            narrowed_default_fields: None,
             emptied,
         }
     }
+}
+
+/// Which default fields an unqualified term searched, out of how many it could have.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NarrowedDefaultFields {
+    /// The fields searched, in the order they were chosen: the index's declared `default_fields`
+    /// order, or by name.
+    pub searched: Vec<String>,
+    /// How many default fields the index has — or, with a declared list, how many it lists —
+    /// before the cap.
+    pub available: usize,
+    /// Whether the fields came from the index's declared `default_fields` rather than by name.
+    pub declared: bool,
 }
 
 /// What parsing a query against an index found, without running it.

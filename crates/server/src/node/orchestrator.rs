@@ -1171,6 +1171,8 @@ pub(super) struct BroadcastStats {
     pub(super) discarded: Vec<String>,
     /// The approximated sort field, if any node reported one; see [`APPROXIMATE_SORT_FIELD`].
     pub(super) approximate_sort: Option<String>,
+    /// The narrowed default fields, if any node reported them; see [`NARROWED_DEFAULT_FIELDS`].
+    pub(super) narrowed_default_fields: Option<storage::NarrowedDefaultFields>,
 }
 
 /// Whether a shard's failure is the request's fault rather than this node's.
@@ -3539,10 +3541,62 @@ impl NodeOrchestrator {
     /// `_seq` is omitted everywhere. It is WAL bookkeeping, and offering it as a queryable field
     /// invites a query that cannot mean anything. Filtering it in one place also settles an
     /// inconsistency where one response reported two different field counts.
+    /// The fields an unqualified term searches on this index, and whether the cap cut them short.
+    ///
+    /// The same selection the query path makes ([`storage::select_default_fields`]), fed from the
+    /// schema and the built index's searchable set rather than from a tantivy schema, so what a
+    /// caller is told a bare term searches is what it searches. `id` is never among them: it is
+    /// answered by exact lookup, not by the default fields.
+    pub(super) fn searched_by_default(
+        schema: &IndexSchema,
+        searchable: &HashSet<String>,
+        max_default_fields: usize,
+    ) -> (Vec<String>, bool) {
+        let candidates = searchable
+            .iter()
+            .filter(|name| name.as_str() != "id")
+            .filter(|name| {
+                schema.fields.get(*name).is_some_and(|field| {
+                    field.field_type.is_default_searchable() && !field.is_shadow
+                })
+            })
+            .cloned();
+        storage::select_default_fields(
+            candidates,
+            schema.default_fields.as_deref(),
+            max_default_fields,
+        )
+    }
+
+    /// Index-level keys describing default search: the declared list (under the name `PUT
+    /// /_config` accepts, so a read-modify-write keeps it), what a bare term actually searches,
+    /// and whether the cap narrowed it.
+    pub(super) fn insert_default_search(
+        map: &mut JsonMap<String, JsonValue>,
+        schema: &IndexSchema,
+        searched: &[String],
+        truncated: bool,
+    ) {
+        if let Some(declared) = &schema.default_fields {
+            map.insert("default_fields".to_string(), serde_json::json!(declared));
+        }
+        map.insert(
+            "searched_by_default".to_string(),
+            serde_json::json!(searched),
+        );
+        if truncated {
+            map.insert(
+                "default_fields_truncated".to_string(),
+                JsonValue::Bool(true),
+            );
+        }
+    }
+
     pub(super) fn describe_fields(
         schema: &IndexSchema,
         searchable: &HashSet<String>,
         sortable: &HashSet<String>,
+        searched: &[String],
     ) -> Vec<JsonValue> {
         let document_key = storage::document_key_field(schema);
         Self::sorted_field_names(schema)
@@ -3567,6 +3621,11 @@ impl NodeOrchestrator {
                 entry.insert(
                     "sortable".to_string(),
                     JsonValue::Bool(sortable.contains(&name)),
+                );
+                // Whether a term with no field in front of it reaches this one.
+                entry.insert(
+                    "default_search".to_string(),
+                    JsonValue::Bool(searched.contains(&name)),
                 );
                 // The key under a name that is not its own, which happens on a shadow index
                 // and nowhere else.
@@ -3603,6 +3662,7 @@ impl NodeOrchestrator {
         schema: &IndexSchema,
         searchable: &HashSet<String>,
         sortable: &HashSet<String>,
+        max_default_fields: usize,
     ) -> JsonValue {
         let mut map = JsonMap::new();
         map.insert("name".to_string(), JsonValue::String(index.to_string()));
@@ -3622,7 +3682,10 @@ impl NodeOrchestrator {
                 JsonValue::String(description.clone()),
             );
         }
-        let fields = Self::describe_fields(schema, searchable, sortable);
+        let (searched, truncated) =
+            Self::searched_by_default(schema, searchable, max_default_fields);
+        Self::insert_default_search(&mut map, schema, &searched, truncated);
+        let fields = Self::describe_fields(schema, searchable, sortable, &searched);
         map.insert("field_count".to_string(), JsonValue::from(fields.len()));
         map.insert("fields".to_string(), JsonValue::Array(fields));
         JsonValue::Object(map)
@@ -4679,7 +4742,11 @@ impl NodeOrchestrator {
             ClientOp::UpdateSchema {
                 index,
                 field_updates,
-            } => self.orch_update_schema(&index, &field_updates).await,
+                default_fields,
+            } => {
+                self.orch_update_schema(&index, &field_updates, default_fields.as_deref())
+                    .await
+            }
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
             // Read from durable state, not from the lazily-filled cache: this answer is what a
             // peer uses to decide whether it may invent a schema, so "I have not looked yet"
@@ -5322,6 +5389,15 @@ impl NodeOrchestrator {
             self.quotas.check_mint(tenant, owned)?;
         }
 
+        // A declared default-field list names fields of this schema, or it is refused: a typo
+        // left to be filtered out at query time would search fewer fields than the caller wrote,
+        // and nothing would say so. Its length is not checked against the node's cap — the cap
+        // is node config and can change after the list is written, so it is applied where the
+        // query runs, to the list's first entries.
+        schema
+            .validate_default_fields()
+            .map_err(OrchestratorError::Validation)?;
+
         // Ensure 'id' field is explicitly in the schema for visibility
         if !schema.fields.contains_key("id") {
             schema.fields.insert(
@@ -5418,6 +5494,7 @@ impl NodeOrchestrator {
         &self,
         index: &str,
         field_updates: &BTreeMap<String, bool>,
+        default_fields: Option<&[String]>,
     ) -> Result<JsonValue, OrchestratorError> {
         let stores: Vec<Arc<HybridStore>> = self
             .shards
@@ -5431,17 +5508,70 @@ impl NodeOrchestrator {
             ));
         }
 
-        let plan = self
-            .fan_out_schema_update(&stores, index, field_updates, true)
-            .await?;
-
-        if plan.is_rejected() {
-            return Ok(Self::schema_update_response(index, &plan));
+        // Judge the schema this request would leave, before any shard writes. Two things can
+        // make a declared list wrong: the list itself, and a flag in the same request turning off
+        // a field it names — the edit that would leave an unqualified term pointed at a field
+        // that no longer matches anything. Both are refused whole.
+        if default_fields.is_some() || field_updates.values().any(|indexed| !indexed) {
+            let Some(current) = self.durable_schema(index).await? else {
+                return Err(OrchestratorError::Storage(
+                    storage::StoreError::IndexNotFound(index.to_string()),
+                ));
+            };
+            let mut proposed = (*current).clone();
+            for (name, indexed) in field_updates {
+                if let Some(field) = proposed.fields.get_mut(name) {
+                    field.indexed = *indexed;
+                }
+            }
+            if let Some(list) = default_fields {
+                proposed.default_fields = (!list.is_empty()).then(|| list.to_vec());
+            }
+            proposed.validate_default_fields().map_err(|reason| {
+                OrchestratorError::Validation(if default_fields.is_some() {
+                    reason
+                } else {
+                    format!(
+                        "{reason}; it is listed in default_fields, so remove it from the list \
+                         first, or in the same request"
+                    )
+                })
+            })?;
         }
 
-        let applied = self
-            .fan_out_schema_update(&stores, index, field_updates, false)
-            .await?;
+        let applied = if field_updates.is_empty() {
+            SchemaFieldUpdate::default()
+        } else {
+            let plan = self
+                .fan_out_schema_update(&stores, index, field_updates, true)
+                .await?;
+
+            if plan.is_rejected() {
+                return Ok(Self::schema_update_response(index, &plan));
+            }
+
+            self.fan_out_schema_update(&stores, index, field_updates, false)
+                .await?
+        };
+
+        if let Some(list) = default_fields {
+            let declared = (!list.is_empty()).then(|| list.to_vec());
+            let handles: Vec<_> = stores
+                .iter()
+                .map(|store| {
+                    let store = Arc::clone(store);
+                    let idx = index.to_string();
+                    let declared = declared.clone();
+                    tokio::task::spawn_blocking(move || store.set_default_fields(&idx, declared))
+                })
+                .collect();
+            for handle in handles {
+                handle
+                    .await
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+                    .map_err(OrchestratorError::Storage)?;
+            }
+        }
 
         // Every shard now agrees on the stored schema, so refresh the orchestrator's own copy
         // from one of them rather than reconstructing what it should be.
@@ -5458,7 +5588,15 @@ impl NodeOrchestrator {
             "Schema field flags updated across shards"
         );
 
-        Ok(Self::schema_update_response(index, &applied))
+        let mut response = Self::schema_update_response(index, &applied);
+        if let Some(list) = default_fields {
+            response["default_fields"] = if list.is_empty() {
+                JsonValue::Null
+            } else {
+                serde_json::json!(list)
+            };
+        }
+        Ok(response)
     }
 
     /// Run the plan or apply half of a schema update on every shard and merge the verdicts.
@@ -5594,7 +5732,13 @@ impl NodeOrchestrator {
                         "Schema found in shard"
                     );
                     let (searchable, sortable) = self.field_capabilities_across_shards(index).await;
-                    return Ok(Self::schema_response(index, &s, &searchable, &sortable));
+                    return Ok(Self::schema_response(
+                        index,
+                        &s,
+                        &searchable,
+                        &sortable,
+                        store.query_policy().max_default_fields,
+                    ));
                 }
             }
         }
@@ -5733,6 +5877,12 @@ pub(super) async fn list_indexes(
 
     let mut all: HashMap<String, IndexTotals> = HashMap::new();
 
+    // Every shard runs the node's one policy; read it once for the default-field report.
+    let max_default_fields = shards
+        .values()
+        .find_map(|shard| shard.store.as_ref())
+        .map_or(0, |store| store.query_policy().max_default_fields);
+
     // Create GetShardStats message
     let msg = GetShardStats { include_data_size };
 
@@ -5861,7 +6011,16 @@ pub(super) async fn list_indexes(
                         JsonValue::String(description.clone()),
                     );
                 }
-                let fields = NodeOrchestrator::describe_fields(&schema, &searchable, &sortable);
+                let (searched, truncated) =
+                    NodeOrchestrator::searched_by_default(&schema, &searchable, max_default_fields);
+                NodeOrchestrator::insert_default_search(
+                    &mut json_obj,
+                    &schema,
+                    &searched,
+                    truncated,
+                );
+                let fields =
+                    NodeOrchestrator::describe_fields(&schema, &searchable, &sortable, &searched);
                 json_obj.insert("field_count".to_string(), JsonValue::from(fields.len()));
                 json_obj.insert("fields".to_string(), JsonValue::Array(fields));
             }

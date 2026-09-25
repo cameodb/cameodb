@@ -326,6 +326,11 @@ pub const RULES: &[&str] = &[
      `shadow`. Fields discovered from a document are added unindexed, and stay that way until a \
      schema update promotes them, so check the `indexed` flag before naming a field.",
     SHADOW_FIELD,
+    "A term with no field in front of it searches the index's default fields, which may be fewer \
+     than all of its text fields: an index can declare them, and a node caps how many are \
+     searched. Each field's `default_search` flag says whether a bare term reaches it, and a \
+     search the cap narrowed carries `_narrowed_default_fields` naming the fields it reached — \
+     name the field to search one that it does not.",
     "Every date literal form works wherever a date value goes: alone, in a range, after a \
      comparison, and in an `IN` set. But a date matched *alone* is an exact instant, so \
      `created:2024-06-15` means midnight precisely and matches nothing unless a document sits on \
