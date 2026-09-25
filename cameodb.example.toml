@@ -115,6 +115,17 @@ enabled = false
 # startup, as is one naming an index outside allowed_indexes (which would read as
 # protection and provide none). Enforced on REST and on /mcp alike.
 # index_overrides = { audit = "reader" }
+#
+# The tenant this key acts for. Indexes it creates are owned by that tenant and count
+# against [security.tenants.<name>] below; keys naming the same tenant share its quota.
+# tenant = "team-a"
+
+# What one tenant's indexes may add up to on this node. Both 0 (unlimited) by default, and a
+# tenant with no entry here has no ceiling. max_indexes is exact; max_bytes is checked against
+# a reading refreshed every 10s, so a tenant can overshoot by that much ingest. Refused 403.
+# [security.tenants.team-a]
+# max_indexes = 20
+# max_bytes = 53687091200               # 50 GiB
 
 # What one caller may spend per minute. Both meters off by default.
 #

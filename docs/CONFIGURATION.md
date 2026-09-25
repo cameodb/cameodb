@@ -631,6 +631,9 @@ allowed_indexes = ["docs", "wiki"]
 # Optional: hold a reduced role on a named index. This key writes to "wiki" and
 # reads "docs", with one key rather than two.
 index_overrides = { docs = "reader" }
+# Optional: the tenant this key acts for. Indexes it creates are owned by that
+# tenant and count against [security.tenants.<name>].
+tenant = "team-a"
 
 [[security.api_keys]]
 # Or keep the digest out of the config file entirely
@@ -704,6 +707,64 @@ you only discover on the day you turn authentication on. These all refuse to sta
 - `allowed_indexes = []`, which reads as "no restriction" but means "no index at all"
 - an `index_overrides` entry that grants more than the key's own role
 - an `index_overrides` entry naming an index outside `allowed_indexes`
+- a blank `tenant`
+
+### Tenant quotas (`[security.tenants]`)
+
+A key may carry a `tenant`. The tenant owns every index that key creates, and
+`[security.tenants.<name>]` bounds what those indexes may add up to on this node:
+
+```toml
+[[security.api_keys]]
+key_hash_file = "/etc/cameodb/keys/acme"
+role = "writer"
+label = "acme-ingest"
+tenant = "acme"
+
+[security.tenants.acme]
+max_indexes = 20                 # most indexes acme may own (0 = unlimited)
+max_bytes = 53687091200          # 50 GiB across all of them (0 = unlimited)
+```
+
+Both ceilings default to `0`, unlimited, and a tenant with no `[security.tenants]` entry has no
+ceiling at all — so an upgrade, or a key given a tenant before anyone has decided its limits,
+changes nothing. Several keys may name one tenant; they share its quota.
+
+**Ownership is decided once, when the index is created,** and stamped on its schema. The stamp
+comes from the key, never the request body: a write or `PUT /_config` naming someone else's
+tenant, or none, is overwritten with the caller's own. Later writes do not move it — a tenant
+cannot shed usage by having another key write into their index — and re-declaring the schema
+with an admin key keeps the owner. A key with no tenant creates indexes nobody owns, which no
+quota counts.
+
+**`max_indexes` is exact.** It is checked when an index is created, by either path — the
+implicit creation a write performs and `PUT /api/{index}/_config` — and both happen on the
+orchestrator's single mailbox, so two concurrent creations cannot both slip under the ceiling.
+The count is of live indexes: clearing an index's documents (`DELETE /api/{index}`) leaves it,
+and its slot, in place; dropping it with `?delete_schema=true` frees the slot.
+
+**`max_bytes` can be overshot by up to ten seconds of ingest.** Usage is the listing's
+`total_size_bytes` — tantivy plus the document store — summed over the tenant's indexes, and
+it is measured off the write path and refreshed at most every ten seconds rather than
+recomputed per write, since an exact figure is a directory walk per index on every request.
+Writes are checked against the latest reading, so a tenant writing flat out can land one
+refresh interval's worth of data past the ceiling before being refused. Set the ceiling with
+that margin in mind. The first write after startup has no reading to check against and starts
+one.
+
+Bytes are charged to the index's **owner**, not the key writing: once a tenant is at their
+ceiling, a write into one of their indexes is refused whoever sends it, including an admin key.
+Raising the ceiling, or deleting data, is the remedy — the refusal names both.
+
+Refusals answer **`403`** and name the tenant and the ceiling:
+
+```json
+{"error": "quota exceeded for tenant 'acme': tenant already owns 20 of 20 permitted indexes; delete one or ask the operator to raise max_indexes"}
+```
+
+Not a `400`, since nothing about the request is malformed, and not a `503`, since retrying the
+same request will not help until room is made. Quotas are per node: in a cluster each node
+holds its own share of a tenant's data and checks its own ceiling.
 
 ### Rate limiting tool calls, search and writes (`[security.limits]`)
 

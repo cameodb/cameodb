@@ -52,7 +52,7 @@ on one.
 | 14 — Security hardening (posture items C3–C8) | ✅ Done | C3–C8 all closed; C8 by M3 on 2026-09-20 |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
-| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed but for O4; M1, M2, M3 and M7 done — the blocker is cleared and the surface is metered. M4 and M5 are the two remaining builds and the M8 decision is owed. M6 is measurement only; its first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), and the arms themselves are still owed |
+| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed but for O4; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; the M8 decision is owed. M6 is measurement only; its first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), and the arms themselves are still owed |
 
 ## Reconciliation, 2026-08-26
 
@@ -4493,12 +4493,53 @@ that assert the surface stays *open* — unmetered by default, and unmetered by 
 
 ### M4 — Per-key resource quotas
 
-📋 **Planned**, and new — nothing in `config.rs` caps anything per key today. With M1 bounding
-the node and M3 bounding the rate, what remains unbounded is the total a single tenant
-accumulates: index count, document count, bytes on disk. The minimum useful set is a cap on
-indexes per key and a cap on bytes per key, refused at the same ingress chokepoint B1's
-allow-list uses, with `security.implicit_index_creation` as the precedent for the shape — a
-refusal that names the remedy, not a silent truncation. Unlimited by default.
+✅ **Done 2026-09-25.** Built per *tenant* rather than per key, which is what the heading's
+"single tenant" meant: a key carries `tenant = "acme"`, keys naming one tenant share its quota,
+and `[security.tenants.acme]` sets `max_indexes` and `max_bytes`. Both `0`, unlimited, by
+default, and a tenant with no entry has no ceiling — an upgrade changes nothing until an
+operator writes one. Document count was dropped from the minimum set: bytes bound the disk,
+count bounds resident memory, and a document cap bounds neither better than those two do.
+
+**Ownership is a stamp on the schema, written once at the mint.** `IndexSchema.tenant` is set
+where the index is created and nowhere else — not refreshed on later writes, so a tenant cannot
+shed usage by having another key write once. Two holes were found wiring it and closed before
+enforcement landed: a body-supplied `tenant` on a write or `PUT /_config` (now overwritten from
+the key at the handler), and an admin re-declaration silently unstamping an index and handing
+its owner their quota back (now preserved from durable state unless the prior record is a
+deletion, in which case the declaring key owns what it creates).
+
+**`max_indexes` is exact, at both mints.** The implicit mint in `staged_schema_validation` and
+the explicit one in `orch_create_config` both run on the orchestrator mailbox, so a count taken
+there from durable schemas cannot race another mint. Counted fresh per mint rather than cached —
+mints are rare, and a running total is the thing that drifts. Clearing an index's data keeps its
+schema and so its slot; `?delete_schema=true` frees it. The integration test caught that
+distinction, and the test was wrong, not the code.
+
+**`max_bytes` is checked against a reading, and the overshoot is stated.** A per-write exact
+figure is a directory walk per index, the cost `commit_index` had removed. Instead
+`TenantQuotas` holds a reading — the listing's `total_size_bytes` per index, summed under its
+owner — refreshed off the write path, single-flight, when a write finds it older than 10s. A
+stale reading still decides, so no write waits on a measurement; a refresh that fails or hangs
+(30s timeout) keeps the previous reading and clears its flag, so it cannot wedge the table. The
+cost is up to one interval of ingest past the ceiling, and that is in CONFIGURATION.md, not
+glossed. Bytes are charged to the index's owner, not the writer: an admin writing into a tenant's
+index at its ceiling is refused too. Checked on all four write paths (engine and actor, single
+and bulk); for a write that mints, the minting tenant is the owner, so a fresh index is no way
+round the ceiling. Per node: in a cluster each node checks its own share.
+
+**Refused `403`, with its own verdict.** `OrchestratorError::QuotaExceeded` →
+`RemoteVerdict::QuotaExceeded` (wire tag `quota-exceeded`), so a peer's refusal of a forwarded
+write stays a refusal rather than reading as a `500` that invites a retry that cannot succeed.
+Not `400` (nothing is malformed) and not `503` (retrying unchanged will not help). MCP maps it to
+a caller error.
+
+Tests: eight unit tests on the decisions (no entry is no ceiling, `0` is unlimited per ceiling,
+refused *at* the cap and only for that tenant, unowned writes never refused, no reading allows,
+byte ceiling per tenant, a stale reading decides then is replaced, owner follows stamp or mint),
+the verdict surviving the wire, and two integration tests against the real binary — the
+index ceiling on both mint paths with another tenant, the operator and an emptied index checked
+alongside, and the byte ceiling refusing within one refresh interval, including through a fresh
+index and an admin key.
 
 ### M5 — Per-index capability subtraction
 
@@ -4802,7 +4843,7 @@ change and it does not belong in a patch.
 **Exit criteria for 0.3.5.** Resident memory is a function of data held rather than of index
 names touched (M1, shown by a run that opens far more indexes than the cap); a compressed
 ingest cannot expand past a stated ceiling (M2); every write route refuses past a per-key rate
-(M3) and past a per-key total (M4); one key can be granted read-only on one index while keeping
+(M3) and past a per-tenant total (M4); one key can be granted read-only on one index while keeping
 write elsewhere (M5); an open-loop arm on the bulk lane and on the single-write lane both show
 goodput that degrades rather than collapsing (M6); an evolving write costs one transaction and
 one fsync rather than two, with no window between the document and the schema that made it

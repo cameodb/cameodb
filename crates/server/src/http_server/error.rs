@@ -48,6 +48,15 @@ impl AppError {
         }
     }
 
+    /// 403 with an explicit, client-safe message.
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        Self {
+            error: anyhow::anyhow!("{}", msg.into()),
+            status: Some(StatusCode::FORBIDDEN),
+            retry_after_secs: None,
+        }
+    }
+
     /// 404 with an explicit, client-safe message.
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self {
@@ -107,6 +116,9 @@ impl AppError {
             // so it is a `503` for the same reason `Unavailable` is: nothing about the request
             // is wrong and retrying is the right move.
             RemoteVerdict::SchemaRequired => Self::service_unavailable(err.to_string()),
+            // The tenant is at a ceiling. The message names which one and how to make room, so
+            // it is shown rather than masked — it is the caller's to act on.
+            RemoteVerdict::QuotaExceeded => Self::forbidden(err.to_string()),
             // No explicit status, so `into_response` masks the text and logs it. The caller
             // learns nothing useful from this node's internals; the operator reads them.
             RemoteVerdict::ServerFault => Self::from(err),

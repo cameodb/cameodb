@@ -443,6 +443,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Tenant quotas: a key may carry a `tenant`, and `[security.tenants.<name>]` bounds what that
+  tenant's indexes add up to.** The index a tenanted key creates is stamped with its tenant at
+  creation — from the key, never the request body, and never moved afterwards, so re-declaring
+  a schema with an admin key cannot unstamp it. `max_indexes` is checked at creation on both
+  paths, a write's implicit creation and `PUT /_config`, and is exact: both run on the
+  orchestrator's mailbox, so concurrent creations cannot both slip under it. `max_bytes` is
+  checked on every write to the tenant's indexes against a usage reading refreshed off the
+  write path every ten seconds, so a tenant can overshoot by up to that much ingest — the
+  alternative is a directory walk per index per write. Refusals answer `403` naming the tenant
+  and the ceiling. Both ceilings default to `0`, unlimited, and a tenant with no entry has none,
+  so an upgrade changes nothing until an operator writes one.
+
+- **`index_overrides` holds a key to a reduced role on named indexes.** A `writer` that must be
+  read-only on one sensitive index keeps write everywhere else with one key rather than two:
+  `index_overrides = { audit = "reader" }`. Subtraction only — an override granting a
+  capability the key's own role lacks, or naming an index outside `allowed_indexes`, is refused
+  at startup. Enforced on REST and on `/mcp` alike; a refusal names the effective role, so it
+  reads differently from an index outside `allowed_indexes`.
+
 - **Per-caller rate limiting on the write surface, and a bucket of their own for anonymous
   callers.** Every write route — `PUT /api/{index}/document`, `DELETE .../document`,
   `POST .../_bulk`, `POST .../_bulk/delete` and `POST .../document/stream` — was governed only

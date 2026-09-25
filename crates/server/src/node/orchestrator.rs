@@ -2295,6 +2295,8 @@ pub(super) struct OrchestratorEngine {
     /// lookup keyed by a hash of the field names used to sit in front of this and answered
     /// with whichever index of that shape was cached last — see `IndexSchema::calculate_fingerprint`.
     pub(super) schema_cache: Arc<SchemaCache>,
+    /// Tenant ceilings — the byte check runs on this lane's writes too.
+    pub(super) quotas: Arc<TenantQuotas>,
     /// Coordinator actor reference for shard assignments and peer lookups.
     pub(super) coordinator: Option<ActorRef<ClusterCoordinator>>,
     /// Node identity for response metadata, and the answer to `GetIdentity`.
@@ -2504,6 +2506,9 @@ impl OrchestratorEngine {
 
         // Lock-free schema lookup, by the one thing that identifies an index: its name.
         let schema = self.load_schema(index).await?;
+        // An index with no schema yet has no owner here; the actor's mint decides one and
+        // checks it there.
+        self.quotas.check_write(schema.tenant.as_deref(), &shards)?;
 
         let ring = self.routing_ring.load_full();
         let ctx = WriteCtx {
@@ -2615,6 +2620,7 @@ impl OrchestratorEngine {
         }
 
         let schema = self.load_schema(index).await?;
+        self.quotas.check_write(schema.tenant.as_deref(), &shards)?;
         // An empty or dropped schema is an index whose shape is still being settled — the
         // actor's staged validation samples and canvasses to decide it, which is a schema
         // write and therefore not this lane's.
@@ -2766,6 +2772,9 @@ pub(crate) struct NodeOrchestrator {
     /// Per-index schema cache to avoid repeated metadata reads (lock-free via ArcSwap).
     /// Wrapped in Arc so it can be shared with the OrchestratorEngine worker pool.
     pub(super) schema_cache: Arc<SchemaCache>,
+    /// Tenant ceilings and the usage reading they are checked against, shared with the engine
+    /// so a reading taken on either write lane serves both.
+    pub(super) quotas: Arc<TenantQuotas>,
     /// Default search result limit when not specified in request
     pub(super) default_search_limit: usize,
     pub(super) max_concurrent_shard_searches: usize,
@@ -3169,6 +3178,14 @@ impl NodeOrchestrator {
                     "index '{index}' does not exist and this node does not create indexes \
                      implicitly; create it with PUT /api/{index}/_config before writing"
                 )));
+            }
+            // A mint is the one moment a tenant's index count grows, and this mailbox is the
+            // only place one happens, so a count taken here cannot race another.
+            if let Some(tenant) = tenant
+                && self.quotas.max_indexes(tenant).is_some()
+            {
+                let owned = owned_index_count(&self.shards, tenant).await?;
+                self.quotas.check_mint(tenant, owned)?;
             }
             let sampled_schema = enhanced_schema_sampling(&docs, SCHEMA_SAMPLE_LIMIT);
             let sampled_field_count = sampled_schema.fields.len();
@@ -3701,6 +3718,7 @@ impl NodeOrchestrator {
         let read_budget = (config.request_timeout_secs > 0)
             .then(|| Duration::from_secs(config.request_timeout_secs));
 
+        let quotas = Arc::new(TenantQuotas::new(config.tenant_quotas.clone()));
         let mut orchestrator = Self {
             mailbox_lane: MailboxLane::new(),
             shards: HashMap::new(),
@@ -3713,6 +3731,7 @@ impl NodeOrchestrator {
             core_layout: CoreLayout::detect(),
             placement: Arc::new(ArcSwap::from_pointee(ShardPlacement::default())),
             schema_cache: Arc::new(SchemaCache::new()),
+            quotas,
             default_search_limit,
             max_concurrent_shard_searches,
             engine: None,
@@ -3780,6 +3799,7 @@ impl NodeOrchestrator {
             shards: ArcSwap::from_pointee(self.shards.clone()),
             routing_ring: Arc::clone(&self.shared_routing_ring),
             schema_cache: Arc::clone(&self.schema_cache),
+            quotas: Arc::clone(&self.quotas),
             coordinator: self.coordinator.clone(),
             identity: self.identity.clone(),
             default_search_limit: self.default_search_limit,
@@ -4810,6 +4830,8 @@ impl NodeOrchestrator {
 
         // Lock-free schema lookup, by the one thing that identifies an index: its name.
         let schema = self.load_schema(index).await?;
+        self.quotas
+            .check_write(owner_of(&schema, tenant), &self.shards)?;
 
         let ctx = WriteCtx {
             shards: &self.shards,
@@ -5126,6 +5148,8 @@ impl NodeOrchestrator {
         // `Arc::make_mut`, so the field map is deep-copied only if this write actually changes
         // it — which most writes do not. It used to be unconditionally unwrapped or cloned here.
         let mut schema_mut = self.load_schema(index).await?;
+        self.quotas
+            .check_write(owner_of(&schema_mut, tenant), &self.shards)?;
 
         // Use staged schema validation: parallel validation + sequential evolution. The batch
         // is handed over and handed back so the fan-out never has to copy it.
@@ -5278,8 +5302,23 @@ impl NodeOrchestrator {
         // mint decided, so updating a schema with an admin key (which carries no tenant) cannot
         // silently unstamp an index and hand its owner their quota back. The stamp is written
         // once, by whoever created the index.
-        if let Some(current) = &current {
+        //
+        // A deletion record is not an index, so declaring over one is a mint: the declaring key
+        // owns what it creates, rather than whoever owned the index that was dropped.
+        let minting = current
+            .as_ref()
+            .is_none_or(|current| current.state == storage::SchemaState::Dropped);
+        if let Some(current) = current.as_ref().filter(|_| !minting) {
             schema.tenant = current.tenant.clone();
+        }
+        // The explicit mint counts against `max_indexes` exactly as the implicit one does. Both
+        // run on this mailbox, so the count cannot race.
+        if minting
+            && let Some(tenant) = schema.tenant.as_deref()
+            && self.quotas.max_indexes(tenant).is_some()
+        {
+            let owned = owned_index_count(&self.shards, tenant).await?;
+            self.quotas.check_mint(tenant, owned)?;
         }
 
         // Ensure 'id' field is explicitly in the schema for visibility
