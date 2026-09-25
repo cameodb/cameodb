@@ -274,8 +274,8 @@ curl -s -X POST http://localhost:9480/api/books/search \
 >
 > Wildcards are reported too, since tantivy drops a `*` it cannot use without an error and
 > matches what is left: a prefix shorter than `[security.limits] min_prefix_length` (default 2),
-> a prefix that names no field (`pre*`, unless `expand_unqualified_prefix` is on, in which case it
-> searches the default fields), a leading or inner wildcard (`*fix`, `pre*fix`), and a
+> a prefix that names no field (`pre*`, but only when `expand_unqualified_prefix` is turned off —
+> by default it searches the default fields), a leading or inner wildcard (`*fix`, `pre*fix`), and a
 > prefix inside a field group (`title:(pre*)`). Each is matched as the literal term, and the note
 > names the form that works — `title:pre*`. A quoted phrase prefix (`"big bad wo"*`) is tantivy's
 > own and is not reported.

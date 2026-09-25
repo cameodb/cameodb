@@ -52,7 +52,7 @@ on one.
 | 14 — Security hardening (posture items C3–C8) | ✅ Done | C3–C8 all closed; C8 by M3 on 2026-09-20 |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
-| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed but for O4; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8's prefix floor and default-field cap have shipped, and its clause-cap decision is owed. M6 is measurement only; its first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), and the arms themselves are still owed |
+| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed but for O4; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 is measurement only; its first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), and the arms themselves are still owed |
 
 ## Reconciliation, 2026-08-26
 
@@ -4802,8 +4802,7 @@ read the code before scheduling the work.
 
 ### M8 — Re-decide the query complexity caps
 
-◐ **In progress — prefix floor and default-field cap shipped 2026-09-25; clause cap still to
-decide.** Originally
+✅ **Closed 2026-09-25 — prefix floor and default-field cap shipped; the clause cap deferred.** Originally
 📋 **a decision, not necessarily code — and its premise is now true.** [C2](#c2--query-complexity-caps)
 was deferred on the reasoning that *rate limiting already bounds what a key costs the node per
 unit time*. That reasoning is sound, and the premise was false on the write surface until
@@ -4878,12 +4877,14 @@ qualified query on a wide index stays clean.
 Query-time only: no reindex, and existing indexes pick it up on start. The list is in the schema
 fingerprint only when declared, so no schema written before it changes thumbprint.
 
-With the fields bounded, `expand_unqualified_prefix` could now default on; it stays off until
-decided.
+With the fields bounded, `expand_unqualified_prefix` defaults **on** (decided 2026-09-25): a
+bare prefix costs one range per default field, and there are now at most 64 of them. The clause
+cap (C) is left as it is — B bounds the width, `min_prefix_length` bounds each range, and M8
+closes here.
 
-Still open here: a cap on clauses after expansion (terms × default fields), which bounds a long
-query the way B bounds a wide schema; and cancelling a search already running on a read thread,
-which is 0.4.0 work.
+Deferred, not done: a cap on clauses after expansion (terms × default fields), which would bound
+a long query the way B bounds a wide schema; and cancelling a search already running on a read
+thread, which is 0.4.0 work.
 
 **Deliberately not in 0.3.5:** [D1–D3](#d-phase-15--high-availability-reindex-replication--migration--planned)
 (reindex, replication, migration), [A1](#a1--mcp-streaming) and [A5](#a5--semantic-routing),

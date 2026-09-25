@@ -3932,19 +3932,15 @@ async fn the_prefix_floor_is_the_configured_one() {
     assert_eq!(body["total_hits"], 2, "two characters expand: {body}");
     assert!(body.get("_discarded_clauses").is_none(), "{body}");
 
-    // A bare prefix is reported by default, naming the setting that would expand it ...
+    // A bare prefix searches the default fields by default ...
     let (_, body) = post_json(
         &node,
         "/api/prefixes/search",
         json!({"query": "qu*", "limit": 10}),
     )
     .await;
-    assert!(
-        body["_discarded_clauses"]
-            .to_string()
-            .contains("expand_unqualified_prefix"),
-        "{body}"
-    );
+    assert_eq!(body["total_hits"], 2, "the bare prefix expanded: {body}");
+    assert!(body.get("_discarded_clauses").is_none(), "{body}");
     drop(node);
 
     let node = seeded("[security.limits]\nmin_prefix_length = 0").await;
@@ -3957,16 +3953,22 @@ async fn the_prefix_floor_is_the_configured_one() {
     assert_eq!(body["total_hits"], 2, "0 turns the floor off: {body}");
     drop(node);
 
-    // ... and with it enabled, searches the default fields.
-    let node = seeded("[security.limits]\nexpand_unqualified_prefix = true").await;
+    // ... and with the expansion turned off, it matches the literal term and says which
+    // setting would expand it.
+    let node = seeded("[security.limits]\nexpand_unqualified_prefix = false").await;
     let (_, body) = post_json(
         &node,
         "/api/prefixes/search",
         json!({"query": "qu*", "limit": 10}),
     )
     .await;
-    assert_eq!(body["total_hits"], 2, "the bare prefix expanded: {body}");
-    assert!(body.get("_discarded_clauses").is_none(), "{body}");
+    assert_eq!(body["total_hits"], 0, "not expanded: {body}");
+    assert!(
+        body["_discarded_clauses"]
+            .to_string()
+            .contains("expand_unqualified_prefix"),
+        "{body}"
+    );
 }
 
 /// A PATCH of `/_schema` with a raw body, for the requests `patch_schema` does not shape.
