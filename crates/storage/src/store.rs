@@ -1522,6 +1522,9 @@ impl HybridStore {
             // the timestamps — come from. A caller that used this whole value as a schema would
             // silently unstamp the index.
             tenant: None,
+            // Query-time only, and never in tantivy; recovered from the stored schema the same
+            // way `tenant` is.
+            default_fields: None,
             routing_field_name: "id".to_string(),
             shadow_fields: HashSet::new(),
         }
@@ -2558,6 +2561,11 @@ impl HybridStore {
     }
 
     /// Get schema for an index
+    /// The query-cost policy this store applies — the node's `[security.limits]` query bounds.
+    pub fn query_policy(&self) -> &QueryPolicy {
+        &self.config.query
+    }
+
     pub fn get_schema(&self, index_name: &str) -> Result<Option<IndexSchema>, StoreError> {
         let read_txn = self.kv.begin_read()?;
 
@@ -2749,6 +2757,35 @@ impl HybridStore {
         );
 
         Ok(outcome)
+    }
+
+    /// Declare which fields an unqualified term searches, or clear the declaration with `None`.
+    ///
+    /// Query-time only, like everything about default fields: no column changes and nothing is
+    /// rebuilt, so it takes effect on the next search. The list is checked against this shard's
+    /// schema before it is stored, and the version advances as for any schema edit, so a peer
+    /// holding the older list loses to this one.
+    pub fn set_default_fields(
+        &self,
+        index: &str,
+        default_fields: Option<Vec<String>>,
+    ) -> Result<(), StoreError> {
+        let mut schema = self
+            .get_schema_cached(index)?
+            .map(|arc| (*arc).clone())
+            .ok_or_else(|| StoreError::IndexNotFound(index.to_string()))?;
+        if schema.default_fields == default_fields {
+            return Ok(());
+        }
+        schema.default_fields = default_fields;
+        schema
+            .validate_default_fields()
+            .map_err(StoreError::Serialization)?;
+        schema.mark_modified();
+        self.persist_schema_evolution(index, &schema)?;
+        self.schema_cache
+            .insert(index.to_string(), Arc::new(schema));
+        Ok(())
     }
 
     /// What [`HybridStore::update_field_indexing`] would do, without doing it.

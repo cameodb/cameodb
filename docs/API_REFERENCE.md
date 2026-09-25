@@ -173,6 +173,14 @@ curl -s -X POST http://localhost:9480/api/books/search \
 >
 > Sorting is exact on a field the built index has a fast column for, which `GET /api/{index}/_config` reports per field as `sortable`. A numeric or date field needs one to be sorted at all. A text or string field without one is sorted *approximately* rather than refused: the top `2 × limit` matches by relevance are collected and then ordered alphabetically, so the result is not the alphabetically first documents in the index. Such a response carries `_approximate_sort` naming the field — do not page through one, since each page orders a different set of candidates and the pages are not slices of a single order.
 >
+> **Narrowed default fields (`_narrowed_default_fields`):** a term with no field in front of it searches the index's default fields, capped by `[security.limits] max_default_fields` (default 64). When the cap cut them short *and* the query had such a term, the response says which fields it reached, beside the hits:
+>
+> ```json
+> "_narrowed_default_fields": {"searched": ["abstract", "author"], "available": 120, "declared": false}
+> ```
+>
+> `available` is how many default fields the index has (or lists, when `declared` is `true` and the fields came from its `default_fields`). Nothing was dropped, so this is not a `_discarded_clauses` entry and the MCP tools do not refuse on it — they attach a `_warning` instead; `search_across_indexes` keys it by index. A word held only in a field outside `searched` was not looked for there: name the field to search it. A query naming every field it searches never carries the key.
+>
 > The column is written when the index is built, so `sortable` cannot be turned on for an index that already holds data: declare the field `fast` in the schema before writing to it. `fast` is the declaration and `sortable` is whether the built index carries it; the two differ for a field declared after the fact.
 >
 > Order is `asc` unless `desc` is given, and an inline order must be exactly one of those words. The JSON payload always wins over inline `sort` clauses, and a `sort` naming a field the index does not have is reported in `_discarded_clauses`.
@@ -622,6 +630,7 @@ curl -s http://localhost:9480/api/books/_config
   "version": 3,
   "thumbprint": "f69a0b9e2146f661",
   "description": "Library catalogue, one document per edition.",
+  "searched_by_default": ["author", "title"],
   "field_count": 3,
   "fields": [
     {"name": "id", "type": "text", "indexed": true, "stored": true, "fast": false, "shadow": false, "searchable": true, "sortable": false},
@@ -640,6 +649,9 @@ has one description. `fields` is ordered with `id` first, then alphabetically.
 | Key | Meaning |
 |-----|---------|
 | `version` | Advances on every change to this schema, starting at 1 — a `PUT /_config`, a field added by a write, a flag flipped by `PATCH /_schema`. **Monotonic, not a count of requests:** one request touching three fields may advance it three times, so compare versions for order and never for how much happened. Adopting a schema that already exists elsewhere keeps the version it came with, which is the point of an agreed version. Two nodes reporting different versions for one index have not converged yet |
+| `default_fields` | Present only when declared: the fields an unqualified term searches, in priority order. Under the name `PUT /_config` accepts, so reading a schema and writing it back keeps the declaration |
+| `searched_by_default` | What an unqualified term actually searches: the declared list, or every indexed text, string and JSON field by name — either way cut to the node's `[security.limits] max_default_fields` (default 64) |
+| `default_fields_truncated` | Present, and `true`, when the cap cut `searched_by_default` short. A bare term then misses the fields left out; a query naming a field reaches it at any width |
 | `thumbprint` | 16 hex digits over the **resolved** schema, so two nodes agree whenever they would build the same index. A declaration and the index built from it therefore match: it hashes what a field resolves to, not what was written, so an omitted tokenizer and the default it fills in are the same schema. Different thumbprints at the same `version` mean the two have genuinely diverged and no retry will settle it |
 
 The pair is what makes divergence answerable from outside the process. Compare
@@ -659,6 +671,7 @@ The per-field keys:
 | `shadow` | The field carries the identifier under its original name; queried through `id` |
 | `returned_as` | Present on `id` alone, and only on an index that has a shadow field: names the field hits carry the identifier under instead, since no hit on such an index carries an `id` |
 | `stored` | Kept in the search index as well as the document store |
+| `default_search` | Whether a term with no field in front of it searches this field — see `searched_by_default` |
 
 #### Change Field Indexing Flags
 Turn a field's `indexed` flag on or off on an existing schema.
@@ -684,8 +697,24 @@ curl -s -X PATCH http://localhost:9480/api/books/_schema \
 }
 ```
 
-A name no shard recognises refuses the whole request with `409`, and nothing is written. An
-empty `field_updates` is a `400`.
+A name no shard recognises refuses the whole request with `409`, and nothing is written. A
+request with neither `field_updates` nor `default_fields` is a `400`.
+
+**Choosing the default search fields.** The same endpoint declares which fields a term with no
+field in front of it searches, in priority order — no rebuild, it applies to the next search:
+
+```bash
+curl -s -X PATCH http://localhost:9480/api/books/_schema \
+  -H "Content-Type: application/json" \
+  -d '{"default_fields": ["title", "author"]}'
+```
+
+`[]` removes the declaration, so every text field is searched again; leaving the key out leaves it
+as it is. It can be sent with `field_updates` or alone, and can also be written in the body of
+`PUT /api/{index}/_config`. Every name must be an indexed text, string or JSON field of the index,
+or the request is refused `400` and nothing changes — as is a `field_updates` turning off a field
+the list names. A list longer than the node's `max_default_fields` is accepted and searched up to
+the cap, first entries first.
 
 **Declaring a field that the index cannot search yet.** A field is only searchable if the
 Tantivy index has a column for it, and that is fixed when the index is built. Fields present on

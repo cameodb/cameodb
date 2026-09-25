@@ -166,6 +166,36 @@ pub(super) fn approximate_sort_note(field: &str) -> String {
     )
 }
 
+/// What a narrowed set of default fields means for the caller holding the hits.
+///
+/// Attached whenever the engine reports [`crate::node::NARROWED_DEFAULT_FIELDS`]. Not a refusal:
+/// nothing in the query was dropped, it ran against the fields the node's policy gives an
+/// unqualified term. But an agent that searched a bare word and got nothing back would otherwise
+/// read that as "the index holds nothing about it", when the word may sit in a field the term
+/// never reached — and the remedy, naming the field, is one the agent can take itself.
+pub(super) fn narrowed_default_fields_note(
+    index: Option<&str>,
+    narrowed: &storage::NarrowedDefaultFields,
+) -> String {
+    let on = index
+        .map(|name| format!(" on '{name}'"))
+        .unwrap_or_default();
+    let why = if narrowed.declared {
+        "the index's declared default_fields are more than this node's max_default_fields"
+    } else {
+        "the index has more text fields than this node's max_default_fields, and declares no \
+         default_fields to choose among them, so the first by name were taken"
+    };
+    format!(
+        "Terms with no field in front of them searched {} of {} default fields{on} ({}): {why}. \
+         A word found only in another field was not looked for there — name that field \
+         (`field:word`) to search it. `describe_index` marks each field's `default_search`.",
+        narrowed.searched.len(),
+        narrowed.available,
+        narrowed.searched.join(", "),
+    )
+}
+
 /// Whether an engine error reports a field the schema does not have.
 ///
 /// Matched against specific signals rather than the word "field", which appears in unrelated

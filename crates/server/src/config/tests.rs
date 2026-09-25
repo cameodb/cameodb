@@ -770,6 +770,7 @@ max_response_bytes = 16777216
             storage::QueryPolicy {
                 min_prefix_length: 2,
                 expand_unqualified_prefix: false,
+                max_default_fields: 64,
             }
         );
 
@@ -779,6 +780,24 @@ max_response_bytes = 16777216
         )
         .expect("parses");
         assert!(on.security.limits.query_policy().expand_unqualified_prefix);
+    }
+
+    /// The default-field cap is 64 unless set, and `0` lifts it.
+    #[test]
+    fn the_default_field_cap_is_64_and_zero_lifts_it() {
+        let config: CameoDbConfig = toml::from_str("").expect("empty config must parse");
+        assert_eq!(config.security.limits.max_default_fields, 64);
+        assert_eq!(
+            crate::ratelimit::DEFAULT_MAX_DEFAULT_FIELDS,
+            config.security.limits.max_default_fields
+        );
+        let off = CameoDbConfig::parse_config_content(
+            "[security.limits]\nmax_default_fields = 0\n",
+            "off.toml",
+        )
+        .expect("zero is valid");
+        assert_eq!(off.security.limits.query_policy().max_default_fields, 0);
+        assert!(off.validate().is_ok());
     }
 
     #[test]

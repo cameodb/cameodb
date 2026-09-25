@@ -778,6 +778,7 @@ max_search_limit = 10000          # largest `limit` an MCP search may ask for
 max_federated_indexes = 20        # most indexes one `search_across_indexes` may name
 min_prefix_length = 2             # shortest `field:pre*` expanded; 0 expands any
 expand_unqualified_prefix = false # let a bare `pre*` search the default fields
+max_default_fields = 64           # most fields an unqualified term searches; 0 = all
 ```
 
 **Two meters, and both are off until you set them.** The first pair meters *calls* — MCP tools
@@ -943,6 +944,47 @@ prefix costs about the same as searching its most common word, because the vocab
   does at 10M.
 - **Characters, not bytes**, counted after the field's analyzer has run.
 
+#### `max_default_fields` — how many fields an unqualified term searches
+
+A term with no field in front of it — `alpha`, `"a phrase"` — is searched in every default field,
+one clause per field, and every indexed text, string and JSON field is a default field. So the
+cost of an unqualified query follows the width of the schema, which is whatever the tenant's
+first documents or `PUT /_config` made it. It defaults to **64**; `0` searches every field.
+
+Measured on one shard with the fields sharing a vocabulary — the worst case, as with log records
+or a wide CSV of similar columns (ROADMAP M8):
+
+| Default fields | 200k docs, 1 term | 200k docs, 5 terms | 1M docs, 1 term | 1M docs, 5 terms |
+|---:|---:|---:|---:|---:|
+| 5 | 0.08 ms | 0.8 ms | 0.44 ms | 3.3 ms |
+| 32 | 1.5 ms | 24 ms | 6.0 ms | 120 ms |
+| 64 | 5.7 ms | 97 ms | 26 ms | 513 ms |
+| 100 | 12.6 ms | 232 ms | | |
+| 200 | 54 ms | 1,067 ms | | |
+| 400 | 229 ms | 5,211 ms | | |
+
+The cost grows faster than the field count — about four times per doubling — and with the
+shard. Where each field holds its own vocabulary the other fields are dictionary misses and even
+400 cost 0.25 ms; a query naming its field is 0.01 ms at every width.
+
+- **Past the cap a bare term is narrowed, not refused.** It searches the index's declared
+  `default_fields` in their order, or else its fields **by name**, up to the cap. By name because
+  every shard has to pick the same fields, and each shard's own field order is an accident of how
+  its index was built. The index reports what a bare term searches under `searched_by_default`,
+  with `default_fields_truncated: true` when the cap cut it; each field carries `default_search`.
+  A search it narrowed carries `_narrowed_default_fields` naming the fields reached, and the MCP
+  tools add a `_warning` — advisory, as for an approximate sort, never a refusal.
+- **Choose the fields with `default_fields`** on the index, in `PUT /api/{index}/_config` or
+  `PATCH /api/{index}/_schema` — no reindex; it applies to the next search. See
+  [API Reference](API_REFERENCE.md#change-field-indexing-flags).
+- **Query-time only.** No index is rebuilt and nothing on disk changes, so the cap applies to
+  existing indexes the moment the node starts. Set it the same on every node of a cluster: shards
+  on nodes with different caps would search different fields for one query. A declared list
+  travels with the schema and avoids the question.
+- **The number of terms is not bounded here.** A query of K words is still up to K × 64 clauses.
+- **It also bounds `expand_unqualified_prefix`**, which expands a bare prefix across these same
+  fields.
+
 #### `expand_unqualified_prefix` — whether `pre*` needs a field
 
 Off by default. Tantivy's grammar has no unqualified prefix: a bare `pre*` has its `*` dropped
@@ -953,8 +995,7 @@ looks like it should.
 
 - **It costs one prefix per default field.** Every indexed text field is a default field, so on
   a wide index one bare prefix is that many ranges. `min_prefix_length` applies to each, which
-  is what keeps any single one of them cheap; the number of them is what the planned cap on
-  default fields (ROADMAP M8) will bound. That is why this is off by default.
+  is what keeps any single one of them cheap; `max_default_fields` bounds how many there are.
 - **Only unqualified prefixes.** `title:pre*` is rewritten as before; a prefix inside a field
   group — `title:(pre*)` — belongs to that field and is never sent to the others. It is still
   reported rather than expanded.

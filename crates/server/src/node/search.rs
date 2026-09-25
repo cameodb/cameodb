@@ -260,6 +260,9 @@ impl ScatterCtx<'_> {
         // approximate order describes the whole answer. A shard with no built index reports
         // nothing, hence first-wins rather than agreement.
         let mut approximate_sort: Option<String> = None;
+        // Every shard runs the node's one policy against the same schema, so one shard's account
+        // of the default fields is the index's. First-wins, as for `approximate_sort`.
+        let mut narrowed_default_fields: Option<storage::NarrowedDefaultFields> = None;
         // One shard is enough. Shards can hold different schemas for the same index, and a
         // query that one of them could not run at all is not answered by the ones that could.
         let mut emptied = false;
@@ -277,6 +280,7 @@ impl ScatterCtx<'_> {
                         }
                     }
                     approximate_sort = approximate_sort.or(r.approximate_sort);
+                    narrowed_default_fields = narrowed_default_fields.or(r.narrowed_default_fields);
                     shard_success += 1;
                 }
                 Err(err) => {
@@ -358,6 +362,7 @@ impl ScatterCtx<'_> {
         discarded.extend(unknown_projection_fields(schema, fields));
         attach_discarded(&mut response, discarded);
         attach_approximate_sort(&mut response, approximate_sort);
+        attach_narrowed_default_fields(&mut response, narrowed_default_fields);
         Ok(response)
     }
 }
@@ -980,6 +985,39 @@ pub(super) fn collect_approximate_sort(responses: &[JsonValue]) -> Option<String
             .get(APPROXIMATE_SORT_FIELD)
             .and_then(|value| value.as_str())
             .map(str::to_string)
+    })
+}
+
+/// The response key saying an unqualified term searched fewer default fields than the index has,
+/// because the node's `max_default_fields` capped them. See
+/// [`storage::SearchOutcome::narrowed_default_fields`].
+///
+/// Carries the fields searched rather than `true`, because the caller's next move is to see
+/// whether the field it cares about is among them, and to name it if it is not.
+pub(crate) const NARROWED_DEFAULT_FIELDS: &str = "_narrowed_default_fields";
+
+/// Attach [`NARROWED_DEFAULT_FIELDS`] to a search response, if the default fields were narrowed.
+pub(super) fn attach_narrowed_default_fields(
+    response: &mut JsonValue,
+    narrowed: Option<storage::NarrowedDefaultFields>,
+) {
+    let Some(narrowed) = narrowed else {
+        return;
+    };
+    if let (Some(obj), Ok(value)) = (response.as_object_mut(), serde_json::to_value(narrowed)) {
+        obj.insert(NARROWED_DEFAULT_FIELDS.to_string(), value);
+    }
+}
+
+/// The narrowing from per-node responses, if any node reported one. First-wins, for the reason
+/// [`collect_approximate_sort`] gives: the nodes ran one query against one index.
+pub(super) fn collect_narrowed_default_fields(
+    responses: &[JsonValue],
+) -> Option<storage::NarrowedDefaultFields> {
+    responses.iter().find_map(|response| {
+        response
+            .get(NARROWED_DEFAULT_FIELDS)
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
     })
 }
 

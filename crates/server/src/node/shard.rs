@@ -1665,6 +1665,7 @@ impl MicroshardActor {
             total_hits: outcome.total_hits,
             discarded: outcome.discarded,
             approximate_sort: outcome.approximate_sort,
+            narrowed_default_fields: outcome.narrowed_default_fields,
             emptied: outcome.emptied,
         })
     }
@@ -2016,6 +2017,7 @@ impl Message<SearchRequest> for MicroshardActor {
                 total_hits: result.total_hits,
                 discarded: result.discarded,
                 approximate_sort: result.approximate_sort,
+                narrowed_default_fields: result.narrowed_default_fields,
                 emptied: result.emptied,
             })
             .map_err(RemoteError::from)

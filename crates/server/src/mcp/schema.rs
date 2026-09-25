@@ -77,6 +77,9 @@ pub(super) struct FieldInfo {
     /// approximately rather than refused, so this is the flag that decides whether an order can
     /// be trusted or paged through.
     pub(super) sortable: bool,
+    /// Whether a term with no field in front of it searches this field — decided by the index's
+    /// declared `default_fields` and the node's `max_default_fields`, not by the type alone.
+    pub(super) default_search: bool,
     /// What the field records, if anyone wrote it down. Never inferred.
     pub(super) description: Option<String>,
     /// The name a hit carries this field's value under, when it is not the field's own name.
@@ -130,6 +133,10 @@ pub(super) fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
                         .unwrap_or(true),
                     sortable: def
                         .get("sortable")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    default_search: def
+                        .get("default_search")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
                     description: def
@@ -226,6 +233,16 @@ pub(super) fn catalogue_entry(entry: &JsonValue) -> JsonValue {
         && let Some(obj) = out.as_object_mut()
     {
         obj.insert("description".to_string(), description.clone());
+    }
+    // Worth knowing before choosing: on this index a bare term searches only some of its text
+    // fields, and `describe_index` says which.
+    if entry.get("default_fields_truncated") == Some(&JsonValue::Bool(true))
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert(
+            "default_fields_truncated".to_string(),
+            JsonValue::Bool(true),
+        );
     }
 
     out

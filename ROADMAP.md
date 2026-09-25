@@ -52,7 +52,7 @@ on one.
 | 14 — Security hardening (posture items C3–C8) | ✅ Done | C3–C8 all closed; C8 by M3 on 2026-09-20 |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
-| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed but for O4; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8's prefix floor has shipped and its clause-cap decision is owed. M6 is measurement only; its first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), and the arms themselves are still owed |
+| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed but for O4; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8's prefix floor and default-field cap have shipped, and its clause-cap decision is owed. M6 is measurement only; its first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), and the arms themselves are still owed |
 
 ## Reconciliation, 2026-08-26
 
@@ -4802,7 +4802,8 @@ read the code before scheduling the work.
 
 ### M8 — Re-decide the query complexity caps
 
-◐ **In progress — prefix floor shipped 2026-09-25; clause cap still to decide.** Originally
+◐ **In progress — prefix floor and default-field cap shipped 2026-09-25; clause cap still to
+decide.** Originally
 📋 **a decision, not necessarily code — and its premise is now true.** [C2](#c2--query-complexity-caps)
 was deferred on the reasoning that *rate limiting already bounds what a key costs the node per
 unit time*. That reasoning is sound, and the premise was false on the write surface until
@@ -4859,13 +4860,30 @@ holds, and declines to a note otherwise. The query settings also moved into one
 `storage::QueryPolicy` on `StorageConfig`, so the next bound is a field there rather than
 another edit to every place a config is built.
 
-**Next: B — cap how many default fields an unqualified term searches**, with a generous default.
-It bounds M0-j's multiplier directly, and it is what would let `expand_unqualified_prefix` default
-on.
+**Then B: `max_default_fields`, default 64, and a per-index `default_fields`.** Measured on a
+realistic corpus rather than M0-j's 500 documents, which had understated it by some fifty times:
+where the fields share a vocabulary the cost of an unqualified query grows about fourfold per
+doubling of the fields, and with the shard — a 5-term query at 1M documents cost 120 ms across 32
+fields, 513 ms across 64, and at 200k documents 5.2 s across 400. Where each field has its own
+vocabulary, 400 fields cost 0.25 ms. Past the cap a bare term is **narrowed, not refused**: the
+index's declared list in order, or its fields by name — name, because each shard's own field order
+is a hash-map accident and every shard must pick the same fields. Refusal was proposed and
+declined: a wide index without a declared list is a legitimate thing to have. What makes the
+narrowing honest is that it is reported — `searched_by_default`, `default_fields_truncated`,
+`default_search` per field, through `GET /_config`, the listing and the MCP tools, and on each
+search it narrowed as `_narrowed_default_fields` with an MCP `_warning`, carried the way
+`_approximate_sort` is — rather than attached as a discarded clause, which would have made every
+MCP search on a wide index fail. Set only when the query had an unqualified clause, so a
+qualified query on a wide index stays clean.
+Query-time only: no reindex, and existing indexes pick it up on start. The list is in the schema
+fingerprint only when declared, so no schema written before it changes thumbprint.
 
-Still open here: a cap on clauses after expansion (terms × default fields), which is what bounds
-M0-j's multiplier and a long query together; a cap on the default fields themselves; and
-cancelling a search already running on a read thread, which is 0.4.0 work.
+With the fields bounded, `expand_unqualified_prefix` could now default on; it stays off until
+decided.
+
+Still open here: a cap on clauses after expansion (terms × default fields), which bounds a long
+query the way B bounds a wide schema; and cancelling a search already running on a read thread,
+which is 0.4.0 work.
 
 **Deliberately not in 0.3.5:** [D1–D3](#d-phase-15--high-availability-reindex-replication--migration--planned)
 (reindex, replication, migration), [A1](#a1--mcp-streaming) and [A5](#a5--semantic-routing),

@@ -2917,3 +2917,77 @@ async fn a_listening_stream_must_belong_to_a_session() {
         "a session's listening stream was refused"
     );
 }
+
+/// A search whose default fields the node's cap narrowed says so, the way an approximate sort
+/// does: the hits come back, `_narrowed_default_fields` names the fields a bare term reached, and
+/// `_warning` tells the agent to name a field to search one outside them. Not an error — nothing
+/// was dropped.
+///
+/// A cap of one against an index with two text fields, `body` and `title`: a bare term searches
+/// `body` (first by name) and not `title`.
+#[tokio::test]
+async fn a_narrowed_search_is_reported_and_not_refused() {
+    let node = TestNode::start_with("[security.limits]\nmax_default_fields = 1").await;
+    for (index, doc) in [
+        (
+            "wide",
+            json!({"id": "w1", "title": "quarterly record", "body": "alpha"}),
+        ),
+        ("narrow", json!({"id": "n1", "title": "quarterly record"})),
+    ] {
+        let status = http()
+            .put(format!("{}/api/{index}/document", node.url))
+            .json(&json!({"id": doc["id"], "doc": doc}))
+            .send()
+            .await
+            .expect("write")
+            .status();
+        assert!(status.is_success(), "seeding {index} failed: {status}");
+        node.await_searchable(index, 1).await;
+    }
+
+    let (is_error, result) = node
+        .call_tool("search_index", json!({"index": "wide", "query": "alpha"}))
+        .await;
+    assert!(!is_error, "narrowing is reported, not refused: {result}");
+    assert_eq!(result["total_hits"], 1, "{result}");
+    assert_eq!(
+        result["_narrowed_default_fields"],
+        json!({"searched": ["body"], "available": 2, "declared": false}),
+        "{result}"
+    );
+    let warning = result["_warning"].as_str().unwrap_or_default();
+    assert!(
+        warning.contains("searched 1 of 2 default fields") && warning.contains("field:word"),
+        "{result}"
+    );
+
+    // A query naming its field reached it: nothing to report.
+    let (_, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "wide", "query": "title:record"}),
+        )
+        .await;
+    assert!(result.get("_narrowed_default_fields").is_none(), "{result}");
+
+    // Federated: reported per index, and only for the index that was narrowed.
+    let (is_error, result) = node
+        .call_tool(
+            "search_across_indexes",
+            json!({"indexes": ["wide", "narrow"], "query": "record"}),
+        )
+        .await;
+    assert!(!is_error, "{result}");
+    let narrowed = result["_narrowed_default_fields"]
+        .as_object()
+        .expect("keyed by index");
+    assert_eq!(narrowed.keys().collect::<Vec<_>>(), ["wide"], "{result}");
+    assert!(
+        result["_warning"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("on 'wide'"),
+        "{result}"
+    );
+}

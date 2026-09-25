@@ -199,6 +199,10 @@ pub(super) fn push_hits(
         .approximate_sort
         .take()
         .or_else(|| collect_approximate_sort(std::slice::from_ref(value)));
+    stats.narrowed_default_fields = stats
+        .narrowed_default_fields
+        .take()
+        .or_else(|| collect_narrowed_default_fields(std::slice::from_ref(value)));
     stats.nodes_contacted += 1;
     if let Some(t) = value.get("took_ms").and_then(|v| v.as_u64()) {
         stats.max_took_ms = match stats.max_took_ms {
@@ -921,6 +925,7 @@ impl RouterActor {
                 total_hits_sum: 0,
                 discarded: Vec::new(),
                 approximate_sort: None,
+                narrowed_default_fields: None,
             };
 
             // The local node is rank 0, then each peer in the order it was dispatched to.
@@ -976,6 +981,7 @@ impl RouterActor {
             });
             attach_discarded(&mut response, stats.discarded);
             attach_approximate_sort(&mut response, stats.approximate_sort);
+            attach_narrowed_default_fields(&mut response, stats.narrowed_default_fields);
             return Ok(response);
         }
 
@@ -1035,6 +1041,7 @@ impl RouterActor {
                 // Read before the loop below consumes `all_results`.
                 let discarded = collect_discarded(&all_results);
                 let approximate_sort = collect_approximate_sort(&all_results);
+                let narrowed_default_fields = collect_narrowed_default_fields(&all_results);
 
                 for mut result in all_results {
                     if let Some(hits) = result.get_mut("hits").and_then(|h| h.as_array_mut()) {
@@ -1079,6 +1086,7 @@ impl RouterActor {
                 });
                 attach_discarded(&mut response, discarded);
                 attach_approximate_sort(&mut response, approximate_sort);
+                attach_narrowed_default_fields(&mut response, narrowed_default_fields);
                 Ok(response)
             }
             ClientOp::Write { .. } | ClientOp::BulkWrite { .. } => {

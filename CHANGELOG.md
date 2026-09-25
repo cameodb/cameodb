@@ -460,6 +460,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A quoted phrase prefix (`"big bad wo"*`) and a `*` a raw field keeps inside its term are
   unaffected.
 
+- **`[security.limits] max_default_fields` caps how many fields an unqualified term searches,
+  default 64; an index can choose them with `default_fields`.** A term with no field is one
+  clause per indexed text, string and JSON field, so its cost followed the schema's width —
+  worse than linearly: measured on a shard whose fields share a vocabulary, a 5-term query cost
+  513 ms across 64 fields at 1M documents and 5.2 s across 400 at 200k. Past the cap a bare term
+  searches the index's declared `default_fields` in order, or else its fields by name, up to the
+  cap — narrowed, not refused, and reported: `searched_by_default` and
+  `default_fields_truncated` on the index, `default_search` on each field, in `GET /_config`, the
+  listing and the MCP tools; and on the search itself, `_narrowed_default_fields` names the fields
+  a bare term reached whenever the cap cut them, with an MCP `_warning` — advisory, like
+  `_approximate_sort`, so the MCP tools do not refuse on it. `default_fields` is set in `PUT /_config` or `PATCH /_schema`
+  (`[]` clears it), takes effect on the next search with no reindex, and is refused `400` if it
+  names anything but an indexed text, string or JSON field. `0` lifts the cap. **This changes
+  results** for unqualified queries on indexes with more than 64 such fields.
+
 - **`[security.limits] expand_unqualified_prefix` lets a bare `pre*` search the default
   fields.** Off by default. On, `qui*` is rewritten into one prefix range per text default field,
   OR'd, with `min_prefix_length` applied to each — the fields an unqualified term already

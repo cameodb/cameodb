@@ -374,6 +374,7 @@ fn expanding(min_prefix_length: usize) -> storage::QueryPolicy {
     storage::QueryPolicy {
         min_prefix_length,
         expand_unqualified_prefix: true,
+        ..Default::default()
     }
 }
 
