@@ -379,6 +379,15 @@ curl -s -X POST http://localhost:9480/api/books/_bulk \
 }
 ```
 
+**Sizing a batch.** This is the highest-throughput write path, and how much you put in one
+request matters more than anything else you can tune — measured at roughly **11x between batches
+of 500 and batches of 20,000**. Send few large batches from a small number of connections rather
+than many small ones from many; the node's ceiling is set by *documents in flight* (batch size x
+concurrent requests), and past roughly 400,000 of those it stops gaining throughput and only adds
+latency. Keep the body inside `limits.max_body_size_mb`, which is what actually bounds a batch.
+See [Write throughput](CONFIGURATION.md#write-throughput-what-actually-moves-it) for the
+measurements and the knee.
+
 #### Streaming Write Documents
 Insert or update multiple documents using NDJSON streaming for large datasets.
 
@@ -892,7 +901,8 @@ curl -s http://localhost:9480/_admin/workers
     "round_robin_sends": 0,
     "actor_mailbox_fallbacks": 0,
     "abandoned": 0,
-    "refused_at_admission": 0
+    "refused_at_admission": 0,
+    "jobs_dropped": 0
   }
 }
 ```
@@ -911,11 +921,28 @@ which is the number `check-config`'s `overload` rule asks you to compare against
 | `actor_mailbox_fallbacks` | Worker queues were full and the job took the overflow path |
 | `refused_at_admission` | Refused at the door, before a body was read, on the predicted wait |
 | `abandoned` | Refused at a worker on dequeue, because the budget could no longer cover the work |
+| `jobs_dropped` | Jobs that left the pool without finishing. **Expected to be `0`** — see below |
 
 Under overload the first of those two should dominate: refusing at the door costs a comparison,
 while refusing at a worker means the request already paid for its body, its parse, a permit and
 a channel hop. A run shedding mostly at `abandoned` means requests are getting past the door —
 worth reporting rather than tuning around.
+
+**`jobs_dropped` is a defect signal, not a tuning dial.** A job that reaches a worker either
+finishes or is counted here; anything other than `0` means an operation stopped without
+completing — it was dropped, it panicked, or it ran so far past its budget that the pool
+reclaimed its slot to stay alive. Each of those is a bug to report, with the node's logs from
+the same window, rather than something to configure around. A non-zero reading is also worth
+acting on quickly: the counter exists because the failure it reports used to be silent until the
+node stopped serving altogether.
+
+**Reading the counters together, when something looks wrong.** `round_robin_sends` minus the
+summed `jobs_completed` is *not* a leak measure once anything is being shed: a job refused at
+dequeue is sent and never completed, by design, so that difference legitimately equals
+`abandoned`. The three numbers that mean work was lost are `in_flight` (which must fall back to
+`0` on an idle node), `queue_depth`, and `jobs_dropped`. An idle node reporting a non-zero
+`in_flight` has lost slots, and a node whose `in_flight` sits at `in_flight_capacity` while
+`jobs_completed` stops moving has lost all of them.
 
 #### Memory Statistics
 Get process memory and jemalloc allocator statistics.

@@ -11,6 +11,7 @@ This guide covers comprehensive configuration management for CameoDB, including 
 - [Environment Variables](#environment-variables)
 - [Multi-Disk Setup](#multi-disk-setup)
 - [Performance Tuning](#performance-tuning)
+  - [Write throughput: what actually moves it](#write-throughput-what-actually-moves-it)
 - [Production Deployment](#production-deployment)
 - [Troubleshooting](#troubleshooting)
 
@@ -372,10 +373,18 @@ wal_sync = true
 wal_segment_size_mb = 64
 
 # Default batch size for bulk ingestion; also the base of the smart-commit threshold
-# (default: 1000)
+# (default: 1000).
+#
+# This is an internal commit-cadence parameter, NOT the number of documents to put in a
+# `_bulk` request. The two are easy to confuse and only the second one moves ingest
+# throughput much — see "Write throughput: what actually moves it".
 default_batch_size = 1000
 
-# Initial number of shards per index (default: 4)
+# Initial number of shards per index (default: 4).
+#
+# Four is the measured optimum for write throughput on a single node, and eight is roughly
+# a third slower — a bulk request fans out to every shard and waits for the slowest. Raise
+# this for data volume and parallel recovery, not for ingest speed.
 num_shards_init = 4
 
 # Maximum shards allowed on this node (default: 8)
@@ -485,6 +494,10 @@ contention (unpinning the writers changes nothing) but the cost of a durable com
 searches running, a WAL fsync competes with tantivy segment reads for IO and page cache, and
 the per-commit cost roughly triples. Setting `wal_sync = false` recovers most of the write
 throughput, at the durability cost that implies.
+
+Note this is specific to *mixed* load. On write-only bulk ingest the same flag makes no
+measurable difference — see "What does not help" under Write throughput — so the trade is worth
+considering only when reads and writes are competing.
 
 Plan capacity from a mixed measurement, not from a single-workload one.
 
@@ -1086,6 +1099,11 @@ default_batch_size = 2000
 [storage]
 # Disable fsync for maximum write speed. Only for data you can reload from elsewhere:
 # a crash can leave the search index ahead of the document store.
+#
+# Measure before accepting this trade. On write-only bulk ingest it made no measurable
+# difference at saturation (370,932 docs/s with fsync on against 365,382 with it off), so
+# the durability is usually free. It earns its keep only under mixed read/write load, where
+# a durable commit competes with segment reads for IO.
 wal_sync = false
 
 # Large WAL segments reduce overhead
@@ -1102,6 +1120,115 @@ disk_usage_threshold_percent = 95
 # Maximize CPU utilization
 search_threads = 32
 ```
+
+### Write throughput: what actually moves it
+
+Measured 2026-09-25 on a 15-core M5 Pro, release build, single node, bulk ingest, harness
+co-located. Single runs — read the shapes, not the third digit — but the shapes held across
+every sweep, and the reversals below were each reproduced.
+
+**The short version: send few large batches, not many small ones.** That one change is worth
+more than every setting in this section combined.
+
+| What you change | Effect on ingest |
+|---|---|
+| Batch size 500 → 20,000 | **~11x** |
+| Concurrency, up to the knee | ~2x |
+| Concurrency, past the knee | nothing, and latency grows |
+| `num_shards_init` 1 → 4 | ~1.4x |
+| `num_shards_init` 4 → 8 | **−36%** |
+| `wal_sync = false` on bulk ingest | nothing measurable |
+| `indexer_num_threads` 1 → 4 | nothing measurable |
+
+#### Batch size and concurrency are one dial, not two
+
+What the node responds to is **documents in flight** — batch size multiplied by concurrent
+requests. The plateau is around 400,000 of them, at roughly 320,000–370,000 documents/second.
+Past that, offering more work buys latency and nothing else.
+
+| Concurrency | Batch | Docs in flight | Docs/sec | p50 |
+|---|---|---|---|---|
+| 16 | 500 | 8k | 25,000 | 324ms |
+| 64 | 2,000 | 128k | 158,000 | 725ms |
+| 32 | 10,000 | 320k | 265,000 | 1.0s |
+| **8** | **50,000** | 400k | **321,000** | **1.1s** |
+| **32** | **20,000** | 640k | **324,000** | 1.5s |
+| 32 | 50,000 | 1.6M | 234,000 | 4.9s |
+
+Two rows are worth dwelling on. **The last one is slower than the ones above it** and has five
+times the latency — over-feeding the node costs throughput, it does not merely fail to add any.
+And the `8 x 50,000` row reaches the plateau with **a third of the latency** of `32 x 20,000`.
+Given a choice, prefer fewer connections sending larger batches: same ceiling, far better tail.
+
+So the knee moves with batch size, and a single "recommended concurrency" would be wrong at
+least half the time:
+
+- at batch 500, more concurrency helps up to about 64
+- at batch 20,000, concurrency 32 already beats 64
+- at batch 50,000, concurrency 8 beats both
+
+**If you tune one thing, raise the batch size and leave concurrency low.**
+
+#### Shard count: the default of 4 is the right default
+
+Measured at a load point that saturates, not at an idle one — this matters, see the warning
+below.
+
+| `num_shards_init` | Docs/sec |
+|---|---|
+| 1 | 122,000 |
+| 2 | 163,000 |
+| **4 (default)** | **172,000** |
+| 8 | 110,000 |
+
+Sharding pays to about four and then reverses. A bulk request fans out to *every* shard and
+waits for the slowest, so each added shard buys parallelism and pays a tail-latency tax on every
+request; past four the tax wins. Raise `num_shards_init` for data volume and parallel recovery
+if you need to — not for write throughput.
+
+#### What does not help
+
+- **`wal_sync = false` on bulk ingest.** Measured at saturation: 370,932 docs/sec with fsync on
+  against 365,382 with it off, and a repeat pair of 357,220 and 358,223 — no difference outside
+  run-to-run noise. **You do not need to trade durability for bulk ingest speed.** (This is
+  specific to write-only bulk load. Under *mixed* read and write load a durable commit is
+  genuinely expensive — see "What mixed read/write load costs" above, where turning it off does
+  recover throughput.)
+- **`indexer_num_threads`.** 1, 2 and 4 measured within noise of each other on bulk ingest.
+- **More cores.** See below.
+
+#### Do not size this node by CPU
+
+**CPU peaked at 3.9 of 15 cores — 26% — at the 324,000 docs/sec plateau**, and sat at 0.6–0.8
+cores for every configuration below it. The write path is bound by latency and serialization,
+not by processor time: one writer thread per shard, a reply round-trip per slice, coalescing in
+between.
+
+The practical consequences:
+
+- A node that looks idle in `top` while ingest feels slow is **not** under-provisioned. Look at
+  batch size first.
+- Adding cores will not raise ingest throughput. Adding *offered load*, in the shape above, will.
+- Capacity-plan ingest from documents/second and documents in flight, not from CPU headroom.
+
+#### Measure before you tune
+
+```bash
+# The knee, found in one pass
+cameodb-bench --url http://localhost:9480 --index yours \
+  --mode bulk --batch-size 20000 --concurrency 32 --duration 30
+```
+
+Then read `GET /_admin/workers`. `in_flight` against `in_flight_capacity` says whether the pool
+is the bottleneck, `jobs_completed` over the run is this node's real service rate, and
+`jobs_dropped` must be `0` — see
+[Worker Pool](API_REFERENCE.md#worker-pool) for what each counter means.
+
+> **A warning that cost us a wrong answer.** The shard table above was first measured at
+> concurrency 16 / batch 500 and appeared to show that *one shard beats four*. That was an
+> artefact of offering too little load: at a point that actually saturates, four beats one by
+> 41%. **A scaling comparison taken below the knee measures your load generator, not the node.**
+> Find the knee first, then compare configurations at it.
 
 ### Performance vs Durability Trade-offs
 
