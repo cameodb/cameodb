@@ -262,9 +262,9 @@ pub const NOT_SUPPORTED: &[NotSupported] = &[
     },
     NotSupported {
         syntax: "pre*",
-        detail: "A prefix needs a field name unless the node enables `expand_unqualified_prefix`; \
-                 otherwise the `*` is dropped, `pre` is matched as a whole term, and reported. \
-                 Name the field, or OR one clause per field.",
+        detail: "A prefix with no field name searches the default fields, unless the node has \
+                 turned `expand_unqualified_prefix` off; then the `*` is dropped, `pre` is matched \
+                 as a whole term, and reported. Naming the field always works.",
     },
     NotSupported {
         syntax: "field:*suffix",

@@ -760,26 +760,31 @@ max_response_bytes = 16777216
         assert!(off.validate().is_ok());
     }
 
-    /// Expanding a bare `pre*` across the default fields is opt-in, and reaches storage's policy.
+    /// Expanding a bare `pre*` across the default fields is on unless turned off, and reaches
+    /// storage's policy either way.
     #[test]
-    fn unqualified_prefix_expansion_is_off_until_enabled() {
+    fn unqualified_prefix_expansion_is_on_until_disabled() {
         let config: CameoDbConfig = toml::from_str("").expect("empty config must parse");
-        assert!(!config.security.limits.expand_unqualified_prefix);
+        assert!(config.security.limits.expand_unqualified_prefix);
         assert_eq!(
             config.security.limits.query_policy(),
             storage::QueryPolicy {
                 min_prefix_length: 2,
-                expand_unqualified_prefix: false,
+                expand_unqualified_prefix: true,
                 max_default_fields: 64,
             }
         );
+        assert_eq!(
+            CameoDbConfig::default().security.limits.query_policy(),
+            config.security.limits.query_policy()
+        );
 
-        let on = CameoDbConfig::parse_config_content(
-            "[security.limits]\nexpand_unqualified_prefix = true\n",
-            "on.toml",
+        let off = CameoDbConfig::parse_config_content(
+            "[security.limits]\nexpand_unqualified_prefix = false\n",
+            "off.toml",
         )
         .expect("parses");
-        assert!(on.security.limits.query_policy().expand_unqualified_prefix);
+        assert!(!off.security.limits.query_policy().expand_unqualified_prefix);
     }
 
     /// The default-field cap is 64 unless set, and `0` lifts it.

@@ -110,12 +110,12 @@ pub struct McpLimitsConfig {
 
     /// Whether a prefix naming no field — a bare `pre*` — searches the default fields.
     ///
-    /// Off by default. Tantivy's grammar has no unqualified prefix: it drops the `*` and matches
-    /// `pre` as a term, which the response reports. On, the node rewrites it into one prefix range
-    /// per text field that an unqualified term would search, OR'd together, with
-    /// `min_prefix_length` applied to each. The cost is one prefix per field, so on a wide index
-    /// it is that many ranges — off until the cap on default fields bounds how many that can be.
-    #[serde(default)]
+    /// On by default. Tantivy's grammar has no unqualified prefix: it drops the `*` and matches
+    /// `pre` as a term. On, the node rewrites it into one prefix range per text field that an
+    /// unqualified term would search, OR'd together, with `min_prefix_length` applied to each.
+    /// The cost is one prefix per default field, which `max_default_fields` bounds — that bound is
+    /// what let this default on. Off, a bare prefix matches the literal term and is reported.
+    #[serde(default = "default_expand_unqualified_prefix")]
     pub expand_unqualified_prefix: bool,
 
     /// Most fields an unqualified term searches. `0` searches every one.
@@ -160,6 +160,12 @@ fn default_min_prefix_length() -> usize {
     DEFAULT_MIN_PREFIX_LENGTH
 }
 
+/// Whether a bare `pre*` searches the default fields when an operator says nothing: yes. Its cost
+/// is one prefix per default field, and `max_default_fields` bounds how many there are.
+fn default_expand_unqualified_prefix() -> bool {
+    true
+}
+
 /// The default-field cap when an operator sets none.
 ///
 /// Generous on purpose: a handful of text fields is the ordinary schema and even a wide CSV or
@@ -198,7 +204,7 @@ impl Default for McpLimitsConfig {
             max_search_limit: default_max_search_limit(),
             max_federated_indexes: default_max_federated_indexes(),
             min_prefix_length: default_min_prefix_length(),
-            expand_unqualified_prefix: false,
+            expand_unqualified_prefix: default_expand_unqualified_prefix(),
             max_default_fields: default_max_default_fields(),
             max_response_bytes: None,
         }

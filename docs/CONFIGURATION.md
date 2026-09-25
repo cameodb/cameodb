@@ -777,7 +777,7 @@ write_burst = 20000               # spendable at once; 0 means one minute's wort
 max_search_limit = 10000          # largest `limit` an MCP search may ask for
 max_federated_indexes = 20        # most indexes one `search_across_indexes` may name
 min_prefix_length = 2             # shortest `field:pre*` expanded; 0 expands any
-expand_unqualified_prefix = false # let a bare `pre*` search the default fields
+expand_unqualified_prefix = true  # a bare `pre*` searches the default fields
 max_default_fields = 64           # most fields an unqualified term searches; 0 = all
 ```
 
@@ -987,15 +987,16 @@ shard. Where each field holds its own vocabulary the other fields are dictionary
 
 #### `expand_unqualified_prefix` — whether `pre*` needs a field
 
-Off by default. Tantivy's grammar has no unqualified prefix: a bare `pre*` has its `*` dropped
-and matches the term `pre`, and the response reports that in `_discarded_clauses`. Turn this on
-and the node rewrites it into one prefix range per text field an unqualified term searches, OR'd
-together — `qui*` becomes `(body:[qui TO quj} OR title:[qui TO quj})` — so it finds what it
-looks like it should.
+On by default. Tantivy's grammar has no unqualified prefix: on its own, a bare `pre*` has its
+`*` dropped and matches the term `pre`. With this on, the node rewrites it into one prefix range
+per text field an unqualified term searches, OR'd together — `qui*` becomes
+`(body:[qui TO quj} OR title:[qui TO quj})` — so it finds what it looks like it should. Set it
+`false` and a bare prefix matches the literal term again, reported in `_discarded_clauses`.
 
 - **It costs one prefix per default field.** Every indexed text field is a default field, so on
   a wide index one bare prefix is that many ranges. `min_prefix_length` applies to each, which
-  is what keeps any single one of them cheap; `max_default_fields` bounds how many there are.
+  is what keeps any single one of them cheap; `max_default_fields` bounds how many there are,
+  which is what let this default on.
 - **Only unqualified prefixes.** `title:pre*` is rewritten as before; a prefix inside a field
   group — `title:(pre*)` — belongs to that field and is never sent to the others. It is still
   reported rather than expanded.

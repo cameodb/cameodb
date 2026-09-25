@@ -475,8 +475,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names anything but an indexed text, string or JSON field. `0` lifts the cap. **This changes
   results** for unqualified queries on indexes with more than 64 such fields.
 
-- **`[security.limits] expand_unqualified_prefix` lets a bare `pre*` search the default
-  fields.** Off by default. On, `qui*` is rewritten into one prefix range per text default field,
+- **A bare `pre*` searches the default fields (`[security.limits] expand_unqualified_prefix`,
+  on by default).** Before, tantivy dropped the `*` and matched the term `pre`. Now `qui*` is
+  rewritten into one prefix range per text default field,
   OR'd, with `min_prefix_length` applied to each — the fields an unqualified term already
   searches. A prefix inside a field group stays that field's. The rewrite runs only when the
   node's reading of the query agrees with tantivy's own parse; otherwise it declines and reports
