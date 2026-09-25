@@ -229,13 +229,13 @@ pub(crate) fn default_routing_field() -> String {
 /// one per index, so the whole node's worth of them is resident in that caller's context at once.
 /// A paragraph is enough to say what a dataset is; a page of it is a document, and belongs
 /// somewhere that can be fetched on purpose.
-pub const MAX_INDEX_DESCRIPTION_CHARS: usize = 512;
+pub(crate) const MAX_INDEX_DESCRIPTION_CHARS: usize = 512;
 
 /// Longest description a single field may carry, in characters.
 ///
 /// Tighter than the index limit because it is paid per field on every schema read: one line
 /// saying what the field means, not the history of how it came to exist.
-pub const MAX_FIELD_DESCRIPTION_CHARS: usize = 200;
+pub(crate) const MAX_FIELD_DESCRIPTION_CHARS: usize = 200;
 
 /// Blank is the same as unset, so an operator clearing a description gets `None` rather than a
 /// key with nothing in it.
@@ -1684,7 +1684,7 @@ pub fn document_key_field(schema: &IndexSchema) -> String {
 /// 2. If shadow fields EXIST: Replaces 'id' with the shadow field(s) (e.g., returns 'book_id' instead of 'id').
 ///
 /// This avoids cloning the bulk of the document (original fields) by using `append`.
-pub fn reconstruct_shadow_fields_owned(
+pub(crate) fn reconstruct_shadow_fields_owned(
     json_blob: JsonValue,
     schema: &IndexSchema,
     doc_id: &str,

@@ -264,7 +264,7 @@ pub(crate) fn warm_segment(index: &str, segment_reader: &tantivy::SegmentReader)
 }
 
 /// An index this shard is holding open, and the tick at which it was last used.
-pub struct OpenIndex {
+pub(crate) struct OpenIndex {
     last_used: AtomicU64,
 }
 

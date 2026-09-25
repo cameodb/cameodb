@@ -52,7 +52,7 @@ on one.
 | 14 — Security hardening (posture items C3–C8) | ✅ Done | C3–C8 all closed; C8 by M3 on 2026-09-20 |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
-| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed but for O4; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 is measurement only; its first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), and the arms themselves are still owed |
+| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 is measurement only; its first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), and the arms themselves are still owed |
 
 ## Reconciliation, 2026-08-26
 
@@ -180,7 +180,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
 | [L1](#l1--size-cache-invalidation-by-substring-evicts-neighbouring-indexes) … [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | Post-0.3.4 review group — all twenty closed; the retrospective's output is [M](#m-the-035-goal-set--multi-tenant-exposure--planned) | — | 2026-09-19 | ✅ |
-| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed but for O4, the M1 blocker cleared, and M2, M3 and M7 done; M6 reduced to measurement, whose first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) | — | 2026-09-25 | ◐ |
+| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed, the M1 blocker cleared, and M2, M3, M4, M5, M7 and M8 done; M6 reduced to measurement, whose first arm found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) | — | 2026-09-25 | ◐ |
 
 ---
 
@@ -3938,6 +3938,19 @@ names a node has touched, and that is precisely the dimension
   `pub` in any of those modules silently widens the crate's public API with no review step.
   (`search.rs` is correctly `pub(crate) use`, as L12 intended.) Named re-export lists make each
   widening deliberate; the glob makes it invisible.
+
+  ✅ **Done 2026-09-25.** `lib.rs` names what it exports: `FieldReference` and `field_references`
+  from `query`; `FieldDef`, `IndexSchema`, `SchemaFieldUpdate`, `SchemaFields`, `SchemaState`,
+  `TantivyFieldType`, `WalOp` and six functions from `schema`; `HybridStore` from `store`. The list
+  is every name another crate, or storage's own integration tests and examples, actually uses,
+  plus the two types that appear in public signatures (`FieldReference`, returned by
+  `field_references`; `SchemaFields`, returned by `get_or_create_index`). The three modules stay
+  `pub(crate) use …::*` for the crate's own wiring — an explicit import outranks a glob, so the two
+  coexist — which makes the lists the whole public surface. Of the 20 `pub` items the globs had
+  been exporting, the four nothing outside used were narrowed to `pub(crate)`: the two description
+  limits, `reconstruct_shadow_fields_owned` and `OpenIndex`. `SchemaFields` was narrowed too and
+  put back when the compiler flagged it as private in `get_or_create_index`'s public signature —
+  which is the review step the glob never offered.
 - **O5 — the `server → client` edge is deliberate and should stay recorded as such.** The
   binary is one artifact: `main.rs` dispatches to `client::run_cli()`, so the server links the
   whole CLI — clap, the interactive shell, the CSV and compression paths. It costs binary size
@@ -4252,7 +4265,7 @@ either does the thing or it does not. Item 6 is ⏱ and is owed a run.
 | 2 | Re-scope the cap to the *index* — all eleven maps — and record the three-threads-per-index fact (**M0-a**, **M0-b**) | [M1](#m1--bound-resident-memory-against-index-count) |
 | 3 | ✅ Stop the per-commit directory walk (**M0-g**) — done 2026-09-19 | this group |
 | 4 | ✅ `pub(crate)` → `pub(super)` across `node/`, and one named boundary list in `node/mod.rs` (**O1**) — done 2026-09-19 | this group |
-| 5 | ◐ Extract the admission subsystem from `orchestrator.rs` (**O2** ✅); re-unite the routing-key family (**O3** ✅); replace `storage`'s glob re-exports with named lists (**O4**, outstanding) | this group |
+| 5 | ✅ Extract the admission subsystem from `orchestrator.rs` (**O2** ✅); re-unite the routing-key family (**O3** ✅); replace `storage`'s glob re-exports with named lists (**O4** ✅) | this group |
 | 6 | ✅ ⏱ Hoist shard-independent query preparation out of the fan-out (**M0-f**) — measured 2026-09-19 and **declined**; the measurement instead found **M0-j** | this group, beside [M6](#m6--close-and-re-measure-the-bulk-lane) |
 | 7 | ✅ The cheap and certain set: the `Arc` in `parallel_validate_schema`, CH6's per-hit clone, the read cache's arbitrary eviction, and the delete-or-activate decision on `get_bulk_operation_budget` and its test (**M0-d**, **M0-e**, **M0-c**, **M0-h**) — done 2026-09-19 | this group, [CH6](#ch6--the-federated-merge-clones-every-hit) |
 
@@ -4266,8 +4279,8 @@ then 1, 3 and 7 in their ranked order, then 6. Step 2 was a re-scoping of
 [M1](#m1--bound-resident-memory-against-index-count)'s own entry rather than code, and is
 recorded there. Step 6 closed by being **declined on its measurement** rather than done, which
 is what ⏱ is for; it left **M0-j** behind, for
-[M8](#m8--re-decide-the-query-complexity-caps). What is left of this group is **O4** from
-step 5. Together the finished steps removed two fsyncs' worth of
+[M8](#m8--re-decide-the-query-complexity-caps). **O4**, the last of step 5, closed on
+2026-09-25, and with it this group. Together the finished steps removed two fsyncs' worth of
 work and a window from every evolving write, ~300 `stat` syscalls from every commit, three
 schema deep-copies from the write path, a deep copy of every hit from every federated MCP
 response, and a documented claim the engine never implemented; they added four regression tests,

@@ -40,10 +40,28 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-pub use query::*;
-pub use schema::*;
+// The crate's public API, named. Before these lists, `lib.rs` re-exported `query`, `schema` and
+// `store` whole, so any `pub` added in those modules widened the crate's API with no review step
+// (O4). Now widening it is an edit here: an item a caller outside the crate needs goes in the
+// list, on purpose, and everything else stays the crate's own business.
+pub use query::{FieldReference, field_references};
+pub use schema::{
+    FieldDef, IndexSchema, SchemaFieldUpdate, SchemaFields, SchemaState, TantivyFieldType, WalOp,
+    byte_value_error, document_key_field, facet_path_error, is_date_value,
+    parse_date_to_timestamp_secs, select_default_fields,
+};
+pub use store::HybridStore;
+// `SchemaFields` is in the list because `HybridStore::get_or_create_index` returns it, not because
+// a caller reads it: its fields are crate-private, so outside the crate it is a handle to hold and
+// drop. Narrowing the type makes that signature a `private_interfaces` warning, which the
+// `-D warnings` clippy gate turns into a failure — so this line is held in place.
+
+// Inside the crate every module reaches its siblings through `crate::*`, so these stay globs —
+// scoped to the crate and no wider, which is what makes the lists above the whole public surface.
+pub(crate) use query::*;
+pub(crate) use schema::*;
 pub(crate) use search::*;
-pub use store::*;
+pub(crate) use store::*;
 
 /// Sort specification for search results
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
