@@ -388,6 +388,7 @@ async fn main() -> Result<()> {
         merge_num_threads: cameodb_config.search.merge_num_threads,
         writer_shutdown_timeout_secs: 30,
         supervisor_timeout_secs: cameodb_config.search.supervisor_timeout_secs,
+        commit_interval_ms: cameodb_config.search.commit_interval_ms,
         writer_core_affinity: cameodb_config.storage.writer_core_affinity,
         shard_affine_dispatch: cameodb_config.storage.shard_affine_dispatch,
         worker_core_affinity: cameodb_config.storage.worker_core_affinity,

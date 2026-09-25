@@ -595,12 +595,19 @@ pub struct SearchConfig {
     #[serde(default = "default_memory_pressure_threshold_percent")]
     pub memory_pressure_threshold_percent: u8,
 
-    /// Maximum number of searches executing concurrently on this node (default: 8).
+    /// Maximum number of searches executing concurrently on this node (default: the number
+    /// of cores available to the process, at least 2).
     ///
     /// Sizes the dedicated read pool's blocking threads, which is where search and stats
     /// work actually runs. Queries beyond this limit queue rather than adding threads, so
     /// raising it trades memory and CPU contention for concurrency. Setting it to 0 derives
     /// `max(2, cpu_cores / 2)`.
+    ///
+    /// A search is CPU-bound and nothing else in the read path serializes it: measured on 15
+    /// cores, 2, 6 and 12 threads served 1,900, 6,250 and 11,600 searches/s on 2.1, 6.5 and
+    /// 12.8 cores. The default used to be a fixed 8, which was the core count of the node it
+    /// was measured on and left most of a larger one idle. Available cores, not the host's:
+    /// in a container the standard library reads the CPU quota the container is given.
     ///
     /// Note this bounds concurrency across all queries; `max_concurrent_shard_searches`
     /// separately bounds the shard fan-out of a single query, and cannot exceed this in
@@ -640,17 +647,36 @@ pub struct SearchConfig {
     #[serde(default = "default_search_limit")]
     pub default_search_limit: usize,
 
-    /// Seconds of write inactivity on an index before it is committed anyway (default: 5).
+    /// Seconds of write inactivity on an index before it is committed anyway (default: 3).
     ///
-    /// The safety net under the operation-count threshold. Writes are committed once enough
-    /// have accumulated, which is what keeps steady ingest cheap; a trickle that never
-    /// reaches the threshold would otherwise stay uncommitted — and therefore unsearchable —
-    /// until the next write arrived. This bounds that window.
+    /// The idle commit. While writes keep arriving, `commit_interval_ms` bounds how long one
+    /// waits to become searchable; that check runs as writes arrive, so the writes that end a
+    /// burst — with nothing after them to trigger it — are committed by this one instead.
+    /// A second above the default interval, so the idle bound is of the same order as the
+    /// loaded one while a writer that pauses briefly between requests does not commit on
+    /// every pause.
     ///
-    /// Lower it to make small writes visible to search sooner, at the cost of more frequent
-    /// commits and the segment churn that follows.
+    /// Keep it at or above `commit_interval_ms`: below it, the idle commit would fire inside
+    /// an interval and take over the job the interval is there to batch.
     #[serde(default = "default_supervisor_timeout_secs")]
     pub supervisor_timeout_secs: u64,
+
+    /// Longest an index's oldest uncommitted write waits to become searchable while writes
+    /// keep arriving, in milliseconds (default: 2000). `0` commits by operation count alone.
+    ///
+    /// A commit is what makes a write visible to search, and the expensive half of a write:
+    /// the indexer flushes a segment and every file of it is synced. It used to be triggered
+    /// by operation count — `[storage] default_batch_size`, 1,000 on a new index — so a bulk
+    /// load committed on nearly every batch, and a trickle that never reached the count was
+    /// not searchable until it did. By time, a bulk load commits once per interval however
+    /// fast it arrives, and a trickle is searchable within one. The count still applies,
+    /// twenty times higher, as a backstop bounding what a restart replays.
+    ///
+    /// Durability is not what this trades: a write is durable when it is acknowledged,
+    /// whatever this is set to. It trades how soon a search sees a write against how much
+    /// work each commit amortizes.
+    #[serde(default = "default_commit_interval_ms")]
+    pub commit_interval_ms: u64,
 
     /// Number of documents per micro-batch when ingesting NDJSON write streams (default: 500)
     #[serde(default = "default_stream_batch_size")]
@@ -1310,6 +1336,19 @@ impl CameoDbConfig {
             .into());
         }
 
+        // A warning rather than a refusal: either order commits everything eventually. Inverted,
+        // the idle commit fires inside every interval and does the batching the interval is for,
+        // which costs throughput and is almost certainly not what the operator meant.
+        let idle_ms = self.search.supervisor_timeout_secs.saturating_mul(1000);
+        if self.search.commit_interval_ms > 0 && idle_ms < self.search.commit_interval_ms {
+            warn!(
+                supervisor_timeout_secs = self.search.supervisor_timeout_secs,
+                commit_interval_ms = self.search.commit_interval_ms,
+                "The idle commit is shorter than the commit interval, so it will commit inside \
+                 every interval; set supervisor_timeout_secs at or above the interval"
+            );
+        }
+
         Ok(())
     }
 
@@ -1452,6 +1491,7 @@ impl Default for SearchConfig {
             enable_early_termination: default_enable_early_termination(),
             default_search_limit: default_search_limit(),
             supervisor_timeout_secs: default_supervisor_timeout_secs(),
+            commit_interval_ms: default_commit_interval_ms(),
             stream_batch_size: default_stream_batch_size(),
             indexer_num_threads: default_indexer_num_threads(),
             merge_num_threads: default_merge_num_threads(),
@@ -1652,11 +1692,15 @@ config_defaults! {
     default_indexer_memory_max_mb -> usize = 512;
     default_total_memory_limit_mb -> usize = 2048;
     default_memory_pressure_threshold_percent -> u8 = 80;
-    default_search_threads -> usize = 8;
+    default_search_threads -> usize = std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(8)
+        .max(2);
     default_search_limit -> usize = 10;
     default_indexer_num_threads -> usize = 1;
     default_merge_num_threads -> usize = 2;
-    default_supervisor_timeout_secs -> u64 = 5;
+    default_supervisor_timeout_secs -> u64 = 3;
+    default_commit_interval_ms -> u64 = 2000;
     default_cluster_enabled -> bool = false;
     default_cluster_bind_address -> String = "0.0.0.0".to_string();
     default_cluster_port -> u16 = 9580;

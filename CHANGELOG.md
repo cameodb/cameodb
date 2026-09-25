@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Closing an index from another thread no longer loses the writes in flight on it.** Past the
+  open-index cap, admitting an index closes a colder one from whichever thread is opening — a
+  search on the read pool, an index creation — and closing commits. A write held its index
+  writer only around the Tantivy add, so a close landing between the write reserving its
+  sequences and adding its documents stamped those sequences durable in a commit that did not
+  contain them, truncated their WAL entries, and dropped the writer they were then added to. The
+  documents stayed in redb (so `id:` lookups found them) and were gone from the search index for
+  good. A write now holds its writer from before it reserves a sequence until it is counted, and
+  a close only takes a writer that is free and holds it through the commit and the teardown.
+  Found by audit; the regression test lost 136 of 600 writes on the old code.
+
+- **A schema edit and a write that evolves the schema no longer overwrite each other.** The
+  writer thread adds fields when a document brings new ones, and `default_fields` and indexing
+  flags are edited from the blocking pool; each read, changed and wrote the schema back
+  unserialized, so one could erase the other in redb and in the cache. A per-index schema lock
+  now covers every such read-modify-write, and a schema loaded on a cache miss no longer
+  replaces one a committed write cached while it loaded.
+
+- **A streaming search counts against the concurrency limit, and gives up on a client that
+  stops reading.** The search ran in a task spawned after the handler returned, so it held no
+  permit, and a client that kept the connection open without reading parked it — and the whole
+  result — indefinitely. The permit now lasts as long as the body, a line the client has not
+  taken in 30 s ends the stream, and the task measures its deadline from when the request
+  arrived rather than from when it was spawned.
+
+- **Two clustered deadlocks are gone.** A cluster-wide index delete awaited the local
+  orchestrator from inside the coordinator's mailbox while orchestrator handlers ask the
+  coordinator, and the periodic shard exchange awaited the peer's coordinator from inside its
+  own while the peer did the same; neither ask had a timeout. The coordinator now only answers
+  who to reach, and both round trips run outside its mailbox. A standalone node was not affected.
+
 - **A refused request no longer costs a log line, and single-write overload no longer halves
   goodput.** Every `503` was logged at `ERROR` — twice, by the trace layer and by the error
   handler — synchronously on the runtime the write path shares. A default node filters at
@@ -166,6 +197,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `500`: it round-trips as the `400` it was raised as.
 
 ### Changed
+
+- **Writes become searchable on a clock, not a count: bulk ingest 1.8–6.6× faster.** A commit
+  is what makes writes visible to search, and it was triggered at 1,000 operations on a new
+  index — so a bulk load committed on nearly every batch, the writer and Tantivy's indexer taking
+  turns, and a steady trickle below the count was not searchable until it reached it (about 17
+  minutes at one write per second; the idle commit only fires after a pause). An index now
+  commits once its oldest uncommitted write has waited `[search] commit_interval_ms` (2,000 by
+  default), with 20× the old count as a backstop, and commits after `supervisor_timeout_secs` of
+  quiet, now 3 s by default instead of 5. The writer answers a drain's callers before committing,
+  so no write waits for a commit and a failed commit no longer fails a write already durable.
+  Measured on the release build, 4 shards, `wal_sync = true`: 500-document batches at
+  concurrency 16 went from 19,700 to 130,000 docs/s (p50 420 → 53 ms), 5,000-document batches at
+  32 from 184,000 to 328,000; single writes held (611 → 588/s at concurrency 16, 1,734 → 1,836 at
+  64). A 1 s interval was measured too and cost 16 concurrent single writers 15% on macOS, where
+  every sync is a full-device flush — hence 2 s. `commit_interval_ms = 0` restores the
+  count-only policy.
+
+- **`search_threads` defaults to the cores the process is given, not a fixed 8.** Searches are
+  CPU-bound and nothing else in the read path serializes them: on 15 cores, 2, 6 and 12 threads
+  served 1,900, 6,250 and 11,600 searches/s on 2.1, 6.5 and 12.8 cores. In a container the
+  default follows the CPU quota; `docker/cameodb-docker.toml` no longer pins 8.
 
 - **The per-index document read cache is gone.** It held 1024 document bodies per index,
   mirroring rows of `data_<index>` on top of redb's page cache and the OS page cache below that,

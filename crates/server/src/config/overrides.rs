@@ -135,6 +135,11 @@ pub(crate) const OVERRIDES: &[Override] = &[
         apply: |c, v| { c.search.supervisor_timeout_secs = v.parse()?; Ok(()) },
     },
     Override {
+        flag: "--commit-interval-ms", env: "CAMEODB_COMMIT_INTERVAL_MS", kind: FlagKind::Value,
+        placeholder: "<MS>", help: "Longest a write waits to become searchable under load (0: by count)",
+        apply: |c, v| { c.search.commit_interval_ms = v.parse()?; Ok(()) },
+    },
+    Override {
         flag: "--node-label", env: "CAMEODB_NODE_LABEL", kind: FlagKind::Value,
         placeholder: "<NAME>", help: "Human-readable name for this node",
         apply: |c, v| { c.node.label = Some(v.to_string()); Ok(()) },

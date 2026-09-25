@@ -743,6 +743,7 @@ pub(super) fn spawn_writer_thread(
                     let mut evictions: Vec<(String, tokio::sync::oneshot::Sender<bool>)> = Vec::new();
                     let mut deletions: Vec<DeleteCommand> = Vec::new();
                     let mut committed_indices: HashSet<String> = HashSet::new();
+                    let mut written_indices: HashSet<String> = HashSet::new();
                     let mut mixed: Vec<String> = Vec::new();
 
                     while let Some(first_cmd) = rx.blocking_recv() {
@@ -780,6 +781,9 @@ pub(super) fn spawn_writer_thread(
                     // Collected rather than posted inline so a burst that commits the same
                     // index several times results in one re-warm request.
                     committed_indices.clear();
+                    // Indices this drain wrote to, whose commit is decided once every reply
+                    // has been sent — see Phase 4b.
+                    written_indices.clear();
 
                     for cmd in pending_cmds.drain(..) {
                         match cmd {
@@ -808,7 +812,7 @@ pub(super) fn spawn_writer_thread(
                     // this same drain.
                     //
                     // Applied by the two phases below they are two
-                    // `apply_batch_and_maybe_commit` calls — two redb transactions, and with
+                    // `apply_batch` calls — two redb transactions, and with
                     // `wal_sync` on two fsyncs — for work one transaction covers. The comment
                     // above has claimed the two are merged since before they were; this is
                     // where it becomes true. Singles go ahead of batches, which is the order
@@ -848,7 +852,7 @@ pub(super) fn spawn_writer_thread(
 
                         let total_ops = merged_ops.len();
                         let res = guard_writer_op(&writer_store, &index, || {
-                            writer_store.apply_batch_and_maybe_commit(&index, merged_ops)
+                            writer_store.apply_batch(&index, merged_ops)
                         });
 
                         let fail_all = |segments: Vec<MergedWriteReply>, reason: String| {
@@ -866,7 +870,7 @@ pub(super) fn spawn_writer_thread(
                         };
 
                         match res {
-                            Ok(((seq_ids, _new_docs), committed)) => {
+                            Ok((seq_ids, _new_docs)) => {
                                 // One sequence per op is the storage layer's contract. Checked
                                 // rather than indexed on faith: this runs on the writer thread,
                                 // where a panic takes every shard's writes down with it.
@@ -885,14 +889,7 @@ pub(super) fn spawn_writer_thread(
                                     );
                                     continue;
                                 };
-                                if committed {
-                                    tracing::info!(
-                                        index = %index,
-                                        total_ops,
-                                        "Writer: threshold commit after merged single and batch writes"
-                                    );
-                                    committed_indices.insert(index.clone());
-                                }
+                                written_indices.insert(index.clone());
                                 tracing::debug!(
                                     index = %index,
                                     total_ops,
@@ -936,35 +933,26 @@ pub(super) fn spawn_writer_thread(
                             // Single write — no coalescing overhead needed
                             let (op, reply) = writes.pop().unwrap();
                             let res = guard_writer_op(&writer_store, index, || {
-                                writer_store.apply_write_and_maybe_commit(index, op)
+                                writer_store.apply_write(index, op)
                             });
                             match &res {
-                                Ok((_, true)) => {
-                                    tracing::info!(index = %index, "Writer: threshold commit after write");
-                                    committed_indices.insert(index.clone());
+                                Ok(_) => {
+                                    written_indices.insert(index.clone());
                                 }
-                                Ok((_, false)) => {}
                                 Err(e) => tracing::error!(index = %index, error = %e, "Writer: write failed"),
                             }
-                            let _ = reply.send(res.map(|(seq_id, _)| seq_id));
+                            let _ = reply.send(res);
                         } else {
                             // Coalesced writes — merge N single writes into one batch
                             let coalesced_count = writes.len();
                             let (ops, replies): (Vec<WalOp>, Vec<_>) = writes.drain(..).unzip();
 
                             let res = guard_writer_op(&writer_store, index, || {
-                                writer_store.apply_batch_and_maybe_commit(index, ops)
+                                writer_store.apply_batch(index, ops)
                             });
                             match res {
-                                Ok(((seq_ids, _new_docs), committed)) => {
-                                    if committed {
-                                        tracing::info!(
-                                            index = %index,
-                                            coalesced = coalesced_count,
-                                            "Writer: threshold commit after coalesced writes"
-                                        );
-                                        committed_indices.insert(index.clone());
-                                    }
+                                Ok((seq_ids, _new_docs)) => {
+                                    written_indices.insert(index.clone());
                                     tracing::debug!(
                                         index = %index,
                                         coalesced = coalesced_count,
@@ -1001,17 +989,15 @@ pub(super) fn spawn_writer_thread(
                             // Single batch — no coalescing overhead needed
                             let (ops, reply) = batches.into_iter().next().unwrap();
                             let res = guard_writer_op(&writer_store, &index, || {
-                                writer_store.apply_batch_and_maybe_commit(&index, ops)
+                                writer_store.apply_batch(&index, ops)
                             });
                             match &res {
-                                Ok((_, true)) => {
-                                    tracing::info!(index = %index, "Writer: threshold commit after batch write");
-                                    committed_indices.insert(index.clone());
+                                Ok(_) => {
+                                    written_indices.insert(index.clone());
                                 }
-                                Ok((_, false)) => {}
                                 Err(e) => tracing::error!(index = %index, error = %e, "Writer: batch write failed"),
                             }
-                            let _ = reply.send(res.map(|((seq_ids, _), _)| seq_ids));
+                            let _ = reply.send(res.map(|(seq_ids, _)| seq_ids));
                         } else {
                             // Coalesced batches — merge N batch writes into one
                             let coalesced_count = batches.len();
@@ -1026,19 +1012,11 @@ pub(super) fn spawn_writer_thread(
 
                             let total_ops = merged_ops.len();
                             let res = guard_writer_op(&writer_store, &index, || {
-                                writer_store.apply_batch_and_maybe_commit(&index, merged_ops)
+                                writer_store.apply_batch(&index, merged_ops)
                             });
                             match res {
-                                Ok(((seq_ids, _new_docs), committed)) => {
-                                    if committed {
-                                        tracing::info!(
-                                            index = %index,
-                                            coalesced_batches = coalesced_count,
-                                            total_ops = total_ops,
-                                            "Writer: threshold commit after coalesced batch writes"
-                                        );
-                                        committed_indices.insert(index.clone());
-                                    }
+                                Ok((seq_ids, _new_docs)) => {
+                                    written_indices.insert(index.clone());
                                     tracing::debug!(
                                         index = %index,
                                         coalesced_batches = coalesced_count,
@@ -1069,6 +1047,33 @@ pub(super) fn spawn_writer_thread(
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    // Phase 4b: the commits this drain's writes made due, decided only now that
+                    // every one of their callers has been answered.
+                    //
+                    // A write is durable once its redb transaction commits, which happened above
+                    // and before its reply. The Tantivy commit decided here is about visibility to
+                    // search, and it is the expensive half: the indexer flushes its segment and
+                    // every file of it is synced. Deciding it inside each apply made the callers of
+                    // that drain wait for it, and told them their write had failed when only the
+                    // commit had — the write itself was durable, and the WAL still held it for the
+                    // next commit or a replay. Once per index here, however many groups wrote to it.
+                    for index in written_indices.drain() {
+                        match guard_writer_op(&writer_store, &index, || {
+                            writer_store.maybe_commit_writer(&index)
+                        }) {
+                            Ok(true) => {
+                                tracing::debug!(index = %index, "Writer: commit after this drain's writes");
+                                committed_indices.insert(index);
+                            }
+                            Ok(false) => {}
+                            Err(e) => tracing::error!(
+                                index = %index,
+                                error = %e,
+                                "Writer: commit failed; the WAL keeps these writes for the next commit or a replay"
+                            ),
                         }
                     }
 
@@ -1770,9 +1775,19 @@ impl MicroshardActor {
 
                             match reply_rx.await {
                                 Ok(Ok(())) => {
-                                    tracing::info!(index = %index_inner, "Supervisor committed index via writer thread after idle timeout");
-                                    // Self-cleanup from the supervisors map
+                                    tracing::debug!(index = %index_inner, "Supervisor committed index via writer thread after idle timeout");
+                                    // Leave the map only if nothing arrived while the commit ran.
+                                    // A write in that window found this supervisor's sender and
+                                    // nudged it rather than arming a new one, and may have landed
+                                    // after the commit — exiting would drop its nudge and leave it
+                                    // unsearchable until some later write. Every nudge is sent
+                                    // under the map's read lock, so under the write lock the
+                                    // channel is final: empty means no write is waiting on us, and
+                                    // the next one will find no entry and arm a fresh supervisor.
                                     let mut supervisors = supervisors_arc.write().await;
+                                    if !rx.is_empty() {
+                                        continue;
+                                    }
                                     supervisors.remove(&index_clone);
                                     break;
                                 }

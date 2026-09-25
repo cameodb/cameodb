@@ -24,6 +24,7 @@ fn test_config(path: std::path::PathBuf) -> StorageConfig {
         merge_num_threads: 2,
         default_batch_size: 1000,
         wal_sync: true,
+        commit_interval_ms: 0,
         query: Default::default(),
     }
 }

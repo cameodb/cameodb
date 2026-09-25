@@ -147,8 +147,27 @@ mod tests {
         assert_eq!(config.search.supervisor_timeout_secs, 30);
         assert_eq!(
             CameoDbConfig::default().search.supervisor_timeout_secs,
-            5,
+            3,
             "the documented default and the code's default have to agree"
+        );
+    }
+
+    /// The commit interval reaches the config from the file, and its default is the one the
+    /// documentation states — under the idle commit, as the two are meant to sit.
+    #[test]
+    fn the_commit_interval_is_configurable_from_the_file() {
+        let config: CameoDbConfig = toml::from_str(
+            "[search]\n\
+             commit_interval_ms = 250\n",
+        )
+        .expect("partial config");
+        assert_eq!(config.search.commit_interval_ms, 250);
+
+        let defaults = CameoDbConfig::default().search;
+        assert_eq!(defaults.commit_interval_ms, 2000);
+        assert!(
+            defaults.supervisor_timeout_secs * 1000 >= defaults.commit_interval_ms,
+            "the idle commit must not fire inside a commit interval by default"
         );
     }
 

@@ -392,6 +392,7 @@ fn writer_test_config(path: std::path::PathBuf) -> StorageConfig {
         merge_num_threads: 1,
         default_batch_size: 1000,
         wal_sync: true,
+        commit_interval_ms: 0,
         query: Default::default(),
     }
 }
@@ -3384,4 +3385,34 @@ fn a_document_reason_is_split_only_when_that_is_what_it_is() {
     assert_eq!(split_document_reason("documents 12: because"), None);
     assert_eq!(split_document_reason("document twelve: because"), None);
     assert_eq!(split_document_reason("index is read-only"), None);
+}
+
+/// A streaming search gives up on a client that stops reading, instead of parking — holding the
+/// whole result — for as long as the connection stays open. A client that has gone is noticed
+/// at once, as before.
+#[tokio::test]
+async fn a_stream_abandons_a_client_that_stops_reading() {
+    let stall = Duration::from_millis(50);
+    let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
+    let line = || bytes::Bytes::from_static(b"{}\n");
+
+    assert!(
+        RouterActor::send_or_abandon(&tx, line(), stall).await,
+        "room in the channel: sent"
+    );
+    let started = Instant::now();
+    assert!(
+        !RouterActor::send_or_abandon(&tx, line(), stall).await,
+        "nobody reading and the channel full: abandoned"
+    );
+    assert!(
+        started.elapsed() >= stall,
+        "after waiting out the stall bound, not before"
+    );
+
+    drop(rx);
+    assert!(
+        !RouterActor::send_or_abandon(&tx, line(), Duration::from_secs(30)).await,
+        "a client that has gone is noticed without waiting"
+    );
 }

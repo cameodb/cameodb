@@ -21,6 +21,7 @@ fn config(path: std::path::PathBuf, query: storage::QueryPolicy) -> StorageConfi
         merge_num_threads: 1,
         default_batch_size: 100_000,
         wal_sync: true,
+        commit_interval_ms: 0,
         query,
     }
 }

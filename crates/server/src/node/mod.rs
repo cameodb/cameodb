@@ -170,9 +170,10 @@ tokio::task_local! {
     ///
     /// A task-local rather than a field on the request or the op: the value is read at job
     /// build inside `handle_client_op`, sixteen call sites upstream of it, and none of them
-    /// has any use for it themselves. `tokio::spawn` inherits the scope, so paths that hand
-    /// the request to a new task — streaming search dispatch, and the worker's op task, which
-    /// re-enters it scoped to the job's `arrived_at` — keep the same stamp. Calls that arrive
+    /// has any use for it themselves. `tokio::spawn` does *not* inherit the scope, so a path
+    /// that hands the request to a new task re-enters it by hand — streaming search dispatch
+    /// with the stamp it read before spawning, the worker's op task scoped to the job's
+    /// `arrived_at` — or its deadline checks start from zero. Calls that arrive
     /// another way — a peer's forwarded op over libp2p, an internal ask, a test — run outside
     /// any scope and get `Instant::now()` from the helper, which is the dispatch-time
     /// behaviour this replaced.
@@ -287,9 +288,13 @@ pub struct NodeConfig {
     pub writer_shutdown_timeout_secs: u64,
     /// Seconds of write inactivity on an index before its supervisor commits it.
     ///
-    /// The safety net under the operation-count threshold: writes that stop short of the
-    /// threshold would otherwise sit uncommitted and unsearchable until the next write.
+    /// The idle commit: the writes that end a burst have nothing after them to trigger the
+    /// interval check, and would otherwise sit unsearchable until the next write.
     pub supervisor_timeout_secs: u64,
+    /// Longest an index's oldest uncommitted write waits for a commit while writes keep
+    /// arriving, in milliseconds; `0` commits by operation count alone. Passed to each shard's
+    /// store as `StorageConfig::commit_interval_ms`.
+    pub commit_interval_ms: u64,
     /// Pin per-shard writer threads to the core given by the shard's dense ordinal.
     /// Improves cache locality and reduces cross-core wakeups under heavy write load.
     /// Default: false (no pinning, OS scheduler decides).
@@ -357,7 +362,8 @@ impl Default for NodeConfig {
             indexer_num_threads: 1,
             merge_num_threads: 2,
             writer_shutdown_timeout_secs: 30,
-            supervisor_timeout_secs: 5,
+            supervisor_timeout_secs: 3,
+            commit_interval_ms: 2000,
             writer_core_affinity: true,
             shard_affine_dispatch: false,
             worker_core_affinity: false,
@@ -633,7 +639,8 @@ impl OrchestratorError {
             | Self::ReadDeadlineExpired { .. }
             | Self::Overloaded { .. }
             | Self::NotReady(_)
-            | Self::Storage(StoreError::WriterPanicked(_)) => RemoteVerdict::Unavailable,
+            | Self::Storage(StoreError::WriterPanicked(_))
+            | Self::Storage(StoreError::WriterClosed(_)) => RemoteVerdict::Unavailable,
 
             Self::Validation(_) => RemoteVerdict::BadRequest,
 

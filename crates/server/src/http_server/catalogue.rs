@@ -318,21 +318,26 @@ pub(super) async fn delete_index_handler(
         delete_schema: params.delete_schema.unwrap_or(false),
     };
 
-    // The coordinator's own error when it produced one, classified by its verdict — so a
-    // delete that could not reach every node answers `503` and invites the retry that will
-    // finish it, rather than the `500` that says the request was hopeless. Anything else is
-    // the coordinator itself not answering, which is a fault of this node.
-    let result = state
+    // The coordinator says who to reach and this task reaches them: the delete does not run
+    // inside the coordinator's mailbox (see `delete_index_cluster`). A coordinator that does not
+    // answer is a fault of this node.
+    let targets = state
         .coordinator
-        .ask(delete_msg)
+        .ask(crate::cluster_coordinator::GetDeleteTargets)
         .await
-        .map_err(|e| match e {
-            kameo::error::SendError::HandlerError(err) => AppError::from_route(err),
-            other => AppError::from(anyhow::anyhow!(
+        .map_err(|e| {
+            AppError::from(anyhow::anyhow!(
                 "Failed to delete index across cluster: {}",
-                other
-            )),
+                e
+            ))
         })?;
+
+    // Its own error when it produced one, classified by its verdict — so a delete that could
+    // not reach every node answers `503` and invites the retry that will finish it, rather
+    // than the `500` that says the request was hopeless.
+    let result = crate::cluster_coordinator::delete_index_cluster(targets, delete_msg)
+        .await
+        .map_err(AppError::from_route)?;
 
     Ok(Json(result))
 }

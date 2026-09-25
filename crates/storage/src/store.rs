@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -130,6 +130,29 @@ pub(crate) fn tantivy_checkpoint_seq(tantivy_index: &Index) -> Option<u64> {
 /// How long startup warmup may spend faulting in segment structures before it gives up on
 /// the indices it has not reached. Indices are warmed smallest-first, so the budget buys the
 /// largest number of warm indices it can and leaves the rest to warm on demand.
+/// How many times a write reopens an index that eviction closed under it before it gives up
+/// with [`StoreError::WriterClosed`]. Each attempt needs a fresh eviction of this very index
+/// inside the few microseconds between opening it and locking its writer.
+const LIVE_WRITER_ATTEMPTS: usize = 3;
+
+/// Lock an index writer, recovering it from a poisoned mutex: a panic applying one write is
+/// caught per operation and the writer rebuilt, so poison is not a reason to fail the next.
+fn lock_writer<'w>(writer: &'w Mutex<IndexWriter>, index: &str) -> MutexGuard<'w, IndexWriter> {
+    writer.lock().unwrap_or_else(|poisoned| {
+        tracing::error!(index = %index, "Writer mutex was poisoned, recovering");
+        poisoned.into_inner()
+    })
+}
+
+/// `pending_since` holds this while an index has nothing waiting for a commit.
+pub(crate) const NOTHING_PENDING: u64 = 0;
+
+/// With a commit interval configured, how far past the count threshold an index may run before
+/// it commits regardless of the clock. The interval is what normally triggers a commit; this
+/// bounds the WAL tail a restart replays and the buffer a commit has to flush, when writes
+/// arrive faster than an interval can cover.
+pub(crate) const COMMIT_BACKSTOP_MULTIPLE: u64 = 20;
+
 pub(crate) const WARMUP_BUDGET: Duration = Duration::from_secs(60);
 
 /// Counting semaphore bounding how many indices replay their WAL tail at once, across every
@@ -280,6 +303,12 @@ pub struct HybridStore {
     pub(crate) current_seq: Arc<DashMap<String, AtomicU64>>,
     /// Operation counters for smart commits per index
     pub(crate) operations_counter: Arc<DashMap<String, AtomicU64>>,
+    /// When each index's oldest uncommitted operation was counted, in milliseconds after
+    /// `commit_clock_epoch`, or [`NOTHING_PENDING`]. What `commit_interval_ms` is measured
+    /// from; see [`Self::should_commit_writer`].
+    pub(crate) pending_since: Arc<DashMap<String, AtomicU64>>,
+    /// The origin `pending_since` is measured from.
+    pub(crate) commit_clock_epoch: std::time::Instant,
     /// Cache of optimal memory budgets per index to avoid frequent syscalls.
     /// See [`BudgetCacheEntry`] for why it carries a timestamp rather than a bare number.
     pub(crate) budget_cache: Arc<DashMap<String, BudgetCacheEntry>>,
@@ -291,6 +320,9 @@ pub struct HybridStore {
     /// Tantivy's `INDEX_WRITER_LOCK` is a non-blocking flock on `.tantivy-writer.lock`, so
     /// two threads opening a writer for the same index race and one fails with `LockBusy`.
     pub(crate) index_init_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    /// Per-index schema locks, serializing every read-modify-write of an index's schema row.
+    /// See [`Self::lock_schema`].
+    pub(crate) schema_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     /// Searcher generation last warmed, per index. A searcher whose generation is unchanged
     /// holds the same `SegmentReader`s with the same filled caches, so re-warming it is
     /// pointless — this makes repeated warm requests for an idle index free.
@@ -479,10 +511,13 @@ impl HybridStore {
             readers: Arc::new(DashMap::new()),
             current_seq: Arc::new(DashMap::new()),
             operations_counter: Arc::new(DashMap::new()),
+            pending_since: Arc::new(DashMap::new()),
+            commit_clock_epoch: std::time::Instant::now(),
             budget_cache: Arc::new(DashMap::new()),
             schema_cache: Arc::new(DashMap::new()),
             fields_cache: Arc::new(DashMap::new()),
             index_init_locks: Arc::new(DashMap::new()),
+            schema_locks: Arc::new(DashMap::new()),
             warmed_generations: Arc::new(DashMap::new()),
             warmup_states: Arc::new(DashMap::new()),
             index_size_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -590,6 +625,7 @@ impl HybridStore {
         self.schema_cache.clear();
         self.budget_cache.clear();
         self.operations_counter.clear();
+        self.pending_since.clear();
         self.current_seq.clear();
         self.index_size_cache
             .lock()
@@ -675,6 +711,7 @@ impl HybridStore {
         // Leaving it non-zero makes the next commit_index for this name believe there is
         // unflushed data.
         self.operations_counter.remove(index);
+        self.pending_since.remove(index);
         // Warmup is invalidated by generation equality, and this name's next reader starts
         // its generation counter from zero. Dropping both entries is what makes the next
         // warm actually run, and stops the name reporting warm while it holds no data.
@@ -735,11 +772,16 @@ impl HybridStore {
         }
 
         if self.max_open_indexes > 0 {
+            // A victim can be taken by a write between being chosen and being closed, and is
+            // then skipped; bounded so a shard whose every index keeps getting written cannot
+            // hold this caller in the loop.
+            let mut skips_left = self.open_indexes.len();
             // `>=` because this call is about to add one.
             while self.open_indexes.len() >= self.max_open_indexes {
                 match self.coldest_closable_index(index) {
-                    Some(victim) => self.close_index(&victim),
-                    None => {
+                    Some(victim) if self.close_index(&victim) => {}
+                    Some(_) if skips_left > 0 => skips_left -= 1,
+                    _ => {
                         tracing::warn!(
                             index = %index,
                             open = self.open_indexes.len(),
@@ -819,16 +861,45 @@ impl HybridStore {
     /// already has and `writer_eviction_test` already pins: the documents are in redb's WAL
     /// until a commit checkpoints past them, so dropping an uncommitted writer costs a replay
     /// on reopen rather than the documents.
-    pub fn close_index(&self, index: &str) {
-        if let Err(e) = self.commit_index(index) {
-            tracing::warn!(
-                index = %index,
-                error = %e,
-                "Close: commit failed, closing anyway; the WAL still holds what it buffered"
-            );
+    ///
+    /// Runs on whichever thread is admitting another index, not on this one's writer thread,
+    /// so it takes the writer only if it is free and holds it from the commit through dropping
+    /// the caches: a write either finished before (and is in the commit) or starts after (and
+    /// finds the writer gone, see `lock_live_writer`). Returns `false`, closing nothing, when a
+    /// write holds the writer — the caller picks another victim rather than wait on it.
+    pub fn close_index(&self, index: &str) -> bool {
+        let writer_arc = self
+            .writers
+            .get(index)
+            .map(|writer| Arc::clone(writer.value()));
+        let Some(writer_arc) = writer_arc else {
+            // Open for reading only: nothing buffered, nothing to commit.
+            self.drop_index_caches(index);
+            tracing::debug!(index = %index, "Index closed");
+            return true;
+        };
+        let mut writer = match writer_arc.try_lock() {
+            Ok(writer) => writer,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+
+        if self.get_operations_count(index) > 0 {
+            let committed = self
+                .commit_locked_writer(index, &mut writer)
+                .and_then(|seq| self.checkpoint_after_commit(index, seq));
+            if let Err(e) = committed {
+                tracing::warn!(
+                    index = %index,
+                    error = %e,
+                    "Close: commit failed, closing anyway; the WAL still holds what it buffered"
+                );
+            }
         }
         self.drop_index_caches(index);
+        drop(writer);
         tracing::debug!(index = %index, "Index closed");
+        true
     }
 
     /// Highest `_seq` present in the index, found by ordering on the `_seq` fast field.
@@ -1889,6 +1960,10 @@ impl HybridStore {
 
         // Additional optimization: larger thresholds for indices with high operation counts
         // This detects bulk operation patterns and adjusts accordingly
+        if self.config.commit_interval_ms > 0 {
+            return self.interval_commit_due(index, operations_since_commit, base_ops);
+        }
+
         let threshold = if operations_since_commit > default_batch as u64 * 5 {
             // For very large batches, allow up to 50% more accumulation
             // This reduces fsync overhead during bulk imports
@@ -1898,6 +1973,49 @@ impl HybridStore {
         };
 
         operations_since_commit >= threshold
+    }
+
+    /// The commit policy when `commit_interval_ms` is set: commit once the oldest uncommitted
+    /// operation has waited an interval, or once the count runs [`COMMIT_BACKSTOP_MULTIPLE`]
+    /// past `base_ops`.
+    ///
+    /// Measured from the oldest pending operation rather than from the last commit, so an index
+    /// that has been idle for an hour does not commit on its first write and on every write
+    /// after it: a quiet index takes a write, waits an interval for company, and commits once.
+    /// Called on the writer thread after each drain, which is when a write can have arrived;
+    /// an index whose writes stop inside an interval is committed by the node's idle commit.
+    fn interval_commit_due(&self, index: &str, pending_ops: u64, base_ops: u64) -> bool {
+        if pending_ops == 0 {
+            return false;
+        }
+        if pending_ops >= base_ops.saturating_mul(COMMIT_BACKSTOP_MULTIPLE) {
+            return true;
+        }
+
+        // Never zero, so a mark set in the first millisecond is not read as "nothing pending".
+        let now = (self.commit_clock_epoch.elapsed().as_millis() as u64).max(1);
+        // `and_then` drops the shard guard before the insert below can ask for its write lock:
+        // the shape OB14 deadlocked on, written the way `should_commit_writer` now is.
+        let since = self.pending_since.get(index).map(|entry| {
+            // First pending operation since the last commit: start its clock.
+            let _ = entry.value().compare_exchange(
+                NOTHING_PENDING,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            entry.value().load(Ordering::Relaxed)
+        });
+        let since = match since {
+            Some(since) => since,
+            None => {
+                self.pending_since
+                    .entry(index.to_string())
+                    .or_insert_with(|| AtomicU64::new(now));
+                return false;
+            }
+        };
+        now.saturating_sub(since) >= self.config.commit_interval_ms
     }
 
     /// Number of replayed WAL entries between commits during recovery.
@@ -1941,6 +2059,10 @@ impl HybridStore {
         if let Some(counter) = self.operations_counter.get(index) {
             counter.value().store(0, Ordering::SeqCst);
         }
+        // Nothing is waiting any more, so the next operation starts a fresh interval.
+        if let Some(since) = self.pending_since.get(index) {
+            since.value().store(NOTHING_PENDING, Ordering::Relaxed);
+        }
     }
 
     /// Reset operation counter to a specific value (for intermediate commits)
@@ -1963,7 +2085,15 @@ impl HybridStore {
             return Ok(());
         }
 
-        let Some(writer_arc) = self.writers.get(index) else {
+        // Cloned out, and the map's shard guard released, before blocking on the writer. The
+        // guard used to live to the end of the commit, so every insert and remove on that shard
+        // of `writers` — opening another index, closing one — waited out a Tantivy commit; and a
+        // thread holding a map guard while it waits on a mutex is the shape OB14 deadlocked on.
+        let Some(writer_arc) = self
+            .writers
+            .get(index)
+            .map(|writer| Arc::clone(writer.value()))
+        else {
             // Pending operations with no writer: the buffered documents were dropped
             // together with the writer (admin eviction, forced removal). They are NOT in
             // Tantivy, so the WAL must be kept and the recovery checkpoint must not move —
@@ -1978,36 +2108,10 @@ impl HybridStore {
             )));
         };
 
-        // Capture the sequence to checkpoint BEFORE committing. Anything allocated after
-        // this point may not be included in the commit below, so claiming it durable would
-        // truncate a WAL entry whose document never reached Tantivy.
-        let committed_seq = self
-            .current_seq
-            .get(index)
-            .map(|counter| counter.load(Ordering::SeqCst));
-
-        // CRITICAL: Minimize lock hold time to prevent deadlocks
-        // The writer lock must be dropped IMMEDIATELY after commit
-        {
-            let mut writer = writer_arc.value().lock().unwrap_or_else(|poisoned| {
-                tracing::error!(index = %index, "Writer mutex was poisoned during commit, recovering");
-                poisoned.into_inner()
-            });
-            // Stamp the sequence into the commit itself, so the checkpoint lands atomically
-            // with the segments rather than in a second write that a crash can separate them
-            // from. Writes that arrive between the capture above and this call may ride along
-            // in the commit without being covered by the stamp; that direction is safe,
-            // costing at most one redundant replay of an idempotent operation.
-            match committed_seq {
-                Some(seq) => commit_writer_at(&mut writer, seq)?,
-                None => {
-                    writer.commit()?;
-                }
-            }
-            // Explicit drop to release lock before any other operations
-            drop(writer);
-        }
-        drop(writer_arc);
+        let committed_seq = {
+            let mut writer = lock_writer(&writer_arc, index);
+            self.commit_locked_writer(index, &mut writer)?
+        };
 
         // All post-commit operations happen WITHOUT holding the writer lock
         tracing::debug!(index = %index, ops_committed = ops_pending, "commit_index: committed");
@@ -2022,17 +2126,53 @@ impl HybridStore {
         // is written, instead of once per commit on the writer thread between the Tantivy
         // commit and the checkpoint transaction.
 
-        // AFTER the Tantivy commit succeeds: record the durable sequence and drop the WAL
-        // entries it covers. Both happen in one redb transaction so a crash can never leave
-        // the checkpoint ahead of the WAL. Only reset the operations counter once the
-        // checkpoint is durable; otherwise a later failure would make the next commit see
-        // zero pending operations and skip the WAL truncation, leaving the replay tail until
-        // the next restart.
+        self.checkpoint_after_commit(index, committed_seq)
+    }
+
+    /// Commit a writer its caller has locked, stamping the sequence it covers into the commit.
+    ///
+    /// The sequence is read under the lock, and that is what makes it exact: a write holds its
+    /// writer from before it reserves a sequence until its document is added (see
+    /// `lock_live_writer`), so with the lock in hand every reserved sequence is in the writer
+    /// and nothing is half-applied. Read before the lock, as it used to be, it could include a
+    /// write another thread had reserved and not yet added — stamping as durable a document
+    /// this commit did not contain, and letting the checkpoint truncate its WAL entry.
+    fn commit_locked_writer(
+        &self,
+        index: &str,
+        writer: &mut IndexWriter,
+    ) -> Result<Option<u64>, StoreError> {
+        let committed_seq = self
+            .current_seq
+            .get(index)
+            .map(|counter| counter.load(Ordering::SeqCst));
+        // Stamp the sequence into the commit itself, so the checkpoint lands atomically with
+        // the segments rather than in a second write that a crash can separate them from.
+        match committed_seq {
+            Some(seq) => commit_writer_at(writer, seq)?,
+            None => {
+                writer.commit()?;
+            }
+        }
+        Ok(committed_seq)
+    }
+
+    /// Record a commit's sequence as durable and drop the WAL entries it covers, then zero
+    /// the index's pending count.
+    ///
+    /// AFTER the Tantivy commit succeeds, and both in one redb transaction so a crash can never
+    /// leave the checkpoint ahead of the WAL. The count is reset only once the checkpoint is
+    /// durable; otherwise a later failure would make the next commit see zero pending
+    /// operations and skip the WAL truncation, leaving the replay tail until the next restart.
+    fn checkpoint_after_commit(
+        &self,
+        index: &str,
+        committed_seq: Option<u64>,
+    ) -> Result<(), StoreError> {
         if let Some(seq) = committed_seq {
             self.checkpoint_committed(index, seq)?;
         }
         self.reset_operations_counter(index);
-
         Ok(())
     }
 
@@ -2180,6 +2320,68 @@ impl HybridStore {
 
     /// Multi-tenant apply_write method
     pub fn apply_write(&self, index: &str, op: WalOp) -> Result<u64, StoreError> {
+        self.apply_write_attempt(index, op, 1)
+    }
+
+    /// Lock `writer_arc`, and hand the guard back only if it is still the writer this shard
+    /// holds for `index`.
+    ///
+    /// **A write holds its index's writer from before it reserves a sequence until the
+    /// document is in Tantivy and counted**, and this is where that starts. The writer thread
+    /// is the only one that writes, but it is not the only one that commits: admitting an index
+    /// past the open-index cap closes a colder one from whatever thread is opening — a search on
+    /// the read pool, an index creation — and closing commits. It used to find the writer mutex
+    /// free for most of a write, which took it only around `add_document`, so a close landing
+    /// between the sequence reservation and the add stamped the reserved sequences as durable
+    /// in a commit that did not contain them, truncated their WAL entries, and dropped the
+    /// writer the documents were then added to. They stayed in redb and never reached the
+    /// search index, on the restart that should have replayed them or on any other.
+    ///
+    /// Held for the whole write, the mutex makes a close either finish before the write starts
+    /// or wait for it to end (`close_index` only ever `try_lock`s, so it skips a busy index
+    /// rather than waiting). What is left is a close landing between `get_or_create_index`
+    /// handing this writer out and the lock here, which leaves it locked but detached; `None`
+    /// says so, and the caller reopens before it has touched anything.
+    fn lock_live_writer<'w>(
+        &self,
+        index: &str,
+        writer_arc: &'w Arc<Mutex<IndexWriter>>,
+    ) -> Option<MutexGuard<'w, IndexWriter>> {
+        let guard = lock_writer(writer_arc, index);
+        let live = self
+            .writers
+            .get(index)
+            .is_some_and(|held| Arc::ptr_eq(held.value(), writer_arc));
+        live.then_some(guard)
+    }
+
+    /// This index's schema lock, which every read-modify-write of its schema row holds from
+    /// the read to the cache update.
+    ///
+    /// The row has more than one writer: the writer thread evolves it when a document brings a
+    /// field it has not seen, and the admin paths edit default fields and indexing flags from
+    /// the blocking pool. Each read the schema, changed a copy and wrote it back with nothing
+    /// between them, so one could write over what the other had just added — a field, or the
+    /// operator's `default_fields` — in redb and in the cache alike.
+    ///
+    /// Ordering: a writer thread takes this while holding its index writer, and takes the redb
+    /// write slot while holding this. Nothing that holds this waits on an index writer, which
+    /// is what keeps the three from forming a cycle. Never removed from the map, like
+    /// `index_init_locks` and for the same reason.
+    fn lock_schema(&self, index: &str) -> Arc<Mutex<()>> {
+        self.schema_locks
+            .entry(index.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .value()
+            .clone()
+    }
+
+    fn apply_write_attempt(
+        &self,
+        index: &str,
+        op: WalOp,
+        attempt: usize,
+    ) -> Result<u64, StoreError> {
         // A delete must not bring an index into existence. `get_or_create_index` below creates
         // one when it is absent, which is what a put wants and the opposite of what removing a
         // document that cannot be there wants — an empty index and a Tantivy directory would be
@@ -2197,8 +2399,14 @@ impl HybridStore {
             return Err(StoreError::IndexNotFound(index.to_string()));
         }
 
-        // Get or create the index
+        // Get or create the index, and hold its writer for the rest of the write.
         let (writer_arc, fields) = self.get_or_create_index(index)?;
+        let Some(writer) = self.lock_live_writer(index, &writer_arc) else {
+            if attempt >= LIVE_WRITER_ATTEMPTS {
+                return Err(StoreError::WriterClosed(index.to_string()));
+            }
+            return self.apply_write_attempt(index, op, attempt + 1);
+        };
 
         // Get sequence ID for this index
         let seq_id = {
@@ -2241,12 +2449,23 @@ impl HybridStore {
                 // the whole schema on every write was the hot-path cost this removes; an indexed
                 // field's type is never changed here (see `evolve_field`).
                 let mut evolved_schema = None;
+                // Held from re-reading the schema below until the evolved one is in the cache,
+                // so an admin edit cannot land between this write's read and its write-back.
+                let schema_lock;
+                let mut _schema_guard = None;
                 if let Some(blob) = &json_blob {
                     let has_new_field = blob.as_object().is_some_and(|obj| {
                         obj.keys().any(|name| !schema.fields.contains_key(name))
                     });
                     if has_new_field {
-                        let mut schema_mut = (*schema).clone();
+                        schema_lock = self.lock_schema(index);
+                        _schema_guard = Some(schema_lock.lock().unwrap_or_else(|p| p.into_inner()));
+                        // Evolve the schema as it stands now, not the snapshot read before the
+                        // lock: an edit that committed in between is part of what gets written.
+                        let current = self
+                            .get_schema_cached(index)?
+                            .unwrap_or(Arc::clone(&schema));
+                        let mut schema_mut = (*current).clone();
                         let evolved_fields = schema_mut.evolve_from_document(blob);
                         if !evolved_fields.is_empty() {
                             tracing::debug!(
@@ -2373,19 +2592,16 @@ impl HybridStore {
                 }
 
                 // Tantivy, after redb is durable.
-                {
-                    let writer = writer_arc.lock().unwrap_or_else(|poisoned| {
-                        tracing::error!(index = %index, "Writer mutex was poisoned, recovering");
-                        poisoned.into_inner()
-                    });
-                    if !is_new_document {
-                        let term = tantivy::Term::from_field_text(fields.id, &id);
-                        writer.delete_term(term);
-                    }
-                    writer.add_document(tantivy_doc)?;
+                if !is_new_document {
+                    let term = tantivy::Term::from_field_text(fields.id, &id);
+                    writer.delete_term(term);
                 }
+                writer.add_document(tantivy_doc)?;
 
+                // Counted before the writer is released, so a commit never sees the document
+                // without the count that makes it commit it.
                 self.increment_operations(index);
+                drop(writer);
                 Ok(seq_id)
             }
             WalOp::Delete { id } => {
@@ -2408,16 +2624,11 @@ impl HybridStore {
                 write_txn.commit()?;
 
                 // Tantivy delete, after redb committed the removal.
-                {
-                    let writer = writer_arc.lock().unwrap_or_else(|poisoned| {
-                        tracing::error!(index = %index, "Writer mutex was poisoned, recovering");
-                        poisoned.into_inner()
-                    });
-                    let term = tantivy::Term::from_field_text(fields.id, &id);
-                    writer.delete_term(term);
-                }
+                let term = tantivy::Term::from_field_text(fields.id, &id);
+                writer.delete_term(term);
 
                 self.increment_operations(index);
+                drop(writer);
                 Ok(seq_id)
             }
         }
@@ -2608,10 +2819,8 @@ impl HybridStore {
             if tantivy_schema.fields.is_empty()
                 && let Some(stored) = stored_schema
             {
-                self.schema_cache
-                    .insert(index.to_string(), Arc::new(stored.clone()));
                 tracing::debug!(index = %index, "Using stored schema (Tantivy has no indexed fields yet)");
-                return Ok(Some(Arc::new(stored)));
+                return Ok(Some(self.cache_loaded_schema(index, stored)));
             }
 
             // Use stored schema as base, then add indexed fields from Tantivy
@@ -2623,23 +2832,34 @@ impl HybridStore {
                 merged_schema.fields.entry(name).or_insert(field_def);
             }
 
-            // Cache the merged schema
-            self.schema_cache
-                .insert(index.to_string(), Arc::new(merged_schema.clone()));
-
             tracing::debug!(index = %index, "Loaded and cached merged schema (Tantivy + stored metadata)");
-            Ok(Some(Arc::new(merged_schema)))
+            Ok(Some(self.cache_loaded_schema(index, merged_schema)))
         } else {
             // Fallback: try to load from stored schema (metadata only)
             if let Some(stored) = stored_schema {
-                self.schema_cache
-                    .insert(index.to_string(), Arc::new(stored.clone()));
                 tracing::debug!(index = %index, "Using stored schema as fallback (Tantivy not available)");
-                Ok(Some(Arc::new(stored)))
+                Ok(Some(self.cache_loaded_schema(index, stored)))
             } else {
                 Ok(None)
             }
         }
+    }
+
+    /// Cache a schema this thread *loaded* on a miss, unless another one arrived meanwhile, and
+    /// return whichever is cached.
+    ///
+    /// Loading reads the stored row and opens the Tantivy index, which is slow, and a write
+    /// that evolves or edits the schema can commit and cache its result inside that window.
+    /// Inserting over it, as this used to, put the older schema back — and the next evolving
+    /// write, starting from the cache, wrote a row without the field the newer one had added.
+    /// Anything that reached the cache while this was loading came from a committed write and
+    /// is at least as new as what this read, so it wins.
+    pub(crate) fn cache_loaded_schema(&self, index: &str, loaded: IndexSchema) -> Arc<IndexSchema> {
+        self.schema_cache
+            .entry(index.to_string())
+            .or_insert_with(|| Arc::new(loaded))
+            .value()
+            .clone()
     }
 
     /// Invalidate cache entry when schema is updated
@@ -2686,6 +2906,9 @@ impl HybridStore {
         index: &str,
         schema: &IndexSchema,
     ) -> Result<(), StoreError> {
+        let schema_lock = self.lock_schema(index);
+        let _schema_guard = schema_lock.lock().unwrap_or_else(|p| p.into_inner());
+
         // Persist to redb first
         self.store_schema(index, schema)?;
 
@@ -2724,6 +2947,9 @@ impl HybridStore {
         index: &str,
         updates: &BTreeMap<String, bool>,
     ) -> Result<SchemaFieldUpdate, StoreError> {
+        // From the read inside the plan to the cache update: see `lock_schema`.
+        let schema_lock = self.lock_schema(index);
+        let _schema_guard = schema_lock.lock().unwrap_or_else(|p| p.into_inner());
         let (mut schema, outcome) = self.plan_field_indexing_inner(index, updates)?;
 
         // Applies what this shard knows and reports what it does not, rather than refusing the
@@ -2770,6 +2996,9 @@ impl HybridStore {
         index: &str,
         default_fields: Option<Vec<String>>,
     ) -> Result<(), StoreError> {
+        // From the read to the cache update: see `lock_schema`.
+        let schema_lock = self.lock_schema(index);
+        let _schema_guard = schema_lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut schema = self
             .get_schema_cached(index)?
             .map(|arc| (*arc).clone())
@@ -3060,6 +3289,15 @@ impl HybridStore {
         index: &str,
         ops: Vec<WalOp>,
     ) -> Result<(Vec<u64>, usize), StoreError> {
+        self.apply_batch_attempt(index, ops, 1)
+    }
+
+    fn apply_batch_attempt(
+        &self,
+        index: &str,
+        ops: Vec<WalOp>,
+        attempt: usize,
+    ) -> Result<(Vec<u64>, usize), StoreError> {
         let ops_len = ops.len();
         if ops.is_empty() {
             return Ok((Vec::new(), 0));
@@ -3082,8 +3320,15 @@ impl HybridStore {
             return Err(StoreError::IndexNotFound(index.to_string()));
         }
 
-        // Get or create the index
+        // Get or create the index, and hold its writer for the rest of the batch — see
+        // `lock_live_writer` for what a close landing mid-batch used to do.
         let (writer_arc, fields) = self.get_or_create_index(index)?;
+        let Some(writer) = self.lock_live_writer(index, &writer_arc) else {
+            if attempt >= LIVE_WRITER_ATTEMPTS {
+                return Err(StoreError::WriterClosed(index.to_string()));
+            }
+            return self.apply_batch_attempt(index, ops, attempt + 1);
+        };
 
         // Get schema for shadow field filtering
         let schema = if let Some(schema) = self.get_schema_cached(index)? {
@@ -3357,11 +3602,6 @@ impl HybridStore {
         let mut new_documents_count = 0usize;
         let mut replaced_documents = 0usize;
         {
-            let writer = writer_arc.lock().unwrap_or_else(|poisoned| {
-                tracing::error!(index = %index, "Writer mutex was poisoned, recovering");
-                poisoned.into_inner()
-            });
-
             for FinalEntry {
                 id,
                 existed_before,
@@ -3403,7 +3643,8 @@ impl HybridStore {
                 "Bulk write completed"
             );
 
-            // Explicit drop of writer to ensure lock release before leaving scope
+            // Released only once the documents are in and counted, which is what makes a close
+            // on another thread either precede this batch or include all of it.
             drop(writer);
         }
 

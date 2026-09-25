@@ -24,6 +24,7 @@ fn test_storage_engine_basics() {
         // Other Configuration
         default_batch_size: 1000, // 1000 operations default
         wal_sync: true,
+        commit_interval_ms: 0,
         query: Default::default(),
     };
 
@@ -126,6 +127,7 @@ fn test_storage_configuration() {
         // Other Configuration
         default_batch_size: 500,
         wal_sync: false,
+        commit_interval_ms: 0,
         query: Default::default(),
     };
 

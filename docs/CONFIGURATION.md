@@ -258,13 +258,23 @@ indexer_memory_max_mb = 512
 memory_pressure_threshold_percent = 80
 
 # Maximum searches running concurrently on this node
-# (default: 8, fallback to max(2, CPU/2) if set to 0)
+# (default: the cores available to the process, at least 2; max(2, CPU/2) if set to 0)
 # Searches beyond this limit queue instead of spawning more threads.
 search_threads = 8
 
 # Default search result limit (default: 10)
 # Note: Explicit limit 0 in queries means count-only mode (returns total_hits without documents)
 default_search_limit = 10
+
+# Longest a write waits to become searchable while writes to its index keep arriving, in
+# milliseconds (default: 2000). A commit is what makes writes visible to search and it is the
+# expensive half of a write, so this is also what a bulk load's commit cost is amortized over.
+# 0 commits by operation count alone (`default_batch_size`), the policy before 0.3.5.
+commit_interval_ms = 2000
+
+# Seconds after an index's last write before it is committed anyway (default: 3): the idle
+# commit, for the writes that end a burst. Keep it at or above commit_interval_ms.
+supervisor_timeout_secs = 3
 ```
 
 ### The MCP endpoint (`[mcp]`)
@@ -372,8 +382,10 @@ wal_sync = true
 # WAL segment size in MB (default: 64)
 wal_segment_size_mb = 64
 
-# Default batch size for bulk ingestion; also the base of the smart-commit threshold
-# (default: 1000).
+# Default batch size for bulk ingestion; also the base of the commit count (default: 1000).
+# With `[search] commit_interval_ms` set (the default), time triggers a commit and twenty times
+# this count is only a backstop bounding what a restart replays; with it at 0, this count is
+# the commit threshold itself.
 #
 # This is an internal commit-cadence parameter, NOT the number of documents to put in a
 # `_bulk` request. The two are easy to confuse and only the second one moves ingest
@@ -478,12 +490,18 @@ Measured on an 8-core node under simultaneous read and write load:
 | `search_threads` | write ok/s | write p99 | search ok/s | search p99 |
 |---|---|---|---|---|
 | 16 (2x cores) | 1 776 | 27.0ms | 3 284 | 15.44ms |
-| 8 (= cores, the default) | 1 895 | 22.3ms | 3 329 | 13.46ms |
+| 8 (= cores, now the default) | 1 895 | 22.3ms | 3 329 | 13.46ms |
 | 6 | 1 837 | 23.1ms | 3 434 | 12.49ms |
 
 Oversizing was worse on every axis, and it was also far less *predictable*: run-to-run write
 throughput spread 1 477-1 853 at 16 against 1 837-1 842 at 6. `docker/cameodb-docker.toml`
 shipped 16 and now ships the default 8.
+
+The default is the number of cores available to the process (at least 2), which is where the
+table above says to put it. It used to be a fixed 8 — right for that node, and a ceiling on a
+larger one: searches scale with cores and nothing else in the read path serializes them.
+Measured read-only on 15 cores, 2, 6 and 12 threads served 1 900, 6 250 and 11 600 searches/s
+on 2.1, 6.5 and 12.8 cores.
 
 ### What mixed read/write load costs
 
@@ -1401,6 +1419,16 @@ The practical consequences:
   batch size first.
 - Adding cores will not raise ingest throughput. Adding *offered load*, in the shape above, will.
 - Capacity-plan ingest from documents/second and documents in flight, not from CPU headroom.
+
+**Remeasured 2026-09-26, after commits moved to a clock** (`commit_interval_ms`, ROADMAP F9). Much
+of what the tables above attribute to batch size was the commit: at the old count of 1,000
+operations a small-batch load committed on nearly every request, and a stack profile showed the
+shard writers waiting on the indexer 41% of the time. With the interval, 500-document batches at
+concurrency 16 do **130,000 docs/s** where the table shows 25,000, and 5,000-document batches at 32
+do 328,000. Larger batches still help, by far less. And the idle CPU is not contention: with
+`wal_sync = false` single writes reach 65,000/s on 9.5 cores. On macOS a durable sync is a
+full-device flush, which is what bounds durable single writes there; measure on the platform you
+deploy to.
 
 #### Measure before you tune
 
