@@ -1959,7 +1959,7 @@ impl MicroshardActor {
             self.signal_supervisor(index).await;
         }
 
-        tracing::info!(
+        tracing::debug!(
             shard_id = %self.shard_id,
             seq_count = all_seq_ids.len(),
             "MicroshardActor: Batch write fully completed"

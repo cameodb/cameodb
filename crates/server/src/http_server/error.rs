@@ -23,6 +23,10 @@ pub struct AppError {
     /// the predicted wait — sets it so a retrying client is told when the node expects to
     /// serve again rather than a constant that could send it back into the same backlog.
     pub retry_after_secs: Option<u64>,
+    /// The node declined work it could not serve in time — admission or the dequeue check —
+    /// rather than failing at it. Logged at `DEBUG` rather than `ERROR`: under overload it is
+    /// the most frequent answer the node gives, and `ShedLog` summarises it (ROADMAP OB15).
+    pub shed: bool,
 }
 
 impl AppError {
@@ -32,6 +36,7 @@ impl AppError {
             error: anyhow::anyhow!("{}", msg.into()),
             status: Some(StatusCode::BAD_REQUEST),
             retry_after_secs: None,
+            shed: false,
         }
     }
 
@@ -45,6 +50,7 @@ impl AppError {
             error: anyhow::anyhow!("{}", msg.into()),
             status: Some(StatusCode::SERVICE_UNAVAILABLE),
             retry_after_secs: None,
+            shed: false,
         }
     }
 
@@ -54,6 +60,7 @@ impl AppError {
             error: anyhow::anyhow!("{}", msg.into()),
             status: Some(StatusCode::FORBIDDEN),
             retry_after_secs: None,
+            shed: false,
         }
     }
 
@@ -63,6 +70,7 @@ impl AppError {
             error: anyhow::anyhow!("{}", msg.into()),
             status: Some(StatusCode::NOT_FOUND),
             retry_after_secs: None,
+            shed: false,
         }
     }
 
@@ -82,6 +90,7 @@ impl AppError {
             error: anyhow::anyhow!("{msg} Retry after {retry_after_secs}s."),
             status: Some(StatusCode::TOO_MANY_REQUESTS),
             retry_after_secs: Some(retry_after_secs),
+            shed: false,
         }
     }
 
@@ -106,6 +115,10 @@ impl AppError {
             } => Some(predicted_wait_ms.div_ceil(1000).max(1)),
             _ => None,
         };
+        let shed = matches!(
+            err,
+            OrchestratorError::Overloaded { .. } | OrchestratorError::ReadDeadlineExpired { .. }
+        );
         let mut app = match err.verdict() {
             RemoteVerdict::NotFound => Self::not_found(err.to_string()),
             RemoteVerdict::BadRequest => Self::bad_request(err.to_string()),
@@ -124,6 +137,7 @@ impl AppError {
             RemoteVerdict::ServerFault => Self::from(err),
         };
         app.retry_after_secs = retry_after_secs;
+        app.shed = shed;
         app
     }
 }
@@ -140,8 +154,16 @@ impl IntoResponse for AppError {
             None => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
         };
 
-        // Log at appropriate level: DEBUG for 404 (expected), WARN for client errors, ERROR for server errors
+        // Log at appropriate level: DEBUG for 404 (expected) and for a refusal — shed work
+        // and a spent rate allowance, which `ShedLog` summarises rather than logging per
+        // request — WARN for client errors, ERROR for server errors.
         match status {
+            _ if self.shed => {
+                tracing::debug!("API refused: {} -> {}", status, error_msg);
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                tracing::debug!("API refused: {} -> {}", status, error_msg);
+            }
             StatusCode::NOT_FOUND => {
                 tracing::debug!("API: {} -> {}: {}", status, message, error_msg);
             }
@@ -194,6 +216,7 @@ where
             error: err.into(),
             status: None,
             retry_after_secs: None,
+            shed: false,
         }
     }
 }
@@ -218,6 +241,29 @@ mod tests {
             response.headers().get(axum::http::header::RETRY_AFTER),
             Some(&axum::http::HeaderValue::from_static("3")),
         );
+    }
+
+    /// Admission and the dequeue check are the node declining work, not failing at it, so
+    /// they are logged quietly and summarised. A 503 for anything else — a peer that cannot
+    /// be reached, a schema the cluster cannot agree — is a condition an operator has to see,
+    /// and keeps its `ERROR` line.
+    #[test]
+    fn only_shed_work_is_marked_as_shed() {
+        let overloaded = AppError::from_route(OrchestratorError::Overloaded {
+            predicted_wait_ms: 900,
+            budget_ms: 1000,
+        });
+        let abandoned = AppError::from_route(OrchestratorError::ReadDeadlineExpired {
+            waited_ms: 1200,
+            budget_ms: 1000,
+        });
+        let unreachable = AppError::from_route(OrchestratorError::PeerUnreachable {
+            message: "peer gone".to_string(),
+        });
+        assert!(overloaded.shed && abandoned.shed);
+        assert!(!unreachable.shed);
+        assert_eq!(unreachable.status, Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!AppError::service_unavailable("schema unavailable").shed);
     }
 
     /// Every other 503 still advises the fixed second — only a refusal carrying the backlog

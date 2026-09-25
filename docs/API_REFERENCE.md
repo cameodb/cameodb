@@ -965,6 +965,13 @@ while refusing at a worker means the request already paid for its body, its pars
 a channel hop. A run shedding mostly at `abandoned` means requests are getting past the door —
 worth reporting rather than tuning around.
 
+These counters, not the log, are the record of shedding. A refused request — `503`, `408` or
+`429` — writes no line of its own: refusals are summarised in one `WARN` per 10 seconds on the
+target `cameodb::http_server::shed`, the first at once, so an overload cannot turn into a log
+flood. A node started without `RUST_LOG` filters at `ERROR` and prints no summary; run at
+`RUST_LOG=warn` or above to see it. A `503` that is not load shedding — an unreachable peer, a
+schema the cluster cannot agree — still logs at `ERROR` with its reason.
+
 **`jobs_dropped` is a defect signal, not a tuning dial.** A job that reaches a worker either
 finishes or is counted here; anything other than `0` means an operation stopped without
 completing — it was dropped, it panicked, or it ran so far past its budget that the pool

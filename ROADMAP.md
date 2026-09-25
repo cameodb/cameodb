@@ -176,6 +176,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to — the evidence behind J1 | 18 | 2026-08-27 | ✅ |
 | [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB12](#ob12--the-schema-gate-deadlocked-a-fan-out-against-itself) | Correctness, ten items from the 2026-09-01 review, the re-read of its own fixes, and the 0.3.3 release check — OB3–OB12 all done | — | 2026-09-01 | ✅ |
 | [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) | **A timed-out request never leaves the worker pool** — a `DashMap` self-deadlock in `should_commit_writer` parked every shard writer thread past a 30s TTL. Found by the first [M6](#m6--close-and-re-measure-the-bulk-lane) arm, fixed and pinned the same day | — | 2026-09-25 | ✅ |
+| [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput) | **Every refused request was an `ERROR` line** — synchronous on the write path's runtime, it halved single-write goodput under overload and failed health. Refusals are now counted into one periodic summary. Found by the M6 single-write arm, fixed the same day | — | 2026-09-25 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
@@ -2833,6 +2834,70 @@ zero while health answers in 1.4ms.
 --keep-index` and read the gap on `/_admin/workers` (0); run the same with
 `--batch-size 500 --concurrency 8 --seed-docs 0` and read it again. It equals the `408` count and
 stays there.
+
+---
+
+### OB15 — Every refused request was an `ERROR` line, and under write overload the logging cost half the goodput
+
+✅ **Found and fixed 2026-09-25**, by the single-write arm of [M6](#m6--close-and-re-measure-the-bulk-lane)
+session 3, on the M5 Pro against `c54ae33`, release build, harness co-located, F8 protocol.
+
+**The shape.** Bulk and read overload degraded cleanly; single-write overload did not. At 2× the
+write capacity (4,000/s offered against ~2,000/s sustained) goodput fell to **1,116 ok/s**, 15%
+of requests ended as `408`, ~1,000 as transport errors, and `/_cluster/health` took up to 2.2s,
+some probes answering `408` or refused at the socket. The pre-M4 baseline `079ad0b` did the same
+(1,290 ok/s), so it was older than any of the M work.
+
+**The cause was the log.** `TraceLayer::new_for_http()` logs every 5xx at `ERROR`, and
+`AppError` logged every 503 at `ERROR` again — so each refusal cost a line, written synchronously
+on the main runtime, where single-write jobs, their shard hand-offs and health all run. A default
+node filters at `ERROR` (`tracing_subscriber::fmt::init` with `RUST_LOG` unset), so these were the
+*only* lines it wrote, and nothing an operator would normally set turned them off: `RUST_LOG=warn`
+measured 1,040 ok/s. 51,000 lines in a 20s arm at 4,000/s; 152,000 (31 MB) at 8,000/s. Reads
+logged 90,000 and were not hurt, because search work runs on its own runtime.
+
+Isolated before changing code — same binary, same arm, only the filter changed:
+
+| `c54ae33`, writes at 4,000/s | ok/s | `408` | health max |
+|---|---|---|---|
+| default filter | 1,116 | 10,218 | 1,990ms, failures |
+| `RUST_LOG=warn` | 1,040 | 10,335 | 1,715ms, failures |
+| `RUST_LOG=info,tower_http=off`, two runs | 2,506 / 2,419 | 201 / 1,111 | 681 / 564ms, all 200 |
+
+It was also an amplifier on an internet-exposed node: every request a caller can get refused cost
+a line, at the one level no deployment filters out.
+
+**The fix.** Refusals are counted, not logged one by one. `http_server/shed.rs` hooks
+`TraceLayer`'s `on_response`, which sees every response — the door's and the concurrency guard's
+503s, the timeout's 408s, the limiter's 429s — and emits one `WARN` per 10s naming how many of
+each, the first refusal after a quiet spell at once. Its `on_failure` leaves 503 to that summary
+and logs every other 5xx exactly as before. `AppError` marks admission and dequeue refusals as
+`shed` and logs them, and every 429, at `DEBUG`; any other 503 — a peer that cannot be reached, a
+schema the cluster cannot agree — keeps its `ERROR` line, because an operator has to see those.
+The dequeue refusal now reads `request abandoned` rather than `read abandoned`, since the worker
+pool raises it for writes too, and three per-shard `INFO` lines per bulk request moved to `DEBUG`.
+
+**Measured after**, fixed binary against `c54ae33` back to back, default filter on both:
+
+| writes offered | fixed | `c54ae33` |
+|---|---|---|
+| 2,000/s | 1,987 ok/s, sustained | 1,987 ok/s, sustained |
+| 4,000/s (2×) | **2,621 ok/s**, 0 × `408`, 0 transport, health ≤ 518ms | 1,056 ok/s, 9,043 × `408`, health ≤ 1,740ms, 4 failures |
+| 8,000/s (4×) | **2,541 ok/s**, 0 × `408`, 0 transport, health ≤ 510ms | 982 ok/s, 7,711 × `408`, 712 transport |
+| 4,000 → 300/s | 2,659 ok/s, then 293 from the first second | 1,206, then 293 |
+
+Goodput is flat from 2× to 4× overload and every refusal is a `503` a client can act on — the
+lane now degrades the way the other two do. Bulk and reads did not move (bulk 105/112 ok/s at
+120/300 offered, reads 884/872/871 ok/s). At `RUST_LOG=warn` the same 4,000/s arm wrote 124 lines
+in total, the summary reporting 13,956 and 14,723 refusals per 10s window.
+
+**What it does not cover.** The summary is a `WARN`, so a node at the default filter prints none
+of it; the counters on `/_admin/workers` are the always-on figure. `health actor budget exhausted`
+is still an `ERROR` per identified probe under overload — bounded by the probe rate, and
+unreachable anonymously once authentication is on, so left alone. And the writer is still a
+synchronous `stderr`/`stdout` write on the runtime: a non-blocking appender would stop *any*
+future burst from stalling it, at the price of dropping lines when its buffer fills. That is a
+separate decision and not taken here.
 
 ---
 

@@ -659,7 +659,7 @@ impl BulkCtx<'_> {
         for (shard_id, positions, outcome) in local_results {
             match outcome {
                 Ok(seq_ids) => {
-                    tracing::info!(
+                    tracing::debug!(
                         shard_id = %shard_id,
                         written_count = seq_ids.len(),
                         "Local shard batch completed successfully"
@@ -680,7 +680,7 @@ impl BulkCtx<'_> {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Local shard processing completed - total_written: {}, errors: {}",
             total_written,
             all_errors.len()

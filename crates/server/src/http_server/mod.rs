@@ -11,6 +11,7 @@ mod error;
 mod health;
 mod routes;
 mod search;
+mod shed;
 mod write;
 
 use crate::ratelimit::Caller;
