@@ -52,7 +52,7 @@ on one.
 | 14 — Security hardening (posture items C3–C8) | ✅ Done | C3–C8 all closed; C8 by M3 on 2026-09-20 |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
-| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3 and M7 done — the blocker is cleared and the surface is metered. M4, M5, M6 and the M8 decision remain |
+| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed but for O4; M1, M2, M3 and M7 done — the blocker is cleared and the surface is metered. M4 and M5 are the two remaining builds and the M8 decision is owed. M6 is measurement only, and its first arm found [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted), which blocks the rest of it |
 
 ## Reconciliation, 2026-08-26
 
@@ -165,7 +165,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F5](#f5--concurrency-sweep-measured-2026-09-02) | Concurrency sweep on the release build — the operating point, and bulk's serialization measured | — | 2026-09-02 | ✅ |
 | [F6](#f6--what-fsync-actually-costs-measured-2026-09-02) | What fsync actually costs — and why turning it off is a reallocation, not a speedup | — | 2026-09-02 | ✅ |
 | [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) | The request timeout sheds the client, not the work — measured: goodput goes to zero, not down | — | 2026-09-15 | ✅ |
-| [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — health fixed, the lane gated, and admission on both lanes predicts against a measured spread; item 3 (bulk in the service estimate) open under [M6](#m6--close-and-re-measure-the-bulk-lane) | — | 2026-09-16 | ◐ |
+| [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — health fixed, both lanes gated, admission predicting against a measured spread, and bulk folded into the service estimate by `0836df2`. All three items closed; the re-measurement is [M6](#m6--close-and-re-measure-the-bulk-lane) | — | 2026-09-17 | ✅ |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items — CH1 done | — | 2026-08-16 | 📋 |
 | [CH11](#ch11--routing-key-derivation-is-written-four-times-with-two-algorithms) | Routing-key derivation, four spellings and two hashes — closed ahead of the split | — | 2026-09-01 | ✅ |
 | [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — all done | — | 2026-09-01 | ✅ |
@@ -175,11 +175,12 @@ first written down here, so the chronology stays visible under the cost ordering
 | [J3](#j3--the-flattening-lane-and-the-reference-that-describes-neither-lane-correctly) | The flattening lane, and the reference that describes neither | 18 | 2026-08-27 | 📋 |
 | [OB2](#ob2--a-facet-field-cannot-be-written-to) | A `facet` field cannot be written to — the evidence behind J1 | 18 | 2026-08-27 | ✅ |
 | [OB3](#ob3--a-single-write-or-delete-can-land-on-the-wrong-shard) … [OB12](#ob12--the-schema-gate-deadlocked-a-fan-out-against-itself) | Correctness, ten items from the 2026-09-01 review, the re-read of its own fixes, and the 0.3.3 release check — OB3–OB12 all done | — | 2026-09-01 | ✅ |
+| [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) | **A timed-out request never leaves the worker pool** — one slot lost per `408`, writes stop node-wide, `SIGTERM` will not stop the process. Found by the first [M6](#m6--close-and-re-measure-the-bulk-lane) arm and blocking it | — | 2026-09-25 | 🔴 |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
 | [L1](#l1--size-cache-invalidation-by-substring-evicts-neighbouring-indexes) … [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | Post-0.3.4 review group — all twenty closed; the retrospective's output is [M](#m-the-035-goal-set--multi-tenant-exposure--planned) | — | 2026-09-19 | ✅ |
-| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed and the M1 blocker cleared, with M2 and M7 done | — | 2026-09-20 | ◐ |
+| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed but for O4, the M1 blocker cleared, and M2, M3 and M7 done; M6 reduced to measurement, whose first arm found [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and stopped there | — | 2026-09-25 | ◐ |
 
 ---
 
@@ -1547,10 +1548,16 @@ OB13 reopening on a second mechanism. Filed as
 
 ### F8 — The overload gates do not cover the bulk write path
 
-◐ **Partial — items 1 and 2 closed and measured, item 3 open.** Measured before it was
+✅ **Done — all three items closed, item 3 on 2026-09-17.** Measured before it was
 planned, 2026-09-16, on the M5 Pro against `beab920` —
 the binary that closed [F7](#f7--the-request-timeout-sheds-the-client-not-the-work), with all
 three of its fixes in.
+
+⚠️ **Every table below predates the fix for item 3 and describes a design that no longer
+exists.** `0836df2` (2026-09-17) moved `BulkWrite` and `BulkDelete` off the actor mailbox and
+onto the worker pool. The diagnosis below — a lane the gates could not see — is what motivated
+that move and is kept for it, but the numbers record the node as it was on 2026-09-16 and are
+not a description of `main`. Re-measuring is [M6](#m6--close-and-re-measure-the-bulk-lane).
 
 Every F7 arm was a search. Its own closing note said the write path was not covered and has its
 own queue. Measured now, the answer is worse than "not covered": **F7's mechanism is absent on
@@ -1766,8 +1773,24 @@ by anything further here.
    deadline, sized from the request timeout, and a body that says which fields are fallbacks.
    Worth having done independently of 1: it is the difference between a degraded node and an
    undiagnosable one.
-3. **Feed bulk into the service estimate**, so the blended figure the door uses reflects the
-   workload with by far the largest per-request cost.
+3. ✅ **Feed bulk into the service estimate**, so the blended figure the door uses reflects the
+   workload with by far the largest per-request cost. **Done 2026-09-17 by `0836df2`** — and by
+   the route item 1 had considered and declined, rather than the one this item proposed.
+   `BulkWrite` and `BulkDelete` became worker-eligible in `handle_client_op`, so a fan-out is
+   served off the pool instead of holding the mailbox for its whole duration. `OpClass::of` maps
+   both to `OpClass::Bulk`, and `record_service` folds every sample into the blend
+   `service_ewma_us` as well as into the class's own EWMA — so the door's pre-body estimate
+   sees bulk cost, which is what this item asked for.
+
+   **Item 1's mailbox gate is still load-bearing, for a smaller lane.** A bulk write that needs
+   a schema written hands itself back as `UseActor` and reaches the actor through
+   `ask_orchestrator`, which still refuses against the mailbox `QueueLoad` before queueing, and
+   that lane folds its own samples at the actor (`mailbox_lane.record_service`). Two lanes, two
+   blends, each predicting against what it actually serves — which is what item 1 built the
+   second set of counters for.
+
+   **The fix is in and its effect is unmeasured.** That is
+   [M6](#m6--close-and-re-measure-the-bulk-lane), and the caveat at the head of this entry.
 
 **Caveats, so these are not over-read.** Single 20s runs, harness co-located. The 30/s arm wrote
 292,000 documents, so capacity during the later arms was below the probed 56/s — "≥2×" is a
@@ -2640,6 +2663,86 @@ until something demonstrates a problem it actually causes.
 
 **Kept as an entry** because the wrong fix was one commit away, and because the default-config
 row is worth having on record: it is the evidence that the exemption works where it matters.
+
+---
+
+### OB14 — A timed-out request never leaves the worker pool, and the node degrades until it is restarted
+
+🔴 **Found 2026-09-25, by the first [M6](#m6--close-and-re-measure-the-bulk-lane) arm**, on the
+M5 Pro against `91fc382`, release build, harness co-located. This is the run F8's re-measurement
+was owed, and it did not get as far as an open-loop arm: the closed-loop capacity probe wedged the
+node.
+
+**The shape, in one line.** Every request the server answers `408` leaves one slot permanently
+occupied in the worker pool's accounting; the slots never come back; reads stay healthy the whole
+time; writes stop node-wide long before the counter reaches capacity; and the process will not
+shut down on `SIGTERM`.
+
+**Measured, three arms on one node** — 4 shards, `search_threads = 2`,
+`max_concurrent_requests = 3000`, `request_timeout_secs = 1`, `wal_sync = true`, the F8 protocol:
+
+| arm | load | goodput | `408` | pool gap after, at rest |
+|---|---|---|---|---|
+| A | bulk, batch 100, concurrency 1, 10s | 54 ok/s, 5,447 docs/s | 0 | **0** |
+| B | bulk, batch 500, concurrency 8, 10s | 19 ok/s, 9,727 docs/s | **16** | **16** |
+| probe | bulk, batch 500, concurrency 4, 200k seeded, 20s | 11 ok/s, 5,587 docs/s | **44** | **44** |
+
+"Pool gap" is `dispatch.round_robin_sends` minus the sum of per-worker `jobs_completed` on
+`/_admin/workers`, read at rest with no client connected. **It equals the `408` count exactly, in
+every arm, and it never decreases.** Arm A is the control: no timeouts, gap 0, `sent == completed`.
+`abandoned` and `refused_at_admission` stayed `0` throughout — no gate refused any of this.
+
+**It is not an observability wart.** The same event that leaks the per-worker `in_flight` gauge
+also skips `job_left_pool()`, and that decrements `outstanding` — the pool-wide counter
+[`QueueLoad`](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) predicts against and the
+one `/_cluster/health` publishes as `queue_depth`. A node that has answered *n* timeouts believes
+it has *n* requests in flight forever, and both the front door and the dequeue check are reading
+that number.
+
+**The degradation is ordered, and the order is the surprising part.**
+
+- **Reads never stop.** With 19 slots gone, `POST /api/armA/search` answered `200` in **4.8ms**
+  with all four shards responding, `/_indexes` in 1.7ms, `/_admin/workers` in 0.5ms.
+- **Writes stop node-wide well before the pool is full.** At the same 19, every write answered
+  `408` after a full second — to the hammered index, and to a brand-new index name. The gap did
+  *not* rise when those writes failed, so they are blocking *before* worker dispatch rather than
+  being dispatched and stuck; the schema-defer path onto the actor is the suspect and this is the
+  part that is inferred rather than measured.
+- **At a gap of 64 — 8 workers × 8 in-flight — everything worker-eligible dies.** `GetIdentity`
+  and `ListIndexes` both failed (`health actor budget exhausted or error`), and health degraded to
+  `status: red` with `active_shards: 0` and `total_indexes: 0` while `/_admin/workers` still
+  reported all four shards `serving: true`. The shards were fine; health could not get an answer.
+  That the body degrades to fallbacks instead of hanging is [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path)
+  item 2 working as designed — on a node whose real state it can no longer see.
+- **`SIGTERM` does not stop the process.** The worker loop's drain reacquires the full semaphore
+  width before returning, and the stuck tasks never give their permits back. The port closed, the
+  process stayed, and `SIGKILL` was required. A node in this state cannot be restarted by an
+  orchestrator that waits for a graceful stop.
+
+**No panic anywhere** in 34,452 lines of debug log, and **CPU at 0.0%** while wedged — the tasks
+are parked, not spinning, which is why nothing in the process noticed.
+
+**Where the decrement lives.** `orchestrator_worker_loop` increments `in_flight` before
+`tokio::spawn`, and the spawned task calls `record_service`, `job_left_pool`,
+`in_flight.fetch_sub`, `jobs_completed.fetch_add` and `drop(permit)` after `run_op` returns. A
+task that never reaches that tail leaks all of it together, which matches the 1:1 count. The
+comment above the F7 check states the intent — *everything past this point is uncancellable* — and
+the measurement says that either the task is cancelled after all, or `run_op` parks forever. Which
+of the two, and where, is the open question; it is a source question rather than a harness one and
+should be answered before anything is changed.
+
+**Why this outranks the rest of the 0.3.5 list.** The trigger is a server-side timeout, which on an
+internet-exposed multi-tenant node is routine traffic rather than an attack — one slow tenant's
+timeouts degrade every other tenant on the process, and the only recovery is a hard restart. The
+1s timeout used here makes it fast to reproduce; a 60s production timeout makes it slower, not
+absent. [M4](#m4--per-key-resource-quotas) and [M5](#m5--per-index-capability-subtraction) bound
+what a tenant may *ask for* and neither touches this.
+
+**Reproduction, from a wiped volume**: start a node with the config above; run
+`cameodb-bench --mode bulk --batch-size 100 --concurrency 1 --duration 10 --seed-docs 5000
+--keep-index` and read the gap on `/_admin/workers` (0); run the same with
+`--batch-size 500 --concurrency 8 --seed-docs 0` and read it again. It equals the `408` count and
+stays there.
 
 ---
 
@@ -3587,8 +3690,10 @@ date. L7 read 2026-10-06, L17 read 2026-10-12, and L18 and L19 read 2026-10-26 �
 the future when written. L11, L15 and L16 read 2026-09-09 against commits of 2026-09-17. All
 seven are corrected to their commit dates above. L1–L4, L8 and L10 check out exactly; L12 and
 L13 read 2026-09-19 against commits made late on 2026-09-18, a night's drift, left as
-recorded. Separately, [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) is
+recorded. Separately, [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path)
 was headed 📋 while two of its three items were ✅ and measured; its marker is corrected to ◐.
+(Corrected again on 2026-09-25, to ✅ — the third item had been done on 2026-09-17, two days
+before this paragraph was written. See [M6](#m6--close-and-re-measure-the-bulk-lane).)
 
 **Output — the goal set for 0.3.5.** The next release is a stability-and-performance patch, and
 its target is a node that can be exposed on the internet as a shared, multi-tenant test
@@ -4315,16 +4420,75 @@ for the trust-boundary reason B1 records.
 
 ### M6 — Close and re-measure the bulk lane
 
-📋 **Planned.** [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) item 3 is the
-only one of its three still open — feed bulk service times into the blended estimate the door
-judges on, which is the workload with by far the largest per-request cost and currently
-contributes nothing to it. F8's own caveats then name what was never measured and should be
-before a shared node is exposed: the single-write path under overload (`Write` *is*
-worker-eligible, so it should be covered — an assumption until an arm says so), and whether a
-retrying client deepens any of it. **M0-f rides the same session**: the read lane's
-shard-independent query preparation is repeated per shard, and its size is owed an arm rather
-than an estimate — the same standard, and the same harness. The F7/F8 precedent is the standard here: this lane's
-behaviour has twice been worse than the reasoning predicted, and only a run has ever settled it.
+◐ **In progress — measurement only, and the first session found a blocker. Corrected 2026-09-25.**
+This entry was written on
+2026-09-19 claiming [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) item 3 as the
+last of its three still open. It was already closed: `0836df2` landed it on 2026-09-17, two days
+after F8 was written and two days before this entry said otherwise. Bulk ops are worker-eligible,
+carry their own `OpClass`, and fold into the blend the door judges on — see
+[F8 item 3](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) for what shipped.
+
+**F8's marker has now been wrong twice, in the same direction, for the same reason.**
+[L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) moved it 📋 → ◐ on
+2026-09-19 because two of its three items were already done; this correction moves it ◐ → ✅
+because the third was too, on a day that fell between those two events. The pattern is specific
+and worth naming: an item is written up from a measurement, the fix lands in a later session
+under a different heading, and nobody walks back to the entry that predicted it. Reading the code
+before scheduling the work is [M7](#m7--redact-the-cluster-psk-in-debug)'s lesson, and it cost
+twelve days there against eight here.
+
+**So no code is owed and the measurement is the whole item** — which was always the larger half.
+Three arms, one session, one harness:
+
+- **The bulk lane**, which is the item's name. Every table in F8 was taken against a binary where
+  a bulk write held the actor mailbox for its entire fan-out. `0836df2` replaced that design and
+  nothing has re-measured it, so the exit criterion — goodput that degrades rather than
+  collapsing — has no evidence either way.
+- **The single-write lane**, which F8's caveats flag and no arm has ever covered: `Write` *is*
+  worker-eligible, so it should be covered, and that is an assumption until an arm says so.
+  Whether a retrying client deepens any of it is the other half of the same caveat.
+- **The read lane** — **M0-f rides the same session**: shard-independent query preparation is
+  repeated per shard, and its size is owed an arm rather than an estimate.
+
+**The harness is ready.** [F2](#f2--an-open-loop-load-generator)'s `cameodb-bench` takes
+`--mode bulk|write|search`, `--rate` and `--rate-steps`, offers Poisson arrivals from a seed, and
+judges itself first — reporting a run `INVALID as a statement about the node` rather than
+presenting a number it cannot stand behind.
+
+**Expect two runs, not one.** [M4](#m4--per-key-resource-quotas) and
+[M5](#m5--per-index-capability-subtraction) add refusal paths on the write ingress and will move
+the overload curve by design, and the exit criterion is a statement about the shipped binary. This
+run is the baseline that attributes the curve to `0836df2`; a shorter confirmation arm belongs at
+the cut.
+
+The F7/F8 precedent is the standard here: this lane's behaviour has twice been worse than the
+reasoning predicted, and only a run has ever settled it.
+
+**Session 1, 2026-09-25 — the bulk lane, and it did not reach an open-loop arm.** Three closed-loop
+arms on the F8 protocol. Two results, one expected and one not.
+
+*Expected, and it closes the question F8 left open.* `dispatch.round_robin_sends` is **non-zero on
+every bulk arm** — 269, 217, 559 — against the **0** F8 measured, which was the tell that no bulk
+work reached the worker pool at all. Bulk is served on the pool, `OpClass::Bulk` is carrying its
+samples, and `0836df2` does what its message says. The third time this lane has been measured is
+the first time the gates can see it.
+
+*Not expected.* The capacity probe wedged the node, and the cause is a defect that makes the
+exit-criterion question unanswerable until it is fixed —
+[OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted):
+every `408` permanently consumes a worker-pool slot, reads stay healthy, writes stop node-wide,
+and `SIGTERM` will not stop the process. Filed with its arms, its counters and a reproduction.
+
+**So the exit criterion — goodput that degrades rather than collapses — is still unmeasured**, and
+saying otherwise from these arms would be the mistake this entry was just corrected for. A node
+that loses a slot per timeout cannot be asked what its overload curve looks like, because the
+answer changes with every arm and never comes back. OB14 first; then the three arms, from a wiped
+volume, in one session.
+
+**Capacity is not comparable to F8's tables and should not be read against them.** The probe
+measured 11 bulk req/s at concurrency 4 against F8's 56, but the binary, the batch size, the seed
+and the machine all differ, and the probe was itself degrading as it ran. It is a number for
+choosing open-loop rates, not a regression.
 
 ### M7 — Redact the cluster PSK in `Debug`
 
@@ -4352,7 +4516,17 @@ was deferred on the reasoning that *rate limiting already bounds what a key cost
 unit time*. That reasoning is sound, and the premise was false on the write surface until
 [M3](#m3--meter-the-write-surface-and-give-anonymous-callers-their-own-bucket) closed it on
 2026-09-20. What is left is to re-read C2 against a multi-tenant node and either re-affirm the
-deferral, or take it up. The two `parse_query_lenient` call sites are where a cap would go.
+deferral, or take it up.
+
+**Where a cap would go, corrected 2026-09-25.** There are three `parse_query_lenient` call sites,
+not two, and since [L12](#l12--storagesrclibrs-is-9961-lines-of-which-one-impl-block-is-4460) they
+are all in `storage/src/search.rs`: one in `validate_query`, which parses for its errors and
+discards the query, and two in `search_documents`. The split bears on where a refusal belongs — a
+cap enforced at the `validate_query` site can *report* the limit to a caller asking whether a query
+is acceptable, instead of only refusing it at execution. The same file's header already records
+one unauthenticated way to wedge a search thread through this parser
+(`fold_untokenizable_whitespace`, `storage/src/query.rs`), which is the shape of reasoning this
+decision is being asked to generalise.
 
 One thing M3 changed that bears on the decision: the rate limiter now meters an *unidentified*
 caller too, so the deferral no longer rests on a node having issued keys.
