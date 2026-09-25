@@ -2819,22 +2819,14 @@ documents: **gap 0 and `green` on every one**, 16,959–25,885 docs/s as merges 
 timeouts. `SIGTERM` stops the node cleanly again. `cargo test -p storage -p server` is green — 36
 suites, no failures.
 
-**What this does *not* close, and should not be read as closing.** Three things the run exposed
-stand on their own merits, because a node should survive a stuck operation rather than depend on
-there never being one:
-
-- **The accounting is not RAII.** `in_flight`, `outstanding` and the worker permit are released
-  at the tail of the spawned task, so any future that parks or is dropped leaks all three. This
-  deadlock was one way to reach that; it is not the only one.
-- **F7's dequeue check is unreachable under saturation.** The loop takes its permit *before*
-  `rx.recv()`, so once parked tasks hold the width no worker reaches the deadline comparison.
-  `abandoned` stayed 0 through every wedged arm, which is the evidence.
-- **Nothing bounds a worker task.** A write that never returns had no upper bound anywhere on the
-  path, and the request timeout sheds the client rather than the work — [F7](#f7--the-request-timeout-sheds-the-client-not-the-work)'s
-  original finding, still true for anything downstream of the dequeue.
-
-Filed together as the follow-up in [M6](#m6--close-and-re-measure-the-bulk-lane); none of them
-blocks the re-measurement now that the lane stays up.
+**What this fix does not cover, and why that mattered.** Three weaknesses the run exposed stand on
+their own merits, because a node should survive a stuck operation rather than depend on there
+never being one: the pool's accounting was not RAII, F7's dequeue check was unreachable once the
+width was held, and nothing bounded a worker task. This deadlock was one way to reach all three;
+it was not the only one. **All three were closed the same day** — see
+[M6](#m6--close-and-re-measure-the-bulk-lane) for the mechanisms, the two tests that fail against
+the code they pin, and the overload run where goodput degrades to 89 ok/s instead of collapsing to
+zero while health answers in 1.4ms.
 
 **Reproduction, from a wiped volume**: start a node with the config above; run
 `cameodb-bench --mode bulk --batch-size 100 --concurrency 1 --duration 10 --seed-docs 5000
@@ -4583,10 +4575,140 @@ saying otherwise from these arms would be the mistake this entry was just correc
 closed-loop, and the criterion is an open-loop statement. What changed is that the lane now stays
 up long enough to ask. The three arms, from a wiped volume, in one session, are still owed.
 
-**Three weaknesses OB14 exposed are not closed by its fix** and belong to this item: the worker
-pool's accounting is not RAII, F7's dequeue check is unreachable once the width is held, and
-nothing bounds a worker task. Each is a way for one stuck operation to take the pool down; none
-blocks the arms.
+**Session 2, 2026-09-25 — the scaling sweep.** Closed-loop, release profile (LTO, stripped),
+M5 Pro, 15 cores, harness co-located, one index per node, each configuration from a wiped volume.
+Single runs: read the shapes, not the third digit.
+
+*Shard count, at a load point that actually saturates (concurrency 64, batch 2000):*
+
+| shards | bulk docs/s | CPU cores of 15 | pool gap |
+|---|---|---|---|
+| 1 | 122,045 | 1.0 | 0 |
+| 2 | 163,185 | 1.4 | 0 |
+| **4** | **172,120** | **1.7** | 0 |
+| 8 | 109,904 | 1.4 | 0 |
+
+Sharding pays to about four and then reverses: 1→2 is +34%, 2→4 is +5%, 4→8 is **−36%**. A bulk
+request fans out to every shard and waits for the slowest, so each added shard buys parallelism
+and pays a tail-latency tax on every request; past four the tax wins. **The default of 4 is the
+right default**, which is worth knowing rather than assuming.
+
+*Load shape, at 4 shards — far the larger lever, and batch size is most of it:*
+
+| concurrency | batch | in-flight docs | docs/s | p50 | cores |
+|---|---|---|---|---|---|
+| 8 | 500 | 4k | 15,117 | 267ms | 0.6 |
+| 16 | 500 | 8k | 25,342 | 324ms | 0.8 |
+| 64 | 2,000 | 128k | 157,514 | 725ms | 1.7 |
+| 128 | 2,000 | 256k | 147,830 | 1,629ms | 2.0 |
+| 32 | 5,000 | 160k | 185,388 | 787ms | 2.3 |
+| 32 | 10,000 | 320k | 265,052 | 1,014ms | 3.1 |
+| **8** | **50,000** | **400k** | **320,997** | **1,055ms** | 3.3 |
+| **32** | **20,000** | **640k** | **324,435** | 1,520ms | 3.8 |
+| 16 | 50,000 | 800k | 251,655 | 2,111ms | 3.1 |
+| 32 | 50,000 | 1.6M | 233,579 | 4,921ms | 2.9 |
+
+**28,261 → 324,435 docs/s, 11.5×, with no code change.** Batch size is the dominant term and
+keeps paying to 20,000; concurrency is the smaller one and turns against you early. The two are
+not independent — what the node responds to is roughly **documents in flight**, the product of
+the two — and the plateau sits near 400,000 of them at about **320,000 docs/s**. Past that,
+offering more buys latency and nothing else: 1.6M in flight is *slower* than 400k and five times
+the p50.
+
+**Where the two reversals matter for an operator.** At batch 500 more concurrency helps and the
+knee is 64. At batch 20,000 concurrency 32 already beats 64, and at batch 50,000 concurrency 8
+beats both — 320,997 docs/s at a p50 of 1,055ms against 233,579 at 4,921ms for four times the
+concurrency. **The best operating point is few large batches, not many small ones**, and an
+importer tuned the other way pays for it twice, in throughput and in tail latency.
+
+*What is not the limiter, tested rather than assumed* (4 shards, concurrency 16, batch 500):
+
+| variant | docs/s | cores |
+|---|---|---|
+| baseline, `wal_sync = true` | 28,261 | 0.8 |
+| `wal_sync = false` | **22,006** | 0.6 |
+| `indexer_num_threads = 2` | 27,219 | 0.8 |
+| `indexer_num_threads = 4` | 27,384 | 0.8 |
+
+Durability is not the constraint — turning fsync off made it *slower* — and indexer threads do
+nothing. **CPU peaked at 3.9 of 15 cores, 26%, at the 324,000 docs/s plateau**, and sat at 0.6–0.8
+for every configuration below it. The ceiling is not the box.
+
+**The pool stayed honest throughout.** `round_robin_sends` minus `jobs_completed` read **0** after
+every one of the twenty-eight arms above, across eleven-fold swings in offered load — which is
+[OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted)'s
+fix holding under far more load than the run that found it.
+
+**The diagnosis, and it is the same structure as OB14 seen from the other side.** High latency at
+low concurrency (267ms for a 500-document batch at concurrency 8), throughput that rises with
+offered load, CPU flat: the write path is **latency- and serialization-bound, not CPU-bound**.
+One writer thread per shard, a oneshot round-trip per slice, coalescing in between — that is what
+caps it, and it is the same machinery a single parked task was able to take down. The remaining
+~9× of this box is behind that, and it is 0.4.0-shaped work rather than a patch.
+
+**A correction worth keeping.** The first pass of this sweep ran at concurrency 16 / batch 500 and
+concluded that *one shard beats four*. That was an artefact of offering too little load: at a
+point that saturates, four beats one by 41%. A scaling claim taken below the knee measures the
+harness, which is [F2](#f2--an-open-loop-load-generator)'s own lesson arriving by a different road.
+
+**Not measured here.** Search throughput — the read arms ran after the write arms, so each
+configuration searched an index of a different size and the numbers are not comparable across
+rows. Open-loop behaviour, which is the exit criterion and is still owed.
+
+**The three weaknesses OB14 exposed are now closed too** — ✅ 2026-09-25, in the same session.
+They were not closed by OB14's fix and did not need to be; each is a way for *any* stuck
+operation to take the pool down, and a node should survive one rather than depend on there never
+being one.
+
+- **The pool's accounting is RAII.** `PoolSlot` holds `in_flight`, `outstanding`, the completion
+  tally and the semaphore permit, and releases all four in `Drop` — so they are released however
+  a job ends, rather than by statements at the tail of a task that may never reach it. A job that
+  leaves without finishing increments the new `jobs_dropped` counter, reported on
+  `/_admin/workers`: the point is that the next leak of this kind is *audible*, which this one
+  was not until the node stopped serving. `jobs_completed` and `jobs_dropped` are about the
+  *work*; a capped job still answers its caller with an error, so nobody waits on a channel that
+  will never be written.
+- **F7's dequeue check is reachable under saturation.** The loop now receives first, checks the
+  deadline *before* waiting for a permit, and checks it again once one is in hand — the wait for
+  capacity is itself spent budget. An already-dead job is refused without occupying a slot a live
+  one could use.
+- **A worker task is bounded.** `WORKER_LIVENESS_MULTIPLE` (twenty budgets, ceiling five minutes)
+  reclaims the slot of an operation that has stopped being slow and started being stuck. It is a
+  liveness backstop and not a deadline — F7 deliberately lets admitted work finish, and a cap
+  tight enough to act as a deadline would shed work about to succeed. Firing it logs at `error`
+  and counts as dropped, because it is a defect report rather than a shedding path. No budget
+  configured still means the pre-F7 contract, uncapped.
+
+**Both tests were checked against the code they pin, not merely written.**
+`an_operation_that_never_returns_costs_one_slot_not_the_pool` fails without the cap — *"a parked
+job was never answered, its slot is still held"* — and `a_stale_job_is_shed_even_when_every_permit_is_held`
+fails against the old ordering. The second needed correcting first: an earlier draft passed
+against the old ordering because the liveness cap fired inside its window and shed the job for the
+wrong reason. Its budget is now long enough that only the ordering can explain the result, which
+is the difference between a test and a decoration.
+
+**Measured end to end on the F8 overload configuration** — 1s timeout, `max_concurrent_requests`
+3000, bulk at concurrency 256:
+
+| | before | after |
+|---|---|---|
+| goodput under overload | **0 ok/s** | **89 ok/s** |
+| refused at admission | 0 | **42,312** |
+| `abandoned` — F7's shed | **0, unreachable** | **5, the guard fires** |
+| `jobs_dropped` | — | **0** |
+| `in_flight` at rest after | **pinned at the width** | **0** |
+| `/_cluster/health` under load | `408` at 1,001ms | **`200` at 1.4ms, green** |
+
+Goodput degrades instead of collapsing, the door refuses cheaply instead of absorbing, and the
+node answers its own health probe throughout. **This is the exit criterion's shape but not its
+evidence**: these arms are closed-loop, and the criterion is an open-loop statement. The three
+arms are still owed.
+
+*One reading note for whoever runs them.* `round_robin_sends` minus `jobs_completed` is a leak
+indicator only while nothing is being shed — a job refused at dequeue is sent and never completed,
+by design, so once `abandoned` is non-zero the difference equals it. The gauges that mean
+"something was lost" are `in_flight`, `queue_depth` and `jobs_dropped`, and all three read zero
+above.
 
 **Capacity is not comparable to F8's tables and should not be read against them.** The probe
 measured 11 bulk req/s at concurrency 4 against F8's 56, but the binary, the batch size, the seed
