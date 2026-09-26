@@ -267,6 +267,8 @@ check_cmd "bulk index written through one node" probe seed crossbulk 3
 check_cmd "bulk index answers fast through every node" probe warm crossbulk
 check_cmd "bulk writes through every node at once: none refused or stalled" \
     probe bulks "$CROSS_SECS" "$CROSS_WRITERS" crossbulk
+check_cmd "single writes through every node at once: none refused or stalled" \
+    probe writes "$CROSS_SECS" "$CROSS_WRITERS" crossbulk
 check_cmd "new indexes minted by bulk writes through every node at once: none refused or stalled" \
     probe bulkmints "$CROSS_SECS" "$CROSS_WRITERS"
 # Several nodes minting the *same* index at once: one of them must mint, the rest adopt its

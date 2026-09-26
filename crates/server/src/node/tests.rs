@@ -3656,3 +3656,52 @@ async fn a_forward_runs_off_the_mailbox() {
         Answer::Later(_) => panic!("a second hop is refused at once, not deferred"),
     }
 }
+
+/// A peer's writes, shares and searches are served off the mailbox; what needs the actor is not.
+///
+/// The worker lane is where the router sends this node's own requests and where a peer's go
+/// now, on the peer lane. An op that must write a schema or edit actor state has to stay on the
+/// actor: offered to a worker it would only be handed back, and a config edit or index delete
+/// run anywhere else would race the actor's own changes.
+#[test]
+fn only_what_a_worker_can_serve_leaves_the_mailbox() {
+    let index = || "books".to_string();
+    for op in [
+        first_write("books"),
+        ClientOp::BulkWrite {
+            index: index(),
+            docs: Vec::new(),
+            forwarded: true,
+            schema_body: None,
+            tenant: None,
+        },
+        ClientOp::BulkDelete {
+            index: index(),
+            docs: Vec::new(),
+            forwarded: true,
+        },
+        ClientOp::Search {
+            index: index(),
+            query: "*".to_string(),
+            limit: None,
+            offset: None,
+            fields: None,
+            sort: None,
+        },
+    ] {
+        assert!(worker_eligible(&op), "a worker must serve {op:?}");
+    }
+    for op in [
+        ClientOp::DeleteIndex {
+            index: index(),
+            delete_schema: false,
+        },
+        ClientOp::GetConfig { index: index() },
+        ClientOp::GetRawSchema {
+            index: index(),
+            minting_by: None,
+        },
+    ] {
+        assert!(!worker_eligible(&op), "{op:?} must stay on the actor");
+    }
+}

@@ -288,6 +288,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A node serves its peers' writes and searches concurrently: bulk writes through every node
+  2.0–2.9× faster.** A share of a bulk write forwarded from a peer, a single write the router
+  sent to its owner and the local half of a peer's search all arrived in the orchestrator's
+  mailbox and were served one at a time, whatever the node's shards and cores. They now run on
+  a lane of their own beside the worker pool, as many at once as the pool can carry; one that
+  needs a schema written still goes to the actor. The lane is separate so that its work, which
+  waits on no peer, can always drain — two nodes whose workers were all waiting on each other
+  could not otherwise serve the shares both were waiting for — and when it is full the op waits
+  its turn on the mailbox, as before. Measured with 8 writers per node: 446–582 bulk batches/s
+  before, 1,165–1,312 after, p99 0.15–0.29 s to 0.04–0.07 s.
+
 - **Writes become searchable on a clock, not a count: bulk ingest 1.8–6.6× faster.** A commit
   is what makes writes visible to search, and it was triggered at 1,000 operations on a new
   index — so a bulk load committed on nearly every batch, the writer and Tantivy's indexer taking

@@ -300,31 +300,7 @@ impl RouterActor {
     ) -> Result<JsonValue, OrchestratorError> {
         // Try worker pool for hot-path ops
         if let Some(tx) = &self.worker_tx {
-            let is_worker_eligible = matches!(
-                op,
-                ClientOp::Write { .. }
-                    | ClientOp::Delete { .. }
-                    | ClientOp::Search { .. }
-                    | ClientOp::Stream { .. }
-                    // Bulk ops fan out over the same snapshots the rest of the engine reads.
-                    // What they cannot do off the mailbox is *decide* a schema — a bulk write
-                    // that needs one written hands itself back as `UseActor`, which is the
-                    // fast/slow split the single-write path already uses.
-                    | ClientOp::BulkWrite { .. }
-                    | ClientOp::BulkDelete { .. }
-                    // A metadata read with no actor state behind it. On the mailbox it queued
-                    // behind whatever write was there; the pool answers it from an ArcSwap.
-                    | ClientOp::GetIdentity
-                    // The index listing asks only `&self` questions of the shard map — stats
-                    // gathered per shard, one schema per index, an identity that never
-                    // changes. `ListClusterIndexes` lands here only as the local half of a
-                    // broadcast, which is the same listing (ROADMAP CH12).
-                    | ClientOp::ListIndexes { .. }
-                    | ClientOp::ListClusterIndexes { .. }
-                    // Waits on peers, so it must not wait on this node's mailbox: see the
-                    // engine's arm for it in `execute`.
-                    | ClientOp::FindSchemaInCluster { .. }
-            );
+            let is_worker_eligible = super::orchestrator::worker_eligible(&op);
             if is_worker_eligible {
                 // Refuse before queueing, not after waiting. The dequeue check below this is
                 // the same decision taken at a worker, by which point the request has already
@@ -485,7 +461,13 @@ impl RouterActor {
         &self,
         op: ClientOp,
     ) -> Result<JsonValue, OrchestratorError> {
-        match self.orchestrator.ask(op).await {
+        // `OnActor`, not the op itself: a `ClientOp` is a peer's, and would be offered to the
+        // worker lane again — which is where most ops reaching here were just declined.
+        match self
+            .orchestrator
+            .ask(super::orchestrator::OnActor(op))
+            .await
+        {
             Ok(result) => Ok(result),
             Err(kameo::error::SendError::HandlerError(err)) => Err(err),
             Err(e) => Err(OrchestratorError::Io(std::io::Error::other(format!(

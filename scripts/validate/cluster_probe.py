@@ -15,6 +15,7 @@ show the evidence. Nodes come from CLUSTER_NODES, a comma-separated list of base
   warm <index>                             a bulk batch through every node until each answers fast
   mints <seconds> <writers>                new-index writes with varied ids through every node
   bulks <seconds> <writers> <index>        bulk writes through every node into an existing index
+  writes <seconds> <writers> <index>       single writes with varied ids through every node
   bulkmints <seconds> <writers>            each bulk write creates its own index, through every node
   samemint <rounds> <writers>              every node writes to one new index at the same moment
   fault <seconds> <from> <to> <index>      node1's health, searches and writes while a peer is
@@ -247,6 +248,21 @@ def cmd_bulks(seconds, writers, index):
         return status, t
 
     return cross_load("bulks", seconds, writers, request)
+
+
+def cmd_writes(seconds, writers, index):
+    """Single writes through every node into an index every node holds, each with its own id.
+
+    Two writes in three belong to a shard on another node, and the router sends each to its
+    owner, where it arrives as a peer's op — so this is the owners' peer entry under load.
+    """
+    def request(node, tag, i):
+        status, t, _ = call("PUT", f"{node}/api/{index}/document",
+                            {"id": f"w{tag}x{i}", "doc": {"title": "cross", "n": i}},
+                            timeout=OP_TIMEOUT)
+        return status, t
+
+    return cross_load("writes", seconds, writers, request)
 
 
 def cmd_bulkmints(seconds, writers):
@@ -563,6 +579,8 @@ def main():
         return cmd_mints(int(args[0]), int(args[1]))
     if cmd == "bulks":
         return cmd_bulks(int(args[0]), int(args[1]), args[2])
+    if cmd == "writes":
+        return cmd_writes(int(args[0]), int(args[1]), args[2])
     if cmd == "bulkmints":
         return cmd_bulkmints(int(args[0]), int(args[1]))
     if cmd == "samemint":
