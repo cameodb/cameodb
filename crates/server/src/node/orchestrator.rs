@@ -22,6 +22,7 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 use kameo::actor::ActorRef;
 use kameo::message::{Context, Message};
+use kameo::reply::DelegatedReply;
 use kameo::{Actor, RemoteActor, remote_message};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -1397,6 +1398,227 @@ pub(super) enum PeerSchemaLookup {
     Unreachable { reason: String },
 }
 
+/// Everything a canvass of the peers for a schema needs, and nothing that ties it to the actor.
+///
+/// Cheap to clone: a flag and two handles. The canvass waits on peers — up to
+/// [`PEER_SCHEMA_LOOKUP_TIMEOUT`] each — and each peer answers through its own orchestrator
+/// mailbox. Run from inside this node's mailbox, that wait is what made two nodes canvassing at
+/// once wait on each other until the timeout; held here instead, it can run on a worker or a
+/// spawned task, and the mailbox stays free to answer the peers' canvasses of this node.
+#[derive(Clone)]
+pub(super) struct SchemaCanvass {
+    /// `[network.cluster] enabled`. A standalone node has nobody to ask.
+    pub(super) clustered: bool,
+    pub(super) coordinator: Option<ActorRef<ClusterCoordinator>>,
+    pub(super) pool: Option<Arc<RemotePeerPool>>,
+}
+
+impl SchemaCanvass {
+    /// What the cluster already knows about an index this node has no schema for.
+    ///
+    /// Three outcomes, and the difference between the last two is the whole point: "nobody has
+    /// one" licenses this node to build a schema by sampling, while "I could not ask everybody"
+    /// does not, and they are indistinguishable if unreachable peers are counted as silent.
+    pub(super) async fn peer_schema_for(&self, index: &str) -> PeerSchemaLookup {
+        use crate::cluster_coordinator::{GetKnownPeers, GetStatus, KnownPeer};
+
+        // The standalone arm, taken before anything is asked of anyone. A node with clustering
+        // off is the whole system: there is nobody to disagree with, and sampling a schema from
+        // the documents is the feature that makes semi-structured input work. `clustered` is
+        // static configuration, so this costs no coordinator round trip — the previous form read
+        // the same fact out of `GetStatus`, which meant a mailbox hop on the first write to
+        // every new index on a node that has no peers by construction.
+        if !self.clustered {
+            return PeerSchemaLookup::NoneHeld;
+        }
+
+        let Some(coordinator) = self.coordinator.as_ref() else {
+            return PeerSchemaLookup::NoneHeld;
+        };
+        let Ok(status): Result<crate::distributed::ClusterStatus, _> =
+            coordinator.ask(GetStatus).await
+        else {
+            return PeerSchemaLookup::Unreachable {
+                reason: "the cluster coordinator did not answer".to_string(),
+            };
+        };
+
+        // Every configured member has to be reachable, not merely every member currently known.
+        // A node that boots alone while its peers are down knows only itself, so "ask all known
+        // peers" would be satisfied by asking nobody — which is exactly the case that produced
+        // three schemas for one index. `total_nodes` is the configured member count, so this
+        // compares against what the operator said the cluster is.
+        if status.connected_nodes < status.total_nodes {
+            return PeerSchemaLookup::Unreachable {
+                // States the fact and leaves the consequence to the caller: this answer now
+                // reaches a `DELETE` deciding whether an index exists as well as a write
+                // deciding whether it may invent a schema, and "a schema created now" is
+                // nonsense in the first case.
+                reason: format!(
+                    "only {} of {} cluster nodes are connected, so no answer covers the whole \
+                     cluster",
+                    status.connected_nodes, status.total_nodes
+                ),
+            };
+        }
+
+        let peers: Vec<KnownPeer> = match self.coordinator.as_ref() {
+            Some(coordinator) => coordinator.ask(GetKnownPeers).await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        if peers.is_empty() {
+            return PeerSchemaLookup::NoneHeld;
+        }
+
+        let Some(pool) = self.pool.clone() else {
+            return PeerSchemaLookup::Unreachable {
+                reason: "no remote peer pool on this node, so no peer can be asked".to_string(),
+            };
+        };
+
+        let op = ClientOp::GetRawSchema {
+            index: index.to_string(),
+        };
+        let answers = futures::future::join_all(peers.into_iter().map(|peer| {
+            let op = op.clone();
+            let pool = pool.clone();
+            async move {
+                let node = peer.node_id;
+                let ask = async {
+                    let remote = pool
+                        .get_orchestrator(node, ConnectionChannel::Operations)
+                        .await
+                        .map_err(|e| format!("node {node} lookup failed: {e}"))?
+                        .ok_or_else(|| format!("node {node} has no reachable orchestrator"))?;
+                    remote
+                        .ask(&op)
+                        .await
+                        .map_err(|e| format!("node {node}: {e}"))
+                };
+                timeout(PEER_SCHEMA_LOOKUP_TIMEOUT, ask)
+                    .await
+                    .unwrap_or_else(|_| Err(format!("node {node} timed out")))
+            }
+        }))
+        .await;
+
+        let mut best: Option<IndexSchema> = None;
+        let mut unreachable = Vec::new();
+        for answer in answers {
+            match answer {
+                Err(why) => unreachable.push(why),
+                Ok(JsonValue::Null) => {}
+                Ok(value) => match serde_json::from_value::<IndexSchema>(value) {
+                    Ok(mut schema) => {
+                        schema.normalize_after_deserialization();
+                        best = Some(match best.take() {
+                            None => schema,
+                            Some(current) => NodeOrchestrator::preferred_schema(current, schema),
+                        });
+                    }
+                    // A peer that answered with something unreadable is not a peer that answered
+                    // "no schema". Counted as unreachable so it cannot license sampling.
+                    Err(e) => unreachable.push(format!("unreadable schema from a peer: {e}")),
+                },
+            }
+        }
+
+        // A schema found from any peer settles it even if another peer was unreachable: the
+        // declaration exists, and adopting it is strictly better than inventing a second one.
+        if let Some(schema) = best {
+            return PeerSchemaLookup::Found(Box::new(schema));
+        }
+        if !unreachable.is_empty() {
+            return PeerSchemaLookup::Unreachable {
+                reason: unreachable.join("; "),
+            };
+        }
+        PeerSchemaLookup::NoneHeld
+    }
+}
+
+/// The answer to [`ClientOp::FindSchemaInCluster`]: this node's own schema if it holds one,
+/// otherwise what a canvass of the peers finds.
+///
+/// Shared by the worker, which normally serves it, and the actor, which serves it when no
+/// worker can. Either way the canvass holds no mailbox.
+pub(super) async fn find_schema_in_cluster(
+    held: Option<Arc<IndexSchema>>,
+    canvass: &SchemaCanvass,
+    index: String,
+) -> Result<JsonValue, OrchestratorError> {
+    let to_json = |schema: &IndexSchema| {
+        serde_json::to_value(schema).map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
+    };
+    // This node first. A holder answers from its own store without asking anyone, which covers
+    // every standalone node and the ordinary clustered case.
+    if let Some(schema) = held {
+        return to_json(&schema);
+    }
+    match canvass.peer_schema_for(&index).await {
+        PeerSchemaLookup::Found(schema) => to_json(&schema),
+        PeerSchemaLookup::NoneHeld => Ok(JsonValue::Null),
+        // Not `null`: nobody said the index is absent, only that the cluster could not be
+        // canvassed. A caller that reads a partial view as "absent" reports a missing index
+        // while a node that holds it is merely unreachable.
+        PeerSchemaLookup::Unreachable { reason } => {
+            Err(OrchestratorError::SchemaUnconfirmed { index, reason })
+        }
+    }
+}
+
+/// What a mailbox op produced: its answer, or the rest of the work, to finish off the mailbox.
+///
+/// `Later` is how an op that must wait on a peer gives the mailbox back first. The actor does
+/// what needs `&mut self` — deciding and saving a schema — and hands back a future that owns
+/// everything else it needs; the handler runs it in a task and answers through the delegated
+/// reply. Waiting inside the mailbox instead is what let two nodes wait on each other: each
+/// forwarding to the other's mailbox from inside its own, until the peer timeout (60 s).
+#[derive(kameo::Reply)]
+pub(super) enum Answer {
+    Now(Result<JsonValue, OrchestratorError>),
+    Later(futures::future::BoxFuture<'static, Result<JsonValue, OrchestratorError>>),
+}
+
+impl Answer {
+    /// The answer, waiting for it here if it was deferred. For callers that are not the mailbox.
+    pub(super) async fn resolve(self) -> Result<JsonValue, OrchestratorError> {
+        match self {
+            Self::Now(result) => result,
+            Self::Later(rest) => rest.await,
+        }
+    }
+}
+
+impl From<Result<Answer, OrchestratorError>> for Answer {
+    fn from(result: Result<Answer, OrchestratorError>) -> Self {
+        result.unwrap_or_else(|err| Self::Now(Err(err)))
+    }
+}
+
+/// [`BulkCtx`], owned: snapshots and handles a task can carry away from the actor.
+///
+/// The shard map is the engine's published snapshot and the ring the shared one — the actor
+/// publishes every topology change to both, which is what the worker lane already relies on —
+/// so a fan-out run from here reads exactly what the actor would have.
+pub(super) struct OwnedBulkView {
+    shards: Arc<HashMap<Uuid, MicroshardActor>>,
+    ring: Arc<ConsistentRing>,
+    coordinator: Option<ActorRef<ClusterCoordinator>>,
+    pool: Option<Arc<RemotePeerPool>>,
+}
+
+impl OwnedBulkView {
+    fn ctx(&self) -> BulkCtx<'_> {
+        BulkCtx {
+            shards: &self.shards,
+            ring: &self.ring,
+            coordinator: self.coordinator.as_ref(),
+            remote_peer_pool: self.pool.as_deref(),
+        }
+    }
+}
+
 /// What a worker did with an op.
 ///
 /// The engine cannot serve every op — schema evolution and bulk writes need `&mut
@@ -2311,6 +2533,9 @@ pub(super) struct OrchestratorEngine {
     pub(super) max_concurrent_shard_searches: usize,
     /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups.
     pub(super) remote_peer_pool: Arc<RemotePeerPool>,
+    /// What a canvass of the peers needs, so a worker can run one — see
+    /// [`ClientOp::FindSchemaInCluster`] in `execute`.
+    pub(super) canvass: SchemaCanvass,
 }
 
 impl std::fmt::Debug for OrchestratorEngine {
@@ -2486,6 +2711,18 @@ impl OrchestratorEngine {
                 )
                 .await,
             ),
+            // A read, and one that waits on peers: the canvass asks each of them through its
+            // orchestrator mailbox. On this node's mailbox it waited while holding it, so a peer
+            // canvassing this node at the same moment — a first write to a new index, minting —
+            // waited on it in turn until both timed out: index deletes answered 503 whenever
+            // new indexes were being created elsewhere.
+            ClientOp::FindSchemaInCluster { index } => {
+                let held = match self.schema_cache.durable(&self.shards.load(), &index).await {
+                    Ok(held) => held,
+                    Err(err) => return WorkerOutcome::Done(Err(err)),
+                };
+                WorkerOutcome::Done(find_schema_in_cluster(held, &self.canvass, index).await)
+            }
             other => WorkerOutcome::UseActor(Box::new(other)),
         }
     }
@@ -2746,6 +2983,13 @@ pub(crate) struct NodeOrchestrator {
     /// Written here rather than at the caller because this actor handles one op at a time, so
     /// the time around `handle` is service with no queue in it. See [`MailboxLane`].
     pub(super) mailbox_lane: MailboxLane,
+    /// Indexes this node is minting a schema for right now, and how many writes are doing it.
+    ///
+    /// Set when a first write's canvass leaves the mailbox, cleared when its
+    /// `MintAfterCanvass` has run. While an index is here and no schema for it is saved yet,
+    /// a peer asking for it is told so rather than told there is none — see `GetRawSchema` in
+    /// `handle_client_op`.
+    pub(super) minting: HashMap<String, usize>,
     /// Map of shard UUIDs to their microshard actors.
     ///
     /// `pub(crate)` rather than `pub(super)`, and the only field of this actor that is: the
@@ -2909,126 +3153,20 @@ impl NodeOrchestrator {
         }
     }
 
-    /// What the cluster already knows about an index this node has no schema for.
-    ///
-    /// Three outcomes, and the difference between the last two is the whole point: "nobody has
-    /// one" licenses this node to build a schema by sampling, while "I could not ask everybody"
-    /// does not, and they are indistinguishable if unreachable peers are counted as silent.
+    /// What the cluster already knows about an index this node has no schema for — see
+    /// [`SchemaCanvass::peer_schema_for`].
     pub(super) async fn peer_schema_for(&self, index: &str) -> PeerSchemaLookup {
-        use crate::cluster_coordinator::{GetKnownPeers, GetStatus, KnownPeer};
+        self.schema_canvass().peer_schema_for(index).await
+    }
 
-        // The standalone arm, taken before anything is asked of anyone. A node with clustering
-        // off is the whole system: there is nobody to disagree with, and sampling a schema from
-        // the documents is the feature that makes semi-structured input work. `clustered` is
-        // static configuration, so this costs no coordinator round trip — the previous form read
-        // the same fact out of `GetStatus`, which meant a mailbox hop on the first write to
-        // every new index on a node that has no peers by construction.
-        if !self.config.clustered {
-            return PeerSchemaLookup::NoneHeld;
+    /// What a canvass of the peers needs from this actor, detached from it, so the canvass can
+    /// run somewhere that does not hold the mailbox.
+    pub(super) fn schema_canvass(&self) -> SchemaCanvass {
+        SchemaCanvass {
+            clustered: self.config.clustered,
+            coordinator: self.coordinator.clone(),
+            pool: self.remote_peer_pool.clone(),
         }
-
-        let Some(coordinator) = self.coordinator.as_ref() else {
-            return PeerSchemaLookup::NoneHeld;
-        };
-        let Ok(status): Result<crate::distributed::ClusterStatus, _> =
-            coordinator.ask(GetStatus).await
-        else {
-            return PeerSchemaLookup::Unreachable {
-                reason: "the cluster coordinator did not answer".to_string(),
-            };
-        };
-
-        // Every configured member has to be reachable, not merely every member currently known.
-        // A node that boots alone while its peers are down knows only itself, so "ask all known
-        // peers" would be satisfied by asking nobody — which is exactly the case that produced
-        // three schemas for one index. `total_nodes` is the configured member count, so this
-        // compares against what the operator said the cluster is.
-        if status.connected_nodes < status.total_nodes {
-            return PeerSchemaLookup::Unreachable {
-                // States the fact and leaves the consequence to the caller: this answer now
-                // reaches a `DELETE` deciding whether an index exists as well as a write
-                // deciding whether it may invent a schema, and "a schema created now" is
-                // nonsense in the first case.
-                reason: format!(
-                    "only {} of {} cluster nodes are connected, so no answer covers the whole \
-                     cluster",
-                    status.connected_nodes, status.total_nodes
-                ),
-            };
-        }
-
-        let peers: Vec<KnownPeer> = match self.coordinator.as_ref() {
-            Some(coordinator) => coordinator.ask(GetKnownPeers).await.unwrap_or_default(),
-            None => Vec::new(),
-        };
-        if peers.is_empty() {
-            return PeerSchemaLookup::NoneHeld;
-        }
-
-        let Some(pool) = self.remote_peer_pool.clone() else {
-            return PeerSchemaLookup::Unreachable {
-                reason: "no remote peer pool on this node, so no peer can be asked".to_string(),
-            };
-        };
-
-        let op = ClientOp::GetRawSchema {
-            index: index.to_string(),
-        };
-        let answers = futures::future::join_all(peers.into_iter().map(|peer| {
-            let op = op.clone();
-            let pool = pool.clone();
-            async move {
-                let node = peer.node_id;
-                let ask = async {
-                    let remote = pool
-                        .get_orchestrator(node, ConnectionChannel::Operations)
-                        .await
-                        .map_err(|e| format!("node {node} lookup failed: {e}"))?
-                        .ok_or_else(|| format!("node {node} has no reachable orchestrator"))?;
-                    remote
-                        .ask(&op)
-                        .await
-                        .map_err(|e| format!("node {node}: {e}"))
-                };
-                timeout(PEER_SCHEMA_LOOKUP_TIMEOUT, ask)
-                    .await
-                    .unwrap_or_else(|_| Err(format!("node {node} timed out")))
-            }
-        }))
-        .await;
-
-        let mut best: Option<IndexSchema> = None;
-        let mut unreachable = Vec::new();
-        for answer in answers {
-            match answer {
-                Err(why) => unreachable.push(why),
-                Ok(JsonValue::Null) => {}
-                Ok(value) => match serde_json::from_value::<IndexSchema>(value) {
-                    Ok(mut schema) => {
-                        schema.normalize_after_deserialization();
-                        best = Some(match best.take() {
-                            None => schema,
-                            Some(current) => Self::preferred_schema(current, schema),
-                        });
-                    }
-                    // A peer that answered with something unreadable is not a peer that answered
-                    // "no schema". Counted as unreachable so it cannot license sampling.
-                    Err(e) => unreachable.push(format!("unreadable schema from a peer: {e}")),
-                },
-            }
-        }
-
-        // A schema found from any peer settles it even if another peer was unreachable: the
-        // declaration exists, and adopting it is strictly better than inventing a second one.
-        if let Some(schema) = best {
-            return PeerSchemaLookup::Found(Box::new(schema));
-        }
-        if !unreachable.is_empty() {
-            return PeerSchemaLookup::Unreachable {
-                reason: unreachable.join("; "),
-            };
-        }
-        PeerSchemaLookup::NoneHeld
     }
 
     /// Which of two schemas for the same index the cluster should settle on.
@@ -3063,6 +3201,8 @@ impl NodeOrchestrator {
     /// Validate a batch against the index's schema, growing the schema first where the batch
     /// needs it. The batch travels in and back out again — see `parallel_validate_schema` for
     /// why owning it is what lets the fan-out avoid copying it.
+    // The terms the write arrived on, as `orch_write` explains for its own list.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn staged_schema_validation(
         &self,
         index: &str,
@@ -3073,6 +3213,10 @@ impl NodeOrchestrator {
         // Stamped onto the schema only if this call is the index's mint; see
         // `ClientOp::Write::tenant`.
         tenant: Option<&str>,
+        // The canvass of the peers for this index, already run outside the mailbox — see
+        // `MintAfterCanvass`. `None` canvasses here, which only a standalone node (whose canvass
+        // asks nobody) or a caller that found a schema a moment ago should reach.
+        settled: Option<PeerSchemaLookup>,
     ) -> Result<(SchemaValidationSummary, Vec<DocPayload>), OrchestratorError> {
         if docs.is_empty() {
             return Ok((
@@ -3135,7 +3279,11 @@ impl NodeOrchestrator {
                 index: index.to_string(),
             });
         } else if is_initial_creation {
-            match self.peer_schema_for(index).await {
+            let lookup = match settled {
+                Some(lookup) => lookup,
+                None => self.peer_schema_for(index).await,
+            };
+            match lookup {
                 // Nobody holds one, so this index really is new and sampling is the right answer.
                 PeerSchemaLookup::NoneHeld => {}
                 PeerSchemaLookup::Found(declared) => {
@@ -3787,6 +3935,7 @@ impl NodeOrchestrator {
         let quotas = Arc::new(TenantQuotas::new(config.tenant_quotas.clone()));
         let mut orchestrator = Self {
             mailbox_lane: MailboxLane::new(),
+            minting: HashMap::new(),
             shards: HashMap::new(),
             writer_liveness: Arc::new(WriterLiveness::default()),
             identity,
@@ -3871,6 +4020,7 @@ impl NodeOrchestrator {
             default_search_limit: self.default_search_limit,
             max_concurrent_shard_searches: self.max_concurrent_shard_searches,
             remote_peer_pool: pool,
+            canvass: self.schema_canvass(),
         });
 
         // Worker count: min(local_shards * 2, cpu_cores * 2), minimum 1.
@@ -4656,11 +4806,11 @@ impl NodeOrchestrator {
     // ========================================================================
 
     /// Handles client operations. Called from Message<ClientOp> handler.
-    pub(super) async fn handle_client_op(
-        &mut self,
-        op: ClientOp,
-    ) -> Result<JsonValue, OrchestratorError> {
-        match op {
+    ///
+    /// Writes and deletes may answer [`Answer::Later`]: the part that waits on a peer, for the
+    /// handler to run off the mailbox. Everything else is answered here and now.
+    pub(super) async fn handle_client_op(&mut self, op: ClientOp) -> Answer {
+        Answer::Now(match op {
             ClientOp::Search {
                 index,
                 query,
@@ -4708,16 +4858,19 @@ impl NodeOrchestrator {
                 schema_body,
                 tenant,
             } => {
-                self.orch_write(
-                    &index,
-                    id,
-                    routing_key,
-                    doc,
-                    forwarded,
-                    schema_body,
-                    tenant.as_deref(),
-                )
-                .await
+                return self
+                    .orch_write(
+                        &index,
+                        id,
+                        routing_key,
+                        doc,
+                        forwarded,
+                        schema_body,
+                        tenant.as_deref(),
+                        None,
+                    )
+                    .await
+                    .into();
             }
             ClientOp::BulkWrite {
                 index,
@@ -4726,20 +4879,34 @@ impl NodeOrchestrator {
                 schema_body,
                 tenant,
             } => {
-                self.orch_bulk_write(&index, docs, forwarded, schema_body, tenant.as_deref())
+                return self
+                    .orch_bulk_write(
+                        &index,
+                        docs,
+                        forwarded,
+                        schema_body,
+                        tenant.as_deref(),
+                        None,
+                    )
                     .await
+                    .into();
             }
             ClientOp::Delete {
                 index,
                 id,
                 routing_key,
                 forwarded,
-            } => self.orch_delete(&index, id, routing_key, forwarded).await,
+            } => {
+                return self
+                    .orch_delete(&index, id, routing_key, forwarded)
+                    .await
+                    .into();
+            }
             ClientOp::BulkDelete {
                 index,
                 docs,
                 forwarded,
-            } => self.orch_bulk_delete(&index, docs, forwarded).await,
+            } => return self.orch_bulk_delete(&index, docs, forwarded).await.into(),
             ClientOp::CreateConfig { index, schema } => {
                 self.orch_create_config(&index, schema).await
             }
@@ -4752,35 +4919,14 @@ impl NodeOrchestrator {
                     .await
             }
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
-            // Read from durable state, not from the lazily-filled cache: this answer is what a
-            // peer uses to decide whether it may invent a schema, so "I have not looked yet"
-            // must not be reported as "there is none". See `durable_schema`.
-            ClientOp::GetRawSchema { index } => Ok(self
-                .durable_schema(&index)
-                .await?
-                .map(|schema| serde_json::to_value(&*schema))
-                .transpose()
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
-                .unwrap_or(JsonValue::Null)),
-            ClientOp::FindSchemaInCluster { index } => {
-                // This node first. A holder answers from its own store without asking anyone,
-                // which covers every standalone node and the ordinary clustered case.
-                if let Some(schema) = self.durable_schema(&index).await? {
-                    return serde_json::to_value(&*schema)
-                        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)));
-                }
-                match self.peer_schema_for(&index).await {
-                    PeerSchemaLookup::Found(schema) => Ok(serde_json::to_value(&*schema)
-                        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?),
-                    PeerSchemaLookup::NoneHeld => Ok(JsonValue::Null),
-                    // Not `null`: nobody said the index is absent, only that the cluster could
-                    // not be canvassed. A caller that reads a partial view as "absent" reports
-                    // a missing index while a node that holds it is merely unreachable.
-                    PeerSchemaLookup::Unreachable { reason } => {
-                        Err(OrchestratorError::SchemaUnconfirmed { index, reason })
-                    }
-                }
-            }
+            ClientOp::GetRawSchema { index } => self.raw_schema_for_peer(index).await,
+            // Normally a worker's — see `OrchestratorEngine::execute`. Here only when no worker
+            // took it, and still without holding this mailbox across the canvass for longer than
+            // the peers take to answer; the answer is the same either way.
+            ClientOp::FindSchemaInCluster { index } => match self.durable_schema(&index).await {
+                Ok(held) => find_schema_in_cluster(held, &self.schema_canvass(), index).await,
+                Err(err) => Err(err),
+            },
             ClientOp::ValidateQuery { index, query } => {
                 self.orch_validate_query(&index, &query).await
             }
@@ -4795,7 +4941,7 @@ impl NodeOrchestrator {
                 index,
                 delete_schema,
             } => self.orch_delete_index(&index, delete_schema).await,
-        }
+        })
     }
 
     /// Delete an index and all its data from all local shards (parallel)
@@ -4881,9 +5027,9 @@ impl NodeOrchestrator {
         }))
     }
 
-    // Eight parameters, and each one is a decision the caller has already made: which index,
-    // which document, where it routes, whether this is a forward, what schema came with it, and
-    // whose quota it stamps. Bundling them into a struct would move the argument list rather
+    // Nine parameters, and each one is a decision the caller has already made: which index,
+    // which document, where it routes, whether this is a forward, what schema came with it,
+    // whose quota it stamps, and what the peers said when canvassed outside the mailbox. Bundling them into a struct would move the argument list rather
     // than shorten it, and the op they are destructured from is that struct.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn orch_write(
@@ -4895,7 +5041,8 @@ impl NodeOrchestrator {
         forwarded: bool,
         schema_body: Option<Box<IndexSchema>>,
         tenant: Option<&str>,
-    ) -> Result<JsonValue, OrchestratorError> {
+        settled: Option<PeerSchemaLookup>,
+    ) -> Result<Answer, OrchestratorError> {
         if self.shards.is_empty() {
             return Err(OrchestratorError::NotReady("No shards".to_string()));
         }
@@ -4925,34 +5072,31 @@ impl NodeOrchestrator {
                     .dispatch(target, index, id, effective_routing_key, doc)
                     .await?
                 {
-                    WriteDispatch::Done(response) => Ok(response),
+                    WriteDispatch::Done(response) => Ok(Answer::Now(Ok(response))),
                     WriteDispatch::Elsewhere {
                         id,
                         effective_routing_key,
                         doc,
-                    } => {
-                        self.forward_op_to_owner(
-                            target,
-                            forwarded,
-                            ClientOp::Write {
-                                index: index.to_string(),
-                                id,
-                                routing_key: effective_routing_key,
-                                doc,
-                                forwarded: true,
-                                // This node reached the fast path, which means it holds a
-                                // schema and this document needs nothing added to it. The
-                                // owner may hold none, and `forwarded` above is all it
-                                // needs to know not to invent one: it asks, and the resend
-                                // below carries the body. Nothing speculative on the wire.
-                                schema_body: None,
-                                // Forwarded, so it mints nothing and stamps nothing.
-                                tenant: None,
-                            },
-                            Some(&schema),
-                        )
-                        .await
-                    }
+                    } => Ok(self.forward_later(
+                        target,
+                        forwarded,
+                        ClientOp::Write {
+                            index: index.to_string(),
+                            id,
+                            routing_key: effective_routing_key,
+                            doc,
+                            forwarded: true,
+                            // This node reached the fast path, which means it holds a
+                            // schema and this document needs nothing added to it. The
+                            // owner may hold none, and `forwarded` above is all it
+                            // needs to know not to invent one: it asks, and the resend
+                            // below carries the body. Nothing speculative on the wire.
+                            schema_body: None,
+                            // Forwarded, so it mints nothing and stamps nothing.
+                            tenant: None,
+                        },
+                        Some(Arc::clone(&schema)),
+                    )),
                 };
             }
         };
@@ -4976,6 +5120,7 @@ impl NodeOrchestrator {
                 forwarded,
                 schema_body.as_deref(),
                 tenant,
+                settled,
             )
             .await?;
 
@@ -5006,31 +5151,28 @@ impl NodeOrchestrator {
             .dispatch(target, index, id, effective_routing_key, doc)
             .await?
         {
-            WriteDispatch::Done(response) => Ok(response),
+            WriteDispatch::Done(response) => Ok(Answer::Now(Ok(response))),
             WriteDispatch::Elsewhere {
                 id,
                 effective_routing_key,
                 doc,
-            } => {
-                self.forward_op_to_owner(
-                    target,
-                    forwarded,
-                    ClientOp::Write {
-                        index: index.to_string(),
-                        id,
-                        routing_key: effective_routing_key,
-                        doc,
-                        // Nothing speculative: `forwarded` is the signal, and the owner
-                        // asks for the body if it needs one.
-                        schema_body: None,
-                        forwarded: true,
-                        // Forwarded, so it mints nothing and stamps nothing.
-                        tenant: None,
-                    },
-                    Some(&schema_mut),
-                )
-                .await
-            }
+            } => Ok(self.forward_later(
+                target,
+                forwarded,
+                ClientOp::Write {
+                    index: index.to_string(),
+                    id,
+                    routing_key: effective_routing_key,
+                    doc,
+                    // Nothing speculative: `forwarded` is the signal, and the owner
+                    // asks for the body if it needs one.
+                    schema_body: None,
+                    forwarded: true,
+                    // Forwarded, so it mints nothing and stamps nothing.
+                    tenant: None,
+                },
+                Some(Arc::clone(&schema_mut)),
+            )),
         }
     }
 
@@ -5046,7 +5188,7 @@ impl NodeOrchestrator {
         id: String,
         routing_key: Option<String>,
         forwarded: bool,
-    ) -> Result<JsonValue, OrchestratorError> {
+    ) -> Result<Answer, OrchestratorError> {
         if self.shards.is_empty() {
             return Err(OrchestratorError::NotReady("No shards".to_string()));
         }
@@ -5063,24 +5205,21 @@ impl NodeOrchestrator {
         let target = ctx.route_write(&Some(effective.clone()))?;
 
         match ctx.dispatch_delete(target, index, &id).await? {
-            Some(response) => Ok(response),
+            Some(response) => Ok(Answer::Now(Ok(response))),
             // The ring placed this delete on a peer. Forward it; the peer re-derives the key
             // from the same schema and routes to the shard it actually hosts.
-            None => {
-                self.forward_op_to_owner(
-                    target,
-                    forwarded,
-                    ClientOp::Delete {
-                        index: index.to_string(),
-                        id,
-                        routing_key: Some(effective),
-                        forwarded: true,
-                    },
-                    // A delete carries no document, so it can never need a schema.
-                    None,
-                )
-                .await
-            }
+            None => Ok(self.forward_later(
+                target,
+                forwarded,
+                ClientOp::Delete {
+                    index: index.to_string(),
+                    id,
+                    routing_key: Some(effective),
+                    forwarded: true,
+                },
+                // A delete carries no document, so it can never need a schema.
+                None,
+            )),
         }
     }
 
@@ -5095,24 +5234,39 @@ impl NodeOrchestrator {
         index: &str,
         docs: Vec<DeletePayload>,
         forwarded: bool,
-    ) -> Result<JsonValue, OrchestratorError> {
+    ) -> Result<Answer, OrchestratorError> {
         let start = std::time::Instant::now();
         if self.shards.is_empty() {
             return Err(OrchestratorError::NotReady("No shards".to_string()));
         }
 
         let schema = self.load_schema(index).await?;
-        let ctx = BulkCtx {
-            shards: &self.shards,
-            ring: &self.routing_ring,
-            coordinator: self.coordinator.as_ref(),
-            remote_peer_pool: self.remote_peer_pool.as_deref(),
-        };
-        ctx.apply_bulk_delete(index, docs, &schema, forwarded, start)
-            .await
+        // A share forwarded here goes no further, so it never waits on a peer and is served in
+        // place. A first hop forwards its remote shares, so it goes off the mailbox — see
+        // `Answer`.
+        if forwarded {
+            let ctx = BulkCtx {
+                shards: &self.shards,
+                ring: &self.routing_ring,
+                coordinator: self.coordinator.as_ref(),
+                remote_peer_pool: self.remote_peer_pool.as_deref(),
+            };
+            return Ok(Answer::Now(
+                ctx.apply_bulk_delete(index, docs, &schema, forwarded, start)
+                    .await,
+            ));
+        }
+        let view = self.owned_bulk_view();
+        let index = index.to_string();
+        Ok(Answer::Later(Box::pin(async move {
+            view.ctx()
+                .apply_bulk_delete(&index, docs, &schema, forwarded, start)
+                .await
+        })))
     }
 
-    /// Forward a single write or delete to the node that owns `target`, and return its answer.
+    /// Forward a single write or delete to the node that owns `target` — as a future that owns
+    /// what it needs, so the mailbox is not held while the peer answers.
     ///
     /// Reached when the ring places a write or delete on a shard this node does not host. The
     /// remote node re-derives the routing key from its own schema, so the op travels the way the
@@ -5125,66 +5279,83 @@ impl NodeOrchestrator {
     /// owns the shard would otherwise pass one write between them until something timed out,
     /// once per write. Refusing states the disagreement instead, and the caller's retry lands
     /// after the views have converged.
-    pub(super) async fn forward_op_to_owner(
+    pub(super) fn forward_later(
         &self,
         target: Uuid,
         already_forwarded: bool,
         op: ClientOp,
-        established: Option<&IndexSchema>,
-    ) -> Result<JsonValue, OrchestratorError> {
+        established: Option<Arc<IndexSchema>>,
+    ) -> Answer {
         if already_forwarded {
-            return Err(OrchestratorError::Io(std::io::Error::other(format!(
+            return Answer::Now(Err(OrchestratorError::Io(std::io::Error::other(format!(
                 "shard {target} was forwarded here and is not local either: this node and the \
                  one that forwarded disagree about who owns it. Retry once the cluster has \
                  settled"
-            ))));
+            )))));
         }
+        let coordinator = self.coordinator.clone();
+        let pool = self.remote_peer_pool.clone();
+        Answer::Later(Box::pin(async move {
+            let node_id = if let Some(coord) = &coordinator {
+                coord
+                    .ask(GetShardAssignments)
+                    .await
+                    .unwrap_or_default()
+                    .get(&target)
+                    .map(|meta| meta.node_id)
+            } else {
+                None
+            };
 
-        let node_id = if let Some(coord) = &self.coordinator {
-            coord
-                .ask(GetShardAssignments)
-                .await
-                .unwrap_or_default()
-                .get(&target)
-                .map(|meta| meta.node_id)
-        } else {
-            None
-        };
+            let Some(node_id) = node_id else {
+                return Err(OrchestratorError::Missing(format!(
+                    "shard {target} is not local and no node owns it"
+                )));
+            };
 
-        let Some(node_id) = node_id else {
-            return Err(OrchestratorError::Missing(format!(
-                "shard {target} is not local and no node owns it"
-            )));
-        };
+            let pool = pool.ok_or_else(|| {
+                OrchestratorError::NotReady("Remote peer pool not initialized".to_string())
+            })?;
 
-        let pool = self.remote_peer_pool.as_ref().ok_or_else(|| {
-            OrchestratorError::NotReady("Remote peer pool not initialized".to_string())
-        })?;
-
-        // One retry, and only for the one answer a retry can change. The peer holds no schema
-        // for this index and said so rather than canvassing anyone, so the resend carries the
-        // body — see [`CarriedSchema`]. Once per node per index; every other forward, and every
-        // other failure, goes through here untouched.
-        pool.converse(node_id, async {
-            let remote = lookup_peer_orchestrator(pool, node_id).await?;
-            match remote_answer(remote.ask(&op).await) {
-                Err(err) if matches!(err.verdict(), RemoteVerdict::SchemaRequired) => {
-                    let Some(schema) = established else {
-                        return Err(err);
-                    };
-                    let Some(resend) = with_schema_body(&op, schema) else {
-                        return Err(err);
-                    };
-                    debug!(
-                        %node_id,
-                        "Peer holds no schema for this index; resending the write with the schema"
-                    );
-                    remote_answer(remote.ask(&resend).await)
+            // One retry, and only for the one answer a retry can change. The peer holds no
+            // schema for this index and said so rather than canvassing anyone, so the resend
+            // carries the body — see [`CarriedSchema`]. Once per node per index; every other
+            // forward, and every other failure, goes through here untouched.
+            pool.converse(node_id, async {
+                let remote = lookup_peer_orchestrator(&pool, node_id).await?;
+                match remote_answer(remote.ask(&op).await) {
+                    Err(err) if matches!(err.verdict(), RemoteVerdict::SchemaRequired) => {
+                        let Some(schema) = established.as_deref() else {
+                            return Err(err);
+                        };
+                        let Some(resend) = with_schema_body(&op, schema) else {
+                            return Err(err);
+                        };
+                        debug!(
+                            %node_id,
+                            "Peer holds no schema for this index; resending the write with the schema"
+                        );
+                        remote_answer(remote.ask(&resend).await)
+                    }
+                    other => other,
                 }
-                other => other,
-            }
-        })
-        .await
+            })
+            .await
+        }))
+    }
+
+    /// The borrowed bulk view's owned twin, for a fan-out that runs off the mailbox.
+    pub(super) fn owned_bulk_view(&self) -> OwnedBulkView {
+        OwnedBulkView {
+            shards: self
+                .engine
+                .as_ref()
+                .map(|engine| engine.shards.load_full())
+                .unwrap_or_else(|| Arc::new(self.shards.clone())),
+            ring: self.shared_routing_ring.load_full(),
+            coordinator: self.coordinator.clone(),
+            pool: self.remote_peer_pool.clone(),
+        }
     }
 
     /// Write many documents in one request — the slow half of the bulk-write path.
@@ -5205,7 +5376,8 @@ impl NodeOrchestrator {
         forwarded: bool,
         schema_body: Option<Box<IndexSchema>>,
         tenant: Option<&str>,
-    ) -> Result<JsonValue, OrchestratorError> {
+        settled: Option<PeerSchemaLookup>,
+    ) -> Result<Answer, OrchestratorError> {
         let start = std::time::Instant::now();
         if self.shards.is_empty() {
             return Err(OrchestratorError::NotReady("No shards".to_string()));
@@ -5229,6 +5401,7 @@ impl NodeOrchestrator {
                 forwarded,
                 schema_body.as_deref(),
                 tenant,
+                settled,
             )
             .await?;
 
@@ -5280,16 +5453,30 @@ impl NodeOrchestrator {
             .collect();
 
         // From here the body is the one the worker lane runs too — same grouping, same one-hop
-        // bound, same accounting — so it is written once, against the borrowed view `BulkCtx`
-        // names.
-        let ctx = BulkCtx {
-            shards: &self.shards,
-            ring: &self.routing_ring,
-            coordinator: self.coordinator.as_ref(),
-            remote_peer_pool: self.remote_peer_pool.as_deref(),
-        };
-        ctx.apply_bulk_write(index, pending, rejections, &schema_mut, forwarded, start)
-            .await
+        // bound, same accounting — so it is written once, against the view `BulkCtx` names.
+        //
+        // A share forwarded here goes no further and is served in place. A first hop forwards
+        // its remote shares to their owners, so everything past the schema — the part that
+        // needed this actor — goes off the mailbox: see `Answer`.
+        if forwarded {
+            let ctx = BulkCtx {
+                shards: &self.shards,
+                ring: &self.routing_ring,
+                coordinator: self.coordinator.as_ref(),
+                remote_peer_pool: self.remote_peer_pool.as_deref(),
+            };
+            return Ok(Answer::Now(
+                ctx.apply_bulk_write(index, pending, rejections, &schema_mut, forwarded, start)
+                    .await,
+            ));
+        }
+        let view = self.owned_bulk_view();
+        let index = index.to_string();
+        Ok(Answer::Later(Box::pin(async move {
+            view.ctx()
+                .apply_bulk_write(&index, pending, rejections, &schema_mut, forwarded, start)
+                .await
+        })))
     }
 
     /// Helper method to group local documents by shard
@@ -6063,6 +6250,64 @@ impl NodeOrchestrator {
         self.schema_cache.durable(&self.shards, index).await
     }
 
+    /// This node's own schema for `index`, for a peer's canvass — see [`ClientOp::GetRawSchema`].
+    ///
+    /// Read from durable state, not from the lazily-filled cache: this answer is what a peer
+    /// uses to decide whether it may invent a schema, so "I have not looked yet" must not be
+    /// reported as "there is none". See `durable_schema`.
+    async fn raw_schema_for_peer(&self, index: String) -> Result<JsonValue, OrchestratorError> {
+        match self.durable_schema(&index).await? {
+            Some(schema) => serde_json::to_value(&*schema)
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e))),
+            // Minting it now, and not saved yet. "None" would be false in the way that
+            // matters: the asker is canvassing to decide whether it may sample a schema of
+            // its own, and two nodes that each heard "none" mint two schemas for one index.
+            // An error counts as unreachable at the asker, which refuses with a retryable
+            // 503 — what it did before the canvass left the mailbox, when this question
+            // simply waited out its timeout behind the mint. Now it is refused at once.
+            None if self.minting.contains_key(&index) => {
+                Err(OrchestratorError::SchemaUnconfirmed {
+                    index,
+                    reason: format!(
+                        "node {} is creating this index's schema right now",
+                        self.identity.uuid
+                    ),
+                })
+            }
+            None => Ok(JsonValue::Null),
+        }
+    }
+
+    /// The index a write would have to canvass the peers for, if it would.
+    ///
+    /// A clustered first hop — not forwarded, carrying no schema — to an index this node holds
+    /// no live schema for: exactly the writes whose staged validation would ask every peer
+    /// before deciding. A forwarded share never canvasses (it asks its sender instead), and a
+    /// standalone node's canvass asks nobody, so neither is worth a trip out of the mailbox.
+    pub(super) async fn mint_canvass_needed(&self, op: &ClientOp) -> Option<String> {
+        if !self.config.clustered {
+            return None;
+        }
+        let index = match op {
+            ClientOp::Write {
+                index,
+                forwarded: false,
+                schema_body: None,
+                ..
+            }
+            | ClientOp::BulkWrite {
+                index,
+                forwarded: false,
+                schema_body: None,
+                ..
+            } => index,
+            _ => return None,
+        };
+        let schema = self.load_schema(index).await.ok()?;
+        (schema.fields.is_empty() || schema.state == storage::SchemaState::Dropped)
+            .then(|| index.clone())
+    }
+
     /// Helper: Load schema from first shard, empty when this node holds none —
     /// [`SchemaCache::schema_for`] against the actor's own shard map.
     pub(super) async fn load_schema(
@@ -6075,25 +6320,160 @@ impl NodeOrchestrator {
 
 #[remote_message("cameo.orchestrator.client_op")]
 impl Message<ClientOp> for NodeOrchestrator {
-    type Reply = Result<JsonValue, OrchestratorError>;
+    /// Delegated so that an op whose answer waits on peers can release the mailbox while it
+    /// waits — see [`NodeOrchestrator::mint_canvass_needed`]. Every other op is answered before
+    /// `handle` returns, exactly as it was. The value on the wire is the same
+    /// `Result<JsonValue, OrchestratorError>` either way, so peers of any version read it.
+    type Reply = DelegatedReply<Result<JsonValue, OrchestratorError>>;
 
-    async fn handle(
-        &mut self,
-        msg: ClientOp,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
+    async fn handle(&mut self, msg: ClientOp, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         // Dequeue-to-answer for the mailbox lane: this actor is serialised, so nothing else is
         // running inside this span and it holds no queue wait. The gate in `RouterActor`
         // predicts against what is folded here.
         let class = OpClass::of(&msg);
         let started = Instant::now();
-        let result = match msg {
+
+        if let Some(index) = self.mint_canvass_needed(&msg).await {
+            let (delegated, reply) = ctx.reply_sender();
+            *self.minting.entry(index.clone()).or_default() += 1;
+            let canvass = self.schema_canvass();
+            let orchestrator = ctx.actor_ref().downgrade();
+            tokio::spawn(async move {
+                let lookup = canvass.peer_schema_for(&index).await;
+                let answer = match orchestrator.upgrade() {
+                    Some(orchestrator) => orchestrator
+                        .ask(MintAfterCanvass {
+                            index,
+                            op: msg,
+                            lookup,
+                        })
+                        .await
+                        .map_err(|err| {
+                            OrchestratorError::NotReady(format!(
+                                "the orchestrator stopped before the write could run: {err}"
+                            ))
+                        }),
+                    None => Err(OrchestratorError::NotReady(
+                        "the orchestrator stopped before the write could run".to_string(),
+                    )),
+                };
+                // The mint's own forwards, if it had any, run here too — still off the mailbox.
+                let result = match answer {
+                    Ok(answer) => answer.resolve().await,
+                    Err(err) => Err(err),
+                };
+                if let Some(reply) = reply {
+                    reply.send(result);
+                }
+            });
+            self.mailbox_lane.record_service(class, started.elapsed());
+            return delegated;
+        }
+
+        let answer = match msg {
             ClientOp::DeleteIndex {
                 index,
                 delete_schema,
-            } => self.orch_delete_index(&index, delete_schema).await,
+            } => Answer::Now(self.orch_delete_index(&index, delete_schema).await),
             other => self.handle_client_op(other).await,
         };
+        self.mailbox_lane.record_service(class, started.elapsed());
+        match answer {
+            Answer::Now(result) => ctx.reply(result),
+            // The rest waits on a peer, so it runs in a task and this mailbox moves on.
+            Answer::Later(rest) => {
+                let (delegated, reply) = ctx.reply_sender();
+                tokio::spawn(async move {
+                    let result = rest.await;
+                    if let Some(reply) = reply {
+                        reply.send(result);
+                    }
+                });
+                delegated
+            }
+        }
+    }
+}
+
+/// A first write to a new index, back in the mailbox with its canvass answered.
+///
+/// The canvass asks every peer, and each peer answers through its own orchestrator mailbox.
+/// Run inside this mailbox it held it for as long as the peers took, and a peer canvassing this
+/// node at the same moment — minting another index — waited on it in turn, until both timed
+/// out and refused: new indexes created through every node at once were measured at 0.1/s,
+/// most refused. So the canvass runs in a task, and only deciding and saving the schema — the
+/// part that needs this actor — comes back here, in order with everything else.
+///
+/// Local only: sent by this node to itself, never over the wire.
+pub(super) struct MintAfterCanvass {
+    index: String,
+    op: ClientOp,
+    lookup: PeerSchemaLookup,
+}
+
+impl Message<MintAfterCanvass> for NodeOrchestrator {
+    /// The write's answer, or its forwards still to run — which the task that sent this runs,
+    /// so they do not hold the mailbox either.
+    type Reply = Answer;
+
+    async fn handle(
+        &mut self,
+        msg: MintAfterCanvass,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let class = OpClass::of(&msg.op);
+        let started = Instant::now();
+        // The schema may have been saved while the canvass ran — by another write to the same
+        // index here, or adopted from a forwarded share. Staged validation reads it again and
+        // then treats this write as an addition rather than a mint, and the canvass goes unused.
+        let result = match msg.op {
+            ClientOp::Write {
+                index,
+                id,
+                routing_key,
+                doc,
+                forwarded,
+                schema_body,
+                tenant,
+            } => self
+                .orch_write(
+                    &index,
+                    id,
+                    routing_key,
+                    doc,
+                    forwarded,
+                    schema_body,
+                    tenant.as_deref(),
+                    Some(msg.lookup),
+                )
+                .await
+                .into(),
+            ClientOp::BulkWrite {
+                index,
+                docs,
+                forwarded,
+                schema_body,
+                tenant,
+            } => self
+                .orch_bulk_write(
+                    &index,
+                    docs,
+                    forwarded,
+                    schema_body,
+                    tenant.as_deref(),
+                    Some(msg.lookup),
+                )
+                .await
+                .into(),
+            // `mint_canvass_needed` sends only the two ops above; anything else runs as usual.
+            other => self.handle_client_op(other).await,
+        };
+        if let Some(count) = self.minting.get_mut(&msg.index) {
+            *count -= 1;
+            if *count == 0 {
+                self.minting.remove(&msg.index);
+            }
+        }
         self.mailbox_lane.record_service(class, started.elapsed());
         result
     }

@@ -6,6 +6,9 @@
 #   storm       new-index writes and index deletes on every node at once leave every node
 #               answering — the load that once deadlocked orchestrator and coordinator mailboxes
 #               across nodes (OB19)
+#   cross-node  requests through every node at once, as behind a load balancer: new indexes
+#               minted on every node by single and by bulk writes, and bulk writes whose shares
+#               cross between every pair of nodes; no request fails or stalls, and every node answers afterwards
 #   restart     two of three nodes restarted together rejoin, converge and serve, and no
 #               committed document is lost
 #   frozen peer node3 paused: node1 keeps answering, and after it resumes the ring converges,
@@ -37,6 +40,8 @@ STORM_DELETERS="${CLUSTER_STORM_DELETERS:-1}"
 IDLE_SECS="${CLUSTER_IDLE_SECS:-60}"
 ROUNDS="${CLUSTER_RESTART_ROUNDS:-3}"
 FREEZE_SECS="${CLUSTER_FREEZE_SECS:-60}"
+CROSS_SECS="${CLUSTER_CROSS_SECS:-20}"
+CROSS_WRITERS="${CLUSTER_CROSS_WRITERS:-2}"
 SURVIVORS=30
 PROJECT="cameodb-validate"
 WORK=""
@@ -248,6 +253,20 @@ sleep "$IDLE_SECS"
 check_cmd "every node writes and deletes after ${IDLE_SECS}s idle" probe probe 30
 check_cmd "the ring is still converged after the storm" probe converge 10
 check_cmd "no node was declared lost for answering pings late under the storm" probe pings-clean
+
+section "cross-node (${CROSS_SECS}s each, $CROSS_WRITERS writers per node, every node at once)"
+# The storm mints every index on one node (its writes all carry id "a"), and the frozen-peer
+# phase writes through node1 alone, so neither makes two nodes wait on each other. These do.
+check_cmd "new indexes minted on every node at once: none refused or stalled" \
+    probe mints "$CROSS_SECS" "$CROSS_WRITERS"
+check_cmd "bulk index written through one node" probe seed crossbulk 3
+check_cmd "bulk index answers fast through every node" probe warm crossbulk
+check_cmd "bulk writes through every node at once: none refused or stalled" \
+    probe bulks "$CROSS_SECS" "$CROSS_WRITERS" crossbulk
+check_cmd "new indexes minted by bulk writes through every node at once: none refused or stalled" \
+    probe bulkmints "$CROSS_SECS" "$CROSS_WRITERS"
+check_cmd "every node writes and deletes right after the cross-node load" probe probe 30
+check_cmd "the ring is still converged after the cross-node load" probe converge 10
 
 section "restart (node2 and node3 together, $ROUNDS rounds)"
 check_cmd "seed documents written" probe seed survivor "$SURVIVORS"

@@ -224,12 +224,6 @@ pub(super) async fn bulk_delete_handler(
 
     check_write_rate(&state, &caller_of(caller), docs.len())?;
 
-    // The first id keeps the request unicast where the whole batch belongs to one shard, which
-    // is the common case; anything else is grouped and forwarded by the orchestrator.
-    let routing_hint = docs
-        .first()
-        .map(|first| first.routing_key().unwrap_or(first.id()).to_string());
-
     let client_op = ClientOp::BulkDelete {
         index,
         docs,
@@ -239,7 +233,8 @@ pub(super) async fn bulk_delete_handler(
 
     let result = state
         .router
-        .route_and_handle(client_op, routing_hint, OperationType::Write)
+        // No key: a bulk op runs where it was received — see `route_and_handle_inner`.
+        .route_and_handle(client_op, None, OperationType::Write)
         .await
         .map_err(AppError::from_route)?;
     Ok(Json(result))
@@ -262,11 +257,6 @@ pub(super) async fn bulk_write_handler(
     check_write_rate(&state, &caller_of(caller), docs.len())?;
     let tenant = tenant_of(authz);
 
-    // Derive a routing hint from the first document to avoid a cluster-wide broadcast. The
-    // schema is not resolved yet at this layer, so this climbs the same ladder the orchestrator
-    // does from the rung below its routing field.
-    let routing_hint = derive_routing_hint(&docs);
-
     let client_op = ClientOp::BulkWrite {
         index,
         docs,
@@ -278,7 +268,8 @@ pub(super) async fn bulk_write_handler(
 
     let result = state
         .router
-        .route_and_handle(client_op, routing_hint, OperationType::Write)
+        // No key: a bulk op runs where it was received — see `route_and_handle_inner`.
+        .route_and_handle(client_op, None, OperationType::Write)
         .await
         .map_err(AppError::from_route)?;
 
@@ -709,19 +700,6 @@ async fn flush_lines(
     }
 }
 
-/// Derive a routing hint from the first document in a batch.
-///
-/// Rungs 2–4 of the routing ladder, via
-/// [`routing_key_without_schema`](crate::node::routing_key_without_schema): rung 1 is the
-/// schema's own routing field, and the schema has not been resolved this early. Shares the
-/// orchestrator's derivation rather than restating it: the two had drifted onto different hashes
-/// of different byte ranges, so a hint could disagree with the key it stood in for.
-fn derive_routing_hint(docs: &[DocPayload]) -> Option<String> {
-    docs.first().and_then(|doc| {
-        crate::node::routing_key_without_schema(doc.routing_key.clone(), &doc.id, &doc.doc)
-    })
-}
-
 /// Dispatch a single micro-batch of documents through the routing layer.
 pub(super) async fn flush_write_batch(
     state: &AppState,
@@ -729,7 +707,6 @@ pub(super) async fn flush_write_batch(
     docs: Vec<DocPayload>,
     tenant: Option<&str>,
 ) -> Result<JsonValue, crate::node::OrchestratorError> {
-    let routing_hint = derive_routing_hint(&docs);
     let client_op = ClientOp::BulkWrite {
         index: index.to_string(),
         docs,
@@ -739,6 +716,7 @@ pub(super) async fn flush_write_batch(
     };
     state
         .router
-        .route_and_handle(client_op, routing_hint, OperationType::Write)
+        // No key: a bulk op runs where it was received — see `route_and_handle_inner`.
+        .route_and_handle(client_op, None, OperationType::Write)
         .await
 }

@@ -97,6 +97,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports it, and the node keeps redialing it — including when other peers are still connected.
   Its shards stay assigned. Those `503`s are logged at `DEBUG`, not one `ERROR` each.
 
+- **Bulk writes sent through every node at once no longer stall for 60 s.** A bulk batch was
+  routed as a whole by its first document's key, so behind a load balancer two batches in three
+  were shipped to another node and ran inside its orchestrator mailbox, forwarding the other
+  shares from there. Two nodes doing that at once waited on each other's mailboxes until the
+  peer timeout: every batch in the suite's cross-node run answered `408` after 60 s. A bulk
+  write or delete now runs on the node that received it, which splits it by document anyway —
+  10,197 batches in 20 s, p50 0.01 s, none failed.
+
+- **New indexes can be created through every node at once.** A first write to a new index
+  canvasses every peer for a schema, and each peer answers through its orchestrator mailbox.
+  The canvass ran inside the asking node's mailbox, so two nodes minting at once — or one minting
+  while another looked an index up to delete it — waited on each other until the 5 s timeout and
+  refused. New indexes created through every node were measured at 0.1/s with most refused, and
+  index deletes during the storm at 13 refusals in 16. The canvass now runs off the mailbox and
+  only deciding and saving the schema comes back to it; the delete's lookup runs on a worker.
+  While a node is minting an index, a peer asking for it is told so at once, which refuses the
+  peer's own mint rather than letting two nodes invent two schemas. Measured: 134 new indexes/s
+  through every node and 74/s under the storm, p50 0.04–0.08 s, none refused.
+
+- **An orchestrator no longer waits on a peer while holding its mailbox.** After deciding a
+  schema it forwarded a write, a delete or a bulk batch's shares from inside the mailbox, so a
+  first bulk write to a new index through every node — each node minting, then forwarding —
+  stalled the same way: 12 of 12 refused or timed out. The forward now runs in a task that
+  answers the caller when the peer does. 354 such batches in 20 s, p50 0.33 s, none failed.
+
 - **A refused request no longer costs a log line, and single-write overload no longer halves
   goodput.** Every `503` was logged at `ERROR` — twice, by the trace layer and by the error
   handler — synchronously on the runtime the write path shares. A default node filters at

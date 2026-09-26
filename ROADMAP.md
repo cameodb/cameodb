@@ -180,6 +180,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB16](#ob16--closing-an-index-from-another-thread-lost-the-writes-in-flight-on-it) … [OB19](#ob19--two-clustered-deadlocks-through-the-coordinators-mailbox) | **The pre-release concurrency audit** — eviction from another thread lost in-flight writes from search (464 of 600 in the test), schema edits and evolution overwrote each other, streaming search ran outside the concurrency limit, and two clustered mailbox deadlocks. All fixed and, where a test can force it, pinned | — | 2026-09-26 | ✅ |
 | [OB20](#ob20--a-fresh-cluster-can-keep-a-partial-ring-and-nothing-repairs-it) | **A fresh cluster can keep a partial ring** — 4 of 5 simultaneous starts left one node without a peer's shards (or alone), and nothing re-synced. Fixed with one connection per peer, a seed redial, and a 10 s shard-map pull; 5 of 5 now converge. Found by the new `cluster` validation suite | — | 2026-09-26 | ✅ |
 | [OB21](#ob21--a-peer-that-stops-answering-detected-refused-at-once-and-bounded-while-it-lasts) | **A peer that stops answering** — orchestrator forwards now share one deadline, stale peer references go on the first failure, and topology can no longer drop the newest ring. Also fixed: a kameo panic at shutdown (5.5), and a frozen peer is detected by ping within ~40 s, after which requests for it are answered at once (5.4) | — | 2026-09-26 | ✅ |
+| [OB22](#ob22--an-orchestrator-waited-on-peers-while-holding-its-mailbox) | **An orchestrator waited on peers while holding its mailbox** — schema canvasses and forwards ran inside it, so two nodes doing either at once waited on each other until a 5 s or 60 s timeout: bulk writes through every node all timed out, and new indexes created through every node ran at 0.1/s, most refused. Fixed; now 510 batches/s and 134 new indexes/s, none failed. Found by the cluster suite's new cross-node phase | — | 2026-09-26 | ✅ |
 | [F9](#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
@@ -3100,6 +3101,52 @@ Two things skewed early runs and are worth knowing before reading any cluster nu
 sleeping mid-run (the suite now holds the Mac awake with `caffeinate`), and a fault landing
 while a restarted node was still canvassing peers for a schema — the suite now warms the index
 through every node first.
+
+### OB22 — An orchestrator waited on peers while holding its mailbox
+
+✅ **Found and fixed 2026-09-26.** The cluster suite gained a cross-node phase that sends requests
+through all three nodes at once, as a load balancer does. Until then no phase made two nodes wait
+on each other: the storm's writes all carry id `a`, so every index was minted on the one node that
+owns that key, and the frozen-peer phase writes through node1 alone.
+
+**The shape.** The orchestrator's mailbox runs one message at a time, and every request from a
+peer lands in it. Four paths asked a peer from inside that mailbox and waited for the answer:
+the schema canvass on a first write to a new index, the same canvass when an index delete looks
+up a name this node does not hold, a forward of a write or delete whose shard is elsewhere, and
+a bulk batch's shares. Two nodes on any of those paths at once each waited on the other's
+mailbox until the canvass timeout (5 s) or the peer timeout (60 s), with everything queued
+behind them — work that kept running for minutes after its clients had given up.
+
+**Fixed.** (1) A bulk write or delete runs on the node that received it. It was routed whole by
+its first document's key, which shipped two batches in three to another node's mailbox, where
+the fan-out ran. The fan-out splits by document, so no route for the whole batch saves a hop.
+(2) The index delete's lookup (`FindSchemaInCluster`) runs on a worker; the canvass it shares
+with the write path is `SchemaCanvass`, which holds nothing of the actor. (3) A first write's
+canvass runs in a task, and the op comes back to the mailbox as `MintAfterCanvass` to decide and
+save the schema; the `ClientOp` reply is a kameo `DelegatedReply`, so the answer on the wire is
+unchanged. While an index is being minted, `GetRawSchema` for it answers an error rather than
+`null`: the asker refuses its own mint (retryable `503`) instead of inventing a second schema,
+which is what the timeout used to do by accident. (4) Every forward — `forward_later`, and a
+first-hop bulk's fan-out over an owned snapshot of the shard map and ring — is handed back as
+`Answer::Later` and runs in a task.
+
+**Measured** — `scripts/validate/cluster.sh`, 3 nodes, 20 s per cross-node load and 60 s of storm,
+2 writers per node:
+
+| | before | after |
+|---|---|---|
+| bulk writes through every node, index held by all | 6 batches, all `408` at 60 s | **10,197**, p50 0.01 s, max 0.18 s |
+| new indexes, varied ids, through every node | 14, 0.1/s, 11 × `503`, p50 10 s | **2,687**, 134/s, p50 0.04 s |
+| new indexes by bulk writes, through every node | 12, all `408` or `503` (measured with (1)–(3) in place) | **354**, 17.7/s, p50 0.33 s |
+| storm: new-index writes | 47, 0.75/s, p50 10.08 s | **4,425**, 73.8/s, p50 0.08 s |
+| storm: index deletes | 16, 13 × `503` and 2 timeouts | **1,195**, 19.9/s, p50 0.07 s, none refused |
+| suite | 31 of 33 | **34 of 34**, `ERROR` 0 on every node |
+
+**Not changed.** Two nodes creating the *same* index at the same moment still refuse each other
+with a retryable `503`, now at once rather than after 5 s; a tie-break that lets one of them win
+is the next step. A forwarded share, and a single write the router sent to its owner, still run
+inside the receiving node's mailbox — they wait on no peer, so they cannot deadlock, but they are
+served one at a time, which is most of a bulk mint's 0.33 s.
 
 ### F9 — Commit on a clock, not a count
 

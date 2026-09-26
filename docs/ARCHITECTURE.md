@@ -516,12 +516,15 @@ Bulk writes are the most complex path: documents are routed individually, then g
 HTTP POST /api/{index}/_bulk
   │
   ▼
-RouterActor::route_and_handle(routing_hint=first_doc.id)
+RouterActor::route_and_handle(no routing key)
   │
-  ▼ Routed to one node (usually local for the first doc)
+  ▼ Always runs on the node that received it: the fan-out below splits the batch by
+  │ document, so no route for the whole batch saves a hop (OB22)
   │
   ▼
-NodeOrchestrator::orch_bulk_write(index, docs[])
+worker pool (engine_bulk_write) — or, when the batch must mint or grow the schema,
+NodeOrchestrator::orch_bulk_write(index, docs[]), which settles the schema in the
+mailbox and runs steps 3–6 in a task, off the mailbox
   │
   ├── 1. Schema Resolution
   │     └── Fingerprint cache → shard fallback

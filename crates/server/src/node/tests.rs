@@ -13,6 +13,7 @@ use storage::{FieldDef, HybridStore, IndexSchema, StorageConfig, StoreError, Tan
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use super::routing::routing_key_without_schema;
 use super::*;
 use serde_json::json;
 
@@ -463,6 +464,11 @@ fn bare_engine() -> OrchestratorEngine {
         default_search_limit: 10,
         max_concurrent_shard_searches: 4,
         remote_peer_pool: Arc::new(RemotePeerPool::new()),
+        canvass: SchemaCanvass {
+            clustered: false,
+            coordinator: None,
+            pool: None,
+        },
     }
 }
 
@@ -866,12 +872,11 @@ fn an_empty_window_leaves_the_estimate_alone() {
     assert_eq!(hist.estimate_us(), 0, "and nothing is cached from it");
 }
 
-/// The HTTP layer picks a *node* before any schema is resolved, so it climbs the same
-/// ladder from one rung lower. The two used to be written out separately and had drifted
-/// onto different hashes of different byte ranges — so a hint and the key it stood in for
-/// could disagree, and the request would take a forwarding hop it did not need.
+/// Without a routing field in the schema, the key is exactly the schema-free ladder. That
+/// ladder once had a second copy in the HTTP layer's bulk hint, and the two had drifted onto
+/// different hashes of different byte ranges; the hint is gone, and the ladder is still one.
 #[test]
-fn a_routing_hint_agrees_with_the_key_it_stands_in_for() {
+fn without_a_routing_field_the_key_is_the_schema_free_ladder() {
     // No routing field, so `effective_routing_key` falls straight through.
     let schema = IndexSchema::default();
     let doc = json!({"title": "Dune", "author": "Herbert"});
@@ -882,7 +887,7 @@ fn a_routing_hint_agrees_with_the_key_it_stands_in_for() {
         assert_eq!(
             effective_routing_key(&schema, id, caller.clone(), &doc),
             routing_key_without_schema(caller.clone(), id, &doc),
-            "hint and key disagree for id={id:?} caller={caller:?}"
+            "the key left the schema-free ladder for id={id:?} caller={caller:?}"
         );
     }
 }
@@ -2045,14 +2050,15 @@ async fn a_metadata_op_defers_rather_than_failing() {
     );
 }
 
-/// The cluster-wide schema lookup has to reach the actor, not a worker.
+/// The cluster-wide schema lookup is answered by a worker, never handed to the actor.
 ///
-/// It answers by canvassing peers, which needs the coordinator and the remote peer pool —
-/// state the worker pool does not hold. A worker that served it would answer from this
-/// node's store alone and report `null` for an index a peer holds, which is the same wrong
-/// answer that made `DELETE` through a non-holding node a 404.
+/// It canvasses peers, and each peer answers through its own orchestrator mailbox. On this
+/// node's mailbox the canvass held it while waiting, so a peer canvassing this node at the same
+/// moment waited too, until both timed out: index deletes answered 503 whenever new indexes
+/// were being minted elsewhere. A standalone engine holding nothing answers `null` — the index
+/// does not exist — without asking anyone.
 #[tokio::test]
-async fn the_cluster_schema_lookup_defers_to_the_actor() {
+async fn the_cluster_schema_lookup_is_answered_by_the_worker() {
     let engine = bare_engine();
 
     let outcome = engine
@@ -2061,10 +2067,13 @@ async fn the_cluster_schema_lookup_defers_to_the_actor() {
         })
         .await;
 
-    assert!(
-        matches!(outcome, WorkerOutcome::UseActor(op) if matches!(*op, ClientOp::FindSchemaInCluster { .. })),
-        "the cluster schema lookup must be deferred to the actor, carrying its own op"
-    );
+    match outcome {
+        WorkerOutcome::Done(Ok(answer)) => assert!(answer.is_null(), "got {answer}"),
+        WorkerOutcome::Done(Err(err)) => panic!("expected null, got {err:?}"),
+        WorkerOutcome::UseActor(_) => {
+            panic!("the cluster schema lookup must not be deferred to the actor")
+        }
+    }
 }
 
 /// The index listing is a metadata read — shard stats asked on a clone, one schema per
@@ -3415,4 +3424,168 @@ async fn a_stream_abandons_a_client_that_stops_reading() {
         !RouterActor::send_or_abandon(&tx, line(), Duration::from_secs(30)).await,
         "a client that has gone is noticed without waiting"
     );
+}
+
+/// A clustered orchestrator with no shards, in a directory of its own.
+async fn clustered_orchestrator(dir: &std::path::Path) -> NodeOrchestrator {
+    let config = NodeConfig {
+        storage_path: dir.to_path_buf(),
+        clustered: true,
+        ..NodeConfig::default()
+    };
+    NodeOrchestrator::new(config, NodeIdentity::new(), 10, 4)
+        .await
+        .expect("an orchestrator with no shards")
+}
+
+fn first_write(index: &str) -> ClientOp {
+    ClientOp::Write {
+        index: index.to_string(),
+        id: "d1".to_string(),
+        routing_key: None,
+        doc: json!({"title": "Dune"}),
+        forwarded: false,
+        schema_body: None,
+        tenant: None,
+    }
+}
+
+/// While this node is minting an index's schema, a peer asking for it is told so — never "none".
+///
+/// The asker is canvassing to decide whether it may sample a schema of its own. Before the
+/// canvass left the mailbox this question waited behind the mint until it timed out, and the
+/// asker refused; answered "none" instead, it would mint a second schema for the same index.
+/// An error is what makes it refuse, and now it hears it at once.
+#[tokio::test]
+async fn a_schema_being_minted_is_not_reported_absent() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut orchestrator = clustered_orchestrator(dir.path()).await;
+    let ask = || ClientOp::GetRawSchema {
+        index: "books".to_string(),
+    };
+
+    let before = orchestrator.handle_client_op(ask()).await.resolve().await;
+    assert!(
+        matches!(&before, Ok(JsonValue::Null)),
+        "nothing held and nothing minting is plainly absent, got {before:?}"
+    );
+
+    orchestrator.minting.insert("books".to_string(), 1);
+    let during = orchestrator.handle_client_op(ask()).await.resolve().await;
+    assert!(
+        matches!(&during, Err(OrchestratorError::SchemaUnconfirmed { index, .. }) if index == "books"),
+        "an index being minted must not read as absent, got {during:?}"
+    );
+
+    let other = orchestrator
+        .handle_client_op(ClientOp::GetRawSchema {
+            index: "films".to_string(),
+        })
+        .await
+        .resolve()
+        .await;
+    assert!(
+        matches!(&other, Ok(JsonValue::Null)),
+        "only the index being minted is affected, got {other:?}"
+    );
+}
+
+/// Only a clustered first write to an index with no schema leaves the mailbox to canvass.
+///
+/// A forwarded share asks its sender rather than the cluster, a write carrying a schema body
+/// has its answer with it, and a standalone node's canvass asks nobody — none of them waits on
+/// a peer, so none is worth the trip out and back.
+#[tokio::test]
+async fn only_a_clustered_first_write_canvasses_outside_the_mailbox() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let orchestrator = clustered_orchestrator(dir.path()).await;
+
+    assert_eq!(
+        orchestrator
+            .mint_canvass_needed(&first_write("books"))
+            .await,
+        Some("books".to_string())
+    );
+    let bulk = ClientOp::BulkWrite {
+        index: "books".to_string(),
+        docs: Vec::new(),
+        forwarded: false,
+        schema_body: None,
+        tenant: None,
+    };
+    assert_eq!(
+        orchestrator.mint_canvass_needed(&bulk).await,
+        Some("books".to_string())
+    );
+
+    let mut forwarded = first_write("books");
+    if let ClientOp::Write { forwarded: f, .. } = &mut forwarded {
+        *f = true;
+    }
+    assert_eq!(orchestrator.mint_canvass_needed(&forwarded).await, None);
+
+    let mut carried = first_write("books");
+    if let ClientOp::Write { schema_body, .. } = &mut carried {
+        let mut schema = IndexSchema::default();
+        schema.fields.insert(
+            "title".to_string(),
+            FieldDef::new("title".to_string(), TantivyFieldType::Text),
+        );
+        *schema_body = Some(Box::new(schema));
+    }
+    assert_eq!(orchestrator.mint_canvass_needed(&carried).await, None);
+
+    let read = ClientOp::GetRawSchema {
+        index: "books".to_string(),
+    };
+    assert_eq!(orchestrator.mint_canvass_needed(&read).await, None);
+
+    let standalone_dir = tempfile::tempdir().expect("temp dir");
+    let standalone = NodeOrchestrator::new(
+        NodeConfig {
+            storage_path: standalone_dir.path().to_path_buf(),
+            ..NodeConfig::default()
+        },
+        NodeIdentity::new(),
+        10,
+        4,
+    )
+    .await
+    .expect("an orchestrator with no shards");
+    assert_eq!(
+        standalone.mint_canvass_needed(&first_write("books")).await,
+        None
+    );
+}
+
+/// A forward to a peer is handed back to run off the mailbox, never awaited inside it.
+///
+/// Awaited inside, two nodes forwarding to each other at once each waited on the other's
+/// mailbox until the 60 s peer timeout — every bulk write sent through all three nodes at once
+/// stalled. The one-hop bound is kept, and still answers at once: a node that was itself
+/// forwarded to refuses rather than forwarding on.
+#[tokio::test]
+async fn a_forward_runs_off_the_mailbox() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let orchestrator = clustered_orchestrator(dir.path()).await;
+    let target = Uuid::new_v4();
+    let delete = |forwarded| ClientOp::Delete {
+        index: "books".to_string(),
+        id: "d1".to_string(),
+        routing_key: None,
+        forwarded,
+    };
+
+    assert!(
+        matches!(
+            orchestrator.forward_later(target, false, delete(true), None),
+            Answer::Later(_)
+        ),
+        "a first hop's forward must be deferred"
+    );
+    match orchestrator.forward_later(target, true, delete(true), None) {
+        Answer::Now(Err(err)) => assert!(err.to_string().contains("disagree about who owns it")),
+        Answer::Now(Ok(v)) => panic!("a second hop must be refused, got {v}"),
+        Answer::Later(_) => panic!("a second hop is refused at once, not deferred"),
+    }
 }
