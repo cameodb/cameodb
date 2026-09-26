@@ -89,6 +89,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     export CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt; \
     export CARGO_HTTP_CHECK_REVOKE=false; \
     export PKG_CONFIG_ALLOW_CROSS=1; \
+    # /src/target is a cache shared by every build on this builder, and cargo judges a crate
+    # fresh by mtime, which COPY preserves. A build of older sources that ran later leaves
+    # artifacts newer than these files, and cargo then links them — an image of code that is
+    # not in this tree. Touching the workspace sources recompiles our crates every time; the
+    # registry dependencies stay cached.
+    find /src/crates -type f -exec touch {} +; \
     TARGET_TRIPLE=""; \
     if [ "${TARGET_ABI}" = "musl" ]; then \
         export OPENSSL_STATIC=1; \

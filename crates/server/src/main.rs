@@ -572,6 +572,7 @@ async fn main() -> Result<()> {
         } else {
             tracing::info!(name = %coordinator_remote_name, "Registered coordinator for remote access");
         }
+        crate::cluster_coordinator::spawn_shard_map_sync(&coordinator_actor, node_id);
     } else if !cluster_enabled {
         tracing::info!("Cluster disabled, skipping coordinator remote registration");
     } else {

@@ -178,7 +178,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) | **A timed-out request never leaves the worker pool** — a `DashMap` self-deadlock in `should_commit_writer` parked every shard writer thread past a 30s TTL. Found by the first [M6](#m6--close-and-re-measure-the-bulk-lane) arm, fixed and pinned the same day | — | 2026-09-25 | ✅ |
 | [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput) | **Every refused request was an `ERROR` line** — synchronous on the write path's runtime, it halved single-write goodput under overload and failed health. Refusals are now counted into one periodic summary. Found by the M6 single-write arm, fixed the same day | — | 2026-09-25 | ✅ |
 | [OB16](#ob16--closing-an-index-from-another-thread-lost-the-writes-in-flight-on-it) … [OB19](#ob19--two-clustered-deadlocks-through-the-coordinators-mailbox) | **The pre-release concurrency audit** — eviction from another thread lost in-flight writes from search (464 of 600 in the test), schema edits and evolution overwrote each other, streaming search ran outside the concurrency limit, and two clustered mailbox deadlocks. All fixed and, where a test can force it, pinned | — | 2026-09-26 | ✅ |
-| [OB20](#ob20--a-fresh-cluster-can-keep-a-partial-ring-and-nothing-repairs-it) | **A fresh cluster can keep a partial ring** — 4 of 5 simultaneous starts left one node without a peer's shards (or alone), and nothing re-syncs: the stable-phase exchange never pushes, and seeds are dialed once. Found by the new `cluster` validation suite | — | 2026-09-26 | 📋 |
+| [OB20](#ob20--a-fresh-cluster-can-keep-a-partial-ring-and-nothing-repairs-it) | **A fresh cluster can keep a partial ring** — 4 of 5 simultaneous starts left one node without a peer's shards (or alone), and nothing re-synced. Fixed with one connection per peer, a seed redial, and a 10 s shard-map pull; 5 of 5 now converge. Found by the new `cluster` validation suite | — | 2026-09-26 | ✅ |
 | [F9](#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
@@ -2976,11 +2976,11 @@ needs a two-node cluster and an interleaving the suite cannot force.
 
 ### OB20 — A fresh cluster can keep a partial ring, and nothing repairs it
 
-📋 **Found 2026-09-26** by the new cluster suite (`scripts/validate/cluster.sh`, opt-in: three
+✅ **Found and fixed 2026-09-26** by the new cluster suite (`scripts/validate/cluster.sh`, opt-in: three
 nodes in Docker). Started together, **4 of 5** fresh clusters failed to converge within 60 s:
 three times one node held 8 of the 12 shards for the whole minute, all three nodes reporting
-`connected_nodes` 3; once node3 stayed connected to no one. Started seeds first, and after
-every restart of two nodes, the ring converged within a second.
+`connected_nodes` 3; once node3 stayed connected to no one. After every restart of two nodes the ring converged within a
+second; started seeds first — the shipped compose file's order — it usually did, but not always.
 
 **Why the ring stays partial.** On a fresh start the shard maps change hands in one burst of
 about 50 ms. The node that ended at 8 fetched `GetShardAssignments` only from node1, five times
@@ -3009,6 +3009,39 @@ listening is never retried (`RequestBootstrapRedial` is a stub).
 The storm numbers are the schema-canvass stall — each new-index write waits on peers'
 orchestrator mailboxes — and are what the cluster Phase 3 work moves. The connection counts are
 the duplicate dials: two peers, and four or five connections to each on first contact.
+
+**The fix, in three steps.**
+
+1. *One connection per peer* (`swarm/mod.rs`). A peer is discovered on its first connection and
+   lost with its last — the first `ConnectionClosed` used to mark a live peer lost while its
+   other connections stayed up — and a Kademlia routing update dials only a peer not already
+   connected or being dialed (`PeerCondition::DisconnectedAndNotDialing`).
+2. *Seed redial*. A node with no peers redials its seeds from the swarm loop, 1 s doubling to
+   30 s; `RequestBootstrapRedial`, a stub until now, asks for a check at once.
+3. *Anti-entropy*. The merge no longer deduplicates on the pushed (generation, checksum) — that
+   key was written by three handlers with three meanings, and every pull carries `(0, 0)`, so
+   only a node's first pull from a peer ever merged. It is idempotent, and moves the generation,
+   ring and snapshot only when a shard is added, removed or changes owner or tokens, not when its
+   counts change. `QueryClusterState` answers `needs_full_sync` by checksum. Every node pulls each
+   connected peer's map every 10 s (`spawn_shard_map_sync`), from spawned tasks with a 5 s bound
+   on each step, so no mailbox waits on a peer. No wire change.
+
+The suite gained a deterministic check for (2): node3 started 10 s before the seeds.
+
+| | before | after |
+|---|---|---|
+| fresh start converged | 1 of 5 | **5 of 5**, each in under 1 s |
+| node3 started before the seeds | alone after 60 s | **joined in 4 s** |
+| seeds started first | usually converged; one run left node1 at 8 of 12 | not needed |
+| node1: connections established; closed (6 real restarts) | 34; 26 | **8; 6** |
+| dial failures, all nodes | 1–6 per node | **0** |
+| ring rebuilds per node, whole run | — | 2, both at startup |
+
+Storm and restart results are unchanged, as expected: the storm is bound by the schema canvass.
+
+A Docker build also turned out able to link crates from an older build — the `target` cache is
+shared and cargo judges freshness by mtime, which `COPY` preserves — and it surfaced here as an
+image missing this week's storage changes. The build now touches the workspace sources first.
 
 ### F9 — Commit on a clock, not a count
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Cluster validation: three nodes in Docker, and the properties only a real cluster has.
 #
-#   formation   nodes started together find each other and agree on one ring
+#   formation   nodes started together find each other and agree on one ring; a node
+#               started before its seeds joins once they are up
 #   storm       new-index writes and index deletes on every node at once leave every node
 #               answering — the load that once deadlocked orchestrator and coordinator mailboxes
 #               across nodes (OB19)
@@ -27,6 +28,7 @@ PORT_BASE="${CLUSTER_PORT_BASE:-19481}"
 PORTS=("$PORT_BASE" "$((PORT_BASE + 1))" "$((PORT_BASE + 2))")
 FORM_SECS="${CLUSTER_FORM_SECS:-60}"
 FORM_ROUNDS="${CLUSTER_FORM_ROUNDS:-3}"
+LATE_SEED_SECS=10
 STORM_SECS="${CLUSTER_STORM_SECS:-60}"
 STORM_WRITERS="${CLUSTER_STORM_WRITERS:-2}"
 STORM_DELETERS="${CLUSTER_STORM_DELETERS:-1}"
@@ -194,6 +196,24 @@ for r in $(seq 1 "$FORM_ROUNDS"); do
         collect_logs "formation-$r"
     fi
 done
+
+section "late seeds (node3 started ${LATE_SEED_SECS}s before the seeds)"
+# Every dial node3 makes at startup is refused. Nothing dials a node that is not a seed, so it
+# joins only if it keeps redialing the seeds itself. Deterministic, unlike the rounds above.
+compose down -t 5 > /dev/null 2>&1
+write_compose "$WORK/data-late-seeds"
+compose up -d node3 > /dev/null 2>&1
+wait_nodes "${PORTS[2]}"
+sleep "$LATE_SEED_SECS"
+compose up -d node1 node2 > /dev/null 2>&1
+wait_nodes "${PORTS[0]}" "${PORTS[1]}"
+if check_cmd "node3 started first joins once the seeds are up" probe converge "$FORM_SECS"; then
+    formed=1
+else
+    formed=0
+    collect_logs late-seeds
+fi
+
 if [ "$formed" -eq 0 ]; then
     # The rest of the suite still has something to say about a cluster that formed. Start one
     # the way the shipped compose file does — seeds first — and carry on, so one failure here

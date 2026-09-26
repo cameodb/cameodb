@@ -14,6 +14,7 @@ use cluster::NodeIdentity;
 use futures::StreamExt;
 use libp2p::core::Transport;
 use libp2p::core::transport::upgrade::Version;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::{
     Multiaddr, PeerId, SwarmBuilder, identify,
     identity::Keypair,
@@ -170,6 +171,15 @@ impl SwarmRuntimeHandle {
                 generation,
                 checksum,
             })?;
+        }
+        Ok(())
+    }
+
+    /// Ask the swarm to redial the seeds if the node has no peer left.
+    pub fn request_seed_redial(&self) -> Result<()> {
+        if let Some(tx) = &self.cmd_tx {
+            tx.send(SwarmCommand::RedialSeeds)
+                .map_err(|_| anyhow::anyhow!("Swarm runtime channel closed"))?;
         }
         Ok(())
     }
@@ -507,6 +517,7 @@ async fn create_production_swarm(
     // Connect to seed nodes for DHT initialization
     let seed_addrs = convert_seed_nodes_to_multiaddrs(&config.seed_nodes);
     let mut connected_peers = 0;
+    let mut dialable_seeds = Vec::new();
 
     info!(
         "🔍 Seed node configuration: {} nodes configured",
@@ -559,6 +570,7 @@ async fn create_production_swarm(
             continue;
         }
 
+        dialable_seeds.push(addr.clone());
         info!("📞 Attempting to dial seed node: {}", addr);
         match swarm.dial(addr.clone()) {
             Ok(_) => {
@@ -585,7 +597,7 @@ async fn create_production_swarm(
     // Start the swarm runtime task to process events
     let (event_tx, event_rx) = unbounded_channel();
     let (cmd_tx, cmd_rx) = unbounded_channel();
-    let runtime = launch_swarm_runtime(swarm, event_tx, cmd_rx, cmd_tx.clone());
+    let runtime = launch_swarm_runtime(swarm, event_tx, cmd_rx, cmd_tx.clone(), dialable_seeds);
 
     Ok(SwarmStartup {
         peer_id,
@@ -774,6 +786,7 @@ fn launch_swarm_runtime(
     event_tx: UnboundedSender<CoordinatorEvent>,
     mut cmd_rx: UnboundedReceiver<SwarmCommand>,
     cmd_tx: UnboundedSender<SwarmCommand>,
+    seeds: Vec<Multiaddr>,
 ) -> SwarmRuntimeHandle {
     let (shutdown_signal_tx, mut shutdown_signal_rx) = watch::channel(SwarmControl::Run);
 
@@ -781,6 +794,7 @@ fn launch_swarm_runtime(
         info!("🔄 Swarm runtime task started");
         let mut metrics = SwarmRuntimeMetrics::default();
         let mut peer_book = PeerBook::default();
+        let mut redial = SeedRedial::new(seeds);
 
         loop {
             select! {
@@ -790,12 +804,16 @@ fn launch_swarm_runtime(
                         break;
                     }
                 }
-                Some(cmd) = cmd_rx.recv() => {
-                    handle_swarm_command(cmd, &mut swarm);
-                }
+                Some(cmd) = cmd_rx.recv() => match cmd {
+                    SwarmCommand::RedialSeeds => redial.check_now(),
+                    cmd => handle_swarm_command(cmd, &mut swarm),
+                },
                 event = swarm.select_next_some() => {
                     metrics.total_events += 1;
                     handle_swarm_event(event, &mut metrics, &event_tx, &mut swarm, &mut peer_book);
+                }
+                _ = tokio::time::sleep_until(redial.next_check), if redial.has_seeds() => {
+                    redial.check(&mut swarm, &mut metrics);
                 }
             }
         }
@@ -820,6 +838,74 @@ pub enum SwarmCommand {
     QueryNodeMetadata {
         node_uuid: Uuid,
     },
+    /// Check now whether the node is cut off, and redial the seeds if it is.
+    RedialSeeds,
+}
+
+/// First wait before redialing the seeds of a node with no peers, doubled per attempt.
+const SEED_REDIAL_FIRST: Duration = Duration::from_secs(1);
+/// Longest wait between redials of a node that stays cut off.
+const SEED_REDIAL_MAX: Duration = Duration::from_secs(30);
+/// How often a connected node looks again at whether it still is.
+const SEED_REDIAL_CONNECTED_CHECK: Duration = Duration::from_secs(5);
+
+/// Redials the seeds while the node has no peer at all.
+///
+/// Seeds were dialed once, at startup. A node that came up before the seeds were listening —
+/// three nodes started together — had every dial refused and stayed alone for good: nothing
+/// else dials a node that is not itself a seed. Only a node with *no* connection redials: one
+/// connected peer is enough for Kademlia to find the rest, and dialing a seed by address alone
+/// while connected to it would open a duplicate connection.
+struct SeedRedial {
+    seeds: Vec<Multiaddr>,
+    backoff: Duration,
+    next_check: tokio::time::Instant,
+}
+
+impl SeedRedial {
+    fn new(seeds: Vec<Multiaddr>) -> Self {
+        Self {
+            seeds,
+            backoff: SEED_REDIAL_FIRST,
+            next_check: tokio::time::Instant::now() + SEED_REDIAL_FIRST,
+        }
+    }
+
+    fn has_seeds(&self) -> bool {
+        !self.seeds.is_empty()
+    }
+
+    fn check_now(&mut self) {
+        self.next_check = tokio::time::Instant::now();
+    }
+
+    fn check(
+        &mut self,
+        swarm: &mut libp2p::Swarm<DhtBehaviour>,
+        metrics: &mut SwarmRuntimeMetrics,
+    ) {
+        let now = tokio::time::Instant::now();
+        if swarm.connected_peers().next().is_some() {
+            self.backoff = SEED_REDIAL_FIRST;
+            self.next_check = now + SEED_REDIAL_CONNECTED_CHECK;
+            return;
+        }
+        info!(
+            seeds = self.seeds.len(),
+            next_in_secs = self.backoff.as_secs(),
+            "📞 No connected peers; redialing seed nodes"
+        );
+        for addr in &self.seeds {
+            if let Err(e) = swarm.dial(addr.clone()) {
+                debug!("⚠️  Seed redial to {} not started: {}", addr, e);
+            }
+        }
+        // Kademlia bootstraps on the first peer connection; let the next one do it again, since
+        // whatever the routing table held when this node lost its last peer is stale.
+        metrics.bootstrapped = false;
+        self.next_check = now + self.backoff;
+        self.backoff = (self.backoff * 2).min(SEED_REDIAL_MAX);
+    }
 }
 
 fn handle_swarm_command(cmd: SwarmCommand, swarm: &mut libp2p::Swarm<DhtBehaviour>) {
@@ -841,6 +927,8 @@ fn handle_swarm_command(cmd: SwarmCommand, swarm: &mut libp2p::Swarm<DhtBehaviou
         SwarmCommand::QueryNodeMetadata { node_uuid } => {
             swarm.behaviour_mut().query_node_metadata(node_uuid);
         }
+        // Owned by the runtime loop, which holds the redial state.
+        SwarmCommand::RedialSeeds => {}
     }
 }
 
@@ -866,22 +954,29 @@ fn handle_swarm_event(
             peer_id,
             established_in,
             endpoint,
+            num_established,
             ..
         } => {
             metrics.connections_established += 1;
-            let addr = Some(endpoint.get_remote_address().to_string());
-            peer_book
-                .addr_by_peer
-                .insert(peer_id.to_string(), addr.clone().unwrap_or_default());
-            let _ = event_tx.send(CoordinatorEvent::PeerDiscovered {
-                peer_id: peer_id.to_string(),
-                address: addr,
-            });
             info!(
-                "🔗 Connection established with {} ({} ms)",
+                "🔗 Connection established with {} ({} ms, {} open)",
                 peer_id,
-                established_in.as_millis()
+                established_in.as_millis(),
+                num_established
             );
+            // A peer is discovered once, on its first connection. Two nodes dialing each other
+            // at once always open a second one, and each extra `PeerDiscovered` re-ran the whole
+            // discovery exchange against the same peer.
+            if num_established.get() == 1 {
+                let addr = Some(endpoint.get_remote_address().to_string());
+                peer_book
+                    .addr_by_peer
+                    .insert(peer_id.to_string(), addr.clone().unwrap_or_default());
+                let _ = event_tx.send(CoordinatorEvent::PeerDiscovered {
+                    peer_id: peer_id.to_string(),
+                    address: addr,
+                });
+            }
 
             // Trigger bootstrap on first non-self peer connection
             if !metrics.bootstrapped && peer_id != *swarm.local_peer_id() {
@@ -911,9 +1006,23 @@ fn handle_swarm_event(
                 }
             }
         }
-        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            cause,
+            num_established,
+            ..
+        } => {
             metrics.connections_closed += 1;
-            info!("🔒 Connection closed with {} ({:?})", peer_id, cause);
+            info!(
+                "🔒 Connection closed with {} ({:?}, {} still open)",
+                peer_id, cause, num_established
+            );
+            // The peer is lost when its last connection goes, not its first. Closing one of
+            // several — an idle duplicate reaching the idle timeout — used to mark a live peer
+            // lost, with nothing to bring it back until some new connection opened.
+            if num_established > 0 {
+                return;
+            }
             let node_uuid = peer_book.uuid_by_peer.remove(&peer_id.to_string());
             let address = peer_book.addr_by_peer.remove(&peer_id.to_string());
             let _ = event_tx.send(CoordinatorEvent::PeerLost {
@@ -1036,7 +1145,14 @@ fn handle_kademlia_event(
             // Skip self-dialing
             if peer != *swarm.local_peer_id() {
                 if let Some(addr) = select_preferred_address(&addr_vec) {
-                    match swarm.dial(addr.clone()) {
+                    // Only when not already connected or dialing: every routing update used to
+                    // open another connection to a peer we already had — four or five per peer
+                    // on first contact, each one re-running identify and discovery.
+                    let opts = DialOpts::peer_id(peer)
+                        .condition(PeerCondition::DisconnectedAndNotDialing)
+                        .addresses(vec![addr.clone()])
+                        .build();
+                    match swarm.dial(opts) {
                         Ok(_) => {
                             peer_book
                                 .addr_by_peer
