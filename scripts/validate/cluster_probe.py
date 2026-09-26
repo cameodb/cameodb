@@ -11,6 +11,9 @@ show the evidence. Nodes come from CLUSTER_NODES, a comma-separated list of base
   seed <index> <count>                     write <count> documents, spread across the nodes
   count <index> <count>                    every node finds exactly <count> of them
   stats                                    the swarm counters from each node's health body
+  warm <index>                             a bulk batch through every node until each answers fast
+  fault <seconds> <from> <to> <index>      node1's health, searches and writes while a peer is
+                                           faulted between <from> and <to>; prints METRIC lines
 """
 import collections
 import json
@@ -206,6 +209,137 @@ def cmd_stats():
     return 0
 
 
+def cmd_warm(index, limit=60):
+    """Send a bulk batch through every node until all of them answer inside a second.
+
+    A node that restarted holds no schema for an index minted while it was away, and its first
+    write there canvasses the peers from inside its mailbox — seconds, when a peer restarted
+    with it. A fault injected in that window lands on requests already queued behind the
+    canvass, which then wait out the whole request timeout, and the fault's numbers measure
+    that timing rather than the build. This is the settling step before one.
+    """
+    started = time.time()
+    rounds = 0
+    while True:
+        rounds += 1
+        slowest = []
+        for k, node in enumerate(NODES):
+            docs = [{"id": f"warm{rounds}n{k}d{d}", "doc": {"title": "warm", "n": d}}
+                    for d in range(30)]
+            status, took, _ = call("POST", f"{node}/api/{index}/_bulk", docs, timeout=OP_TIMEOUT)
+            slowest.append((node, status, took))
+        if all(st in (200, 201) and took < 1.0 for _, st, took in slowest):
+            print(f"every node answers in under 1s after {time.time() - started:.0f}s "
+                  f"({rounds} round{'s' if rounds > 1 else ''})")
+            return 0
+        if time.time() - started >= limit:
+            print("not settled after {}s: {}".format(limit, "; ".join(
+                f"{n} {st} in {t:.1f}s" for n, st, t in slowest)))
+            return 1
+        time.sleep(1)
+
+
+def cmd_fault(seconds, fault_from, fault_to, index):
+    """What the first node's clients see while another node is faulted.
+
+    The shell side does the faulting on the same clock: it starts this, waits `fault_from`
+    seconds, faults the peer, and restores it at `fault_to`. Health is polled every second,
+    searches fan out to every node, and single writes go to `index` (which must already exist,
+    so no write here mints a schema). Exits 1 if health ever failed to answer in 5 s — the one
+    property that must hold on a node whose peer is gone.
+    """
+    node = NODES[0]
+    started = time.time()
+    events = []
+    lock = threading.Lock()
+
+    def rec(kind, at, status, took, extra=None):
+        with lock:
+            events.append((at - started, kind, status, took, extra))
+
+    def loop(kind, fn, pause):
+        while time.time() - started < seconds:
+            at = time.time()
+            status, took, extra = fn()
+            rec(kind, at, status, took, extra)
+            time.sleep(max(0, pause - (time.time() - at)))
+
+    def health_once():
+        status, took, body = call("GET", node + "/_cluster/health", timeout=5)
+        view = (body.get("connected_nodes"), body.get("status")) if isinstance(body, dict) else None
+        return status, took, view
+
+    def search_once():
+        status, took, _ = call("POST", f"{node}/api/survivor/search",
+                               {"query": "title:survivor", "limit": 1})
+        return status, took, None
+
+    counter = iter(range(10**9))
+    counter_lock = threading.Lock()
+
+    def next_id():
+        with counter_lock:
+            return next(counter)
+
+    # Past the router's own give-up (two attempts at the transport timeout), so a write the
+    # cluster refused reads as its status, not as this client losing patience first.
+    write_timeout = 45
+
+    def write_once():
+        i = next_id()
+        status, took, _ = call("PUT", f"{node}/api/{index}/document",
+                               {"id": f"f{i}", "doc": {"title": "during", "n": i}},
+                               timeout=write_timeout)
+        return status, took, None
+
+    def bulk_once():
+        # Spread over every shard, so each batch has a share for the frozen node.
+        base = next_id() * 1000
+        docs = [{"id": f"b{base + k}", "doc": {"title": "during", "n": k}} for k in range(30)]
+        status, took, body = call("POST", f"{node}/api/{index}/_bulk", docs, timeout=write_timeout)
+        written = body.get("items_written") if isinstance(body, dict) else None
+        return status, took, written
+
+    # Several single writers: one parked on a key the frozen node owns must not hide whether
+    # writes to every other key kept going.
+    loops = [("health", health_once, 1.0), ("search", search_once, 0.5),
+             ("bulk", bulk_once, 0.5)] + [("write", write_once, 0.2)] * 4
+    threads = [threading.Thread(target=loop, args=a, daemon=True) for a in loops]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(seconds + write_timeout + 30)
+
+    def phase(t):
+        return "before" if t < fault_from else ("during" if t < fault_to else "after")
+
+    for kind in ("write", "bulk", "search"):
+        for ph in ("before", "during", "after"):
+            es = [e for e in events if e[1] == kind and phase(e[0]) == ph]
+            if not es:
+                continue
+            t = [e[3] for e in es]
+            ok = sum(1 for e in es if e[2] in (200, 201))
+            other = collections.Counter(str(e[2]) for e in es if e[2] not in (200, 201))
+            docs = ""
+            if kind == "bulk":
+                written = sum(e[4] or 0 for e in es)
+                docs = f"  docs {written}/{30 * len(es)}"
+            print(f"METRIC fault {kind:<6} {ph:<6} {len(es):>4} ops  ok {ok:>4}  "
+                  f"p50 {percentile(t, 50):5.2f}s  max {max(t):5.2f}s  not-ok {json.dumps(dict(other))}"
+                  f"{docs}")
+    health = sorted(e for e in events if e[1] == "health")
+    healthy_view = health[0][4] if health else None
+    noticed = next((e[0] for e in health
+                    if fault_from <= e[0] < fault_to + 5 and e[4] != healthy_view), None)
+    print("METRIC fault node1 health noticed the fault "
+          + (f"{noticed - fault_from:.0f}s after it began" if noticed is not None
+             else f"never (stayed {healthy_view})"))
+    failed = [e for e in health if e[2] != 200]
+    print(f"node1 health answered {len(health) - len(failed)} of {len(health)} polls within 5s")
+    return 0 if health and not failed else 1
+
+
 def main():
     if not NODES:
         sys.exit("CLUSTER_NODES is not set")
@@ -222,6 +356,10 @@ def main():
         return cmd_count(args[0], int(args[1]))
     if cmd == "stats":
         return cmd_stats()
+    if cmd == "warm":
+        return cmd_warm(args[0])
+    if cmd == "fault":
+        return cmd_fault(int(args[0]), int(args[1]), int(args[2]), args[3])
     sys.exit(f"unknown subcommand: {cmd}")
 
 

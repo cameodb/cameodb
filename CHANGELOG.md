@@ -64,6 +64,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   older than the cached artifacts were not recompiled. The build now touches the workspace
   sources first.
 
+- **A peer that stops answering no longer holds an orchestrator for longer than the remote
+  timeout.** The orchestrator forwards a bulk batch, a bulk delete or a misrouted write to the
+  owning node from its mailbox, and only the transport bounded each step: the registry lookup had
+  no bound, and a forward that needed the schema resent could wait the timeout twice. The lookup,
+  the ask and the resend now share one deadline, and a peer that could not be reached is answered
+  `503` (retry) rather than `500`.
+
+- **A stale reference to a restarted peer is dropped on the first failure.** Cached peer actor
+  references were evicted only when the peer was seen to disconnect; until then a restarted
+  peer's old reference kept failing. A request that fails to reach a peer now drops that peer's
+  references and the next one looks it up afresh. A peer's own error answers do not.
+
+- **The newest cluster topology is never dropped on its way to the orchestrator.** Ring updates
+  went through a 16-slot queue that discarded the *newest* ring once full, so an orchestrator
+  behind a busy mailbox could keep routing on an older one until the next change. A `watch`
+  channel now holds the latest ring, and a backlog collapses into one update.
+
 - **A refused request no longer costs a log line, and single-write overload no longer halves
   goodput.** Every `503` was logged at `ERROR` — twice, by the trace layer and by the error
   handler — synchronously on the runtime the write path shares. A default node filters at

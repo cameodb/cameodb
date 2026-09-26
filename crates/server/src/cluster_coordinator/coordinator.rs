@@ -10,7 +10,6 @@ use kameo::{Actor, RemoteActor, remote_message};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tokio::task;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -46,7 +45,7 @@ pub struct ClusterCoordinator {
     pub(crate) expected_shards: HashMap<Uuid, ShardMetadata>,
 
     // Subscribers for topology updates
-    pub(crate) topology_subscribers: Vec<mpsc::Sender<ConsistentRing>>,
+    pub(crate) topology_subscribers: Vec<tokio::sync::watch::Sender<ConsistentRing>>,
 
     // DHT Bootstrap tracking - DHT is used only during bootstrap, then push-only
     pub(crate) bootstrap_complete: bool,
@@ -873,17 +872,11 @@ impl ClusterCoordinator {
                 "ClusterCoordinator: broadcasting topology update"
             );
 
-            let ring_clone = self.ring.clone();
-            self.topology_subscribers.retain(|tx| {
-                match tx.try_send(ring_clone.clone()) {
-                    Ok(_) => true,
-                    Err(mpsc::error::TrySendError::Closed(_)) => false, // Prune closed channels
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        warn!("ClusterCoordinator: subscriber channel full, skipping update");
-                        true
-                    }
-                }
-            });
+            // Overwrites whatever the subscriber has not read yet: only the latest ring matters.
+            // `send` fails only when the receiver is gone, which is the one reason to prune.
+            let ring = &self.ring;
+            self.topology_subscribers
+                .retain(|tx| tx.send(ring.clone()).is_ok());
         }
     }
 
@@ -917,8 +910,9 @@ impl Message<SubscribeTopology> for ClusterCoordinator {
     ) -> Self::Reply {
         info!("ClusterCoordinator: new topology subscriber registered");
         // Send current ring immediately
-        let _ = msg.subscriber.try_send(self.ring.clone());
-        self.topology_subscribers.push(msg.subscriber);
+        if msg.subscriber.send(self.ring.clone()).is_ok() {
+            self.topology_subscribers.push(msg.subscriber);
+        }
     }
 }
 

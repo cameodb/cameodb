@@ -119,7 +119,7 @@ Each `MicroshardActor` manages a single shard’s data and index.
   - `generation: u64` - Cluster state generation number for versioning
   - `state_store: Option<Arc<ClusterStateStore>>` - Persistent metadata storage (metadata.redb)
   - `local_orchestrator: Option<ActorRef<NodeOrchestrator>>` - Reference to local orchestrator for coordinated operations
-  - `topology_subscribers: Vec<mpsc::Sender<ConsistentRing>>` - Subscribers for topology updates
+  - `topology_subscribers: Vec<watch::Sender<ConsistentRing>>` - Subscribers for topology updates; each holds the latest ring
   - `remote_peer_pool: Option<Arc<RemotePeerPool>>` - Cached remote actor references
 
 - **Key Messages**:
